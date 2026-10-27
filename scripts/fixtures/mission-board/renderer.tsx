@@ -136,13 +136,13 @@ const loomPlan=(missionId:string):LoomPlan=>({planId:`plan-${missionId}`,mission
 const loomTasks=(missionId:string):LoomTask[]=>[
  {taskId:'task-1',planId:`plan-${missionId}`,title:'设计恢复协议',description:'定义工作区快照格式与恢复边界',assigneeAgentId:profiles[0].agentId,status:'done',acceptanceCriteria:loomAcceptance,blockedReason:null,createdAt:now,updatedAt:now,revision:1},
  {taskId:'task-2',planId:`plan-${missionId}`,title:'实现快照保存',description:'在 Core 中实现工作区快照保存',assigneeAgentId:profiles[1].agentId,status:'done',acceptanceCriteria:loomAcceptance,blockedReason:null,createdAt:now,updatedAt:now,revision:1},
- {taskId:'task-3',planId:`plan-${missionId}`,title:'实现恢复逻辑',description:'从快照恢复工作区状态',assigneeAgentId:profiles[1].agentId,status:'in_progress',acceptanceCriteria:loomAcceptance,blockedReason:null,createdAt:now,updatedAt:now,revision:1},
+ {taskId:'task-3',planId:`plan-${missionId}`,title:'实现恢复逻辑',description:'从快照恢复工作区状态',assigneeAgentId:profiles[1].agentId,status:'ready',acceptanceCriteria:loomAcceptance,blockedReason:null,createdAt:now,updatedAt:now,revision:1},
  {taskId:'task-4',planId:`plan-${missionId}`,title:'验收测试',description:'验证恢复正确性并留下验收记录',assigneeAgentId:profiles[0].agentId,status:'blocked',acceptanceCriteria:loomAcceptance,blockedReason:'等待“实现恢复逻辑”完成并通过人工验收',createdAt:now,updatedAt:now,revision:1}
 ]
-const loomDependencies=():LoomDependency[]=>[
- {dependencyId:'dep-1',upstreamTaskId:'task-1',downstreamTaskId:'task-2',condition:'task_done',resolvedArtifactId:null,resolution:null,createdAt:now},
- {dependencyId:'dep-2',upstreamTaskId:'task-2',downstreamTaskId:'task-3',condition:'task_done',resolvedArtifactId:null,resolution:null,createdAt:now},
- {dependencyId:'dep-3',upstreamTaskId:'task-3',downstreamTaskId:'task-4',condition:'artifact_accepted',resolvedArtifactId:null,resolution:null,createdAt:now}
+const loomDependencies=(planId:string):LoomDependency[]=>[
+ {dependencyId:'dep-1',planId,upstreamTaskId:'task-1',downstreamTaskId:'task-2',condition:'task_done',resolvedArtifactId:null,resolution:null,createdAt:now},
+ {dependencyId:'dep-2',planId,upstreamTaskId:'task-2',downstreamTaskId:'task-3',condition:'task_done',resolvedArtifactId:null,resolution:null,createdAt:now},
+ {dependencyId:'dep-3',planId,upstreamTaskId:'task-3',downstreamTaskId:'task-4',condition:'artifact_accepted',resolvedArtifactId:null,resolution:null,createdAt:now}
 ]
 const client={...model.client,onInvalidated:undefined,onEvent:(fn:any)=>{events.add(fn);return()=>events.delete(fn)},missionAttachments:{
  update:async(_commandId:string,patch:any,keepAttachmentIds:string[],attachments:any[])=>{
@@ -251,7 +251,7 @@ const client={...model.client,onInvalidated:undefined,onEvent:(fn:any)=>{events.
  }
  if(method==='loom.plan.get')return loomPlan(p.missionId)
  if(method==='loom.tasks.list')return loomTasks(p.missionId)
- if(method==='loom.dependencies.list')return loomDependencies()
+ if(method==='loom.dependencies.list')return loomDependencies(`plan-${p.missionId}`)
  return model.client.request(method as any,p)
 }}
 const preferences:any={appearance:{get:async()=>appearance,onChanged:()=>()=>{}},generalPreferences:new Proxy({}, {get:(_,key)=>key==='onChanged'?()=>()=>{}:async(...args:any[])=>{if(key==='setInterfaceLanguagePreference')Object.assign(prefs,{interfaceLanguage:args[0],interfaceLanguagePreference:args[0],languageRevision:prefs.languageRevision+1});if(String(key).startsWith('set'))calls.push({method:`preferences.${String(key)}`,p:args});if(key==='setNewConversationDefaults')prefs.newConversationDefaults=args[0];return structuredClone(prefs)}}),navigationPreferences:new Proxy({}, {get:(_,key)=>key==='onChanged'?()=>()=>{}:async()=>navigationPrefs})}

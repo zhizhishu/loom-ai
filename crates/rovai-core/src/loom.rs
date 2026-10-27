@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::db::Database;
 
 /// LOOM control-plane task state machine: DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED.
+/// The persisted literals stay uppercase; the wire shape is the contract's lowercase one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "snake_case")]
 pub enum LoomTaskStatus {
     Draft,
     Ready,
@@ -36,8 +37,9 @@ impl LoomTaskStatus {
 }
 
 /// Dependency release conditions: the upstream Task is done, or its artifact was accepted.
+/// The persisted literals stay uppercase; the wire shape is the contract's lowercase one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "snake_case")]
 pub enum LoomDependencyCondition {
     TaskDone,
     ArtifactAccepted,
@@ -60,13 +62,31 @@ impl LoomDependencyCondition {
     }
 }
 
+/// One acceptance criterion on the wire; `criterionId` is the stable identity every
+/// verdict binds to, never the array position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomAcceptanceCriterion {
+    pub criterion_id: String,
+    pub text: String,
+}
+
+/// Acceptance criteria snapshot: the Plan defines the version and every Task of the
+/// Plan inherits the same one, so a verdict can be bound to a frozen version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomAcceptanceCriteriaSnapshot {
+    pub version: String,
+    pub criteria: Vec<LoomAcceptanceCriterion>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoomPlan {
     pub plan_id: String,
     pub mission_id: String,
     pub goal: String,
-    pub acceptance_criteria: Vec<String>,
+    pub acceptance_criteria: LoomAcceptanceCriteriaSnapshot,
     pub created_at: String,
     pub revision: i64,
 }
@@ -80,11 +100,22 @@ pub struct LoomTask {
     pub description: String,
     pub assignee_agent_id: Option<String>,
     pub status: LoomTaskStatus,
-    pub acceptance_criteria: Vec<String>,
+    pub acceptance_criteria: LoomAcceptanceCriteriaSnapshot,
     pub blocked_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub revision: i64,
+}
+
+/// Frozen release trace: written once when a dependency first resolves and never
+/// upgraded afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomDependencyResolution {
+    pub resolved_at: String,
+    pub upstream_task_revision: i64,
+    pub candidate_id: Option<String>,
+    pub review_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,10 +127,7 @@ pub struct LoomDependency {
     pub downstream_task_id: String,
     pub condition: LoomDependencyCondition,
     pub resolved_artifact_id: Option<String>,
-    pub resolved_at: Option<String>,
-    pub upstream_task_revision: Option<i64>,
-    pub candidate_id: Option<String>,
-    pub review_id: Option<String>,
+    pub resolution: Option<LoomDependencyResolution>,
     pub created_at: String,
 }
 
@@ -118,33 +146,61 @@ fn scoped_mission(mission_id: &str) -> Result<&str> {
     Ok(mission_id)
 }
 
-/// Persisted acceptance criteria accept both the imported `{criterionId,text}` shape and
-/// a plain text list; the read model only exposes the texts.
+/// Persisted acceptance criteria are `{criterionId,text}` rows; the read model adds the
+/// Plan-level version every Task inherits to form the snapshot.
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredCriterion {
-    Text(String),
-    Described { text: String },
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredCriterion {
+    criterion_id: String,
+    text: String,
 }
 
-fn criteria(raw: &str, owner: &str) -> Result<Vec<String>> {
-    let stored: Vec<StoredCriterion> = serde_json::from_str(raw)
-        .with_context(|| format!("{owner} acceptance criteria are not a list"))?;
-    Ok(stored
-        .into_iter()
-        .map(|criterion| match criterion {
-            StoredCriterion::Text(text) | StoredCriterion::Described { text, .. } => text,
-        })
-        .collect())
+fn criteria_snapshot(
+    raw: &str,
+    version: &str,
+    owner: &str,
+) -> Result<LoomAcceptanceCriteriaSnapshot> {
+    let stored: Vec<StoredCriterion> = serde_json::from_str(raw).with_context(|| {
+        format!("{owner} acceptance criteria are not a list of {{criterionId,text}} rows")
+    })?;
+    Ok(LoomAcceptanceCriteriaSnapshot {
+        version: version.to_string(),
+        criteria: stored
+            .into_iter()
+            .map(|criterion| LoomAcceptanceCriterion {
+                criterion_id: criterion.criterion_id,
+                text: criterion.text,
+            })
+            .collect(),
+    })
+}
+
+/// A frozen release trace exists only once the database recorded both the release
+/// moment and the upstream revision; a half-written trace is not a release.
+fn resolution(
+    resolved_at: Option<String>,
+    upstream_task_revision: Option<i64>,
+    candidate_id: Option<String>,
+    review_id: Option<String>,
+) -> Option<LoomDependencyResolution> {
+    let resolved_at = resolved_at?;
+    let upstream_task_revision = upstream_task_revision?;
+    Some(LoomDependencyResolution {
+        resolved_at,
+        upstream_task_revision,
+        candidate_id,
+        review_id,
+    })
 }
 
 /// The authoritative plan for one Mission, if orchestration was configured.
 pub fn plan_get(database: &Database, mission_id: &str) -> Result<Option<LoomPlan>> {
     let mission_id = scoped_mission(mission_id)?;
-    let row: Option<(String, String, String, String, String, i64)> = database
+    let row: Option<(String, String, String, String, String, String, i64)> = database
         .connection()
         .query_row(
-            "SELECT plan_id, mission_id, goal, acceptance_criteria_json, created_at, revision
+            "SELECT plan_id, mission_id, goal, acceptance_criteria_json,
+                    acceptance_criteria_version, created_at, revision
              FROM loom_plan WHERE mission_id=?1",
             [mission_id],
             |row| {
@@ -155,14 +211,27 @@ pub fn plan_get(database: &Database, mission_id: &str) -> Result<Option<LoomPlan
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(plan_id, mission_id, goal, acceptance_criteria_json, created_at, revision)| {
+        |(
+            plan_id,
+            mission_id,
+            goal,
+            acceptance_criteria_json,
+            acceptance_criteria_version,
+            created_at,
+            revision,
+        )| {
             Ok(LoomPlan {
-                acceptance_criteria: criteria(&acceptance_criteria_json, &plan_id)?,
+                acceptance_criteria: criteria_snapshot(
+                    &acceptance_criteria_json,
+                    &acceptance_criteria_version,
+                    &plan_id,
+                )?,
                 plan_id,
                 mission_id,
                 goal,
@@ -182,7 +251,8 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
         .prepare(
             "SELECT task.task_id, task.plan_id, task.title, task.description,
                     task.assignee_agent_id, task.status, task.acceptance_criteria_json,
-                    task.blocked_reason, task.created_at, task.updated_at, task.revision
+                    plan.acceptance_criteria_version, task.blocked_reason, task.created_at,
+                    task.updated_at, task.revision
              FROM loom_task AS task
              JOIN loom_plan AS plan ON plan.plan_id=task.plan_id
              WHERE plan.mission_id=?1
@@ -197,10 +267,11 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, String>(8)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
                 row.get::<_, String>(9)?,
-                row.get::<_, i64>(10)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, i64>(11)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -214,6 +285,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
                 assignee_agent_id,
                 status,
                 acceptance_criteria_json,
+                acceptance_criteria_version,
                 blocked_reason,
                 created_at,
                 updated_at,
@@ -221,7 +293,11 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
             )| {
                 Ok(LoomTask {
                     status: LoomTaskStatus::parse(&status)?,
-                    acceptance_criteria: criteria(&acceptance_criteria_json, &task_id)?,
+                    acceptance_criteria: criteria_snapshot(
+                        &acceptance_criteria_json,
+                        &acceptance_criteria_version,
+                        &task_id,
+                    )?,
                     task_id,
                     plan_id,
                     title,
@@ -286,15 +362,17 @@ pub fn dependencies_list(database: &Database, mission_id: &str) -> Result<Vec<Lo
             )| {
                 Ok(LoomDependency {
                     condition: LoomDependencyCondition::parse(&condition)?,
+                    resolution: resolution(
+                        resolved_at,
+                        upstream_task_revision,
+                        candidate_id,
+                        review_id,
+                    ),
                     dependency_id,
                     plan_id,
                     upstream_task_id,
                     downstream_task_id,
                     resolved_artifact_id,
-                    resolved_at,
-                    upstream_task_revision,
-                    candidate_id,
-                    review_id,
                     created_at,
                 })
             },
@@ -657,9 +735,17 @@ pub fn plan_import(
     }
 
     transaction.execute(
-        "INSERT INTO loom_plan(plan_id,mission_id,goal,acceptance_criteria_json,created_at,revision)
-         VALUES(?1,?2,?3,?4,?5,1)",
-        params![&plan_id, mission_id, goal, &acceptance_criteria_json, &now],
+        "INSERT INTO loom_plan(plan_id,mission_id,goal,acceptance_criteria_json,
+                              acceptance_criteria_version,created_at,revision)
+         VALUES(?1,?2,?3,?4,?5,?6,1)",
+        params![
+            &plan_id,
+            mission_id,
+            goal,
+            &acceptance_criteria_json,
+            acceptance_criteria_version,
+            &now
+        ],
     )?;
     for task in &task_rows {
         transaction.execute(

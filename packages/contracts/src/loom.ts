@@ -1,8 +1,12 @@
 // LOOM 控制层类型：从 ACCP 抄的核心概念，适配 Rovai 的 Mission/AgentRun 模型。
 // 证据：docs/loom/control-plane.md、Pi 工兵 ACCP 盘点、Astra UI 审查。
 
-/** Task 状态机：从 ACCP 抄，扩展 Rovai MissionStatus。 */
-export type LoomTaskStatus = 'draft' | 'ready' | 'blocked' | 'in_progress' | 'in_review' | 'done' | 'cancelled'
+/**
+ * Task 状态机：严格照 ACCP 的六个状态。
+ * 刻意没有 in_progress ——「正在执行」属于 Run/Attempt，不属于 Task；
+ * Task 只是可领取（ready）、被阻塞（blocked）或待审（in_review）。
+ */
+export type LoomTaskStatus = 'draft' | 'ready' | 'blocked' | 'in_review' | 'done' | 'canceled'
 
 /** DAG 依赖边：从 ACCP 抄 task_dependencies。 */
 export type LoomDependencyCondition = 'task_done' | 'artifact_accepted'
@@ -48,6 +52,8 @@ export interface LoomDependencyResolution {
 export interface LoomDependency {
   /** 依赖 ID */
   dependencyId: string
+  /** 所属计划 ID（边不得跨计划） */
+  planId: string
   /** 上游 Task ID */
   upstreamTaskId: string
   /** 下游 Task ID */
@@ -88,8 +94,8 @@ export interface LoomTask {
   title: string
   /** 任务描述 */
   description: string
-  /** 负责人 Agent ID（责任≠执行授权） */
-  assigneeAgentId: string
+  /** 负责人 Agent ID（责任≠执行授权；可为空表示未指派） */
+  assigneeAgentId: string | null
   /** 状态 */
   status: LoomTaskStatus
   /** 验收标准版本快照（逐条稳定 ID + 版本） */

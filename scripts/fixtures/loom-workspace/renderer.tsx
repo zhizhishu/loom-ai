@@ -82,7 +82,7 @@ const tasks: LoomTask[] = [
   {
     taskId: 'task-3', planId: plan.planId,
     title: '实现恢复逻辑', description: '从快照恢复工作区状态',
-    assigneeAgentId: 'agent-build', status: 'in_progress',
+    assigneeAgentId: 'agent-build', status: 'ready',
     acceptanceCriteria: plan.acceptanceCriteria,
     blockedReason: null, createdAt, updatedAt: createdAt, revision: 1
   },
@@ -96,9 +96,9 @@ const tasks: LoomTask[] = [
 ]
 
 const dependencies: LoomDependency[] = [
-  { dependencyId: 'dep-1', upstreamTaskId: 'task-1', downstreamTaskId: 'task-2', condition: 'task_done', resolvedArtifactId: null, resolution: null, createdAt },
-  { dependencyId: 'dep-2', upstreamTaskId: 'task-2', downstreamTaskId: 'task-3', condition: 'task_done', resolvedArtifactId: null, resolution: null, createdAt },
-  { dependencyId: 'dep-3', upstreamTaskId: 'task-3', downstreamTaskId: 'task-4', condition: 'artifact_accepted', resolvedArtifactId: null, resolution: null, createdAt }
+  { dependencyId: 'dep-1', planId: plan.planId, upstreamTaskId: 'task-1', downstreamTaskId: 'task-2', condition: 'task_done', resolvedArtifactId: null, resolution: null, createdAt },
+  { dependencyId: 'dep-2', planId: plan.planId, upstreamTaskId: 'task-2', downstreamTaskId: 'task-3', condition: 'task_done', resolvedArtifactId: null, resolution: null, createdAt },
+  { dependencyId: 'dep-3', planId: plan.planId, upstreamTaskId: 'task-3', downstreamTaskId: 'task-4', condition: 'artifact_accepted', resolvedArtifactId: null, resolution: null, createdAt }
 ]
 
 const delivery: MissionDelivery = {

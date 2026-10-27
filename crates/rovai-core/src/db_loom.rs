@@ -77,7 +77,10 @@ fn table_sql(connection: &Connection, table: &str) -> rusqlite::Result<Option<St
         .optional()
 }
 
-pub(super) fn schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+pub(super) fn schema_matches(
+    connection: &Connection,
+    projection_schema_version: i64,
+) -> rusqlite::Result<bool> {
     let compact = |sql: &str| sql.split_whitespace().collect::<String>();
     let holds = |table: &str, tokens: &[&str]| -> rusqlite::Result<bool> {
         Ok(table_sql(connection, table)?.is_some_and(|sql| {
@@ -85,6 +88,8 @@ pub(super) fn schema_matches(connection: &Connection) -> rusqlite::Result<bool> 
             tokens.iter().all(|token| sql.contains(&compact(token)))
         }))
     };
+    let plan_version_recorded =
+        projection_schema_version < 169 || plan_holds_acceptance_criteria_version(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -92,17 +97,34 @@ pub(super) fn schema_matches(connection: &Connection) -> rusqlite::Result<bool> 
             "json_valid(acceptance_criteria_json)",
             "revision INTEGER NOT NULL CHECK(revision >= 1)",
         ],
-    )? && holds(
-        TASK_TABLE,
-        &[TASK_STATUS, "UNIQUE(plan_id, task_id)", "json_valid(acceptance_criteria_json)"],
-    )? && holds(
-        DEPENDENCY_TABLE,
-        &[
-            DEPENDENCY_CONDITION,
-            "CHECK(upstream_task_id <> downstream_task_id)",
-            "REFERENCES loom_task(plan_id, task_id)",
-        ],
-    )?)
+    )? && plan_version_recorded
+        && holds(
+            TASK_TABLE,
+            &[
+                TASK_STATUS,
+                "UNIQUE(plan_id, task_id)",
+                "json_valid(acceptance_criteria_json)",
+            ],
+        )?
+        && holds(
+            DEPENDENCY_TABLE,
+            &[
+                DEPENDENCY_CONDITION,
+                "CHECK(upstream_task_id <> downstream_task_id)",
+                "REFERENCES loom_task(plan_id, task_id)",
+            ],
+        )?)
+}
+
+/// Migration 219 hangs the acceptance criteria version on the Plan; Tasks inherit it.
+fn plan_holds_acceptance_criteria_version(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1)
+             WHERE name='acceptance_criteria_version' AND type='TEXT'
+               AND \"notnull\"=1 AND dflt_value IS NOT NULL)",
+        [PLAN_TABLE],
+        |row| row.get(0),
+    )
 }
 
 pub(super) fn migrate(database: &mut Database) -> Result<()> {
@@ -130,7 +152,8 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
         anyhow::ensure!(
             matches!(
                 classify_database_contract(&tx)?,
-                DatabaseContractClassification::Current(_)
+                DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                    if marker.projection_schema_version == 168
             ),
             "LOOM projection schema admission failed"
         );
@@ -140,6 +163,43 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
     let restored = database.connection.execute_batch("PRAGMA foreign_keys=ON;");
     result?;
     restored?;
+    Ok(())
+}
+
+/// Migration 219: the Plan owns the acceptance criteria version that every Task of the
+/// Plan inherits; Tasks carry no version column of their own.
+pub(super) fn migrate_acceptance_criteria_version(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 168
+        ),
+        "LOOM acceptance criteria version migration requires schema 168"
+    );
+    // Plans imported before this migration have no recorded version; the literal is
+    // kept as the snapshot version instead of inventing a revision number.
+    tx.execute_batch(
+        "ALTER TABLE loom_plan ADD COLUMN acceptance_criteria_version TEXT NOT NULL
+             DEFAULT 'legacy';
+         INSERT INTO schema_migration VALUES(219,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=169,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    anyhow::ensure!(
+        plan_holds_acceptance_criteria_version(&tx)?,
+        "LOOM acceptance criteria version migration did not create the required column"
+    );
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::Current(_)
+        ),
+        "LOOM acceptance criteria version schema admission failed"
+    );
+    tx.commit()?;
     Ok(())
 }
 
@@ -163,7 +223,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
-            DELETE FROM schema_migration WHERE version=218;
+            DELETE FROM schema_migration WHERE version IN (218,219);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();

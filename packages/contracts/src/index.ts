@@ -4310,6 +4310,7 @@ export type CoreMethod =
   | 'missions.start'
   | 'missions.linkPr'
   | 'loom.plan.get'
+  | 'loom.plan.import'
   | 'loom.tasks.list'
   | 'loom.dependencies.list'
   | 'automations.create'
