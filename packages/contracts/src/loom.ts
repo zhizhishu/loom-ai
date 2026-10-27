@@ -175,6 +175,7 @@ export type LoomDependencyBlockReason =
   | 'candidate_not_accepted'
   | 'accepted_review_missing'
   | 'review_criteria_mismatch'
+  | 'review_criteria_incomplete'
 
 /** 单条依赖边的求值结果。 */
 export interface LoomDependencyEvaluation {
@@ -268,6 +269,24 @@ function loomAcceptedReview(candidateId: string, reviews: readonly LoomReview[])
 }
 
 /**
+ * 逐条验收结论必须覆盖该版本的每一条 criterionId 且全部为 satisfied。
+ * 缺条、重复条、或任一条不满足，都不能释放依赖。
+ */
+export function loomReviewSatisfiesCriteria(
+  review: LoomReview,
+  criteria: readonly LoomAcceptanceCriterion[]
+): boolean {
+  if (criteria.length === 0) return false
+  const seen = new Set<string>()
+  for (const result of review.criteriaResults) {
+    if (!result.satisfied) return false
+    if (seen.has(result.criterionId)) return false
+    seen.add(result.criterionId)
+  }
+  return criteria.every(criterion => seen.has(criterion.criterionId))
+}
+
+/**
  * 依赖边求值：已冻结的边直接返回冻结溯源，不自动升级。
  * artifact_accepted 不能只看 task_done —— 必须由上游链头候选
  * verificationStatus === 'verified' 且 acceptanceStatus === 'accepted'，
@@ -304,6 +323,9 @@ export function loomEvaluateDependency(dependency: LoomDependency, graph: LoomDe
   if (review === null) return { ...base, satisfied: false, reason: 'accepted_review_missing', resolution: null }
   if (review.acceptanceCriteriaVersion !== candidate.acceptanceCriteria.version) {
     return { ...base, satisfied: false, reason: 'review_criteria_mismatch', resolution: null }
+  }
+  if (!loomReviewSatisfiesCriteria(review, candidate.acceptanceCriteria.criteria)) {
+    return { ...base, satisfied: false, reason: 'review_criteria_incomplete', resolution: null }
   }
   return {
     ...base,

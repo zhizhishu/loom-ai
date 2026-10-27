@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency } from '@contracts'
+import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
 import { UiText, uiAttribute, useUiText } from './interface-language'
@@ -15,26 +16,17 @@ function LoomEmpty({ title, children }: { title: string; children: ReactNode }) 
   </div>
 }
 
-/** 依赖就绪判定：一条规则求值，不是事件。 */
-export function loomTaskReady(task: LoomTask, dependencies: LoomDependency[], tasks: LoomTask[]): boolean {
-  const upstreams = dependencies.filter(d => d.downstreamTaskId === task.taskId)
-  return upstreams.every(dep => {
-    const upstream = tasks.find(t => t.taskId === dep.upstreamTaskId)
-    if (!upstream) return false
-    if (dep.condition === 'task_done') return upstream.status === 'done'
-    if (dep.condition === 'artifact_accepted') return upstream.status === 'done' // 简化：先只看 task_done
-    return false
-  })
-}
-
-/** 依赖图渲染：archify 流程视图。 */
+/** 依赖图渲染：archify 流程视图。就绪判定走控制层契约，不在 UI 里另立规则。 */
 function LoomFlow({ tasks, dependencies, agents }: {
   tasks: LoomTask[]
   dependencies: LoomDependency[]
   agents: AgentProfile[]
 }) {
   const t = useUiText()
-  const readyTasks = tasks.filter(task => loomTaskReady(task, dependencies, tasks))
+  // 尚无 Candidate/Review 读取路径，传空集合：artifact_accepted 边因此保持未释放，
+  // 不会被"上游 done"误判为已验收。
+  const graph = { tasks, dependencies, candidates: [], reviews: [], evaluatedAt: new Date(0).toISOString() }
+  const readyTasks = tasks.filter(task => loomTaskReady(task.taskId, graph).ready)
   const blockedTasks = tasks.filter(task => task.status === 'blocked')
   
   return <div className="loom-flow">
@@ -50,7 +42,7 @@ function LoomFlow({ tasks, dependencies, agents }: {
     <div className="loom-flow-graph">
       {tasks.map(task => {
         const upstreams = dependencies.filter(d => d.downstreamTaskId === task.taskId)
-        const ready = loomTaskReady(task, dependencies, tasks)
+        const ready = loomTaskReady(task.taskId, graph).ready
         const assignee = agents.find(a => a.agentId === task.assigneeAgentId)
         
         return <div key={task.taskId} className={`loom-flow-node ${ready ? 'ready' : ''} ${task.status}`}>
@@ -62,7 +54,7 @@ function LoomFlow({ tasks, dependencies, agents }: {
           {upstreams.length > 0 && (
             <div className="loom-flow-node-deps">
               {t('依赖')}: {upstreams.map(d => {
-                const upstream = tasks.find(t => t.taskId === d.upstreamTaskId)
+                const upstream = tasks.find(entry => entry.taskId === d.upstreamTaskId)
                 return upstream?.title ?? d.upstreamTaskId
               }).join(', ')}
             </div>

@@ -1,5 +1,6 @@
 //! LOOM orchestration projection: plan, task and dependency facts for one Mission.
-//! Read-only authority: this migration creates empty tables and no write path.
+//! This migration only creates the tables; the single write path is
+//! `loom::plan_import`, which validates the whole graph in one transaction.
 use super::*;
 
 const PLAN_TABLE: &str = "loom_plan";

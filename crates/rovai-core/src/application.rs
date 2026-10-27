@@ -589,6 +589,15 @@ fn request_error_body(error: &anyhow::Error) -> ErrorBody {
             details: json!({ "subsystem": error.id, "state": error.state }),
         };
     }
+    if let Some(error) = error.downcast_ref::<rovai_core::loom::LoomPlanImportError>() {
+        return ErrorBody {
+            kind: "domain_rejection",
+            code: error.code().to_string(),
+            message: error.message().to_string(),
+            retryable: false,
+            details: json!({}),
+        };
+    }
     if let Some(error) = error.downcast_ref::<CommandGatewayError>() {
         let code = match error {
             CommandGatewayError::InvalidEnvelope(_) => "COMMAND_ENVELOPE_INVALID",
@@ -9499,6 +9508,13 @@ impl Core {
                     });
                 }
                 Ok(serde_json::to_value(snapshot)?)
+            }
+            "loom.plan.import" => {
+                let input: rovai_core::loom::LoomPlanImportInput =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let result = rovai_core::loom::plan_import(&mut database, input)?;
+                Ok(serde_json::to_value(result)?)
             }
             "loom.plan.get" | "loom.tasks.list" | "loom.dependencies.list" => {
                 let params: rovai_core::loom::MissionScopeInput =
