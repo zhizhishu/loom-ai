@@ -228,3 +228,245 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
         )
         .unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collaboration::ProjectBindingKind;
+    use crate::command::{ActorRef, CommandEnvelope};
+    use crate::loom::{
+        LoomPlanImportCriterion, LoomPlanImportDependency, LoomPlanImportInput, LoomPlanImportTask,
+        dependencies_list, plan_get, plan_import, tasks_list,
+    };
+    use crate::mission::{CreateMissionCommand, MissionService};
+    use uuid::Uuid;
+
+    /// A real Mission through the product command, because `loom_plan` is keyed by `mission.id`.
+    fn create_mission(database: &mut Database, directory: &std::path::Path, title: &str) -> String {
+        let workspace = directory.join(format!("loom-upgrade-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let created = MissionService::default()
+            .create(
+                database,
+                &CommandEnvelope {
+                    command_id: Uuid::new_v4().to_string(),
+                    actor: ActorRef::User {
+                        user_id: "local_user".into(),
+                    },
+                    camp_id: None,
+                    expected_versions: vec![],
+                    execution_epoch: None,
+                    payload: CreateMissionCommand {
+                        team: None,
+                        title: title.into(),
+                        description: String::new(),
+                        description_content: None,
+                        project_path: workspace.to_string_lossy().into_owned(),
+                        project_binding_kind: ProjectBindingKind::Directory,
+                        member_agent_ids: vec!["agent_1".into()],
+                        default_lead_agent_id: "agent_1".into(),
+                        tags: vec![],
+                        source_attachments: vec![],
+                    },
+                },
+            )
+            .unwrap();
+        created.result.payload["missionId"]
+            .as_str()
+            .expect("mission creation must return a missionId")
+            .to_string()
+    }
+
+    fn projection_version(database: &Database) -> i64 {
+        database
+            .connection()
+            .query_row(
+                "SELECT projection_schema_version FROM rovai_data_contract WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn migration_receipts(database: &Database, version: i64) -> i64 {
+        database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migration WHERE version=?1",
+                [version],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn plan_criteria_version_columns(database: &Database) -> i64 {
+        database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1)
+                 WHERE name='acceptance_criteria_version'",
+                [PLAN_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The upgrade path the deployed 168 databases take: rebuild the LOOM projection at
+    /// 167 with the owner's own downgrade, walk 218 back to 168, then apply 219.
+    #[test]
+    fn acceptance_criteria_version_upgrade_defaults_legacy_and_keeps_loom_writable() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let legacy_mission = create_mission(&mut database, &directory, "LOOM legacy plan");
+        let imported_mission = create_mission(&mut database, &directory, "LOOM imported plan");
+
+        downgrade_for_test(database.connection());
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 167
+        ));
+
+        // Migration 218 rebuilds the three LOOM tables without a criteria version column.
+        migrate(&mut database).unwrap();
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 168
+        ));
+        assert!(schema_matches(database.connection(), 168).unwrap());
+        assert!(!plan_holds_acceptance_criteria_version(database.connection()).unwrap());
+        assert_eq!(
+            plan_criteria_version_columns(&database),
+            0,
+            "assertion schema_168_plan_has_no_acceptance_criteria_version_column"
+        );
+
+        // A Plan imported before 219 carries only its criteria snapshot.
+        database
+            .connection()
+            .execute(
+                r#"INSERT INTO loom_plan(plan_id,mission_id,goal,acceptance_criteria_json,created_at,revision)
+                   VALUES('plan_legacy',?1,'legacy goal','[{"criterionId":"criterion_one","text":"one"}]','2026-01-01T00:00:00Z',1)"#,
+                [&legacy_mission],
+            )
+            .unwrap();
+
+        migrate_acceptance_criteria_version(&mut database).unwrap();
+
+        assert!(plan_holds_acceptance_criteria_version(database.connection()).unwrap());
+        assert_eq!(
+            plan_criteria_version_columns(&database),
+            1,
+            "assertion schema_169_plan_has_acceptance_criteria_version_column"
+        );
+        let (not_null, default): (i64, Option<String>) = database
+            .connection()
+            .query_row(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info(?1)
+                 WHERE name='acceptance_criteria_version'",
+                [PLAN_TABLE],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(not_null, 1, "assertion plan_column_is_not_null");
+        assert_eq!(
+            default.as_deref(),
+            Some("'legacy'"),
+            "assertion plan_column_default_is_the_legacy_literal"
+        );
+        let legacy_version: String = database
+            .connection()
+            .query_row(
+                "SELECT acceptance_criteria_version FROM loom_plan WHERE plan_id='plan_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_version, "legacy",
+            "assertion pre_219_plan_reads_back_the_default_version"
+        );
+
+        assert_eq!(
+            migration_receipts(&database, 218),
+            1,
+            "assertion schema_migration_records_218_once"
+        );
+        assert_eq!(
+            migration_receipts(&database, 219),
+            1,
+            "assertion schema_migration_records_219_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            169,
+            "assertion contract_marker_advances_to_169"
+        );
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::Current(_)
+        ));
+
+        // The product write path still stores all three LOOM tables, and reads them back.
+        let imported = plan_import(
+            &mut database,
+            LoomPlanImportInput {
+                mission_id: imported_mission.clone(),
+                goal: "Ship after the criteria version upgrade".into(),
+                acceptance_criteria_version: "ac-v2".into(),
+                criteria: vec![
+                    LoomPlanImportCriterion {
+                        criterion_id: "criterion_one".into(),
+                        text: "one".into(),
+                    },
+                    LoomPlanImportCriterion {
+                        criterion_id: "criterion_two".into(),
+                        text: "two".into(),
+                    },
+                ],
+                tasks: vec![
+                    LoomPlanImportTask {
+                        task_id: "task_a".into(),
+                        title: "Task A".into(),
+                        description: String::new(),
+                        assignee_agent_id: None,
+                    },
+                    LoomPlanImportTask {
+                        task_id: "task_b".into(),
+                        title: "Task B".into(),
+                        description: String::new(),
+                        assignee_agent_id: None,
+                    },
+                ],
+                dependencies: vec![LoomPlanImportDependency {
+                    upstream_task_id: "task_a".into(),
+                    downstream_task_id: "task_b".into(),
+                    condition: None,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            imported.acceptance_criteria_version, "ac-v2",
+            "assertion imported_plan_echoes_criteria_version"
+        );
+        let plan = plan_get(&database, &imported_mission).unwrap().unwrap();
+        assert_eq!(
+            plan.acceptance_criteria.version, "ac-v2",
+            "assertion loom_plan_reads_back_the_imported_criteria_version"
+        );
+        assert_eq!(
+            tasks_list(&database, &imported_mission).unwrap().len(),
+            2,
+            "assertion loom_task_reads_back_both_tasks"
+        );
+        assert_eq!(
+            dependencies_list(&database, &imported_mission)
+                .unwrap()
+                .len(),
+            1,
+            "assertion loom_dependency_reads_back_the_edge"
+        );
+    }
+}
