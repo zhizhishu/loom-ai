@@ -14,7 +14,7 @@ import {EMPTY_SNAPSHOT} from '../../../apps/desktop/src/shared/navigation-prefer
 import {applyAppearanceSnapshot} from '../../../apps/desktop/src/renderer/src/theme'
 import '../../../apps/desktop/src/renderer/src/styles.css'
 import '../../../apps/web/src/mobile.css'
-import type {MissionRecord, ThreadOpenProjection, NotificationEpisodeChange, NotificationEpisodeView, NotificationActionView} from '@contracts'
+import type {MissionRecord, ThreadOpenProjection, NotificationEpisodeChange, NotificationEpisodeView, NotificationActionView, LoomPlan, LoomTask, LoomDependency} from '@contracts'
 
 // UI-only acceptance: production BusinessApp/components, deterministic memory adapter.
 const query=new URLSearchParams(location.search), theme=query.get('theme')==='night'?'night':'day'
@@ -130,6 +130,20 @@ function projectDescription(m: any, command: any) {
   m.description = missionDescriptionText(command.descriptionContent, profiles)
   m.memberAgentIds = [...new Set([...m.memberAgentIds, ...missionMentionIds(command.descriptionContent)])]
 }
+// LOOM 编排 tab：完整 App fixture 需要真实 DAG（计划/任务/依赖），而不是读取失败。
+const loomAcceptance={version:'v1',criteria:[{criterionId:'c1',text:'工作区保存后可恢复'},{criterionId:'c2',text:'交付有独立验收记录'}]}
+const loomPlan=(missionId:string):LoomPlan=>({planId:`plan-${missionId}`,missionId,goal:'实现工作区恢复与验收闭环',acceptanceCriteria:loomAcceptance,createdAt:now,revision:1})
+const loomTasks=(missionId:string):LoomTask[]=>[
+ {taskId:'task-1',planId:`plan-${missionId}`,title:'设计恢复协议',description:'定义工作区快照格式与恢复边界',assigneeAgentId:profiles[0].agentId,status:'done',acceptanceCriteria:loomAcceptance,blockedReason:null,createdAt:now,updatedAt:now,revision:1},
+ {taskId:'task-2',planId:`plan-${missionId}`,title:'实现快照保存',description:'在 Core 中实现工作区快照保存',assigneeAgentId:profiles[1].agentId,status:'done',acceptanceCriteria:loomAcceptance,blockedReason:null,createdAt:now,updatedAt:now,revision:1},
+ {taskId:'task-3',planId:`plan-${missionId}`,title:'实现恢复逻辑',description:'从快照恢复工作区状态',assigneeAgentId:profiles[1].agentId,status:'in_progress',acceptanceCriteria:loomAcceptance,blockedReason:null,createdAt:now,updatedAt:now,revision:1},
+ {taskId:'task-4',planId:`plan-${missionId}`,title:'验收测试',description:'验证恢复正确性并留下验收记录',assigneeAgentId:profiles[0].agentId,status:'blocked',acceptanceCriteria:loomAcceptance,blockedReason:'等待“实现恢复逻辑”完成并通过人工验收',createdAt:now,updatedAt:now,revision:1}
+]
+const loomDependencies=():LoomDependency[]=>[
+ {dependencyId:'dep-1',upstreamTaskId:'task-1',downstreamTaskId:'task-2',condition:'task_done',resolvedArtifactId:null,resolution:null,createdAt:now},
+ {dependencyId:'dep-2',upstreamTaskId:'task-2',downstreamTaskId:'task-3',condition:'task_done',resolvedArtifactId:null,resolution:null,createdAt:now},
+ {dependencyId:'dep-3',upstreamTaskId:'task-3',downstreamTaskId:'task-4',condition:'artifact_accepted',resolvedArtifactId:null,resolution:null,createdAt:now}
+]
 const client={...model.client,onInvalidated:undefined,onEvent:(fn:any)=>{events.add(fn);return()=>events.delete(fn)},missionAttachments:{
  update:async(_commandId:string,patch:any,keepAttachmentIds:string[],attachments:any[])=>{
   calls.push({method:'missions.updateWithAttachments',p:{patch,keepAttachmentIds,attachments}})
@@ -235,6 +249,9 @@ const client={...model.client,onInvalidated:undefined,onEvent:(fn:any)=>{events.
   if(c.workspaceDisposition==='cleanup'&&m!.workspaceResourcesPresent)orphanCleanups.push(workspaceFor(m!,'cleanup_pending'))
   items.splice(items.indexOf(m!),1);changed();return accepted({threadId:m!.threadId,operationId:p.commandId,workspaceCleanupScheduled:c.workspaceDisposition==='cleanup'})
  }
+ if(method==='loom.plan.get')return loomPlan(p.missionId)
+ if(method==='loom.tasks.list')return loomTasks(p.missionId)
+ if(method==='loom.dependencies.list')return loomDependencies()
  return model.client.request(method as any,p)
 }}
 const preferences:any={appearance:{get:async()=>appearance,onChanged:()=>()=>{}},generalPreferences:new Proxy({}, {get:(_,key)=>key==='onChanged'?()=>()=>{}:async(...args:any[])=>{if(key==='setInterfaceLanguagePreference')Object.assign(prefs,{interfaceLanguage:args[0],interfaceLanguagePreference:args[0],languageRevision:prefs.languageRevision+1});if(String(key).startsWith('set'))calls.push({method:`preferences.${String(key)}`,p:args});if(key==='setNewConversationDefaults')prefs.newConversationDefaults=args[0];return structuredClone(prefs)}}),navigationPreferences:new Proxy({}, {get:(_,key)=>key==='onChanged'?()=>()=>{}:async()=>navigationPrefs})}

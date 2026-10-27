@@ -110,18 +110,26 @@ app.whenReady().then(async () => {
   await click('.loom-section-tabs button:nth-of-type(2)')
   await expectPressed(1, 'Pointer activation did not open the 编排 section')
   await waitFor("document.querySelector('.loom-section-body > div:last-child').hidden === true", 'Plan section did not hide the shared activity container')
-  const plan = await script(`({
-    emptyTitle: document.querySelector('.loom-plan .loom-empty h3')?.innerText ?? null,
-    emptyCopy: document.querySelector('.loom-plan .loom-empty div')?.innerText ?? '',
-    foundation: [...document.querySelectorAll('.loom-foundation > div')].map(entry => entry.innerText.replace(/\\n/g, ': ')),
-    controls: document.querySelectorAll('.loom-plan input, .loom-plan button, .loom-plan textarea').length
-  })`)
-  assert.equal(plan.emptyTitle, '尚未配置编排', `Plan section invented a plan state: ${JSON.stringify(plan.emptyTitle)}`)
-  assert(plan.emptyCopy.includes('这个使命还没有任务依赖或执行计划'), `Plan section lost its honest empty copy: ${plan.emptyCopy}`)
-  assert.equal(plan.controls, 0, 'Plan section must not offer controls for an unconfigured plan')
-  assert.deepEqual(plan.foundation, ['当前使命: 补齐使命工作区恢复路径', '队员: 2', '执行中: 1'],
-    `Plan foundation no longer reports the real mission facts: ${JSON.stringify(plan.foundation)}`)
-  cases.push('编排 section shows the honest unconfigured plan with real mission facts and no invented controls')
+  await waitFor("!!document.querySelector('.loom-plan .loom-flow')", 'Plan section did not render the task dependency flow')
+  const plan = await script(`(() => {
+    const nodes = [...document.querySelectorAll('.loom-plan .loom-flow-node')]
+    const blocked = document.querySelector('.loom-plan .loom-flow-node.blocked')
+    return {
+      flow: !!document.querySelector('.loom-plan .loom-flow'),
+      nodeCount: nodes.length,
+      firstTitle: nodes[0]?.querySelector('.loom-flow-node-title')?.innerText ?? null,
+      blockedCopy: blocked?.innerText ?? '',
+      stats: document.querySelector('.loom-plan .loom-flow-stats')?.innerText ?? '',
+      controls: document.querySelectorAll('.loom-plan input, .loom-plan button, .loom-plan textarea').length
+    }
+  })()`)
+  assert.equal(plan.flow, true, `Plan section did not render the archify flow view: ${JSON.stringify(plan)}`)
+  assert.equal(plan.nodeCount, 4, `Plan flow must render one node per task: ${JSON.stringify(plan.nodeCount)}`)
+  assert(plan.firstTitle?.includes('设计恢复协议'), `Plan flow lost its first task title: ${JSON.stringify(plan.firstTitle)}`)
+  assert(plan.blockedCopy.includes('等待恢复逻辑完成'), `Plan flow lost the real blocked reason: ${JSON.stringify(plan.blockedCopy)}`)
+  assert(plan.stats.includes('总任务: 4'), `Plan flow stats no longer count the real tasks: ${JSON.stringify(plan.stats)}`)
+  assert.equal(plan.controls, 0, 'Plan section must not offer controls for a read-only plan')
+  cases.push('编排 section renders the real task dependency flow with four nodes, the blocked task reason, honest stats and no invented controls')
 
   stage = 'delivery section by keyboard Enter'
   await script("document.querySelectorAll('.loom-section-tabs button')[2].focus()")
