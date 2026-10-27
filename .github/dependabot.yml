@@ -8,7 +8,8 @@ updates:
       day: monday
       time: "09:00"
       timezone: Asia/Shanghai
-    open-pull-requests-limit: 5
+    # LOOM 不接收自动依赖升级 PR；需要时临时改回 5。
+    open-pull-requests-limit: 0
     groups:
       github-actions:
         patterns:
