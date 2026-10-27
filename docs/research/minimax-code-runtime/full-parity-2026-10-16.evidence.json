@@ -1,0 +1,851 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-16",
+  "kind": "real-cli-scripted-provider-and-code-audit",
+  "adapter": "minimax-code-cli",
+  "nativeVersion": "0.6.12",
+  "platform": "macos-arm64",
+  "baselineImplementation": "3f5e9f8f694533eb4b2985c1446a32ed02ee0638",
+  "coreSha256": "51641bb92877db63b1a8a376748544597127572cd1e2ed9a8f9e39861e97b2ce",
+  "modelSource": "deterministic loopback OpenAI-compatible provider; synthetic key; no real LLM",
+  "ui": "Core API and persisted Evidence; Renderer not started",
+  "auditScope": {
+    "closedRuntimeCount": 19,
+    "otherRuntimesNotRerun": true,
+    "authorityFiles": [
+      "crates/rovai-core/src/context.rs",
+      "crates/rovai-core/src/acp.rs",
+      "crates/rovai-core/src/agent_runtime_adapter.rs",
+      "crates/rovai-core/src/compaction.rs",
+      "crates/rovai-core/src/steer.rs",
+      "crates/rovai-core/src/native_usage.rs",
+      "crates/rovai-core/src/monitoring.rs",
+      "docs/runtime-activity/registry.md"
+    ]
+  },
+  "failedAttempts": [
+    {
+      "kind": "fixture_schema_error",
+      "count": 3,
+      "reason": "edit used engine-internal path/edits instead of advertised file_path/old_string/new_string; corrected and rerun; original script Run-success assertion was insufficient",
+      "countedAsEditPass": false
+    },
+    {
+      "kind": "compatibility_register_digest_stale",
+      "test": "runtime_platform_admission::tests::platform_evidence_revisions_bind_their_frozen_source_bytes",
+      "reason": "baseline implementation added the MiniMax Preview entry to docs/runtime-compatibility.md after the last test but left its source digest stale; synchronized with the final register bytes; no Runtime qualification promoted",
+      "initialDefaultSuite": {
+        "passed": 426,
+        "failed": 1,
+        "ignored": 1
+      },
+      "targetedRetest": {
+        "passed": 1,
+        "failed": 0
+      }
+    }
+  ],
+  "beforeFix": {
+    "status": "observed_mapping_defects",
+    "results": [
+      {
+        "case": "FILE_READ_ABS",
+        "runId": "e2b6277c-3f1c-4b26-a87f-9f9f50fe1d7f",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_READ_REL",
+        "runId": "b3b442e4-effe-4c0e-880d-b32718cf4de9",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {},
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_WRITE_NEW",
+        "runId": "fd6312e6-135c-4a34-981b-f244b1c50138",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "operationKind": "write",
+              "path": "文件矩阵/新增 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_WRITE_EXISTING",
+        "runId": "2f9bb3fa-f3fb-4d19-9a82-67c3566a651b",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/新增 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "operationKind": "write",
+              "path": "文件矩阵/新增 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_WRITE_EMPTY",
+        "runId": "c717ab43-61ae-41a1-b20a-8cf7c78589dd",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/空 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "operationKind": "write",
+              "path": "文件矩阵/空 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_EDIT",
+        "runId": "2e75b074-2649-4884-93b7-804a96b857b3",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "operationKind": "write",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": "complete_before_after",
+            "diffEntrySemantics": [
+              "full_before_after"
+            ],
+            "previewEllipsisInDiff": true
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_EDIT_BACK",
+        "runId": "76c01543-f295-4548-8d30-249710884447",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "operationKind": "write",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": "complete_before_after",
+            "diffEntrySemantics": [
+              "full_before_after"
+            ],
+            "previewEllipsisInDiff": true
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_EDIT_FAILED",
+        "runId": "dbd13adb-8fb0-444d-8ae7-65d431db3da1",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "failed",
+            "nativeKind": "edit",
+            "operation": {},
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      }
+    ]
+  },
+  "afterFix": {
+    "status": "passed",
+    "fileRunCount": 10,
+    "checks": [
+      {
+        "name": "FILE_READ_ABS",
+        "status": "passed",
+        "run": "b89d1526-6fde-4a0e-a80c-8a025d6e9bd2"
+      },
+      {
+        "name": "FILE_READ_REL",
+        "status": "passed",
+        "run": "edb02dce-ed49-482c-8c9d-205fffce8def"
+      },
+      {
+        "name": "FILE_WRITE_NEW",
+        "status": "passed",
+        "run": "51b7800c-6cb6-44dd-9795-ba31866ec863"
+      },
+      {
+        "name": "FILE_WRITE_EXISTING",
+        "status": "passed",
+        "run": "f36a81be-3ef2-4e29-b16e-a0dafd3133ed"
+      },
+      {
+        "name": "FILE_WRITE_EMPTY",
+        "status": "passed",
+        "run": "3394dbf8-0095-4bfb-888b-3d1889b3a226"
+      },
+      {
+        "name": "FILE_EDIT",
+        "status": "passed",
+        "run": "9420cb04-8187-4f4c-adc0-1bcf4614d86f"
+      },
+      {
+        "name": "FILE_EDIT_BACK",
+        "status": "passed",
+        "run": "b49a2d7a-0db6-425c-bc1d-4082295028f6"
+      },
+      {
+        "name": "FILE_EDIT_FAILED",
+        "status": "passed",
+        "run": "3289a3cc-55ab-410d-90d3-411edfe499d0"
+      },
+      {
+        "name": "FILE_WRITE_REL",
+        "status": "passed",
+        "run": "ad9ae1dc-8c48-4e56-bee0-35f64d1f984b"
+      },
+      {
+        "name": "FILE_EDIT_REL",
+        "status": "passed",
+        "run": "c9b7623c-fc3a-4c4c-a84e-b6e956850043"
+      },
+      {
+        "name": "file cards survive Core restart",
+        "status": "passed"
+      }
+    ],
+    "results": [
+      {
+        "case": "FILE_READ_ABS",
+        "runId": "b89d1526-6fde-4a0e-a80c-8a025d6e9bd2",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_READ_REL",
+        "runId": "edb02dce-ed49-482c-8c9d-205fffce8def",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_WRITE_NEW",
+        "runId": "51b7800c-6cb6-44dd-9795-ba31866ec863",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "changeKind": "add",
+              "operationKind": "write",
+              "path": "文件矩阵/新增 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": [
+          {
+            "fileCount": 1,
+            "isStale": false,
+            "operationCount": 1,
+            "revision": 1,
+            "schemaVersion": 3
+          }
+        ]
+      },
+      {
+        "case": "FILE_WRITE_EXISTING",
+        "runId": "f36a81be-3ef2-4e29-b16e-a0dafd3133ed",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/新增 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "changeKind": "update",
+              "operationKind": "write",
+              "path": "文件矩阵/新增 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": "unified_diff_snapshot",
+            "diffEntrySemantics": [
+              "unified_diff_snapshot"
+            ],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": [
+          {
+            "additions": 1,
+            "deletions": 1,
+            "fileCount": 1,
+            "isStale": false,
+            "operationCount": 1,
+            "revision": 1,
+            "schemaVersion": 3
+          }
+        ]
+      },
+      {
+        "case": "FILE_WRITE_EMPTY",
+        "runId": "3394dbf8-0095-4bfb-888b-3d1889b3a226",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/空 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "changeKind": "update",
+              "operationKind": "write",
+              "path": "文件矩阵/空 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": "unified_diff_snapshot",
+            "diffEntrySemantics": [
+              "unified_diff_snapshot"
+            ],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": [
+          {
+            "additions": 1,
+            "deletions": 0,
+            "fileCount": 1,
+            "isStale": false,
+            "operationCount": 1,
+            "revision": 1,
+            "schemaVersion": 3
+          }
+        ]
+      },
+      {
+        "case": "FILE_EDIT",
+        "runId": "9420cb04-8187-4f4c-adc0-1bcf4614d86f",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "operationKind": "write",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": "unified_diff_snapshot",
+            "diffEntrySemantics": [
+              "unified_diff_snapshot"
+            ],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": [
+          {
+            "additions": 1,
+            "deletions": 1,
+            "fileCount": 1,
+            "isStale": false,
+            "operationCount": 1,
+            "revision": 1,
+            "schemaVersion": 3
+          }
+        ]
+      },
+      {
+        "case": "FILE_EDIT_BACK",
+        "runId": "b49a2d7a-0db6-425c-bc1d-4082295028f6",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "operationKind": "write",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": "unified_diff_snapshot",
+            "diffEntrySemantics": [
+              "unified_diff_snapshot"
+            ],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": [
+          {
+            "additions": 1,
+            "deletions": 1,
+            "fileCount": 1,
+            "isStale": false,
+            "operationCount": 1,
+            "revision": 1,
+            "schemaVersion": 3
+          }
+        ]
+      },
+      {
+        "case": "FILE_EDIT_FAILED",
+        "runId": "3289a3cc-55ab-410d-90d3-411edfe499d0",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/编辑 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "failed",
+            "nativeKind": "edit",
+            "operation": {},
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": []
+      },
+      {
+        "case": "FILE_WRITE_REL",
+        "runId": "ad9ae1dc-8c48-4e56-bee0-35f64d1f984b",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "changeKind": "add",
+              "operationKind": "write",
+              "path": "文件矩阵/相对 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": [
+          {
+            "fileCount": 1,
+            "isStale": false,
+            "operationCount": 1,
+            "revision": 1,
+            "schemaVersion": 3
+          }
+        ]
+      },
+      {
+        "case": "FILE_EDIT_REL",
+        "runId": "c9b7623c-fc3a-4c4c-a84e-b6e956850043",
+        "terminal": [
+          {
+            "outcome": "succeeded",
+            "nativeKind": "read",
+            "operation": {
+              "operationKind": "read",
+              "path": "文件矩阵/相对 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": null,
+            "diffEntrySemantics": [],
+            "previewEllipsisInDiff": false
+          },
+          {
+            "outcome": "succeeded",
+            "nativeKind": "edit",
+            "operation": {
+              "operationKind": "write",
+              "path": "文件矩阵/相对 file.txt",
+              "schemaVersion": 2,
+              "status": "available"
+            },
+            "diffSemantic": "unified_diff_snapshot",
+            "diffEntrySemantics": [
+              "unified_diff_snapshot"
+            ],
+            "previewEllipsisInDiff": false
+          }
+        ],
+        "cards": [
+          {
+            "additions": 1,
+            "deletions": 1,
+            "fileCount": 1,
+            "isStale": false,
+            "operationCount": 1,
+            "revision": 1,
+            "schemaVersion": 3
+          }
+        ]
+      }
+    ],
+    "coreRestartCardsEqual": true
+  },
+  "existingFlowRegression": {
+    "status": "passed",
+    "runCount": 15,
+    "checks": [
+      {
+        "name": "A",
+        "status": "passed",
+        "run": "a498049b-6949-4f1a-bf50-7793d7117f47"
+      },
+      {
+        "name": "B",
+        "status": "passed",
+        "run": "c4046b99-80b2-492f-a38a-b23c9990843e"
+      },
+      {
+        "name": "warm Host reuse",
+        "status": "passed"
+      },
+      {
+        "name": "C",
+        "status": "passed",
+        "run": "69c607ee-e4e4-4c2f-b0e5-0f811260c77b"
+      },
+      {
+        "name": "cold exact native binding resume",
+        "status": "passed"
+      },
+      {
+        "name": "journal input/output/cache observed on active exact Session",
+        "status": "passed"
+      },
+      {
+        "name": "live Steer stays in original Run",
+        "status": "passed"
+      },
+      {
+        "name": "Steer image path + native read reaches provider as image",
+        "status": "passed"
+      },
+      {
+        "name": "assigned MCP actual call after cold resume and Steer retirement",
+        "status": "passed"
+      },
+      {
+        "name": "NO_MCP",
+        "status": "passed",
+        "run": "6c4cb4dd-4592-4d94-8cc6-1c09e0c6f7ae"
+      },
+      {
+        "name": "MCP removal fences stale tools while preserving Session",
+        "status": "passed"
+      },
+      {
+        "name": "command output STDOUT",
+        "status": "passed"
+      },
+      {
+        "name": "command output STDERR",
+        "status": "passed"
+      },
+      {
+        "name": "command output EMPTY",
+        "status": "passed"
+      },
+      {
+        "name": "command output NONZERO",
+        "status": "passed"
+      },
+      {
+        "name": "command output LARGE",
+        "status": "passed"
+      },
+      {
+        "name": "native permission ALLOW",
+        "approvals": 1,
+        "status": "passed"
+      },
+      {
+        "name": "native permission DENY",
+        "approvals": 1,
+        "status": "passed"
+      },
+      {
+        "name": "cancel held native command and reap its process",
+        "status": "passed"
+      },
+      {
+        "name": "structured command stdout + stderr",
+        "status": "passed"
+      },
+      {
+        "name": "MISSING_SESSION",
+        "status": "passed",
+        "run": "0f828bdf-c002-422a-aee2-ec67399422c2"
+      },
+      {
+        "name": "exact missing native Session creates replacement before dispatch",
+        "status": "passed"
+      },
+      {
+        "name": "zero-send recovery and accepted-send suppression",
+        "status": "passed"
+      }
+    ]
+  },
+  "regressions": {
+    "acpExtended": {
+      "passed": 68,
+      "failed": 0,
+      "ignored": 2
+    },
+    "runtimeDiffExtended": {
+      "passed": 17,
+      "failed": 0
+    },
+    "publicPayloadOwner": {
+      "passed": 1,
+      "failed": 0
+    },
+    "defaultWorkspace": {
+      "command": "pnpm test:rust:pr",
+      "passed": 473,
+      "failed": 0,
+      "ignored": 1,
+      "byTarget": {
+        "rovaiCoreLib": 427,
+        "rovaiCli": 31,
+        "rovaiHostLib": 4,
+        "rovaiWebLib": 11
+      }
+    },
+    "documentationGates": {
+      "docsTest": {
+        "passed": 10,
+        "failed": 0
+      },
+      "docsCheck": "passed",
+      "docsCheckCi": "passed",
+      "baseRef": "3979e32ec4834ce5fc02cd72309bbd7b5cd800c6"
+    },
+    "formatAndSyntax": {
+      "cargoFmt": "passed",
+      "nodeCheck": "passed",
+      "gitDiffCheck": "passed"
+    }
+  },
+  "limits": [
+    "real-account generation blocked by native login requirement from prior attempt",
+    "manual/threshold/overflow+retry compaction and post-compact cold not verified",
+    "external native credential/provider refresh not verified; no dedicated MiniMax native-config digest",
+    "Skills actual reads/update/conflict/isolation not verified",
+    "complete builtin operation catalog not verified",
+    "full concurrency/LRU/crash/late-event/HTTP MCP matrix not verified",
+    "short-Run Usage and final tail can be absent",
+    "Renderer clicking, large/omitted patches and multi-file mutation matrix not verified",
+    "no cross-platform MiniMax qualification"
+  ],
+  "cleanup": {
+    "ownedEphemeralFixtures": 4,
+    "runtimeFilesRootsRemoved": 4,
+    "ownedProcessMatchesBeforeCleanup": 0,
+    "dailyAppAndCredentialsUnchanged": true
+  }
+}

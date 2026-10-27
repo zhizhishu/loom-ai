@@ -1,0 +1,15 @@
+{
+  "sessionId": "questionnaire-session",
+  "toolCall": {
+    "toolCallId": "questionnaire-tool",
+    "title": "AskUserQuestion",
+    "content": [
+      {"type": "content", "content": {"type": "text", "text": "Which color?"}}
+    ]
+  },
+  "options": [
+    {"optionId": "q0_opt_0", "name": "Blue", "kind": "allow_once"},
+    {"optionId": "q0_opt_1", "name": "Green", "kind": "allow_once"},
+    {"optionId": "q0_skip", "name": "Skip", "kind": "reject_once"}
+  ]
+}

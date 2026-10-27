@@ -1,0 +1,7 @@
+.copy-workbench { height: 100dvh; }
+.copy-workbench > .app-shell { min-height: 0; height: 100%; }
+.copy-window-lights { position: absolute; z-index: 25; top: 14px; left: 18px; display: flex; gap: 8px; pointer-events: none; }
+.copy-window-lights i { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; }
+.copy-window-lights i:nth-child(2) { background: #febc2e; }
+.copy-window-lights i:nth-child(3) { background: #28c840; }
+.edge-cases { padding: 32px; max-width: 700px; margin: auto; }

@@ -1,0 +1,173 @@
+{
+  "date": "2026-10-25",
+  "scope": "Hermes reduction after badd0cd6e; official ACP and native user Home retained",
+  "native": {
+    "version": "0.22.4",
+    "sourceCommit": "4d04303818b61bf3aa09278af48356315515965b",
+    "sourceModified": false,
+    "terminalBackend": "local"
+  },
+  "controlled": {
+    "fixture": "rovai-hermes-native-session-MJWMOO",
+    "command": "node scripts/smoke-hermes-native-session.mjs <official-source> <prepared-python>",
+    "provider": "loopback scripted Responses; no paid model",
+    "isolation": [
+      "one disposable user Home for both members",
+      "independent Core data, Skill Library and MCP configuration",
+      "fixed CLI installation before Gateway/Core startup",
+      "Gateway started before Core with no ~/.local/bin in its inherited PATH"
+    ],
+    "checks": {
+      "noHermesContextProjection": true,
+      "concurrentMembers": true,
+      "backgroundUsesRunAtCallTime": true,
+      "noActiveOrUnknownSessionRejected": true,
+      "gatewaySurvivesCoreShutdown": true,
+      "nativeCompactionNoRulesRedelivery": true,
+      "nativeSystemPromptPreserved": true,
+      "nativeConfigUnchanged": true,
+      "mcpNewAndColdResumeWithPartialFailure": true,
+      "fixedCliWithoutAcpPathInjection": true,
+      "cancelDoesNotStopOtherSession": true,
+      "mcpRebindAfterNativeGatewayRestart": true,
+      "coreKillDoesNotKillGatewayOrReplay": true,
+      "actualModelInputsMatchRulesDelivery": true,
+      "noHermesCompatibilityDigests": true,
+      "cliEntryInstalledBeforeRuns": true,
+      "originalSessionColdResume": true
+    },
+    "runStatusCounts": {
+      "cancelled": 1,
+      "failed": 1,
+      "succeeded": 10
+    },
+    "successfulInputs": [
+      {
+        "label": "B0",
+        "member": "B",
+        "rules": "initial",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A0",
+        "member": "A",
+        "rules": "initial",
+        "executionEpoch": 1
+      },
+      {
+        "label": "B1",
+        "member": "B",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A1",
+        "member": "A",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A2",
+        "member": "A",
+        "rules": "update",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A3",
+        "member": "A",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A4",
+        "member": "A",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "B3",
+        "member": "B",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A6",
+        "member": "A",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "B4",
+        "member": "B",
+        "rules": "none",
+        "executionEpoch": 1
+      }
+    ],
+    "compression": {
+      "committedSummaries": 2,
+      "protectFirstN": 0,
+      "protectLastN": 2,
+      "contextLength": 65536,
+      "syntheticInputTokens": 60000
+    },
+    "wireSha256": "519590855ae784f6184cae6395e268d7e07a93bf90ecef5f83d31a2336a65ab0"
+  },
+  "interpretation": [
+    "Every observed main model request ran without a projected Hermes context.json; Run authorization used the existing in-memory registry.",
+    "Successful Runs persisted NULL Host/Binding/runtime compatibility digests and still resumed the original native Session.",
+    "Both members executed plain rovai send; A0 background invocation first made during A1 belonged to A1 by the approved call-time policy.",
+    "Core shutdown, cancellation and SIGKILL did not kill the shared Gateway or replay accepted input.",
+    "First and genuine update payloads remained correct; two native compactions produced no rules redelivery.",
+    "Native config/.env hashes were unchanged and native system instructions remained present."
+  ],
+  "limits": [
+    "Only macOS arm64 and the local terminal backend were exercised.",
+    "No paid model, Windows/Linux, execute_code, subagent or remote/container terminal qualification.",
+    "Bundled CLI installation helper was verified with temporary Home fixtures; no daily App installation was performed.",
+    "Structured Hermes Diff, MCP custom cwd and reliable per-Run usage/cost remain outside this change.",
+    "The cancelled and Core-killed Runs have expected non-success outcomes; shared Gateway cancellation is not a general rollback guarantee."
+  ],
+  "afterMainMerge": {
+    "mainCommit": "1028095f6d318f1d77802c518ec76f97c036f402",
+    "fixture": "rovai-hermes-native-session-TPM8dy",
+    "nativeCommit": "4d04303818b61bf3aa09278af48356315515965b",
+    "checks": {
+      "noHermesContextProjection": true,
+      "concurrentMembers": true,
+      "backgroundUsesRunAtCallTime": true,
+      "noActiveOrUnknownSessionRejected": true,
+      "gatewaySurvivesCoreShutdown": true,
+      "nativeCompactionNoRulesRedelivery": true,
+      "nativeSystemPromptPreserved": true,
+      "nativeConfigUnchanged": true,
+      "mcpNewAndColdResumeWithPartialFailure": true,
+      "fixedCliWithoutAcpPathInjection": true,
+      "cancelDoesNotStopOtherSession": true,
+      "mcpRebindAfterNativeGatewayRestart": true,
+      "coreKillDoesNotKillGatewayOrReplay": true,
+      "actualModelInputsMatchRulesDelivery": true,
+      "noHermesCompatibilityDigests": true,
+      "cliEntryInstalledBeforeRuns": true,
+      "originalSessionColdResume": true
+    },
+    "runStatusCounts": {
+      "cancelled": 1,
+      "failed": 1,
+      "succeeded": 10
+    },
+    "successfulInputKinds": [
+      "initial",
+      "initial",
+      "none",
+      "none",
+      "update",
+      "none",
+      "none",
+      "none",
+      "none",
+      "none"
+    ],
+    "committedSummaries": 2,
+    "wireSha256": "3cc5c8909151bfe9a5f970bd2ca7b4890964f19af48dace0b2396df0209f450f"
+  }
+}

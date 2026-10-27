@@ -1,0 +1,22 @@
+{
+  "productionComponents": true,
+  "simulatedEvidence": true,
+  "realRuntime": false,
+  "widths": [
+    360,
+    390,
+    430,
+    844
+  ],
+  "themes": [
+    "day",
+    "night"
+  ],
+  "checks": [
+    "10-avatar-wrap",
+    "3-runs",
+    "independent-disclosures-retained-across-member-switch",
+    "shared-command-group",
+    "rotation"
+  ]
+}

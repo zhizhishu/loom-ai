@@ -1,0 +1,148 @@
+---
+document_type: architecture
+architecture: windows-desktop-platform
+authority: windows-desktop-platform-composition
+status: accepted
+last_updated: 2026-10-11
+---
+
+# Windows Desktop Platform
+
+本文组合 Windows x64 Desktop 的平台模块、进程、IPC、存储、Renderer 与发布边界。它不重新拥有 Runtime
+领域、Built-in operation、Skill Library 或 AgentRun terminal 语义；这些长期权威仍由对应 ADR、Contract 与
+Architecture 持有。
+
+## 1. Supported host envelope
+
+v1.05 目标为 Windows 10 22H2+ 与 Windows 11 native x64、MSVC、per-user、non-admin、local NTFS、Electron
+system frame + hidden title strip + Window Controls Overlay 和 NSIS。Windows ARM64、x86、WSL Core、MSIX/Store、
+企业 MSI、系统服务、UNC/network/removable workspace 与 non-NTFS 不在首版准入。
+
+Host envelope 通过不等于 Runtime 可选。每个 Adapter 还必须通过
+[Runtime Platform Admission v2](../contracts/runtime-platform-admission-v2.md)。
+
+## 2. Platform seams
+
+| Module / seam | macOS implementation | Windows implementation | Stable caller interface |
+| --- | --- | --- | --- |
+| Local IPC | Unix Socket | protected Named Pipe | `LocalIpcEndpoint` + async byte stream |
+| Managed process | process group + bounded signals | atomic Job-list `CreateProcessW` | `ManagedProcessLaunchSpec → ManagedProcess` |
+| Runtime search | inherited/login-shell PATH + known dirs | inherited PATH + per-capture HKCU User/HKLM Machine PATH hydration + known dirs | immutable Runtime Search Environment |
+| Executable identity | device/inode + fingerprint | opened volume/file ID + fingerprint | frozen executable identity |
+| Private storage | create-new + 0700/0600 | creation-time protected DACL | private create/atomic write helpers |
+| Attachment traversal | `openat`/no-follow | handle-relative reparse-safe traversal | bounded immutable snapshot |
+| SkillProjection | managed native links | copy + journal + root gate | reconcile/verify/Snapshot |
+| Window chrome | hidden titlebar + traffic lights | hidden title strip + top-level menu projection + native submenu/WCO | platform presentation only |
+
+These are real two-adapter seams. Domain callers do not select OS implementations or import `windows-sys`; Windows API
+use remains inside the corresponding adapter.
+
+Windows Web credentials have a narrow availability exception inside the storage adapter: `web-auth.json` uses the
+already admitted Core directory as its trust boundary, accepts inherited file permissions, and hardens only new empty
+atomic siblings on a best-effort basis. General private-file rules stay strict. See
+[Windows Web credential exception](../contracts/windows-private-storage-v2.md#windows-web-credential-exception).
+
+## 3. Managed processes and shutdown
+
+[Managed Runtime Process v2](../contracts/managed-runtime-process-v2.md) is the only Runtime/Probe launch interface.
+Windows creates the child with its Job and explicit inheritable handles in one `CreateProcessW` operation. Runtime entrypoint
+is a closed `native_executable | windows_command_shim` union: native `.exe` remains direct; `.cmd/.bat` uses canonical
+System32 `cmd.exe` with a Core-owned batch serializer, disabled AutoRun/delayed expansion and a composite shim/interpreter
+identity. `.com/.ps1` and PowerShell fallback remain unsupported.
+The owned Job's current `ActiveProcesses == 0` is the Windows cleanup boundary. Core commits cleanup and wakes the
+Delivery scheduler as soon as that query succeeds; transient query failures and active members stay within one bounded
+cleanup attempt and the existing local retry worker. Historical completion notifications, cumulative counts and
+descendant process handles do not gate the next Run. Native terminal settlement remains separate from resource cleanup.
+
+Windows Runtime Search Environment 每次 capture/rescan 都按 inherited process PATH、HKCU User PATH、HKLM Machine
+PATH、known locations 的稳定顺序生成新快照；Registry 只读失败不会阻断 inherited PATH，环境变量展开、目录存在性
+过滤与路径去重都在快照建立前完成。同一目录严格按 `.exe → .cmd → .bat`，不同目录保持来源原顺序；手动绝对路径与
+Adapter override 是 terminal candidate set，失败时不回退另一个同名 Runtime。Codex 的已知 npm/pnpm `codex.cmd`
+仅可被有界解析为 `@openai/codex` 的 Windows x64 platform package 中真实 `codex.exe` 的定位证据；解析成功后
+`.cmd`、`node.exe` 与 Node entrypoint 都不进入 Installation/launch identity。其他 bounded `.cmd/.bat` 保持明确的
+`windows_command_shim` identity，不伪装成 native executable。
+
+Electron→Core stdin/stdout RPC remains. Main force-kill acceptance must prove Core observes EOF or a parent handle,
+executes bounded shutdown and closes every Runtime Job. Process exit and Job cleanup never invent a Provider terminal;
+Planned Shutdown and accepted-input recovery keep that authority.
+
+## 4. Local IPC
+
+[Built-in Tool Transport v20](../contracts/builtin-tool-transport-v20.md) inherits v19 and v14's one discriminated endpoint. Windows Pipe
+instances are private at creation, byte-mode, local-only and authenticated again by process/lease tokens. The listener
+creates the next secured instance before dispatching the connected one; inability to replenish closes admission.
+
+The macOS Unix Socket implementation uses the same IPC v2 wire under v20. Router, receipt and replay remain
+transport-independent.
+
+## 5. Storage and filesystem
+
+[Windows Private Storage v2](../contracts/windows-private-storage-v2.md) places Core and Electron state under separate
+`%LOCALAPPDATA%\Rovai AI` children. Private objects are created with a protected DACL before becoming visible. Opened
+handle identity, verified ancestry and reparse policy—not lowercase strings—own security and deduplication.
+
+MCP 管理初始化按[外部 MCP 配置边界](foundational-invariants.md#skills-external-mcp)默认准备权限：首次创建前
+收紧当前用户拥有的既有父目录；加载格式有效的既有配置时可仅修复其父目录与文件 DACL，随后重新检查，
+不改写 JSON。通用私有存储准入仍拒绝未知对象。权限审计使用元数据句柄，读取失败保留为检查失败；
+诊断自检不调用初始化或修复。
+
+The derived legacy Camp Published Attachment View is the explicit `<data_dir>\runtime-files` private child; Windows never
+uses the macOS Home-based instance directory. Root/managed containers use native private-directory admission, and Runtime
+may receive only one current-Camp `attachments` descendant. Existing Authority remains under Core `camp-attachments`;
+new Desktop user attachments instead keep source refs and use current Run Temp only when the source lies outside
+executionRoot. This storage backend does not qualify any Adapter: every `windows-x64` row remains `not_qualified` until
+independent exact-root, read-only, sandbox and lifecycle evidence exists.
+
+All three shipped EXEs embed `longPathAware`; host policy and the tested envelope are diagnostic facts. The installer
+does not change HKLM. Unsupported storage or paths fail with stable blockers before Runtime input.
+
+Legacy/Agent Attachment import opens and verifies each component under the admitted root, rejects reparse escape and copies
+from the same verified handles. It does not apply to new Desktop user source refs. Skill Projection uses the separate
+multi-stage copy contract and does not write ownership markers inside Runtime-visible Skill content.
+
+## 6. Desktop and packaging
+
+Windows startup 的壳层/正式 data-root 分层由
+[Availability-first Runtime](availability-first-runtime.md#windows-shell-storage-boundary)拥有。先用已打包 `rovai.exe`
+的独立原生入口建立私有 Electron bootstrap profile 并获取实例锁，只有 primary 运行完整 Core data-root preparer；正式
+准备失败仍显示壳层，但没有 Core data path。ready 后恢复必须 relaunch 到同一目标 root，不重绑 sessionData，也不创建
+临时 SQLite。两个 helper 都沿用现有 private-storage 原语，不新增可继承 ACL 或 PowerShell 后备路径。
+
+Windows keeps the system frame while hiding its App icon/title strip and native menu-bar presentation. The Renderer projects
+only four fixed top-level menu labels on the rail-colored WCO row; a closed preload/Main request maps each label back to the
+existing Electron application-menu role and opens that native submenu. Submenu commands and accelerators remain Electron-owned.
+Renderer reuses its controlled drag regions and shortens only the Windows sidebar's top spacer from 38px to 8px; it does not
+fork page structure or content. Snap Layout, Alt+Space, double-click maximize/restore, native window buttons and multi-monitor
+DPI remain OS-owned. Preload's platform projection is presentation-only and does not decide Core security.
+
+Windows Main separately owns the main-window close controller and native Tray. Its local preference is independent of Host/Web
+and Core state. Renderer only projects a revisioned snapshot and submits a choice for the current prompt identity; tray creation,
+hide/show and explicit quit remain Main operations. A hide preserves the live BrowserWindow and all background services;
+explicit quit/update invalidates pending hide work and joins in-flight preference writes before the existing Renderer preparation
+and Core drain. The narrow capability is absent outside Windows. See [Windows Window Close v1](../contracts/windows-window-close-v1.md).
+
+Packaging stages `rovai-core.exe` and `rovai.exe` per target without sharing dirty sidecar output with macOS. Formal
+release separately Authenticode-signs Electron EXE, both sidecars and installer with SHA-256/RFC 3161 timestamp; the
+verifier checks PE x64, manifests, signer allowlist for that release, timestamp, resources and hashes. SmartScreen
+reputation is reported separately from signature validity.
+
+Upgrade first requests App closure and completes planned shutdown before replacing a locked sidecar. New and old Core
+must not run concurrently. Schema-incompatible downgrade is blocked explicitly.
+
+## 7. UI and acceptance
+
+[Windows Interaction Delta](../ui/windows-interaction-delta.md) owns cross-platform presentation differences without
+creating a second product surface. Automated checks cover contracts and DOM behavior; real Windows 10/11 acceptance owns
+native submenu/controls, DPI, High Contrast/Forced Colors, NVDA, IME, Explorer, installer, SmartScreen and upgrade behavior.
+
+CI uses a fixed Windows Server runner for compile/package evidence and never presents it as Windows 10/11 UX evidence.
+Signed release qualification requires real Windows 10 22H2 and Windows 11 machines or equivalent managed images.
+
+## References
+
+- [v1.05 overview](../versions/v1.05/README.md)
+- [Runtime 平台安全不变量](foundational-invariants.md#runtime-platform-security)
+- [Runtime 平台安全不变量](foundational-invariants.md#runtime-platform-security)
+- [Built-in 运输不变量](foundational-invariants.md#skills-builtin-transport)
+- [Runtime 平台安全不变量](foundational-invariants.md#runtime-platform-security)
+- [Skill Library 与投影不变量](foundational-invariants.md#skills-library-projection)

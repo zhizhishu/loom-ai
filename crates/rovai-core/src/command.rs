@@ -1,0 +1,1237 @@
+use std::{error::Error, fmt, io::Write};
+
+use anyhow::{Context, Result};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::db::Database;
+
+pub(crate) const COMMAND_RESULT_STORAGE_MARKER_JSON: &str =
+    r#"{"_rovaiStorage":"command-result-columns-v1"}"#;
+const COMMAND_RESULT_STORAGE_MARKER: &str = "command-result-columns-v1";
+
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait DomainCommand: sealed::Sealed + Serialize {
+    const TYPE: &'static str;
+    const ALLOWED_WHILE_CAMP_DELETING: bool = false;
+
+    /// Existing private draft commands belong to a Host-verified editor.
+    fn draft_client(&self) -> Option<&crate::draft_client::DraftClient> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActorRef {
+    User {
+        user_id: String,
+    },
+    Agent {
+        agent_id: String,
+        source_agent_run_id: String,
+    },
+    System {
+        component_id: String,
+    },
+}
+
+impl ActorRef {
+    fn actor_type(&self) -> &'static str {
+        match self {
+            Self::User { .. } => "user",
+            Self::Agent { .. } => "agent",
+            Self::System { .. } => "system",
+        }
+    }
+
+    fn actor_id(&self) -> &str {
+        match self {
+            Self::User { user_id } => user_id,
+            Self::Agent { agent_id, .. } => agent_id,
+            Self::System { component_id } => component_id,
+        }
+    }
+
+    fn source_agent_run_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent {
+                source_agent_run_id,
+                ..
+            } => Some(source_agent_run_id),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedVersion {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandEnvelope<P> {
+    pub command_id: String,
+    pub actor: ActorRef,
+    pub camp_id: Option<String>,
+    pub expected_versions: Vec<ExpectedVersion>,
+    pub execution_epoch: Option<i64>,
+    pub payload: P,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityReference {
+    pub entity_type: String,
+    pub entity_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandResultStatus {
+    Applied,
+    Accepted,
+    Rejected,
+}
+
+impl CommandResultStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "applied" => Ok(Self::Applied),
+            "accepted" => Ok(Self::Accepted),
+            "rejected" => Ok(Self::Rejected),
+            _ => anyhow::bail!("unknown persisted command result status: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandHandlerResult {
+    pub status: CommandResultStatus,
+    pub code: String,
+    pub payload: Value,
+    pub result_entity: Option<EntityReference>,
+}
+
+impl CommandHandlerResult {
+    pub fn applied(
+        code: impl Into<String>,
+        payload: Value,
+        result_entity: Option<EntityReference>,
+    ) -> Self {
+        Self {
+            status: CommandResultStatus::Applied,
+            code: code.into(),
+            payload,
+            result_entity,
+        }
+    }
+
+    pub fn rejected(code: impl Into<String>, payload: Value) -> Self {
+        Self {
+            status: CommandResultStatus::Rejected,
+            code: code.into(),
+            payload,
+            result_entity: None,
+        }
+    }
+
+    pub fn accepted(
+        code: impl Into<String>,
+        payload: Value,
+        result_entity: Option<EntityReference>,
+    ) -> Self {
+        Self {
+            status: CommandResultStatus::Accepted,
+            code: code.into(),
+            payload,
+            result_entity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredCommandResult {
+    pub command_id: String,
+    pub command_type: String,
+    pub status: CommandResultStatus,
+    pub code: String,
+    pub payload: Value,
+    pub result_entity: Option<EntityReference>,
+    pub recorded_at: String,
+    #[serde(skip)]
+    actor_type: String,
+    #[serde(skip)]
+    actor_id: String,
+    #[serde(skip)]
+    source_agent_run_id: Option<String>,
+    #[serde(skip)]
+    command_client_id: Option<String>,
+    #[serde(skip)]
+    camp_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandExecution {
+    pub result: StoredCommandResult,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandGatewayError {
+    InvalidEnvelope(String),
+    IdempotencyConflict { command_id: String },
+}
+
+impl fmt::Display for CommandGatewayError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEnvelope(message) => {
+                write!(formatter, "invalid command envelope: {message}")
+            }
+            Self::IdempotencyConflict { command_id } => {
+                write!(formatter, "idempotency_conflict for command {command_id}")
+            }
+        }
+    }
+}
+
+impl Error for CommandGatewayError {}
+
+#[derive(Debug, Default)]
+pub struct DomainCommandGateway;
+
+impl DomainCommandGateway {
+    pub fn replay_if_recorded<C>(
+        &self,
+        database: &Database,
+        envelope: &CommandEnvelope<C>,
+    ) -> Result<Option<CommandExecution>>
+    where
+        C: DomainCommand,
+    {
+        validate_envelope::<C>(envelope)?;
+        load_stored_result(database.connection(), &envelope.command_id)?
+            .map(|result| replay_or_conflict(result, envelope))
+            .transpose()
+    }
+
+    pub fn execute<C, F>(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<C>,
+        handler: F,
+    ) -> Result<CommandExecution>
+    where
+        C: DomainCommand,
+        F: FnOnce(&Transaction<'_>) -> Result<CommandHandlerResult>,
+    {
+        validate_envelope::<C>(envelope)?;
+
+        if let Some(result) = load_stored_result(database.connection(), &envelope.command_id)? {
+            return replay_or_conflict(result, envelope);
+        }
+
+        let message_output = database.message_changes.clone();
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to start domain command transaction")?;
+
+        if let Some(result) = load_stored_result(&transaction, &envelope.command_id)? {
+            transaction.commit()?;
+            return replay_or_conflict(result, envelope);
+        }
+
+        let message_changes =
+            crate::message_changes::MessageChanges::begin(&transaction, message_output);
+        let deletion_in_progress = if C::ALLOWED_WHILE_CAMP_DELETING {
+            false
+        } else if let Some(camp_id) = envelope.camp_id.as_deref() {
+            camp_deletion_in_progress(&transaction, camp_id)?
+        } else {
+            false
+        };
+        let handler_result = if deletion_in_progress {
+            CommandHandlerResult::rejected(
+                "camp.deletion_in_progress",
+                json!({
+                    "campId": envelope.camp_id,
+                    "message": "Camp deletion is already in progress",
+                }),
+            )
+        } else {
+            handler(&transaction)?
+        };
+        let recorded_at = chrono::Utc::now().to_rfc3339();
+        let mut stored_result = StoredCommandResult {
+            command_id: envelope.command_id.clone(),
+            command_type: C::TYPE.to_string(),
+            status: handler_result.status,
+            code: handler_result.code,
+            payload: handler_result.payload,
+            result_entity: handler_result.result_entity,
+            recorded_at,
+            actor_type: envelope.actor.actor_type().to_string(),
+            actor_id: envelope.actor.actor_id().to_string(),
+            source_agent_run_id: envelope.actor.source_agent_run_id().map(str::to_string),
+            command_client_id: envelope
+                .payload
+                .draft_client()
+                .map(|client| client.id().to_owned()),
+            camp_id: envelope.camp_id.clone(),
+        };
+        append_command_result(&transaction, envelope, &stored_result)?;
+        message_changes.commit(transaction)?;
+        if stored_result.status != CommandResultStatus::Rejected {
+            database.execution_wake.command_committed(C::TYPE);
+        }
+        crate::execution_text::request_settlement(database);
+
+        crate::thread_compat::project_command_result(C::TYPE, &mut stored_result.payload)?;
+
+        Ok(CommandExecution {
+            result: stored_result,
+            replayed: false,
+        })
+    }
+}
+
+fn camp_deletion_in_progress(connection: &rusqlite::Connection, camp_id: &str) -> Result<bool> {
+    let column_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('camp') WHERE name='deletion_operation_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !column_exists {
+        return Ok(false);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM camp WHERE id=?1 AND deletion_operation_id IS NOT NULL)",
+        [camp_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn validate_envelope<C>(envelope: &CommandEnvelope<C>) -> Result<()>
+where
+    C: DomainCommand,
+{
+    if C::TYPE.trim().is_empty() {
+        return Err(CommandGatewayError::InvalidEnvelope(
+            "command type must not be empty".to_string(),
+        )
+        .into());
+    }
+    if envelope.command_id.trim().is_empty() {
+        return Err(CommandGatewayError::InvalidEnvelope(
+            "commandId must not be empty".to_string(),
+        )
+        .into());
+    }
+    match (&envelope.actor, envelope.execution_epoch) {
+        (ActorRef::Agent { .. }, None) => Err(CommandGatewayError::InvalidEnvelope(
+            "agent commands require executionEpoch".to_string(),
+        )
+        .into()),
+        (ActorRef::User { .. } | ActorRef::System { .. }, Some(_)) => {
+            Err(CommandGatewayError::InvalidEnvelope(
+                "executionEpoch is only valid for agent commands".to_string(),
+            )
+            .into())
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn canonical_json_digest(value: &Value) -> Result<String> {
+    canonical_json_digest_with(|writer| write_canonical_json(writer, value))
+}
+
+pub(crate) fn canonical_json_digest_with(
+    write: impl FnOnce(&mut dyn Write) -> Result<()>,
+) -> Result<String> {
+    struct DigestWriter<'a>(&'a mut Sha256);
+
+    impl Write for DigestWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut digest = Sha256::new();
+    write(&mut DigestWriter(&mut digest))?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub(crate) fn write_canonical_json(writer: &mut dyn Write, value: &Value) -> Result<()> {
+    match value {
+        Value::Array(values) => {
+            writer.write_all(b"[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    writer.write_all(b",")?;
+                }
+                write_canonical_json(writer, value)?;
+            }
+            writer.write_all(b"]")?;
+        }
+        Value::Object(values) => {
+            writer.write_all(b"{")?;
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    writer.write_all(b",")?;
+                }
+                serde_json::to_writer(&mut *writer, key)
+                    .context("failed to serialize canonical JSON object key")?;
+                writer.write_all(b":")?;
+                write_canonical_json(writer, value)?;
+            }
+            writer.write_all(b"}")?;
+        }
+        scalar => serde_json::to_writer(writer, scalar)
+            .context("failed to serialize canonical JSON scalar")?,
+    }
+    Ok(())
+}
+
+fn replay_or_conflict<C>(
+    mut result: StoredCommandResult,
+    envelope: &CommandEnvelope<C>,
+) -> Result<CommandExecution>
+where
+    C: DomainCommand,
+{
+    // commandId names the first submission. A retry returns that result even
+    // if its payload changed; a new operation must use a new commandId.
+    if result.command_type == C::TYPE
+        && result.actor_type == envelope.actor.actor_type()
+        && result.actor_id == envelope.actor.actor_id()
+        && result.source_agent_run_id.as_deref() == envelope.actor.source_agent_run_id()
+        && result.command_client_id.as_deref().is_none_or(|client_id| {
+            envelope
+                .payload
+                .draft_client()
+                .is_some_and(|client| client.id() == client_id)
+        })
+        && result.camp_id == envelope.camp_id
+    {
+        crate::thread_compat::project_command_result(C::TYPE, &mut result.payload)?;
+        return Ok(CommandExecution {
+            result,
+            replayed: true,
+        });
+    }
+
+    Err(CommandGatewayError::IdempotencyConflict {
+        command_id: result.command_id,
+    }
+    .into())
+}
+
+fn load_stored_result(
+    connection: &rusqlite::Connection,
+    command_id: &str,
+) -> Result<Option<StoredCommandResult>> {
+    let row = connection
+        .query_row(
+            "SELECT command_id, command_type, result_status, result_code, result_payload_json,
+                result_entity_type, result_entity_id, created_at, actor_type, actor_id,
+                source_agent_run_id, camp_id, command_client_id
+         FROM event_log WHERE event_type = 'command.result' AND command_id = ?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            command_id,
+            command_type,
+            status,
+            code,
+            payload,
+            entity_type,
+            entity_id,
+            recorded_at,
+            actor_type,
+            actor_id,
+            source_agent_run_id,
+            camp_id,
+            command_client_id,
+        )| {
+            Ok(StoredCommandResult {
+                command_id,
+                command_type,
+                status: CommandResultStatus::parse(&status)?,
+                code,
+                payload: serde_json::from_str(&payload)
+                    .context("failed to decode persisted command result payload")?,
+                result_entity: entity_type.zip(entity_id).map(|(entity_type, entity_id)| {
+                    EntityReference {
+                        entity_type,
+                        entity_id,
+                    }
+                }),
+                recorded_at,
+                actor_type,
+                actor_id,
+                source_agent_run_id,
+                camp_id,
+                command_client_id,
+            })
+        },
+    )
+    .transpose()
+}
+
+pub(crate) fn project_persisted_command_result_event_payload(
+    payload_json: &str,
+    command_type: Option<&str>,
+    result_status: Option<&str>,
+    result_code: Option<&str>,
+    result_payload_json: Option<&str>,
+    result_entity_type: Option<&str>,
+    result_entity_id: Option<&str>,
+) -> Result<Value> {
+    let stored_payload: Value = serde_json::from_str(payload_json)
+        .context("failed to decode persisted command result event payload")?;
+    let Some(marker) = stored_payload
+        .as_object()
+        .and_then(|object| object.get("_rovaiStorage"))
+    else {
+        return Ok(stored_payload);
+    };
+    let known_marker = stored_payload
+        .as_object()
+        .is_some_and(|object| object.len() == 1)
+        && marker.as_str() == Some(COMMAND_RESULT_STORAGE_MARKER);
+    anyhow::ensure!(
+        known_marker,
+        "unsupported persisted command result storage marker"
+    );
+
+    let command_type = command_type.context("stored command result is missing command_type")?;
+    let status = CommandResultStatus::parse(
+        result_status.context("stored command result is missing result_status")?,
+    )?;
+    let code = result_code.context("stored command result is missing result_code")?;
+    let result: Value = serde_json::from_str(
+        result_payload_json.context("stored command result is missing result_payload_json")?,
+    )
+    .context("failed to decode persisted command result result_payload_json")?;
+    let result_entity = match (result_entity_type, result_entity_id) {
+        (None, None) => None,
+        (Some(entity_type), Some(entity_id)) => Some(EntityReference {
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+        }),
+        _ => anyhow::bail!("stored command result has an incomplete result entity reference"),
+    };
+
+    Ok(json!({
+        "commandType": command_type,
+        "status": status,
+        "code": code,
+        "result": result,
+        "resultEntity": result_entity,
+    }))
+}
+
+fn append_command_result<C>(
+    transaction: &Transaction<'_>,
+    envelope: &CommandEnvelope<C>,
+    result: &StoredCommandResult,
+) -> Result<()>
+where
+    C: DomainCommand,
+{
+    let result_entity_type = result
+        .result_entity
+        .as_ref()
+        .map(|reference| reference.entity_type.as_str());
+    let result_entity_id = result
+        .result_entity
+        .as_ref()
+        .map(|reference| reference.entity_id.as_str());
+    let result_payload_json = serde_json::to_string(&result.payload)?;
+
+    transaction.execute(
+        r#"
+        INSERT INTO event_log(
+            event_id, task_id, turn_id, sequence, event_type, native_method,
+            payload_json, camp_id, entity_type, entity_id, actor_type, actor_id,
+            source_agent_run_id, execution_epoch, command_id, command_type,
+            result_status, result_code,
+            result_payload_json, result_entity_type, result_entity_id, created_at, command_client_id
+        ) VALUES (
+            ?1, NULL, NULL, NULL, 'command.result', NULL,
+            ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18
+        )
+        "#,
+        params![
+            Uuid::new_v4().to_string(),
+            COMMAND_RESULT_STORAGE_MARKER_JSON,
+            envelope.camp_id,
+            result_entity_type,
+            result_entity_id,
+            envelope.actor.actor_type(),
+            envelope.actor.actor_id(),
+            envelope.actor.source_agent_run_id(),
+            envelope.execution_epoch,
+            result.command_id,
+            result.command_type,
+            result.status.as_str(),
+            result.code,
+            result_payload_json,
+            result_entity_type,
+            result_entity_id,
+            result.recorded_at,
+            result.command_client_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Erases a withdrawn command's result content and any historical request
+/// digest. Its command identity and scope remain available for result lookup.
+pub(crate) fn erase_command_result_receipt(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    command_type: &str,
+    actor: &ActorRef,
+    camp_id: &str,
+    message_id: &str,
+) -> Result<()> {
+    let payload = serde_json::to_string(&json!({
+        "messageId": message_id,
+        "status": "withdrawn",
+    }))?;
+    let changed = transaction.execute(
+        r#"
+        UPDATE event_log
+        SET request_digest = NULL,
+            request_digest_version = NULL,
+            result_status = 'applied',
+            result_code = 'message.withdrawn',
+            result_payload_json = ?2,
+            result_entity_type = 'camp_message',
+            result_entity_id = ?3
+        WHERE event_type = 'command.result'
+          AND command_id = ?1
+          AND command_type = ?4
+          AND actor_type = ?5
+          AND actor_id = ?6
+          AND camp_id = ?7
+          AND result_entity_type = 'camp_message'
+          AND result_entity_id = ?3
+        "#,
+        params![
+            command_id,
+            payload,
+            message_id,
+            command_type,
+            actor.actor_type(),
+            actor.actor_id(),
+            camp_id,
+        ],
+    )?;
+    anyhow::ensure!(
+        changed == 1,
+        "publication command receipt is unavailable for erasure"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, path::Path};
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize)]
+    struct TestCommand {
+        payload: Value,
+    }
+
+    impl sealed::Sealed for TestCommand {}
+
+    impl DomainCommand for TestCommand {
+        const TYPE: &'static str = "test.command";
+    }
+
+    fn database() -> (Database, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!("rovai-command-test-{}", Uuid::new_v4()));
+        let database = Database::open(&directory).expect("database should open");
+        (database, directory)
+    }
+
+    fn system_command(command_id: &str, payload: Value) -> CommandEnvelope<TestCommand> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::System {
+                component_id: "command-test".to_string(),
+            },
+            camp_id: None,
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload: TestCommand { payload },
+        }
+    }
+
+    #[test]
+    fn canonical_digest_ignores_json_object_key_order() {
+        let left = system_command("command-1", json!({ "a": 1, "b": { "c": 2, "d": 3 } }));
+        let right = system_command("command-1", json!({ "b": { "d": 3, "c": 2 }, "a": 1 }));
+
+        assert_eq!(
+            canonical_json_digest(&left.payload.payload).unwrap(),
+            canonical_json_digest(&right.payload.payload).unwrap()
+        );
+    }
+
+    #[test]
+    fn command_results_store_one_body_and_replay_all_statuses_without_rerunning_handlers() {
+        let (mut database, directory) = database();
+        let gateway = DomainCommandGateway;
+        for (index, handler_result) in [
+            CommandHandlerResult::applied(
+                "test.applied",
+                json!({ "answer": 42, "text": "完整结果 🧭" }),
+                Some(EntityReference {
+                    entity_type: "test_entity".to_string(),
+                    entity_id: "entity-applied".to_string(),
+                }),
+            ),
+            CommandHandlerResult::accepted(
+                "test.accepted",
+                json!(["queued", { "position": 2 }]),
+                None,
+            ),
+            CommandHandlerResult::rejected("test.rejected", Value::Null),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let command_id = format!("command-{index}");
+            let envelope = system_command(&command_id, json!({ "value": index }));
+            let calls = Cell::new(0);
+            let expected_handler_result = handler_result.clone();
+            let first = gateway
+                .execute(&mut database, &envelope, |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(handler_result)
+                })
+                .expect("first command should persist its result");
+            let replay = gateway
+                .execute(&mut database, &envelope, |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(CommandHandlerResult::rejected("must.not.run", Value::Null))
+                })
+                .expect("duplicate command should replay");
+
+            assert!(!first.replayed);
+            assert!(replay.replayed);
+            assert_eq!(first.result, replay.result);
+            assert_eq!(first.result.recorded_at, replay.result.recorded_at);
+            assert_eq!(calls.get(), 1);
+            let persisted: (
+                String,
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                i64,
+            ) = database
+                .connection()
+                .query_row(
+                    r#"
+                    SELECT payload_json, command_type, result_status, result_code,
+                           result_payload_json, result_entity_type, result_entity_id,
+                           length(CAST(payload_json AS BLOB))
+                               + length(CAST(result_payload_json AS BLOB))
+                    FROM event_log
+                    WHERE event_type = 'command.result' AND command_id = ?1
+                    "#,
+                    [&command_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(persisted.0, COMMAND_RESULT_STORAGE_MARKER_JSON);
+            assert_eq!(
+                serde_json::from_str::<Value>(&persisted.4).unwrap(),
+                expected_handler_result.payload
+            );
+            let projected = project_persisted_command_result_event_payload(
+                &persisted.0,
+                Some(&persisted.1),
+                Some(&persisted.2),
+                Some(&persisted.3),
+                Some(&persisted.4),
+                persisted.5.as_deref(),
+                persisted.6.as_deref(),
+            )
+            .unwrap();
+            assert_eq!(
+                projected,
+                json!({
+                    "commandType": TestCommand::TYPE,
+                    "status": expected_handler_result.status,
+                    "code": expected_handler_result.code,
+                    "result": expected_handler_result.payload,
+                    "resultEntity": expected_handler_result.result_entity,
+                })
+            );
+            assert_eq!(
+                database
+                    .connection()
+                    .query_row(
+                        "SELECT COUNT(*) FROM event_log WHERE command_id = ?1",
+                        [&command_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                persisted.7,
+                COMMAND_RESULT_STORAGE_MARKER_JSON.len() as i64 + persisted.4.len() as i64
+            );
+        }
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn command_result_projection_preserves_json_boundaries_and_fails_closed_on_markers() {
+        let original = json!({
+            "campId": "public-id", "conversationId": "public-id",
+            "userData": { "campId": "literal", "conversationId": "literal" }
+        });
+        let mut automation = original.clone();
+        crate::thread_compat::project_command_result("automation.run", &mut automation).unwrap();
+        assert_eq!(automation["threadId"], "public-id");
+        assert!(automation.get("conversationId").is_none());
+        assert_eq!(automation["userData"], original["userData"]);
+        let mut single_chat = original.clone();
+        crate::thread_compat::project_command_result("single_chat.open", &mut single_chat).unwrap();
+        assert_eq!(single_chat["conversationId"], "public-id");
+        let mut old_automation_view = json!({ "lastRun": { "campId": "public-id" } });
+        crate::thread_compat::project_command_result("automation.update", &mut old_automation_view)
+            .unwrap();
+        assert_eq!(
+            old_automation_view["lastRun"],
+            json!({ "threadId": "public-id" })
+        );
+
+        let large = "大正文🧭".repeat(32 * 1024);
+        for result in [
+            Value::Null,
+            json!({}),
+            json!([]),
+            json!(42),
+            json!(true),
+            json!("Unicode 结果 🧭"),
+            json!({ "nested": [{ "large": large }] }),
+        ] {
+            let result_json = serde_json::to_string(&result).unwrap();
+            let payload = project_persisted_command_result_event_payload(
+                COMMAND_RESULT_STORAGE_MARKER_JSON,
+                Some("test.command"),
+                Some("accepted"),
+                Some("test.accepted"),
+                Some(&result_json),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(payload["result"], result);
+            assert!(payload["resultEntity"].is_null());
+        }
+
+        let old = json!({
+            "commandType": "old.command",
+            "status": "applied",
+            "code": "old.applied",
+            "result": { "kept": true },
+            "resultEntity": null,
+            "historicalExtension": "preserved",
+        });
+        assert_eq!(
+            project_persisted_command_result_event_payload(
+                &old.to_string(),
+                None,
+                None,
+                None,
+                None,
+                Some("ignored"),
+                None,
+            )
+            .unwrap(),
+            old
+        );
+
+        for (payload_json, command_type, status, code, result_json, entity_type, entity_id) in [
+            (
+                r#"{"_rovaiStorage":"command-result-columns-v2"}"#,
+                Some("test.command"),
+                Some("applied"),
+                Some("ok"),
+                Some("null"),
+                None,
+                None,
+            ),
+            (
+                r#"{"_rovaiStorage":"command-result-columns-v1","extra":true}"#,
+                Some("test.command"),
+                Some("applied"),
+                Some("ok"),
+                Some("null"),
+                None,
+                None,
+            ),
+            (
+                COMMAND_RESULT_STORAGE_MARKER_JSON,
+                None,
+                Some("applied"),
+                Some("ok"),
+                Some("null"),
+                None,
+                None,
+            ),
+            (
+                COMMAND_RESULT_STORAGE_MARKER_JSON,
+                Some("test.command"),
+                None,
+                Some("ok"),
+                Some("null"),
+                None,
+                None,
+            ),
+            (
+                COMMAND_RESULT_STORAGE_MARKER_JSON,
+                Some("test.command"),
+                Some("applied"),
+                None,
+                Some("null"),
+                None,
+                None,
+            ),
+            (
+                COMMAND_RESULT_STORAGE_MARKER_JSON,
+                Some("test.command"),
+                Some("applied"),
+                Some("ok"),
+                None,
+                None,
+                None,
+            ),
+            (
+                COMMAND_RESULT_STORAGE_MARKER_JSON,
+                Some("test.command"),
+                Some("unknown"),
+                Some("ok"),
+                Some("null"),
+                None,
+                None,
+            ),
+            (
+                COMMAND_RESULT_STORAGE_MARKER_JSON,
+                Some("test.command"),
+                Some("applied"),
+                Some("ok"),
+                Some("not-json"),
+                None,
+                None,
+            ),
+            (
+                COMMAND_RESULT_STORAGE_MARKER_JSON,
+                Some("test.command"),
+                Some("applied"),
+                Some("ok"),
+                Some("null"),
+                Some("task"),
+                None,
+            ),
+        ] {
+            assert!(
+                project_persisted_command_result_event_payload(
+                    payload_json,
+                    command_type,
+                    status,
+                    code,
+                    result_json,
+                    entity_type,
+                    entity_id,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn committed_results_replay_after_reopen_and_handler_errors_roll_back_atomically() {
+        let (mut database, directory) = database();
+        let gateway = DomainCommandGateway;
+        let (output, mut events) = tokio::sync::mpsc::unbounded_channel();
+        database.message_changes = Some(output.clone());
+        let committed = system_command("command-committed", json!({ "value": 1 }));
+        let first = gateway
+            .execute(&mut database, &committed, |transaction| {
+                transaction.execute("INSERT INTO event_log(event_id,event_type,camp_id,entity_type,entity_id,payload_json,created_at)
+                    VALUES ('message-hint-fixture','camp_message.withdrawn','scope-fixture','camp_message','message-fixture','{}','2026-10-08T00:00:00Z')", [])?;
+                crate::message_changes::record(transaction, "scope-fixture", true, &["message-fixture".into()]);
+                assert!(events.try_recv().is_err(), "uncommitted writes must not emit");
+                Ok(CommandHandlerResult::applied(
+                    "test.persisted",
+                    json!({ "first": true }),
+                    None,
+                ))
+            })
+            .unwrap();
+        let change: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(change["method"], "thread.messages.changed");
+        assert_eq!(change["params"]["threadId"], "scope-fixture");
+        assert_eq!(
+            change["params"]["unavailableMessageIds"],
+            json!(["message-fixture"])
+        );
+        assert!(events.try_recv().is_err());
+        drop(database);
+
+        let mut database = Database::open(&directory).unwrap();
+        database.message_changes = Some(output);
+        let replay = gateway
+            .execute(&mut database, &committed, |_| {
+                unreachable!("a committed command must replay after database reopen")
+            })
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result, first.result);
+        assert!(
+            events.try_recv().is_err(),
+            "replay must not re-emit change hints"
+        );
+
+        let failed = system_command("command-failed", json!({ "value": 2 }));
+        let error = gateway
+            .execute(&mut database, &failed, |transaction| {
+                transaction.execute(
+                    "INSERT INTO event_log(event_id,event_type,camp_id,entity_type,entity_id,payload_json,created_at) VALUES (?1,'camp_message.sent','scope-fixture','camp_message','message-fixture','{}',?2)",
+                    params![Uuid::new_v4().to_string(), chrono::Utc::now().to_rfc3339()],
+                )?;
+                crate::message_changes::record(transaction, "scope-fixture", false, &[]);
+                anyhow::bail!("handler fixture failure")
+            })
+            .expect_err("handler failure must abort the transaction");
+        assert!(error.to_string().contains("handler fixture failure"));
+        let remaining: (i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM event_log WHERE command_id='command-failed'),
+                    (SELECT COUNT(*) FROM event_log WHERE event_type='camp_message.sent')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(remaining, (0, 0));
+        assert!(
+            events.try_recv().is_err(),
+            "rolled-back writes must not emit change hints"
+        );
+
+        // A successful handler is insufficient: receipt/commit failure must discard hints too.
+        database
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_hint_receipt BEFORE INSERT ON event_log
+            WHEN NEW.command_id='receipt-failed' BEGIN SELECT RAISE(ABORT,'receipt failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            gateway
+                .execute(
+                    &mut database,
+                    &system_command("receipt-failed", json!({})),
+                    |transaction| {
+                        crate::message_changes::record(
+                            transaction,
+                            "scope-fixture",
+                            true,
+                            &["not-committed".into()],
+                        );
+                        Ok(CommandHandlerResult::applied("fixture", json!({}), None))
+                    }
+                )
+                .is_err()
+        );
+        assert!(events.try_recv().is_err());
+        database
+            .connection()
+            .execute_batch("DROP TRIGGER reject_hint_receipt")
+            .unwrap();
+
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        database
+            .connection()
+            .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::Read {
+                    table_name: "camp_message" | "event_sequence",
+                    ..
+                } if context.accessor.is_none() => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))
+            .unwrap();
+        gateway
+            .execute(
+                &mut database,
+                &system_command("unrelated-command", json!({})),
+                |_| Ok(CommandHandlerResult::applied("unrelated", json!({}), None)),
+            )
+            .unwrap();
+        assert!(events.try_recv().is_err());
+        database
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn replay_lookup_returns_the_persisted_result_without_opening_a_write_transaction() {
+        let (mut database, directory) = database();
+        let gateway = DomainCommandGateway;
+        let envelope = system_command("command-lookup", json!({ "value": 42 }));
+
+        assert!(
+            gateway
+                .replay_if_recorded(&database, &envelope)
+                .unwrap()
+                .is_none()
+        );
+        gateway
+            .execute(&mut database, &envelope, |_| {
+                Ok(CommandHandlerResult::accepted(
+                    "test.accepted",
+                    json!({ "answer": 42 }),
+                    None,
+                ))
+            })
+            .unwrap();
+
+        let replay = gateway
+            .replay_if_recorded(&database, &envelope)
+            .unwrap()
+            .expect("persisted result should be found");
+        assert!(replay.replayed);
+        assert_eq!(replay.result.code, "test.accepted");
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn command_identity_replays_the_first_result_and_rejects_a_different_scope() {
+        let (mut database, directory) = database();
+        let gateway = DomainCommandGateway;
+        let first = system_command("command-1", json!({ "value": 1 }));
+        gateway
+            .execute(&mut database, &first, |_| {
+                Ok(CommandHandlerResult::applied(
+                    "test.applied",
+                    json!({ "value": 1 }),
+                    None,
+                ))
+            })
+            .unwrap();
+
+        let changed = system_command("command-1", json!({ "value": 2 }));
+        let replay = gateway
+            .execute(&mut database, &changed, |_| {
+                unreachable!("a repeated command ID must not run again")
+            })
+            .expect("same command identity should replay its first result");
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload, json!({ "value": 1 }));
+        let mut other_actor = changed.clone();
+        other_actor.actor = ActorRef::System {
+            component_id: "another-actor".to_string(),
+        };
+        let error = gateway
+            .replay_if_recorded(&database, &other_actor)
+            .expect_err("an ID belonging to another actor must not replay");
+        assert!(matches!(
+            error.downcast_ref::<CommandGatewayError>(),
+            Some(CommandGatewayError::IdempotencyConflict { command_id })
+                if command_id == "command-1"
+        ));
+
+        drop(database);
+        std::fs::remove_dir_all(Path::new(&directory))
+            .expect("temporary database should be removable");
+    }
+}

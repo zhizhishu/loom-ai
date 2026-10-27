@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "gate": "server_os",
+  "runtimeQualification": false,
+  "sourceCommit": "a5f25ba00e8866dbbf4d13d3733a610399eacbe8",
+  "packageManifestSha256": "b8bb92f16c3dbe7c87ac9dc0a238dc45858265f7b9cf99e4b7afe9e5c9a5a652",
+  "platform": "Linux-6.1.0-53-cloud-amd64-x86_64-with-glibc2.36",
+  "libc": [
+    "glibc",
+    "2.36"
+  ],
+  "osRelease": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nVERSION_ID=\"12\"\nVERSION=\"12 (bookworm)\"\nVERSION_CODENAME=bookworm\nID=debian\nHOME_URL=\"https://www.debian.org/\"\nSUPPORT_URL=\"https://www.debian.org/support\"\nBUG_REPORT_URL=\"https://bugs.debian.org/\"\n",
+  "checks": [
+    "package_hashes",
+    "web_ui",
+    "authentication",
+    "authenticated_read_write",
+    "no_node_electron_or_rust_on_host_path",
+    "exclusive_data_root",
+    "durable_sigterm",
+    "restart",
+    "persisted_data",
+    "persisted_session",
+    "persisted_token"
+  ],
+  "status": "passed"
+}

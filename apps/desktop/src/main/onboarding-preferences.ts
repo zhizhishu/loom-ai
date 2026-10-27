@@ -1,0 +1,695 @@
+import { isInterfaceLanguage } from '../shared/general-preferences-model'
+import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { isThreadId } from '@contracts'
+import type {
+  AdapterPermissionConfig,
+  InterfaceLanguage,
+  AdapterKind,
+  BuiltinMemberAvatarRole,
+  ModelSelection,
+  OnboardingProvisioningOperation,
+  OnboardingRuntimeSelection,
+  OnboardingRuntimeCopy,
+  OnboardingRuntimeCopyTarget,
+  OnboardingSnapshot,
+  OnboardingStep,
+  StructuredError
+} from '@contracts'
+import { writePrivateJson } from './general-preferences'
+
+const MEMBER_ROLES = new Set<BuiltinMemberAvatarRole>(['luoke', 'muwa', 'mianzhi', 'qilu'])
+const ADAPTER_KINDS = new Set<AdapterKind>([
+  'codex-cli',
+  'pi',
+  'opencode-cli',
+  'copilot-cli',
+  'claude-code-cli',
+  'kiro-cli',
+  'qoder-cli',
+  'codebuddy-cli',
+  'qwen-code',
+  'trae-cn-cli',
+  'cursor-agent',
+  'kimi-code-cli',
+  'minimax-code-cli',
+  'hermes-cli',
+  'grok-build',
+  'deepseek-harness',
+  'zcode-app',
+  'antigravity-app'
+])
+const STEPS = new Set<OnboardingStep>(['welcome', 'member', 'runtime'])
+const STABLE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/
+const MAX_MODEL_OPTIONS_BYTES = 16_384
+
+export const DEFAULT_ONBOARDING_SNAPSHOT: OnboardingSnapshot = {
+  schemaVersion: 4,
+  status: 'uninitialized'
+}
+
+export function parseOnboardingSnapshot(value: unknown, legacyLanguage: InterfaceLanguage = 'zh-CN'): OnboardingSnapshot | null {
+  if (
+    !isRecord(value)
+    || (value.schemaVersion !== 1 && value.schemaVersion !== 2 && value.schemaVersion !== 3 && value.schemaVersion !== 4)
+    || typeof value.status !== 'string'
+  ) return null
+  value = normalizeQuickChatId(value)
+  if (!isRecord(value)) return null
+  const sourceSchemaVersion = value.schemaVersion
+  if (value.status === 'uninitialized') {
+    return hasExactKeys(value, ['schemaVersion', 'status'])
+      ? { ...DEFAULT_ONBOARDING_SNAPSHOT }
+      : null
+  }
+  if (value.status === 'in_progress') {
+    if (!hasExactKeys(value, [
+      'schemaVersion',
+      'status',
+      'step',
+      'selectedMemberRole',
+      'runtimeSelection',
+      'provisioning'
+    ])) return null
+    if (typeof value.step !== 'string' || !STEPS.has(value.step as OnboardingStep)) return null
+    const selectedMemberRole = value.selectedMemberRole === null
+      ? null
+      : isMemberRole(value.selectedMemberRole) ? value.selectedMemberRole : undefined
+    if (selectedMemberRole === undefined) return null
+    const runtimeSelection = value.runtimeSelection === null
+      ? null
+      : parseRuntimeSelection(value.runtimeSelection)
+    if (value.runtimeSelection !== null && runtimeSelection === null) return null
+    const provisioning = value.provisioning === null
+      ? null
+      : parseProvisioning(value.provisioning, sourceSchemaVersion as number, legacyLanguage)
+    if (value.provisioning !== null && provisioning === null) return null
+    if (value.step === 'runtime' && selectedMemberRole === null) return null
+    if (provisioning && (
+      value.step !== 'runtime'
+      || !runtimeSelection?.model
+      || provisioning.runtimePermissions.adapterKind !== runtimeSelection.adapterKind
+    )) return null
+    return {
+      schemaVersion: 4,
+      status: 'in_progress',
+      step: value.step as OnboardingStep,
+      selectedMemberRole,
+      runtimeSelection,
+      provisioning
+    }
+  }
+  if (value.status === 'completed') {
+    if (!hasExactKeys(value, [
+      'schemaVersion',
+      'status',
+      'origin',
+      'completedAt',
+      'selectedMemberRole',
+      'memberAgentId',
+      'quickChatThreadId'
+    ])) return null
+    if (
+      value.origin !== 'onboarding'
+      && value.origin !== 'runtime_deferred'
+      && value.origin !== 'existing_installation'
+    ) return null
+    if (value.origin === 'runtime_deferred' && sourceSchemaVersion === 1) return null
+    if (!isTimestamp(value.completedAt)) return null
+    if (value.selectedMemberRole !== null && !isMemberRole(value.selectedMemberRole)) return null
+    if (value.memberAgentId !== null && !isStableId(value.memberAgentId)) return null
+    if (value.quickChatThreadId !== null && !isThreadId(value.quickChatThreadId)) return null
+    if (value.origin === 'onboarding' && (
+      value.selectedMemberRole === null
+      || value.memberAgentId === null
+      || value.quickChatThreadId === null
+    )) return null
+    if ((value.origin === 'existing_installation' || value.origin === 'runtime_deferred') && (
+      value.selectedMemberRole !== null
+      || value.memberAgentId !== null
+      || value.quickChatThreadId !== null
+    )) return null
+    return {
+      schemaVersion: 4,
+      status: 'completed',
+      origin: value.origin,
+      completedAt: value.completedAt,
+      selectedMemberRole: value.selectedMemberRole,
+      memberAgentId: value.memberAgentId,
+      quickChatThreadId: value.quickChatThreadId
+    }
+  }
+  return null
+}
+
+export async function readOnboardingSnapshot(filePath: string): Promise<OnboardingSnapshot> {
+  return (await readOnboardingSnapshotResult(filePath)).snapshot
+}
+
+async function readOnboardingSnapshotResult(filePath: string, legacyLanguage: InterfaceLanguage = 'zh-CN'): Promise<{
+  snapshot: OnboardingSnapshot
+  degradation: StructuredError | null
+}> {
+  try {
+    const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown
+    const snapshot = parseOnboardingSnapshot(parsed, legacyLanguage)
+    return snapshot
+      ? { snapshot, degradation: null }
+      : {
+          snapshot: { ...DEFAULT_ONBOARDING_SNAPSHOT },
+          degradation: onboardingDegradation(
+            'onboarding_preferences_invalid',
+            'Onboarding preferences are invalid; in-memory defaults are active and the original file was not changed.'
+          )
+        }
+  } catch (error) {
+    return {
+      snapshot: { ...DEFAULT_ONBOARDING_SNAPSHOT },
+      degradation: isMissingPathError(error)
+        ? null
+        : onboardingDegradation(
+            'onboarding_preferences_unreadable',
+            'Onboarding preferences could not be read; in-memory defaults are active and the original file was not changed.'
+          )
+    }
+  }
+}
+
+export class OnboardingStore {
+  readonly #filePath: string
+  #snapshot: OnboardingSnapshot
+  readonly loadDegradation: StructuredError | null
+  #writeTail: Promise<void> = Promise.resolve()
+
+  private constructor(
+    filePath: string,
+    snapshot: OnboardingSnapshot,
+    loadDegradation: StructuredError | null = null
+  ) {
+    this.#filePath = filePath
+    this.#snapshot = snapshot
+    this.loadDegradation = loadDegradation
+  }
+
+  static async load(filePath: string, legacyLanguage: InterfaceLanguage = 'zh-CN'): Promise<OnboardingStore> {
+    const result = await readOnboardingSnapshotResult(filePath, legacyLanguage)
+    return new OnboardingStore(filePath, result.snapshot, result.degradation)
+  }
+
+  static defaults(filePath: string): OnboardingStore {
+    return new OnboardingStore(filePath, { ...DEFAULT_ONBOARDING_SNAPSHOT })
+  }
+
+  get(): OnboardingSnapshot {
+    return structuredClone(this.#snapshot)
+  }
+
+  async getAfterPendingWrites(): Promise<OnboardingSnapshot> {
+    // The first Renderer read can arrive while authority classification is being persisted.
+    await this.#writeTail
+    return this.get()
+  }
+
+  initialize(
+    hasExistingProductData: boolean,
+    options: { persist?: boolean } = {}
+  ): Promise<OnboardingSnapshot> {
+    return this.#enqueue(async () => {
+      if (this.#snapshot.status !== 'uninitialized') return this.get()
+      const next: OnboardingSnapshot = hasExistingProductData
+        ? {
+            schemaVersion: 4,
+            status: 'completed',
+            origin: 'existing_installation',
+            completedAt: new Date().toISOString(),
+            selectedMemberRole: null,
+            memberAgentId: null,
+            quickChatThreadId: null
+          }
+        : inProgress('welcome')
+      if (options.persist === false) {
+        this.#snapshot = next
+        return this.get()
+      }
+      return this.#commit(next)
+    })
+  }
+
+  showWelcome(): Promise<OnboardingSnapshot> {
+    return this.#mutateInProgress((current) => {
+      if (current.provisioning) throw new Error('首次引导初始化已经开始，不能返回欢迎页')
+      if (current.step === 'welcome') return current
+      if (current.step !== 'member') throw new Error('请先返回队员选择页')
+      return { ...current, step: 'welcome' }
+    })
+  }
+
+  completeWelcome(): Promise<OnboardingSnapshot> {
+    return this.#mutateInProgress((current) => {
+      if (current.step === 'member') return current
+      if (current.step !== 'welcome') throw new Error('欢迎页已经完成')
+      return {
+        ...current,
+        step: 'member',
+        selectedMemberRole: current.selectedMemberRole ?? 'luoke'
+      }
+    })
+  }
+
+  selectMember(role: unknown): Promise<OnboardingSnapshot> {
+    if (!isMemberRole(role)) return Promise.reject(new Error('Unsupported onboarding member role'))
+    return this.#mutateInProgress((current) => {
+      if (current.provisioning) throw new Error('首次引导初始化已经开始，不能更换队员')
+      if (current.step !== 'member') throw new Error('当前不在队员选择页')
+      const changed = current.selectedMemberRole !== role
+      return {
+        ...current,
+        selectedMemberRole: role,
+        runtimeSelection: changed ? null : current.runtimeSelection
+      }
+    })
+  }
+
+  showMemberSelection(): Promise<OnboardingSnapshot> {
+    return this.#mutateInProgress((current) => {
+      if (current.provisioning) throw new Error('首次引导初始化已经开始，不能返回队员选择')
+      if (current.step === 'member') return current
+      if (current.step !== 'runtime') throw new Error('请先完成欢迎页')
+      return { ...current, step: 'member' }
+    })
+  }
+
+  completeMemberSelection(): Promise<OnboardingSnapshot> {
+    return this.#mutateInProgress((current) => {
+      if (current.step === 'runtime') return current
+      if (current.step !== 'member') throw new Error('请先完成欢迎页')
+      if (!current.selectedMemberRole) throw new Error('请先选择一位队员')
+      return { ...current, step: 'runtime' }
+    })
+  }
+
+  setRuntimeSelection(selection: unknown): Promise<OnboardingSnapshot> {
+    const parsed = selection === null ? null : parseRuntimeSelection(selection)
+    if (selection !== null && !parsed) return Promise.reject(new Error('Invalid onboarding Runtime selection'))
+    return this.#mutateInProgress((current) => {
+      if (current.step !== 'runtime') throw new Error('当前不在智能体配置页')
+      if (current.provisioning) throw new Error('首次引导初始化已经开始，不能修改运行配置')
+      return { ...current, runtimeSelection: parsed }
+    })
+  }
+
+  deferRuntimeSetup(): Promise<OnboardingSnapshot> {
+    return this.#enqueue(async () => {
+      const current = requireInProgress(this.#snapshot)
+      if (current.step !== 'runtime') {
+        throw new Error('当前不在智能体配置页')
+      }
+      if (current.provisioning) {
+        throw new Error('首次引导初始化已经开始，不能跳过运行配置')
+      }
+      return this.#commit({
+        schemaVersion: 4,
+        status: 'completed',
+        origin: 'runtime_deferred',
+        completedAt: new Date().toISOString(),
+        selectedMemberRole: null,
+        memberAgentId: null,
+        quickChatThreadId: null
+      })
+    })
+  }
+
+  beginProvisioning(
+    selection: unknown,
+    runtimePermissions: unknown,
+    interfaceLanguage: InterfaceLanguage = 'zh-CN'
+  ): Promise<OnboardingSnapshot> {
+    if (!isInterfaceLanguage(interfaceLanguage)) return Promise.reject(new Error('Unsupported onboarding language'))
+    const parsed = parseRuntimeSelection(selection)
+    if (!parsed?.model) return Promise.reject(new Error('请先完成智能体与模型配置'))
+    const parsedPermissions = parseRuntimePermissions(runtimePermissions)
+    if (!parsedPermissions || parsedPermissions.adapterKind !== parsed.adapterKind) {
+      return Promise.reject(new Error('智能体默认权限与当前选择不匹配'))
+    }
+    return this.#mutateInProgress((current) => {
+      if (current.step !== 'runtime' || !current.selectedMemberRole) {
+        throw new Error('首次引导还没有准备好初始化')
+      }
+      if (current.provisioning) {
+        if (
+          JSON.stringify(current.runtimeSelection) !== JSON.stringify(parsed)
+          || JSON.stringify(current.provisioning.runtimePermissions)
+            !== JSON.stringify(parsedPermissions)
+        ) {
+          throw new Error('首次引导初始化已经开始，请重试当前配置')
+        }
+        return current
+      }
+      return {
+        ...current,
+        runtimeSelection: parsed,
+        provisioning: {
+          interfaceLanguage,
+          memberCommandId: randomUUID(),
+          runtimeCommandId: randomUUID(),
+          campCommandId: randomUUID(),
+          runtimePermissions: parsedPermissions,
+          memberAgentId: null,
+          memberVersionBeforeRuntime: null,
+          memberVersionAfterRuntime: null,
+          runtimeCopies: null,
+          quickChatThreadId: null
+        }
+      }
+    })
+  }
+
+  recordProvisionedMember(agentId: unknown, version: unknown): Promise<OnboardingSnapshot> {
+    if (!isStableId(agentId) || !isPositiveVersion(version)) {
+      return Promise.reject(new Error('Invalid provisioned member checkpoint'))
+    }
+    return this.#mutateProvisioning((operation) => {
+      if (operation.memberAgentId && (
+        operation.memberAgentId !== agentId
+        || operation.memberVersionBeforeRuntime !== version
+      )) throw new Error('首次引导队员检查点不一致')
+      return {
+        ...operation,
+        memberAgentId: agentId,
+        memberVersionBeforeRuntime: version
+      }
+    })
+  }
+
+  recordProvisionedRuntime(version: unknown): Promise<OnboardingSnapshot> {
+    if (!isPositiveVersion(version)) return Promise.reject(new Error('Invalid Runtime checkpoint'))
+    return this.#mutateProvisioning((operation) => {
+      if (!operation.memberAgentId || operation.memberVersionBeforeRuntime === null) {
+        throw new Error('首次引导队员尚未创建')
+      }
+      if (operation.memberVersionAfterRuntime !== null && operation.memberVersionAfterRuntime !== version) {
+        throw new Error('首次引导 Runtime 检查点不一致')
+      }
+      return { ...operation, memberVersionAfterRuntime: version }
+    })
+  }
+
+  recordProvisionedThread(threadId: unknown): Promise<OnboardingSnapshot> {
+    if (!isThreadId(threadId)) return Promise.reject(new Error('Invalid provisioned Thread checkpoint'))
+    return this.#mutateProvisioning((operation) => {
+      if (operation.memberVersionAfterRuntime === null) {
+        throw new Error('首次引导 Runtime 尚未保存')
+      }
+      if (operation.runtimeCopies === null || operation.runtimeCopies.some((target) => target.status === 'pending')) {
+        throw new Error('首次引导初始化尚未完成')
+      }
+      if (operation.quickChatThreadId && operation.quickChatThreadId !== threadId) {
+        throw new Error('首次引导快速对话检查点不一致')
+      }
+      return { ...operation, quickChatThreadId: threadId }
+    })
+  }
+
+  prepareRuntimeCopies(targets: unknown): Promise<OnboardingSnapshot> {
+    const parsed = parseRuntimeCopyTargets(targets)
+    if (!parsed) return Promise.reject(new Error('Invalid onboarding Runtime copy targets'))
+    return this.#mutateProvisioning((operation) => {
+      if (operation.memberVersionAfterRuntime === null) throw new Error('首次引导 Runtime 尚未保存')
+      // First durable plan wins, including after a lost checkpoint reply.
+      if (operation.runtimeCopies !== null) return operation
+      if (parsed.some((target) => target.agentId === operation.memberAgentId)) {
+        throw new Error('Invalid onboarding Runtime copy targets')
+      }
+      return {
+        ...operation,
+        runtimeCopies: parsed.map((target) => ({ ...target, commandId: randomUUID(), status: 'pending' }))
+      }
+    })
+  }
+
+  recordRuntimeCopy(agentId: unknown, commandId: unknown, outcome: unknown): Promise<OnboardingSnapshot> {
+    if (!isStableId(agentId) || !isUuid(commandId) || !['applied', 'skipped', 'retry'].includes(outcome as string)) {
+      return Promise.reject(new Error('Invalid onboarding Runtime copy checkpoint'))
+    }
+    return this.#mutateProvisioning((operation) => {
+      const target = operation.runtimeCopies?.find((candidate) => candidate.agentId === agentId)
+      if (!target) throw new Error('Invalid onboarding Runtime copy checkpoint')
+      // An old response cannot settle or rotate a newer attempt.
+      if (target.commandId !== commandId) return operation
+      if (target.status !== 'pending') {
+        if (target.status !== outcome) throw new Error('Invalid onboarding Runtime copy checkpoint')
+        return operation
+      }
+      return {
+        ...operation,
+        runtimeCopies: operation.runtimeCopies!.map((candidate) => candidate !== target ? candidate
+          : outcome === 'retry'
+            ? { ...target, commandId: randomUUID() }
+            : { ...target, status: outcome as 'applied' | 'skipped' })
+      }
+    })
+  }
+
+  complete(): Promise<OnboardingSnapshot> {
+    return this.#enqueue(async () => {
+      const current = requireInProgress(this.#snapshot)
+      const operation = current.provisioning
+      if (
+        !current.selectedMemberRole
+        || !operation?.memberAgentId
+        || operation.memberVersionAfterRuntime === null
+        || !operation.quickChatThreadId
+        || operation.runtimeCopies === null
+        || operation.runtimeCopies.some((target) => target.status === 'pending')
+      ) throw new Error('首次引导初始化尚未完成')
+      return this.#commit({
+        schemaVersion: 4,
+        status: 'completed',
+        origin: 'onboarding',
+        completedAt: new Date().toISOString(),
+        selectedMemberRole: current.selectedMemberRole,
+        memberAgentId: operation.memberAgentId,
+        quickChatThreadId: operation.quickChatThreadId
+      })
+    })
+  }
+
+  #mutateInProgress(
+    mutate: (current: Extract<OnboardingSnapshot, { status: 'in_progress' }>) => Extract<OnboardingSnapshot, { status: 'in_progress' }>
+  ): Promise<OnboardingSnapshot> {
+    return this.#enqueue(async () => this.#commit(mutate(requireInProgress(this.#snapshot))))
+  }
+
+  #mutateProvisioning(
+    mutate: (operation: OnboardingProvisioningOperation) => OnboardingProvisioningOperation
+  ): Promise<OnboardingSnapshot> {
+    return this.#mutateInProgress((current) => {
+      if (!current.provisioning) throw new Error('首次引导初始化尚未开始')
+      return { ...current, provisioning: mutate(current.provisioning) }
+    })
+  }
+
+  async #commit(next: OnboardingSnapshot): Promise<OnboardingSnapshot> {
+    await writePrivateJson(this.#filePath, next)
+    this.#snapshot = next
+    return this.get()
+  }
+
+  #enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#writeTail.then(operation, operation)
+    this.#writeTail = result.then(() => undefined, () => undefined)
+    return result
+  }
+}
+
+function parseRuntimeCopyTargets(value: unknown): OnboardingRuntimeCopyTarget[] | null {
+  if (!Array.isArray(value) || value.length > 3) return null
+  const targets: OnboardingRuntimeCopyTarget[] = []
+  for (const target of value) {
+    if (!hasExactKeys(target, ['agentId', 'expectedVersion'])
+      || !isStableId(target.agentId) || !isPositiveVersion(target.expectedVersion)
+      || targets.some((existing) => existing.agentId === target.agentId)) return null
+    targets.push({ agentId: target.agentId, expectedVersion: target.expectedVersion })
+  }
+  return targets
+}
+
+function parseRuntimeCopies(value: unknown): OnboardingRuntimeCopy[] | null {
+  if (!Array.isArray(value)) return null
+  const copies: OnboardingRuntimeCopy[] = []
+  for (const target of value) {
+    if (!hasExactKeys(target, ['agentId', 'expectedVersion', 'commandId', 'status'])
+      || !isUuid(target.commandId)
+      || !['pending', 'applied', 'skipped'].includes(target.status as string)
+      || copies.some((existing) => existing.commandId === target.commandId)) return null
+    copies.push(target as unknown as OnboardingRuntimeCopy)
+  }
+  if (!parseRuntimeCopyTargets(copies.map(({ agentId, expectedVersion }) => ({ agentId, expectedVersion })))) return null
+  return copies
+}
+
+function onboardingDegradation(code: string, message: string): StructuredError {
+  return { code, message, retryable: true, details: {} }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return error instanceof Error
+    && 'code' in error
+    && (error as NodeJS.ErrnoException).code === 'ENOENT'
+}
+
+function inProgress(step: OnboardingStep): Extract<OnboardingSnapshot, { status: 'in_progress' }> {
+  return {
+    schemaVersion: 4,
+    status: 'in_progress',
+    step,
+    selectedMemberRole: null,
+    runtimeSelection: null,
+    provisioning: null
+  }
+}
+
+function requireInProgress(
+  snapshot: OnboardingSnapshot
+): Extract<OnboardingSnapshot, { status: 'in_progress' }> {
+  if (snapshot.status !== 'in_progress') throw new Error('首次引导当前不可修改')
+  return snapshot
+}
+
+function parseRuntimeSelection(value: unknown): OnboardingRuntimeSelection | null {
+  if (!hasExactKeys(value, ['adapterKind', 'model'])) return null
+  if (typeof value.adapterKind !== 'string' || !ADAPTER_KINDS.has(value.adapterKind as AdapterKind)) return null
+  const model = value.model === null ? null : parseModelSelection(value.model)
+  if (value.model !== null && model === null) return null
+  return { adapterKind: value.adapterKind as AdapterKind, model }
+}
+
+function parseModelSelection(value: unknown): ModelSelection | null {
+  if (!isRecord(value) || typeof value.mode !== 'string') return null
+  if (value.mode === 'runtime_default') {
+    return hasExactKeys(value, ['mode']) ? { mode: 'runtime_default' } : null
+  }
+  if (value.mode !== 'explicit' || !hasExactKeys(value, ['mode', 'modelId', 'options'])) return null
+  if (typeof value.modelId !== 'string' || value.modelId.length < 1 || value.modelId.length > 256) return null
+  const options = normalizedJsonObject(value.options)
+  if (!options) return null
+  if (Buffer.byteLength(JSON.stringify(options), 'utf8') > MAX_MODEL_OPTIONS_BYTES) return null
+  return {
+    mode: 'explicit',
+    modelId: value.modelId,
+    options
+  }
+}
+
+function parseProvisioning(value: unknown, schemaVersion: number, legacyLanguage: InterfaceLanguage): OnboardingProvisioningOperation | null {
+  value = normalizeQuickChatId(value)
+  if (!hasExactKeys(value, [
+    'memberCommandId',
+    'runtimeCommandId',
+    'campCommandId',
+    'runtimePermissions',
+    'memberAgentId',
+    'memberVersionBeforeRuntime',
+    'memberVersionAfterRuntime',
+    'quickChatThreadId',
+    ...(schemaVersion >= 3 ? ['runtimeCopies'] : []),
+    ...(schemaVersion === 4 ? ['interfaceLanguage'] : [])
+  ])) return null
+  if (schemaVersion === 4 && !isInterfaceLanguage(value.interfaceLanguage)) return null
+  if (!isUuid(value.memberCommandId) || !isUuid(value.runtimeCommandId) || !isUuid(value.campCommandId)) return null
+  const runtimePermissions = parseRuntimePermissions(value.runtimePermissions)
+  if (!runtimePermissions) return null
+  if (value.memberAgentId !== null && !isStableId(value.memberAgentId)) return null
+  if (value.memberVersionBeforeRuntime !== null && !isPositiveVersion(value.memberVersionBeforeRuntime)) return null
+  if (value.memberVersionAfterRuntime !== null && !isPositiveVersion(value.memberVersionAfterRuntime)) return null
+  if (value.quickChatThreadId !== null && !isThreadId(value.quickChatThreadId)) return null
+  if ((value.memberAgentId === null) !== (value.memberVersionBeforeRuntime === null)) return null
+  if (value.memberVersionAfterRuntime !== null && value.memberVersionBeforeRuntime === null) return null
+  if (value.quickChatThreadId !== null && value.memberVersionAfterRuntime === null) return null
+  const runtimeCopies = schemaVersion < 3 || value.runtimeCopies === null
+    ? null : parseRuntimeCopies(value.runtimeCopies)
+  if (schemaVersion >= 3 && value.runtimeCopies !== null && runtimeCopies === null) return null
+  if (runtimeCopies !== null && (value.memberVersionAfterRuntime === null
+    || runtimeCopies.some((target) => target.agentId === value.memberAgentId
+      || [value.memberCommandId, value.runtimeCommandId, value.campCommandId].includes(target.commandId)))) return null
+  return {
+    interfaceLanguage: schemaVersion === 4 ? value.interfaceLanguage as InterfaceLanguage : legacyLanguage,
+    memberCommandId: value.memberCommandId,
+    runtimeCommandId: value.runtimeCommandId,
+    campCommandId: value.campCommandId,
+    runtimePermissions,
+    runtimeCopies,
+    memberAgentId: value.memberAgentId,
+    memberVersionBeforeRuntime: value.memberVersionBeforeRuntime,
+    memberVersionAfterRuntime: value.memberVersionAfterRuntime,
+    quickChatThreadId: value.quickChatThreadId
+  }
+}
+
+// Accept an existing checkpoint without resetting onboarding. Mixed spellings are invalid.
+function normalizeQuickChatId(value: unknown): unknown {
+  if (!isRecord(value) || !('quickChatCampId' in value)) return value
+  if ('quickChatThreadId' in value) return null
+  const { quickChatCampId, ...rest } = value
+  return { ...rest, quickChatThreadId: quickChatCampId }
+}
+
+function parseRuntimePermissions(value: unknown): AdapterPermissionConfig | null {
+  if (!hasExactKeys(value, ['adapterKind', 'schemaVersion', 'values'])) return null
+  if (typeof value.adapterKind !== 'string' || !ADAPTER_KINDS.has(value.adapterKind as AdapterKind)) return null
+  if (!isPositiveVersion(value.schemaVersion)) return null
+  const values = normalizedJsonObject(value.values)
+  if (!values || Buffer.byteLength(JSON.stringify(values), 'utf8') > MAX_MODEL_OPTIONS_BYTES) return null
+  return {
+    adapterKind: value.adapterKind as AdapterKind,
+    schemaVersion: value.schemaVersion,
+    values
+  }
+}
+
+function hasExactKeys<T extends string>(
+  value: unknown,
+  keys: readonly T[]
+): value is Record<T, unknown> {
+  if (!isRecord(value)) return false
+  const actual = Object.keys(value).sort()
+  const expected = [...keys].sort()
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function normalizedJsonObject(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null
+  try {
+    const serialized = JSON.stringify(value)
+    if (serialized === undefined) return null
+    const normalized = JSON.parse(serialized) as unknown
+    return isRecord(normalized) ? normalized : null
+  } catch {
+    return null
+  }
+}
+
+function isMemberRole(value: unknown): value is BuiltinMemberAvatarRole {
+  return typeof value === 'string' && MEMBER_ROLES.has(value as BuiltinMemberAvatarRole)
+}
+
+function isStableId(value: unknown): value is string {
+  return typeof value === 'string' && STABLE_ID.test(value)
+}
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+}
+
+function isPositiveVersion(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+
+function isTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+}

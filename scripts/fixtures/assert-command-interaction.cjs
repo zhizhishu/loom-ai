@@ -1,0 +1,160 @@
+const assert = require('node:assert/strict')
+
+module.exports = async function assertCommandInteraction(window, run, capture) {
+  window.webContents.debugger.attach('1.3')
+  await window.webContents.debugger.sendCommand('Emulation.setFocusEmulationEnabled', { enabled: true })
+  const settle = () => run('window.campOpenTest.settle()')
+  const waitFor = async expression => {
+    const deadline = Date.now() + 5000
+    do { await settle(); if (await run(expression)) return } while (Date.now() < deadline)
+    assert.fail(`Command interaction condition: ${expression}`)
+  }
+  const userScroll = expression => run(`(() => {
+    const host = document.querySelector('.execution-drawer-body')
+    host.dispatchEvent(new WheelEvent('wheel', { deltaY: 100, bubbles: true }))
+    ${expression}
+  })()`)
+  const top = selector => run(`document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect().top`)
+  const clickAt = async expression => {
+    const point = await run(`(() => { const rect = (${expression}).getBoundingClientRect(); return {
+      x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2)
+    } })()`)
+    window.webContents.sendInputEvent({ type: 'mouseMove', ...point })
+    window.webContents.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
+    window.webContents.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
+    await settle()
+  }
+  const stable = async (selector, before, label) => {
+    await settle()
+    const after = await top(selector)
+    assert.ok(Math.abs(after - before) < 2, `${label}: moved ${after - before}px`)
+    return after - before
+  }
+  const report = []
+  for (const placement of ['bottom', 'inspector']) {
+    window.setSize(placement === 'bottom' ? 1200 : 1040, 800)
+    await run(`document.documentElement.dataset.theme = '${placement === 'bottom' ? 'day' : 'night'}';
+      window.campOpenTest.commandInteraction(true);
+      window.campOpenTest.showRunningExecution('${placement}', 700, 81)`)
+    await waitFor('document.querySelector("button[aria-label^=打开][aria-label*=执行过程]") !== null')
+    await run('document.querySelector("button[aria-label^=打开][aria-label*=执行过程]").click()')
+    await waitFor('document.querySelector(".compaction-event") !== null')
+    const group = '.tool-group-summary'
+    const compact = '.compaction-event > summary'
+    assert.equal(await run('document.querySelector(".tool-group-copy").textContent'), 'TOKEN=fixture-value echo 80')
+    assert.equal(await run('document.querySelector(".tool-group-summary > .tool-call-icon").dataset.iconDomain'), 'terminal')
+    assert.equal(await run('document.querySelectorAll(".tool-group-summary .tool-group-disclosure").length'), 0)
+    assert.equal(await run('getComputedStyle(document.querySelector(".tool-group-summary .running-text-highlight")).animationDuration'), '2.4s')
+    const compactTop = await top(compact)
+    await run('document.querySelector(".compaction-event > summary").click()')
+    await waitFor('window.campOpenTest.pendingCommandResults() === 1')
+    await stable(compact, compactTop, `${placement} Compact loading`)
+    assert.equal(await run('document.querySelector(".compaction-event .running-text-highlight") === null'), true)
+    await run('window.campOpenTest.releaseCommandResult(true)')
+    await waitFor('document.querySelector(".compaction-event .tool-result-retry") !== null')
+    await stable(compact, compactTop, `${placement} Compact failure`)
+    await run('document.querySelector(".tool-result-retry").click()')
+    await waitFor('window.campOpenTest.pendingCommandResults() === 1')
+    await run('window.campOpenTest.releaseCommandResult()')
+    await waitFor('document.querySelector(".compaction-event pre") !== null')
+    await stable(compact, compactTop, `${placement} Compact retry result`)
+    const width = await run(`(() => { const row = document.querySelector('.compaction-event');
+      return { row: row.getBoundingClientRect().width, detail: row.querySelector('pre').getBoundingClientRect().width }; })()`)
+    assert.ok(width.row - width.detail <= 3, `full content track: ${JSON.stringify(width)}`)
+    await run('document.querySelector(".compaction-event > summary").click()')
+    await stable(compact, compactTop, `${placement} Compact collapse`)
+    const groupTop = await top(group)
+    await run('document.querySelector(".tool-group-summary").click()')
+    await waitFor('document.querySelector(".tool-call-disclosure") !== null')
+    await stable(group, groupTop, `${placement} group expansion`)
+    assert.equal(await run('document.querySelector(".tool-group-summary .running-text-highlight") === null'), true)
+    assert.equal(await run('document.querySelectorAll(".tool-group-items .running-text-highlight").length'), 0)
+    await userScroll('host.scrollTop = host.scrollHeight')
+    await settle()
+    // The expanded history group has its own cursor; scroll through child pages.
+    for (let page = 0; page < 4 && !await run('document.querySelector("[data-execution-item-key=\\"tool:window-80\\"]")'); page++) {
+      await userScroll('host.scrollTop = host.scrollHeight')
+      await run('new Promise(resolve => setTimeout(resolve, 180))')
+    }
+    // Pick the final command, which is kept in the measured child virtual list.
+    await waitFor('document.querySelector("[data-execution-item-key=\\"tool:window-80\\"]") !== null')
+    const command = '[data-execution-item-key="tool:window-80"] > summary'
+    await userScroll(`document.querySelector(${JSON.stringify(command)}).scrollIntoView({ block: 'center' })`)
+    await settle()
+    const commandTop = await top(command)
+    await run(`document.querySelector(${JSON.stringify(command)}).click()`)
+    await waitFor('window.campOpenTest.pendingCommandResults() === 1')
+    await stable(command, commandTop, `${placement} command loading`)
+    await run('window.campOpenTest.releaseCommandResult()')
+    await waitFor('document.querySelector("[data-tool-result-key$=\\":window-80\\"]") !== null')
+    await stable(command, commandTop, `${placement} command result`)
+    await capture(`command-interaction-${placement}`)
+    await run(`document.querySelector(${JSON.stringify(command)}).click()`)
+    await stable(command, commandTop, `${placement} command collapse`)
+    const reads = await run('window.campOpenTest.executionWindowState().contentReads.length')
+    await run(`document.querySelector(${JSON.stringify(command)}).focus({ preventScroll: true })`)
+    window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' })
+    window.webContents.sendInputEvent({ type: 'char', keyCode: '\r' })
+    window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' })
+    await waitFor('document.querySelector("[data-execution-item-key=\\"tool:window-80\\"]").open')
+    await stable(command, commandTop, `${placement} keyboard expansion`)
+    assert.equal(await run('window.campOpenTest.executionWindowState().contentReads.length'), reads, 'cached result reopens without a read')
+    const focus = await run(`(() => { const el = document.querySelector(${JSON.stringify(command)}); return {outline:getComputedStyle(el).outlineStyle, isFocused:document.activeElement===el, active:document.activeElement?.outerHTML.slice(0,200), visible:el.matches(':focus-visible'), windowFocus:document.hasFocus()}; })()`); assert.equal(focus.outline, 'solid', JSON.stringify({placement,focus}))
+    await userScroll('host.scrollTop -= 80')
+    await settle()
+    assert.equal(await run('document.querySelector(".execution-drawer-body").dataset.executionDisclosureAnchor'), undefined, 'user scrolling releases disclosure')
+    const readingTop = await top(command)
+    await run('window.campOpenTest.appendExecution(1)')
+    await settle()
+    await stable(command, readingTop, `${placement} background output preserves reading position`)
+    const pendingRow = '[data-execution-item-key="tool:window-78"] > summary'
+    await userScroll(`document.querySelector(${JSON.stringify(pendingRow)}).scrollIntoView({ block: 'center' })`)
+    await settle()
+    await run(`document.querySelector(${JSON.stringify(pendingRow)}).click()`)
+    await waitFor('window.campOpenTest.pendingCommandResults() === 1')
+    await userScroll('host.scrollTop -= 40')
+    await settle()
+    const userPosition = await top(pendingRow)
+    await run('window.campOpenTest.releaseCommandResult()')
+    await waitFor('document.querySelector("[data-tool-result-key$=\\":window-78\\"]") !== null')
+    await stable(pendingRow, userPosition, `${placement} user scroll wins over late result`)
+    await userScroll(`document.querySelector(${JSON.stringify(command)}).scrollIntoView({ block: 'center' })`)
+    await waitFor('document.querySelector("[data-execution-item-key=\\"tool:window-79\\"]") !== null')
+    const readRow = '[data-execution-item-key="tool:window-79"]'
+    await userScroll(`document.querySelector(${JSON.stringify(readRow)}).scrollIntoView({ block: 'center' })`)
+    await settle()
+    await run(`document.querySelector(${JSON.stringify(readRow)}).querySelector('.tool-file-link').click()`)
+    await settle()
+    assert.equal(await run(`document.querySelector(${JSON.stringify(readRow)}).open`), false, 'file preview click never expands the command')
+    assert.equal(await run('document.documentElement.scrollWidth > innerWidth'), false)
+    assert.equal(await run('[...document.querySelectorAll(".execution-placement-button span")].every(node => getComputedStyle(node).display !== "none")'), true)
+    for (const targetPlacement of [placement === 'bottom' ? 'inspector' : 'bottom', placement]) {
+      await userScroll(`document.querySelector(${JSON.stringify(command)}).scrollIntoView({ block: 'center' })`)
+      await settle()
+      await run(`window.commandSummary = document.querySelector(${JSON.stringify(command)}); window.commandSummary.click()`)
+      await settle()
+      await clickAt(`[...document.querySelectorAll('.execution-placement-button')].find(button => button.getClientRects().length)`)
+      await waitFor(`document.querySelector('.execution-placement-option[data-placement=${targetPlacement}]') !== null`)
+      await clickAt(`document.querySelector('.execution-placement-option[data-placement=${targetPlacement}]')`)
+      await waitFor(`document.querySelector('.execution-drawer-${targetPlacement}') !== null`)
+      assert.equal(await run(`window.commandSummary === document.querySelector(${JSON.stringify(command)})`), true, 'placement moves the same command DOM')
+      await settle()
+      const movedTop = await top(command)
+      await run('window.commandSummary.click()')
+      await stable(command, movedTop, `${targetPlacement} disclosure after placement move`)
+      assert.equal(await run('window.campOpenTest.pendingCommandResults()'), 0, 'placement retains cached result')
+    }
+    report.push({ placement, compactTop, commandTop, width, cachedReads: reads })
+  }
+  await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] })
+  await run('if (document.querySelector(".compaction-event").open) document.querySelector(".compaction-event > summary").click()')
+  await settle()
+  assert.equal(await run('[...document.querySelectorAll(".running-text-highlight")].every(node => getComputedStyle(node).display === "none")'), true)
+  await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [] })
+  await window.webContents.debugger.sendCommand('Emulation.setTouchEmulationEnabled', { enabled: true })
+  assert.equal(await run('matchMedia("(pointer: coarse)").matches'), true)
+  await waitFor('getComputedStyle(document.querySelector(".command-expand-cue")).opacity === "1"')
+  assert.ok(await run('document.querySelector(".tool-call-summary").getBoundingClientRect().height') >= 44)
+  window.webContents.debugger.detach()
+  return report
+}

@@ -1,0 +1,290 @@
+name: macOS signed build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-signed-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  require-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require main branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Signed builds may only run from main."
+            exit 1
+          fi
+
+  build:
+    needs: require-main
+    name: macOS ${{ matrix.arch }} signed build
+    runs-on: ${{ matrix.runner }}
+    environment: release-signing
+    env:
+      MAC_RELEASE_TEAM_ID: ${{ vars.MAC_RELEASE_TEAM_ID }}
+      MAC_RELEASE_CERT_SHA256: ${{ vars.MAC_RELEASE_CERT_SHA256 }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            artifact-name: rovai-macos-arm64-signed
+          - arch: x64
+            runner: macos-15-intel
+            artifact-name: rovai-macos-x64-signed
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 26
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.20.0
+
+      - name: Install Rust 1.97.1
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare Developer ID signing and notarization
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+
+          : "${MAC_CSC_LINK:?MAC_CSC_LINK is required}"
+          : "${MAC_CSC_KEY_PASSWORD:?MAC_CSC_KEY_PASSWORD is required}"
+          : "${APPLE_API_KEY_BASE64:?APPLE_API_KEY_BASE64 is required}"
+          : "${APPLE_API_KEY_ID:?APPLE_API_KEY_ID is required}"
+          : "${APPLE_API_ISSUER:?APPLE_API_ISSUER is required}"
+          [[ "$MAC_RELEASE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || {
+            echo "MAC_RELEASE_TEAM_ID must be a 10-character Team ID" >&2
+            exit 1
+          }
+          [[ "$MAC_RELEASE_CERT_SHA256" =~ ^[A-F0-9]{64}$ ]] || {
+            echo "MAC_RELEASE_CERT_SHA256 must be 64 uppercase hex characters" >&2
+            exit 1
+          }
+
+          P12_PATH="$RUNNER_TEMP/rovai-release-signing.p12"
+          CERT_PEM="$RUNNER_TEMP/rovai-release-signing.pem"
+          API_KEY_PATH="$RUNNER_TEMP/rovai-notarization-key.p8"
+          G2_CERT_PATH="$RUNNER_TEMP/rovai-developer-id-g2.cer"
+          KEYCHAIN_PATH="$RUNNER_TEMP/rovai-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          DEFAULT_KEYCHAIN="$(security default-keychain -d user | tr -d '"')"
+
+          printf '%s' "$MAC_CSC_LINK" | /usr/bin/base64 -D > "$P12_PATH"
+          test -s "$P12_PATH"
+          printf '%s' "$APPLE_API_KEY_BASE64" | /usr/bin/base64 -D > "$API_KEY_PATH"
+          test -s "$API_KEY_PATH"
+
+          openssl pkcs12 \
+            -in "$P12_PATH" \
+            -clcerts \
+            -nokeys \
+            -passin env:MAC_CSC_KEY_PASSWORD \
+            -out "$CERT_PEM"
+          openssl x509 -in "$CERT_PEM" -checkend 0 -noout
+          ACTUAL_FINGERPRINT="$(
+            openssl x509 -in "$CERT_PEM" -noout -fingerprint -sha256 \
+              | cut -d= -f2 \
+              | tr -d ':\r\n' \
+              | tr '[:lower:]' '[:upper:]'
+          )"
+          test "$ACTUAL_FINGERPRINT" = "$MAC_RELEASE_CERT_SHA256" || {
+            echo "Developer ID certificate fingerprint does not match release-signing policy" >&2
+            exit 1
+          }
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$DEFAULT_KEYCHAIN"
+
+          curl --fail --location --silent --show-error \
+            --output "$G2_CERT_PATH" \
+            'https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer'
+          G2_CERT_SHA256="$(shasum -a 256 "$G2_CERT_PATH" | awk '{print $1}')"
+          test "$G2_CERT_SHA256" = \
+            'f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a' || {
+            echo "Developer ID G2 intermediate fingerprint mismatch" >&2
+            exit 1
+          }
+          security add-certificates -k "$KEYCHAIN_PATH" "$G2_CERT_PATH"
+
+          security import "$P12_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$MAC_CSC_KEY_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep -E "Developer ID Application:.*\\(${MAC_RELEASE_TEAM_ID}\\)"
+
+          printf 'CSC_NAME=%s\n' "$MAC_RELEASE_TEAM_ID" >> "$GITHUB_ENV"
+          printf 'CSC_KEYCHAIN=%s\n' "$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          printf 'APPLE_API_KEY=%s\n' "$API_KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build signed release artifacts
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: node scripts/retry-macos-build.mjs ${{ matrix.arch }}
+
+      - name: Notarize and staple release DMG
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          DMG_PATH="dist/Rovai-AI-${VERSION}-${{ matrix.arch }}.dmg"
+          test -s "$DMG_PATH"
+          xcrun notarytool submit "$DMG_PATH" \
+            --key "$APPLE_API_KEY" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          node scripts/retry-macos-ticket.mjs staple "$DMG_PATH"
+
+      - name: Verify signed release artifacts
+        run: node scripts/verify-macos-release.mjs ${{ matrix.arch }}
+
+      - name: Clean sensitive signing material
+        if: always()
+        shell: bash
+        run: |
+          set +x
+          set +e
+
+          P12_PATH="$RUNNER_TEMP/rovai-release-signing.p12"
+          CERT_PEM="$RUNNER_TEMP/rovai-release-signing.pem"
+          API_KEY_PATH="$RUNNER_TEMP/rovai-notarization-key.p8"
+          G2_CERT_PATH="$RUNNER_TEMP/rovai-developer-id-g2.cer"
+          KEYCHAIN_PATH="$RUNNER_TEMP/rovai-signing.keychain-db"
+          DEFAULT_KEYCHAIN="$(
+            security default-keychain -d user 2>/dev/null |
+              tr -d '"'
+          )"
+
+          if test -n "$DEFAULT_KEYCHAIN"; then
+            security list-keychains \
+              -d user \
+              -s "$DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+
+          security delete-keychain \
+            "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
+
+          rm -f \
+            "$P12_PATH" \
+            "$CERT_PEM" \
+            "$API_KEY_PATH" \
+            "$G2_CERT_PATH" \
+            "$KEYCHAIN_PATH"
+
+          exit 0
+
+      - name: Upload signed artifacts
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/latest-mac.yml
+            dist/signing-report-*.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble:
+    needs: build
+    name: Assemble macOS release bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 26
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.20.0
+
+      - name: Install manifest dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Download arm64 artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rovai-macos-arm64-signed
+          path: dist/intermediate/arm64
+
+      - name: Download x64 artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rovai-macos-x64-signed
+          path: dist/intermediate/x64
+
+      - name: Assemble architecture-complete update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          cp dist/intermediate/arm64/*.dmg dist/release/
+          cp dist/intermediate/arm64/*.zip dist/release/
+          cp dist/intermediate/arm64/signing-report-*.txt dist/release/
+          cp dist/intermediate/x64/*.dmg dist/release/
+          cp dist/intermediate/x64/*.zip dist/release/
+          cp dist/intermediate/x64/signing-report-*.txt dist/release/
+          node scripts/merge-macos-update-info.mjs \
+            dist/release/latest-mac.yml \
+            dist/intermediate/arm64/latest-mac.yml \
+            dist/intermediate/x64/latest-mac.yml
+
+      - name: Upload complete signed macOS release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rovai-macos-signed
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 7

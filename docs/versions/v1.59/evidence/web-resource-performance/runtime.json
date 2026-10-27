@@ -1,0 +1,33 @@
+{
+  "verifiedAt": "2026-09-14T11:00:54.217Z",
+  "simulation": false,
+  "realRuntime": true,
+  "setup": "Empty Desktop-managed Host; Runtime check, member configuration and Camp creation use the production browser UI.",
+  "entry": "desktop",
+  "checks": {
+    "browserRuntimeMemberAndCampSetup": true,
+    "mobileSendDoesNotNavigateToExecution": true,
+    "mobileCommandVisibleWhileRunning": true,
+    "mobileRunBoundaryMatchesDesktop": true,
+    "webCommandVisibleWhileRunning": true,
+    "realRunSucceeded": true
+  },
+  "screenshots": {
+    "mobile-after-send.png": "451ea826ec744a4071011eafbcb700be3789923feb3888483e1b03096c4a3222",
+    "mobile-live-command.png": "b513899fd91c677afb658bd30299d1bd75e7913b1a1266ac570d6d32992feff4",
+    "web-live-command.png": "8ce28822f91f3fc4324bddebb8b2eee08939cccc00529613ad5ed5e5bc54a710",
+    "mobile-command-completed.png": "438a7b438f00a34bd2c2666027a29998111554216c09d22d5bc5c49995800eff"
+  },
+  "notVerified": [
+    "Second physical device/LAN",
+    "Other platforms",
+    "Physical sleep/wake"
+  ],
+  "campId": "rvcamp_01m2fs85brffgaz0xryy2z9qmq",
+  "status": "passed",
+  "sourceCommit": "2ace68a6a7c514d143005ab75f2cf2657266235e",
+  "command": "ROVAI_HOST_ENTRY=desktop ROVAI_HOST_BIN=<packaged Host> ROVAI_APP_BIN=<packaged App> node /tmp/rovai-perf-mobile-command-20260914.mjs",
+  "scriptSha256": "953295cb42fe67c587fa7c602432d03af605d4c4e3105490d12b49beb1bbecfc",
+  "log": "/tmp/rovai-perf-runtime-packaged.log",
+  "realPhone": false
+}

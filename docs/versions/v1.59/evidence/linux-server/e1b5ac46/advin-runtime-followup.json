@@ -1,0 +1,1729 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+  "fullQualification": false,
+  "reports": [
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "antigravity-app",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-antigravity-app-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-antigravity-app-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-antigravity-app-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions"
+      ],
+      "runs": [],
+      "runtimeVersion": "1.2.2",
+      "admission": null,
+      "status": "failed",
+      "error": "Runtime execution timed out",
+      "attempt": "server-integration-antigravity-app-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "claude-code-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-claude-code-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-claude-code-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-claude-code-cli-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "71ac1b1b-f679-4df0-8cab-bf32e18e2c5b",
+          "status": "succeeded",
+          "conversationId": "f6dd4fa4-594c-4ce9-855a-7d1a70f39962",
+          "nativeBinding": {
+            "native_session_id": "cb630673-390c-4fa9-98ca-91e21da89755",
+            "native_binding_id": "97656427-5695-4499-9e29-df95ae77f1cf",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "9971c2ee-424d-42af-8b22-0ae9c768c141",
+          "status": "succeeded",
+          "conversationId": "f6dd4fa4-594c-4ce9-855a-7d1a70f39962",
+          "nativeBinding": {
+            "native_session_id": "cb630673-390c-4fa9-98ca-91e21da89755",
+            "native_binding_id": "97656427-5695-4499-9e29-df95ae77f1cf",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "e5a91f9f-62d3-480e-884e-e57de9b2703a",
+          "status": "succeeded",
+          "conversationId": "f6dd4fa4-594c-4ce9-855a-7d1a70f39962",
+          "nativeBinding": {
+            "native_session_id": "cb630673-390c-4fa9-98ca-91e21da89755",
+            "native_binding_id": "97656427-5695-4499-9e29-df95ae77f1cf",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "e103982c-f414-41e7-aeeb-4922a873b5ef",
+          "status": "succeeded",
+          "conversationId": "f6dd4fa4-594c-4ce9-855a-7d1a70f39962",
+          "nativeBinding": {
+            "native_session_id": "cb630673-390c-4fa9-98ca-91e21da89755",
+            "native_binding_id": "97656427-5695-4499-9e29-df95ae77f1cf",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "2.1.270 (Claude Code)",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "Write",
+          "outcome": "succeeded"
+        }
+      ],
+      "status": "passed",
+      "attempt": "server-integration-claude-code-cli-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "codebuddy-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-codebuddy-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-codebuddy-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-codebuddy-cli-1/data/mcp.json",
+      "checks": [],
+      "runs": [],
+      "status": "failed",
+      "error": "runtime.product.check: CORE_REQUEST_FAILED",
+      "attempt": "server-integration-codebuddy-cli-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "codebuddy-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-codebuddy-cli-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-codebuddy-cli-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-codebuddy-cli-2/data/mcp.json",
+      "checks": [],
+      "runs": [],
+      "status": "failed",
+      "error": "runtime.product.check: CORE_REQUEST_FAILED",
+      "attempt": "server-integration-codebuddy-cli-2"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "codebuddy-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-codebuddy-cli-3/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-codebuddy-cli-3/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-codebuddy-cli-3/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions"
+      ],
+      "runs": [],
+      "runtimeVersion": "2.150.0",
+      "admission": null,
+      "status": "failed",
+      "error": "Runtime run failed: see private fixture",
+      "failure": {
+        "code": "runtime_prompt_refusal",
+        "detail": "ACP prompt ended as refusal",
+        "origin": "runtime",
+        "phase": "execution",
+        "retryable": false,
+        "runtimeKind": "codebuddy-cli",
+        "summary": "CodeBuddy CLI 未能完成运行"
+      },
+      "attempt": "server-integration-codebuddy-cli-3"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "codex-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-codex-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-codex-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-codex-cli-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "b3bb69af-bfa3-4fe9-9958-cebcb37af43a",
+          "status": "succeeded",
+          "conversationId": "ddf0689e-c523-4385-ad63-7d538207ad76",
+          "nativeBinding": {
+            "native_session_id": "01a09ff7-1dcf-7d30-8205-3637b6f36da9",
+            "native_binding_id": "0d23a2bf-4327-4504-9510-807b97bf16cb",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "6f064dec-4493-44cb-ab5e-caf9c76aba63",
+          "status": "succeeded",
+          "conversationId": "ddf0689e-c523-4385-ad63-7d538207ad76",
+          "nativeBinding": {
+            "native_session_id": "01a09ff7-1dcf-7d30-8205-3637b6f36da9",
+            "native_binding_id": "0d23a2bf-4327-4504-9510-807b97bf16cb",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "69d5abca-9886-422e-be21-fb6c071823aa",
+          "status": "succeeded",
+          "conversationId": "ddf0689e-c523-4385-ad63-7d538207ad76",
+          "nativeBinding": {
+            "native_session_id": "01a09ff7-1dcf-7d30-8205-3637b6f36da9",
+            "native_binding_id": "0d23a2bf-4327-4504-9510-807b97bf16cb",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "ea1c96c4-50ab-4022-a021-927ec48b1ea0",
+          "status": "succeeded",
+          "conversationId": "ddf0689e-c523-4385-ad63-7d538207ad76",
+          "nativeBinding": {
+            "native_session_id": "01a09ff7-1dcf-7d30-8205-3637b6f36da9",
+            "native_binding_id": "0d23a2bf-4327-4504-9510-807b97bf16cb",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "codex-cli 0.154.0",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "command",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "status": "passed",
+      "attempt": "server-integration-codex-cli-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "copilot-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-copilot-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-copilot-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-copilot-cli-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection"
+      ],
+      "runs": [
+        {
+          "id": "7f2be995-bc80-4ad4-a116-98232ebd50cc",
+          "status": "succeeded",
+          "conversationId": "1f1b0931-0e6e-49e2-b415-37b2624b4942",
+          "nativeBinding": {
+            "native_session_id": "c84e9d45-09e0-480c-b4e2-158a18e4061d",
+            "native_binding_id": "c726e938-ea71-4ed2-9a60-8fd2c230dd42",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "GitHub Copilot CLI 1.0.83.",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "status": "failed",
+      "error": "Runtime final marker must be publicly projected",
+      "attempt": "server-integration-copilot-cli-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "copilot-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-copilot-cli-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-copilot-cli-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-copilot-cli-2/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "63261089-c9ce-4ed7-b86f-e330f7bf8cc5",
+          "status": "succeeded",
+          "conversationId": "96ea7bd3-628a-49f5-8521-e0e2353041cd",
+          "nativeBinding": {
+            "native_session_id": "786be17f-d0a1-4379-9e6a-289d38882a97",
+            "native_binding_id": "77a600e7-2ef8-42ea-82db-95d40d296859",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "3cc288de-15bd-4767-9618-423137be7df8",
+          "status": "succeeded",
+          "conversationId": "96ea7bd3-628a-49f5-8521-e0e2353041cd",
+          "nativeBinding": {
+            "native_session_id": "786be17f-d0a1-4379-9e6a-289d38882a97",
+            "native_binding_id": "77a600e7-2ef8-42ea-82db-95d40d296859",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "d490a4c2-6a29-4d8d-b77e-4e325ba6eb3e",
+          "status": "succeeded",
+          "conversationId": "96ea7bd3-628a-49f5-8521-e0e2353041cd",
+          "nativeBinding": {
+            "native_session_id": "786be17f-d0a1-4379-9e6a-289d38882a97",
+            "native_binding_id": "77a600e7-2ef8-42ea-82db-95d40d296859",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "45d5d918-b715-4581-9466-6678274ed5f9",
+          "status": "succeeded",
+          "conversationId": "96ea7bd3-628a-49f5-8521-e0e2353041cd",
+          "nativeBinding": {
+            "native_session_id": "786be17f-d0a1-4379-9e6a-289d38882a97",
+            "native_binding_id": "77a600e7-2ef8-42ea-82db-95d40d296859",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "GitHub Copilot CLI 1.0.83.",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "camp.message.send",
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": true,
+        "childReaped": true
+      },
+      "status": "passed",
+      "attempt": "server-integration-copilot-cli-2"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "grok-build",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-grok-build-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-grok-build-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-grok-build-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection"
+      ],
+      "runs": [
+        {
+          "id": "8d747c2c-2407-4f30-8198-764cdbb032c0",
+          "status": "succeeded",
+          "conversationId": "75b65267-13b7-429d-b858-18797fa6909c",
+          "nativeBinding": {
+            "native_session_id": "01a09ffe-0ee8-7993-8853-d0b117196167",
+            "native_binding_id": "e9451ce3-25b4-4491-aca0-0297ab65286c",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "grok 1.0.30 (04b7ffed98c6)",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "status": "failed",
+      "error": "Runtime final marker must be publicly projected",
+      "attempt": "server-integration-grok-build-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "grok-build",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-grok-build-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-grok-build-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-grok-build-2/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "bca1d664-e9bc-4d72-95ac-4e86f43d57c7",
+          "status": "succeeded",
+          "conversationId": "8baac995-d556-4397-95b1-86427fde0761",
+          "nativeBinding": {
+            "native_session_id": "01a0a00d-a12a-78d2-a044-6d2403679210",
+            "native_binding_id": "6a8511c0-da23-48f0-b3f5-f210ee54e37e",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "70c40782-0b25-4139-9463-d3e67867c629",
+          "status": "succeeded",
+          "conversationId": "8baac995-d556-4397-95b1-86427fde0761",
+          "nativeBinding": {
+            "native_session_id": "01a0a00d-a12a-78d2-a044-6d2403679210",
+            "native_binding_id": "6a8511c0-da23-48f0-b3f5-f210ee54e37e",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "6412c8dd-0311-4133-b06f-d74a72a42cc1",
+          "status": "succeeded",
+          "conversationId": "8baac995-d556-4397-95b1-86427fde0761",
+          "nativeBinding": {
+            "native_session_id": "01a0a00d-a12a-78d2-a044-6d2403679210",
+            "native_binding_id": "6a8511c0-da23-48f0-b3f5-f210ee54e37e",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "e1ce28b2-b187-48a2-ba0c-3e75f5d858c7",
+          "status": "succeeded",
+          "conversationId": "8baac995-d556-4397-95b1-86427fde0761",
+          "nativeBinding": {
+            "native_session_id": "01a0a00d-a12a-78d2-a044-6d2403679210",
+            "native_binding_id": "6a8511c0-da23-48f0-b3f5-f210ee54e37e",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "grok 1.0.30 (04b7ffed98c6)",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": true,
+        "childReaped": true
+      },
+      "status": "passed",
+      "attempt": "server-integration-grok-build-2"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "kimi-code-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-kimi-code-cli-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-kimi-code-cli-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-kimi-code-cli-2/data/mcp.json",
+      "checks": [],
+      "runs": [],
+      "status": "failed",
+      "error": "Native Runtime availability check returned stable_failure; see private diagnostic",
+      "attempt": "server-integration-kimi-code-cli-2"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "kiro-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-kiro-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-kiro-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-kiro-cli-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "977853ca-dfe3-4b1e-b646-8ed7fa16e37e",
+          "status": "succeeded",
+          "conversationId": "8b555222-18c5-4847-b2f4-cd35c782d3f3",
+          "nativeBinding": {
+            "native_session_id": "3b187c19-83d8-49f2-b5e1-f3be9414c902",
+            "native_binding_id": "f9625f3f-40d3-48fa-a2b4-73ac75519c9b",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "3b6aa3f1-08fd-4481-a7c3-102aa7d8c087",
+          "status": "succeeded",
+          "conversationId": "8b555222-18c5-4847-b2f4-cd35c782d3f3",
+          "nativeBinding": {
+            "native_session_id": "3b187c19-83d8-49f2-b5e1-f3be9414c902",
+            "native_binding_id": "f9625f3f-40d3-48fa-a2b4-73ac75519c9b",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "e6353361-7912-4b35-ac00-7e59d6e32232",
+          "status": "succeeded",
+          "conversationId": "8b555222-18c5-4847-b2f4-cd35c782d3f3",
+          "nativeBinding": {
+            "native_session_id": "3b187c19-83d8-49f2-b5e1-f3be9414c902",
+            "native_binding_id": "f9625f3f-40d3-48fa-a2b4-73ac75519c9b",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "bc1991df-922c-4469-ae76-23c858a2b514",
+          "status": "succeeded",
+          "conversationId": "8b555222-18c5-4847-b2f4-cd35c782d3f3",
+          "nativeBinding": {
+            "native_session_id": "3b187c19-83d8-49f2-b5e1-f3be9414c902",
+            "native_binding_id": "f9625f3f-40d3-48fa-a2b4-73ac75519c9b",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "kiro-cli 2.21.4",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": true,
+        "childReaped": true
+      },
+      "status": "passed",
+      "attempt": "server-integration-kiro-cli-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "opencode-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-opencode-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-opencode-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-opencode-cli-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message"
+      ],
+      "runs": [
+        {
+          "id": "4c4faae0-2a22-4aef-bb67-c8ef566b8cb0",
+          "status": "succeeded",
+          "conversationId": "e4e9deb1-46b8-40ee-a117-dae8586d1417",
+          "nativeBinding": {
+            "native_session_id": "ses_f6005dc49fferjHNBqUTmDqsum",
+            "native_binding_id": "9c51b11b-ff11-4a28-a462-9fbd15ab6e97",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "d6ead8b8-2e2c-47a9-b5fc-14febbbdc902",
+          "status": "succeeded",
+          "conversationId": "e4e9deb1-46b8-40ee-a117-dae8586d1417",
+          "nativeBinding": {
+            "native_session_id": "ses_f6005dc49fferjHNBqUTmDqsum",
+            "native_binding_id": "9c51b11b-ff11-4a28-a462-9fbd15ab6e97",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "fec11cde-b861-4f9b-b5f2-f0a084373e89",
+          "status": "succeeded",
+          "conversationId": "e4e9deb1-46b8-40ee-a117-dae8586d1417",
+          "nativeBinding": {
+            "native_session_id": "ses_f6005dc49fferjHNBqUTmDqsum",
+            "native_binding_id": "9c51b11b-ff11-4a28-a462-9fbd15ab6e97",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "274f8803-38f2-46b1-8729-8cf3b2084649",
+          "status": "succeeded",
+          "conversationId": "e4e9deb1-46b8-40ee-a117-dae8586d1417",
+          "nativeBinding": {
+            "native_session_id": "ses_f6005dc49fferjHNBqUTmDqsum",
+            "native_binding_id": "9c51b11b-ff11-4a28-a462-9fbd15ab6e97",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "1.18.30",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "status": "failed",
+      "error": "Cancel only after the native sleep command appears in public execution evidence",
+      "attempt": "server-integration-opencode-cli-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "opencode-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-opencode-cli-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-opencode-cli-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-opencode-cli-2/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message"
+      ],
+      "runs": [
+        {
+          "id": "addbf34a-84dc-467b-b4eb-84c011bfce21",
+          "status": "succeeded",
+          "conversationId": "ae385578-92fd-4945-b43a-b14c085a3d21",
+          "nativeBinding": {
+            "native_session_id": "ses_f5ff61721ffeglGv1yRxkELLfF",
+            "native_binding_id": "edad5420-4770-4ef1-a2de-3b55bdfde2a2",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "749da90a-55d1-4659-9915-5c49f3bf021b",
+          "status": "succeeded",
+          "conversationId": "ae385578-92fd-4945-b43a-b14c085a3d21",
+          "nativeBinding": {
+            "native_session_id": "ses_f5ff61721ffeglGv1yRxkELLfF",
+            "native_binding_id": "edad5420-4770-4ef1-a2de-3b55bdfde2a2",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "9c5bda7a-7c0f-4ffa-b259-d00f83707387",
+          "status": "succeeded",
+          "conversationId": "ae385578-92fd-4945-b43a-b14c085a3d21",
+          "nativeBinding": {
+            "native_session_id": "ses_f5ff61721ffeglGv1yRxkELLfF",
+            "native_binding_id": "edad5420-4770-4ef1-a2de-3b55bdfde2a2",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "8225a81e-e4d2-4a3e-a5c4-25c60bfcc697",
+          "status": "succeeded",
+          "conversationId": "ae385578-92fd-4945-b43a-b14c085a3d21",
+          "nativeBinding": {
+            "native_session_id": "ses_f5ff61721ffeglGv1yRxkELLfF",
+            "native_binding_id": "edad5420-4770-4ef1-a2de-3b55bdfde2a2",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "1.18.30",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": false
+      },
+      "status": "failed",
+      "error": "Cancellation must reap the fixture child\n+ actual - expected\n\n+ [\n+   51810\n+ ]\n- []\n",
+      "attempt": "server-integration-opencode-cli-2"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "pi",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-pi-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-pi-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-pi-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "124edcaa-7290-46de-b4ab-7e258e94e06d",
+          "status": "succeeded",
+          "conversationId": "9483eb89-e4b3-412b-bc51-1eaff66627fe",
+          "nativeBinding": {
+            "native_session_id": "01a09ff9-45dc-7382-b030-875ec3b3ef9e",
+            "native_binding_id": "49dd0fda-7ad6-4337-a16d-85dd6af2f3a8",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "1294339b-e6f1-46bd-b1f9-dd360130f3bd",
+          "status": "succeeded",
+          "conversationId": "9483eb89-e4b3-412b-bc51-1eaff66627fe",
+          "nativeBinding": {
+            "native_session_id": "01a09ff9-45dc-7382-b030-875ec3b3ef9e",
+            "native_binding_id": "49dd0fda-7ad6-4337-a16d-85dd6af2f3a8",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "9a685255-6c6d-49d3-99d0-6bb21e0ea954",
+          "status": "succeeded",
+          "conversationId": "9483eb89-e4b3-412b-bc51-1eaff66627fe",
+          "nativeBinding": {
+            "native_session_id": "01a09ff9-45dc-7382-b030-875ec3b3ef9e",
+            "native_binding_id": "49dd0fda-7ad6-4337-a16d-85dd6af2f3a8",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "793abeb8-9c9b-4e70-8712-bec356826476",
+          "status": "succeeded",
+          "conversationId": "9483eb89-e4b3-412b-bc51-1eaff66627fe",
+          "nativeBinding": {
+            "native_session_id": "01a09ff9-45dc-7382-b030-875ec3b3ef9e",
+            "native_binding_id": "49dd0fda-7ad6-4337-a16d-85dd6af2f3a8",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "0.85.1",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "bash",
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "write",
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "read",
+          "outcome": "succeeded"
+        }
+      ],
+      "status": "passed",
+      "attempt": "server-integration-pi-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "qoder-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-qoder-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-qoder-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-qoder-cli-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions"
+      ],
+      "runs": [],
+      "runtimeVersion": "1.1.51",
+      "admission": null,
+      "status": "failed",
+      "error": "Runtime run failed: see private fixture",
+      "failure": {
+        "code": "runtime_prompt_runtime_error",
+        "detail": "ACP error 500: Your personal Credits have been exhausted. Please check your plan.",
+        "origin": "runtime",
+        "phase": "execution",
+        "retryable": false,
+        "runtimeKind": "qoder-cli",
+        "summary": "Qoder CLI 未能完成运行"
+      },
+      "attempt": "server-integration-qoder-cli-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "qoder-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-qoder-cli-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-qoder-cli-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-qoder-cli-2/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message"
+      ],
+      "runs": [
+        {
+          "id": "ebb0ab28-8e15-46f5-aab3-5c316884db32",
+          "status": "succeeded",
+          "conversationId": "3f9b7c05-9f57-4762-81bb-090f57438562",
+          "nativeBinding": {
+            "native_session_id": "afb184de-7aba-400e-939c-af35512e6eb3",
+            "native_binding_id": "708fb6bd-ea99-4583-a839-b920d06d5037",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "144f112e-86fb-4f05-9216-f839de9f352c",
+          "status": "succeeded",
+          "conversationId": "3f9b7c05-9f57-4762-81bb-090f57438562",
+          "nativeBinding": {
+            "native_session_id": "afb184de-7aba-400e-939c-af35512e6eb3",
+            "native_binding_id": "708fb6bd-ea99-4583-a839-b920d06d5037",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "2fa9a8f0-802d-45f1-8551-6fc7aeb63f63",
+          "status": "succeeded",
+          "conversationId": "3f9b7c05-9f57-4762-81bb-090f57438562",
+          "nativeBinding": {
+            "native_session_id": "afb184de-7aba-400e-939c-af35512e6eb3",
+            "native_binding_id": "708fb6bd-ea99-4583-a839-b920d06d5037",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "071fb9dc-e713-448e-aef6-6412e3dd4a3c",
+          "status": "succeeded",
+          "conversationId": "3f9b7c05-9f57-4762-81bb-090f57438562",
+          "nativeBinding": {
+            "native_session_id": "afb184de-7aba-400e-939c-af35512e6eb3",
+            "native_binding_id": "708fb6bd-ea99-4583-a839-b920d06d5037",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "1.1.51",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": true
+      },
+      "status": "failed",
+      "error": "Cancellation must reap the fixture child\n+ actual - expected\n\n+ [\n+   58157\n+ ]\n- []\n",
+      "attempt": "server-integration-qoder-cli-2"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "qwen-code",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-qwen-code-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-qwen-code-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-qwen-code-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message"
+      ],
+      "runs": [
+        {
+          "id": "37872c80-2532-4610-a9d9-043eae8ce950",
+          "status": "succeeded",
+          "conversationId": "2d20c9f4-0e26-4947-be46-972f5599bfdb",
+          "nativeBinding": {
+            "native_session_id": "b1b94ffc-6fc3-4cbb-9f00-13b9e2871711",
+            "native_binding_id": "6ba44910-7a58-469e-8566-7239352b01ed",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "c15d60bc-aa13-4241-a73b-36af1d36afca",
+          "status": "succeeded",
+          "conversationId": "2d20c9f4-0e26-4947-be46-972f5599bfdb",
+          "nativeBinding": {
+            "native_session_id": "b1b94ffc-6fc3-4cbb-9f00-13b9e2871711",
+            "native_binding_id": "6ba44910-7a58-469e-8566-7239352b01ed",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "78d2c28c-1a51-4a55-8170-2de531d82c8d",
+          "status": "succeeded",
+          "conversationId": "2d20c9f4-0e26-4947-be46-972f5599bfdb",
+          "nativeBinding": {
+            "native_session_id": "b1b94ffc-6fc3-4cbb-9f00-13b9e2871711",
+            "native_binding_id": "6ba44910-7a58-469e-8566-7239352b01ed",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "e7168e43-983c-4f23-b2e5-4e8293c42dd4",
+          "status": "succeeded",
+          "conversationId": "2d20c9f4-0e26-4947-be46-972f5599bfdb",
+          "nativeBinding": {
+            "native_session_id": "b1b94ffc-6fc3-4cbb-9f00-13b9e2871711",
+            "native_binding_id": "6ba44910-7a58-469e-8566-7239352b01ed",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "0.23.3",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "status": "failed",
+      "error": "Cancellable tool must still be active",
+      "attempt": "server-integration-qwen-code-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "qwen-code",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-qwen-code-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-qwen-code-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-qwen-code-2/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "c5694c47-867d-4d0d-987e-0c45c68ca74c",
+          "status": "succeeded",
+          "conversationId": "feb51d78-4c16-4ae7-9a2e-1a6e25e919bd",
+          "nativeBinding": {
+            "native_session_id": "7b58f191-9ccc-4902-8a6e-5b13ff006e19",
+            "native_binding_id": "292ce76a-2e4d-4b8d-9151-61c5715f2ab6",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "f77b07b4-7230-4af1-80cb-19240a453727",
+          "status": "succeeded",
+          "conversationId": "feb51d78-4c16-4ae7-9a2e-1a6e25e919bd",
+          "nativeBinding": {
+            "native_session_id": "7b58f191-9ccc-4902-8a6e-5b13ff006e19",
+            "native_binding_id": "292ce76a-2e4d-4b8d-9151-61c5715f2ab6",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "48eb1a4c-6654-4d76-9a43-c95051c842d6",
+          "status": "succeeded",
+          "conversationId": "feb51d78-4c16-4ae7-9a2e-1a6e25e919bd",
+          "nativeBinding": {
+            "native_session_id": "7b58f191-9ccc-4902-8a6e-5b13ff006e19",
+            "native_binding_id": "292ce76a-2e4d-4b8d-9151-61c5715f2ab6",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "2eb4c558-5685-4f12-a96b-5d62fe8989a3",
+          "status": "succeeded",
+          "conversationId": "feb51d78-4c16-4ae7-9a2e-1a6e25e919bd",
+          "nativeBinding": {
+            "native_session_id": "7b58f191-9ccc-4902-8a6e-5b13ff006e19",
+            "native_binding_id": "292ce76a-2e4d-4b8d-9151-61c5715f2ab6",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "0.23.3",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": false,
+        "childReaped": true
+      },
+      "status": "passed",
+      "attempt": "server-integration-qwen-code-2"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "trae-cn-cli",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-trae-cn-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-trae-cn-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-trae-cn-cli-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions"
+      ],
+      "runs": [],
+      "runtimeVersion": "trae-cli version 0.120.52",
+      "admission": null,
+      "status": "failed",
+      "error": "Runtime run failed: see private fixture",
+      "failure": {
+        "code": "runtime_prompt_runtime_error",
+        "detail": "ACP error -32603: Internal error",
+        "origin": "runtime",
+        "phase": "execution",
+        "retryable": true,
+        "runtimeKind": "trae-cn-cli",
+        "summary": "TRAE CLI 未能完成运行"
+      },
+      "attempt": "server-integration-trae-cn-cli-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "zcode-app",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-zcode-app-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-zcode-app-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-zcode-app-1/data/mcp.json",
+      "checks": [],
+      "runs": [],
+      "status": "failed",
+      "error": "Native Runtime availability check returned stable_failure; see private diagnostic",
+      "attempt": "server-integration-zcode-app-1"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "zcode-app",
+      "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-zcode-app-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-zcode-app-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-zcode-app-2/data/mcp.json",
+      "checks": [],
+      "runs": [],
+      "status": "failed",
+      "error": "Native Runtime availability check returned stable_failure; see private diagnostic",
+      "attempt": "server-integration-zcode-app-2"
+    }
+  ],
+  "memoryGuards": [
+    {
+      "name": "server-antigravity-app-1",
+      "initial": {
+        "availableKiB": 7490300,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7277624,
+      "peakTestUserRssKiB": 423316,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 282894336,
+      "cgroupCurrentBytes": 133193728,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 156.5,
+      "final": {
+        "availableKiB": 7520700,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-codebuddy-cli-1",
+      "initial": {
+        "availableKiB": 7474792,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7196472,
+      "peakTestUserRssKiB": 463016,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 351977472,
+      "cgroupCurrentBytes": 351977472,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 6.04,
+      "final": {
+        "availableKiB": 7422080,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-codebuddy-cli-2",
+      "initial": {
+        "availableKiB": 7509364,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7187572,
+      "peakTestUserRssKiB": 471484,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 360067072,
+      "cgroupCurrentBytes": 360067072,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 6.04,
+      "final": {
+        "availableKiB": 7468100,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-codebuddy-cli-3",
+      "initial": {
+        "availableKiB": 7512976,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7130356,
+      "peakTestUserRssKiB": 538148,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 413933568,
+      "cgroupCurrentBytes": 412348416,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 12.08,
+      "final": {
+        "availableKiB": 7444472,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-copilot-cli-2",
+      "initial": {
+        "availableKiB": 7502760,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 6999292,
+      "peakTestUserRssKiB": 1125424,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 719671296,
+      "cgroupCurrentBytes": 719671296,
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 65.49,
+      "final": {
+        "availableKiB": 7549236,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-grok-build-2",
+      "initial": {
+        "availableKiB": 7521180,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7438904,
+      "peakTestUserRssKiB": 282660,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 116498432,
+      "cgroupCurrentBytes": 116498432,
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 45.3,
+      "final": {
+        "availableKiB": 7534032,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-kimi-code-cli-2",
+      "initial": {
+        "availableKiB": 7543024,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7411176,
+      "peakTestUserRssKiB": 244132,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 598388736,
+      "cgroupCurrentBytes": 559407104,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 10.07,
+      "final": {
+        "availableKiB": 7514452,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-kiro-cli-1",
+      "initial": {
+        "availableKiB": 7494724,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7031680,
+      "peakTestUserRssKiB": 555348,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 674676736,
+      "cgroupCurrentBytes": 665075712,
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 39.77,
+      "final": {
+        "availableKiB": 7380672,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-opencode-cli-2",
+      "initial": {
+        "availableKiB": 7512312,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 6080552,
+      "peakTestUserRssKiB": 1823324,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1559269376,
+      "cgroupCurrentBytes": 1013219328,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 100.24,
+      "final": {
+        "availableKiB": 7515696,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-qoder-cli-1",
+      "initial": {
+        "availableKiB": 7531748,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 6695988,
+      "peakTestUserRssKiB": 1033992,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 908398592,
+      "cgroupCurrentBytes": 908386304,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 26.19,
+      "final": {
+        "availableKiB": 7480616,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-qoder-cli-2",
+      "initial": {
+        "availableKiB": 7521724,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 5941268,
+      "peakTestUserRssKiB": 1946724,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1977307136,
+      "cgroupCurrentBytes": 788705280,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 116.89,
+      "final": {
+        "availableKiB": 7532684,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-qwen-code-2",
+      "initial": {
+        "availableKiB": 7527336,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 5310820,
+      "peakTestUserRssKiB": 2606964,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 2544984064,
+      "cgroupCurrentBytes": 1235398656,
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 73.08,
+      "final": {
+        "availableKiB": 7452900,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-trae-cn-cli-1",
+      "initial": {
+        "availableKiB": 7402488,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7402380,
+      "peakTestUserRssKiB": 145136,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 128745472,
+      "cgroupCurrentBytes": 112951296,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 4.53,
+      "final": {
+        "availableKiB": 7456520,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-zcode-app-1",
+      "initial": {
+        "availableKiB": 7525944,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 6792012,
+      "peakTestUserRssKiB": 972356,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1072787456,
+      "cgroupCurrentBytes": 306855936,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 7.05,
+      "final": {
+        "availableKiB": 7314268,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-zcode-app-2",
+      "initial": {
+        "availableKiB": 7516944,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 6758920,
+      "peakTestUserRssKiB": 996308,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1005756416,
+      "cgroupCurrentBytes": 240939008,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 8.56,
+      "final": {
+        "availableKiB": 7173520,
+        "swapUsedKiB": 0
+      }
+    }
+  ],
+  "userVerification": {
+    "runtime": "trae-cn-cli",
+    "linuxStatus": "passed",
+    "verificationSource": "user_reported_other_host",
+    "localTesting": "stopped_at_user_request",
+    "scope": "Linux support confirmed by maintainer on another machine; this host integration attempt remains failed in its original report",
+    "otherHostVersion": null
+  }
+}

@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "macos-arm64-deepseek-harness-v1",
+  "capturedAt": "2026-09-15",
+  "platform": "macos-arm64",
+  "hostEnvelope": {
+    "os": "macOS 26.3",
+    "build": "25D125",
+    "architecture": "arm64"
+  },
+  "baseRevision": "d8d6dc6068ddc8eefa2adb8ec5e15cc683663ddc",
+  "qualifiedRuntimeKinds": [
+    "deepseek-harness"
+  ],
+  "runtimeEvidence": {
+    "runtimeVersion": "0.1.5-rc.2",
+    "minimumVersion": ">=0.1.5-rc.2",
+    "protocol": "acp-v1",
+    "bridgeVersion": "0.0.1",
+    "launch": "dsh --profile acp --patch <private-rovai-patch>",
+    "package": "@deepseek-ai/dsh@0.1.5-rc.2",
+    "packageIntegrity": "sha512-8Xc8hCQHcIWRmTCVU/xZdp6/qMsWMeAd2ObChKDEsfhUPJFXx6H0lgeb1DxUMD86HZrrVN+1bCvn1ppjZ/fOxw==",
+    "authentication": "Native DSH configuration; official DeepSeek Flash and user-authorized MiniMax-M3 BYOK through llm-pi-ai / Anthropic-compatible API",
+    "executableFingerprint": "sha256:0ff7f1d72c4e0cbe14001709c81e20a04b70464118a7f78568952988e28f2ac5"
+  },
+  "acceptance": {
+    "status": "qualified",
+    "platformScope": "macos-arm64 only",
+    "referenceMatrix": "docs/research/deepseek-harness-runtime/acp-0.1.5-parity.md",
+    "axes": {
+      "authProviderModel": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native DSH settings/profile; real official DeepSeek and MiniMax BYOK generation; native default and explicit opaque catalog selection; missing credentials are non-retryable authentication failures; profile/credentials/settings changes fence reuse."
+      },
+      "hostFleetLru": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Shared resident_multi_session Fleet; same-Host warm, native A/B/A, concurrent distinct Hosts and Sessions, exact switch-back; production idle eviction after 1845641 ms and exact resume on a new Host; Core crash and planned shutdown reap all observed descendants."
+      },
+      "nativeSessionContinuation": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Exact warm, Host restart and Core cold resume; compacted Session restoration; zero history Action/Approval replay; invalid persisted identity produces one continuity-lost event and one replacement Session."
+      },
+      "bootstrapContext": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Official systemPrompt section and one-pass variable expansion read exact Session-bound SHA-256-verified private Bootstrap bytes at every model step. A/B/A, cold and compact retain identity; native child agents do not inherit Camp member self identity."
+      },
+      "compactionContinuity": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native manual, pressure, context-overflow, automatic threshold and one controlled overflow plus real automatic retry; generation 0 to 5; fail/cancel retain generation. Seven checkpoints each load a fresh Skill marker and call actual MCP with one approval; final denial has zero effects."
+      },
+      "skills": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Real native discovery/invocation, managed import, same-name conflict preservation, update/delete/disable/restart; existing delivery group and additive native/project directories."
+      },
+      "externalMcp": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Real native provider calls assigned stdio and HTTP servers; whole-definition RovaiWins collision; update retires old Host and resumes exact Session; adjacent isolation, unassign/reassign/delete and native restoration; allow once one effect, deny/cancel/read-only zero effects."
+      },
+      "toolActionCommandOutput": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Real stdout, stderr, mixed, empty, nonzero and oversized output in runtime.action; stable call identity, canonical read/add/edit/empty-file paths. Official tools/result supplies exit/signal/timeout; nonzero exit is failed and public output truncates at 4 KiB."
+      },
+      "narrationFinalMissingSend": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Committed ACP public/thought distinction and authoritative end_turn; real zero-send recovery publication, accepted-send suppression and tool-to-final cases."
+      },
+      "permissionApprovalWorkspace": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "All six frozen sandbox/approval combinations; real workspace-write file/Bash inside success and outside refusal; read-only refusal; MCP allow/deny/cancel and Shell cancellation with 32-second no-late-write observation."
+      },
+      "builtinRovaiCli": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Current contract-v24 all 23 operations, 70 evidence rows and 35 samples through native Bash and bundled CLI; three input sources, exact addressing, Gather, history/attachments, initial and successor Run lease fencing."
+      },
+      "usageCacheCost": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Official committed per-call fields use exclusive cache buckets; context occupancy is separate. Automatic summary usage is correlated through compaction/start ID and owner turn. Independent native observer versus Core database matches each Run and total across two warm turns plus cold continuation: four calls including one summary, no replay. Missing cache-write/reasoning/cost remain unknown as reported."
+      },
+      "retryQueueCancelCleanup": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Shared accepted-input, queue and lease owner; quota/credential failures do not retry blindly; native overflow owns its retry; cancelled approvals and running Shell do not produce late effects; Core crash, idle eviction and planned shutdown clean process trees."
+      },
+      "readyVersionPlatform": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "CLI minimum 0.1.5-rc.2 separated from ACP bridge 0.0.1; executable fingerprint, initialize/new/exact resume and real grouped model catalog. This artifact qualifies only macOS arm64; each machine still needs normal installation/model/Session readiness checks."
+      }
+    },
+    "idleEviction": {
+      "passed": true,
+      "elapsedMs": 1845641,
+      "descendantsReaped": 1,
+      "exactResume": true
+    },
+    "usageReconciliation": {
+      "passed": true,
+      "warm": {
+        "runs": 2,
+        "nativeCalls": 3,
+        "automaticSummaryCalls": 1,
+        "totals": {
+          "uncached_input_tokens": 39168,
+          "output_tokens": 479,
+          "cache_read_tokens": 7040
+        },
+        "bucketsMatch": true,
+        "perRunAttributionMatches": true
+      },
+      "cold": {
+        "runs": 3,
+        "nativeCalls": 4,
+        "automaticSummaryCalls": 1,
+        "totals": {
+          "uncached_input_tokens": 39550,
+          "output_tokens": 485,
+          "cache_read_tokens": 16512
+        },
+        "bucketsMatch": true,
+        "perRunAttributionMatches": true
+      },
+      "exactColdResume": true,
+      "noReplay": true
+    },
+    "regression": {
+      "rustLib": {
+        "passed": 813,
+        "ignored": 6
+      },
+      "rustCli": {
+        "passed": 35
+      },
+      "rustSlow": {
+        "passed": 310
+      },
+      "vitest": {
+        "passedFiles": 204,
+        "passedTests": 2072,
+        "commandOptions": "--maxWorkers=1 --testTimeout=15000 --expect.poll.timeout=15000"
+      },
+      "latestFocusedUsageAuthAndConfiguration": "passed",
+      "nodeObserverAndMissingSend": "7 passed",
+      "clippyAllTargetsDenyWarnings": "passed",
+      "rustfmt": "passed",
+      "typecheck": "passed",
+      "webAndDesktopBuild": "passed",
+      "documentationGovernanceCheckpoint": "passed"
+    }
+  },
+  "privateLogSha256": {
+    "core": "d8b172e9d81a91a890c22b62d498dcccc892dbfea540828fcadf164905be682d",
+    "command3": "812c4e59c278964ccce0a083c8b848ddca1443a8622eefc7109a5e1fb5767692",
+    "native7": "20965d1f583bcae2baf3126ed42a476908e77f8c971672d75ca02807265d18df",
+    "skills3": "67dcf7a42de1fcbffdb3ed19c1071b96fb9da79c46c80ad56c766805c5ef595e",
+    "builtin2": "13d177796cc734e4ff27c3ec0070a6f5db92dfa942bc0aaf2649474456239e83",
+    "mcp2": "0a73c6f528a47e7e6578532e49fa8e12697a39e3364b9e375d14852a346c3432",
+    "mcp4-scripted": "a77dc5d6218843ed7dfa454d87f5946568e0db45997c9c23f8de8861954f97fe",
+    "minimax-command2": "be834162dd3880fd21ea26c66eae5aec692041c3a30145b61da81102ef535aba",
+    "minimax-cold": "0547d988569c84c04cdccbb1bac02ad2d9ee34412ec37b574a10f00888ae13c8",
+    "minimax-missing2": "11f3826d57a0b7dae7db0c1cd3115285106c3150bc6a3e1f656f8b9088bf8476",
+    "minimax-native2": "6c5dce9d72748f91c8de1c543ace2b21ae98965bc154b2ab4e5021fcc651d945",
+    "minimax-mcp2": "a395c16e5202ef672dd0b24ddba7513755356c4e5ef1a014ae5278f7ce46d346",
+    "minimax-safety3": "910ca3072ae46cdca5c31be7d9cf5d6571f5f6243c36efe9d723c834d7775982",
+    "minimax-explicit2": "e4c155f5d7b73d32fc0ea62f615f9149b70a1a7e8ea926f5ac66eab5bc60aaae",
+    "minimax-native3": "d61e72cff48c8f30c6b4bf832c99531662df21e4fd25df6f7ee4440eb5c59fce",
+    "minimax-keyless2-error": "eb39c74127be9cb965888b65757e775b53bc9a56eb89a50729f4eff4472e5505",
+    "minimax-usage2": "5ae2818a32cd574f5382a9e961585f36f845b2c5d2b14ea824f833c46d55e485",
+    "minimax-usage3": "ce21495ab72a54a20bdf0ee8c1f8b1098b73a083b5e8af6e1780513acd653e36",
+    "minimax-fleet4": "6a99d3b0a142cdbc66c26aaecc1a7e3d15ded2c914b8681dc402d5cda1f8a245"
+  },
+  "limitations": [
+    "No macOS x64, Windows x64 or Linux x64 qualification is inferred.",
+    "ACP has no session/load, additionalDirectories, manual compact command, compaction lifecycle, MCP SSE/resources/prompts or client filesystem/terminal bridge. Exact resume, persistent native System prompt and native tools implement the accepted product behavior.",
+    "Overflow acceptance injects one context-window error at the official llm/stream seam and exercises the real native summarizer and automatic retry. It does not claim a naturally exhausted provider window.",
+    "Idle manual compaction has no active native turn and is not attributed to the next AgentRun. Automatic summary usage is correlated through its durable compaction/start owner. Missing token fields and cost remain unknown.",
+    "Credentials, raw prompts, local machine paths, Session IDs and Run IDs are excluded from this qualification artifact."
+  ],
+  "qualificationBasis": {
+    "type": "reproducible-target-host-golden-flows",
+    "decision": "All 14 Runtime integration axes are verified on macOS arm64; upstream ACP interface differences are accepted by V1.59-D08. This is Adapter behavior qualification, not a packaged application release or a cross-platform claim.",
+    "versionDecision": "docs/versions/v1.59/decisions.md#v1-59-d08"
+  },
+  "implementationSourceSha256": {
+    "crates/rovai-core/src/dsh.rs": "4332983897051924f957f6284e7a208377028bd67e1fb634df25db621a31b3ee",
+    "crates/rovai-core/src/dsh/bootstrap.mjs": "12a40a53fd772e41bbfa6394c5b62fbc759dc7e91aa1c217af49d58445cab8d8",
+    "crates/rovai-core/src/acp.rs": "e5d13baa204ebade278061c60e64844de2595e55162f752d18309b9fb67fdacc",
+    "crates/rovai-core/src/runtime_fleet.rs": "4dd4274e7ff80092c716c6b26b894509ada6f03161ba34ffecbc50342bb986ec",
+    "crates/rovai-core/src/monitoring.rs": "97f574ba8fe19b998966ee1bca94267af7769f7d68d765b561b72b125955d12c",
+    "crates/rovai-core/src/runtime_failure.rs": "372af77cf7a6b044d345c49443451a3800fca2cccac63a8a3f1f232e39884708",
+    "scripts/probe-dsh-runtime.mjs": "23f190d09e8f1667b60a8a03d82b5e0c5ef7bf5b3d8e57307e3313a471068346",
+    "scripts/smoke-dsh-fleet.mjs": "46468902f05ba27bcc0c72eb7111d858a832fef7b4eeac7eb9d9a7d4d7727ba9",
+    "scripts/smoke-dsh-safety.mjs": "b870ad050921dddb46ac7bd9d8aa756cb48231600d992406f29247560f182d92",
+    "scripts/smoke-dsh-usage.mjs": "b7552aeb796e8d6716b1a4646168db3094620f5bcf90f3d7202bae715344416f",
+    "scripts/smoke-mcp-projection.mjs": "c875e1cdb6a8f60e0f1087ff33d0c3b877527b500a1bdce37c94faf02286e660"
+  },
+  "notQualified": [
+    {
+      "platform": "macos-x64",
+      "reason": "No DSH target-host qualification evidence"
+    },
+    {
+      "platform": "windows-x64",
+      "reason": "No DSH target-host qualification evidence"
+    },
+    {
+      "platform": "linux-x64",
+      "reason": "No DSH target-host qualification evidence"
+    }
+  ]
+}

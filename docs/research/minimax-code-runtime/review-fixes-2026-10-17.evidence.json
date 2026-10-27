@@ -1,0 +1,171 @@
+{
+  "schemaVersion": 1,
+  "observedAt": "2026-10-16T16:23:16.868036+00:00",
+  "baseCommit": "af13c2fc4d28c14878efa61e2a8a52b93c781abf",
+  "implementation": "changes accompanying this evidence on rovai/minimax-code-acp",
+  "runtime": {
+    "package": "@minimax-ai/code",
+    "version": "0.6.12",
+    "platform": "macos-arm64",
+    "admission": "preview"
+  },
+  "scope": {
+    "productionCore": true,
+    "realCli": true,
+    "realLlmThisRevision": false,
+    "provider": "deterministic loopback Chat Completions",
+    "officialAccountConfigChanged": false,
+    "previousDevAppPreserved": true,
+    "devAppUpdatedThisRevision": false
+  },
+  "questionnaire": {
+    "productDefaultChanged": false,
+    "toolCatalogStillExposesAskUser": true,
+    "permissionFallbackGuard": "implemented; ordinary Approval/bypass never selects questionnaire answers",
+    "simpleSingleSelectRegression": "passed; synthetic native option shape, not claimed as a new live upstream invocation",
+    "primaryHideStatus": "blocked: no official ACP process/session-local config or tool-exclusion entry point in 0.6.12"
+  },
+  "completion": {
+    "cases": [
+      {
+        "case": "SEND_EMPTY",
+        "runId": "5671eefa-968d-4c3e-9f91-90b5429fc42f",
+        "status": "succeeded",
+        "errorCode": null,
+        "publicMessageCount": 1,
+        "publicFailure": null
+      },
+      {
+        "case": "AFTER_EMPTY",
+        "runId": "79327778-9b49-4178-bf98-41772fa8eee8",
+        "status": "succeeded",
+        "errorCode": null,
+        "publicMessageCount": 1,
+        "publicFailure": null
+      },
+      {
+        "case": "EMPTY_NO_SEND",
+        "runId": "6d944f27-3c0c-408b-aeaf-1cb752bf38bb",
+        "status": "failed",
+        "errorCode": "runtime_missing_final_output",
+        "publicMessageCount": 0,
+        "publicFailure": {
+          "code": "runtime_missing_final_output",
+          "summary": "MiniMax Code 未能完成运行",
+          "retryable": false
+        }
+      },
+      {
+        "case": "SEND_ERROR",
+        "runId": "a8a3818f-5aa6-4151-9842-0225c764b7a4",
+        "status": "failed",
+        "errorCode": "runtime_prompt_runtime_error",
+        "publicMessageCount": 1,
+        "publicFailure": {
+          "code": "runtime_prompt_runtime_error",
+          "summary": "消息已发送，但运行结束校验失败",
+          "retryable": false
+        }
+      }
+    ],
+    "sameHostFollowup": "passed; same conversation only, not cross-session A-B-A or concurrency",
+    "nativeTerminalEvidence": "production ACP completion admission plus committed Core facts; no claim that the prior seq17 failure raw response was newly recovered"
+  },
+  "usage": {
+    "firstAttempt": {
+      "terminalCases": "passed",
+      "shortRun": "AFTER_EMPTY all fields missing; direct display/canonical ID comparison invalid"
+    },
+    "finalAttempt": {
+      "status": "passed",
+      "shortRun": {
+        "prompt_input_total_tokens": 120,
+        "output_tokens": 5,
+        "usage_quality": "runtime_reported_partial"
+      },
+      "runs": [
+        {
+          "agent_run_id": "5671eefa-968d-4c3e-9f91-90b5429fc42f",
+          "uncached_input_tokens": 100,
+          "cache_read_tokens": 20,
+          "cache_write_tokens": 0,
+          "output_tokens": 5,
+          "usage_quality": "runtime_reported_partial"
+        },
+        {
+          "agent_run_id": "79327778-9b49-4178-bf98-41772fa8eee8",
+          "uncached_input_tokens": 100,
+          "cache_read_tokens": 20,
+          "cache_write_tokens": 0,
+          "output_tokens": 5,
+          "usage_quality": "runtime_reported_partial"
+        },
+        {
+          "agent_run_id": "6d944f27-3c0c-408b-aeaf-1cb752bf38bb",
+          "uncached_input_tokens": null,
+          "cache_read_tokens": null,
+          "cache_write_tokens": null,
+          "output_tokens": null,
+          "usage_quality": null
+        },
+        {
+          "agent_run_id": "a8a3818f-5aa6-4151-9842-0225c764b7a4",
+          "uncached_input_tokens": 100,
+          "cache_read_tokens": 20,
+          "cache_write_tokens": 0,
+          "output_tokens": 5,
+          "usage_quality": "runtime_reported_partial"
+        }
+      ]
+    },
+    "ownership": "frozen ACP display IDs -> exact root Session native canonical_message_id and turn_id -> journal identity; old baseline and next turn excluded",
+    "maxAttempts": 3,
+    "maxAcceptedLatencyMs": 1500,
+    "businessTerminalWaits": false,
+    "completeness": "partial when observed; unknown when absent; not a complete bill"
+  },
+  "verification": {
+    "targetedOwners": [
+      "acp::tests::approval_selects_the_exact_native_option_id",
+      "acp::tests::final_agent_message_uses_complete_assistant_suffix_after_last_tool_activity",
+      "application::tests::acp_prompt_failure_is_retryable_only_when_input_was_not_accepted",
+      "team_tool::tests::slow_tests::accepted_send_suppresses_missing_send_recovery_for_recipient_matrix",
+      "native_usage::tests::native_cursor_excludes_history_replays_partial_lines_and_file_resets",
+      "monitoring::tests::call_normalization_and_request_counts_do_not_depend_on_flush_partition"
+    ],
+    "newStandaloneRustTests": 0,
+    "nativeSmoke": "passed",
+    "rustPrGate": {
+      "status": "passed",
+      "passed": 473,
+      "ignored": 1,
+      "command": "pnpm test:rust:pr"
+    },
+    "documentationGates": {
+      "status": "passed",
+      "tests": 10,
+      "commands": [
+        "pnpm docs:test",
+        "pnpm docs:check",
+        "DOCS_BASE_REF=af13c2fc4d28c14878efa61e2a8a52b93c781abf pnpm docs:check:ci"
+      ]
+    },
+    "correctedFailures": [
+      "exact send query initially used nonexistent agent_run.agent_id; corrected to conversation owner",
+      "terminal Usage initially compared different native ID namespaces; corrected to explicit native mapping",
+      "compatibility evidence digest initially stale after register update; synced to final source bytes"
+    ]
+  },
+  "preservedBoundaries": {
+    "fast": false,
+    "newAuthProviderDigest": false,
+    "startupSystemPromptHostFence": "unchanged",
+    "preciseResume": "unchanged",
+    "configRefreshRegression": "rerun A/B if per-run permissionMode setter is optimized or mcode upgraded",
+    "automaticCompact": "prior verified 64K threshold path retained",
+    "manualCompactColdResume": "prior evidence retained",
+    "builtinCli": "prior 21/29 subset only",
+    "fullSkillsMcpConflictHttpFaultMatrix": "not qualified",
+    "crossSessionAndConcurrency": "not qualified"
+  }
+}

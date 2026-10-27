@@ -1,0 +1,123 @@
+{
+  "sourceCommit": "448c234f9163c58f9cb122114453131e7764e15c",
+  "packageManifestSha256": "d06610be60674bf90b6cd2a5516ddfb41525a3b479752535a1e6abab0d53e9ed",
+  "status": "passed",
+  "checks": [
+    "https_ui_and_certificate",
+    "anonymous_api_rejected",
+    "administrator_login",
+    "app.info",
+    "health.check",
+    "navigation.snapshot",
+    "execution_subsystems_ready_under_umask_077",
+    "systemd_restart",
+    "persisted_administrator_token",
+    "persisted_browser_session"
+  ],
+  "minimumAvailableKiB": 7323772,
+  "maximumSwapUsedKiB": 0,
+  "processBeforeRestart": "86320",
+  "processAfterRestart": "86453",
+  "service": [
+    "Restart=no",
+    "MemoryCurrent=318758912",
+    "MemoryPeak=319016960",
+    "MemoryMax=4294967296",
+    "ActiveState=active",
+    "SubState=running"
+  ],
+  "endpoint": "public_https",
+  "physicalPhoneVerified": false,
+  "browser": {
+    "viewport": {
+      "width": 390,
+      "height": 844
+    },
+    "sessionRestoredAfterUpgrade": true,
+    "reply": "\u8fde\u63a5\u6210\u529f",
+    "runs": [
+      {
+        "id": "d97b1365-25df-4679-99b5-a5b397bb53b8",
+        "status": "succeeded"
+      },
+      {
+        "id": "7935340c-e618-44c5-9526-51a2ab4411fd",
+        "status": "cancelled"
+      }
+    ]
+  },
+  "subsystems": [
+    {
+      "id": "attachments",
+      "state": "ready"
+    },
+    {
+      "id": "builtin-tools",
+      "state": "ready"
+    },
+    {
+      "id": "maintenance",
+      "state": "ready"
+    },
+    {
+      "id": "mcp",
+      "state": "ready"
+    },
+    {
+      "id": "skills",
+      "state": "ready"
+    }
+  ],
+  "serviceFinal": [
+    "Restart=no",
+    "MemoryCurrent=346521600",
+    "MemoryPeak=785711104",
+    "MemoryMax=4294967296",
+    "ActiveState=active",
+    "SubState=running"
+  ],
+  "serviceMemoryEvents": {
+    "low": "0",
+    "high": "0",
+    "max": "0",
+    "oom": "0",
+    "oom_kill": "0",
+    "oom_group_kill": "0"
+  },
+  "memoryGuard": {
+    "name": "server-os-448c234f",
+    "initial": {
+      "availableKiB": 7487564,
+      "swapUsedKiB": 0
+    },
+    "minimumAvailableKiB": 7472704,
+    "peakTestUserRssKiB": 57372,
+    "maximumSwapUsedKiB": 0,
+    "status": "passed",
+    "initialCgroupEvents": {
+      "low": 0,
+      "high": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0,
+      "oom_group_kill": 0
+    },
+    "finalCgroupEvents": {
+      "low": 0,
+      "high": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0,
+      "oom_group_kill": 0
+    },
+    "cgroupPeakBytes": 32751616,
+    "cgroupCurrentBytes": 32751616,
+    "exitCode": 0,
+    "reason": null,
+    "elapsedSeconds": 3.02,
+    "final": {
+      "availableKiB": 7474148,
+      "swapUsedKiB": 0
+    }
+  }
+}

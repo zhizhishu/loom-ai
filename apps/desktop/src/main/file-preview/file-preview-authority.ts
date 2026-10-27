@@ -1,0 +1,145 @@
+import { dirname, isAbsolute } from 'node:path'
+import type { CoreMethod, OpenFilePreviewRequest } from '@contracts'
+import {
+  parseDesktopAttachmentTarget,
+  type DesktopAttachmentTarget
+} from '../attachment-desktop'
+import type {
+  FilePreviewAuthorityResult,
+  FilePreviewSourceAuthority
+} from './file-preview-service'
+
+interface CoreRequester {
+  request<T>(method: CoreMethod, params?: unknown): Promise<T>
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function boundedString(value: unknown, maximum = 4_096): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= maximum
+    && !value.includes('\0')
+}
+
+export function parseCoreFilePreviewAuthorityResult(
+  value: unknown,
+  request: Exclude<OpenFilePreviewRequest, { kind: 'child_of_handle' | 'authorized_root' | 'attachment' }>
+): FilePreviewAuthorityResult | null {
+  if (!isObject(value) || value.threadId !== request.threadId) return null
+  if (value.kind === 'evidence_review' && request.kind === 'run_evidence') {
+    if (
+      value.agentRunId !== request.agentRunId
+      || value.executionEpoch !== request.executionEpoch
+      || value.evidenceFileId !== request.evidenceFileId
+    ) return null
+    return {
+      kind: 'evidence_review',
+      threadId: request.threadId,
+      agentRunId: request.agentRunId,
+      executionEpoch: request.executionEpoch,
+      evidenceFileId: request.evidenceFileId
+    }
+  }
+  if (value.kind === 'evidence_identity_unavailable' && request.kind === 'run_evidence') {
+    if (
+      value.agentRunId !== request.agentRunId
+      || value.executionEpoch !== request.executionEpoch
+      || value.evidenceFileId !== request.evidenceFileId
+    ) return null
+    return {
+      kind: 'evidence_identity_unavailable',
+      threadId: request.threadId,
+      agentRunId: request.agentRunId,
+      executionEpoch: request.executionEpoch,
+      evidenceFileId: request.evidenceFileId
+    }
+  }
+  if (
+    value.kind !== 'file_target'
+    || value.sourceKind !== request.kind
+    || !boundedString(value.sourceIdentity, 512)
+    || !boundedString(value.rootPath)
+    || !boundedString(value.basePath)
+    || !isAbsolute(value.rootPath)
+    || !isAbsolute(value.basePath)
+    || value.allowChildren !== true
+  ) return null
+  if (request.kind === 'run_evidence') {
+    if (value.sourceKind !== 'run_evidence' || !boundedString(value.rawReference)) return null
+  } else if (value.rawReference !== request.rawReference) return null
+  return {
+    kind: 'file_target',
+    threadId: request.threadId,
+    sourceKind: request.kind,
+    sourceIdentity: value.sourceIdentity,
+    rootPath: value.rootPath,
+    basePath: value.basePath,
+    rawReference: value.rawReference,
+    allowChildren: true
+  }
+}
+
+function attachmentAuthorityTarget(
+  request: Extract<OpenFilePreviewRequest, { kind: 'attachment' }>,
+  target: DesktopAttachmentTarget
+): FilePreviewAuthorityResult {
+  const locator = request.locator
+  const ownerIdentity = locator.owner === 'message'
+    ? `${locator.owner}:${locator.messageId}`
+    : locator.owner === 'pending' || locator.owner === 'pending_edit'
+      ? `${locator.owner}:${locator.pendingInputId}`
+      : locator.owner === 'single_chat_message'
+        ? `${locator.owner}:${locator.conversationId}:${locator.conversationMessageId}`
+        : locator.owner === 'single_chat_pending' || locator.owner === 'single_chat_pending_edit'
+          ? `${locator.owner}:${locator.conversationId}:${locator.pendingInputId}`
+          : locator.owner === 'single_chat_composer'
+            ? `${locator.owner}:${locator.conversationId}`
+            : locator.owner
+  return {
+    kind: 'file_target',
+    threadId: request.threadId,
+    sourceKind: request.kind,
+    sourceIdentity: `attachment:${ownerIdentity}:${target.attachmentId}`,
+    rootPath: dirname(target.path),
+    basePath: dirname(target.path),
+    candidatePath: target.path,
+    displayName: target.displayName,
+    openRisk: target.openRisk,
+    canShowPath: target.canShowPath,
+    allowChildren: true
+  }
+}
+
+export class CoreFilePreviewSourceAuthority implements FilePreviewSourceAuthority {
+  constructor(
+    private readonly core: CoreRequester,
+    private readonly resolveLocalAttachment?: (
+      locator: Extract<OpenFilePreviewRequest, { kind: 'attachment' }>['locator']
+    ) => Promise<DesktopAttachmentTarget | null>
+  ) {}
+
+  async resolve(
+    request: Exclude<OpenFilePreviewRequest, { kind: 'child_of_handle' | 'authorized_root' }>
+  ): Promise<FilePreviewAuthorityResult | null> {
+    if (request.kind === 'attachment') {
+      if (request.locator.owner === 'composer' && this.resolveLocalAttachment) {
+        const target = await this.resolveLocalAttachment(request.locator)
+        return target ? attachmentAuthorityTarget(request, target) : null
+      }
+      const value = await this.core.request<unknown>(
+        'thread.attachments.desktopOpenTarget' as CoreMethod,
+        request.locator
+      )
+      const target = parseDesktopAttachmentTarget(value, request.locator.attachmentRefId)
+      return target ? attachmentAuthorityTarget(request, target) : null
+    }
+    const value = await this.core.request<unknown>(
+      'filePreview.resolveSource' as CoreMethod,
+      request
+    )
+    return parseCoreFilePreviewAuthorityResult(value, request)
+  }
+}

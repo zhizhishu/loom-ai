@@ -1,0 +1,51 @@
+[package]
+name = "rovai-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+extended-tests = []
+slow-tests = ["extended-tests"]
+legacy-migration-tests = ["slow-tests"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+croner = "4.0.0"
+comrak = { version = "=0.48.0", default-features = false }
+dirs = "6"
+dunce = "1.0.5"
+getrandom = "0.3"
+gif = "0.14"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
+json5 = "0.4"
+rusqlite = { version = "0.40.2", features = ["backup", "bundled", "functions"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+toml = "0.9"
+toml_edit = "0.25"
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+url = "2"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+rusqlite = { version = "0.40.2", features = ["hooks"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }

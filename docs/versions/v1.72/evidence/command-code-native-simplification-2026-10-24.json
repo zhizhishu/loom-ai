@@ -1,0 +1,2592 @@
+{
+  "scope": "Command Code native HOME + official Mod + ACP integration; not platform or App qualification",
+  "date": "2026-10-24",
+  "commandCodeVersion": "1.88.0",
+  "model": "sub2api/gpt-6-sol",
+  "officialCliSha256": "600725f967cc98f6144066c24e850d934bd4a1f503c3bf82f2bd2584a8757dfd",
+  "bootstrapModSha256": "e2e2de75da58e8568313ddf2b91eb6a7a7877877f32415644b55884f6f115b25",
+  "nativeContract": {
+    "nativeNameWins": true,
+    "stdioCustomCwdCorrect": true,
+    "rawAcpLiteralChangedByNativeExpansion": true,
+    "onceEscapedEnvAndHeadersArrivedUnchanged": true,
+    "nonexistentLoadAndResumeAccepted": true,
+    "coldExactIdPrecheckStillRequired": true
+  },
+  "realMcp": {
+    "version": "1.88.0",
+    "criterion": "native codemode target call + actual MCP tools/call + unpredictable receipt in subsequent provider input and final ACP answer",
+    "cases": [
+      {
+        "case": "acp-stdio",
+        "sessionId": "503304e0-eabc-409f-8a91-673878e918a6",
+        "foregroundProviderRequests": 3,
+        "foregroundHttp200AndParsed": true,
+        "modelIds": [
+          "gpt-6-sol"
+        ],
+        "directTargetSchemaCount": 0,
+        "codemodeTargetCalls": [
+          {
+            "id": "call_8ffeb04395904130b5e4a7ca9ff0992d",
+            "targetReferenced": true,
+            "codeSha256": "c2e40c80c3f3e2850bd0b607f3f57a50ab586438b961249241a87788d949d4d9",
+            "requestId": 2,
+            "argumentsSha256": "079773efc0c536990e1d2f965d98e0ace31df26b54343d20898a36f18910d3d2"
+          }
+        ],
+        "mcpInitialized": true,
+        "mcpDiscovered": true,
+        "serverTargetCalls": 1,
+        "issuedReceipts": [
+          "RCP_073a276c-ea54-4ebf-87c1-49557a66811f"
+        ],
+        "finalRoundtripReceipts": [
+          "RCP_073a276c-ea54-4ebf-87c1-49557a66811f"
+        ],
+        "bootstrapReadyMatched": true,
+        "bootstrapExactlyOnceInEveryForegroundSystemAndAbsentFromUser": true,
+        "auxiliaryRequestsWithoutTools": 1,
+        "auxiliaryAbortedDuringHarnessShutdown": 1,
+        "fullChainPassed": true
+      },
+      {
+        "case": "acp-http",
+        "sessionId": "9828a505-ca0d-45fc-b511-bc49d3805e13",
+        "foregroundProviderRequests": 3,
+        "foregroundHttp200AndParsed": true,
+        "modelIds": [
+          "gpt-6-sol"
+        ],
+        "directTargetSchemaCount": 0,
+        "codemodeTargetCalls": [
+          {
+            "id": "call_63805d0943d743a4ae8a418f7af94569",
+            "targetReferenced": true,
+            "codeSha256": "c2e40c80c3f3e2850bd0b607f3f57a50ab586438b961249241a87788d949d4d9",
+            "requestId": 2,
+            "argumentsSha256": "079773efc0c536990e1d2f965d98e0ace31df26b54343d20898a36f18910d3d2"
+          }
+        ],
+        "mcpInitialized": true,
+        "mcpDiscovered": true,
+        "serverTargetCalls": 1,
+        "issuedReceipts": [
+          "RCP_701cbb8d-1dc7-4b85-b5b7-dfd5d931d20d"
+        ],
+        "finalRoundtripReceipts": [
+          "RCP_701cbb8d-1dc7-4b85-b5b7-dfd5d931d20d"
+        ],
+        "bootstrapReadyMatched": true,
+        "bootstrapExactlyOnceInEveryForegroundSystemAndAbsentFromUser": true,
+        "auxiliaryRequestsWithoutTools": 0,
+        "auxiliaryAbortedDuringHarnessShutdown": 0,
+        "fullChainPassed": true
+      }
+    ]
+  },
+  "continuity": {
+    "originalSession": "1a406534-ada3-4fef-a3af-4f0fffcae3d5",
+    "model": "sub2api/gpt-6-sol",
+    "cases": [
+      {
+        "case": "cold-1-load",
+        "version": "1.88.0",
+        "readyMatched": true,
+        "exactTargetListed": true,
+        "pid": 54799,
+        "selectedModel": "sub2api/gpt-6-sol",
+        "savedModelPreserved": true
+      },
+      {
+        "case": "cold-1-recall",
+        "stopReason": "end_turn",
+        "pid": 54799,
+        "receiptMatched": true,
+        "responseSha256": "2e6ffbed1445aa067b901683a5f4fcf54f69cf57c0d14ad7dd8867ca07664ac5"
+      },
+      {
+        "case": "warm-recall",
+        "stopReason": "end_turn",
+        "pid": 54799,
+        "receiptMatched": true,
+        "responseSha256": "2e6ffbed1445aa067b901683a5f4fcf54f69cf57c0d14ad7dd8867ca07664ac5"
+      },
+      {
+        "case": "cold-2-load",
+        "version": "1.88.0",
+        "readyMatched": true,
+        "exactTargetListed": true,
+        "pid": 54866,
+        "selectedModel": "sub2api/gpt-6-sol",
+        "savedModelPreserved": true
+      },
+      {
+        "case": "cold-2-recall",
+        "stopReason": "end_turn",
+        "pid": 54866,
+        "receiptMatched": true,
+        "responseSha256": "2e6ffbed1445aa067b901683a5f4fcf54f69cf57c0d14ad7dd8867ca07664ac5"
+      }
+    ],
+    "modelSelectionOverriddenOnLoad": false
+  },
+  "coldMcpReplacement": {
+    "initialHarnessDeniedPermission": {
+      "originalSession": "1a406534-ada3-4fef-a3af-4f0fffcae3d5",
+      "model": "sub2api/gpt-6-sol",
+      "cases": [
+        {
+          "case": "cold-1-load",
+          "version": "1.88.0",
+          "readyMatched": true,
+          "exactTargetListed": true,
+          "pid": 60588,
+          "selectedModel": "sub2api/gpt-6-sol",
+          "savedModelPreserved": true
+        },
+        {
+          "case": "cold-with-replaced-mcp",
+          "stopReason": "end_turn",
+          "pid": 60588,
+          "receiptMatched": false,
+          "actualCalls": 0,
+          "transportChangedFrom": "stdio",
+          "transportChangedTo": "http",
+          "responseSha256": "eb0be6d636d52794e3ab5c50e7ef17aac1235da10f904ab59fbe8b9c73c30cf9"
+        }
+      ],
+      "modelSelectionOverriddenOnLoad": false,
+      "passed": false
+    },
+    "afterApplyingProductionPermissionRpc": {
+      "originalSession": "1a406534-ada3-4fef-a3af-4f0fffcae3d5",
+      "model": "sub2api/gpt-6-sol",
+      "cases": [
+        {
+          "case": "cold-1-load",
+          "version": "1.88.0",
+          "readyMatched": true,
+          "exactTargetListed": true,
+          "pid": 60978,
+          "selectedModel": "sub2api/gpt-6-sol",
+          "savedModelPreserved": true
+        },
+        {
+          "case": "cold-with-replaced-mcp",
+          "stopReason": "end_turn",
+          "pid": 60978,
+          "receiptMatched": true,
+          "actualCalls": 1,
+          "transportChangedFrom": "stdio",
+          "transportChangedTo": "http",
+          "responseSha256": "9484e8645c7cf130ae2fdd9fcef44dde06aa1ce468d2402baafe2b720c830c0d"
+        }
+      ],
+      "modelSelectionOverriddenOnLoad": false,
+      "initialPermissionMode": "default",
+      "permissionModeAppliedViaRpc": "bypass",
+      "passed": true
+    }
+  },
+  "cleanup": {
+    "fixtureRemoved": true,
+    "remainingFixtureProcesses": [],
+    "removed": "Entire isolated fixture, including copied auth/providers and native session history",
+    "dailyInstallationChanged": false,
+    "dailyNativeHomeChangedByAdapter": false
+  },
+  "qualificationChanged": false,
+  "followupControlBoundaryRegression": {
+    "baseRevision": "9e9ebbcb89759b8b0ff9cbc93e7daa22e147b574",
+    "targetedRust": {
+      "passed": 42,
+      "failed": 0,
+      "ignored": 1,
+      "ignoredReason": "existing real-account Command Code smoke; no native fixture in this rerun"
+    },
+    "covered": [
+      "shared ACP cold callback is skipped for warm Host and rejects cold before process/material creation",
+      "Command installation admission ignores missing path/generation observations but preserves disabled/missing installation rejection",
+      "cold entry refresh adopts current fingerprint and preserves model, permissions and installation ID; stale version observation is cleared",
+      "MCP dispatcher retires only affected Command members; conflicts and no-op writes preserve all Hosts",
+      "MCP membership old/new union; update, enable, assignment, delete and import mutation facts",
+      "shared Fleet cancellation, startup, reap, owner scope; immutable binding and legacy-digest continuity"
+    ],
+    "realModelAndMcpRerun": false,
+    "newProductionFiles": 0,
+    "bindingLayoutChanged": false,
+    "review": {
+      "standards": {
+        "found": 1,
+        "fixed": 1,
+        "open": 0,
+        "issue": "started runtimeVersion must come from actual Host"
+      },
+      "spec": {
+        "open": 0
+      }
+    },
+    "firstAttempts": [
+      {
+        "fixtureExpectation": "setMembers enables the server; disabling it is a change, not a no-op",
+        "corrected": true
+      },
+      {
+        "fixtureExpectation": "entry verification does not invoke a version subprocess; verify the new fingerprint and absent stale version instead",
+        "corrected": true
+      }
+    ],
+    "defaultWorkspace": {
+      "fullAttempts": 2,
+      "corePerAttempt": {
+        "passed": 428,
+        "failed": 1,
+        "ignored": 1
+      },
+      "failure": "runtime_discovery::tests::cursor_agent_alias_rejects_an_unrelated_agent_binary: runtime_probe_timed_out",
+      "singlePackageIsolatedRerun": "passed",
+      "sameWorkspaceBinaryIsolatedRerun": "passed in 0.32s",
+      "remainingTargets": {
+        "workspace-bins": {
+          "passed": 31,
+          "failed": 0,
+          "ignored": 0
+        },
+        "workspace-other-libs": {
+          "passed": 15,
+          "failed": 0,
+          "ignored": 0
+        },
+        "workspace-doc-tests": {
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      },
+      "cursorCodeOrTimeoutChanged": false,
+      "failedFixturesRemoved": true,
+      "fullWorkspaceClaimedGreen": false
+    }
+  },
+  "followupAvailabilityFixes": {
+    "date": "2026-10-25",
+    "baseRevision": "30139ed2cdc3057e55a4988ce35c112cae4bb264",
+    "targetedRust": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 1,
+      "owners": [
+        "command_code_acp::tests::native_home_and_immutable_bootstrap_materials",
+        "cline::tests::long_bootstrap_bindings_preserve_utf8_and_enforce_body_limits",
+        "member_environment::tests::private_versions_preserve_credentials_and_new_launches_read_current_configuration",
+        "health::tests::acp_probe_failure_classification_separates_auth_protocol_and_transient_errors",
+        "application::tests::runtime_configuration_writes_preserve_startups_and_retire_changed_command_hosts"
+      ],
+      "ignoredReason": "existing real-account Command Code smoke; no native fixture in this rerun"
+    },
+    "covered": [
+      "existing binding accepts changed or empty new input without rewriting its bytes or modification time",
+      "128 KiB quoted Bootstrap body survives a JSON envelope exceeding 256 KiB in Rust and the actual Mod hook",
+      "body budget, Session isolation and invalid binding refusal remain covered by existing owners",
+      "explicit environment writes distinguish parsed value and inheritance changes from whitespace/key-order no-ops; replay keeps the original mutation fact",
+      "Command and Kimi fake ACP processes preserve authentication, protocol and transient errors plus stderr through the real health probe",
+      "existing dispatcher and Fleet MCP retirement regression remains passing"
+    ],
+    "memberEnvironmentDispatch": "changed fact consumed only after Applied and non-replayed command; code-reviewed, no test-only platform admission bypass added",
+    "nodeBootstrap": {
+      "passed": 1,
+      "failed": 0
+    },
+    "workspaceAllTargetsSlowTestsCheck": "passed",
+    "documentationTests": {
+      "passed": 10,
+      "failed": 0
+    },
+    "documentationGates": "passed including diff-aware base check",
+    "newRepositoryFiles": 0,
+    "newProductionFiles": 0,
+    "newRustTestOwners": 0,
+    "realModelAndMcpRerun": false,
+    "fullWorkspaceRerun": false,
+    "qualificationChanged": false
+  },
+  "followupReviewFixes": {
+    "date": "2026-10-25",
+    "baseRevision": "ce140e68483c60525f4718acb82fdba380c84149",
+    "targetedRust": {
+      "passed": 8,
+      "failed": 0,
+      "owners": [
+        "application::tests::runtime_configuration_writes_preserve_startups_and_retire_changed_command_hosts",
+        "application::runtime_check_environment::tests::local_saves_finish_while_environment_capture_is_held_and_never_launch_work",
+        "agent_profile::slow_tests::profile_and_installation_commands_are_idempotent_and_explicit",
+        "command_code_acp::tests::version_gate_accepts_native_release_labels",
+        "runtime_custom_api::tests::startup_saves_preserve_native_files_and_merge_only_local_preferences",
+        "mcp_import::tests::import_commit_rehydrates_credentials_and_fences_replacement_before_startup",
+        "runtime_failure::tests::classifies_auth_quota_model_and_permission_failures_with_stable_codes",
+        "acp::tests::trae_completed_run_enters_lru_and_reuses_the_same_host_session"
+      ]
+    },
+    "covered": [
+      "installation update releases the database before waiting for a controlled Fleet startup that reads it",
+      "installation replay and a new command with the same target preserve the Host, version and generation",
+      "stale field-edit retry succeeds without revision or search-generation changes while its executable is temporarily absent",
+      "Command version gate accepts v/product prefixes and build metadata, retaining the stable 1.88 minimum",
+      "MCP member additions/removals preserve unchanged owners; disabled definition, assignment, deletion and import do not retire Hosts; re-enabling still applies",
+      "authentication labels use the shared neutral wording and existing sanitized native failure details",
+      "shared ACP reuse still honors configured digests while Native Binding skips absent MCP digests"
+    ],
+    "startupSettingsLock": "explicit release before Fleet await verified in code; no test-only Command platform admission bypass",
+    "defaultWorkspace": {
+      "core": {
+        "passed": 429,
+        "failed": 1,
+        "ignored": 1
+      },
+      "failure": "runtime_discovery::tests::cursor_agent_alias_rejects_an_unrelated_agent_binary: runtime_probe_timed_out",
+      "sameWorkspaceBinaryIsolatedRerun": "passed in 1.01s",
+      "remainingTargets": {
+        "passed": 46,
+        "failed": 0,
+        "ignored": 0
+      },
+      "docTests": "passed",
+      "cursorCodeOrTimeoutChanged": false,
+      "failedFixtureRemoved": true,
+      "fullWorkspaceClaimedGreen": false
+    },
+    "cargoCheckWorkspace": "passed",
+    "formatCheck": "passed",
+    "documentationTests": {
+      "passed": 10,
+      "failed": 0
+    },
+    "documentationGates": "passed including diff-aware base check",
+    "typecheck": "passed",
+    "pnpmTest": "passed",
+    "vitest": {
+      "passed": 2992,
+      "skipped": 2,
+      "failed": 0
+    },
+    "nodeMainSuite": {
+      "passed": 358,
+      "skipped": 2,
+      "failed": 0
+    },
+    "newRepositoryFiles": 0,
+    "newProductionFiles": 0,
+    "newRustTestOwners": 1,
+    "realModelAndMcpRerun": false,
+    "qualificationChanged": false
+  },
+  "followupStdioCwdControl": {
+    "date": "2026-10-25",
+    "reviewBaseCommit": "942219d366510aa1cd55c31b7671e43580ff0448",
+    "officialNpmPackage": "command-code@1.88.0",
+    "officialCliSha256": "600725f967cc98f6144066c24e850d934bd4a1f503c3bf82f2bd2584a8757dfd",
+    "platform": "macOS arm64",
+    "scope": "Native ACP session/new and session/load stdio launch/discovery/cwd/argv/env/process ownership controls; no model prompt or tools/call",
+    "productionChange": "Pass existing Session cwd to wire adapter; retain original command/args for equal cwd using existing shared path comparison; retain existing argv wrapper for different cwd",
+    "initialHarnessFailure": {
+      "failure": "cwd/argv/env mismatch: direct",
+      "nativePid": 38464,
+      "cause": "JavaScript replacement string $$ was interpreted by replaceAll, so the harness under-escaped env. Production Rust escaping was unchanged.",
+      "correction": "Use a replacement callback to return literal $${ at the same single wire boundary",
+      "expectedLiteral": "$${literal} \\ ' quote",
+      "mcpReceipts": [
+        {
+          "case": "direct",
+          "method": "tools/list",
+          "cwd": "<fixture>/session space",
+          "pid": 38482,
+          "ppid": 38464,
+          "args": [
+            "space value",
+            "quote'\"",
+            "$() `literal`",
+            "",
+            "中文"
+          ],
+          "literal": "${literal} \\ ' quote"
+        },
+        {
+          "case": "custom",
+          "method": "tools/list",
+          "cwd": "<fixture>/custom space",
+          "pid": 38487,
+          "ppid": 38483,
+          "args": [
+            "space value",
+            "quote'\"",
+            "$() `literal`",
+            "",
+            "中文"
+          ],
+          "literal": "${literal} \\ ' quote"
+        }
+      ],
+      "promptRpcCalls": 0,
+      "allRecordedPidsGoneBeforeFixtureRemoval": true
+    },
+    "cases": [
+      {
+        "method": "session/new",
+        "sessionId": "b75ba29c-35d3-4e6c-9f26-50c5d3554676",
+        "nativePid": 38662,
+        "hostCwd": "<fixture>/attempt-2/host space",
+        "sessionCwd": "<fixture>/attempt-2/session space",
+        "readyPidAndNonceMatched": true,
+        "mcpReceipts": [
+          {
+            "case": "direct",
+            "method": "tools/list",
+            "cwd": "<fixture>/attempt-2/session space",
+            "pid": 38667,
+            "ppid": 38662,
+            "args": [
+              "space value",
+              "quote'\"",
+              "$() `literal`",
+              "",
+              "中文"
+            ],
+            "literal": "$${literal} \\ ' quote",
+            "expectedCwd": "<fixture>/attempt-2/session space",
+            "directParentIsNative": true
+          },
+          {
+            "case": "custom",
+            "method": "tools/list",
+            "cwd": "<fixture>/attempt-2/custom space",
+            "pid": 38669,
+            "ppid": 38668,
+            "args": [
+              "space value",
+              "quote'\"",
+              "$() `literal`",
+              "",
+              "中文"
+            ],
+            "literal": "$${literal} \\ ' quote",
+            "expectedCwd": "<fixture>/attempt-2/custom space",
+            "directParentIsNative": false
+          }
+        ],
+        "customWrapperParentIsNative": true,
+        "exitedOnEof": true,
+        "cleanup": "Close stdin, wait for native exit, terminate fixture process group, verify all recorded PIDs gone",
+        "neededSigkill": [],
+        "remainingPids": [],
+        "promptRpcCalls": 0,
+        "toolsCallRequests": 0
+      },
+      {
+        "method": "session/load",
+        "sessionId": "b75ba29c-35d3-4e6c-9f26-50c5d3554676",
+        "nativePid": 39290,
+        "hostCwd": "<fixture>/attempt-2/host space",
+        "sessionCwd": "<fixture>/attempt-2/session space",
+        "readyPidAndNonceMatched": true,
+        "mcpReceipts": [
+          {
+            "case": "direct",
+            "method": "tools/list",
+            "cwd": "<fixture>/attempt-2/session space",
+            "pid": 39299,
+            "ppid": 39290,
+            "args": [
+              "space value",
+              "quote'\"",
+              "$() `literal`",
+              "",
+              "中文"
+            ],
+            "literal": "$${literal} \\ ' quote",
+            "expectedCwd": "<fixture>/attempt-2/session space",
+            "directParentIsNative": true
+          },
+          {
+            "case": "custom",
+            "method": "tools/list",
+            "cwd": "<fixture>/attempt-2/custom space",
+            "pid": 39301,
+            "ppid": 39300,
+            "args": [
+              "space value",
+              "quote'\"",
+              "$() `literal`",
+              "",
+              "中文"
+            ],
+            "literal": "$${literal} \\ ' quote",
+            "expectedCwd": "<fixture>/attempt-2/custom space",
+            "directParentIsNative": false
+          }
+        ],
+        "customWrapperParentIsNative": true,
+        "exitedOnEof": true,
+        "cleanup": "Close stdin, wait for native exit, terminate fixture process group, verify all recorded PIDs gone",
+        "neededSigkill": [],
+        "remainingPids": [],
+        "promptRpcCalls": 0,
+        "toolsCallRequests": 0
+      }
+    ],
+    "processReduction": "One fewer resident Node launcher per actually started Rovai stdio server whose effective cwd equals Session cwd; custom-cwd wrapper remains",
+    "performanceMeasured": false,
+    "windowsLinuxQualified": false,
+    "historicalContentContinuityRetested": false,
+    "nativeCodeObservation": "1.88 bindAgentSession changes process cwd to the Session cwd before connectEditorMcpServers; stdio constructor receives command/args/env",
+    "isolation": {
+      "dailyAppAndCliUnchanged": true,
+      "dailyNativeHistoryUnchanged": true,
+      "credentialDelivery": "Read existing native credential locally and pass in child environment only; no secret in exported evidence",
+      "fixtureOwnedPidsVerifiedAbsent": [
+        38464,
+        38482,
+        38483,
+        38487,
+        38662,
+        38667,
+        38668,
+        38669,
+        39290,
+        39299,
+        39300,
+        39301
+      ],
+      "fixtureRemoved": true
+    },
+    "validation": {
+      "pureWireOwner": "mcp_wire_uses_session_cwd_without_a_launcher_and_preserves_literals",
+      "cargoCheckWorkspace": "passed",
+      "pureWireOwnerPassed": true,
+      "defaultWorkspace": {
+        "core": {
+          "passed": 431,
+          "failed": 0,
+          "ignored": 1
+        },
+        "remainingTargets": {
+          "passed": 46,
+          "failed": 0,
+          "ignored": 0
+        },
+        "docTests": "passed",
+        "previouslyFlakyCursorCase": "passed in the complete suite; implementation and timeout unchanged"
+      },
+      "formatCheck": "passed",
+      "documentationTests": {
+        "passed": 10,
+        "failed": 0
+      },
+      "documentationGates": "passed including diff-aware base check",
+      "newRustTestOwners": 1,
+      "newRepositoryFiles": 0,
+      "newProductionFiles": 0,
+      "qualificationChanged": false
+    }
+  },
+  "followupSub2apiRealMcp": {
+    "repositoryCommit": "e1e667905ef558e4d8d6e3e67ab5eeba496041b5",
+    "commandVersion": "1.88.0",
+    "cliSha256": "600725f967cc98f6144066c24e850d934bd4a1f503c3bf82f2bd2584a8757dfd",
+    "model": "sub2api/gpt-6-sol",
+    "scope": "Real native official ACP + current Mod and stdio argv delivery; not an App or production AgentRun qualification",
+    "phases": [
+      {
+        "label": "first-direct",
+        "sessionId": "238b1212-7ea9-4a1d-af0d-df4868f8fbd9",
+        "pid": 46909,
+        "stopReason": "end_turn",
+        "targetServer": "direct_cwd",
+        "actualCalls": 1,
+        "receipt": "RCP_c6150018-e981-42fc-ae89-34e5568b63e8",
+        "returnedReceipt": true,
+        "receiptInSubsequentModelInput": true,
+        "providerRequests": 3,
+        "providerResponses": 3,
+        "allForegroundHttp200": true,
+        "bootstrapExactlyOnce": true,
+        "passed": true,
+        "codemodeTargetCalls": [
+          {
+            "id": "call_64f4407f99be4977a2be6e25bfa1b38a",
+            "name": "codemode",
+            "argumentsSha256": "5473bba2b87bed000a743c3374c58fee30feec53b07b36fba4956c21103debbb",
+            "matchedAcpCompletedReceipt": true
+          }
+        ]
+      },
+      {
+        "label": "warm-custom",
+        "sessionId": "238b1212-7ea9-4a1d-af0d-df4868f8fbd9",
+        "pid": 46909,
+        "stopReason": "end_turn",
+        "targetServer": "custom_cwd",
+        "actualCalls": 1,
+        "receipt": "RCP_a8ebe514-4228-41b3-a738-506ab109cca3",
+        "returnedReceipt": true,
+        "receiptInSubsequentModelInput": true,
+        "providerRequests": 3,
+        "providerResponses": 3,
+        "allForegroundHttp200": true,
+        "bootstrapExactlyOnce": true,
+        "passed": true,
+        "codemodeTargetCalls": [
+          {
+            "id": "call_edef87e5294a4b198354df2f49ef3bd0",
+            "name": "codemode",
+            "argumentsSha256": "981a57583206bb9cb81549040670b25c9fee9f44acd4de494312dae3d3f7703c",
+            "matchedAcpCompletedReceipt": true
+          }
+        ]
+      },
+      {
+        "label": "warm-http",
+        "sessionId": "238b1212-7ea9-4a1d-af0d-df4868f8fbd9",
+        "pid": 46909,
+        "stopReason": "end_turn",
+        "targetServer": "http_cwd",
+        "actualCalls": 1,
+        "receipt": "RCP_8c62905d-380c-4fdc-968e-95c723aad98a",
+        "returnedReceipt": true,
+        "receiptInSubsequentModelInput": true,
+        "providerRequests": 3,
+        "providerResponses": 3,
+        "allForegroundHttp200": true,
+        "bootstrapExactlyOnce": true,
+        "passed": true,
+        "codemodeTargetCalls": [
+          {
+            "id": "call_004afbe106db4c1db0a8c48ca72fdecd",
+            "name": "codemode",
+            "argumentsSha256": "8a47e30604539d25067c4b66b4187e3da562613b88dcaa06c366df72e4df91c2",
+            "matchedAcpCompletedReceipt": true
+          }
+        ]
+      },
+      {
+        "label": "cold-direct-recall",
+        "sessionId": "238b1212-7ea9-4a1d-af0d-df4868f8fbd9",
+        "pid": 47404,
+        "stopReason": "end_turn",
+        "targetServer": "direct_cwd",
+        "actualCalls": 1,
+        "receipt": "RCP_9627881e-0a52-4c48-ae0b-c109123be75b",
+        "returnedReceipt": true,
+        "receiptInSubsequentModelInput": true,
+        "providerRequests": 2,
+        "providerResponses": 2,
+        "allForegroundHttp200": true,
+        "bootstrapExactlyOnce": true,
+        "originalReceiptRecalled": true,
+        "passed": true,
+        "codemodeTargetCalls": [
+          {
+            "id": "call_7672e930706e4a80a3281088313cff1e",
+            "name": "codemode",
+            "argumentsSha256": "18dcf79efd6d75208383403e717db2e55b74ea888575868c3c36975ce64bd1fd",
+            "matchedAcpCompletedReceipt": true
+          }
+        ]
+      }
+    ],
+    "explicitByokModelSelected": true,
+    "coldModelPreserved": true,
+    "stdioStartChecks": [
+      {
+        "case": "direct_cwd",
+        "pid": 47062,
+        "ppid": 46909,
+        "cwdMatched": true,
+        "argsMatched": true,
+        "literalMatched": true,
+        "directParentIsNative": true
+      },
+      {
+        "case": "custom_cwd",
+        "pid": 47085,
+        "ppid": 47082,
+        "cwdMatched": true,
+        "argsMatched": true,
+        "literalMatched": true,
+        "directParentIsNative": false
+      },
+      {
+        "case": "direct_cwd",
+        "pid": 47422,
+        "ppid": 47404,
+        "cwdMatched": true,
+        "argsMatched": true,
+        "literalMatched": true,
+        "directParentIsNative": true
+      },
+      {
+        "case": "custom_cwd",
+        "pid": 47443,
+        "ppid": 47442,
+        "cwdMatched": true,
+        "argsMatched": true,
+        "literalMatched": true,
+        "directParentIsNative": false
+      }
+    ],
+    "httpLiteralPreserved": true,
+    "passed": true,
+    "remainingPids": [],
+    "ownedPids": [
+      46909,
+      47404,
+      47062,
+      47085,
+      47082,
+      47422,
+      47443,
+      47442
+    ],
+    "auxiliaryRequests": 1,
+    "abortedRequests": [],
+    "productionCodeModified": false,
+    "date": "2026-10-25",
+    "platform": "macOS arm64",
+    "foregroundProviderRequests": 11,
+    "auxiliaryProviderRequests": 1,
+    "allProviderHttp200": true,
+    "probeSourceSha256": "df33cc71fd50a5779087772a70486b5579e02c8fb99aa3d66ed57a2f289f9ebf",
+    "observerSource": "docs/research/command-code-runtime/fixtures/mcp_delivery_observer.mjs",
+    "observerSourceSha256": "6e38f931899cb98fc721761871b0d84cc89a713ef060b38b1a397486b6b25964",
+    "method": "Unmodified official 1.88 + current production Mod; same-cwd original command/args and different-cwd production argv wrapper; loopback relay forwards original provider bytes to configured native sub2api; receipt generated only after actual MCP tools/call",
+    "isolation": {
+      "nativeProviderSource": "Command Code own sub2api configuration",
+      "nativeAuthentication": "Existing native credential supplied in isolated child environment; no new login or account bypass tested",
+      "providerSecretDelivery": "Resolved in local memory and passed by child env reference; no credential/endpoint/full prompt/history in evidence",
+      "dailyAppAndCliUnchanged": true,
+      "dailyNativeHistoryUnchanged": true,
+      "fixtureRemoved": true
+    },
+    "cleanup": "Closed CLI stdin, terminated fixture process groups, verified all 8 recorded native/stdio/wrapper PIDs absent, then removed owned fixture",
+    "observationNote": "ACP sparse tool updates are correlated by exact native tool ID, Session ID, completed status and receipt; search_tools is excluded from codemodeTargetCalls",
+    "notVerified": [
+      "Full App/Core restart",
+      "Permission deny/cancel matrix",
+      "Native questionnaires",
+      "Skills update/revoke matrix",
+      "Manual/threshold/overflow compaction",
+      "Usage/cost reconciliation",
+      "Windows/Linux qualification",
+      "CPU/memory performance"
+    ],
+    "productionChanges": 0,
+    "qualificationChanged": false,
+    "bootstrapSource": "Fixed synthetic acceptance text delivered by unchanged production Mod; full product Context formatter is outside this native probe",
+    "repositoryValidation": {
+      "rustWorkspaceInitial": {
+        "corePassed": 429,
+        "coreFailed": 2,
+        "coreIgnored": 1,
+        "failures": [
+          "runtime_platform_admission::tests::platform_evidence_revisions_bind_their_frozen_source_bytes",
+          "runtime_discovery::tests::cursor_agent_alias_rejects_an_unrelated_agent_binary"
+        ]
+      },
+      "evidenceRevisionResolution": "Reverted this follow-up edit of runtime-compatibility.md; retained existing qualification bytes/revision and recorded new native results only in existing v1.72 report/evidence. Same workspace configuration rebuilt; affected owner passed.",
+      "cursorResolution": "Existing runtime_probe_timed_out under suite; isolated rerun in same workspace test binary passed in 0.30 seconds. No Cursor code/timeout change; owned failed fixture removed.",
+      "remainingWorkspaceTargetsPassed": 46,
+      "docTestsPassed": true,
+      "documentationTestsPassed": 10,
+      "documentationGatesPassed": true,
+      "rustFormatPassed": true,
+      "newRepositoryFiles": 0,
+      "newRustTestOwners": 0,
+      "fullWorkspaceGreenClaimed": false
+    }
+  },
+  "followupRunBoundary20261025": {
+    "baselineCommit": "6470ebd6bc3460a9af1b21855528556933bfc056",
+    "commandCodeVersion": "1.88.0",
+    "officialCliSha256": "600725f967cc98f6144066c24e850d934bd4a1f503c3bf82f2bd2584a8757dfd",
+    "bootstrapModSha256": "f3edc08a6c8b3406e9c0e5db61c8df43a903b27354a9f41f260b3bf87eae69fa",
+    "scope": "Isolated official CLI ACP and production Mod; deterministic loopback model; no Core/App or external model",
+    "toolFilter": {
+      "hook": "onSessionStart",
+      "api": "setActiveTools(getActiveTools().filter(...))",
+      "baselineToolCount": 13,
+      "filteredToolCount": 12,
+      "removedTools": [
+        "ask_user_question"
+      ],
+      "addedTools": [],
+      "baselineQuestionRequests": 1,
+      "filteredQuestionRequests": 0,
+      "forcedDisabledToolCall": "refused without questionnaire; subsequent read_file and next prompt completed"
+    },
+    "skillsPriority": [
+      {
+        "label": "project-command",
+        "exit": 0,
+        "found": true
+      },
+      {
+        "label": "project-agents",
+        "exit": 0,
+        "found": true
+      },
+      {
+        "label": "user-command",
+        "exit": 0,
+        "found": true
+      },
+      {
+        "label": "user-agents",
+        "exit": 0,
+        "found": true
+      }
+    ],
+    "runBoundary": [
+      {
+        "case": "production-warm",
+        "sessionId": "b5bfd440-b5de-4e30-b677-0ae72f086349",
+        "pid": 28004,
+        "bootstrapCounts": [
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            0,
+            1,
+            0
+          ],
+          [
+            0,
+            1,
+            0
+          ]
+        ],
+        "userBootstrapCounts": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "stopReasons": [
+          "end_turn",
+          "end_turn",
+          "end_turn"
+        ],
+        "methods": [
+          "initialize",
+          "session/new",
+          "session/set_model",
+          "session/set_mode",
+          "session/prompt",
+          "session/prompt",
+          "session/prompt"
+        ],
+        "readyValidatedAndRemoved": true,
+        "steadyMaterials": [
+          "bindings",
+          "rovai-bootstrap.mjs"
+        ],
+        "bindingFileCount": 1,
+        "historyCompletenessProven": false
+      },
+      {
+        "case": "production-cold",
+        "sessionId": "b5bfd440-b5de-4e30-b677-0ae72f086349",
+        "pid": 28057,
+        "bootstrapCounts": [
+          [
+            0,
+            0,
+            1
+          ],
+          [
+            0,
+            0,
+            1
+          ],
+          [
+            0,
+            0,
+            1
+          ]
+        ],
+        "userBootstrapCounts": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "stopReasons": [
+          "end_turn",
+          "end_turn",
+          "end_turn"
+        ],
+        "methods": [
+          "initialize",
+          "session/resume",
+          "session/set_model",
+          "session/set_mode",
+          "session/prompt",
+          "session/prompt",
+          "session/prompt"
+        ],
+        "readyValidatedAndRemoved": true,
+        "steadyMaterials": [
+          "bindings",
+          "rovai-bootstrap.mjs"
+        ],
+        "bindingFileCount": 1,
+        "historyCompletenessProven": false
+      },
+      {
+        "case": "production-missing",
+        "sessionId": "88923b6d-fa46-4560-bded-b1cb79f7324b",
+        "pid": 28083,
+        "bootstrapCounts": [
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            1,
+            0,
+            0
+          ]
+        ],
+        "userBootstrapCounts": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "stopReasons": [
+          "end_turn",
+          "end_turn",
+          "end_turn"
+        ],
+        "methods": [
+          "initialize",
+          "session/resume",
+          "session/set_model",
+          "session/set_mode",
+          "session/prompt",
+          "session/prompt",
+          "session/prompt"
+        ],
+        "readyValidatedAndRemoved": true,
+        "steadyMaterials": [
+          "bindings",
+          "rovai-bootstrap.mjs"
+        ],
+        "bindingFileCount": 1,
+        "historyCompletenessProven": false
+      }
+    ],
+    "fileReceipts": [
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/new.txt",
+          "content": "alpha\nbeta\n"
+        },
+        "status": "completed",
+        "result": [
+          "File created successfully at: <fixture>/files/workspace/new.txt"
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/new.txt"
+        },
+        "status": "completed",
+        "result": [
+          "Read 1/1 file, 2 lines\n1: alpha\n2: beta"
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/new.txt",
+          "old_string": "beta",
+          "new_string": "gamma"
+        },
+        "status": "completed",
+        "result": [
+          "Edited <fixture>/files/workspace/new.txt (1 replacement)\n\nSnippet (lines 1-3 of 3):\n1\talpha\n2\tgamma\n3\t"
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/created.txt",
+          "old_string": "",
+          "new_string": "created\nbody\n"
+        },
+        "status": "completed",
+        "result": [
+          "Created <fixture>/files/workspace/created.txt (3 lines)"
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/empty.txt"
+        },
+        "status": "completed",
+        "result": [
+          "Read 1/1 file, 0 lines\nNote: the file exists but is empty."
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/empty.txt",
+          "content": "filled\n"
+        },
+        "status": "completed",
+        "result": [
+          "File created successfully at: <fixture>/files/workspace/empty.txt"
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/new.txt"
+        },
+        "status": "completed",
+        "result": [
+          "Read 1/1 file, 2 lines\n1: alpha\n2: gamma"
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/new.txt",
+          "content": "one\none\n"
+        },
+        "status": "completed",
+        "result": [
+          "The file <fixture>/files/workspace/new.txt has been updated successfully."
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/new.txt",
+          "old_string": "one",
+          "new_string": "two",
+          "replace_all": true
+        },
+        "status": "completed",
+        "result": [
+          "Edited <fixture>/files/workspace/new.txt (2 replacements)\n\nSnippet (lines 1-3 of 3):\n1\ttwo\n2\ttwo\n3\t"
+        ]
+      },
+      {
+        "input": {
+          "file_path": "<fixture>/files/workspace/new.txt",
+          "old_string": "missing",
+          "new_string": "unused"
+        },
+        "status": "failed",
+        "result": [
+          "No occurrences of the specified text were found in the file. The old_string must match the file contents exactly, including whitespace and indentation. Read the file to see its current content."
+        ]
+      }
+    ],
+    "cleanup": {
+      "nativeProcessGroupsChecked": 6,
+      "remainingProcessGroups": [],
+      "isolatedFixtureRemoved": true
+    },
+    "qualificationChanged": false,
+    "limitations": [
+      "Repeated B is a deterministic native prompt, not a Core failed-Run retry test.",
+      "Missing session ID was accepted natively; no history completeness claim.",
+      "write_file created text also occurs for an existing empty file, so its add state remains unknown.",
+      "No Renderer click-through, platform admission, or full real-model regression in this follow-up."
+    ],
+    "validation": {
+      "workspace": {
+        "command": "cargo test --workspace",
+        "corePassed": 431,
+        "otherTargetsPassed": 46,
+        "failed": 0,
+        "ignored": 1,
+        "docTestsPassed": true
+      },
+      "targetedExistingOwners": "Command bootstrap/MCP/version, history restore quarantine, native Skills, tool Diff, resume classification, permission cancellation, long bootstrap",
+      "nodeModOwner": "passed",
+      "docsTestsPassed": 10,
+      "docsGovernance": "passed against PR base",
+      "formatAndDiffChecks": "passed",
+      "newRustTestFunctions": 0,
+      "newRepositoryFiles": 0,
+      "fixtureCorrections": [
+        "Preserved native Command acknowledgement after first activity rather than imposing TRAE ordering.",
+        "Retired the obsolete Command Host-lifetime immutable binding assertion."
+      ]
+    }
+  },
+  "followupDirectBootstrap20261025": {
+    "scope": "Verification only; production binding transport and public qualification unchanged",
+    "date": "2026-10-25",
+    "platform": {
+      "system": "Darwin",
+      "release": "25.6.0",
+      "machine": "arm64"
+    },
+    "identity": {
+      "baselineCommit": "9807c9261786b95cf72cf838ac5ea30d2fb99fa7",
+      "version": "1.88.0",
+      "tarball": "https://registry.npmjs.org/command-code/-/command-code-1.88.0.tgz",
+      "integrity": "sha512-8es7pmDlw1YYbUYUW3RHDGyI3zBQAhvkZaBh2ZxSnuuzZY1mavrN4e5+SICi8nBqah6GYThMLtvfqmFnL95i3A==",
+      "cliSha256": "600725f967cc98f6144066c24e850d934bd4a1f503c3bf82f2bd2584a8757dfd",
+      "sourceReview": [
+        {
+          "symbol": "function parseSlashCommand",
+          "offsets": [
+            51634
+          ]
+        },
+        {
+          "symbol": "async function servePrompt",
+          "offsets": [
+            41283
+          ]
+        },
+        {
+          "symbol": "async function handleSetConfigOption",
+          "offsets": [
+            43786
+          ]
+        },
+        {
+          "symbol": "async function handleNewSession",
+          "offsets": [
+            38028
+          ]
+        },
+        {
+          "symbol": "async function handleLoadSession",
+          "offsets": [
+            38325
+          ]
+        },
+        {
+          "symbol": "async function handleResumeSession",
+          "offsets": [
+            38843
+          ]
+        },
+        {
+          "symbol": "async function resolveCommand(",
+          "offsets": [
+            2348413
+          ]
+        },
+        {
+          "symbol": "function loadCommandModHost(",
+          "offsets": [
+            2339923
+          ]
+        },
+        {
+          "symbol": "function applyModLaunchOptions",
+          "offsets": [
+            2339737
+          ]
+        },
+        {
+          "symbol": "setFlagValue:",
+          "offsets": [
+            277328
+          ]
+        },
+        {
+          "symbol": "SESSION_SET_CONFIG_OPTION",
+          "offsets": [
+            35667,
+            1622212
+          ]
+        },
+        {
+          "symbol": "runCommand:",
+          "offsets": [
+            276857
+          ]
+        },
+        {
+          "symbol": "function setStableProcessTitle(",
+          "offsets": [
+            2388535
+          ]
+        }
+      ],
+      "offsetUnit": "Python character index in UTF-8 decoded dist/cli.mjs, not byte offsets or line numbers"
+    },
+    "model": "Deterministic loopback OpenAI-compatible provider; synthetic native-auth env value; no external paid model",
+    "officialSources": [
+      "https://commandcode.ai/docs/reference/cli",
+      "https://commandcode.ai/docs/mods",
+      "https://commandcode.ai/docs/acp",
+      "https://commandcode.ai/changelog"
+    ],
+    "stageA": {
+      "directSystemFieldFound": false,
+      "checkedConsumers": [
+        "ACP dispatcher",
+        "session/new",
+        "session/load",
+        "session/resume",
+        "session/set_config_option"
+      ],
+      "initialArgv": [
+        "<official npm command-code executable>",
+        "acp",
+        "--mod",
+        "<probe-mod.mjs>",
+        "--mod-option",
+        "rovai-bootstrap=<synthetic UTF-8 body>"
+      ],
+      "flagRule": "Declared string flag; first equals separates name; getFlag read lazily in System hook after launch overrides",
+      "dynamicEntry": "Official addCommand handler, reached through session/prompt slash-command dispatch before runTurn",
+      "dynamicWire": {
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "<same native session id>",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "/rovai-bootstrap <JSON string literal of frozen Bootstrap>"
+            }
+          ]
+        }
+      },
+      "dynamicHandler": "JSON.parse(args) assigns a process-local variable; returns no prompt or message",
+      "literalNewlineInCommandSupported": false,
+      "singleLineJsonStringPreservesNewline": true,
+      "newServiceOrProtocolReader": false
+    },
+    "syntheticBodies": {
+      "A": {
+        "utf8Bytes": 107,
+        "sha256": "e21f47b7dacc0c2d4aaadd7a21aecfc5edc8293ddbf28bf0888a0e3e0f0f48e4"
+      },
+      "B": {
+        "utf8Bytes": 75,
+        "sha256": "59305351af656d46393aea7552346c8a1806eacea5626a6aec80117b02c38819"
+      },
+      "C": {
+        "utf8Bytes": 72,
+        "sha256": "4e5d15757c40f84c3c4f4e3b813f1046147f8185f4e2e68c0ac753ec55308fc7"
+      }
+    },
+    "stageBC": {
+      "pid": 69932,
+      "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+      "methods": [
+        "initialize",
+        "session/new",
+        "session/set_model",
+        "session/set_mode",
+        "session/prompt",
+        "session/prompt",
+        "session/prompt",
+        "session/prompt",
+        "session/prompt"
+      ],
+      "cases": [
+        {
+          "label": "initial-A",
+          "pid": 69932,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "initial-A",
+              "foreground": true,
+              "systemBytes": 40532,
+              "systemSha256": "1afdbba0956e04ebfda1cae6b8084de92dea93b5dbd7343895b447f7c54c3181",
+              "expectedBytes": 107,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 1,
+                "B": 0,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            },
+            {
+              "label": "initial-A",
+              "foreground": true,
+              "systemBytes": 40532,
+              "systemSha256": "1afdbba0956e04ebfda1cae6b8084de92dea93b5dbd7343895b447f7c54c3181",
+              "expectedBytes": 107,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 1,
+                "B": 0,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "warm-B",
+          "pid": 69932,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "warm-B",
+              "foreground": true,
+              "systemBytes": 40500,
+              "systemSha256": "56efc8bff00e865a1ec9bb6b0dbbdcf2c91dc64215b47acf88868eb235ccc9c0",
+              "expectedBytes": 75,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 1,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "warm-A",
+          "pid": 69932,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "warm-A",
+              "foreground": true,
+              "systemBytes": 40532,
+              "systemSha256": "1afdbba0956e04ebfda1cae6b8084de92dea93b5dbd7343895b447f7c54c3181",
+              "expectedBytes": 107,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 1,
+                "B": 0,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        }
+      ],
+      "controls": [
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        },
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        }
+      ],
+      "bindingFiles": [],
+      "steadyMaterialFiles": [],
+      "controlInHistory": false,
+      "validBootstrapInStderr": false,
+      "processGroupAbsent": true
+    },
+    "stageD": {
+      "cases": [
+        {
+          "label": "cold-C",
+          "pid": 69949,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "cold-C",
+              "foreground": true,
+              "systemBytes": 40552,
+              "systemSha256": "dff0de67d35f87e9a186d9e5f32bfe4e649f85d31192aaeda6c14a6f316cc4c9",
+              "expectedBytes": 72,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 0,
+                "C": 1
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "codemode",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "mcp-actual",
+          "pid": 69949,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "mcp-actual",
+              "foreground": true,
+              "systemBytes": 40552,
+              "systemSha256": "dff0de67d35f87e9a186d9e5f32bfe4e649f85d31192aaeda6c14a6f316cc4c9",
+              "expectedBytes": 72,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 0,
+                "C": 1
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "codemode",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            },
+            {
+              "label": "mcp-actual",
+              "foreground": true,
+              "systemBytes": 40552,
+              "systemSha256": "dff0de67d35f87e9a186d9e5f32bfe4e649f85d31192aaeda6c14a6f316cc4c9",
+              "expectedBytes": 72,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 0,
+                "C": 1
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "codemode",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "size-TYPICAL",
+          "pid": 69949,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "size-TYPICAL",
+              "foreground": true,
+              "systemBytes": 50720,
+              "systemSha256": "410172b6cec19cf968182bbea9d2889fe8355b100780501bef68d2622cc13249",
+              "expectedBytes": 10240,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 0,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "codemode",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "size-MAX",
+          "pid": 69949,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "size-MAX",
+              "foreground": true,
+              "systemBytes": 171552,
+              "systemSha256": "eaac74776c0755d838d58eca37ac8904aa381fdc2841e452c5eeffa78ba4ba85",
+              "expectedBytes": 131072,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 0,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "codemode",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "active-A",
+          "pid": 69949,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "active-A",
+              "foreground": true,
+              "systemBytes": 40587,
+              "systemSha256": "b098bca9c50250b620d7d2ad4bebfbeaab214b024bc622b0d1c2818f6741709a",
+              "expectedBytes": 107,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 1,
+                "B": 0,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "codemode",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "following-B",
+          "pid": 69949,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "following-B",
+              "foreground": true,
+              "systemBytes": 40555,
+              "systemSha256": "7089b084a705feab6ee132198947c1d834fdd4de22e80ae78be634dd10f07e25",
+              "expectedBytes": 75,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 1,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "codemode",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "cancel-B",
+          "pid": 69949,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "stopReason": "cancelled",
+          "requests": [
+            {
+              "label": "cancel-B",
+              "foreground": true,
+              "systemBytes": 40555,
+              "systemSha256": "7089b084a705feab6ee132198947c1d834fdd4de22e80ae78be634dd10f07e25",
+              "expectedBytes": 75,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 1,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "codemode",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "argv-128",
+          "pid": 69964,
+          "sessionId": "a1475543-043d-4343-b0fc-e234164f6bd3",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "argv-128",
+              "foreground": true,
+              "systemBytes": 171497,
+              "systemSha256": "a3cb41013320177c0676b10581c2e434dfdcbb9dc0327a310be4452bbba0ec3b",
+              "expectedBytes": 131072,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 0,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "channel-first-A",
+          "pid": 69976,
+          "sessionId": "303114cf-a6a8-4177-8d8f-457c162f5f72",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "channel-first-A",
+              "foreground": true,
+              "systemBytes": 40532,
+              "systemSha256": "579e9374d6c6dbd8793af3359e152c4336d090f9fd5f6f579b6f2ab41fc982a8",
+              "expectedBytes": 107,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 1,
+                "B": 0,
+                "C": 0
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        },
+        {
+          "label": "channel-cold-C",
+          "pid": 69984,
+          "sessionId": "303114cf-a6a8-4177-8d8f-457c162f5f72",
+          "stopReason": "end_turn",
+          "requests": [
+            {
+              "label": "channel-cold-C",
+              "foreground": true,
+              "systemBytes": 40497,
+              "systemSha256": "31094def93399697e68903dd89964152bc589645eeada1f44cfddc0432e58edf",
+              "expectedBytes": 72,
+              "expectedExactCount": 1,
+              "expectedInUser": false,
+              "markerCounts": {
+                "A": 0,
+                "B": 0,
+                "C": 1
+              },
+              "nativeSystemRetained": true,
+              "questionToolPresent": false,
+              "controlInModelUser": false,
+              "userInputUnchanged": true,
+              "toolNames": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_directory",
+                "glob",
+                "grep",
+                "shell_command",
+                "schedule_wakeup",
+                "activate_skill",
+                "agent",
+                "agent_output",
+                "search_tools"
+              ]
+            }
+          ]
+        }
+      ],
+      "controls": [
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        },
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        },
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        },
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        },
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        },
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        },
+        {
+          "stopReason": "end_turn",
+          "modelRequests": 0,
+          "historyUnchanged": true,
+          "controlBodyInEvents": false,
+          "agentMessageEvents": 0
+        }
+      ],
+      "sizes": [
+        {
+          "bytes": 10240,
+          "sha256": "37262abcf5b0f58127420e71e0f1b8a72867a9f88f8d3e653006c4ae70cb0ce5",
+          "exact": true,
+          "path": "ACP Mod command"
+        },
+        {
+          "bytes": 131072,
+          "sha256": "ec08014a45b426c129e41f0d826841e2f4c0ed4215ec73c1ac8ccbdf6f8bed6f",
+          "exact": true,
+          "path": "ACP Mod command"
+        },
+        {
+          "bytes": 131072,
+          "sha256": "3e9da49fa5d7e55201b241a0ac9a5d8c7c50992dbb89ddc1dc7c2f703caeac6c",
+          "exact": true,
+          "path": "official npm executable argv"
+        }
+      ],
+      "hosts": [
+        {
+          "pid": 69949,
+          "sessionId": "7e1dc3b6-e11f-412e-aaf5-0fc0fab6714e",
+          "methods": [
+            "initialize",
+            "session/resume",
+            "session/set_model",
+            "session/set_mode",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt",
+            "session/prompt"
+          ],
+          "argvBodyBytes": 72,
+          "argvBodyVisibleEarly": false,
+          "argvBodyVisibleSteady": false,
+          "processGroupAbsent": true,
+          "bootstrapInStderr": false,
+          "controlInHistory": false,
+          "materialFiles": []
+        },
+        {
+          "pid": 69964,
+          "sessionId": "a1475543-043d-4343-b0fc-e234164f6bd3",
+          "methods": [
+            "initialize",
+            "session/new",
+            "session/set_model",
+            "session/set_mode",
+            "session/prompt"
+          ],
+          "argvBodyBytes": 131072,
+          "argvBodyVisibleEarly": false,
+          "argvBodyVisibleSteady": false,
+          "processGroupAbsent": true,
+          "bootstrapInStderr": false,
+          "controlInHistory": false,
+          "materialFiles": []
+        },
+        {
+          "pid": 69976,
+          "sessionId": "303114cf-a6a8-4177-8d8f-457c162f5f72",
+          "methods": [
+            "initialize",
+            "session/new",
+            "session/set_model",
+            "session/set_mode",
+            "session/prompt",
+            "session/prompt"
+          ],
+          "argvBodyBytes": 0,
+          "argvBodyVisibleEarly": null,
+          "argvBodyVisibleSteady": null,
+          "processGroupAbsent": true,
+          "bootstrapInStderr": false,
+          "controlInHistory": false,
+          "materialFiles": []
+        },
+        {
+          "pid": 69984,
+          "sessionId": "303114cf-a6a8-4177-8d8f-457c162f5f72",
+          "methods": [
+            "initialize",
+            "session/resume",
+            "session/set_model",
+            "session/set_mode",
+            "session/prompt",
+            "session/prompt"
+          ],
+          "argvBodyBytes": 0,
+          "argvBodyVisibleEarly": null,
+          "argvBodyVisibleSteady": null,
+          "processGroupAbsent": true,
+          "bootstrapInStderr": false,
+          "controlInHistory": false,
+          "materialFiles": []
+        }
+      ],
+      "actualMcpToolsCalls": 1,
+      "mcpReceipt": "ROVAI_MCP_PROBE_OK",
+      "mcpReceiptInFollowingModelRequest": true,
+      "mcpProcesses": [
+        {
+          "pid": 69958,
+          "parentPid": 69949,
+          "group": 69958
+        }
+      ],
+      "remainingMcpProcesses": [],
+      "inFlightControlError": {
+        "code": -32600,
+        "message": "A prompt is already running for this session"
+      },
+      "singleChannelFirstAndCold": true,
+      "cancelStopReason": "cancelled",
+      "newSessionListPreflight": false
+    },
+    "errorVisibility": {
+      "validControl": {
+        "stopReason": "end_turn",
+        "modelRequests": 0,
+        "historyUnchanged": true,
+        "controlBodyInEvents": false,
+        "agentMessageEvents": 0
+      },
+      "malformedRejected": true,
+      "errorCode": -32603,
+      "syntheticMarkerInError": true,
+      "malformedModelRequests": 0,
+      "malformedHistoryUnchanged": true,
+      "pid": 70001,
+      "sessionId": "5e7aef2d-34ec-4104-af3f-6ffde262b633",
+      "methods": [
+        "initialize",
+        "session/new",
+        "session/set_model",
+        "session/set_mode",
+        "session/prompt",
+        "session/prompt",
+        "session/prompt"
+      ],
+      "processGroupAbsent": true,
+      "syntheticMarkerInStderr": true,
+      "validBootstrapInStderr": false,
+      "materials": [],
+      "followingRun": {
+        "label": "after-invalid-control",
+        "pid": 70001,
+        "sessionId": "5e7aef2d-34ec-4104-af3f-6ffde262b633",
+        "stopReason": "end_turn",
+        "requests": [
+          {
+            "label": "after-invalid-control",
+            "foreground": true,
+            "systemBytes": 40532,
+            "systemSha256": "c609cf07b99f8eaf90ad8e4a85ff35552795f1db5b99a7a43b60078a3c5add9f",
+            "expectedBytes": 107,
+            "expectedExactCount": 1,
+            "expectedInUser": false,
+            "markerCounts": {
+              "A": 1,
+              "B": 0,
+              "C": 0
+            },
+            "nativeSystemRetained": true,
+            "questionToolPresent": false,
+            "controlInModelUser": false,
+            "userInputUnchanged": true,
+            "toolNames": [
+              "read_file",
+              "write_file",
+              "edit_file",
+              "read_directory",
+              "glob",
+              "grep",
+              "shell_command",
+              "schedule_wakeup",
+              "activate_skill",
+              "agent",
+              "agent_output",
+              "search_tools"
+            ]
+          }
+        ]
+      },
+      "interpretation": "A malformed synthetic JSON payload is rejected without model/history writes, but raw JSON.parse error exposes its input fragment in ACP error and stderr. A production handler must use a fixed error message."
+    },
+    "visibilityLimits": [
+      "Non-empty argv payload absent in sampled ps output after spawn and initialize; native process.title overwrites display. Startup window and OS auditing not proven private.",
+      "Empty argv body has no disclosure observation; None is not a positive ps visibility result.",
+      "Normal stderr observation covered synthetic A/B/C and cancellation; it is not a universal guarantee for every diagnostic.",
+      "Core/App managed startup, public command and diagnostic UI not exercised; Windows/Linux untested."
+    ],
+    "assertionRefinement": {
+      "issue": "Initial user-role check searched re-serialized JSON for a multiline body, which could miss an escaped match.",
+      "correction": "Search decoded string values, assert exact unmodified user input, rerun complete B/C/D and error probe.",
+      "nativeFailure": false,
+      "finalRerunPassed": true,
+      "previousRecordedGroups": [
+        67915,
+        68165,
+        68519,
+        68524,
+        68533,
+        68544,
+        68555,
+        69612
+      ]
+    },
+    "finalRerunForegroundRequests": 16,
+    "successfulControls": 10,
+    "controlModelRequests": 0,
+    "decision": {
+      "startupArgvAloneEquivalent": false,
+      "officialModCommandCandidateFeasible": true,
+      "recommendedRoute": "Single existing ACP Mod-command route for first, warm and cold; do not put Bootstrap in argv.",
+      "productionReplacementComplete": false,
+      "minimalScope": [
+        "Existing Mod command and memory value",
+        "Run pre-input ACP request using current frozen Context",
+        "Remove binding serialization/write/rename/read/SHA only after integration verification"
+      ],
+      "cost": "One control roundtrip and JSON encode/decode per Run replaces body file publication and hook read; no performance benchmark",
+      "remainingIntegrationBoundaries": [
+        "Keep control end_turn and usage_update separate from business Run completion/usage",
+        "Fixed decode error without raw payload",
+        "Process-local state validated only for one root Native Binding per Host; subagent/multiple-session behavior not qualified",
+        "Full Core frozen-input/retry/ManagedProcess paths and target platforms not exercised"
+      ],
+      "additionalLocksProcessesCachesWatchers": false
+    },
+    "fixtureSourceSha256": {
+      "probe-mod.mjs": "281c92a5e16aeb99640f5d5e8de1de00531d193194483336e45165ce581821fb",
+      "probe.py": "5c106e15e710777f3abdbd8b3db78dda1f9d7a64512ded2c1d5fbc324594be1d",
+      "boundaries.py": "8613937273fb4fd477d4c2531fcc0983ee7e1628dbd3a2ee2c2345e19a78b2c6",
+      "error-probe.py": "07f06f12ae9f4aa669fe854d9ffa7a142ebefb1f86ca1e090c8355ec82120692",
+      "mcp-server.py": "16158d3056dec4d9e0593bc9db5b423c2827a314d6f9169c329b6b473ad9ec17"
+    },
+    "cleanup": {
+      "recordedGroupsConfirmedAbsent": [
+        67915,
+        68165,
+        68519,
+        68524,
+        68533,
+        68544,
+        68555,
+        69612,
+        69932,
+        69949,
+        69958,
+        69964,
+        69976,
+        69984,
+        70001
+      ],
+      "mcpProcessAbsent": true,
+      "steadyMaterialInventory": {
+        "d-channel": [],
+        "bc": [],
+        "d-argv-128": [],
+        "error-probe": [],
+        "d-cold": [],
+        "d-channel-cold": []
+      },
+      "fixtureRemoved": true,
+      "removalScope": "Exact owned isolated probe root only; native daily HOME and installation untouched"
+    },
+    "validation": {
+      "docsTests": {
+        "passed": 10,
+        "failed": 0
+      },
+      "docsCheck": "passed",
+      "docsCheckCi": {
+        "status": "passed",
+        "base": "cd3cc99119c45f8ee47e55fe763bab773447a75c"
+      },
+      "workspaceDefault": {
+        "command": "cargo test --workspace",
+        "status": "passed",
+        "corePassed": 431,
+        "coreFailed": 0,
+        "coreIgnored": 1,
+        "otherTargetsPassed": 46,
+        "docTests": "passed",
+        "logSha256": "760ac9dc2705ff763b6b8a5ed7847c6d1e2dfd75daf40a2fac14a04bbaf86a55"
+      },
+      "diffCheck": "passed"
+    },
+    "productionCodeChanged": false,
+    "qualificationChanged": false
+  },
+  "followupDirectBootstrapImplementation20261025": {
+    "baseline": "02ac0a514ddce88cfaeceec7d2b931779182d586",
+    "scope": "Production replacement in existing Command Mod and AcpRuntime delivery; no public qualification change",
+    "officialPackage": {
+      "name": "command-code",
+      "version": "1.88.0",
+      "registryTarball": "https://registry.npmjs.org/command-code/-/command-code-1.88.0.tgz",
+      "cliSha256": "600725f967cc98f6144066c24e850d934bd4a1f503c3bf82f2bd2584a8757dfd"
+    },
+    "productionMod": {
+      "revision": "command-code-system-bootstrap-v2",
+      "sha256": "bca8cadca01d225914b2c6b7ee8b1f201db593a05df47206dcb917caf77379ea",
+      "controlCommand": "rovai-bootstrap",
+      "initialWarmCold": "same existing ACP session/prompt command dispatch",
+      "bodyStorage": "one Host-owned Mod memory value",
+      "bodyArgv": false,
+      "bodyFiles": false,
+      "fallback": false
+    },
+    "deleted": [
+      "bindings directory and body JSON",
+      "temporary body writes and rename",
+      "Mod body file reads and SHA-256",
+      "filename-only native Session ID restrictions",
+      "file corruption/missing-body process-exit branches and obsolete test assertions"
+    ],
+    "environment": {
+      "platform": "macOS arm64",
+      "channel": "automated acceptance",
+      "isolation": "new temporary native HOME and cwd",
+      "model": "deterministic loopback OpenAI-completions fixture",
+      "credentials": "synthetic local-only placeholder",
+      "externalModelRequests": 0,
+      "dailyAppOrConfigurationModified": false,
+      "fullCoreOrAppStarted": false
+    },
+    "nativeProductionPath": {
+      "testOwner": "acp::tests::isolated_command_code_acp_direct_bootstrap_and_cold_resume",
+      "entry": "official executable through production ManagedProcess -> AcpHost -> AcpRuntime and embedded Mod",
+      "result": "passed three times; final run retains native mode and BYOK checks",
+      "receipts": [
+        {
+          "accepted": 1,
+          "bootstrapBytes": 51,
+          "host": 0,
+          "pid": 80689,
+          "run": 0,
+          "sessionId": "05ace62d-09b0-47c9-b9c7-d771ab304246"
+        },
+        {
+          "accepted": 1,
+          "bootstrapBytes": 30,
+          "host": 0,
+          "pid": 80689,
+          "run": 1,
+          "sessionId": "05ace62d-09b0-47c9-b9c7-d771ab304246"
+        },
+        {
+          "accepted": 1,
+          "bootstrapBytes": 51,
+          "host": 0,
+          "pid": 80689,
+          "run": 2,
+          "sessionId": "05ace62d-09b0-47c9-b9c7-d771ab304246"
+        },
+        {
+          "accepted": 1,
+          "bootstrapBytes": 131072,
+          "host": 0,
+          "pid": 80689,
+          "run": 3,
+          "sessionId": "05ace62d-09b0-47c9-b9c7-d771ab304246"
+        },
+        {
+          "accepted": 1,
+          "bootstrapBytes": 30,
+          "host": 1,
+          "pid": 80699,
+          "run": 0,
+          "sessionId": "05ace62d-09b0-47c9-b9c7-d771ab304246"
+        }
+      ],
+      "successfulControlUpdates": 5,
+      "invalidControlUpdates": 4,
+      "invalidKinds": [
+        "malformed JSON",
+        "number",
+        "null",
+        "object"
+      ],
+      "controlBusinessEvents": 0,
+      "businessInputsAccepted": 5,
+      "foregroundModelRequests": [
+        {
+          "index": 1,
+          "label": "0_0",
+          "toolCount": 12,
+          "path": "/v1/chat/completions",
+          "bootstrapBytes": 51,
+          "systemCount": 1,
+          "bodyInUser": false,
+          "nativeSystemRetained": true,
+          "questionToolAbsent": true,
+          "controlInMessages": false,
+          "systemSha256": "4e5a24f4f26db4a7a8a14517e2bf126d44295b20f8459ddb4c96454ef332d971",
+          "staleMarkers": []
+        },
+        {
+          "index": 2,
+          "label": "0_0",
+          "toolCount": 12,
+          "path": "/v1/chat/completions",
+          "bootstrapBytes": 51,
+          "systemCount": 1,
+          "bodyInUser": false,
+          "nativeSystemRetained": true,
+          "questionToolAbsent": true,
+          "controlInMessages": false,
+          "systemSha256": "4e5a24f4f26db4a7a8a14517e2bf126d44295b20f8459ddb4c96454ef332d971",
+          "staleMarkers": [],
+          "toolReceiptPresent": true
+        },
+        {
+          "index": 4,
+          "label": "0_1",
+          "toolCount": 12,
+          "path": "/v1/chat/completions",
+          "bootstrapBytes": 30,
+          "systemCount": 1,
+          "bodyInUser": false,
+          "nativeSystemRetained": true,
+          "questionToolAbsent": true,
+          "controlInMessages": false,
+          "systemSha256": "7817a5de1cd551141d9ea7e2391015fd9aefe6f832ea90aa404ec6bc3e38771e",
+          "staleMarkers": []
+        },
+        {
+          "index": 5,
+          "label": "0_2",
+          "toolCount": 12,
+          "path": "/v1/chat/completions",
+          "bootstrapBytes": 51,
+          "systemCount": 1,
+          "bodyInUser": false,
+          "nativeSystemRetained": true,
+          "questionToolAbsent": true,
+          "controlInMessages": false,
+          "systemSha256": "4e5a24f4f26db4a7a8a14517e2bf126d44295b20f8459ddb4c96454ef332d971",
+          "staleMarkers": []
+        },
+        {
+          "index": 6,
+          "label": "0_3",
+          "toolCount": 12,
+          "path": "/v1/chat/completions",
+          "bootstrapBytes": 131072,
+          "systemCount": 1,
+          "bodyInUser": false,
+          "nativeSystemRetained": true,
+          "questionToolAbsent": true,
+          "controlInMessages": false,
+          "systemSha256": "97042471056c9d1e150dfd7dee9fac6fd8d0c72e9405970438d24f4f257dae44",
+          "staleMarkers": []
+        },
+        {
+          "index": 7,
+          "label": "1_0",
+          "toolCount": 12,
+          "path": "/v1/chat/completions",
+          "bootstrapBytes": 30,
+          "systemCount": 1,
+          "bodyInUser": false,
+          "nativeSystemRetained": true,
+          "questionToolAbsent": true,
+          "controlInMessages": false,
+          "systemSha256": "f46c42fecd76faa197841d217ad2c04b3371119037e1fa7262475486450c6904",
+          "staleMarkers": []
+        }
+      ],
+      "backgroundModelRequests": [
+        {
+          "index": 3,
+          "kind": "native session title",
+          "toolCount": 0,
+          "derivedFrom": "first business user input and its assistant result",
+          "controlContentPresent": false
+        }
+      ],
+      "invalidInputInNativeErrorOrStderr": false,
+      "controlTextInNativeHistory": false,
+      "steadyHostFiles": [
+        "rovai-bootstrap.mjs"
+      ],
+      "hostShutdownRemovedMaterials": true,
+      "privateFilesAfterShutdown": 0,
+      "modeUpdates": [
+        "default",
+        "auto-accept",
+        "plan",
+        "dont-ask",
+        "bypass"
+      ],
+      "explicitByokModel": "rovai-probe/model"
+    },
+    "fixtureCorrection": {
+      "initialRustOwner": "passed",
+      "initialObserver": "flagged one additional no-tool model request",
+      "inspection": "rerun captured its native session-title System and business-derived user input; classified separately, not ignored as a control success",
+      "firstHostPids": [
+        78244,
+        78277
+      ],
+      "firstForegroundRequests": 6,
+      "firstNativeTitleRequests": 1,
+      "productionFixRequired": false
+    },
+    "regression": {
+      "targetedExtendedRust": {
+        "passed": 5,
+        "ignored": 1,
+        "owners": [
+          "command_code_acp (3 pure/material owners)",
+          "history_restore_replay_is_quarantined_and_only_current_prompt_accepts_input (TRAE plus Command success/error/cancelled)",
+          "cline::long_bootstrap_bindings_preserve_utf8_and_enforce_body_limits"
+        ]
+      },
+      "realNativeIgnoredOwnerExplicitRun": {
+        "passed": 1,
+        "runs": 3
+      },
+      "nodeModOwner": {
+        "passed": 1,
+        "checks": [
+          "ready after both registrations",
+          "A-B-A replaces value",
+          "128 KiB UTF-8 and quoted payload",
+          "invalid input preserves value and fixed error",
+          "question filter retained"
+        ]
+      },
+      "newRustTestFunctions": 0,
+      "newRepositoryFiles": 0,
+      "workspace": {
+        "corePassed": 431,
+        "coreFailed": 0,
+        "coreIgnored": 1,
+        "otherTargetsPassed": 46,
+        "docTests": "passed"
+      },
+      "cargoCheckWorkspace": "passed",
+      "rustFmt": "passed",
+      "nodeDocsTests": {
+        "passed": 10
+      },
+      "documentationCheck": "passed",
+      "documentationCi": {
+        "result": "passed",
+        "base": "cd3cc99119c45f8ee47e55fe763bab773447a75c"
+      },
+      "diffCheck": "passed"
+    },
+    "cleanup": {
+      "nativePids": [
+        78244,
+        78277,
+        78449,
+        78487,
+        80689,
+        80699
+      ],
+      "allRecordedPidsExited": true,
+      "materialFilesRemovedByProductionShutdown": true,
+      "fixtureDeleted": true
+    },
+    "notClaimed": [
+      "full Core/App queue or fault-retry acceptance",
+      "external real model or MCP rerun for this implementation",
+      "Windows/Linux and other platforms",
+      "subagent or multi-root-Session isolation",
+      "latency CPU or memory improvement",
+      "public qualification"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>HTML 预览</title></head><body><script>
+// Trusted HTML uses the actual Web origin and native browser storage.
+// CSP and the parent iframe grant the same preview capabilities.
+// Only its actual parent may supply the bytes it read through the authenticated API.
+(() => {
+  const [previewId, generation] = location.hash.slice(1).split('.');
+  const hostOrigin = new URL(location.href).origin;
+  if (parent === window || !previewId || !generation) return;
+  const ready = () => parent.postMessage({ protocol: 'rovai-html-preview-v1', type: 'bootstrap-ready', previewId, generation, documentId: 'bootstrap' }, hostOrigin);
+  const receive = event => {
+    const data = event.data;
+    if (event.source !== parent || event.origin !== hostOrigin || !data || typeof data !== 'object'
+      || data.protocol !== 'rovai-html-preview-v1' || data.previewId !== previewId || data.generation !== generation) return;
+    if (data.type === 'connect') { ready(); return; }
+    if (data.type !== 'initialize' || typeof data.html !== 'string' || data.html.length > 24 * 1024 * 1024) return;
+    removeEventListener('message', receive);
+    document.open(); document.write(data.html); document.close();
+  };
+  addEventListener('message', receive);
+  ready();
+})();
+</script></body></html>

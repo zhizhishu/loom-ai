@@ -1,0 +1,294 @@
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { execFileSync, spawn } from 'node:child_process'
+import { createInterface } from 'node:readline'
+import {
+  coreDataDirectoryArguments,
+  removeEphemeralRuntimeCampFilesRoot
+} from './lib/runtime-camp-files-root.mjs'
+
+const root = resolve(import.meta.dirname, '..')
+const dataFixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'rovai-member-config-smoke-')))
+const dataDir = process.platform === 'win32'
+  ? await realpath(JSON.parse(execFileSync(
+    join(root, 'target', 'debug', 'rovai-core.exe'),
+    ['--prepare-windows-data-root', join(dataFixtureRoot, 'formal')],
+    { encoding: 'utf8' }
+  )).core)
+  : dataFixtureRoot
+const runtimeHome = await realpath(await mkdtemp(join(tmpdir(), 'rovai-member-config-home-')))
+let first
+let reopened
+
+try {
+  first = startCore(dataDir)
+  const agents = await first.request('members.list')
+  if (agents.length !== 4) throw new Error(`Expected four Starter members: ${JSON.stringify(agents)}`)
+  if (agents.some((agent) => agent.runtimeReadiness?.status !== 'runtime_not_configured')) {
+    throw new Error(`Starter member unexpectedly has Runtime config: ${JSON.stringify(agents)}`)
+  }
+
+  const camps = await first.request('camps.list')
+  if (camps.length !== 0) throw new Error(`Fresh member storage created an empty Camp: ${JSON.stringify(camps)}`)
+  const leadMemberships = await first.request('members.camps.list', {
+    agentId: 'agent_1'
+  })
+  if (leadMemberships.length !== 0) {
+    throw new Error(`Fresh member unexpectedly belongs to a Camp: ${JSON.stringify(leadMemberships)}`)
+  }
+  const preflight = await first.request('camps.creationPreflight')
+  if (!preflight.admissible
+      || !preflight.initialLeadAgentId
+      || preflight.presentMembers.length !== agents.length
+      || preflight.presentMembers.some((member) => member.runtimeConfigured)) {
+    throw new Error(`Unconfigured members failed structural preflight: ${JSON.stringify(preflight)}`)
+  }
+
+  const createCommandId = crypto.randomUUID()
+  const createResult = await first.request('members.create', {
+    commandId: createCommandId,
+    command: {
+      displayName: 'Smoke Builder',
+      teamRole: 'Developer',
+      professionalResponsibilities: 'Validates v0.27 member identity persistence.',
+      personalityTraits: ['Careful', 'careful'],
+      workingPrinciples: 'Do not execute during this smoke.',
+      growthTopic: ''
+    }
+  })
+  if (first.memberEvents().length !== 1
+      || first.memberEvents()[0].params?.reason !== 'members.create') {
+    throw new Error(`Committed member creation did not notify the roster: ${JSON.stringify(first.memberEvents())}`)
+  }
+  const replay = await first.request('members.create', {
+    commandId: createCommandId,
+    command: {
+      displayName: 'Smoke Builder',
+      teamRole: 'Developer',
+      professionalResponsibilities: 'Validates v0.27 member identity persistence.',
+      personalityTraits: ['Careful', 'careful'],
+      workingPrinciples: 'Do not execute during this smoke.',
+      growthTopic: ''
+    }
+  })
+  if (createResult.code !== 'agent_profile.created'
+      || replay.commandId !== createResult.commandId
+      || replay.resultEntity?.entityId !== createResult.resultEntity?.entityId
+      || first.memberEvents().length !== 1) {
+    throw new Error(`AgentProfile command did not replay: ${JSON.stringify({ createResult, replay })}`)
+  }
+  const agentId = createResult.resultEntity.entityId
+
+  const profile = await first.request('members.get', { agentId })
+  const selectedRuntime = await first.request('members.runtime.set', {
+    commandId: crypto.randomUUID(),
+    command: {
+      agentId,
+      expectedVersion: profile.version,
+      adapterKind: 'qoder-cli',
+      model: { mode: 'runtime_default' },
+      permissions: { adapterKind: 'qoder-cli', schemaVersion: 1, values: {} }
+    }
+  })
+  const expectedUnavailableCode = 'runtime_configuration_unavailable'
+  if (selectedRuntime.status !== 'rejected'
+      || selectedRuntime.code !== expectedUnavailableCode) {
+    throw new Error(`Unavailable Runtime configuration was not rejected atomically: ${JSON.stringify(selectedRuntime)}`)
+  }
+  const unqualifiedCursor = await first.request('members.runtime.set', {
+    commandId: crypto.randomUUID(),
+    command: {
+      agentId,
+      expectedVersion: profile.version,
+      adapterKind: 'cursor-agent',
+      model: { mode: 'runtime_default' },
+      permissions: {
+        adapterKind: 'cursor-agent',
+        schemaVersion: 1,
+        values: { execution_mode: 'agent', approval_policy: 'force' }
+      }
+    }
+  })
+  if (unqualifiedCursor.status !== 'rejected'
+      || unqualifiedCursor.code !== 'runtime_platform_not_qualified') {
+    throw new Error(`Unqualified Cursor configuration was not rejected atomically: ${JSON.stringify(unqualifiedCursor)}`)
+  }
+  const unavailableKimi = await first.request('members.runtime.set', {
+    commandId: crypto.randomUUID(),
+    command: {
+      agentId,
+      expectedVersion: profile.version,
+      adapterKind: 'kimi-code-cli',
+      model: { mode: 'runtime_default' },
+      permissions: {
+        adapterKind: 'kimi-code-cli',
+        schemaVersion: 1,
+        values: { permission_mode: 'yolo' }
+      }
+    }
+  })
+  if (unavailableKimi.status !== 'rejected'
+      || unavailableKimi.code !== 'runtime_configuration_unavailable') {
+    throw new Error(`Missing Kimi configuration was not rejected atomically: ${JSON.stringify(unavailableKimi)}`)
+  }
+  if (first.memberEvents().length !== 1) {
+    throw new Error(`Rejected Runtime changes notified the roster: ${JSON.stringify(first.memberEvents())}`)
+  }
+  const unresolvedProfile = await first.request('members.get', { agentId })
+  const unresolvedInstallations = await first.request('runtime.installations.list')
+  if (unresolvedProfile.runtimeConfiguration !== null
+      || unresolvedProfile.runtimeReadiness?.status !== 'runtime_not_configured'
+      || unresolvedInstallations.some((installation) => (
+        installation.adapterKind === 'qoder-cli'
+        || installation.adapterKind === 'cursor-agent'
+        || installation.adapterKind === 'kimi-code-cli'
+      ))) {
+    throw new Error(`Missing Product Runtime did not remain unresolved without fallback: ${JSON.stringify({
+      unresolvedProfile,
+      unresolvedInstallations
+    })}`)
+  }
+  await first.stop()
+  first = null
+
+  reopened = startCore(dataDir)
+  const persistedProfile = await reopened.request('members.get', { agentId })
+  const installations = await reopened.request('runtime.installations.list')
+  if (Object.hasOwn(persistedProfile, 'handle')
+      || persistedProfile.teamRole !== 'Developer'
+      || persistedProfile.professionalResponsibilities !== 'Validates v0.27 member identity persistence.'
+      || persistedProfile.personalityTraits?.join(',') !== 'Careful'
+      || persistedProfile.workingPrinciples !== 'Do not execute during this smoke.'
+      || persistedProfile.runtimeConfiguration !== null
+      || persistedProfile.runtimeReadiness?.status !== 'runtime_not_configured'
+      || installations.some((installation) => (
+        installation.adapterKind === 'qoder-cli'
+        || installation.adapterKind === 'cursor-agent'
+        || installation.adapterKind === 'kimi-code-cli'
+      ))) {
+    throw new Error(`Member configuration did not survive restart: ${JSON.stringify({
+      persistedProfile,
+      installations
+    })}`)
+  }
+  await reopened.stop()
+  reopened = null
+
+  console.log(JSON.stringify({
+    ok: true,
+    starterCount: agents.length,
+    customAgentId: agentId,
+    selectedRuntimeKind: null,
+    selectedRuntimeReadiness: persistedProfile.runtimeReadiness.status,
+    unconfiguredMemberCount: preflight.presentMembers
+      .filter((member) => !member.runtimeConfigured).length,
+    noRuntimeFallback: true,
+    cursorPlatformAdmissionBlocked: true,
+    kimiMissingRuntimeRejected: true,
+    noEmptyCampOnStartup: true,
+    restartPersistence: true
+  }, null, 2))
+} finally {
+  await first?.stop()
+  await reopened?.stop()
+  await removeEphemeralRuntimeCampFilesRoot(dataDir, { homeDirectory: runtimeHome })
+  await rm(dataFixtureRoot, { recursive: true, force: true })
+  await rm(runtimeHome, { recursive: true, force: true })
+}
+
+function startCore(dataDirectory) {
+  const childEnvironment = {
+    ...process.env,
+    HOME: runtimeHome,
+    PATH: '/usr/bin:/bin',
+    SHELL: '/bin/sh',
+    PNPM_HOME: ''
+  }
+  for (const key of [
+    'ROVAI_CODEX_BIN',
+    'ROVAI_OPENCODE_BIN',
+    'ROVAI_COPILOT_BIN',
+    'ROVAI_CLAUDE_CODE_BIN',
+    'ROVAI_KIRO_BIN',
+    'ROVAI_QODER_BIN',
+    'ROVAI_CODEBUDDY_BIN',
+    'ROVAI_QWEN_BIN',
+    'ROVAI_TRAE_CN_BIN',
+    'ROVAI_CURSOR_BIN',
+    'ROVAI_KIMI_BIN',
+    'ROVAI_ANTIGRAVITY_BIN'
+  ]) {
+    delete childEnvironment[key]
+  }
+  const child = spawn(join(root, 'target', 'debug', 'rovai-core'), [
+    ...coreDataDirectoryArguments(dataDirectory, { homeDirectory: runtimeHome }),
+    '--skill-library-root', join(dataDirectory, 'managed-skill-library')
+  ], {
+    cwd: root,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: childEnvironment
+  })
+  const stderr = []
+  child.stderr.on('data', (chunk) => {
+    stderr.push(String(chunk))
+    process.stderr.write(chunk)
+  })
+  const pending = new Map()
+  const memberEvents = []
+  const startupFailures = []
+  let nextId = 1
+  createInterface({ input: child.stdout }).on('line', (line) => {
+    const message = JSON.parse(line)
+    if (message.kind === 'core_startup' && message.status === 'failed') {
+      startupFailures.push({ phase: message.phase, code: message.error?.code })
+    }
+    if (message.method) {
+      if (message.method === 'members.invalidated') memberEvents.push(message)
+      return
+    }
+    const request = pending.get(message.id)
+    if (!request) return
+    clearTimeout(request.timer)
+    pending.delete(message.id)
+    if (message.error) request.reject(new Error(message.error.message))
+    else request.resolve(message.result)
+  })
+  child.once('error', (error) => {
+    for (const request of pending.values()) {
+      clearTimeout(request.timer)
+      request.reject(error)
+    }
+    pending.clear()
+  })
+  child.once('close', (code, signal) => {
+    for (const request of pending.values()) {
+      clearTimeout(request.timer)
+      request.reject(new Error(`rovai-core exited before replying (code=${code}, signal=${signal}): ${JSON.stringify(startupFailures)} ${stderr.slice(-10).join('')}`))
+    }
+    pending.clear()
+  })
+  return {
+    memberEvents: () => [...memberEvents],
+    request(method, params = {}) {
+      const id = nextId++
+      return new Promise((resolveRequest, rejectRequest) => {
+        const timer = setTimeout(() => {
+          pending.delete(id)
+          rejectRequest(new Error(`Timed out waiting for ${method}`))
+        }, 30_000)
+        pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer })
+        child.stdin.write(`${JSON.stringify({ id, method, params })}\n`)
+      })
+    },
+    async stop() {
+      if (child.exitCode !== null) return
+      child.stdin.end()
+      await Promise.race([
+        new Promise((resolveClose) => child.once('close', resolveClose)),
+        new Promise((resolveTimeout) => setTimeout(resolveTimeout, 2_000))
+      ])
+      if (child.exitCode === null) child.kill('SIGTERM')
+    }
+  }
+}

@@ -1,0 +1,2816 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+
+use anyhow::{Context, Result};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::{
+    db::Database,
+    execution_evidence::{
+        ExecutionEvidenceService, payload_affects_file_facts, successful_send_input_file_path,
+    },
+    managed_blob::{
+        GC_OWNER_FILE_CHANGE_PROJECTION, ManagedBlobStore, attach_gc_candidate, detach_gc_candidate,
+    },
+    runtime_diff::{
+        exact_mutation_fragment, fragment_line_count, normalize_reported_path_for_display,
+        reported_mutation_diff, split_unified_diff_sections, unified_diff_counts,
+        unified_diff_from_complete_states, unified_diff_section_identity,
+    },
+};
+
+pub const AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunChangedFileSummaryView {
+    #[serde(default)]
+    pub evidence_file_id: String,
+    pub path: String,
+    pub change_kind: String,
+    pub presentation_kind: String,
+    pub operation_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunFileChangesView {
+    pub schema_version: u32,
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    #[serde(default)]
+    pub source_change_sequence: i64,
+    #[serde(default = "default_projection_revision")]
+    pub revision: i64,
+    #[serde(default)]
+    pub is_stale: bool,
+    pub files: Vec<AgentRunChangedFileSummaryView>,
+    pub file_count: u64,
+    pub operation_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+    pub completed_at: String,
+}
+
+fn default_projection_revision() -> i64 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunFileChangeBlockView {
+    pub sequence: i64,
+    pub semantics: String,
+    pub change_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunChangedFileDetailView {
+    #[serde(default)]
+    pub evidence_file_id: String,
+    pub path: String,
+    pub change_kind: String,
+    pub presentation_kind: String,
+    pub operation_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+    pub blocks: Vec<AgentRunFileChangeBlockView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunFileChangesDetailView {
+    pub schema_version: u32,
+    pub card: AgentRunFileChangesView,
+    pub files: Vec<AgentRunChangedFileDetailView>,
+}
+
+#[derive(Debug, Clone)]
+struct SequencedEvidence {
+    id: String,
+    sequence: i64,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservedSemantics {
+    FullBeforeAfter {
+        before: Option<String>,
+        after: Option<String>,
+    },
+    UnifiedDiffSnapshot {
+        diff: String,
+    },
+    ExactMutation {
+        old_text: String,
+        new_text: String,
+    },
+    ReportedMutation {
+        diff: String,
+        additions: u64,
+        deletions: u64,
+    },
+    OperationOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedChange {
+    sequence: i64,
+    path: String,
+    change_kind: String,
+    semantics: ObservedSemantics,
+}
+
+#[derive(Debug)]
+struct AggregatedProjection {
+    details: AgentRunFileChangesDetailView,
+    source_evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionState {
+    status: String,
+    source_change_sequence: i64,
+    revision: i64,
+    details_blob_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct AgentRunFileChangeProjector;
+
+impl AgentRunFileChangeProjector {
+    pub fn project_terminal_run(
+        &self,
+        database: &mut Database,
+        blob_store: &ManagedBlobStore,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<Option<AgentRunFileChangesView>> {
+        let terminal = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT agent_run.status, agent_run.ended_at, agent_run.workspace_json
+                FROM agent_run
+                WHERE agent_run.id = ?1 AND agent_run.execution_epoch = ?2
+                "#,
+                params![agent_run_id, execution_epoch],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, completed_at, workspace_json)) = terminal else {
+            return Ok(None);
+        };
+        if !matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+            return Ok(None);
+        }
+        let completed_at = completed_at.context("terminal AgentRun has no ended_at")?;
+        let execution_root = workspace_json
+            .as_deref()
+            .and_then(|workspace| serde_json::from_str::<Value>(workspace).ok())
+            .and_then(|workspace| {
+                workspace
+                    .get("executionRoot")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .context("terminal AgentRun has no frozen execution root")?;
+        let source_change_sequence =
+            load_file_facts_change_sequence(database.connection(), agent_run_id, execution_epoch)?;
+        let existing = load_projection_state(database, agent_run_id, execution_epoch)?;
+        if existing
+            .as_ref()
+            .is_some_and(|state| state.source_change_sequence == source_change_sequence)
+        {
+            return match existing.as_ref().map(|state| state.status.as_str()) {
+                Some("complete") => load_card(database, agent_run_id, execution_epoch),
+                Some("no_changes") => Ok(None),
+                _ => anyhow::bail!("AgentRun file-change projection has an invalid status"),
+            };
+        }
+        let existing_file_ids = load_existing_file_ids(database, agent_run_id, execution_epoch)?;
+        let evidence = match load_full_evidence(database, blob_store, agent_run_id, execution_epoch)
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                record_projection_failure(
+                    database,
+                    agent_run_id,
+                    execution_epoch,
+                    source_change_sequence,
+                    "source_unreadable",
+                )?;
+                return Err(error);
+            }
+        };
+        if let Some(error_code) = file_fact_source_error(&evidence) {
+            record_projection_failure(
+                database,
+                agent_run_id,
+                execution_epoch,
+                source_change_sequence,
+                error_code,
+            )?;
+            anyhow::bail!("AgentRun file-change source is not trustworthy: {error_code}");
+        }
+        let Some(mut projection) = aggregate_evidence_with_existing_ids(
+            agent_run_id,
+            execution_epoch,
+            &completed_at,
+            Path::new(&execution_root),
+            &evidence,
+            &existing_file_ids,
+        ) else {
+            publish_projection(
+                database,
+                agent_run_id,
+                execution_epoch,
+                source_change_sequence,
+                &completed_at,
+                None,
+                existing.as_ref(),
+            )?;
+            return Ok(None);
+        };
+        let next_revision = existing.as_ref().map_or(1, |state| state.revision + 1);
+        projection.details.card.source_change_sequence = source_change_sequence;
+        projection.details.card.revision = next_revision;
+        projection.details.card.is_stale = false;
+        projection.details.card.completed_at = completed_at.clone();
+        let encoded = serde_json::to_vec(&projection.details)?;
+        let blob = blob_store.put_bytes_candidate(
+            database,
+            &encoded,
+            "application/vnd.rovai.agent-run-file-changes+json",
+            "sensitive",
+            GC_OWNER_FILE_CHANGE_PROJECTION,
+        )?;
+        publish_projection(
+            database,
+            agent_run_id,
+            execution_epoch,
+            source_change_sequence,
+            &completed_at,
+            Some((&projection, &blob.id)),
+            existing.as_ref(),
+        )?;
+        load_card(database, agent_run_id, execution_epoch)
+    }
+
+    pub fn recover_terminal_runs(
+        &self,
+        database: &mut Database,
+        blob_store: &ManagedBlobStore,
+    ) -> Result<usize> {
+        let candidates = {
+            let mut statement = database.connection().prepare(
+                r#"
+                SELECT agent_run.id, agent_run.execution_epoch
+                FROM agent_run
+                WHERE agent_run.status IN ('succeeded', 'failed', 'cancelled')
+                  AND (
+                      NOT EXISTS (
+                          SELECT 1 FROM agent_run_file_change_projection AS projection
+                          WHERE projection.agent_run_id = agent_run.id
+                            AND projection.execution_epoch = agent_run.execution_epoch
+                      )
+                      OR COALESCE((
+                          SELECT projection.source_change_sequence
+                          FROM agent_run_file_change_projection AS projection
+                          WHERE projection.agent_run_id = agent_run.id
+                            AND projection.execution_epoch = agent_run.execution_epoch
+                      ), 0) < COALESCE((
+                          SELECT state.file_facts_change_sequence
+                          FROM agent_run_execution_epoch_state AS state
+                          WHERE state.agent_run_id = agent_run.id
+                            AND state.execution_epoch = agent_run.execution_epoch
+                      ), 0)
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM agent_run_execution_evidence AS evidence
+                      WHERE evidence.agent_run_id = agent_run.id
+                        AND evidence.execution_epoch = agent_run.execution_epoch
+                  )
+                ORDER BY agent_run.ended_at, agent_run.id
+                "#,
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut recovered = 0_usize;
+        for (agent_run_id, execution_epoch) in candidates {
+            match self.project_terminal_run(database, blob_store, &agent_run_id, execution_epoch) {
+                Ok(_) => recovered = recovered.saturating_add(1),
+                Err(error) => eprintln!(
+                    "AgentRun file-change projection recovery remains pending for {agent_run_id}/{execution_epoch}: {error:#}"
+                ),
+            }
+        }
+        Ok(recovered)
+    }
+}
+
+pub fn list_completed_run_file_changes(
+    connection: &rusqlite::Connection,
+    camp_id: &str,
+) -> Result<Vec<AgentRunFileChangesView>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT projection.agent_run_id, projection.execution_epoch,
+               projection.file_count, projection.operation_count,
+               projection.additions, projection.deletions,
+               projection.files_summary_json, projection.completed_at,
+               projection.schema_version, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+               projection.source_change_sequence, projection.revision,
+               COALESCE(epoch_state.file_facts_change_sequence, 0)
+        FROM agent_run_file_change_projection AS projection
+        JOIN agent_run ON agent_run.id = projection.agent_run_id
+        LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+        LEFT JOIN agent_run_execution_epoch_state AS epoch_state
+          ON epoch_state.agent_run_id = projection.agent_run_id
+         AND epoch_state.execution_epoch = projection.execution_epoch
+        WHERE COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?1
+          AND projection.status = 'complete'
+        ORDER BY projection.completed_at, projection.agent_run_id, projection.execution_epoch
+        "#,
+    )?;
+    statement
+        .query_map([camp_id], card_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn find_run_file_change_summary(
+    connection: &rusqlite::Connection,
+    camp_id: &str,
+    agent_run_id: &str,
+    execution_epoch: i64,
+    evidence_file_id: &str,
+) -> Result<Option<AgentRunChangedFileSummaryView>> {
+    let card = connection
+        .query_row(
+            r#"
+            SELECT projection.agent_run_id, projection.execution_epoch,
+                   projection.file_count, projection.operation_count,
+                   projection.additions, projection.deletions,
+                   projection.files_summary_json, projection.completed_at,
+                   projection.schema_version, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                   projection.source_change_sequence, projection.revision,
+                   COALESCE(epoch_state.file_facts_change_sequence, 0)
+            FROM agent_run_file_change_projection AS projection
+            JOIN agent_run ON agent_run.id = projection.agent_run_id
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            LEFT JOIN agent_run_execution_epoch_state AS epoch_state
+              ON epoch_state.agent_run_id = projection.agent_run_id
+             AND epoch_state.execution_epoch = projection.execution_epoch
+            WHERE projection.agent_run_id = ?1
+              AND projection.execution_epoch = ?2
+              AND COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?3
+              AND projection.status = 'complete'
+            "#,
+            params![agent_run_id, execution_epoch, camp_id],
+            card_from_row,
+        )
+        .optional()?;
+    Ok(card.and_then(|card| {
+        card.files
+            .into_iter()
+            .find(|file| file.evidence_file_id == evidence_file_id)
+    }))
+}
+
+pub fn read_run_file_changes(
+    database: &Database,
+    blob_store: &ManagedBlobStore,
+    camp_id: &str,
+    agent_run_id: &str,
+    execution_epoch: i64,
+) -> Result<AgentRunFileChangesDetailView> {
+    let (blob_id, stored_schema_version, source_change_sequence, revision, current_source) =
+        database
+            .connection()
+            .query_row(
+                r#"
+            SELECT projection.details_blob_id, projection.schema_version,
+                   projection.source_change_sequence, projection.revision,
+                   COALESCE(epoch_state.file_facts_change_sequence, 0)
+            FROM agent_run_file_change_projection AS projection
+            JOIN agent_run ON agent_run.id = projection.agent_run_id
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            LEFT JOIN agent_run_execution_epoch_state AS epoch_state
+              ON epoch_state.agent_run_id = projection.agent_run_id
+             AND epoch_state.execution_epoch = projection.execution_epoch
+            WHERE projection.agent_run_id = ?1
+              AND projection.execution_epoch = ?2
+              AND COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?3
+              AND projection.status = 'complete'
+            "#,
+                params![agent_run_id, execution_epoch, camp_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("AgentRun file changes do not exist in this Thread")?;
+    let stored_schema_version = u32::try_from(stored_schema_version)
+        .context("AgentRun file changes have an invalid stored schema version")?;
+    ensure_supported_schema_version(stored_schema_version)?;
+    let bytes = blob_store.read_bytes(database, &blob_id)?;
+    let mut detail = serde_json::from_slice::<AgentRunFileChangesDetailView>(&bytes)
+        .context("AgentRun file changes are not valid JSON")?;
+    if detail.card.agent_run_id != agent_run_id || detail.card.execution_epoch != execution_epoch {
+        anyhow::bail!("AgentRun file changes identity is invalid");
+    }
+    if detail.schema_version != stored_schema_version
+        || detail.card.schema_version != stored_schema_version
+    {
+        anyhow::bail!("AgentRun file changes schema evidence is inconsistent");
+    }
+    detail.card.source_change_sequence = source_change_sequence;
+    detail.card.revision = revision;
+    detail.card.is_stale = source_change_sequence < current_source;
+    adapt_detail_to_public_v2(detail, camp_id, stored_schema_version)
+}
+
+fn load_card(
+    database: &Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+) -> Result<Option<AgentRunFileChangesView>> {
+    database
+        .connection()
+        .query_row(
+            r#"
+            SELECT projection.agent_run_id, projection.execution_epoch,
+                   projection.file_count, projection.operation_count,
+                   projection.additions, projection.deletions,
+                   projection.files_summary_json, projection.completed_at,
+                   projection.schema_version, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                   projection.source_change_sequence, projection.revision,
+                   COALESCE(epoch_state.file_facts_change_sequence, 0)
+            FROM agent_run_file_change_projection AS projection
+            JOIN agent_run ON agent_run.id = projection.agent_run_id
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            LEFT JOIN agent_run_execution_epoch_state AS epoch_state
+              ON epoch_state.agent_run_id = projection.agent_run_id
+             AND epoch_state.execution_epoch = projection.execution_epoch
+            WHERE projection.agent_run_id = ?1 AND projection.execution_epoch = ?2
+              AND projection.status = 'complete'
+            "#,
+            params![agent_run_id, execution_epoch],
+            card_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_file_facts_change_sequence(
+    connection: &rusqlite::Connection,
+    agent_run_id: &str,
+    execution_epoch: i64,
+) -> Result<i64> {
+    Ok(connection.query_row(
+        r#"
+        SELECT COALESCE((
+            SELECT file_facts_change_sequence
+            FROM agent_run_execution_epoch_state
+            WHERE agent_run_id = ?1 AND execution_epoch = ?2
+        ), 0)
+        "#,
+        params![agent_run_id, execution_epoch],
+        |row| row.get(0),
+    )?)
+}
+
+fn load_projection_state(
+    database: &Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+) -> Result<Option<ProjectionState>> {
+    database
+        .connection()
+        .query_row(
+            r#"
+            SELECT status, source_change_sequence, revision, details_blob_id
+            FROM agent_run_file_change_projection
+            WHERE agent_run_id = ?1 AND execution_epoch = ?2
+            "#,
+            params![agent_run_id, execution_epoch],
+            |row| {
+                Ok(ProjectionState {
+                    status: row.get(0)?,
+                    source_change_sequence: row.get(1)?,
+                    revision: row.get(2)?,
+                    details_blob_id: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_existing_file_ids(
+    database: &Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+) -> Result<BTreeMap<String, String>> {
+    Ok(load_card(database, agent_run_id, execution_epoch)?
+        .map(|card| {
+            card.files
+                .into_iter()
+                .map(|file| (file.path, file.evidence_file_id))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn record_projection_failure(
+    database: &Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+    source_change_sequence: i64,
+    error_code: &str,
+) -> Result<()> {
+    database.connection().execute(
+        r#"
+        UPDATE agent_run_file_change_projection
+        SET last_attempted_source_change_sequence = ?3,
+            last_error_code = ?4,
+            updated_at = ?5
+        WHERE agent_run_id = ?1 AND execution_epoch = ?2
+        "#,
+        params![
+            agent_run_id,
+            execution_epoch,
+            source_change_sequence,
+            error_code,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn publish_projection(
+    database: &mut Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+    source_change_sequence: i64,
+    completed_at: &str,
+    projection: Option<(&AggregatedProjection, &str)>,
+    existing: Option<&ProjectionState>,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let revision = existing.map_or(1, |state| state.revision + 1);
+    let (status, file_count, operation_count, additions, deletions, summary_json, blob_id, sources) =
+        match projection {
+            Some((projection, blob_id)) => (
+                "complete",
+                projection.details.card.file_count as i64,
+                projection.details.card.operation_count as i64,
+                projection.details.card.additions.map(|value| value as i64),
+                projection.details.card.deletions.map(|value| value as i64),
+                serde_json::to_string(&projection.details.card.files)?,
+                Some(blob_id),
+                serde_json::to_string(&projection.source_evidence_ids)?,
+            ),
+            None => (
+                "no_changes",
+                0,
+                0,
+                None,
+                None,
+                "[]".to_string(),
+                None,
+                "[]".to_string(),
+            ),
+        };
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current_source = transaction.query_row(
+        r#"
+        SELECT COALESCE((
+            SELECT file_facts_change_sequence
+            FROM agent_run_execution_epoch_state
+            WHERE agent_run_id = ?1 AND execution_epoch = ?2
+        ), 0)
+        "#,
+        params![agent_run_id, execution_epoch],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if current_source != source_change_sequence {
+        transaction.commit()?;
+        anyhow::bail!("AgentRun file facts changed while the projection was being built");
+    }
+    transaction.execute(
+        r#"
+        INSERT INTO agent_run_file_change_projection(
+            agent_run_id, execution_epoch, schema_version, status,
+            file_count, operation_count, additions, deletions,
+            files_summary_json, details_blob_id,
+            source_evidence_ids_json, completed_at, created_at,
+            source_change_sequence, revision, updated_at,
+            last_attempted_source_change_sequence, last_error_code
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?13, ?14, NULL
+        )
+        ON CONFLICT(agent_run_id, execution_epoch) DO UPDATE SET
+            schema_version = excluded.schema_version,
+            status = excluded.status,
+            file_count = excluded.file_count,
+            operation_count = excluded.operation_count,
+            additions = excluded.additions,
+            deletions = excluded.deletions,
+            files_summary_json = excluded.files_summary_json,
+            details_blob_id = excluded.details_blob_id,
+            source_evidence_ids_json = excluded.source_evidence_ids_json,
+            completed_at = excluded.completed_at,
+            source_change_sequence = excluded.source_change_sequence,
+            revision = excluded.revision,
+            updated_at = excluded.updated_at,
+            last_attempted_source_change_sequence = excluded.last_attempted_source_change_sequence,
+            last_error_code = NULL
+        "#,
+        params![
+            agent_run_id,
+            execution_epoch,
+            i64::from(AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION),
+            status,
+            file_count,
+            operation_count,
+            additions,
+            deletions,
+            summary_json,
+            blob_id,
+            sources,
+            completed_at,
+            now,
+            source_change_sequence,
+            revision,
+        ],
+    )?;
+    if let Some(blob_id) = blob_id {
+        attach_gc_candidate(&transaction, blob_id)?;
+    }
+    if let Some(old_blob_id) = existing
+        .and_then(|state| state.details_blob_id.as_deref())
+        .filter(|old_blob_id| Some(*old_blob_id) != blob_id)
+    {
+        detach_gc_candidate(
+            &transaction,
+            old_blob_id,
+            GC_OWNER_FILE_CHANGE_PROJECTION,
+            &now,
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn card_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRunFileChangesView> {
+    let files_json = row.get::<_, String>(6)?;
+    let mut files = serde_json::from_str::<Vec<AgentRunChangedFileSummaryView>>(&files_json)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                files_json.len(),
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let agent_run_id = row.get::<_, String>(0)?;
+    let execution_epoch = row.get::<_, i64>(1)?;
+    let stored_schema_version = u32::try_from(row.get::<_, i64>(8)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    let camp_id = row.get::<_, String>(9)?;
+    adapt_summary_ids(
+        &mut files,
+        &camp_id,
+        &agent_run_id,
+        execution_epoch,
+        stored_schema_version,
+    )
+    .map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            files_json.len(),
+            rusqlite::types::Type::Text,
+            error.into(),
+        )
+    })?;
+    Ok(AgentRunFileChangesView {
+        schema_version: AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION,
+        agent_run_id,
+        execution_epoch,
+        source_change_sequence: row.get(10)?,
+        revision: row.get(11)?,
+        is_stale: row.get::<_, i64>(10)? < row.get::<_, i64>(12)?,
+        file_count: row.get::<_, i64>(2)?.max(0) as u64,
+        operation_count: row.get::<_, i64>(3)?.max(0) as u64,
+        additions: row
+            .get::<_, Option<i64>>(4)?
+            .map(|value| value.max(0) as u64),
+        deletions: row
+            .get::<_, Option<i64>>(5)?
+            .map(|value| value.max(0) as u64),
+        files,
+        completed_at: row.get(7)?,
+    })
+}
+
+fn new_evidence_file_id() -> String {
+    format!("ef_{}", Uuid::now_v7().simple())
+}
+
+fn legacy_evidence_file_id(
+    camp_id: &str,
+    agent_run_id: &str,
+    execution_epoch: i64,
+    stored_schema_version: u32,
+    ordinal: usize,
+) -> String {
+    let mut digest = Sha256::new();
+    for component in [
+        "rovai-evidence-file-id-v1".to_string(),
+        camp_id.to_string(),
+        agent_run_id.to_string(),
+        execution_epoch.to_string(),
+        stored_schema_version.to_string(),
+        ordinal.to_string(),
+    ] {
+        digest.update(component.as_bytes());
+        digest.update([0]);
+    }
+    format!("ef_{:x}", digest.finalize())
+}
+
+fn ensure_supported_schema_version(stored_schema_version: u32) -> Result<()> {
+    if !matches!(
+        stored_schema_version,
+        1 | 2 | AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION
+    ) {
+        anyhow::bail!(
+            "AgentRun file changes schema version {stored_schema_version} is not supported"
+        );
+    }
+    Ok(())
+}
+
+fn adapt_summary_ids(
+    files: &mut [AgentRunChangedFileSummaryView],
+    camp_id: &str,
+    agent_run_id: &str,
+    execution_epoch: i64,
+    stored_schema_version: u32,
+) -> Result<()> {
+    ensure_supported_schema_version(stored_schema_version)?;
+    for (ordinal, file) in files.iter_mut().enumerate() {
+        match stored_schema_version {
+            1 => {
+                file.evidence_file_id = legacy_evidence_file_id(
+                    camp_id,
+                    agent_run_id,
+                    execution_epoch,
+                    stored_schema_version,
+                    ordinal,
+                );
+            }
+            2 | AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION => {
+                if file.evidence_file_id.trim().is_empty() {
+                    anyhow::bail!("AgentRun file changes have a missing Evidence File identity");
+                }
+            }
+            _ => unreachable!("schema version was validated before adaptation"),
+        }
+    }
+    Ok(())
+}
+
+fn adapt_detail_to_public_v2(
+    mut detail: AgentRunFileChangesDetailView,
+    camp_id: &str,
+    stored_schema_version: u32,
+) -> Result<AgentRunFileChangesDetailView> {
+    if detail.card.files.len() != detail.files.len() {
+        anyhow::bail!("AgentRun file changes summary and detail are misaligned");
+    }
+    let agent_run_id = detail.card.agent_run_id.clone();
+    let execution_epoch = detail.card.execution_epoch;
+    adapt_summary_ids(
+        &mut detail.card.files,
+        camp_id,
+        &agent_run_id,
+        execution_epoch,
+        stored_schema_version,
+    )?;
+    for (ordinal, file) in detail.files.iter_mut().enumerate() {
+        let summary = &detail.card.files[ordinal];
+        if file.path != summary.path {
+            anyhow::bail!("AgentRun file changes summary and detail are misaligned");
+        }
+        match stored_schema_version {
+            1 => file.evidence_file_id = summary.evidence_file_id.clone(),
+            2 | AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION => {
+                if file.evidence_file_id != summary.evidence_file_id
+                    || file.evidence_file_id.trim().is_empty()
+                {
+                    anyhow::bail!(
+                        "AgentRun file changes summary and detail identity are misaligned"
+                    );
+                }
+            }
+            _ => unreachable!("schema version was validated before detail adaptation"),
+        }
+    }
+    detail.schema_version = AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION;
+    detail.card.schema_version = AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION;
+    Ok(detail)
+}
+
+fn load_full_evidence(
+    database: &Database,
+    blob_store: &ManagedBlobStore,
+    agent_run_id: &str,
+    execution_epoch: i64,
+) -> Result<Vec<SequencedEvidence>> {
+    let rows = {
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT id, COALESCE(change_sequence, sequence) AS fact_sequence
+            FROM agent_run_execution_evidence
+            WHERE agent_run_id = ?1 AND execution_epoch = ?2
+            ORDER BY fact_sequence, id
+            "#,
+        )?;
+        statement
+            .query_map(params![agent_run_id, execution_epoch], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    rows.into_iter()
+        .map(|(id, sequence)| {
+            let payload =
+                ExecutionEvidenceService.read_full_payload_unscoped(database, blob_store, &id)?;
+            Ok(SequencedEvidence {
+                id,
+                sequence,
+                payload,
+            })
+        })
+        .collect()
+}
+
+#[cfg(all(test, feature = "extended-tests"))]
+fn aggregate_evidence(
+    agent_run_id: &str,
+    execution_epoch: i64,
+    completed_at: &str,
+    execution_root: &Path,
+    evidence: &[SequencedEvidence],
+) -> Option<AggregatedProjection> {
+    aggregate_evidence_with_existing_ids(
+        agent_run_id,
+        execution_epoch,
+        completed_at,
+        execution_root,
+        evidence,
+        &BTreeMap::new(),
+    )
+}
+
+fn aggregate_evidence_with_existing_ids(
+    agent_run_id: &str,
+    execution_epoch: i64,
+    completed_at: &str,
+    execution_root: &Path,
+    evidence: &[SequencedEvidence],
+    existing_file_ids: &BTreeMap<String, String>,
+) -> Option<AggregatedProjection> {
+    let mut changes = Vec::new();
+    let mut latest_run_snapshot: Option<(i64, String)> = None;
+    let mut source_evidence_ids = Vec::new();
+    let mut send_input_paths = BTreeSet::new();
+    for item in evidence {
+        if let Some(path) = successful_send_input_file_path(&item.payload)
+            .and_then(|path| normalize_reported_path_for_display(execution_root, path))
+        {
+            send_input_paths.insert(path);
+            source_evidence_ids.push(item.id.clone());
+        }
+        if let Some(diff) = item
+            .payload
+            .pointer("/runtimeRunDiff/diff")
+            .and_then(Value::as_str)
+            .filter(|_| {
+                item.payload
+                    .pointer("/runtimeRunDiff/status")
+                    .and_then(Value::as_str)
+                    == Some("available")
+            })
+        {
+            latest_run_snapshot = Some((item.sequence, diff.to_string()));
+            source_evidence_ids.push(item.id.clone());
+        }
+        let before = changes.len();
+        append_diff_changes(&mut changes, item.sequence, execution_root, &item.payload);
+        append_operation_only_change(&mut changes, item.sequence, execution_root, &item.payload);
+        if changes.len() != before {
+            source_evidence_ids.push(item.id.clone());
+        }
+    }
+    source_evidence_ids.sort();
+    source_evidence_ids.dedup();
+
+    let observed_counts = operation_counts_by_path(&changes);
+    let mut files = match latest_run_snapshot {
+        Some((sequence, diff)) => file_details_with_authoritative_snapshot(
+            sequence,
+            execution_root,
+            &diff,
+            changes,
+            &observed_counts,
+        ),
+        None => file_details_from_operations(changes),
+    };
+    // Apply to the final file list so both authoritative snapshots and operation
+    // fallbacks share the exclusion, detail and statistics. Never read the file.
+    files.retain(|file| !send_input_paths.contains(&file.path));
+    if files.is_empty() {
+        return None;
+    }
+    for file in &mut files {
+        file.evidence_file_id = existing_file_ids
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_else(new_evidence_file_id);
+    }
+    let all_files_have_counts = files
+        .iter()
+        .all(|file| file.additions.is_some() && file.deletions.is_some());
+    let (additions, deletions) = if all_files_have_counts {
+        sum_known_counts(files.iter().map(|file| (file.additions, file.deletions)))
+    } else {
+        (None, None)
+    };
+    let operation_count = files
+        .iter()
+        .map(|file| file.operation_count)
+        .fold(0_u64, u64::saturating_add);
+    let summaries = files
+        .iter()
+        .map(|file| AgentRunChangedFileSummaryView {
+            evidence_file_id: file.evidence_file_id.clone(),
+            path: file.path.clone(),
+            change_kind: file.change_kind.clone(),
+            presentation_kind: file.presentation_kind.clone(),
+            operation_count: file.operation_count,
+            additions: file.additions,
+            deletions: file.deletions,
+        })
+        .collect::<Vec<_>>();
+    let card = AgentRunFileChangesView {
+        schema_version: AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION,
+        agent_run_id: agent_run_id.to_string(),
+        execution_epoch,
+        source_change_sequence: 0,
+        revision: 1,
+        is_stale: false,
+        file_count: summaries.len() as u64,
+        operation_count,
+        additions,
+        deletions,
+        files: summaries,
+        completed_at: completed_at.to_string(),
+    };
+    Some(AggregatedProjection {
+        details: AgentRunFileChangesDetailView {
+            schema_version: AGENT_RUN_FILE_CHANGES_SCHEMA_VERSION,
+            card,
+            files,
+        },
+        source_evidence_ids,
+    })
+}
+
+fn file_fact_source_error(evidence: &[SequencedEvidence]) -> Option<&'static str> {
+    evidence.iter().find_map(|item| {
+        if !payload_affects_file_facts(&item.payload) {
+            return None;
+        }
+        if item
+            .payload
+            .pointer("/_rovaiLifecycle/terminalConflict")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Some("source_terminal_conflict");
+        }
+        if item
+            .payload
+            .pointer("/_rovaiContent/complete")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            return Some("source_content_incomplete");
+        }
+        None
+    })
+}
+
+fn append_diff_changes(
+    changes: &mut Vec<ObservedChange>,
+    sequence: i64,
+    execution_root: &Path,
+    payload: &Value,
+) {
+    let Some(diff) = payload.get("runtimeDiff") else {
+        return;
+    };
+    if diff.get("status").and_then(Value::as_str) != Some("available") {
+        return;
+    }
+    let Some(entries) = diff.get("entries").and_then(Value::as_array) else {
+        return;
+    };
+    let single_operation_path = (entries.len() == 1)
+        .then(|| normalized_file_operation_path(payload, execution_root))
+        .flatten();
+    for entry in entries {
+        let Some(raw_path) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(path) = single_operation_path
+            .clone()
+            .or_else(|| normalize_reported_path_for_display(execution_root, raw_path))
+        else {
+            continue;
+        };
+        let semantics = entry
+            .get("semantics")
+            .and_then(Value::as_str)
+            .or_else(|| diff.get("semanticKind").and_then(Value::as_str));
+        let observed = match semantics {
+            Some("reported_mutation") => {
+                let Some((diff, additions, deletions)) = reported_mutation_diff(entry) else {
+                    continue;
+                };
+                ObservedChange {
+                    sequence,
+                    path,
+                    change_kind: "update".to_string(),
+                    semantics: ObservedSemantics::ReportedMutation {
+                        diff,
+                        additions,
+                        deletions,
+                    },
+                }
+            }
+            Some("full_before_after" | "complete_before_after") => {
+                let Some(before) =
+                    optional_text(entry.get("before").or_else(|| entry.get("oldText")))
+                else {
+                    continue;
+                };
+                let Some(after) =
+                    optional_text(entry.get("after").or_else(|| entry.get("newText")))
+                else {
+                    continue;
+                };
+                if before == after {
+                    continue;
+                }
+                let change_kind = normalized_change_kind(entry, &before, &after);
+                ObservedChange {
+                    sequence,
+                    path,
+                    change_kind,
+                    semantics: ObservedSemantics::FullBeforeAfter { before, after },
+                }
+            }
+            Some("unified_diff_snapshot" | "codex_file_change_snapshot") => {
+                let Some(diff) = entry.get("diff").and_then(Value::as_str) else {
+                    continue;
+                };
+                if diff.is_empty() {
+                    continue;
+                }
+                ObservedChange {
+                    sequence,
+                    path,
+                    change_kind: entry
+                        .get("changeKind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("update")
+                        .to_string(),
+                    semantics: ObservedSemantics::UnifiedDiffSnapshot {
+                        diff: diff.to_string(),
+                    },
+                }
+            }
+            Some("exact_mutation") => {
+                let Some(old_text) = entry
+                    .get("oldText")
+                    .or_else(|| entry.get("oldFragment"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(new_text) = entry
+                    .get("newText")
+                    .or_else(|| entry.get("newFragment"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if old_text == new_text {
+                    continue;
+                }
+                ObservedChange {
+                    sequence,
+                    path,
+                    change_kind: "update".to_string(),
+                    semantics: ObservedSemantics::ExactMutation {
+                        old_text: old_text.to_string(),
+                        new_text: new_text.to_string(),
+                    },
+                }
+            }
+            _ => continue,
+        };
+        changes.push(observed);
+    }
+}
+
+fn append_operation_only_change(
+    changes: &mut Vec<ObservedChange>,
+    sequence: i64,
+    execution_root: &Path,
+    payload: &Value,
+) {
+    if payload
+        .pointer("/runtimeDiff/status")
+        .and_then(Value::as_str)
+        == Some("unavailable")
+        && payload
+            .pointer("/runtimeDiff/safeReasonCode")
+            .and_then(Value::as_str)
+            == Some("runtime_diff_no_changes")
+    {
+        return;
+    }
+    let Some(operation) = payload.get("runtimeFileOperation") else {
+        return;
+    };
+    let Some(path) = normalized_file_operation_path(payload, execution_root) else {
+        return;
+    };
+    if changes
+        .iter()
+        .rev()
+        .take_while(|change| change.sequence == sequence)
+        .any(|change| change.path == path)
+    {
+        return;
+    }
+    changes.push(ObservedChange {
+        sequence,
+        path,
+        change_kind: operation
+            .get("changeKind")
+            .and_then(Value::as_str)
+            .unwrap_or("update")
+            .to_string(),
+        semantics: ObservedSemantics::OperationOnly,
+    });
+}
+
+fn normalized_file_operation_path(payload: &Value, execution_root: &Path) -> Option<String> {
+    let operation = payload.get("runtimeFileOperation")?;
+    if operation.get("status").and_then(Value::as_str) != Some("available") {
+        return None;
+    }
+    match operation.get("operationKind").and_then(Value::as_str) {
+        Some("write") => {}
+        Some(_) => return None,
+        None if operation
+            .get("changeKind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "add" | "update" | "delete")) => {}
+        None => return None,
+    }
+    let raw_path = operation.get("path").and_then(Value::as_str)?;
+    normalize_reported_path_for_display(execution_root, raw_path)
+}
+
+fn optional_text(value: Option<&Value>) -> Option<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(text)) => Some(Some(text.clone())),
+        Some(_) => None,
+    }
+}
+
+fn normalized_change_kind(
+    entry: &Value,
+    before: &Option<String>,
+    after: &Option<String>,
+) -> String {
+    entry
+        .get("changeKind")
+        .and_then(Value::as_str)
+        .filter(|kind| matches!(*kind, "add" | "update" | "delete"))
+        .unwrap_or(match (before, after) {
+            (None, Some(_)) => "add",
+            (Some(_), None) => "delete",
+            _ => "update",
+        })
+        .to_string()
+}
+
+fn operation_counts_by_path(changes: &[ObservedChange]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for change in changes {
+        *counts.entry(change.path.clone()).or_default() += 1;
+    }
+    counts
+}
+
+fn file_details_from_operations(
+    changes: Vec<ObservedChange>,
+) -> Vec<AgentRunChangedFileDetailView> {
+    let mut by_path = BTreeMap::<String, Vec<ObservedChange>>::new();
+    for change in changes {
+        by_path.entry(change.path.clone()).or_default().push(change);
+    }
+    by_path
+        .into_iter()
+        .filter_map(|(path, mut operations)| {
+            operations.sort_by_key(|operation| operation.sequence);
+            file_detail_from_operations(path, operations)
+        })
+        .collect()
+}
+
+fn file_detail_from_operations(
+    path: String,
+    operations: Vec<ObservedChange>,
+) -> Option<AgentRunChangedFileDetailView> {
+    let operation_count = operations.len() as u64;
+    let operation_only = operations
+        .iter()
+        .filter(|operation| matches!(operation.semantics, ObservedSemantics::OperationOnly))
+        .cloned()
+        .collect::<Vec<_>>();
+    let diff_operations = operations
+        .iter()
+        .filter(|operation| !matches!(operation.semantics, ObservedSemantics::OperationOnly))
+        .cloned()
+        .collect::<Vec<_>>();
+    if diff_operations.is_empty() {
+        return Some(AgentRunChangedFileDetailView {
+            evidence_file_id: String::new(),
+            path,
+            change_kind: combined_change_kind(&operations),
+            presentation_kind: "operation_only".to_string(),
+            operation_count,
+            additions: None,
+            deletions: None,
+            blocks: operations.iter().map(operation_block).collect(),
+        });
+    }
+    let Some(mut detail) = file_detail_from_diff_operations(path.clone(), diff_operations) else {
+        if operation_only.is_empty() {
+            return None;
+        }
+        return Some(AgentRunChangedFileDetailView {
+            evidence_file_id: String::new(),
+            path,
+            change_kind: combined_change_kind(&operation_only),
+            presentation_kind: "operation_only".to_string(),
+            operation_count,
+            additions: None,
+            deletions: None,
+            blocks: operation_only.iter().map(operation_block).collect(),
+        });
+    };
+    if !operation_only.is_empty() {
+        return Some(AgentRunChangedFileDetailView {
+            evidence_file_id: String::new(),
+            path,
+            change_kind: combined_change_kind(&operations),
+            presentation_kind: "operation_history".to_string(),
+            operation_count,
+            additions: detail.additions,
+            deletions: detail.deletions,
+            blocks: operations.iter().map(operation_block).collect(),
+        });
+    }
+    detail.operation_count = operation_count;
+    Some(detail)
+}
+
+fn file_detail_from_diff_operations(
+    path: String,
+    operations: Vec<ObservedChange>,
+) -> Option<AgentRunChangedFileDetailView> {
+    if operations.iter().all(|operation| {
+        matches!(
+            operation.semantics,
+            ObservedSemantics::FullBeforeAfter { .. }
+        )
+    }) {
+        return continuous_full_state_detail(path, operations);
+    }
+    if operations.len() == 1
+        && matches!(
+            operations[0].semantics,
+            ObservedSemantics::UnifiedDiffSnapshot { .. }
+        )
+    {
+        let operation = &operations[0];
+        let ObservedSemantics::UnifiedDiffSnapshot { diff } = &operation.semantics else {
+            unreachable!();
+        };
+        let (additions, deletions) = unified_diff_counts(diff);
+        return Some(AgentRunChangedFileDetailView {
+            evidence_file_id: String::new(),
+            path,
+            change_kind: operation.change_kind.clone(),
+            presentation_kind: "full_net_diff".to_string(),
+            operation_count: 1,
+            additions: Some(additions),
+            deletions: Some(deletions),
+            blocks: vec![AgentRunFileChangeBlockView {
+                sequence: operation.sequence,
+                semantics: "full_net_diff".to_string(),
+                change_kind: operation.change_kind.clone(),
+                additions: Some(additions),
+                deletions: Some(deletions),
+                diff: Some(diff.clone()),
+            }],
+        });
+    }
+    let exact_only = operations
+        .iter()
+        .all(|operation| matches!(operation.semantics, ObservedSemantics::ExactMutation { .. }));
+    let reported_only = operations.iter().all(|operation| {
+        matches!(
+            operation.semantics,
+            ObservedSemantics::ReportedMutation { .. }
+        )
+    });
+    let change_kind = combined_change_kind(&operations);
+    let blocks = operations.iter().map(operation_block).collect::<Vec<_>>();
+    let (additions, deletions) = sum_known_counts(
+        blocks
+            .iter()
+            .map(|block| (block.additions, block.deletions)),
+    );
+    Some(AgentRunChangedFileDetailView {
+        evidence_file_id: String::new(),
+        path,
+        change_kind,
+        presentation_kind: if exact_only {
+            "exact_mutations"
+        } else if reported_only {
+            "reported_mutations"
+        } else {
+            "operation_history"
+        }
+        .to_string(),
+        operation_count: operations.len() as u64,
+        additions,
+        deletions,
+        blocks,
+    })
+}
+
+fn continuous_full_state_detail(
+    path: String,
+    operations: Vec<ObservedChange>,
+) -> Option<AgentRunChangedFileDetailView> {
+    let first = operations.first()?;
+    let ObservedSemantics::FullBeforeAfter {
+        before: baseline,
+        after: first_after,
+    } = &first.semantics
+    else {
+        return None;
+    };
+    let mut current = first_after.clone();
+    let mut continuous = true;
+    for operation in operations.iter().skip(1) {
+        let ObservedSemantics::FullBeforeAfter { before, after } = &operation.semantics else {
+            continuous = false;
+            break;
+        };
+        if before != &current {
+            continuous = false;
+            break;
+        }
+        current = after.clone();
+    }
+    if !continuous {
+        let change_kind = combined_change_kind(&operations);
+        let blocks = operations.iter().map(operation_block).collect::<Vec<_>>();
+        let (additions, deletions) = sum_known_counts(
+            blocks
+                .iter()
+                .map(|block| (block.additions, block.deletions)),
+        );
+        return Some(AgentRunChangedFileDetailView {
+            evidence_file_id: String::new(),
+            path,
+            change_kind,
+            presentation_kind: "operation_history".to_string(),
+            operation_count: operations.len() as u64,
+            additions,
+            deletions,
+            blocks,
+        });
+    }
+    if baseline == &current {
+        return None;
+    }
+    let change_kind = match (baseline, &current) {
+        (None, Some(_)) => "add",
+        (Some(_), None) => "delete",
+        _ => "update",
+    }
+    .to_string();
+    let diff = unified_diff_from_complete_states(&path, baseline.as_deref(), current.as_deref())?;
+    let (additions, deletions) = unified_diff_counts(&diff);
+    Some(AgentRunChangedFileDetailView {
+        evidence_file_id: String::new(),
+        path,
+        change_kind: change_kind.clone(),
+        presentation_kind: "full_net_diff".to_string(),
+        operation_count: operations.len() as u64,
+        additions: Some(additions),
+        deletions: Some(deletions),
+        blocks: vec![AgentRunFileChangeBlockView {
+            sequence: first.sequence,
+            semantics: "full_net_diff".to_string(),
+            change_kind,
+            additions: Some(additions),
+            deletions: Some(deletions),
+            diff: Some(diff),
+        }],
+    })
+}
+
+fn operation_block(operation: &ObservedChange) -> AgentRunFileChangeBlockView {
+    if let ObservedSemantics::ReportedMutation {
+        diff,
+        additions,
+        deletions,
+    } = &operation.semantics
+    {
+        return AgentRunFileChangeBlockView {
+            sequence: operation.sequence,
+            semantics: "reported_mutation".to_string(),
+            change_kind: operation.change_kind.clone(),
+            additions: Some(*additions),
+            deletions: Some(*deletions),
+            diff: Some(diff.clone()),
+        };
+    }
+    if let ObservedSemantics::ExactMutation { old_text, new_text } = &operation.semantics {
+        return AgentRunFileChangeBlockView {
+            sequence: operation.sequence,
+            semantics: "exact_mutation".to_string(),
+            change_kind: operation.change_kind.clone(),
+            additions: Some(fragment_line_count(new_text)),
+            deletions: Some(fragment_line_count(old_text)),
+            diff: Some(exact_mutation_fragment(old_text, new_text)),
+        };
+    }
+    let (semantics, diff) = match &operation.semantics {
+        ObservedSemantics::FullBeforeAfter { before, after } => (
+            "full_before_after",
+            unified_diff_from_complete_states(&operation.path, before.as_deref(), after.as_deref()),
+        ),
+        ObservedSemantics::UnifiedDiffSnapshot { diff } => {
+            ("unified_diff_snapshot", Some(diff.clone()))
+        }
+        ObservedSemantics::ExactMutation { .. } | ObservedSemantics::ReportedMutation { .. } => {
+            unreachable!()
+        }
+        ObservedSemantics::OperationOnly => ("operation_only", None),
+    };
+    let (additions, deletions) = diff
+        .as_deref()
+        .map(unified_diff_counts)
+        .map_or((None, None), |(additions, deletions)| {
+            (Some(additions), Some(deletions))
+        });
+    AgentRunFileChangeBlockView {
+        sequence: operation.sequence,
+        semantics: semantics.to_string(),
+        change_kind: operation.change_kind.clone(),
+        additions,
+        deletions,
+        diff,
+    }
+}
+
+fn sum_known_counts(
+    counts: impl IntoIterator<Item = (Option<u64>, Option<u64>)>,
+) -> (Option<u64>, Option<u64>) {
+    let mut found = false;
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    for (known_additions, known_deletions) in counts {
+        if let (Some(known_additions), Some(known_deletions)) = (known_additions, known_deletions) {
+            found = true;
+            additions = additions.saturating_add(known_additions);
+            deletions = deletions.saturating_add(known_deletions);
+        }
+    }
+    if found {
+        (Some(additions), Some(deletions))
+    } else {
+        (None, None)
+    }
+}
+
+fn combined_change_kind(operations: &[ObservedChange]) -> String {
+    let kinds = operations
+        .iter()
+        .map(|operation| operation.change_kind.as_str())
+        .collect::<BTreeSet<_>>();
+    if kinds.len() == 1 {
+        kinds.into_iter().next().unwrap_or("update").to_string()
+    } else {
+        "update".to_string()
+    }
+}
+
+fn file_details_from_authoritative_snapshot(
+    sequence: i64,
+    execution_root: &Path,
+    diff: &str,
+    observed_counts: &BTreeMap<String, u64>,
+) -> Option<Vec<AgentRunChangedFileDetailView>> {
+    let sections = split_unified_diff_sections(diff);
+    if sections.is_empty() {
+        return None;
+    }
+    let mut files = Vec::new();
+    for section in sections {
+        let (raw_path, change_kind) = unified_diff_section_identity(&section)?;
+        let path = normalize_reported_path_for_display(execution_root, &raw_path)?;
+        let (additions, deletions) = unified_diff_counts(&section);
+        let operation_count = observed_counts.get(&path).copied().unwrap_or(1);
+        files.push(AgentRunChangedFileDetailView {
+            evidence_file_id: String::new(),
+            path,
+            change_kind: change_kind.clone(),
+            presentation_kind: "full_net_diff".to_string(),
+            operation_count,
+            additions: Some(additions),
+            deletions: Some(deletions),
+            blocks: vec![AgentRunFileChangeBlockView {
+                sequence,
+                semantics: "full_net_diff".to_string(),
+                change_kind,
+                additions: Some(additions),
+                deletions: Some(deletions),
+                diff: Some(section),
+            }],
+        });
+    }
+    Some(files)
+}
+
+fn file_details_with_authoritative_snapshot(
+    sequence: i64,
+    execution_root: &Path,
+    diff: &str,
+    changes: Vec<ObservedChange>,
+    observed_counts: &BTreeMap<String, u64>,
+) -> Vec<AgentRunChangedFileDetailView> {
+    let outside_operations = changes
+        .iter()
+        .filter(|change| Path::new(&change.path).is_absolute())
+        .cloned()
+        .collect::<Vec<_>>();
+    if diff.trim().is_empty() {
+        return file_details_from_operations(outside_operations);
+    }
+    let Some(mut snapshot_files) =
+        file_details_from_authoritative_snapshot(sequence, execution_root, diff, observed_counts)
+    else {
+        return file_details_from_operations(changes);
+    };
+    let snapshot_paths = snapshot_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    let missing_outside_operations = outside_operations
+        .into_iter()
+        .filter(|change| !snapshot_paths.contains(&change.path))
+        .collect::<Vec<_>>();
+    snapshot_files.extend(file_details_from_operations(missing_outside_operations));
+    snapshot_files
+}
+
+#[cfg(all(test, feature = "extended-tests"))]
+mod tests {
+    use super::*;
+    use crate::execution_evidence::ExecutionEvidenceService;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn evidence(sequence: i64, payload: Value) -> SequencedEvidence {
+        SequencedEvidence {
+            id: format!("evidence-{sequence}"),
+            sequence,
+            payload,
+        }
+    }
+
+    fn full(sequence: i64, before: Option<&str>, after: Option<&str>) -> SequencedEvidence {
+        full_at(sequence, "src/app.ts", before, after)
+    }
+
+    fn full_at(
+        sequence: i64,
+        path: &str,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> SequencedEvidence {
+        evidence(
+            sequence,
+            json!({
+                "runtimeDiff": {
+                    "status": "available",
+                    "semanticKind": "complete_before_after",
+                    "entries": [{
+                        "semantics": "full_before_after",
+                        "path": path,
+                        "changeKind": "update",
+                        "before": before,
+                        "after": after
+                    }]
+                }
+            }),
+        )
+    }
+
+    fn summary(path: &str) -> AgentRunChangedFileSummaryView {
+        AgentRunChangedFileSummaryView {
+            evidence_file_id: String::new(),
+            path: path.to_string(),
+            change_kind: "update".to_string(),
+            presentation_kind: "operation_only".to_string(),
+            operation_count: 1,
+            additions: None,
+            deletions: None,
+        }
+    }
+
+    #[test]
+    fn legacy_evidence_file_ids_are_stable_and_ordinal_specific() {
+        let mut first = vec![summary("src/a.ts"), summary("src/b.ts")];
+        let mut replay = first.clone();
+
+        adapt_summary_ids(&mut first, "camp-1", "run-1", 3, 1).unwrap();
+        adapt_summary_ids(&mut replay, "camp-1", "run-1", 3, 1).unwrap();
+
+        assert_eq!(first, replay);
+        assert_ne!(first[0].evidence_file_id, first[1].evidence_file_id);
+        assert!(
+            first
+                .iter()
+                .all(|file| file.evidence_file_id.starts_with("ef_"))
+        );
+    }
+
+    #[test]
+    fn unknown_file_change_projection_schema_fails_closed() {
+        let mut files = vec![summary("src/a.ts")];
+        let error = adapt_summary_ids(&mut files, "camp-1", "run-1", 3, 99).unwrap_err();
+        assert!(error.to_string().contains("is not supported"));
+    }
+
+    #[test]
+    fn continuous_full_states_form_one_net_diff() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-27T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                full(1, Some("A\n"), Some("B\n")),
+                full(2, Some("B\n"), Some("C\n")),
+            ],
+        )
+        .expect("continuous changes should project");
+
+        let file = &projection.details.files[0];
+        assert_eq!(file.presentation_kind, "full_net_diff");
+        assert_eq!(file.operation_count, 2);
+        let diff = file.blocks[0].diff.as_deref().unwrap();
+        assert!(diff.contains("-A"));
+        assert!(diff.contains("+C"));
+        assert!(!diff.contains("-B"));
+    }
+
+    #[test]
+    fn full_state_round_trip_removes_the_file_from_the_card() {
+        assert!(
+            aggregate_evidence(
+                "run-1",
+                1,
+                "2026-08-27T00:00:00Z",
+                Path::new("/repo"),
+                &[
+                    full(1, Some("A\n"), Some("B\n")),
+                    full(2, Some("B\n"), Some("A\n"))
+                ],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn discontinuous_full_states_degrade_only_that_file_to_operation_history() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-27T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                full(1, Some("A\n"), Some("B\n")),
+                full(2, Some("X\n"), Some("C\n")),
+            ],
+        )
+        .unwrap();
+        let file = &projection.details.files[0];
+        assert_eq!(file.presentation_kind, "operation_history");
+        assert_eq!(file.blocks.len(), 2);
+        assert_eq!(file.additions, Some(2));
+        assert_eq!(file.deletions, Some(2));
+        assert_eq!(projection.details.card.additions, Some(2));
+        assert_eq!(projection.details.card.deletions, Some(2));
+    }
+
+    #[test]
+    fn exact_mutations_remain_chronological_fragments_with_known_totals() {
+        let reported = aggregate_evidence("run-reported", 1, "2026-10-05T00:00:00Z", Path::new("/repo"), &[
+            evidence(1, json!({"runtimeDiff":{"status":"available","semanticKind":"reported_mutation","entries":[{
+                "semantics":"reported_mutation","path":"src/a.ts","fragments":[{"oldText":"A","newText":"B"},{"oldText":"second","newText":"changed"}]
+            }]}})),
+            evidence(2, json!({"runtimeDiff":{"status":"available","semanticKind":"reported_mutation","entries":[{
+                "semantics":"reported_mutation","path":"src/a.ts","fragments":[{"oldText":"B","newText":"A"}]
+            }]}})),
+        ]).unwrap();
+        let file = &reported.details.files[0];
+        assert_eq!(file.presentation_kind, "reported_mutations");
+        assert_eq!(file.operation_count, 2);
+        assert_eq!((file.additions, file.deletions), (Some(3), Some(3)));
+        assert_eq!(file.blocks[0].semantics, "reported_mutation");
+        assert_eq!(
+            file.blocks[0].diff.as_deref(),
+            Some("-A\n+B\n-second\n+changed\n")
+        );
+        assert!(!file.blocks[0].diff.as_ref().unwrap().contains("@@"));
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-27T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                evidence(1, json!({"runtimeDiff": {"status": "available", "semanticKind": "exact_mutation", "entries": [{"semantics": "exact_mutation", "path": "src/app.ts", "oldText": "A", "newText": "B"}]}})),
+                evidence(2, json!({"runtimeDiff": {"status": "available", "semanticKind": "exact_mutation", "entries": [{"semantics": "exact_mutation", "path": "src/app.ts", "oldText": "B", "newText": "C"}]}})),
+            ],
+        )
+        .unwrap();
+        let file = &projection.details.files[0];
+        assert_eq!(file.presentation_kind, "exact_mutations");
+        assert_eq!(file.blocks.len(), 2);
+        assert_eq!(file.blocks[0].diff.as_deref(), Some("-A\n+B\n"));
+        assert_eq!(file.blocks[1].diff.as_deref(), Some("-B\n+C\n"));
+        assert_eq!(file.additions, Some(2));
+        assert_eq!(file.deletions, Some(2));
+        assert_eq!(projection.details.card.additions, Some(2));
+        assert_eq!(projection.details.card.deletions, Some(2));
+    }
+
+    #[test]
+    fn path_only_operation_stays_counted_while_reliable_diffs_form_the_file_totals() {
+        let projection = aggregate_evidence(
+            "run-qoder",
+            1,
+            "2026-08-28T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                evidence(
+                    1,
+                    json!({
+                        "runtimeFileOperation": {
+                            "status": "available",
+                            "path": "src/app.ts",
+                            "changeKind": "update"
+                        }
+                    }),
+                ),
+                full(2, Some("state=pending"), Some("state=completed")),
+                evidence(
+                    3,
+                    json!({
+                        "runtimeFileOperation": {
+                            "status": "available",
+                            "path": "src/worker.ts",
+                            "changeKind": "update"
+                        }
+                    }),
+                ),
+                full_at(
+                    4,
+                    "src/worker.ts",
+                    Some("phase=queued\nmode=safe\n"),
+                    Some("phase=done\n"),
+                ),
+            ],
+        )
+        .expect("the reliable Qoder edit should remain reviewable");
+
+        assert_eq!(projection.details.files.len(), 2);
+        for file in &projection.details.files {
+            assert_eq!(file.presentation_kind, "operation_history");
+            assert_eq!(file.operation_count, 2);
+            assert_eq!(file.blocks.len(), 2);
+            assert_eq!(file.blocks[0].semantics, "operation_only");
+            assert!(file.blocks[0].diff.is_none());
+            assert_eq!(file.blocks[1].semantics, "full_before_after");
+            assert!(file.blocks[1].diff.is_some());
+        }
+        assert_eq!(projection.details.files[0].additions, Some(1));
+        assert_eq!(projection.details.files[0].deletions, Some(1));
+        assert_eq!(projection.details.files[1].additions, Some(1));
+        assert_eq!(projection.details.files[1].deletions, Some(2));
+        assert_eq!(projection.details.card.operation_count, 4);
+        assert_eq!(projection.details.card.additions, Some(2));
+        assert_eq!(projection.details.card.deletions, Some(3));
+    }
+
+    #[test]
+    fn operation_only_add_path_preserves_its_change_kind_without_diff_or_counts() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-27T00:00:00Z",
+            Path::new("/repo"),
+            &[evidence(1, json!({"runtimeFileOperation": {"status": "available", "path": "src/app.ts", "changeKind": "add"}}))],
+        )
+        .unwrap();
+        let file = &projection.details.files[0];
+        assert_eq!(file.change_kind, "add");
+        assert_eq!(file.presentation_kind, "operation_only");
+        assert!(file.blocks[0].diff.is_none());
+        assert_eq!(projection.details.card.additions, None);
+    }
+
+    #[test]
+    fn read_operation_never_enters_the_files_changed_projection() {
+        assert!(
+            aggregate_evidence(
+                "run-read",
+                1,
+                "2026-09-06T00:00:00Z",
+                Path::new("/repo"),
+                &[evidence(
+                    1,
+                    json!({
+                        "runtimeFileOperation": {
+                            "schemaVersion": 2,
+                            "status": "available",
+                            "operationKind": "read",
+                            "path": "docs/README.md"
+                        }
+                    }),
+                )],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn incomplete_or_conflicting_file_facts_never_become_no_changes() {
+        for (marker, expected) in [
+            (
+                json!({
+                    "_rovaiContent": {"state": "too_large", "complete": false},
+                    "runtimeDiff": {"status": "available", "entries": []}
+                }),
+                "source_content_incomplete",
+            ),
+            (
+                json!({
+                    "_rovaiLifecycle": {"terminalConflict": true},
+                    "runtimeFileOperation": {
+                        "status": "available",
+                        "operationKind": "write",
+                        "path": "src/app.ts"
+                    }
+                }),
+                "source_terminal_conflict",
+            ),
+        ] {
+            assert_eq!(
+                file_fact_source_error(&[evidence(1, marker)]),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            file_fact_source_error(&[evidence(
+                1,
+                json!({"_rovaiContent": {"state": "too_large", "complete": false}}),
+            )]),
+            None,
+            "an unrelated large command output must not block valid file projection"
+        );
+    }
+
+    #[test]
+    fn managed_output_unavailable_evidence_does_not_create_a_files_changed_card() {
+        assert!(
+            aggregate_evidence(
+                "run-1",
+                1,
+                "2026-08-28T00:00:00Z",
+                Path::new("/repo"),
+                &[evidence(
+                    1,
+                    json!({
+                        "runtimeFileOperation": {
+                            "status": "unavailable",
+                            "safeReasonCode": "runtime_file_operation_managed_output_root"
+                        },
+                        "runtimeDiff": {
+                            "status": "unavailable",
+                            "safeReasonCode": "runtime_diff_managed_output_root"
+                        }
+                    }),
+                )],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn successful_send_sources_filter_snapshot_and_operation_files_with_exact_paths() {
+        let root = std::env::temp_dir().join("send-source-projection");
+        let reply = root.join("reply.md").to_string_lossy().replace('\\', "/");
+        let outside = root
+            .parent()
+            .unwrap()
+            .join("outside-reply.md")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let send = |path: &str| {
+            serde_json::json!({
+                "kind": "builtin_tool_invocation", "canonicalTool": "thread.message.send",
+                "sourceAuthority": "core", "status": "completed", "coreEnvelope": {"ok": true},
+                "sendInputFilePath": path,
+            })
+        };
+        let mut original = vec![
+            full_at(1, "src/code.rs", Some("old\n"), Some("new\n")),
+            full_at(2, "reply.md", None, Some("reply\n")),
+            full_at(3, "reply.md.copy", None, Some("keep\n")),
+            full_at(4, &outside, None, Some("outside\n")),
+        ];
+        for snapshot in [false, true] {
+            let mut items = original.clone();
+            if snapshot {
+                items.push(evidence(5, json!({"runtimeRunDiff": {
+                    "status": "available",
+                    "diff": "diff --git a/src/code.rs b/src/code.rs\n--- a/src/code.rs\n+++ b/src/code.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/reply.md b/reply.md\nnew file mode 100644\n--- /dev/null\n+++ b/reply.md\n@@ -0,0 +1 @@\n+reply\ndiff --git a/reply.md.copy b/reply.md.copy\nnew file mode 100644\n--- /dev/null\n+++ b/reply.md.copy\n@@ -0,0 +1 @@\n+keep\n"
+                }})));
+            }
+            items.extend([
+                evidence(6, send(&reply)),
+                evidence(7, send(&outside)),
+                evidence(8, send(&reply)),
+            ]);
+            let result = aggregate_evidence("run", 1, "now", &root, &items).unwrap();
+            assert_eq!(
+                result
+                    .details
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["reply.md.copy", "src/code.rs"])
+            );
+            assert_eq!(result.details.card.file_count, 2);
+            assert_eq!(result.details.card.additions, Some(2));
+            assert_eq!(result.details.card.deletions, Some(1));
+            assert_eq!(result.details.card.operation_count, 2);
+        }
+        for (field, value) in [
+            ("status", json!("failed")),
+            ("status", json!("started")),
+            ("sourceAuthority", json!("runtime")),
+            ("canonicalTool", json!("member.get")),
+            ("coreEnvelope", json!({"ok": false})),
+            ("sendInputFilePath", Value::Null),
+            ("sendInputFilePath", json!("reply.md")),
+        ] {
+            let mut invalid = send(&reply);
+            invalid[field] = value;
+            assert!(!payload_affects_file_facts(&invalid));
+            let mut items = original.clone();
+            items.push(evidence(5, invalid));
+            assert_eq!(
+                aggregate_evidence("run", 1, "now", &root, &items)
+                    .unwrap()
+                    .details
+                    .card
+                    .file_count,
+                4
+            );
+        }
+        // Attachment-only metadata cannot exclude a modified deliverable.
+        original.push(evidence(
+            5,
+            json!({"status": "completed", "files": [reply]}),
+        ));
+        assert_eq!(
+            aggregate_evidence("run", 1, "now", &root, &original)
+                .unwrap()
+                .details
+                .card
+                .file_count,
+            4
+        );
+        // No file or directory is created: filtering still works after source deletion.
+        assert!(
+            aggregate_evidence(
+                "run",
+                1,
+                "now",
+                &root,
+                &[
+                    full_at(1, "reply.md", None, Some("reply\n")),
+                    evidence(2, send(&reply)),
+                ]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn one_operation_only_file_keeps_the_whole_card_on_operation_counts() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-28T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                full(1, Some("A\n"), Some("B\n")),
+                evidence(
+                    2,
+                    json!({
+                        "runtimeFileOperation": {
+                            "status": "available",
+                            "path": "src/path-only.ts",
+                            "changeKind": "update"
+                        }
+                    }),
+                ),
+            ],
+        )
+        .expect("both observed files should remain in the card");
+
+        assert_eq!(projection.details.card.file_count, 2);
+        assert_eq!(projection.details.card.operation_count, 2);
+        assert_eq!(projection.details.card.additions, None);
+        assert_eq!(projection.details.card.deletions, None);
+    }
+
+    #[test]
+    fn explicit_runtime_no_change_does_not_fall_back_to_operation_only() {
+        assert!(
+            aggregate_evidence(
+                "run-1",
+                1,
+                "2026-08-28T00:00:00Z",
+                Path::new("/repo"),
+                &[evidence(
+                    1,
+                    json!({
+                        "runtimeDiff": {
+                            "status": "unavailable",
+                            "safeReasonCode": "runtime_diff_no_changes"
+                        },
+                        "runtimeFileOperation": {
+                            "status": "available",
+                            "path": "src/app.ts",
+                            "changeKind": "update"
+                        }
+                    }),
+                )],
+            )
+            .is_none(),
+            "an explicit no-change result must not become a Files Changed card"
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_no_change_is_omitted_from_a_mixed_card() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-28T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                full(1, Some("A\n"), Some("B\n")),
+                evidence(
+                    2,
+                    json!({
+                        "runtimeDiff": {
+                            "status": "unavailable",
+                            "safeReasonCode": "runtime_diff_no_changes"
+                        },
+                        "runtimeFileOperation": {
+                            "status": "available",
+                            "path": "src/unchanged.ts",
+                            "changeKind": "update"
+                        }
+                    }),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(projection.details.card.file_count, 1);
+        assert_eq!(projection.details.files[0].path, "src/app.ts");
+        assert_eq!(projection.details.card.additions, Some(1));
+        assert_eq!(projection.details.card.deletions, Some(1));
+    }
+
+    #[test]
+    fn single_terminal_diff_uses_the_matching_file_operation_path_identity() {
+        for (diff_path, operation_path) in [
+            (
+                "/private/tmp/rovai-outside/outside-alpha.txt",
+                "/tmp/rovai-outside/outside-alpha.txt",
+            ),
+            ("outside-alpha.txt", "/tmp/rovai-outside/outside-alpha.txt"),
+        ] {
+            let projection = aggregate_evidence(
+                "run-1",
+                1,
+                "2026-08-28T00:00:00Z",
+                Path::new("/repo"),
+                &[evidence(
+                    1,
+                    json!({
+                        "runtimeDiff": {
+                            "status": "available",
+                            "semanticKind": "complete_before_after",
+                            "entries": [{
+                                "semantics": "full_before_after",
+                                "path": diff_path,
+                                "changeKind": "update",
+                                "before": "before\n",
+                                "after": "after\n"
+                            }]
+                        },
+                        "runtimeFileOperation": {
+                            "status": "available",
+                            "path": operation_path,
+                            "changeKind": "update"
+                        }
+                    }),
+                )],
+            )
+            .expect("the terminal file change should project");
+
+            assert_eq!(projection.details.card.file_count, 1);
+            assert_eq!(projection.details.files.len(), 1);
+            let file = &projection.details.files[0];
+            assert_eq!(file.path, operation_path);
+            assert_eq!(file.presentation_kind, "full_net_diff");
+            assert_eq!(file.operation_count, 1);
+            assert!(
+                file.blocks[0]
+                    .diff
+                    .as_deref()
+                    .is_some_and(|diff| diff.contains("-before") && diff.contains("+after"))
+            );
+        }
+    }
+
+    #[test]
+    fn multi_file_diff_does_not_relabel_every_entry_as_the_operation_path() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-28T00:00:00Z",
+            Path::new("/repo"),
+            &[evidence(
+                1,
+                json!({
+                    "runtimeDiff": {
+                        "status": "available",
+                        "semanticKind": "exact_mutation",
+                        "entries": [
+                            {
+                                "semantics": "exact_mutation",
+                                "path": "src/a.ts",
+                                "oldText": "A",
+                                "newText": "B"
+                            },
+                            {
+                                "semantics": "exact_mutation",
+                                "path": "src/b.ts",
+                                "oldText": "C",
+                                "newText": "D"
+                            }
+                        ]
+                    },
+                    "runtimeFileOperation": {
+                        "status": "available",
+                        "path": "/tmp/rovai-outside/outside-alpha.txt",
+                        "changeKind": "update"
+                    }
+                }),
+            )],
+        )
+        .expect("the reported changes should project");
+
+        let paths = projection
+            .details
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains("src/a.ts"));
+        assert!(paths.contains("src/b.ts"));
+        assert!(paths.contains("/tmp/rovai-outside/outside-alpha.txt"));
+    }
+
+    #[test]
+    fn latest_authoritative_run_snapshot_wins_without_recombining_operations() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-27T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                full(1, Some("A\n"), Some("B\n")),
+                evidence(2, json!({"runtimeRunDiff": {"status": "available", "diff": "diff --git a/src/app.ts b/src/app.ts\n--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-A\n+C\n"}})),
+            ],
+        )
+        .unwrap();
+        let diff = projection.details.files[0].blocks[0]
+            .diff
+            .as_deref()
+            .unwrap();
+        assert!(diff.contains("+C"));
+        assert!(!diff.contains("+B"));
+    }
+
+    #[test]
+    fn empty_authoritative_run_snapshot_suppresses_terminal_operation_fallback() {
+        assert!(
+            aggregate_evidence(
+                "run-1",
+                1,
+                "2026-08-27T00:00:00Z",
+                Path::new("/repo"),
+                &[
+                    full(1, Some("A\n"), Some("B\n")),
+                    evidence(
+                        2,
+                        json!({"runtimeRunDiff": {"status": "available", "diff": ""}}),
+                    ),
+                ],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn authoritative_snapshot_keeps_explicit_cross_root_terminal_changes() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-28T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                full(1, Some("inside-before\n"), Some("inside-after\n")),
+                evidence(
+                    2,
+                    json!({
+                        "runtimeDiff": {
+                            "status": "available",
+                            "semanticKind": "complete_before_after",
+                            "entries": [{
+                                "semantics": "full_before_after",
+                                "path": "../shared/outside.ts",
+                                "changeKind": "update",
+                                "before": "outside-before\n",
+                                "after": "outside-after\n"
+                            }]
+                        }
+                    }),
+                ),
+                evidence(
+                    3,
+                    json!({"runtimeRunDiff": {"status": "available", "diff": ""}}),
+                ),
+            ],
+        )
+        .expect("cross-root terminal evidence should remain visible");
+
+        assert_eq!(projection.details.card.file_count, 1);
+        assert_eq!(projection.details.files[0].path, "/shared/outside.ts");
+        assert_eq!(
+            projection.details.files[0].presentation_kind,
+            "full_net_diff"
+        );
+        assert!(
+            projection.details.files[0].blocks[0]
+                .diff
+                .as_deref()
+                .is_some_and(|diff| diff.contains("--- /shared/outside.ts"))
+        );
+    }
+
+    #[test]
+    fn nonempty_authoritative_snapshot_adds_only_missing_cross_root_operations() {
+        let projection = aggregate_evidence(
+            "run-1",
+            1,
+            "2026-08-28T00:00:00Z",
+            Path::new("/repo"),
+            &[
+                evidence(1, json!({"runtimeFileOperation": {"status": "available", "path": "src/roundtrip.ts", "changeKind": "update"}})),
+                evidence(2, json!({"runtimeFileOperation": {"status": "available", "path": "/shared/outside.ts", "changeKind": "update"}})),
+                evidence(3, json!({"runtimeRunDiff": {"status": "available", "diff": "diff --git a/src/app.ts b/src/app.ts\n--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-A\n+B\n"}})),
+            ],
+        )
+        .expect("snapshot and cross-root operation should project together");
+
+        assert_eq!(
+            projection
+                .details
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/app.ts", "/shared/outside.ts"]
+        );
+        assert_eq!(projection.details.card.additions, None);
+        assert_eq!(projection.details.card.operation_count, 2);
+    }
+
+    #[test]
+    fn terminal_runs_in_a_non_git_directory_project_independent_replayable_cards() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-run-file-changes-test-{}", Uuid::new_v4()));
+        let execution_root = directory.join("plain-directory");
+        std::fs::create_dir_all(&execution_root).unwrap();
+        assert!(!execution_root.join(".git").exists());
+        let (mut database, data_dir) = crate::test_support::seeded_runtime_database_fast();
+        let now = "2026-08-27T00:00:00Z";
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO camp(
+                    id, title, project_binding_kind, project_path,
+                    last_message_sequence, version, created_at, updated_at
+                ) VALUES ('file-change-camp', 'File changes', 'directory', ?1, 0, 1, ?2, ?2)
+                "#,
+                params![execution_root.to_string_lossy().as_ref(), now],
+            )
+            .unwrap();
+        for (index, agent_id) in ["agent_1", "agent_2", "agent_3"].into_iter().enumerate() {
+            database
+                .connection()
+                .execute(
+                    r#"
+                    INSERT INTO conversation(id, camp_id, agent_id, created_at, updated_at)
+                    VALUES (?1, 'file-change-camp', ?2, ?3, ?3)
+                    "#,
+                    params![format!("file-change-conversation-{index}"), agent_id, now],
+                )
+                .unwrap();
+        }
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO camp_turn(
+                    id, camp_id, trigger_type, trigger_id, status, created_at, updated_at
+                ) VALUES (
+                    'file-change-turn', 'file-change-camp', 'system_event',
+                    'file-change-trigger', 'running', ?1, ?1
+                )
+                "#,
+                [now],
+            )
+            .unwrap();
+        for index in 0..3 {
+            database
+                .connection()
+                .execute(
+                    r#"
+                    INSERT INTO agent_run(
+                        id, camp_turn_id, conversation_id,
+                        initial_camp_context_through_sequence,
+                        initial_conversation_context_through_sequence,
+                        responsibility_key, start_reason, purpose,
+                        completion_role, effective_config_json, workspace_json,
+                        status, idempotency_key, runtime_adapter_kind, execution_epoch,
+                        created_at, started_at, updated_at
+                    ) VALUES (
+                        ?1, 'file-change-turn', ?2, 0, 0, ?3,
+                        'initial', 'test Runtime-reported file changes', 'required',
+                        '{"runtimeAdapter":"qoder-cli"}', ?4,
+                        'running', ?1, 'qoder-cli', 1, ?5, ?5, ?5
+                    )
+                    "#,
+                    params![
+                        format!("file-change-run-{index}"),
+                        format!("file-change-conversation-{index}"),
+                        format!("file-change-responsibility-{index}"),
+                        serde_json::to_string(&json!({
+                            "executionRoot": execution_root,
+                            "access": "write",
+                            "isolation": "shared"
+                        }))
+                        .unwrap(),
+                        now,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let blob_store = ManagedBlobStore::new(&data_dir);
+        for index in 0..3 {
+            ExecutionEvidenceService
+                .record_runtime_event(
+                    &mut database,
+                    &blob_store,
+                    &format!("file-change-run-{index}"),
+                    1,
+                    "runtime.action",
+                    &json!({
+                        "eventId": format!("file-change-event-{index}"),
+                        "toolCallId": format!("file-change-tool-{index}"),
+                        "status": "completed",
+                        "kind": "edit",
+                        "runtimeFileOperation": {
+                            "adapterKind": "qoder-cli",
+                            "protocolFamily": "acp-v1",
+                            "sourceEventKind": "session/update.tool_call_update.completed",
+                            "operationKind": "write",
+                            "path": format!("src/run-{index}.ts")
+                        }
+                    }),
+                )
+                .unwrap()
+                .expect("successful file operation should be persisted");
+        }
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'failed', ended_at = ?1, updated_at = ?1 WHERE id = 'file-change-run-0'",
+                [now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'cancelled', ended_at = ?1, updated_at = ?1 WHERE id = 'file-change-run-1'",
+                [now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'succeeded', ended_at = ?1, updated_at = ?1 WHERE id = 'file-change-run-2'",
+                [now],
+            )
+            .unwrap();
+        ExecutionEvidenceService
+            .record_terminal_run_diff_snapshot(
+                &mut database,
+                &blob_store,
+                "file-change-run-2",
+                1,
+                &json!({
+                    "eventId": "empty-authoritative-snapshot",
+                    "runtimeRunDiff": {
+                        "status": "available",
+                        "semanticKind": "unified_diff_snapshot",
+                        "diff": ""
+                    }
+                }),
+            )
+            .unwrap()
+            .expect("an empty authoritative terminal snapshot should be durable");
+
+        assert_eq!(
+            AgentRunFileChangeProjector
+                .recover_terminal_runs(&mut database, &blob_store)
+                .unwrap(),
+            3,
+            "successful no_changes publication is also recovered work"
+        );
+        let cards =
+            list_completed_run_file_changes(database.connection(), "file-change-camp").unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].files[0].path, "src/run-0.ts");
+        assert_eq!(cards[1].files[0].path, "src/run-1.ts");
+        assert_eq!(cards[0].additions, None);
+        assert_eq!(cards[1].additions, None);
+        let detail = read_run_file_changes(
+            &database,
+            &blob_store,
+            "file-change-camp",
+            "file-change-run-1",
+            1,
+        )
+        .unwrap();
+        assert_eq!(detail.files[0].presentation_kind, "operation_only");
+        assert_eq!(
+            AgentRunFileChangeProjector
+                .recover_terminal_runs(&mut database, &blob_store)
+                .unwrap(),
+            0,
+            "replay must not create a second card for the same Run epoch"
+        );
+
+        let original_card = cards
+            .iter()
+            .find(|card| card.agent_run_id == "file-change-run-1")
+            .unwrap()
+            .clone();
+        let original_file_id = original_card.files[0].evidence_file_id.clone();
+        let original_blob_id: String = database
+            .connection()
+            .query_row(
+                "SELECT details_blob_id FROM agent_run_file_change_projection WHERE agent_run_id = 'file-change-run-1' AND execution_epoch = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let late_result = ExecutionEvidenceService
+            .record_builtin_tool_result(
+                &mut database,
+                &blob_store,
+                "file-change-run-1",
+                1,
+                &json!({
+                    "toolCallId": "file-change-tool-1",
+                    "status": "completed",
+                    "kind": "edit",
+                    "runtimeFileOperation": {
+                        "adapterKind": "qoder-cli",
+                        "protocolFamily": "acp-v1",
+                        "sourceEventKind": "session/update.tool_call_update.completed",
+                        "operationKind": "write",
+                        "path": "src/run-1.ts"
+                    },
+                    "runtimeDiff": {
+                        "adapterKind": "qoder-cli",
+                        "protocolFamily": "acp-v1",
+                        "sourceEventKind": "session/update.tool_call_update.completed",
+                        "semanticKind": "complete_before_after",
+                        "entries": [{
+                            "path": "src/run-1.ts",
+                            "oldText": "old\n",
+                            "newText": "new\n",
+                        }]
+                    }
+                }),
+            )
+            .unwrap()
+            .expect("a permitted late terminal result should update its lifecycle row");
+        let (display_sequence, fact_sequence): (i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT sequence, change_sequence FROM agent_run_execution_evidence WHERE id = ?1",
+                [&late_result.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(fact_sequence > display_sequence);
+        let loaded = load_full_evidence(&database, &blob_store, "file-change-run-1", 1).unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .find(|evidence| evidence.id == late_result.id)
+                .unwrap()
+                .sequence,
+            fact_sequence,
+            "mutable lifecycle facts must be ordered by their latest observation"
+        );
+        let stale_card = list_completed_run_file_changes(database.connection(), "file-change-camp")
+            .unwrap()
+            .into_iter()
+            .find(|card| card.agent_run_id == "file-change-run-1")
+            .unwrap();
+        assert!(stale_card.is_stale);
+        assert_eq!(stale_card.revision, original_card.revision);
+        assert!(
+            stale_card.source_change_sequence
+                < {
+                    database
+                .connection()
+                .query_row(
+                    "SELECT file_facts_change_sequence FROM agent_run_execution_epoch_state WHERE agent_run_id = 'file-change-run-1' AND execution_epoch = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                }
+        );
+        assert_eq!(
+            AgentRunFileChangeProjector
+                .recover_terminal_runs(&mut database, &blob_store)
+                .unwrap(),
+            1
+        );
+        let refreshed = read_run_file_changes(
+            &database,
+            &blob_store,
+            "file-change-camp",
+            "file-change-run-1",
+            1,
+        )
+        .unwrap();
+        assert!(!refreshed.card.is_stale);
+        assert_eq!(refreshed.card.revision, original_card.revision + 1);
+        assert_eq!(refreshed.files[0].evidence_file_id, original_file_id);
+        assert_eq!(refreshed.files[0].additions, Some(1));
+        assert!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT gc_candidate_owner IS 'file_change_projection' AND gc_candidate_at IS NOT NULL FROM managed_blob WHERE id = ?1",
+                    [&original_blob_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "replaced projection details must become a recoverable GC candidate"
+        );
+
+        ExecutionEvidenceService
+            .record_terminal_run_diff_snapshot(
+                &mut database,
+                &blob_store,
+                "file-change-run-2",
+                1,
+                &json!({
+                    "eventId": "late-authoritative-snapshot",
+                    "runtimeRunDiff": {
+                        "status": "available",
+                        "semanticKind": "unified_diff_snapshot",
+                        "diff": "diff --git a/src/late.ts b/src/late.ts\n--- a/src/late.ts\n+++ b/src/late.ts\n@@ -1 +1 @@\n-old\n+new\n"
+                    }
+                }),
+            )
+            .unwrap()
+            .expect("a permitted late snapshot should invalidate no_changes");
+        assert_eq!(
+            AgentRunFileChangeProjector
+                .recover_terminal_runs(&mut database, &blob_store)
+                .unwrap(),
+            1
+        );
+        let formerly_empty =
+            list_completed_run_file_changes(database.connection(), "file-change-camp")
+                .unwrap()
+                .into_iter()
+                .find(|card| card.agent_run_id == "file-change-run-2")
+                .expect("no_changes must not suppress a later valid file fact");
+        assert_eq!(formerly_empty.files[0].path, "src/late.ts");
+        assert!(!formerly_empty.is_stale);
+
+        // The existing persistence owner also covers late Send provenance, epoch
+        // isolation and restart: a newly excluded last file must publish no_changes.
+        let send_source = json!({
+            "toolCallId": "late-send-source", "kind": "builtin_tool_invocation",
+            "canonicalTool": "thread.message.send", "sourceAuthority": "core",
+            "status": "completed", "coreEnvelope": {"ok": true},
+            "sendInputFilePath": execution_root.join("src/late.ts").to_string_lossy(),
+        });
+        assert!(
+            ExecutionEvidenceService
+                .record_builtin_tool_result(
+                    &mut database,
+                    &blob_store,
+                    "file-change-run-2",
+                    2,
+                    &send_source,
+                )
+                .unwrap()
+                .is_none(),
+            "another epoch must not contribute an exclusion"
+        );
+        let recorded = ExecutionEvidenceService
+            .record_builtin_tool_result(
+                &mut database,
+                &blob_store,
+                "file-change-run-2",
+                1,
+                &send_source,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(recorded.file_facts_changed);
+        assert!(
+            !ExecutionEvidenceService
+                .record_builtin_tool_result(
+                    &mut database,
+                    &blob_store,
+                    "file-change-run-2",
+                    1,
+                    &send_source,
+                )
+                .unwrap()
+                .unwrap()
+                .file_facts_changed,
+            "replayed provenance must not invalidate again"
+        );
+        drop(database);
+        let mut database = Database::open(&data_dir).unwrap();
+        assert_eq!(
+            AgentRunFileChangeProjector
+                .recover_terminal_runs(&mut database, &blob_store)
+                .unwrap(),
+            1
+        );
+        let cards =
+            list_completed_run_file_changes(database.connection(), "file-change-camp").unwrap();
+        assert_eq!(cards.len(), 2, "only the source Run loses its card");
+        assert!(
+            cards
+                .iter()
+                .all(|card| card.agent_run_id != "file-change-run-2")
+        );
+        assert_eq!(
+            load_projection_state(&database, "file-change-run-2", 1)
+                .unwrap()
+                .unwrap()
+                .status,
+            "no_changes"
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(data_dir).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}

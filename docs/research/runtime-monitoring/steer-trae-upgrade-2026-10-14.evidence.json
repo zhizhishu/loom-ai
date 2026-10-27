@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "scope": "User seq32; local official TRAE upgrade, actual ACP transport, and official product vs transport distinction",
+  "date": "2026-10-14",
+  "platform": "macOS arm64",
+  "baselineCommit": "2f57544e26cfcffdb00a9822dd59270f31e2e02f",
+  "installation": {
+    "previousVersion": "0.120.52",
+    "installedVersion": "0.209.1",
+    "channel": "official public stable",
+    "officialReleaseDate": "2026-10-10",
+    "installerURL": "https://trae.cn/trae-cli/install_v2.sh",
+    "manifestURL": "https://lf-cdn.trae.com.cn/obj/trae-com-cn/trae-cli/v2/public/stable/latest.json",
+    "installerSha256": "d86c84066bb493d40f6d671733b6243dddb9c39df1a9084676470736548b5be8",
+    "manifestSha256": "a26d1114a60afcf0dba4fe02dd6e2d0bb846bc2bafa4a88add50d9ff486464a5",
+    "installedBinarySha256": "3200223c47c771ce216e2d8b5bbebbc4d22ffb7d60e1216b1fdea4a3c45bd176",
+    "aliases": [
+      "traecli",
+      "trae-cli",
+      "trae-agent",
+      "ta"
+    ],
+    "previousBinaryPreserved": true,
+    "oldYamlUnchanged": true,
+    "enterpriseLoginSucceeded": true,
+    "migrationSkippedEnterpriseLoginBaseURL": true,
+    "originalLoginBaseURLRestored": true
+  },
+  "protocolAttempt": {
+    "attempt": "trae-enterprise-acp-01",
+    "status": "passed",
+    "nativeVersion": "0.209.1",
+    "transport": "ACP stdio",
+    "model": "glm-5.3/high",
+    "permissionMode": "default",
+    "steeringAdvertised": true,
+    "toolBoundary": {
+      "ready": true,
+      "firstPromptStillPending": true
+    },
+    "method": "_session/steering",
+    "inputShape": {
+      "sessionId": "same active session",
+      "prompt": [
+        {
+          "type": "text",
+          "text": "用户更正：当前工具结束后，只回复 STEER_032_成功，替代原先 ORIGINAL_032；不要运行新工具。"
+        }
+      ]
+    },
+    "supplementResult": {
+      "outcome": "injected"
+    },
+    "originalStopReason": "end_turn",
+    "assistantText": "STEER_032_成功",
+    "eventOrder": [
+      {
+        "index": 18,
+        "responseTo": 4,
+        "outcome": "injected"
+      },
+      {
+        "index": 27,
+        "text": "STEER_032_成功"
+      },
+      {
+        "index": 29,
+        "responseTo": 3,
+        "stopReason": "end_turn"
+      }
+    ],
+    "secondSessionPromptSent": false,
+    "cancelSent": false,
+    "rawReportSha256": "2fdc4c3fa895599c58af1295a08e444d2ff8f91226fb7541c53bbb2663b54d40",
+    "wireSha256": "50a79e1469157d3b37f8ad9fa77cb89617e64caec2de7e5e53eb5ce0126ecba4",
+    "harnessSha256": "1e7b4ef2e9b676ddf72a6809ddf33e6c984640e0d604bebd0893b2512da2fd35"
+  },
+  "launchCompatibility": {
+    "oldArgumentOrderRejectedByNewCLI": true,
+    "correctedOrder": "traecli --permission-mode <configured-value> acp serve",
+    "oldVersionInitializeWithCorrectedOrderPassed": true,
+    "productSteerImplemented": false,
+    "dailyRovaiAppInstalledOrRestarted": false
+  },
+  "coreChecks": [
+    {
+      "attempt": "ready-before-01",
+      "status": "failed",
+      "ready": false,
+      "probeStatus": "light_ready",
+      "version": null,
+      "diagnosticCode": "runtime_probe_transient_failure",
+      "coreExitCode": 0,
+      "rawSha256": "a976cfe0eab6a827487cba712f2d717aa4761102bd46303c66bbb7b988f30485"
+    },
+    {
+      "attempt": "ready-detail-02",
+      "status": "failed",
+      "ready": false,
+      "probeStatus": "light_ready",
+      "version": null,
+      "diagnosticCode": "runtime_probe_transient_failure",
+      "coreExitCode": 0,
+      "rawSha256": "cbf2fafc9f2738bae1d347c2ae056b7c526924988848887a9e04c25a63089a47"
+    },
+    {
+      "attempt": "ready-after-03",
+      "status": "passed",
+      "ready": true,
+      "probeStatus": "ready",
+      "version": "traecli 0.209.1",
+      "diagnosticCode": null,
+      "coreExitCode": 0,
+      "rawSha256": "b213514eb1d3e3b94b15e934a582d314518565bafc6dd5c55c3f553300ee4ea7"
+    }
+  ],
+  "ordinaryCoreSmokeAttempts": [
+    {
+      "rawSha256": "594cf927fad25a94c633a322b6af59357ff53f6af751e821c1acfe6ceea4efa3",
+      "exitCode": 1,
+      "agentRunPassed": true,
+      "adapter": "trae-cn-cli",
+      "version": "traecli 0.209.1",
+      "modelCount": 82,
+      "modelSelection": "trae-cn-cli://runtime-default",
+      "output": "ROVAI_TRAE_ACP_OK",
+      "cleanup": "rejected: fixture outside the platform temporary directory"
+    },
+    {
+      "rawSha256": "d6f560c0b8e6e28b8e8da48e96f269c9e0e157ddedc7a76b311fe40f3aa7ffd4",
+      "exitCode": 0,
+      "agentRunPassed": true,
+      "adapter": "trae-cn-cli",
+      "version": "traecli 0.209.1",
+      "modelCount": 82,
+      "modelSelection": "trae-cn-cli://runtime-default",
+      "output": "ROVAI_TRAE_ACP_OK",
+      "cleanup": "passed"
+    }
+  ],
+  "officialProductScope": {
+    "qoder": {
+      "officialIDESteer": true,
+      "releaseVersion": "1.10.1",
+      "releaseDate": "2026-06-23",
+      "source": "https://docs.qoder.com/zh/release-notes/desktop",
+      "currentTransport": "ACP",
+      "testedCLIVersions": [
+        "1.1.65",
+        "1.1.71"
+      ],
+      "sameTurnInCurrentTransport": false,
+      "testsInheritedFrom": "steer-kiro-zcode-2026-10-14.evidence.json"
+    },
+    "antigravity": {
+      "currentTransport": "Stream JSON",
+      "testedCLIVersion": "1.3.5",
+      "sameTurnInCurrentTransport": false,
+      "source": "https://www.antigravity.google/docs/cli/headless/",
+      "wholeProductUnsupportedClaim": false,
+      "testsInheritedFrom": "steer-kiro-zcode-2026-10-14.evidence.json",
+      "officialInteractiveArtifactFeedbackDocumented": true,
+      "officialInteractiveSource": "https://antigravity.google/docs/artifacts",
+      "interactiveSameTurnMessageInjectionVerified": false
+    }
+  },
+  "productSupport": {
+    "integrated": [
+      "Codex",
+      "Claude Code",
+      "Pi",
+      "CodeBuddy",
+      "Qwen Code",
+      "Grok Build",
+      "Kiro CLI",
+      "ZCode"
+    ],
+    "currentTransportVerifiedButNotIntegrated": [
+      "TRAE CLI CN"
+    ],
+    "currentTransportUnsupportedInTestedVersions": [
+      "Kimi Code",
+      "OpenCode",
+      "DeepSeek Harness",
+      "GitHub Copilot",
+      "Qoder",
+      "Antigravity"
+    ],
+    "excludedByUser": [
+      "Cursor",
+      "Cline",
+      "Command Code"
+    ]
+  },
+  "privacy": "Exported allowlisted results only; no credentials, account names, enterprise configuration values, native history, or raw wire.",
+  "cleanup": {
+    "temporaryAuthCopiesRemoved": 6,
+    "dailyNativeAuthPreserved": true,
+    "isolatedRuntimeFilesRemoved": true
+  },
+  "validation": {
+    "extendedTraeRegression": {
+      "passed": 10,
+      "failed": 0,
+      "ignored": 1
+    },
+    "workspace": {
+      "passed": 471,
+      "failed": 0,
+      "ignored": 1
+    },
+    "docsTests": {
+      "passed": 10,
+      "failed": 0
+    },
+    "docsCheck": "passed",
+    "docsCheckCI": "passed",
+    "rustFmt": "passed",
+    "diffWhitespace": "passed",
+    "rawWorkspaceLogSha256": "db85884de1f941790a53707fae45703d0e015bc42b81228a3acfda326ecf3054"
+  }
+}

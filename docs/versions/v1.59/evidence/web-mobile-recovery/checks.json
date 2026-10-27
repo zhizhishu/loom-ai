@@ -1,0 +1,157 @@
+{
+  "status": "passed",
+  "sourceCommit": "7d497e2560df557cf7db43b2723deb0313a08925",
+  "mergedMain": "0bfc35b0dc68d99eeb483f59406e3beca84a2840",
+  "scope": "macOS arm64 package; isolated App/Host/browser profiles and Skill/MCP paths. Real Codex run initiated through the mobile production UI. Mobile devices are Chrome viewport simulations.",
+  "regressions": [
+    {
+      "owner": "apps/web/src/camp-adapter.test.ts",
+      "red": "The initially empty Web execution window rejected agentRunExecution.changes before HTTP dispatch; a new command never appeared.",
+      "green": "The real ConsoleClient/CampAdapter/ExecutionWindow chain admits new command evidence and refreshes its completed phase.",
+      "redLog": "/tmp/rovai-web-command-regression-red.log",
+      "greenLog": "/tmp/rovai-web-command-regression-green.log"
+    },
+    {
+      "owner": "crates/rovai-web/src/auth.rs",
+      "red": "Reopen index 30 (31st fork) returned capacity instead of recovering.",
+      "green": "96 sequential forks stay bounded at 32; pinned Session survives, old idle entries are revoked, correct long Token reclaims a slot. All 32 pinned Sessions still reject a new one. Restart, legacy stored format, storage failures and renewal/revocation races remain covered by existing owners.",
+      "clock": "Injected clock; no real 30-day wait.",
+      "redLog": "/tmp/rovai-session-capacity-red.log"
+    },
+    {
+      "owner": "scripts/lib/host-web-sessions.test.mjs",
+      "passed": true,
+      "sequentialTabClosesAndReopens": 40,
+      "otherActiveTabsRetainIdentityAndDrafts": 2,
+      "browserProcessReopenWithoutLogin": true,
+      "packageEvidence": "sessions.json"
+    },
+    {
+      "owner": "scripts/lib/host-web.test.mjs",
+      "passed": true,
+      "httpForksWithOtherSseConnectionsOpen": 64,
+      "scope": "Existing shared Host, revocation, drafts, listener and clock owner; debug Host."
+    }
+  ],
+  "checks": [
+    {
+      "command": "pnpm typecheck",
+      "passed": true,
+      "log": "/tmp/rovai-recovery-typecheck.log"
+    },
+    {
+      "command": "pnpm test",
+      "passed": true,
+      "vitestFiles": 199,
+      "vitestPassed": 2025,
+      "nodePassed": 317,
+      "nodePlatformSkipped": 2,
+      "log": "/tmp/rovai-recovery-full-test.log"
+    },
+    {
+      "command": "pnpm test:rust:staged",
+      "route": "full / cargo test --workspace",
+      "passed": true,
+      "passedTests": 846,
+      "existingManualIgnored": 6,
+      "log": "/tmp/rovai-recovery-rust-staged-2.log"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "passed": true,
+      "log": "/tmp/rovai-recovery-clippy.log"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "passed": true,
+      "log": "/tmp/rovai-recovery-rust-format.log"
+    },
+    {
+      "command": "node --test scripts/lib/host-web.test.mjs scripts/lib/host-web-channels.test.mjs",
+      "passed": true,
+      "groups": 3,
+      "log": "/tmp/rovai-recovery-host-test.log"
+    },
+    {
+      "command": "pnpm test:host-web-mobile",
+      "passed": true,
+      "groups": 3,
+      "log": "/tmp/rovai-recovery-mobile-test.log",
+      "executionFixture": "execution.json",
+      "serverFixture": "server.json"
+    },
+    {
+      "command": "ROVAI_HOST_BIN=<packaged Host> ROVAI_WEB_UI=<packaged Web> node --test scripts/lib/host-web-sessions.test.mjs",
+      "passed": true,
+      "log": "/tmp/rovai-recovery-package-sessions-20260914.log",
+      "evidence": "sessions.json"
+    },
+    {
+      "command": "ROVAI_HOST_BIN=<packaged Host> ROVAI_WEB_UI=<packaged Web> node --test --test-name-pattern='phone workbench uses' scripts/lib/host-web-mobile.test.mjs",
+      "passed": true,
+      "groups": 1,
+      "log": "/tmp/rovai-recovery-package-mobile-20260914.log",
+      "evidence": "mobile.json"
+    },
+    {
+      "command": "CARGO_BUILD_JOBS=2 pnpm package:mac:daily",
+      "passed": true,
+      "evidence": "build.json",
+      "log": "/tmp/rovai-recovery-package-20260914.log"
+    },
+    {
+      "command": "node /tmp/rovai-recovery-install-acceptance-20260914.mjs",
+      "passed": true,
+      "evidence": "validation.json",
+      "log": "/tmp/rovai-recovery-install-acceptance-20260914-retry.log"
+    },
+    {
+      "command": "ROVAI_HOST_ENTRY=desktop ROVAI_HOST_BIN=<packaged Host> ROVAI_APP_BIN=<packaged App> node /tmp/rovai-recovery-mobile-command-20260914.mjs",
+      "passed": true,
+      "evidence": "runtime.json",
+      "scriptSha256": "21f6ea7b9b33a5edcb0983a5058bb524accdce992e97efbbbdaa9631d1718409",
+      "log": "/tmp/rovai-recovery-mobile-command-20260914-final.log"
+    },
+    {
+      "command": "pnpm install:mac:daily --backup <recorded path>",
+      "passed": true,
+      "evidence": "installation.json",
+      "log": "/tmp/rovai-recovery-install-promote-20260914.log"
+    },
+    {
+      "command": "pnpm docs:test && pnpm docs:check; DOCS_BASE_REF=f6a60c02 pnpm docs:check:ci",
+      "passed": true,
+      "log": "/tmp/rovai-recovery-docs-ci-final.log"
+    }
+  ],
+  "initialFailuresAndCorrections": [
+    {
+      "case": "Rust workspace validation",
+      "failure": "New legacy-format test used an unqualified serde_json::Value; compilation failed before execution.",
+      "correction": "Qualified the test-only type; full workspace rerun passed.",
+      "log": "/tmp/rovai-recovery-rust-staged.log"
+    },
+    {
+      "case": "Mobile acceptance setup",
+      "failure": "Old expectation assumed auto-selected memory detail; new list behavior requires explicit selection. An empty-placeholder assertion was initially placed in a nonempty-draft fixture.",
+      "correction": "Select list rows explicitly; check placeholder geometry in the actual empty Camp. All original behavior checks remain."
+    },
+    {
+      "case": "Packaged App acceptance",
+      "failure": "Runtime.evaluate CDP timeout while two native App smoke processes overlapped; exact cause not established.",
+      "correction": "Unchanged App and assertions passed when native App smokes ran serially; no timeout increase.",
+      "log": "/tmp/rovai-recovery-install-acceptance-20260914.log"
+    },
+    {
+      "case": "Mobile native command acceptance",
+      "failure": "A generic send selector picked the hidden SingleChatPanel button (zero rectangle), and the dispatched click hit the header. Waiting for any enabled send button did not fix target selection.",
+      "correction": "Scope the pointer click and readiness check to the form containing #camp-message; production code unchanged.",
+      "diagnosticLog": "/tmp/rovai-recovery-mobile-command-diagnose-20260914.log"
+    }
+  ],
+  "limits": [
+    "No physical iOS/Android, second physical device, Windows or Linux qualification is inferred.",
+    "Idle Sessions may be reclaimed under capacity pressure; open SSE and authenticated in-flight requests pin their Sessions.",
+    "The installed disk bundle is new; daily processes are preserved until the user exits and reopens the canonical App."
+  ]
+}

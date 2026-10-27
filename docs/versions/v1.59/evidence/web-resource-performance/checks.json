@@ -1,0 +1,146 @@
+{
+  "sourceCommit": "2ace68a6a7c514d143005ab75f2cf2657266235e",
+  "status": "passed",
+  "base": "6c1aa1bf",
+  "isolation": "All Host, browser and App acceptance use task-owned data, Skill Library, MCP and browser profiles; daily data is not used.",
+  "checks": [
+    {
+      "command": "pnpm test",
+      "status": "passed",
+      "vitest": {
+        "files": 200,
+        "tests": 2028
+      },
+      "node": {
+        "passed": 317,
+        "skipped": 2
+      },
+      "log": "/tmp/rovai-perf-full-js.log",
+      "scope": "Full suite before final reveal-only navigation adjustment; final affected paths additionally covered below."
+    },
+    {
+      "command": "pnpm typecheck",
+      "status": "passed",
+      "log": "/tmp/rovai-perf-typecheck-final.log"
+    },
+    {
+      "command": "pnpm exec vitest run apps/desktop/src/renderer/src/App.test.ts apps/web/src/camp-adapter.test.ts apps/web/src/client.test.ts apps/web/src/file-digest.test.ts",
+      "status": "passed",
+      "tests": 194,
+      "log": "/tmp/rovai-perf-web-targeted-final.log"
+    },
+    {
+      "command": "CARGO_BUILD_JOBS=2 pnpm test:rust:staged",
+      "status": "passed",
+      "workspacePassed": 847,
+      "manualIgnored": 6,
+      "log": "/tmp/rovai-perf-full-rust.log"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "status": "passed",
+      "log": "/tmp/rovai-perf-clippy.log"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "status": "passed"
+    },
+    {
+      "command": "node --test --test-name-pattern=\"Desktop and Web share\" scripts/lib/host-web.test.mjs",
+      "status": "passed",
+      "groups": 1,
+      "log": "/tmp/rovai-perf-host-http.log",
+      "scope": "Debug Host source resource/HTTP boundary, later rerun with packaged Host."
+    },
+    {
+      "command": "node --test --test-name-pattern=\"phone execution shares\" scripts/lib/host-web-mobile.test.mjs",
+      "status": "passed",
+      "groups": 1,
+      "log": "/tmp/rovai-perf-mobile-runs.log",
+      "scope": "Shared production components with simulated evidence; both themes and four widths; not real Runtime."
+    },
+    {
+      "command": "ROVAI_HOST_ENTRY=headless node /tmp/rovai-perf-mobile-command-20260914.mjs",
+      "status": "passed",
+      "log": "/tmp/rovai-perf-runtime-debug-final.log",
+      "scope": "Isolated real Runtime; mobile send remains in conversation, manual execution opens selected Run, live command and shared header checked; final Run succeeded."
+    },
+    {
+      "command": "CARGO_BUILD_JOBS=2 pnpm test:rust:slow",
+      "status": "passed",
+      "tests": 310,
+      "log": "/tmp/rovai-perf-rust-slow.log",
+      "scope": "Together with full workspace above covers the library, CLI and slow-test scopes of test:rust:pr."
+    },
+    {
+      "command": "pnpm docs:test",
+      "status": "passed",
+      "tests": 10,
+      "log": "/tmp/rovai-perf-doc-tests.log"
+    },
+    {
+      "command": "CARGO_BUILD_JOBS=2 pnpm package:mac:daily",
+      "status": "passed",
+      "log": "/tmp/rovai-perf-package-20260914.log",
+      "build": "build.json"
+    },
+    {
+      "command": "node scripts/measure-host-web-resources.mjs",
+      "status": "passed",
+      "log": "/tmp/rovai-perf-measure-final.log",
+      "evidence": "measurement.json"
+    },
+    {
+      "command": "ROVAI_HOST_BIN=<package Host> ROVAI_WEB_UI=<package Web> node --test --test-name-pattern=\"Desktop and Web share\" scripts/lib/host-web.test.mjs",
+      "status": "passed",
+      "groups": 1,
+      "log": "/tmp/rovai-perf-packaged-http.log",
+      "scope": "Package HTTP checks include raw bytes, same-size/same-mtime generation rejection, upload cancellation/limits/replay cleanup, and static-cache boundaries."
+    },
+    {
+      "command": "ROVAI_HOST_BIN=<package Host> ROVAI_WEB_UI=<package Web> ROVAI_MOBILE_OUTPUT=/tmp/rovai-perf-packaged-mobile node --test --test-name-pattern=\"phone workbench\" scripts/lib/host-web-mobile.test.mjs",
+      "status": "passed",
+      "evidence": "mobile.json",
+      "log": "/tmp/rovai-perf-packaged-mobile.log",
+      "scope": "All assertions complete before mobile.json is written: 2 MiB image uploads once, Host confirms it, zero raw image readbacks for its initial draft thumbnail; after reload one raw read restores the image. Existing mobile navigation/drafts/HTML/setting/schedule checks pass."
+    },
+    {
+      "command": "ROVAI_HOST_ENTRY=desktop node /tmp/rovai-perf-mobile-command-20260914.mjs",
+      "status": "passed",
+      "scope": "Packaged Desktop-managed Host and packaged Web, real Codex Runtime; not a simulated Run.",
+      "evidence": "runtime.json",
+      "log": "/tmp/rovai-perf-runtime-packaged.log"
+    },
+    {
+      "command": "node /tmp/rovai-perf-install-acceptance-20260914.mjs",
+      "status": "passed",
+      "evidence": "validation.json",
+      "log": "/tmp/rovai-perf-install-acceptance-final-20260914.log"
+    },
+    {
+      "command": "node /tmp/rovai-perf-install-promote-20260914.mjs",
+      "status": "passed",
+      "evidence": "installation.json",
+      "log": "/tmp/rovai-perf-install-promote-20260914.log"
+    },
+    {
+      "command": "DOCS_BASE_REF=6c1aa1bf pnpm docs:check:ci",
+      "status": "passed",
+      "log": "/tmp/rovai-perf-docs-delivery.log"
+    }
+  ],
+  "initialFailuresAndResolution": [
+    "Before the polling fix, a subscribed client with no handles made 4 update requests in 6 controlled seconds; the same owner now requires zero and checks stop/resume.",
+    "Before the byte-response change, the 20 MiB download JSON payload was 27,962,080 bytes; the new path returns exactly 20,971,520 original bytes.",
+    "First cache-manifest implementation hashed chunks before Vite rewrote preload references. The real HTTP owner rejected the mismatch; the manifest now hashes final written output and the same boundary checks pass.",
+    "First no-auto-navigation implementation discarded submitted Run selection. Real UI acceptance exposed an empty manual execution selection; the fix preserves selection and suppresses only revealing the execution tab.",
+    "Local smoke harness fixes: scope Send to the Camp composer form, find HTML attachments by their accessible filename, canonicalize the temporary scan fixture for the no-follow policy, wait for both Host readiness and listener origin. No production assertion was removed or timeout relaxed.",
+    "Package recovery smoke initially hit CDP Runtime.evaluate timeout during startup Camp interaction. The isolated database already contained its created Camp. Adding stage logs only, the serial rerun passed the original assertions and timeouts. No product cause is claimed; initial log: /tmp/rovai-perf-install-acceptance-20260914.log."
+  ],
+  "limits": [
+    "Each resource read still computes a fresh full-source SHA-256. These changes reduce body retention, repeat scans/copies and Base64 processing; they do not remove the full-file hash input per page.",
+    "Binary response.blob() still receives the complete bounded file. Shared preview consumers may construct a byte array from that Blob.",
+    "Local File reuse is disposable and requires Host binding/availability/generation confirmation; refresh, another device, cache eviction or changed content falls back to Host reading.",
+    "Native platform qualification remains macOS arm64 only; Chrome mobile viewport simulation does not qualify physical iOS/Android devices."
+  ]
+}

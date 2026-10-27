@@ -1,0 +1,5960 @@
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    error::Error as StdError,
+    fmt,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use anyhow::{Context, Result};
+use rovai_core::{
+    agent_profile::FrozenAgentRuntimeConfig,
+    agent_runtime_adapter::CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID,
+    managed_process::{
+        ManagedProcess, ManagedProcessLaunchSpec, ManagedProcessPurpose, ManagedStdinPolicy,
+        ManagedWindowsArgvDialect,
+    },
+    mcp::McpServerDefinition,
+    runtime::{AgentRunWorkspace, PermissionSemantics},
+    runtime_discovery::is_runtime_entrypoint_file,
+    runtime_failure::{
+        RuntimeFailureError, RuntimeFailureOrigin, RuntimeFailurePhase, RuntimeFailureView,
+        public_runtime_failure_from_output,
+    },
+    runtime_search_operation,
+};
+use serde::Deserialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    sync::{Mutex as AsyncMutex, mpsc, oneshot},
+    task::{AbortHandle, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use crate::{
+    builtin_tool_runtime::BuiltinToolProcessConfig,
+    claude_control::{self, ClaudeControl, ControlReadGuard},
+    runtime_mcp::{remove_stale_mcp_configs, write_ephemeral_additive_mcp_config},
+};
+
+const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(windows)]
+const CLAUDE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(windows))]
+const CLAUDE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+// The catalog is advisory. Validate only options this adapter can transmit;
+// the native CLI owns acceptance of model IDs and future effort values.
+fn claude_model_effort(options: &Value) -> Result<Option<&str>> {
+    let options = options
+        .as_object()
+        .context("Claude Code model options must be an object")?;
+    for key in options.keys() {
+        if key != "effort" {
+            anyhow::bail!("Claude Code cannot transmit model option: {key}");
+        }
+    }
+    options
+        .get("effort")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+                .context("Claude Code effort must be a non-empty string without control characters")
+        })
+        .transpose()
+}
+
+// Keep prompt/settings bytes out of argv, including for Windows command shims.
+// Only a pre-spawn guard removes a file on drop. After spawn the registered run
+// owns its path until its managed Job has been confirmed empty on Windows.
+struct ClaudeLaunchFile(PathBuf);
+
+impl ClaudeLaunchFile {
+    fn write(directory: &Path, contents: &[u8]) -> Result<Self> {
+        use rovai_core::platform::private_storage::{
+            create_private_new_file, prepare_private_directory,
+        };
+        use std::io::Write;
+
+        let directory = prepare_private_directory(&directory.join("claude-inputs"))?;
+        let path = directory.join(format!("{}.txt", uuid::Uuid::new_v4()));
+        let mut file = create_private_new_file(&path)?;
+        let guard = Self(path);
+        let written = file.write_all(contents).and_then(|()| file.flush());
+        drop(file);
+        written?;
+        Ok(guard)
+    }
+
+    fn into_managed_path(mut self) -> PathBuf {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for ClaudeLaunchFile {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty()
+            && let Err(error) = std::fs::remove_file(&self.0)
+        {
+            eprintln!("Claude Code pre-spawn launch file cleanup failed: {error}");
+        }
+    }
+}
+
+fn remove_stale_claude_inputs(private_runtime_dir: &Path) {
+    let directory = private_runtime_dir.join("claude-inputs");
+    if !directory.exists() {
+        return;
+    }
+    let directory =
+        match rovai_core::platform::private_storage::prepare_private_directory(&directory) {
+            Ok(directory) => directory,
+            Err(error) => {
+                eprintln!("Claude Code stale input directory could not be inspected: {error:#}");
+                return;
+            }
+        };
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("Claude Code stale inputs could not be listed: {error}");
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!("Claude Code stale input entry could not be read: {error}");
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".txt")) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(stem).is_err()
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(entry.path()) {
+            eprintln!("Claude Code stale input {name:?} could not be removed: {error}");
+        }
+    }
+}
+
+pub struct ClaudeCodeRunRequest {
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub workspace: AgentRunWorkspace,
+    pub permission_semantics: PermissionSemantics,
+    pub runtime: FrozenAgentRuntimeConfig,
+    pub prompt: String,
+    pub resumable_native_session_id: Option<String>,
+    pub new_native_session_id: Option<String>,
+    pub session_bootstrap: Option<String>,
+    pub builtin_tools: Option<BuiltinToolProcessConfig>,
+    pub external_mcp_servers: BTreeMap<String, McpServerDefinition>,
+    pub attachment_access_root: Option<PathBuf>,
+    pub persist_session: bool,
+    pub input_accepted: Option<mpsc::UnboundedSender<ClaudeCodeInputAccepted>>,
+    pub runtime_events: Option<mpsc::UnboundedSender<ClaudeCodeRuntimeEvent>>,
+    pub launch_handoff: Option<oneshot::Sender<()>>,
+    /// Native initialization completed, but no business input has been sent.
+    /// Core records dispatch only after releasing this gate.
+    pub input_ready: Option<mpsc::UnboundedSender<oneshot::Sender<String>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClaudeCodeInputNotSent {
+    pub session_unavailable: bool,
+}
+impl fmt::Display for ClaudeCodeInputNotSent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Claude Code initialization ended before business input dispatch")
+    }
+}
+impl StdError for ClaudeCodeInputNotSent {}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeCodeInputAccepted {
+    pub native_session_id: String,
+    pub native_turn_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeRuntimeEvent {
+    pub event_type: &'static str,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeRunResult {
+    pub native_session_id: String,
+    pub native_turn_id: String,
+    pub final_output: String,
+    pub usage: Option<Value>,
+    /// A trusted native result may precede confirmation of Job cleanup.
+    pub cleanup_confirmed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClaudeCodeCleanupPending;
+
+impl fmt::Display for ClaudeCodeCleanupPending {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Claude Code Job cleanup remains pending")
+    }
+}
+
+impl StdError for ClaudeCodeCleanupPending {}
+
+/// The registered one-shot worker returned its result. This does not prove a
+/// native terminal outcome or process-tree isolation; cleanup may still be pending.
+#[derive(Debug)]
+pub(crate) struct ClaudeCodeRunEnded;
+
+impl fmt::Display for ClaudeCodeRunEnded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Claude Code managed run has ended")
+    }
+}
+
+impl StdError for ClaudeCodeRunEnded {}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeDeliveredFailure {
+    pub native_session_id: String,
+    pub native_turn_id: String,
+    pub error_code: String,
+    pub failure: RuntimeFailureView,
+}
+
+impl fmt::Display for ClaudeCodeDeliveredFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Claude Code accepted the input but ended with {}",
+            self.error_code
+        )
+    }
+}
+
+impl StdError for ClaudeCodeDeliveredFailure {}
+
+struct ClaudeCodeProcessControl {
+    interrupt: AsyncMutex<Option<oneshot::Sender<()>>>,
+    resources: AsyncMutex<Option<ClaudeCodeRunResources>>,
+    worker: StdMutex<Option<AbortHandle>>,
+    worker_finished: AtomicBool,
+    protocol: StdMutex<Option<Arc<ClaudeControl>>>,
+}
+
+struct ClaudeCodeRunResources {
+    child: ManagedProcess,
+    bootstrap_file: Option<PathBuf>,
+    settings_file: Option<PathBuf>,
+}
+
+type ActiveClaudeRuns = StdMutex<HashMap<(String, i64), Arc<ClaudeCodeProcessControl>>>;
+
+struct ClaudeOutputTasks {
+    stdout: JoinHandle<Result<ClaudeCodeStreamCapture>>,
+    stderr: JoinHandle<Result<CapturedBytes>>,
+    stdin: JoinHandle<Result<()>>,
+}
+
+impl Drop for ClaudeOutputTasks {
+    fn drop(&mut self) {
+        self.stdout.abort();
+        self.stderr.abort();
+        self.stdin.abort();
+    }
+}
+
+impl ClaudeCodeRunResources {
+    async fn finish(&mut self, terminate: bool, deadline: Instant) -> Result<()> {
+        if terminate && let Err(error) = self.child.force_terminate_tree() {
+            eprintln!("Claude Code tree termination request failed: {error}");
+        }
+        #[cfg(not(windows))]
+        tokio::time::timeout_at(deadline, self.child.wait())
+            .await
+            .context("Claude Code root process reap timed out")?
+            .context("failed to reap Claude Code root process")?;
+
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            loop {
+                let last_error = match self.child.tree_is_empty() {
+                    Ok(true) => break,
+                    Ok(false) => self
+                        .child
+                        .force_terminate_tree()
+                        .err()
+                        .map(anyhow::Error::from),
+                    Err(error) => Some(anyhow::Error::from(error)),
+                };
+                if Instant::now() >= deadline {
+                    return Err(last_error.unwrap_or_else(|| {
+                        anyhow::anyhow!(
+                            "Claude Code descendants remained active before cleanup deadline"
+                        )
+                    }))
+                    .context("Claude Code process tree cleanup is unconfirmed");
+                }
+                tokio::time::sleep(Duration::from_millis(if cfg!(windows) { 10 } else { 20 }))
+                    .await;
+            }
+        }
+
+        for (name, file) in [
+            ("bootstrap", &mut self.bootstrap_file),
+            ("settings", &mut self.settings_file),
+        ] {
+            if let Some(path) = file.as_ref() {
+                match std::fs::remove_file(path) {
+                    Ok(()) => *file = None,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => *file = None,
+                    Err(error) => {
+                        eprintln!(
+                            "Claude Code {name} launch file cleanup failed after process cleanup: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct ClaudeCodeCliRuntimeAdapter {
+    active: Arc<ActiveClaudeRuns>,
+    private_runtime_dir: PathBuf,
+}
+
+impl ClaudeCodeCliRuntimeAdapter {
+    #[cfg(all(test, feature = "extended-tests"))]
+    pub fn new(data_dir: &Path) -> Result<Self> {
+        let adapter = Self::deferred(data_dir);
+        adapter.initialize_storage()?;
+        Ok(adapter)
+    }
+
+    pub fn deferred(data_dir: &Path) -> Self {
+        Self {
+            active: Arc::new(StdMutex::new(HashMap::new())),
+            private_runtime_dir: data_dir.join("runtime-private"),
+        }
+    }
+
+    pub fn initialize_storage(&self) -> Result<()> {
+        let private_runtime_dir = &self.private_runtime_dir;
+        std::fs::create_dir_all(private_runtime_dir).with_context(|| {
+            format!(
+                "failed to create private Runtime directory {}",
+                private_runtime_dir.display()
+            )
+        })?;
+        restrict_directory_permissions(private_runtime_dir)?;
+        remove_stale_mcp_configs(private_runtime_dir)?;
+        remove_stale_claude_inputs(private_runtime_dir);
+        Ok(())
+    }
+
+    pub async fn run(&self, mut request: ClaudeCodeRunRequest) -> Result<ClaudeCodeRunResult> {
+        let key = (request.agent_run_id.clone(), request.execution_epoch);
+        let (interrupt, interrupted) = oneshot::channel();
+        let control = Arc::new(ClaudeCodeProcessControl {
+            interrupt: AsyncMutex::new(Some(interrupt)),
+            resources: AsyncMutex::new(None),
+            worker: StdMutex::new(None),
+            worker_finished: AtomicBool::new(false),
+            protocol: StdMutex::new(None),
+        });
+        {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if active.contains_key(&key) {
+                anyhow::bail!("Claude Code process already exists for this AgentRun epoch");
+            }
+            active.insert(key.clone(), control.clone());
+        }
+        let active = self.active.clone();
+        let private_runtime_dir = self.private_runtime_dir.clone();
+        let launch_handoff = request.launch_handoff.take();
+        let (result_sender, result_receiver) = oneshot::channel();
+        let tracked_control = control.clone();
+        let worker = tokio::spawn(async move {
+            let result = rovai_core::runtime_discovery::with_launch_environment(
+                request.runtime.environment.clone(),
+                Self::run_process(
+                    &private_runtime_dir,
+                    &tracked_control,
+                    &request,
+                    interrupted,
+                    launch_handoff,
+                ),
+            )
+            .await;
+            tracked_control
+                .worker_finished
+                .store(true, Ordering::Release);
+            if tracked_control.resources.lock().await.is_none() {
+                let mut active = active
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if active
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &tracked_control))
+                {
+                    active.remove(&key);
+                }
+            }
+            tracked_control
+                .worker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let _ = result_sender.send(result);
+        });
+        *control
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker.abort_handle());
+        drop(worker);
+        result_receiver
+            .await
+            .context("Claude Code managed run ended without a result")?
+            .context(ClaudeCodeRunEnded)
+    }
+
+    pub(crate) fn get_agent_run(&self, run_id: &str, epoch: i64) -> Option<Arc<ClaudeControl>> {
+        self.active
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(run_id.to_string(), epoch))
+            .and_then(|run| run.protocol.lock().unwrap().clone())
+    }
+
+    pub async fn interrupt(&self, agent_run_id: &str, execution_epoch: i64) -> bool {
+        if let Some(protocol) = self.get_agent_run(agent_run_id, execution_epoch) {
+            protocol.fence_active_input();
+        }
+        let control = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(agent_run_id.to_string(), execution_epoch))
+            .cloned();
+        let Some(control) = control else {
+            return false;
+        };
+        control
+            .interrupt
+            .lock()
+            .await
+            .take()
+            .is_some_and(|sender| sender.send(()).is_ok())
+    }
+
+    pub async fn wait_for_agent_run_quiescence(
+        &self,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        timeout: Duration,
+    ) -> bool {
+        let key = (agent_run_id.to_string(), execution_epoch);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let control = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&key)
+                .cloned();
+            let Some(control) = control else {
+                return true;
+            };
+            if control.worker_finished.load(Ordering::Acquire)
+                && let Ok(mut owned) = control.resources.try_lock()
+            {
+                let reaped = match owned.as_mut() {
+                    Some(resources) => matches!(
+                        tokio::time::timeout_at(deadline, resources.finish(true, deadline)).await,
+                        Ok(Ok(()))
+                    ),
+                    None => true,
+                };
+                if reaped {
+                    *owned = None;
+                    let mut active = self
+                        .active
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if active
+                        .get(&key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &control))
+                    {
+                        active.remove(&key);
+                    }
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    pub async fn shutdown_all(&self) {
+        let controls = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for control in controls {
+            if let Some(sender) = control.interrupt.lock().await.take() {
+                let _ = sender.send(());
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (agent_run_id, execution_epoch) in active.keys() {
+            eprintln!(
+                "Claude Code run cleanup remains unconfirmed at Core shutdown: run={agent_run_id} epoch={execution_epoch}"
+            );
+        }
+    }
+
+    async fn run_process(
+        private_runtime_dir: &Path,
+        control: &ClaudeCodeProcessControl,
+        request: &ClaudeCodeRunRequest,
+        mut interrupted: oneshot::Receiver<()>,
+        launch_handoff: Option<oneshot::Sender<()>>,
+    ) -> Result<ClaudeCodeRunResult> {
+        let execution_root = Path::new(&request.workspace.execution_root);
+        if !execution_root.is_dir() {
+            let internal = anyhow::anyhow!(
+                "Claude Code execution directory no longer exists: {}",
+                execution_root.display()
+            );
+            let failure = claude_public_failure(
+                request,
+                private_runtime_dir,
+                RuntimeFailureOrigin::Environment,
+                RuntimeFailurePhase::Spawn,
+                "runtime_execution_directory_unavailable",
+                "Claude Code 的执行目录不可用",
+                Some(&internal.to_string()),
+                false,
+            );
+            return Err(internal.context(RuntimeFailureError::new(failure)));
+        }
+        if let Some(root) = request.attachment_access_root.as_deref()
+            && !root.is_dir()
+        {
+            let internal = anyhow::anyhow!(
+                "Claude Code Thread Attachment access root is unavailable: {}",
+                root.display()
+            );
+            let failure = claude_public_failure(
+                request,
+                private_runtime_dir,
+                RuntimeFailureOrigin::Environment,
+                RuntimeFailurePhase::Spawn,
+                "runtime_attachment_root_unavailable",
+                "Claude Code 的附件目录不可用",
+                Some(&internal.to_string()),
+                false,
+            );
+            return Err(internal.context(RuntimeFailureError::new(failure)));
+        }
+        let executable = Path::new(&request.runtime.executable_path);
+        if !is_runtime_entrypoint_file(executable) {
+            let internal = anyhow::anyhow!(
+                "Claude Code executable is missing or not executable: {}",
+                executable.display()
+            );
+            let failure = claude_public_failure(
+                request,
+                private_runtime_dir,
+                RuntimeFailureOrigin::Environment,
+                RuntimeFailurePhase::Spawn,
+                "runtime_executable_unavailable",
+                "Claude Code 可执行文件不可用",
+                Some(&internal.to_string()),
+                false,
+            );
+            return Err(internal.context(RuntimeFailureError::new(failure)));
+        }
+        let values = request
+            .runtime
+            .permissions
+            .values
+            .as_object()
+            .context("Claude Code permission configuration must be an object")?;
+        let configured_mode = values
+            .get("permission_mode")
+            .and_then(serde_json::Value::as_str)
+            .context("Claude Code requires permission_mode")?;
+        if ![
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "manual",
+            "dontAsk",
+            "plan",
+        ]
+        .contains(&configured_mode)
+        {
+            anyhow::bail!("Claude Code permission_mode has an unsupported value");
+        }
+        let legacy_read_only = request.permission_semantics == PermissionSemantics::CoreEnforcedV1
+            && request.workspace.access == "read_only";
+        let permission_mode = if legacy_read_only {
+            // `plan` also suppresses Rovai-ai's explicitly pre-authorized Team
+            // Tool. `dontAsk` fails closed for every action that would require
+            // a prompt, while `--allowedTools` below can still admit the one
+            // binding-authenticated collaboration tool.
+            "dontAsk"
+        } else {
+            configured_mode
+        };
+
+        let native_session_id =
+            if let Some(session_id) = request.resumable_native_session_id.as_deref() {
+                validate_session_id(session_id)?;
+                session_id.to_string()
+            } else if let Some(session_id) = request.new_native_session_id.as_deref() {
+                validate_session_id(session_id)?;
+                session_id.to_string()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+        let fast_override = request
+            .runtime
+            .camp_fast
+            .as_ref()
+            .and_then(|fast| fast.fast_override);
+        if let Some(api) = &request.runtime.custom_api {
+            api.assert_current()?;
+        }
+        // Settings env can replace inherited env. Keep this override in the
+        // existing private file as well as the child environment below.
+        let mut inline_settings = serde_json::json!({
+            "env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+        });
+        if let Some(overlay) = request
+            .runtime
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.overlay.as_ref())
+        {
+            let env = inline_settings["env"]
+                .as_object_mut()
+                .context("Claude inline environment is invalid")?;
+            for (name, value) in overlay {
+                env.insert(name.clone(), serde_json::json!(value));
+            }
+        }
+
+        rovai_core::camp_fast::merge_claude_inline_settings(&mut inline_settings, fast_override)?;
+        // Native settings can override inherited env. Apply managed policy only
+        // after the member overlay and all other settings have been merged.
+        let env = inline_settings["env"]
+            .as_object_mut()
+            .context("Claude inline environment is invalid")?;
+        if cfg!(windows) {
+            env.retain(|key, _| !key.eq_ignore_ascii_case("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"));
+        }
+        env.insert(
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(),
+            serde_json::json!("1"),
+        );
+        let effort = claude_model_effort(&request.runtime.model.options)?;
+        let mut command = Command::new(executable);
+        rovai_core::runtime_discovery::configure_runtime_command(
+            rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+            &mut command,
+        );
+        if let Some(environment) = &request.runtime.environment {
+            environment.validate_model_selection(
+                rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+                &if request.runtime.model.source == "runtime_default" {
+                    rovai_core::agent_profile::ModelSelection::RuntimeDefault
+                } else {
+                    rovai_core::agent_profile::ModelSelection::Explicit {
+                        model_id: request.runtime.model.model_id.clone(),
+                        options: request.runtime.model.options.clone(),
+                        dsh_source: None,
+                    }
+                },
+            )?;
+            environment.validate_claude_routing(request.runtime.reported_version.as_deref())?;
+            environment.apply(&mut command)?;
+        }
+        if let Some(config) = &request.builtin_tools {
+            config.configure_command(&mut command)?;
+        }
+        command
+            .arg("--print")
+            .args(["--input-format", "stream-json"])
+            .args(["--output-format", "stream-json"])
+            .args(["--permission-prompt-tool", "stdio"])
+            .env("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")
+            .arg("--verbose")
+            .arg("--include-partial-messages")
+            .arg("--replay-user-messages")
+            .args(["--permission-mode", permission_mode]);
+        if let Some(root) = request.attachment_access_root.as_deref() {
+            command.arg("--add-dir").arg(root);
+        }
+        if let Some(config) = request.builtin_tools.as_ref() {
+            command.arg("--add-dir").arg(config.run_tmp());
+        }
+        if permission_mode == "bypassPermissions" {
+            command.arg("--dangerously-skip-permissions");
+        }
+        let mut disallowed_tools = if legacy_read_only {
+            vec!["Edit", "Write", "NotebookEdit"]
+        } else {
+            Vec::new()
+        };
+        disallowed_tools.push("AskUserQuestion");
+        command.arg(format!("--disallowedTools={}", disallowed_tools.join(",")));
+        if request.runtime.model.source == "explicit"
+            && request.runtime.model.model_id != CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID
+        {
+            command.args(["--model", request.runtime.model.model_id.as_str()]);
+        }
+        if let Some(effort) = effort {
+            command.args(["--effort", effort]);
+        }
+        let bootstrap_file = request
+            .session_bootstrap
+            .as_deref()
+            .map(|bootstrap| ClaudeLaunchFile::write(private_runtime_dir, bootstrap.as_bytes()))
+            .transpose()?;
+        let settings_file = if inline_settings
+            .as_object()
+            .is_some_and(|settings| !settings.is_empty())
+        {
+            Some(ClaudeLaunchFile::write(
+                private_runtime_dir,
+                &serde_json::to_vec(&inline_settings)?,
+            )?)
+        } else {
+            None
+        };
+        command.args(launch_session_arguments(
+            request.resumable_native_session_id.as_deref(),
+            &native_session_id,
+            bootstrap_file.as_ref().map(|file| file.0.as_path()),
+            settings_file.as_ref().map(|file| file.0.as_path()),
+        )?);
+        if !request.persist_session {
+            command.arg("--no-session-persistence").arg("--tools=");
+        }
+        let _external_mcp_config = if request.external_mcp_servers.is_empty() {
+            None
+        } else {
+            let config = write_ephemeral_additive_mcp_config(
+                private_runtime_dir,
+                &request.external_mcp_servers,
+            )?;
+            command.arg("--mcp-config").arg(config.path());
+            Some(config)
+        };
+        command.current_dir(execution_root);
+        // Apply the fixed managed policy after all Runtime/Built-in env merges.
+        command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
+        command.env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+        if !matches!(
+            interrupted.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ) {
+            anyhow::bail!("Claude Code process was interrupted before spawn");
+        }
+        // Frozen context can contain user messages and local paths. The managed
+        // process uses piped stdin so it never appears in argv or diagnostics.
+        let launch_result: Result<ManagedProcess> = (|| {
+            let spec = ManagedProcessLaunchSpec::capture(
+                &command,
+                ManagedProcessPurpose::RuntimeOneShot,
+                ManagedStdinPolicy::Piped,
+                ManagedWindowsArgvDialect::MicrosoftCrt,
+                format!("agent-run:{}:claude-code-cli", request.agent_run_id),
+            )?;
+            ManagedProcess::spawn(spec)
+        })();
+        let child = launch_result.map_err(|error| {
+            let raw_detail = error.to_string();
+            let failure = claude_public_failure(
+                request,
+                private_runtime_dir,
+                RuntimeFailureOrigin::Environment,
+                RuntimeFailurePhase::Spawn,
+                "runtime_spawn_failed",
+                "Claude Code 进程无法启动",
+                Some(&raw_detail),
+                true,
+            );
+            error
+                .context(format!(
+                    "failed to start {} in Claude Code print mode",
+                    executable.display()
+                ))
+                .context(RuntimeFailureError::new(failure))
+        })?;
+        // No await separates spawn from transferring all three resources into
+        // the adapter's registered run. Aborting the caller cannot drop them.
+        let mut owned = control
+            .resources
+            .try_lock()
+            .expect("new Claude Code run has no competing resource owner");
+        *owned = Some(ClaudeCodeRunResources {
+            child,
+            bootstrap_file: bootstrap_file.map(ClaudeLaunchFile::into_managed_path),
+            settings_file: settings_file.map(ClaudeLaunchFile::into_managed_path),
+        });
+        let resources = owned.as_mut().expect("Claude Code run was just installed");
+        let mut cleanup_deadline = None;
+        let result = Self::execute_spawned(
+            private_runtime_dir,
+            request,
+            control,
+            permission_mode,
+            resources,
+            interrupted,
+            launch_handoff,
+            native_session_id,
+            &mut cleanup_deadline,
+        )
+        .await;
+        let cleanup = resources
+            .finish(
+                result.is_err(),
+                cleanup_deadline.unwrap_or_else(|| Instant::now() + CLAUDE_CLEANUP_TIMEOUT),
+            )
+            .await;
+        match cleanup {
+            Ok(()) => {
+                *owned = None;
+                result
+            }
+            Err(error) => {
+                eprintln!(
+                    "Claude Code process cleanup remains pending for run={} epoch={}: {error:#}",
+                    request.agent_run_id, request.execution_epoch
+                );
+                // Keep the Job owner registered for the existing cleanup worker.
+                // A trusted native terminal remains the business result.
+                result
+                    .map(|mut result| {
+                        result.cleanup_confirmed = false;
+                        result
+                    })
+                    .map_err(|error| error.context(ClaudeCodeCleanupPending))
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "frozen launch configuration and process-owned resources remain explicit"
+    )]
+    async fn execute_spawned(
+        private_runtime_dir: &Path,
+        request: &ClaudeCodeRunRequest,
+        process_control: &ClaudeCodeProcessControl,
+        permission_mode: &str,
+        resources: &mut ClaudeCodeRunResources,
+        mut interrupted: oneshot::Receiver<()>,
+        launch_handoff: Option<oneshot::Sender<()>>,
+        native_session_id: String,
+        cleanup_deadline: &mut Option<Instant>,
+    ) -> Result<ClaudeCodeRunResult> {
+        let child = &mut resources.child;
+        let stdin = child
+            .take_stdin()
+            .context("Claude Code stdin was unavailable")?;
+        let (mut protocol, initialized, writes) = ClaudeControl::new(
+            native_session_id.clone(),
+            permission_mode.to_string(),
+            request.runtime_events.clone(),
+        );
+        let redactor = request
+            .runtime
+            .custom_api
+            .as_ref()
+            .and_then(|api| api.redactor().ok());
+        let redactor = Some(
+            request
+                .runtime
+                .environment
+                .as_ref()
+                .map(|env| env.redactor())
+                .unwrap_or_else(|| {
+                    rovai_core::runtime_custom_api::CredentialRedactor::from_values(vec![])
+                })
+                .extend(redactor.unwrap_or_else(|| {
+                    rovai_core::runtime_custom_api::CredentialRedactor::from_values(vec![])
+                })),
+        );
+        Arc::get_mut(&mut protocol)
+            .expect("unshared protocol")
+            .set_credential_redactor(redactor);
+        *process_control.protocol.lock().unwrap() = Some(protocol.clone());
+        let _protocol_guard = ControlReadGuard(protocol.clone());
+        let stdout = child
+            .take_stdout()
+            .context("Claude Code stdout was unavailable")?;
+        let stderr = child
+            .take_stderr()
+            .context("Claude Code stderr was unavailable")?;
+        let native_turn_id = format!(
+            "claude-code:{}:{}",
+            request.agent_run_id, request.execution_epoch
+        );
+        let acceptance_observed = Arc::new(AtomicBool::new(false));
+        let mut tasks = ClaudeOutputTasks {
+            stdout: tokio::spawn(capture_claude_stream(
+                stdout,
+                native_session_id.clone(),
+                native_turn_id.clone(),
+                request.input_accepted.clone(),
+                request.runtime_events.clone(),
+                acceptance_observed.clone(),
+                Some(protocol.clone()),
+            )),
+            stderr: tokio::spawn(capture_claude_stderr(
+                stderr,
+                request.runtime_events.clone(),
+            )),
+            stdin: tokio::spawn(claude_control::write_control_stream(
+                stdin,
+                protocol.clone(),
+                writes,
+            )),
+        };
+        let initialization: Result<_> = tokio::select! {
+            biased;
+            _ = &mut interrupted => {
+                    child.force_terminate_tree().context("failed to stop Claude Code before closing input")?;
+                    anyhow::bail!("Claude Code process was interrupted during stdin delivery");
+                },
+            status = child.wait() => Err(anyhow::anyhow!("Claude Code exited before initialization: {:?}", status?)),
+            initialized = async {
+                protocol.initialize().await?;
+                let initialized = tokio::time::timeout(claude_control::INITIALIZE_TIMEOUT, initialized).await
+                    .context("Claude Code protocol initialization timed out")?
+                    .context("Claude Code initialization channel closed")?;
+                Ok(initialized)
+            } => initialized,
+        };
+        let initialize = match initialization {
+            Ok(initialize) => initialize,
+            Err(error) => {
+                let deadline = Instant::now() + CLAUDE_CLEANUP_TIMEOUT;
+                *cleanup_deadline = Some(deadline);
+                let _ = child.force_terminate_tree();
+                protocol.disconnect();
+                let detail = match tokio::time::timeout_at(deadline, &mut tasks.stderr).await {
+                    Ok(Ok(Ok(captured))) => {
+                        protocol.redact_text(&String::from_utf8_lossy(&captured.bytes))
+                    }
+                    _ => protocol.redact_text(&format!("{error:#}")),
+                };
+                // This CLI has no qualified machine-readable unavailable-target
+                // result here. Initialization/stderr text cannot authorize replacement.
+                let missing = false;
+                let failure = claude_public_failure(
+                    request,
+                    private_runtime_dir,
+                    RuntimeFailureOrigin::Compatibility,
+                    RuntimeFailurePhase::Execution,
+                    if missing {
+                        "runtime_session_unavailable"
+                    } else {
+                        "runtime_control_initialization_failed"
+                    },
+                    "Claude Code 会话初始化失败",
+                    Some(&detail),
+                    false,
+                );
+                return Err(error.context(RuntimeFailureError::new(failure)).context(
+                    ClaudeCodeInputNotSent {
+                        session_unavailable: missing,
+                    },
+                ));
+            }
+        };
+        if let Some(events) = &request.runtime_events {
+            let enabled = initialize
+                .get("fast_mode_state")
+                .and_then(rovai_core::camp_fast::ObservedFastState::from_claude)
+                .and_then(rovai_core::camp_fast::ObservedFastState::fast_default);
+            let _ = events.send(ClaudeCodeRuntimeEvent {
+                event_type: "runtime.fast.initialized",
+                payload: serde_json::json!({ "enabled": enabled }),
+            });
+        }
+        let prompt = if let Some(ready) = &request.input_ready {
+            let (release, released) = oneshot::channel();
+            ready
+                .send(release)
+                .map_err(|_| anyhow::anyhow!("Claude Code dispatch owner is unavailable"))?;
+            tokio::select! {
+                biased;
+                _ = &mut interrupted => {
+                    child.force_terminate_tree().context("failed to stop Claude Code before closing input")?;
+                    anyhow::bail!("Claude Code was interrupted before input delivery");
+                },
+                release = released => release.context("Claude Code input dispatch was fenced")?,
+            }
+        } else {
+            request.prompt.clone()
+        };
+        tokio::select! {
+            biased;
+            _ = &mut interrupted => {
+                    child.force_terminate_tree().context("failed to stop Claude Code before closing input")?;
+                    anyhow::bail!("Claude Code process was interrupted during stdin delivery");
+                },
+            delivered = protocol.send_prompt(&prompt) => {
+                delivered.context("failed to deliver structured input to Claude Code stdin")?;
+            }
+        }
+        if let Some(handoff) = launch_handoff {
+            let _ = handoff.send(());
+        }
+        let mut stdin_closed = false;
+        let mut exit_deadline = None;
+        let mut status = None;
+        let mut stdout = None;
+        let mut stderr = None;
+        let mut output_deadline = None;
+        while status.is_none() || stdout.is_none() || stderr.is_none() {
+            let deadline = output_deadline;
+            let end_deadline = exit_deadline;
+            tokio::select! {
+                biased;
+                _ = &mut interrupted => {
+                    child.force_terminate_tree().context("failed to stop Claude Code before closing input")?;
+                    anyhow::bail!("Claude Code process was interrupted");
+                },
+                _ = async move { tokio::time::sleep_until(deadline.expect("output deadline is set")).await }, if deadline.is_some() => {
+                    anyhow::bail!("Claude Code output collectors did not finish after root exit");
+                }
+                _ = async move { tokio::time::sleep_until(end_deadline.expect("exit deadline is set")).await }, if end_deadline.is_some() && status.is_none() => {
+                    anyhow::bail!("Claude Code process did not exit after session end");
+                }
+                written = &mut tasks.stdin, if !stdin_closed => {
+                    written.context("Claude Code stdin writer failed")??;
+                    stdin_closed = true;
+                    exit_deadline = Some(Instant::now() + claude_control::EXIT_TIMEOUT);
+                }
+                collected = &mut tasks.stdout, if stdout.is_none() => {
+                    let collected = collected.context("Claude Code stdout collector failed")?;
+                    protocol.disconnect();
+                    tasks.stdin.abort();
+                    stdin_closed = true;
+                    exit_deadline = Some(Instant::now() + claude_control::EXIT_TIMEOUT);
+                    stdout = Some(match collected {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let failure = claude_public_failure(
+                                request,
+                                private_runtime_dir,
+                                RuntimeFailureOrigin::Compatibility,
+                                RuntimeFailurePhase::Execution,
+                                "runtime_stream_incompatible",
+                                "Claude Code 返回了当前版本无法识别的输出",
+                                Some(&error.to_string()),
+                                false,
+                            );
+                            return Err(claude_failure_error(
+                                error,
+                                failure,
+                                &native_session_id,
+                                &native_turn_id,
+                                acceptance_observed.load(Ordering::Acquire),
+                            ));
+                        }
+                    });
+                }
+                collected = &mut tasks.stderr, if stderr.is_none() => {
+                    stderr = Some(collected.context("Claude Code stderr collector failed")??);
+                }
+                waited = child.wait(), if status.is_none() => {
+                    status = Some(waited.context("failed to wait for Claude Code process")?);
+                    // Fence writes immediately, but drain stdout before settling
+                    // missing receipts: the last replay may already be in the pipe.
+                    protocol.fence_active_input();
+                    tasks.stdin.abort();
+                    stdin_closed = true;
+                    child.force_terminate_tree().context("failed to terminate Claude Code descendants after root exit")?;
+                    output_deadline = Some(Instant::now() + CLAUDE_CLEANUP_TIMEOUT);
+                    *cleanup_deadline = output_deadline;
+                }
+            }
+        }
+        let status = status.expect("Claude Code root status was collected");
+        let mut stdout = stdout.expect("Claude Code stdout was collected");
+        // Only final display/error text is scrubbed. Session IDs and parsed
+        // protocol state have already been consumed unchanged.
+        if let Some(output) = stdout.final_result.as_mut() {
+            output.result = protocol.redact_text(&output.result);
+        }
+        let stderr = stderr.expect("Claude Code stderr was collected");
+        if !status.success() {
+            let raw_stderr = protocol.redact_text(&String::from_utf8_lossy(&stderr.bytes));
+            let exit_diagnostic = format!(
+                "Claude Code process exited with {} (stderrBytes={}, stderrDigest={})",
+                status, stderr.total_bytes, stderr.digest
+            );
+            if raw_stderr.trim().is_empty()
+                && let Some(output) = stdout.final_result.as_ref()
+                && let Err(error) = validate_claude_terminal_result(
+                    output,
+                    &native_session_id,
+                    &native_turn_id,
+                    false,
+                    &claude_sensitive_paths(request, private_runtime_dir),
+                )
+            {
+                return Err(error.context(exit_diagnostic));
+            }
+            let compatibility = explicit_mcp_config_rejection(&stderr.bytes)
+                || unsupported_option_rejection(&stderr.bytes);
+            let failure = claude_public_failure(
+                request,
+                private_runtime_dir,
+                if compatibility {
+                    RuntimeFailureOrigin::Compatibility
+                } else {
+                    RuntimeFailureOrigin::Runtime
+                },
+                RuntimeFailurePhase::Execution,
+                if compatibility {
+                    "runtime_cli_incompatible"
+                } else {
+                    "runtime_process_failed"
+                },
+                if compatibility {
+                    "当前 Claude Code 版本不支持 Rovai 所需的命令参数"
+                } else {
+                    "Claude Code 进程执行失败"
+                },
+                Some(&raw_stderr),
+                !compatibility,
+            );
+            let internal = anyhow::anyhow!(exit_diagnostic);
+            return Err(claude_failure_error(
+                internal,
+                failure,
+                &native_session_id,
+                &native_turn_id,
+                stdout.acceptance_emitted,
+            ));
+        }
+        let output = match stdout.final_result {
+            Some(output) => output,
+            None => {
+                let internal = anyhow::anyhow!("Claude Code stream omitted its final result event");
+                let failure = claude_public_failure(
+                    request,
+                    private_runtime_dir,
+                    RuntimeFailureOrigin::Compatibility,
+                    RuntimeFailurePhase::Terminal,
+                    "runtime_missing_final_result",
+                    "Claude Code 未返回当前集成所需的最终结果",
+                    Some(&internal.to_string()),
+                    false,
+                );
+                return Err(claude_failure_error(
+                    internal,
+                    failure,
+                    &native_session_id,
+                    &native_turn_id,
+                    stdout.acceptance_emitted,
+                ));
+            }
+        };
+        let sensitive_paths = claude_sensitive_paths(request, private_runtime_dir);
+        let final_output = validate_claude_terminal_result(
+            &output,
+            &native_session_id,
+            &native_turn_id,
+            protocol.has_unsupported_questionnaire(),
+            &sensitive_paths,
+        )?;
+        Ok(ClaudeCodeRunResult {
+            native_session_id,
+            native_turn_id,
+            final_output,
+            usage: (!output.usage.is_null() || output.total_cost_usd.is_some()).then(|| {
+                serde_json::json!({
+                    "session_id": output.session_id,
+                    "usage": output.usage,
+                    "total_cost_usd": output.total_cost_usd,
+                    "model_calls_observed": output.model_calls_observed,
+                })
+            }),
+            cleanup_confirmed: true,
+        })
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Runtime request and closed public failure fields stay explicit at this boundary"
+)]
+fn claude_public_failure(
+    request: &ClaudeCodeRunRequest,
+    private_runtime_dir: &Path,
+    origin: RuntimeFailureOrigin,
+    phase: RuntimeFailurePhase,
+    code: &str,
+    summary: &str,
+    raw_detail: Option<&str>,
+    retryable: bool,
+) -> RuntimeFailureView {
+    let sensitive_paths = claude_sensitive_paths(request, private_runtime_dir);
+    public_runtime_failure_from_output(
+        rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+        origin,
+        phase,
+        code,
+        summary,
+        raw_detail,
+        &sensitive_paths,
+        retryable,
+    )
+}
+
+fn claude_sensitive_paths<'a>(
+    request: &'a ClaudeCodeRunRequest,
+    private_runtime_dir: &'a Path,
+) -> Vec<(&'a Path, &'static str)> {
+    let mut sensitive_paths = vec![
+        (Path::new(&request.workspace.execution_root), "<project>"),
+        (private_runtime_dir, "<runtime-private>"),
+        (
+            Path::new(&request.runtime.executable_path),
+            "<runtime-executable>",
+        ),
+    ];
+    if let Some(root) = request.attachment_access_root.as_deref() {
+        sensitive_paths.push((root, "<attachment-root>"));
+    }
+    if let Some(config) = request.builtin_tools.as_ref() {
+        sensitive_paths.push((config.run_tmp(), "<run-tmp>"));
+    }
+    sensitive_paths
+}
+
+fn claude_failure_error(
+    internal: anyhow::Error,
+    failure: RuntimeFailureView,
+    native_session_id: &str,
+    native_turn_id: &str,
+    delivered: bool,
+) -> anyhow::Error {
+    if delivered {
+        let error_code = failure.code.clone();
+        internal.context(ClaudeCodeDeliveredFailure {
+            native_session_id: native_session_id.to_string(),
+            native_turn_id: native_turn_id.to_string(),
+            error_code,
+            failure,
+        })
+    } else {
+        internal.context(RuntimeFailureError::new(failure))
+    }
+}
+
+fn validate_claude_terminal_result(
+    output: &ClaudeCodeJsonResult,
+    native_session_id: &str,
+    native_turn_id: &str,
+    unsupported_questionnaire: bool,
+    sensitive_paths: &[(&Path, &str)],
+) -> Result<String> {
+    let observed_session_id = match output.session_id.as_deref() {
+        Some(observed_session_id) => observed_session_id,
+        None => {
+            let internal = anyhow::anyhow!("Claude Code result omitted session_id");
+            let failure = public_runtime_failure_from_output(
+                rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+                RuntimeFailureOrigin::Compatibility,
+                RuntimeFailurePhase::Terminal,
+                "runtime_session_incompatible",
+                "Claude Code 最终结果缺少会话标识",
+                Some(&internal.to_string()),
+                sensitive_paths,
+                false,
+            );
+            return Err(claude_failure_error(
+                internal,
+                failure,
+                native_session_id,
+                native_turn_id,
+                true,
+            ));
+        }
+    };
+    if let Err(error) = validate_session_id(observed_session_id) {
+        let failure = public_runtime_failure_from_output(
+            rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Compatibility,
+            RuntimeFailurePhase::Terminal,
+            "runtime_session_incompatible",
+            "Claude Code 返回了无效的会话标识",
+            Some(&error.to_string()),
+            sensitive_paths,
+            false,
+        );
+        return Err(claude_failure_error(
+            error,
+            failure,
+            native_session_id,
+            native_turn_id,
+            true,
+        ));
+    }
+    if observed_session_id != native_session_id {
+        let internal = anyhow::anyhow!(
+            "Claude Code returned a different session than requested (expected {native_session_id}, observed {observed_session_id})"
+        );
+        let failure = public_runtime_failure_from_output(
+            rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Compatibility,
+            RuntimeFailurePhase::Terminal,
+            "runtime_session_incompatible",
+            "Claude Code 返回了另一个会话的结果",
+            Some(&internal.to_string()),
+            sensitive_paths,
+            false,
+        );
+        return Err(claude_failure_error(
+            internal,
+            failure,
+            native_session_id,
+            native_turn_id,
+            true,
+        ));
+    }
+    if output.is_error || output.subtype.as_deref() != Some("success") {
+        let failure = public_runtime_failure_from_output(
+            rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Runtime,
+            RuntimeFailurePhase::Terminal,
+            "runtime_terminal_failure",
+            "Claude Code 返回了失败结果",
+            Some(&output.result),
+            sensitive_paths,
+            true,
+        );
+        let internal = anyhow::anyhow!(
+            "Claude Code terminal result reported failure (subtype={:?}, isError={}): {}",
+            output.subtype,
+            output.is_error,
+            output.result
+        );
+        return Err(claude_failure_error(
+            internal,
+            failure,
+            native_session_id,
+            native_turn_id,
+            true,
+        ));
+    }
+    if unsupported_questionnaire {
+        let failure = public_runtime_failure_from_output(
+            rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Compatibility,
+            RuntimeFailurePhase::Terminal,
+            "runtime_questionnaire_unsupported",
+            "原生问卷暂不受支持，未提交答案。请通过 Thread 对话询问用户",
+            None,
+            sensitive_paths,
+            false,
+        );
+        return Err(claude_failure_error(
+            anyhow::anyhow!("Claude Code requested unsupported native user input"),
+            failure,
+            native_session_id,
+            native_turn_id,
+            true,
+        ));
+    }
+    let final_output = output.result.trim().to_string();
+    if final_output.is_empty() {
+        let internal = anyhow::anyhow!("Claude Code success result contained no final output");
+        let failure = public_runtime_failure_from_output(
+            rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Compatibility,
+            RuntimeFailurePhase::Terminal,
+            "runtime_missing_final_output",
+            "Claude Code 最终结果缺少必要内容",
+            Some(&internal.to_string()),
+            sensitive_paths,
+            false,
+        );
+        return Err(claude_failure_error(
+            internal,
+            failure,
+            native_session_id,
+            native_turn_id,
+            true,
+        ));
+    }
+    Ok(final_output)
+}
+
+fn explicit_mcp_config_rejection(stderr: &[u8]) -> bool {
+    let diagnostic = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    ["--mcp-config", "mcp config", "mcp configuration"]
+        .iter()
+        .any(|marker| diagnostic.contains(marker))
+        && [
+            "unknown option",
+            "unrecognized option",
+            "unsupported option",
+            "invalid",
+            "rejected",
+        ]
+        .iter()
+        .any(|marker| diagnostic.contains(marker))
+}
+
+fn unsupported_option_rejection(stderr: &[u8]) -> bool {
+    let diagnostic = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    [
+        "unknown option",
+        "unrecognized option",
+        "unsupported option",
+        "unknown argument",
+        "unrecognized argument",
+    ]
+    .iter()
+    .any(|marker| diagnostic.contains(marker))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeCodeJsonResult {
+    #[serde(default)]
+    subtype: Option<String>,
+    #[serde(default)]
+    is_error: bool,
+    #[serde(default)]
+    result: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    usage: Value,
+    #[serde(default)]
+    total_cost_usd: Option<Value>,
+    #[serde(skip)]
+    model_calls_observed: bool,
+}
+
+#[derive(Debug)]
+struct ClaudeCodeStreamCapture {
+    final_result: Option<ClaudeCodeJsonResult>,
+    acceptance_emitted: bool,
+}
+
+#[derive(Debug, Default)]
+struct ClaudeCodeStreamState {
+    final_result: Option<ClaudeCodeJsonResult>,
+    acceptance_emitted: bool,
+    model_observation_emitted: bool,
+    message_ordinal: u64,
+    native_message_id: Option<String>,
+    native_usage_message_id: Option<String>,
+    native_message_model: Option<String>,
+    call_usage: serde_json::Map<String, Value>,
+    model_calls_observed: bool,
+    last_call_usage_observed: bool,
+    message_text_completed: bool,
+    text_delta_emitted: bool,
+    stream_text_items: HashMap<u64, String>,
+    stream_thinking_items: HashMap<u64, String>,
+    pending_text_items: VecDeque<String>,
+    completed_text_packets: HashMap<String, Vec<String>>,
+    tool_names: HashMap<String, String>,
+    partial_tools: HashMap<u64, (String, String)>,
+    started_tools: HashSet<String>,
+    terminal_tools: HashSet<String>,
+    tool_inputs: HashMap<String, Value>,
+    tool_queries: HashMap<String, Value>,
+    file_operation_candidates: HashMap<String, Value>,
+    exact_edit_mutations: HashMap<String, Value>,
+    api_retry_attempts: HashSet<(u64, u64)>,
+}
+
+async fn capture_claude_stream<R>(
+    mut reader: R,
+    expected_session_id: String,
+    native_turn_id: String,
+    input_accepted: Option<mpsc::UnboundedSender<ClaudeCodeInputAccepted>>,
+    runtime_events: Option<mpsc::UnboundedSender<ClaudeCodeRuntimeEvent>>,
+    acceptance_observed: Arc<AtomicBool>,
+    protocol: Option<Arc<ClaudeControl>>,
+) -> Result<ClaudeCodeStreamCapture>
+where
+    R: AsyncRead + Unpin,
+{
+    let _protocol_guard = protocol.clone().map(ControlReadGuard);
+    let mut line = Vec::new();
+    let mut oversized_line = false;
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut state = ClaudeCodeStreamState::default();
+    loop {
+        let deadline = protocol
+            .as_ref()
+            .and_then(|protocol| protocol.run_end_deadline());
+        let read = tokio::select! {
+            read = reader.read(&mut buffer) => read?,
+            _ = async { protocol.as_ref().expect("control channel is present").wait_for_state_change().await }, if protocol.is_some() => continue,
+            _ = async { tokio::time::sleep_until(deadline.expect("run end deadline is set")).await }, if deadline.is_some() => {
+                anyhow::bail!("Claude Code did not report a complete idle session after its result");
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        for byte in &buffer[..read] {
+            if *byte == b'\n' {
+                if oversized_line {
+                    oversized_line = false;
+                    continue;
+                }
+                if !line.is_empty() {
+                    process_claude_protocol_line(
+                        &line,
+                        protocol.as_deref(),
+                        &expected_session_id,
+                        &native_turn_id,
+                        input_accepted.as_ref(),
+                        runtime_events.as_ref(),
+                        acceptance_observed.as_ref(),
+                        &mut state,
+                    )?;
+                    line.clear();
+                }
+                continue;
+            }
+            if oversized_line {
+                continue;
+            }
+            if line.len() >= rovai_core::agent_run_image::MAX_IMAGE_EVENT_BYTES {
+                // An oversized image/tool result is optional evidence, not a failed AgentRun.
+                // Drop this frame, then keep reading the independently framed terminal result.
+                line.clear();
+                oversized_line = true;
+                continue;
+            }
+            line.push(*byte);
+        }
+    }
+    if !line.is_empty() {
+        process_claude_protocol_line(
+            &line,
+            protocol.as_deref(),
+            &expected_session_id,
+            &native_turn_id,
+            input_accepted.as_ref(),
+            runtime_events.as_ref(),
+            acceptance_observed.as_ref(),
+            &mut state,
+        )?;
+    }
+    if let Some(fallback) = claude_final_result_fallback(&state)
+        && let Some(sender) = runtime_events.as_ref()
+    {
+        let _ = sender.send(fallback);
+    }
+    Ok(ClaudeCodeStreamCapture {
+        final_result: state.final_result,
+        acceptance_emitted: state.acceptance_emitted,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stream and native control routing share one reader"
+)]
+fn process_claude_protocol_line(
+    line: &[u8],
+    protocol: Option<&ClaudeControl>,
+    expected_session_id: &str,
+    native_turn_id: &str,
+    input_accepted: Option<&mpsc::UnboundedSender<ClaudeCodeInputAccepted>>,
+    runtime_events: Option<&mpsc::UnboundedSender<ClaudeCodeRuntimeEvent>>,
+    acceptance_observed: &AtomicBool,
+    state: &mut ClaudeCodeStreamState,
+) -> Result<()> {
+    if let Some(protocol) = protocol {
+        let event: Value =
+            serde_json::from_slice(line).context("Claude Code emitted invalid stream JSON")?;
+        if protocol.route(&event)? {
+            return Ok(());
+        }
+        process_claude_stream_line(
+            line,
+            expected_session_id,
+            native_turn_id,
+            input_accepted,
+            runtime_events,
+            acceptance_observed,
+            state,
+        )?;
+        protocol.observe(&event)?;
+        return Ok(());
+    }
+    process_claude_stream_line(
+        line,
+        expected_session_id,
+        native_turn_id,
+        input_accepted,
+        runtime_events,
+        acceptance_observed,
+        state,
+    )
+}
+
+fn process_claude_stream_line(
+    line: &[u8],
+    expected_session_id: &str,
+    native_turn_id: &str,
+    input_accepted: Option<&mpsc::UnboundedSender<ClaudeCodeInputAccepted>>,
+    runtime_events: Option<&mpsc::UnboundedSender<ClaudeCodeRuntimeEvent>>,
+    acceptance_observed: &AtomicBool,
+    state: &mut ClaudeCodeStreamState,
+) -> Result<()> {
+    let event: Value =
+        serde_json::from_slice(line).context("Claude Code emitted invalid stream JSON")?;
+    if claude_event_proves_input_accepted(&event, expected_session_id)? && !state.acceptance_emitted
+    {
+        if let Some(sender) = input_accepted {
+            let _ = sender.send(ClaudeCodeInputAccepted {
+                native_session_id: expected_session_id.to_string(),
+                native_turn_id: native_turn_id.to_string(),
+            });
+        }
+        state.acceptance_emitted = true;
+        acceptance_observed.store(true, Ordering::Release);
+    }
+    for runtime_event in normalize_claude_runtime_events(&event, expected_session_id, state)? {
+        if let Some(sender) = runtime_events {
+            let _ = sender.send(runtime_event);
+        }
+    }
+    if event.get("type").and_then(Value::as_str) == Some("result") {
+        if !matches!(event.get("subtype"), Some(Value::String(_)))
+            || !matches!(event.get("is_error"), Some(Value::Bool(_)))
+            || !matches!(event.get("result"), Some(Value::String(_)))
+            || !matches!(event.get("session_id"), Some(Value::String(_)))
+        {
+            anyhow::bail!("Claude Code final stream event omitted a required result field");
+        }
+        // A print-mode process can keep working after an early result (for
+        // example while background agents finish). Only the last validated
+        // result at EOF determines the terminal outcome and usage.
+        let mut result: ClaudeCodeJsonResult =
+            serde_json::from_value(event).context("Claude Code final stream event was invalid")?;
+        result.model_calls_observed = state.model_calls_observed;
+        state.final_result = Some(result);
+    }
+    Ok(())
+}
+
+fn claude_final_result_fallback(state: &ClaudeCodeStreamState) -> Option<ClaudeCodeRuntimeEvent> {
+    let result = state.final_result.as_ref()?;
+    if state.text_delta_emitted || result.subtype.as_deref() != Some("success") || result.is_error {
+        return None;
+    }
+    let text = result.result.trim();
+    (!text.is_empty()).then(|| ClaudeCodeRuntimeEvent {
+        event_type: "agent.text.delta",
+        payload: serde_json::json!({
+            "itemId": "claude-final",
+            "delta": text,
+        }),
+    })
+}
+
+fn claude_text_item_id(state: &ClaudeCodeStreamState, index: u64) -> String {
+    match &state.native_message_id {
+        Some(id) => format!("claude-text-native:{id}:{index}"),
+        None => format!("claude-text-{}-{index}", state.message_ordinal),
+    }
+}
+
+impl ClaudeCodeStreamState {
+    fn reset_text_items(&mut self) {
+        self.stream_text_items.clear();
+        self.stream_thinking_items.clear();
+        self.pending_text_items.clear();
+        self.message_text_completed = false;
+    }
+
+    fn stream_text_item(&mut self, index: u64) -> String {
+        if let Some(item) = self.stream_text_items.get(&index) {
+            return item.clone();
+        }
+        let item = claude_text_item_id(self, index);
+        self.stream_text_items.insert(index, item.clone());
+        self.pending_text_items.push_back(item.clone());
+        item
+    }
+
+    fn completed_text_items(&mut self, event: &Value, blocks: &[Value]) -> Vec<String> {
+        let packet_id = nonempty_string(event.get("uuid"));
+        if let Some(items) = packet_id
+            .as_ref()
+            .and_then(|id| self.completed_text_packets.get(id))
+        {
+            return items.clone();
+        }
+        // Assistant packets can contain just one completed block, even when its
+        // stream index follows thinking/tool blocks. Pair public text by stream
+        // order, keeping identities after content_block_stop. Never match prose.
+        let items = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block.get("text").and_then(Value::as_str).is_some()
+            })
+            .map(|(index, _)| {
+                self.pending_text_items.pop_front().unwrap_or_else(|| {
+                    let item = claude_text_item_id(self, index as u64);
+                    if packet_id.is_some() {
+                        // Without partial events, separate packets of the same
+                        // message still need separate identities; UUID replay
+                        // reuses this mapping without exposing the packet UUID.
+                        format!("{item}:packet:{}", self.completed_text_packets.len())
+                    } else {
+                        item
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Some(packet_id) = packet_id {
+            self.completed_text_packets.insert(packet_id, items.clone());
+        }
+        items
+    }
+}
+
+fn merge_claude_numeric_usage(
+    target: &mut serde_json::Map<String, Value>,
+    usage: &serde_json::Map<String, Value>,
+) {
+    for key in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ] {
+        if let Some(number) = usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|n| *n >= 0 && *n <= 9_007_199_254_740_991)
+        {
+            target.insert(key.to_string(), serde_json::json!(number));
+        }
+    }
+}
+
+fn claude_context_observation(
+    state: &ClaudeCodeStreamState,
+    session_id: &str,
+    window: Option<i64>,
+) -> Option<ClaudeCodeRuntimeEvent> {
+    if !state.last_call_usage_observed {
+        return None;
+    }
+    let message_id = state.native_usage_message_id.as_deref()?;
+    let model = state.native_message_model.as_deref()?;
+    if message_id.is_empty() || model.is_empty() {
+        return None;
+    }
+    // Each root call owns its input buckets. The latest Session projection
+    // independently resolves capacity against this actual model identity.
+    let used = [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .into_iter()
+    .try_fold(0i64, |total, key| {
+        total.checked_add(state.call_usage.get(key)?.as_i64()?)
+    })?;
+    if used > 9_007_199_254_740_991 {
+        return None;
+    }
+    Some(ClaudeCodeRuntimeEvent {
+        event_type: "runtime.context.observed",
+        payload: serde_json::json!({
+            "sessionId":session_id, "messageId":message_id, "modelId":model,
+            "usedTokens":used, "windowTokens":window,
+        }),
+    })
+}
+
+fn normalize_claude_runtime_events(
+    event: &Value,
+    expected_session_id: &str,
+    state: &mut ClaudeCodeStreamState,
+) -> Result<Vec<ClaudeCodeRuntimeEvent>> {
+    let mut normalized = Vec::new();
+    let root =
+        crate::runtime::is_root_output(event) && crate::runtime::is_root_output(&event["event"]);
+    if event.get("type").and_then(Value::as_str) == Some("stream_event")
+        && event.pointer("/event/type").and_then(Value::as_str) == Some("message_delta")
+        && event.get("parent_tool_use_id").is_none_or(Value::is_null)
+    {
+        validate_claude_stream_session(event, expected_session_id)?;
+        if let Some(usage) = event.pointer("/event/usage").and_then(Value::as_object) {
+            merge_claude_numeric_usage(&mut state.call_usage, usage);
+            if let Some(message_id) = &state.native_usage_message_id
+                && [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                ]
+                .into_iter()
+                .any(|key| {
+                    usage
+                        .get(key)
+                        .and_then(Value::as_i64)
+                        .is_some_and(|n| n >= 0)
+                })
+            {
+                state.model_calls_observed = true;
+                state.last_call_usage_observed = true;
+                normalized.push(ClaudeCodeRuntimeEvent { event_type: "runtime.usage.observed", payload: serde_json::json!({
+                    "sessionId":expected_session_id, "messageId":message_id, "usage":state.call_usage,
+                }) });
+                if let Some(context) = claude_context_observation(state, expected_session_id, None)
+                {
+                    normalized.push(context);
+                }
+            }
+        }
+    }
+    if event.get("type").and_then(Value::as_str) == Some("result")
+        && event.get("parent_tool_use_id").is_none_or(Value::is_null)
+        && let Some(model) = &state.native_message_model
+    {
+        validate_claude_stream_session(event, expected_session_id)?;
+        crate::monitoring::context_acceptance_trace(|| {
+            serde_json::json!({
+                "kind":"claude_native_final", "sessionId":expected_session_id,
+                "receivedAt":chrono::Utc::now().to_rfc3339()
+            })
+        });
+        let window = event
+            .get("modelUsage")
+            .and_then(|v| v.get(model))
+            .and_then(|v| v.get("contextWindow"))
+            .and_then(Value::as_i64)
+            .filter(|n| *n >= 0 && *n <= 9_007_199_254_740_991);
+        // Match Claude's native input-only context percentage, never the
+        // result's aggregate Usage or output from all tool rounds.
+        if let Some(context) = claude_context_observation(state, expected_session_id, window) {
+            normalized.push(context);
+        }
+    }
+    if (event.get("type").and_then(Value::as_str) == Some("system")
+        && event.get("subtype").and_then(Value::as_str) == Some("init"))
+        || event.get("type").and_then(Value::as_str) == Some("result")
+    {
+        validate_claude_stream_session(event, expected_session_id)?;
+        let fast = event
+            .get("fast_mode_state")
+            .and_then(rovai_core::camp_fast::ObservedFastState::from_claude)
+            .unwrap_or_default();
+        let disabled_reason = event
+            .get("fast_mode_disabled_reason")
+            .and_then(Value::as_str)
+            .and_then(|reason| {
+                rovai_core::runtime_failure::sanitize_public_runtime_error(reason, &[])
+            });
+        normalized.push(ClaudeCodeRuntimeEvent {
+            event_type: "runtime.fast.observed",
+            payload: serde_json::json!({"state": fast, "disabledReason": disabled_reason}),
+        });
+    }
+    match event.get("type").and_then(Value::as_str) {
+        Some("system") if event.get("subtype").and_then(Value::as_str) == Some("api_retry") => {
+            validate_claude_stream_session(event, expected_session_id)?;
+            let Some(attempt) = event.get("attempt").and_then(Value::as_u64) else {
+                return Ok(normalized);
+            };
+            let Some(max_attempts) = event.get("max_retries").and_then(Value::as_u64) else {
+                return Ok(normalized);
+            };
+            let Some(retry_delay_ms) = event.get("retry_delay_ms").and_then(Value::as_u64) else {
+                return Ok(normalized);
+            };
+            if attempt == 0
+                || max_attempts == 0
+                || attempt > max_attempts
+                || !state.api_retry_attempts.insert((attempt, max_attempts))
+            {
+                return Ok(normalized);
+            }
+            normalized.push(ClaudeCodeRuntimeEvent {
+                event_type: "runtime.diagnostic",
+                payload: serde_json::json!({
+                    "diagnosticId": "claude-api-retry",
+                    "code": "runtime_api_retrying",
+                    "status": "retrying",
+                    "attempt": attempt,
+                    "maxAttempts": max_attempts,
+                    "retryAfterSeconds": retry_delay_ms / 1_000,
+                }),
+            });
+        }
+        Some("system") if event.get("subtype").and_then(Value::as_str) == Some("init") => {
+            validate_claude_stream_session(event, expected_session_id)?;
+            let model_id = event
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model_id| !model_id.is_empty())
+                .map(str::to_string);
+            if !state.model_observation_emitted
+                && let Some(model_id) = model_id
+            {
+                state.model_observation_emitted = true;
+                normalized.push(ClaudeCodeRuntimeEvent {
+                    event_type: "runtime.model.observed",
+                    payload: serde_json::json!({"modelId": model_id}),
+                });
+            }
+        }
+        Some("stream_event")
+            if event.pointer("/event/type").and_then(Value::as_str) == Some("message_start") =>
+        {
+            validate_claude_stream_session(event, expected_session_id)?;
+            if !root {
+                return Ok(normalized);
+            }
+            state.message_ordinal = state.message_ordinal.saturating_add(1);
+            state.native_message_id = event
+                .pointer("/event/message/id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if event
+                .get("parent_tool_use_id")
+                .is_some_and(|v| !v.is_null())
+            {
+                state.native_message_id = None;
+            } else {
+                state.native_usage_message_id = state.native_message_id.clone();
+                state.native_message_model = event
+                    .pointer("/event/message/model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                state.call_usage.clear();
+                state.last_call_usage_observed = false;
+                if let Some(usage) = event
+                    .pointer("/event/message/usage")
+                    .and_then(Value::as_object)
+                {
+                    merge_claude_numeric_usage(&mut state.call_usage, usage);
+                    // Installed Claude emits an all-zero provisional start.
+                    // It cannot fill fields absent from the later real delta.
+                    if state.call_usage.len() == 4
+                        && state.call_usage.values().all(|v| v.as_i64() == Some(0))
+                    {
+                        state.call_usage.clear();
+                    }
+                }
+            }
+            state.reset_text_items();
+        }
+        Some("stream_event")
+            if event.pointer("/event/type").and_then(Value::as_str)
+                == Some("content_block_start") =>
+        {
+            let Some(block) = event.pointer("/event/content_block") else {
+                return Ok(normalized);
+            };
+            let block_type = block.get("type").and_then(Value::as_str);
+            if block_type == Some("text") {
+                validate_claude_stream_session(event, expected_session_id)?;
+                if let Some(index) = event.pointer("/event/index").and_then(Value::as_u64) {
+                    state.stream_text_item(index);
+                }
+                return Ok(normalized);
+            }
+            if block_type == Some("thinking") {
+                validate_claude_stream_session(event, expected_session_id)?;
+                if !root {
+                    return Ok(normalized);
+                }
+                // The native message ID must survive reconnect/replay. A local
+                // ordinal cannot establish an item identity for private text.
+                let Some(native) = state
+                    .native_message_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                else {
+                    return Ok(normalized);
+                };
+                if let Some(index) = event.pointer("/event/index").and_then(Value::as_u64) {
+                    let item_id = format!("claude-thinking:{native}:{index}");
+                    state.stream_thinking_items.insert(index, item_id.clone());
+                    normalized.push(ClaudeCodeRuntimeEvent {
+                        event_type: "agent.thought.started",
+                        payload: serde_json::json!({"itemId": item_id}),
+                    });
+                }
+                return Ok(normalized);
+            }
+            if block_type != Some("tool_use") {
+                return Ok(normalized);
+            }
+            validate_claude_stream_session(event, expected_session_id)?;
+            let Some(tool_use_id) = nonempty_string(block.get("id")) else {
+                return Ok(normalized);
+            };
+            let Some(tool_name) = nonempty_string(block.get("name")) else {
+                return Ok(normalized);
+            };
+            if let Some(index) = event.pointer("/event/index").and_then(Value::as_u64) {
+                state
+                    .partial_tools
+                    .insert(index, (tool_use_id.clone(), tool_name.clone()));
+            }
+            state
+                .tool_names
+                .insert(tool_use_id.clone(), tool_name.clone());
+            if let Some(input) = public_claude_tool_input(&tool_name, block.get("input")) {
+                state.tool_inputs.insert(tool_use_id.clone(), input);
+            }
+            if let Some(query) = public_claude_search_query(&tool_name, block.get("input")) {
+                state.tool_queries.insert(tool_use_id.clone(), query);
+            }
+            if let Some(candidate) = claude_file_operation_candidate(&tool_name, block.get("input"))
+            {
+                state
+                    .file_operation_candidates
+                    .insert(tool_use_id, candidate);
+            }
+        }
+        Some("stream_event")
+            if event.pointer("/event/type").and_then(Value::as_str)
+                == Some("content_block_delta") =>
+        {
+            let Some(delta) = event.pointer("/event/delta") else {
+                return Ok(normalized);
+            };
+            if delta.get("type").and_then(Value::as_str) == Some("thinking_delta") {
+                validate_claude_stream_session(event, expected_session_id)?;
+                if !root {
+                    return Ok(normalized);
+                }
+                let Some(index) = event.pointer("/event/index").and_then(Value::as_u64) else {
+                    return Ok(normalized);
+                };
+                let Some(text) = delta
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                else {
+                    return Ok(normalized);
+                };
+                let Some(item_id) = state.stream_thinking_items.get(&index) else {
+                    return Ok(normalized);
+                };
+                normalized.push(ClaudeCodeRuntimeEvent {
+                    event_type: "agent.thought.delta",
+                    payload: serde_json::json!({
+                        "itemId": item_id,
+                        "delta": text,
+                    }),
+                });
+                return Ok(normalized);
+            }
+            if delta.get("type").and_then(Value::as_str) != Some("text_delta") {
+                return Ok(normalized);
+            }
+            let Some(text) = delta
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            else {
+                return Ok(normalized);
+            };
+            validate_claude_stream_session(event, expected_session_id)?;
+            let index = event
+                .pointer("/event/index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let item_id = state.stream_text_item(index);
+            state.text_delta_emitted = true;
+            normalized.push(ClaudeCodeRuntimeEvent {
+                event_type: "agent.text.delta",
+                payload: serde_json::json!({
+                    "itemId": item_id,
+                    "delta": text,
+                }),
+            });
+        }
+        Some("stream_event")
+            if event.pointer("/event/type").and_then(Value::as_str)
+                == Some("content_block_stop") =>
+        {
+            validate_claude_stream_session(event, expected_session_id)?;
+            if let Some(index) = event.pointer("/event/index").and_then(Value::as_u64) {
+                state.partial_tools.remove(&index);
+                if root && let Some(item_id) = state.stream_thinking_items.remove(&index) {
+                    normalized.push(ClaudeCodeRuntimeEvent {
+                        event_type: "agent.thought.completed",
+                        payload: serde_json::json!({"itemId": item_id}),
+                    });
+                }
+            }
+        }
+        Some("assistant") => {
+            let Some(blocks) = claude_message_content(event) else {
+                return Ok(normalized);
+            };
+            validate_claude_stream_session(event, expected_session_id)?;
+            let packet_replay = nonempty_string(event.get("uuid"))
+                .is_some_and(|id| state.completed_text_packets.contains_key(&id));
+            if !packet_replay && let Some(id) = event.pointer("/message/id").and_then(Value::as_str)
+            {
+                if state
+                    .native_message_id
+                    .as_deref()
+                    .is_some_and(|previous| previous != id)
+                {
+                    state.reset_text_items();
+                }
+                state.native_message_id = Some(id.to_owned());
+            } else if !packet_replay && state.message_text_completed {
+                state.message_ordinal = state.message_ordinal.saturating_add(1);
+                state.native_message_id = None;
+                state.reset_text_items();
+            }
+            let mut text_items = state.completed_text_items(event, blocks).into_iter();
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(text) = block.get("text").and_then(Value::as_str)
+                {
+                    state.text_delta_emitted = true;
+                    if !packet_replay {
+                        state.message_text_completed = true;
+                    }
+                    normalized.push(ClaudeCodeRuntimeEvent {
+                        event_type: "agent.text.completed",
+                        payload: serde_json::json!({
+                            "itemId": text_items.next().context("Claude text packet changed its public block shape")?,
+                            "text": text,
+                        }),
+                    });
+                }
+            }
+            let tool_blocks = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .collect::<Vec<_>>();
+            if tool_blocks.is_empty() {
+                return Ok(normalized);
+            }
+            validate_claude_stream_session(event, expected_session_id)?;
+            for block in tool_blocks {
+                let Some(tool_use_id) = nonempty_string(block.get("id")) else {
+                    continue;
+                };
+                let Some(tool_name) = nonempty_string(block.get("name")) else {
+                    continue;
+                };
+                state
+                    .tool_names
+                    .insert(tool_use_id.clone(), tool_name.clone());
+                if let Some(input) = public_claude_tool_input(&tool_name, block.get("input")) {
+                    state.tool_inputs.insert(tool_use_id.clone(), input);
+                }
+                if let Some(query) = public_claude_search_query(&tool_name, block.get("input")) {
+                    state.tool_queries.insert(tool_use_id.clone(), query);
+                }
+                if let Some(candidate) =
+                    claude_file_operation_candidate(&tool_name, block.get("input"))
+                {
+                    state
+                        .file_operation_candidates
+                        .insert(tool_use_id.clone(), candidate);
+                } else {
+                    state.file_operation_candidates.remove(&tool_use_id);
+                }
+                if let Some(mutation) = claude_exact_edit_mutation(&tool_name, block.get("input")) {
+                    state
+                        .exact_edit_mutations
+                        .insert(tool_use_id.clone(), mutation);
+                } else {
+                    state.exact_edit_mutations.remove(&tool_use_id);
+                }
+                if let Some(event) = claude_tool_started(state, tool_use_id, tool_name) {
+                    normalized.push(event);
+                }
+            }
+        }
+        Some("user") => {
+            let Some(blocks) = claude_message_content(event) else {
+                return Ok(normalized);
+            };
+            let tool_results = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .collect::<Vec<_>>();
+            if tool_results.is_empty() {
+                return Ok(normalized);
+            }
+            validate_claude_stream_session(event, expected_session_id)?;
+            for block in tool_results {
+                let Some(tool_use_id) = nonempty_string(block.get("tool_use_id")) else {
+                    continue;
+                };
+                if !state.terminal_tools.insert(tool_use_id.clone()) {
+                    continue;
+                }
+                let tool_name = state.tool_names.get(&tool_use_id).cloned();
+                if let Some(images) =
+                    rovai_core::agent_run_image::claude_tool_images(block, tool_name.clone())
+                {
+                    normalized.push(ClaudeCodeRuntimeEvent {
+                        event_type: rovai_core::agent_run_image::IMAGE_EVENT,
+                        payload: serde_json::to_value(images)?,
+                    });
+                }
+                if let Some(tool_name) = tool_name.clone()
+                    && let Some(event) = claude_tool_started(state, tool_use_id.clone(), tool_name)
+                {
+                    normalized.push(event);
+                }
+                let failed = block.get("is_error").and_then(Value::as_bool) == Some(true)
+                    || event
+                        .pointer("/tool_use_result/is_error")
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                let reliably_non_error = claude_tool_result_is_reliably_non_error(event, block);
+                let output = tool_name.as_deref().and_then(|name| {
+                    if name.eq_ignore_ascii_case("bash") {
+                        public_claude_bash_output(event, block)
+                    } else if public_claude_text_result_tool(name) {
+                        public_claude_tool_result_text(block.get("content"))
+                    } else {
+                        None
+                    }
+                });
+                let input = state.tool_inputs.get(&tool_use_id).cloned();
+                let query = state.tool_queries.get(&tool_use_id).cloned();
+                let kind = tool_name.as_deref().map(claude_tool_kind).unwrap_or("tool");
+                let title = tool_name.clone();
+                let exact_mutation = state.exact_edit_mutations.remove(&tool_use_id);
+                let file_operation_candidate = state.file_operation_candidates.remove(&tool_use_id);
+                let mut payload = serde_json::json!({
+                    "toolCallId": tool_use_id,
+                    "toolName": tool_name,
+                    "status": if failed { "failed" } else { "completed" },
+                    "kind": kind,
+                    "title": title,
+                    "input": input,
+                    "output": output,
+                });
+                let search_operation_candidate = tool_name.as_deref().and_then(|tool_name| {
+                    runtime_search_operation::claude_web_search_candidate(
+                        "assistant.tool_use.WebSearch+user.tool_result",
+                        tool_name,
+                        query.as_ref(),
+                    )
+                });
+                runtime_search_operation::insert_candidate(
+                    &mut payload,
+                    search_operation_candidate,
+                );
+                if reliably_non_error && let Some(mut candidate) = file_operation_candidate {
+                    if tool_name.as_deref() == Some("Write")
+                        && let Some(change_kind) = claude_write_change_kind(event, &candidate)
+                    {
+                        candidate["changeKind"] = Value::String(change_kind.to_string());
+                    }
+                    payload["runtimeFileOperation"] = candidate;
+                }
+                if reliably_non_error && let Some(exact_mutation) = exact_mutation {
+                    payload["runtimeDiff"] = serde_json::json!({
+                        "adapterKind": "claude-code-cli",
+                        "protocolFamily": "claude-stream-json",
+                        "sourceEventKind": "assistant.tool_use.Edit+user.tool_result.completed",
+                        "semanticKind": "exact_mutation",
+                        "entries": [exact_mutation],
+                    });
+                }
+                normalized.push(ClaudeCodeRuntimeEvent {
+                    event_type: "runtime.action",
+                    payload,
+                });
+            }
+        }
+        _ => {}
+    }
+    if !root {
+        for item in &mut normalized {
+            item.payload["runtimeRootOutput"] = serde_json::json!(false);
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn claude_tool_started(
+    state: &mut ClaudeCodeStreamState,
+    tool_use_id: String,
+    tool_name: String,
+) -> Option<ClaudeCodeRuntimeEvent> {
+    let kind = claude_tool_kind(&tool_name);
+    let title = tool_name.clone();
+    state
+        .tool_names
+        .insert(tool_use_id.clone(), tool_name.clone());
+    let input = state.tool_inputs.get(&tool_use_id).cloned();
+    let query = state.tool_queries.get(&tool_use_id).cloned();
+    state.started_tools.insert(tool_use_id.clone()).then(|| {
+        let mut payload = serde_json::json!({
+            "toolCallId": tool_use_id,
+            "toolName": tool_name,
+            "status": "in_progress",
+            "kind": kind,
+            "title": title,
+            "input": input,
+        });
+        let search_operation_candidate =
+            payload
+                .get("toolName")
+                .and_then(Value::as_str)
+                .and_then(|tool_name| {
+                    runtime_search_operation::claude_web_search_candidate(
+                        "assistant.tool_use.WebSearch",
+                        tool_name,
+                        query.as_ref(),
+                    )
+                });
+        runtime_search_operation::insert_candidate(&mut payload, search_operation_candidate);
+        ClaudeCodeRuntimeEvent {
+            event_type: "runtime.action",
+            payload,
+        }
+    })
+}
+
+fn public_claude_tool_input(tool_name: &str, input: Option<&Value>) -> Option<Value> {
+    if !tool_name.eq_ignore_ascii_case("bash") {
+        return None;
+    }
+    input?
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+        .map(|command| Value::String(command.to_string()))
+}
+
+fn public_claude_search_query(tool_name: &str, input: Option<&Value>) -> Option<Value> {
+    if tool_name != "WebSearch" {
+        return None;
+    }
+    let query = input?.get("query")?;
+    match query {
+        Value::String(query) if !query.trim().is_empty() => Some(Value::String(query.clone())),
+        Value::Array(queries)
+            if !queries.is_empty()
+                && queries
+                    .iter()
+                    .all(|query| query.as_str().is_some_and(|query| !query.trim().is_empty())) =>
+        {
+            Some(Value::Array(queries.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn claude_file_operation_candidate(tool_name: &str, input: Option<&Value>) -> Option<Value> {
+    let operation_kind = match tool_name {
+        "Read" => "read",
+        "Edit" | "Write" => "write",
+        _ => return None,
+    };
+    let path = input?
+        .get("file_path")?
+        .as_str()
+        .filter(|path| !path.trim().is_empty())?;
+    Some(serde_json::json!({
+        "adapterKind": "claude-code-cli",
+        "protocolFamily": "claude-stream-json",
+        "sourceEventKind": "assistant.tool_use.file+user.tool_result.completed",
+        "operationKind": operation_kind,
+        "path": path,
+    }))
+}
+
+fn claude_write_change_kind<'a>(event: &'a Value, candidate: &Value) -> Option<&'a str> {
+    let result = event.get("tool_use_result")?.as_object()?;
+    let result_path = result.get("filePath")?.as_str()?.trim();
+    let candidate_path = candidate.get("path")?.as_str()?.trim();
+    if result_path.is_empty() || result_path != candidate_path {
+        return None;
+    }
+    // Claude Code 2.1.236 reports both a missing file and an already-existing
+    // empty file as `create` with `originalFile: null`. That shape cannot prove
+    // add without consulting the live filesystem, so keep it as path-only
+    // write. `update` remains a reliable edit refinement for the matching path.
+    match result.get("type")?.as_str()? {
+        "update" => Some("update"),
+        _ => None,
+    }
+}
+
+fn claude_exact_edit_mutation(tool_name: &str, input: Option<&Value>) -> Option<Value> {
+    if tool_name != "Edit" {
+        return None;
+    }
+    let input = input?.as_object()?;
+    let path = input
+        .get("file_path")?
+        .as_str()
+        .filter(|path| !path.trim().is_empty())?;
+    let old_text = input.get("old_string")?.as_str()?;
+    let new_text = input.get("new_string")?.as_str()?;
+    if old_text == new_text {
+        return None;
+    }
+    match input.get("replace_all") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) | Some(_) => return None,
+    }
+    Some(serde_json::json!({
+        "semantics": "exact_mutation",
+        "path": path,
+        "oldText": old_text,
+        "newText": new_text,
+    }))
+}
+
+fn claude_tool_kind(tool_name: &str) -> &'static str {
+    match tool_name.to_ascii_lowercase().as_str() {
+        "bash" => "execute",
+        "read" | "glob" => "read",
+        "grep" => "file_search",
+        "websearch" => "web_search",
+        "edit" | "notebookedit" => "edit",
+        "write" => "write",
+        _ => "tool",
+    }
+}
+
+fn claude_message_content(event: &Value) -> Option<&Vec<Value>> {
+    event
+        .pointer("/message/content")
+        .or_else(|| event.get("content"))
+        .and_then(Value::as_array)
+}
+
+fn validate_claude_stream_session(event: &Value, expected_session_id: &str) -> Result<()> {
+    let observed_session_id = event
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("Claude Code public stream event omitted session_id")?;
+    validate_session_id(observed_session_id)?;
+    if observed_session_id != expected_session_id {
+        anyhow::bail!(
+            "Claude Code tool event targeted another session (expected {expected_session_id}, observed {observed_session_id})"
+        );
+    }
+    Ok(())
+}
+
+fn public_claude_bash_output(event: &Value, tool_result: &Value) -> Option<String> {
+    let structured = event.get("tool_use_result").and_then(Value::as_object);
+    let mut output = Vec::<String>::new();
+    if let Some(structured) = structured {
+        for field in ["stdout", "stderr"] {
+            let Some(text) = structured
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            if !output.iter().any(|existing| existing == text) {
+                output.push(text.to_string());
+            }
+        }
+    }
+    if output.is_empty()
+        && let Some(text) = public_claude_tool_result_text(tool_result.get("content"))
+    {
+        output.push(text);
+    }
+    (!output.is_empty()).then(|| output.join("\n"))
+}
+
+fn public_claude_text_result_tool(name: &str) -> bool {
+    // Keep this list exact: file-reading and file-editing results can contain
+    // workspace content, while unknown future tools have no reviewed boundary.
+    name.starts_with("mcp__")
+        || matches!(
+            name,
+            "Agent"
+                | "Artifact"
+                | "AskUserQuestion"
+                | "CronCreate"
+                | "CronDelete"
+                | "CronList"
+                | "EndConversation"
+                | "EnterPlanMode"
+                | "EnterWorktree"
+                | "ExitPlanMode"
+                | "ExitWorktree"
+                | "ListAgents"
+                | "ListMcpResourcesTool"
+                | "Monitor"
+                | "PowerShell"
+                | "PushNotification"
+                | "RemoteTrigger"
+                | "ReportFindings"
+                | "ScheduleWakeup"
+                | "SendFeedback"
+                | "SendMessage"
+                | "SendUserFile"
+                | "ShareOnboardingGuide"
+                | "Skill"
+                | "TaskCreate"
+                | "TaskGet"
+                | "TaskList"
+                | "TaskOutput"
+                | "TaskStop"
+                | "TaskUpdate"
+                | "TodoWrite"
+                | "ToolSearch"
+                | "WaitForMcpServers"
+                | "WebFetch"
+                | "WebSearch"
+                | "Workflow"
+        )
+}
+
+fn public_claude_tool_result_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Array(blocks) => {
+            let joined = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+fn claude_tool_result_is_reliably_non_error(event: &Value, tool_result: &Value) -> bool {
+    [
+        tool_result.get("is_error"),
+        event.pointer("/tool_use_result/is_error"),
+    ]
+    .into_iter()
+    .all(|value| matches!(value, None | Some(Value::Bool(false))))
+}
+
+fn nonempty_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn claude_event_proves_input_accepted(event: &Value, expected_session_id: &str) -> Result<bool> {
+    let event_type = event.get("type").and_then(Value::as_str);
+    let proves_acceptance = match event_type {
+        Some("assistant") => true,
+        Some("stream_event") => matches!(
+            event.pointer("/event/type").and_then(Value::as_str),
+            Some(
+                "message_start"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "message_delta"
+                    | "message_stop"
+            )
+        ),
+        _ => false,
+    };
+    if !proves_acceptance {
+        return Ok(false);
+    }
+    let observed_session_id = event
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("Claude Code accepted-input event omitted session_id")?;
+    validate_session_id(observed_session_id)?;
+    if observed_session_id != expected_session_id {
+        anyhow::bail!(
+            "Claude Code accepted-input event targeted another session (expected {expected_session_id}, observed {observed_session_id})"
+        );
+    }
+    Ok(true)
+}
+
+#[derive(Debug)]
+struct CapturedBytes {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+    digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeCodeApiRetryDiagnostic {
+    attempt: u64,
+    max_attempts: u64,
+    retry_after_seconds: u64,
+}
+
+const MAX_STDERR_DIAGNOSTIC_SCAN_BYTES: usize = 16 * 1024;
+
+async fn capture_claude_stderr<R>(
+    mut reader: R,
+    runtime_events: Option<mpsc::UnboundedSender<ClaudeCodeRuntimeEvent>>,
+) -> Result<CapturedBytes>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut total_bytes = 0_usize;
+    let mut digest = Sha256::new();
+    let mut diagnostic_scan = Vec::new();
+    let mut emitted_retries = HashSet::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(read);
+        digest.update(&buffer[..read]);
+        if bytes.len() < MAX_CAPTURE_BYTES {
+            let remaining = MAX_CAPTURE_BYTES - bytes.len();
+            bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+
+        diagnostic_scan.extend_from_slice(&buffer[..read]);
+        if diagnostic_scan.len() > MAX_STDERR_DIAGNOSTIC_SCAN_BYTES {
+            diagnostic_scan.drain(
+                ..diagnostic_scan
+                    .len()
+                    .saturating_sub(MAX_STDERR_DIAGNOSTIC_SCAN_BYTES),
+            );
+        }
+        let public_lines = strip_claude_terminal_controls(&diagnostic_scan);
+        for line in public_lines.lines() {
+            let Some(retry) = parse_claude_api_retry_diagnostic(line) else {
+                continue;
+            };
+            if !emitted_retries.insert((retry.attempt, retry.max_attempts)) {
+                continue;
+            }
+            if let Some(sender) = runtime_events.as_ref() {
+                let _ = sender.send(ClaudeCodeRuntimeEvent {
+                    event_type: "runtime.diagnostic",
+                    payload: serde_json::json!({
+                        "diagnosticId": "claude-api-retry",
+                        "code": "runtime_api_retrying",
+                        "status": "retrying",
+                        "attempt": retry.attempt,
+                        "maxAttempts": retry.max_attempts,
+                        "retryAfterSeconds": retry.retry_after_seconds,
+                    }),
+                });
+            }
+        }
+    }
+    Ok(CapturedBytes {
+        bytes,
+        total_bytes,
+        digest: format!("sha256:{:x}", digest.finalize()),
+    })
+}
+
+fn parse_claude_api_retry_diagnostic(line: &str) -> Option<ClaudeCodeApiRetryDiagnostic> {
+    let normalized = line.to_ascii_lowercase();
+    if !normalized.contains("api error") || !normalized.contains("retrying in") {
+        return None;
+    }
+    let attempt_tail = normalized.rsplit_once("attempt")?.1.trim_start();
+    let attempt_digits = attempt_tail
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let attempt = attempt_digits.parse::<u64>().ok()?;
+    let max_tail = attempt_tail.get(attempt_digits.len()..)?.trim_start();
+    let max_tail = max_tail.strip_prefix('/')?.trim_start();
+    let max_digits = max_tail
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let max_attempts = max_digits.parse::<u64>().ok()?;
+    if attempt == 0 || max_attempts == 0 || attempt > max_attempts {
+        return None;
+    }
+
+    let retry_tail = normalized.split_once("retrying in")?.1.trim_start();
+    let retry_digits = retry_tail
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let retry_after_seconds = retry_digits.parse::<u64>().ok()?;
+    Some(ClaudeCodeApiRetryDiagnostic {
+        attempt,
+        max_attempts,
+        retry_after_seconds,
+    })
+}
+
+fn strip_claude_terminal_controls(raw: &[u8]) -> String {
+    let mut output = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == 0x1b {
+            index += 1;
+            if index >= raw.len() {
+                break;
+            }
+            match raw[index] {
+                b'[' => {
+                    index += 1;
+                    while index < raw.len() {
+                        let byte = raw[index];
+                        index += 1;
+                        if (0x40..=0x7e).contains(&byte) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    index += 1;
+                    while index < raw.len() {
+                        if raw[index] == 0x07 {
+                            index += 1;
+                            break;
+                        }
+                        if raw[index] == 0x1b && raw.get(index + 1).copied() == Some(b'\\') {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                _ => index += 1,
+            }
+            continue;
+        }
+        let byte = raw[index];
+        index += 1;
+        match byte {
+            b'\n' | b'\r' => output.push(b'\n'),
+            b'\t' => output.push(b' '),
+            0x00..=0x1f | 0x7f => {}
+            _ => output.push(byte),
+        }
+    }
+    String::from_utf8_lossy(&output)
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\n')
+        .collect()
+}
+
+fn validate_session_id(value: &str) -> Result<()> {
+    uuid::Uuid::parse_str(value).with_context(|| "Claude Code session identifier is not a UUID")?;
+    Ok(())
+}
+
+fn launch_session_arguments(
+    resume: Option<&str>,
+    session_id: &str,
+    bootstrap: Option<&Path>,
+    settings: Option<&Path>,
+) -> Result<Vec<String>> {
+    let mut arguments = if let Some(session_id) = resume {
+        vec!["--resume".to_string(), session_id.to_string()]
+    } else {
+        vec!["--session-id".to_string(), session_id.to_string()]
+    };
+    for (flag, path) in [
+        ("--append-system-prompt-file", bootstrap),
+        ("--settings", settings),
+    ] {
+        if let Some(path) = path {
+            arguments.push(flag.to_string());
+            arguments.push(
+                path.to_str()
+                    .context("Claude launch file path is not Unicode")?
+                    .to_string(),
+            );
+        }
+    }
+    Ok(arguments)
+}
+
+#[cfg(unix)]
+fn restrict_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, feature = "extended-tests"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::AsyncWriteExt;
+
+    async fn remove_claude_fixture(root: &Path) {
+        #[cfg(windows)]
+        {
+            // Job-level cleanup can complete before Windows releases a fixture
+            // executable's directory handle; this retry is only test teardown.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match std::fs::remove_dir_all(root) {
+                    Ok(()) => break,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("Claude fixture directory remained locked: {error}"),
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_options_must_be_transmittable_without_a_catalog() {
+        assert_eq!(claude_model_effort(&json!({})).unwrap(), None);
+        assert_eq!(
+            claude_model_effort(&json!({"effort":"future-level"})).unwrap(),
+            Some("future-level")
+        );
+        for options in [
+            json!(null),
+            json!([]),
+            json!({"effort":1}),
+            json!({"effort":""}),
+            json!({"effort":"high\n"}),
+            json!({"unknown":"value"}),
+        ] {
+            assert!(
+                claude_model_effort(&options).is_err(),
+                "must not silently drop {options}"
+            );
+        }
+    }
+
+    fn fake_claude_request(
+        workspace: &Path,
+        executable: &Path,
+        agent_run_id: String,
+        session_id: &str,
+    ) -> ClaudeCodeRunRequest {
+        use rovai_core::agent_profile::{
+            AdapterKind, AdapterPermissionConfig, ResolvedModelSelection,
+        };
+
+        ClaudeCodeRunRequest {
+            agent_run_id,
+            execution_epoch: 1,
+            workspace: AgentRunWorkspace {
+                execution_root: workspace.to_string_lossy().to_string(),
+                access: "read_write".to_string(),
+                isolation: "shared".to_string(),
+            },
+            permission_semantics: PermissionSemantics::RuntimeManagedV2,
+            runtime: FrozenAgentRuntimeConfig {
+                environment: cfg!(windows).then(|| {
+                    let overlay: BTreeMap<String, String> = BTreeMap::from([(
+                        "claude_code_disable_background_tasks".into(),
+                        "0".into(),
+                    )]);
+                    let mut values =
+                        rovai_core::runtime_discovery::capture_host_runtime_environment();
+                    for (name, value) in &overlay {
+                        values.retain(|key, _| !key.eq_ignore_ascii_case(name));
+                        values.insert(name.clone(), value.clone());
+                    }
+                    rovai_core::member_environment::LaunchEnvironment {
+                        values: Some(values),
+                        overlay: Some(overlay),
+                    }
+                }),
+                custom_api: None,
+                camp_fast: None,
+                adapter_kind: AdapterKind::ClaudeCodeCli,
+                installation_id: "claude-test".to_string(),
+                installation_generation: 1,
+                search_environment_generation: 1,
+                executable_path: executable.to_string_lossy().to_string(),
+                auth_scope: "test".to_string(),
+                reported_version: Some("test".to_string()),
+                executable_fingerprint: "sha256:test".to_string(),
+                capabilities: vec!["cli.print".to_string()],
+                protocol_version: "claude-code-cli-v1".to_string(),
+                model: ResolvedModelSelection {
+                    dsh_source: None,
+                    source: "runtime_default".to_string(),
+                    model_id: CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID.to_string(),
+                    options: json!({}),
+                },
+                permissions: AdapterPermissionConfig {
+                    adapter_kind: AdapterKind::ClaudeCodeCli,
+                    schema_version: 1,
+                    values: json!({"permission_mode": "manual"}),
+                },
+                native_session_compatibility_key: Some(
+                    "claude-code-cli:stream-json-v1".to_string(),
+                ),
+                binding_compatibility_digest: Some("binding".to_string()),
+                host_config_digest: Some("host".to_string()),
+                config_digest: "config".to_string(),
+            },
+            prompt: "test input".to_string(),
+            resumable_native_session_id: None,
+            new_native_session_id: Some(session_id.to_string()),
+            session_bootstrap: None,
+            builtin_tools: None,
+            external_mcp_servers: BTreeMap::new(),
+            attachment_access_root: None,
+            persist_session: true,
+            input_accepted: None,
+            runtime_events: None,
+            launch_handoff: None,
+            input_ready: None,
+        }
+    }
+
+    fn claude_fixture() -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("rovai-claude-lifecycle-{}", uuid::Uuid::new_v4()));
+        rovai_core::platform::private_storage::prepare_private_directory(&root).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        (root, workspace)
+    }
+
+    fn fake_claude_executable(root: &Path, name: &str, session_id: &str, mode: &str) -> PathBuf {
+        let marker = root.join(format!("{name}.started"));
+        #[cfg(windows)]
+        let executable = root.join(format!("{name}.cmd"));
+        #[cfg(unix)]
+        let executable = root.join(name);
+        #[cfg(windows)]
+        let body = {
+            let script = root.join(format!("{name}.ps1"));
+            let settings = "$settingsIndex = [Array]::IndexOf($args, '--settings')\nif ($settingsIndex -lt 0) { exit 8 }\n$settings = Get-Content -Raw -LiteralPath $args[$settingsIndex + 1] | ConvertFrom-Json\nif ($settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY -ne '1' -or $env:CLAUDE_CODE_DISABLE_AUTO_MEMORY -ne '1' -or $settings.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS -ne '1' -or $env:CLAUDE_CODE_DISABLE_BACKGROUND_TASKS -ne '1') { exit 9 }\n";
+            let handshake = "$init = [Console]::ReadLine() | ConvertFrom-Json\n[Console]::WriteLine((@{type='control_response';response=@{subtype='success';request_id=$init.request_id;response=@{}}} | ConvertTo-Json -Compress -Depth 5))\n";
+            let normal = format!(
+                "$prompt = [Console]::ReadLine()\n[Console]::WriteLine('{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"{session_id}\",\"result\":\"ok\"}}')\n[Console]::WriteLine('{{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"idle\",\"session_id\":\"{session_id}\"}}')\n$null = [Console]::In.ReadToEnd()\n"
+            );
+            let contents = match mode {
+                "normal" => format!("{handshake}{normal}"),
+                "blocked" => format!(
+                    "{handshake}Set-Content -LiteralPath '{}' -Value ready\nStart-Sleep -Seconds 30\n{normal}",
+                    marker.display()
+                ),
+                "stdin-error" => "exit 7\n".into(),
+                "missing-session" => format!(
+                    "[Console]::Error.WriteLine('No conversation found with session ID: {session_id}')\nexit 1\n"
+                ),
+                "output-error" => format!(
+                    "{handshake}$prompt = [Console]::ReadLine()\n[Console]::WriteLine('{{\"type\":\"stream_event\",\"session_id\":\"wrong-session\",\"event\":{{\"type\":\"message_start\"}}}}')\nStart-Sleep -Seconds 30\n"
+                ),
+                "spawn-error" => String::new(),
+                _ => unreachable!(),
+            };
+            std::fs::write(&script, format!("{settings}{contents}")).unwrap();
+            if mode == "spawn-error" {
+                "x".repeat(129 * 1024)
+            } else {
+                format!(
+                    "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" %*\r\n",
+                    script.display()
+                )
+            }
+        };
+        #[cfg(unix)]
+        let body = {
+            let handshake = "IFS= read -r init\ninit_id=$(printf '%s' \"$init\" | /usr/bin/sed -E 's/.*\"request_id\":\"([^\"]+)\".*/\\1/')\nprintf '%s\\n' \"{\\\"type\\\":\\\"control_response\\\",\\\"response\\\":{\\\"subtype\\\":\\\"success\\\",\\\"request_id\\\":\\\"$init_id\\\",\\\"response\\\":{}}}\"\n";
+            let normal = format!(
+                "IFS= read -r prompt\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"{session_id}\",\"result\":\"ok\"}}' '{{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"idle\",\"session_id\":\"{session_id}\"}}'\n/bin/cat >/dev/null\n"
+            );
+            match mode {
+                "normal" => format!("#!/bin/sh\n{handshake}{normal}"),
+                "blocked" => format!(
+                    "#!/bin/sh\n{handshake}printf ready > '{}'\n/bin/sleep 30\n{normal}",
+                    marker.display()
+                ),
+                "stdin-error" => "#!/bin/sh\nexit 7\n".into(),
+                "missing-session" => format!(
+                    "#!/bin/sh\nprintf '%s\\n' 'No conversation found with session ID: {session_id}' >&2\nexit 1\n"
+                ),
+                "output-error" => format!(
+                    "#!/bin/sh\n{handshake}IFS= read -r prompt\nprintf '%s\\n' '{{\"type\":\"stream_event\",\"session_id\":\"wrong-session\",\"event\":{{\"type\":\"message_start\"}}}}'\n/bin/sleep 30\n"
+                ),
+                "spawn-error" => "#!/no-such-claude-interpreter\n".into(),
+                _ => unreachable!(),
+            }
+        };
+        std::fs::write(&executable, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        executable
+    }
+
+    fn claude_launch_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let directory = root.join("runtime-private").join("claude-inputs");
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        entries
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    async fn wait_for_claude_fixture(predicate: impl Fn() -> bool) {
+        // The Windows fixture starts cmd.exe and cold PowerShell processes on
+        // shared CI runners; this is a test startup budget, not a Runtime policy.
+        let startup_budget = Duration::from_secs(if cfg!(windows) { 15 } else { 5 });
+        tokio::time::timeout(startup_budget, async {
+            while !predicate() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Claude Code fixture did not reach the expected state");
+    }
+
+    #[test]
+    fn native_fast_state_is_session_scoped_and_preserves_cooldown() {
+        let session_id = "00000000-0000-4000-8000-000000000001";
+        for (native, expected) in [
+            ("on", "fast"),
+            ("off", "standard"),
+            ("cooldown", "cooldown"),
+            ("unknown-future-state", "unknown"),
+        ] {
+            for kind in ["system", "result"] {
+                let mut stream = ClaudeCodeStreamState::default();
+                let event = json!({"type": kind, "subtype": "init", "session_id": session_id, "fast_mode_state": native, "fast_mode_disabled_reason": "org disabled; api_key=secret"});
+                let events =
+                    normalize_claude_runtime_events(&event, session_id, &mut stream).unwrap();
+                assert_eq!(
+                    events
+                        .iter()
+                        .find(|event| event.event_type == "runtime.fast.observed")
+                        .unwrap()
+                        .payload["state"],
+                    expected
+                );
+                let fast = events
+                    .iter()
+                    .find(|event| event.event_type == "runtime.fast.observed")
+                    .unwrap();
+                assert_eq!(
+                    fast.payload["disabledReason"],
+                    "org disabled; api_key=[redacted]"
+                );
+                let mut absent = event.clone();
+                absent.as_object_mut().unwrap().remove("fast_mode_state");
+                absent
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("fast_mode_disabled_reason");
+                let unknown =
+                    normalize_claude_runtime_events(&absent, session_id, &mut stream).unwrap();
+                let unknown = unknown
+                    .iter()
+                    .find(|event| event.event_type == "runtime.fast.observed")
+                    .unwrap();
+                assert_eq!(unknown.payload["state"], "unknown");
+                assert!(unknown.payload["disabledReason"].is_null());
+                assert!(
+                    normalize_claude_runtime_events(
+                        &event,
+                        "00000000-0000-4000-8000-000000000002",
+                        &mut stream
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_only_uuid_session_identifiers() {
+        assert!(validate_session_id("0bdd2166-d420-40c6-94be-70b93eb290c5").is_ok());
+        assert!(validate_session_id("latest").is_err());
+    }
+
+    #[test]
+    fn appends_complete_bootstrap_for_new_and_resumed_sessions() {
+        let root =
+            std::env::temp_dir().join(format!("rovai-claude-launch-{}", uuid::Uuid::new_v4()));
+        rovai_core::platform::private_storage::prepare_private_directory(&root).unwrap();
+        for bootstrap in ["single line", "中文\nline \"two\"", "中文\r\n100% complete"] {
+            for resume in [None, Some("resume-id")] {
+                for fast in [None, Some(true), Some(false)] {
+                    let bootstrap_file =
+                        ClaudeLaunchFile::write(&root, bootstrap.as_bytes()).unwrap();
+                    let mut settings = json!({"env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}});
+                    rovai_core::camp_fast::merge_claude_inline_settings(&mut settings, fast)
+                        .unwrap();
+                    let settings_file = Some(
+                        ClaudeLaunchFile::write(&root, &serde_json::to_vec(&settings).unwrap())
+                            .unwrap(),
+                    );
+                    let args = launch_session_arguments(
+                        resume,
+                        "new-id",
+                        Some(&bootstrap_file.0),
+                        settings_file.as_ref().map(|file| file.0.as_path()),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        args[0],
+                        if resume.is_some() {
+                            "--resume"
+                        } else {
+                            "--session-id"
+                        }
+                    );
+                    assert_eq!(args[2], "--append-system-prompt-file");
+                    assert_eq!(std::fs::read(&args[3]).unwrap(), bootstrap.as_bytes());
+                    assert!(
+                        args.iter()
+                            .all(|arg| !arg.contains(['\n', '\r', '\"', '%']))
+                    );
+                    #[cfg(windows)]
+                    {
+                        use rovai_core::windows_runtime_entrypoint::serialize_command_shim_command_line;
+                        use std::ffi::{OsStr, OsString};
+                        let serialize = |args: Vec<OsString>| {
+                            serialize_command_shim_command_line(
+                                OsStr::new(r"C:\Windows\System32\cmd.exe"),
+                                Path::new(r"C:\runtime\claude.cmd"),
+                                &args,
+                            )
+                        };
+                        serialize(args.iter().map(OsString::from).collect()).unwrap();
+                        if bootstrap.contains('\n') {
+                            let legacy =
+                                serialize(vec!["--append-system-prompt".into(), bootstrap.into()]);
+                            assert!(
+                                legacy
+                                    .unwrap_err()
+                                    .to_string()
+                                    .contains("command-line break")
+                            );
+                        }
+                    }
+                    assert_eq!(args[4], "--settings");
+                    let value: Value =
+                        serde_json::from_slice(&std::fs::read(&args[5]).unwrap()).unwrap();
+                    assert_eq!(value["fastMode"].as_bool(), fast);
+                    assert_eq!(value["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"], "1");
+                    let bootstrap_path = bootstrap_file.0.clone();
+                    let settings_path = settings_file.as_ref().map(|file| file.0.clone());
+                    drop(bootstrap_file);
+                    drop(settings_file);
+                    assert!(!bootstrap_path.exists());
+                    assert!(settings_path.is_none_or(|path| !path.exists()));
+                }
+            }
+        }
+        assert_eq!(
+            launch_session_arguments(None, "new-id", None, None).unwrap(),
+            vec!["--session-id", "new-id"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_files_are_removed_after_a_normal_claude_exit() {
+        let (root, workspace) = claude_fixture();
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let executable = fake_claude_executable(&root, "normal", session_id, "normal");
+        let adapter = ClaudeCodeCliRuntimeAdapter::new(&root).unwrap();
+        let mut request = fake_claude_request(
+            &workspace,
+            &executable,
+            uuid::Uuid::new_v4().to_string(),
+            session_id,
+        );
+        request.session_bootstrap = Some("中文\nquoted \"text\" 100%".to_string());
+        let result = adapter.run(request).await.unwrap();
+        assert_eq!(result.final_output, "ok");
+        assert!(claude_launch_files(&root).is_empty());
+        assert!(adapter.active.lock().unwrap().is_empty());
+        remove_claude_fixture(&root).await;
+    }
+
+    #[tokio::test]
+    async fn pre_spawn_failure_removes_launch_files_and_registration() {
+        let (root, workspace) = claude_fixture();
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let executable = fake_claude_executable(&root, "invalid", session_id, "spawn-error");
+        let adapter = ClaudeCodeCliRuntimeAdapter::new(&root).unwrap();
+        let mut request = fake_claude_request(
+            &workspace,
+            &executable,
+            uuid::Uuid::new_v4().to_string(),
+            session_id,
+        );
+        request.session_bootstrap = Some("pre-spawn failure".to_string());
+        assert!(adapter.run(request).await.is_err());
+        assert!(claude_launch_files(&root).is_empty());
+        assert!(adapter.active.lock().unwrap().is_empty());
+        remove_claude_fixture(&root).await;
+    }
+
+    #[tokio::test]
+    async fn early_stdin_or_initialization_failure_reaps_before_removing_launch_files() {
+        for missing in [false, true] {
+            let (root, workspace) = claude_fixture();
+            let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+            let executable = fake_claude_executable(
+                &root,
+                "stdin-error",
+                session_id,
+                if missing {
+                    "missing-session"
+                } else {
+                    "stdin-error"
+                },
+            );
+            let adapter = ClaudeCodeCliRuntimeAdapter::new(&root).unwrap();
+            let mut request = fake_claude_request(
+                &workspace,
+                &executable,
+                uuid::Uuid::new_v4().to_string(),
+                session_id,
+            );
+            request.prompt = "x".repeat(16 * 1024 * 1024);
+            request.runtime.camp_fast = Some(rovai_core::camp_fast::FrozenThreadMemberFast {
+                runtime_binding_revision: "test-binding".into(),
+                fast_override: Some(false),
+            });
+            request.session_bootstrap = Some("stdin failure".to_string());
+            if missing {
+                request.resumable_native_session_id = Some(session_id.into());
+                request.new_native_session_id = None;
+            }
+            let (ready, mut received) = mpsc::unbounded_channel();
+            request.input_ready = Some(ready);
+            let error = tokio::time::timeout(Duration::from_secs(5), adapter.run(request))
+                .await
+                .expect("an exited native process must not wait for the initialization deadline")
+                .unwrap_err();
+            assert!(
+                received.recv().await.is_none(),
+                "no input dispatch may be released"
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<ClaudeCodeInputNotSent>()
+                    .unwrap()
+                    .session_unavailable,
+                false
+            );
+            assert!(
+                format!("{error:#}").contains("Claude Code stdin")
+                    || format!("{error:#}").contains("before initialization"),
+                "the original stdin or initialization error was lost: {error:#}"
+            );
+            assert!(claude_launch_files(&root).is_empty());
+            assert!(adapter.active.lock().unwrap().is_empty());
+            remove_claude_fixture(&root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn output_failure_terminates_the_still_running_process_before_cleanup() {
+        let (root, workspace) = claude_fixture();
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let executable =
+            fake_claude_executable(&root, "invalid-stream", session_id, "output-error");
+        let adapter = ClaudeCodeCliRuntimeAdapter::new(&root).unwrap();
+        let mut request = fake_claude_request(
+            &workspace,
+            &executable,
+            uuid::Uuid::new_v4().to_string(),
+            session_id,
+        );
+        request.session_bootstrap = Some("invalid stream".to_string());
+        let error = tokio::time::timeout(Duration::from_secs(5), adapter.run(request))
+            .await
+            .expect("stream failure must stop the process before its long sleep")
+            .unwrap_err();
+        assert!(error.downcast_ref::<RuntimeFailureError>().is_some());
+        assert!(error.downcast_ref::<ClaudeCodeRunEnded>().is_some());
+        assert!(claude_launch_files(&root).is_empty());
+        assert!(adapter.active.lock().unwrap().is_empty());
+        remove_claude_fixture(&root).await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_stdin_write_keeps_files_until_the_tree_is_reaped() {
+        for before_dispatch in [false, true] {
+            let (root, workspace) = claude_fixture();
+            let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+            let executable = fake_claude_executable(&root, "blocked", session_id, "blocked");
+            let adapter = Arc::new(ClaudeCodeCliRuntimeAdapter::new(&root).unwrap());
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let mut request =
+                fake_claude_request(&workspace, &executable, run_id.clone(), session_id);
+            request.prompt = "x".repeat(16 * 1024 * 1024);
+            request.session_bootstrap = Some("blocked write".to_string());
+            let (ready, mut received) = mpsc::unbounded_channel();
+            if before_dispatch {
+                request.input_ready = Some(ready);
+            }
+            let running = adapter.clone();
+            let task = tokio::spawn(async move { running.run(request).await });
+            wait_for_claude_fixture(|| {
+                root.join("blocked.started").exists() && claude_launch_files(&root).len() == 2
+            })
+            .await;
+            let release = if before_dispatch {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(5), received.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            assert!(
+                !adapter
+                    .wait_for_agent_run_quiescence(&run_id, 1, Duration::ZERO)
+                    .await
+            );
+            assert!(adapter.interrupt(&run_id, 1).await);
+            let error = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(if before_dispatch {
+                "interrupted before input delivery"
+            } else {
+                "interrupted during stdin delivery"
+            }));
+            drop(release);
+            assert!(claude_launch_files(&root).is_empty());
+            assert!(adapter.active.lock().unwrap().is_empty());
+            remove_claude_fixture(&root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_claude_runs_delete_only_their_own_launch_files() {
+        let (root, workspace) = claude_fixture();
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let blocked = fake_claude_executable(&root, "blocked", session_id, "blocked");
+        let normal = fake_claude_executable(&root, "normal", session_id, "normal");
+        let adapter = Arc::new(ClaudeCodeCliRuntimeAdapter::new(&root).unwrap());
+        let first_id = uuid::Uuid::new_v4().to_string();
+        let mut first = fake_claude_request(&workspace, &blocked, first_id.clone(), session_id);
+        first.prompt = "x".repeat(16 * 1024 * 1024);
+        first.session_bootstrap = Some("first still running".to_string());
+        let running = adapter.clone();
+        let first_task = tokio::spawn(async move { running.run(first).await });
+        wait_for_claude_fixture(|| root.join("blocked.started").exists()).await;
+        let mut second = fake_claude_request(
+            &workspace,
+            &normal,
+            uuid::Uuid::new_v4().to_string(),
+            session_id,
+        );
+        second.session_bootstrap = Some("second completed".to_string());
+        assert_eq!(adapter.run(second).await.unwrap().final_output, "ok");
+        let remaining = claude_launch_files(&root);
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining
+                .iter()
+                .any(|(_, bytes)| bytes == b"first still running")
+        );
+        assert!(remaining.iter().any(|(_, bytes)| {
+            serde_json::from_slice::<Value>(bytes)
+                .ok()
+                .is_some_and(|value| value["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1")
+        }));
+        assert!(adapter.interrupt(&first_id, 1).await);
+        assert!(first_task.await.unwrap().is_err());
+        assert!(claude_launch_files(&root).is_empty());
+        remove_claude_fixture(&root).await;
+    }
+
+    #[test]
+    fn recognizes_only_bounded_claude_api_retry_status() {
+        assert_eq!(
+            parse_claude_api_retry_diagnostic("✻ API error · Retrying in 0s · attempt 1/10"),
+            Some(ClaudeCodeApiRetryDiagnostic {
+                attempt: 1,
+                max_attempts: 10,
+                retry_after_seconds: 0,
+            })
+        );
+        assert_eq!(
+            parse_claude_api_retry_diagnostic("API Error · Retrying in 12s · attempt 10/10"),
+            Some(ClaudeCodeApiRetryDiagnostic {
+                attempt: 10,
+                max_attempts: 10,
+                retry_after_seconds: 12,
+            })
+        );
+        assert!(
+            parse_claude_api_retry_diagnostic(
+                "API error: api_key=private-key; request payload follows"
+            )
+            .is_none()
+        );
+        assert!(
+            parse_claude_api_retry_diagnostic("API error · Retrying in 0s · attempt 11/10")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_retry_status_is_emitted_before_the_claude_process_exits() {
+        let (mut writer, reader) = tokio::io::duplex(1_024);
+        let (runtime_event_sender, mut runtime_event_receiver) = mpsc::unbounded_channel();
+        let capture = tokio::spawn(capture_claude_stderr(reader, Some(runtime_event_sender)));
+        let status = b"\x1b[31m\xe2\x9c\xbb API error\x1b[0m \xc2\xb7 Retrying in 0s \xc2\xb7 attempt 1/10\r";
+        writer.write_all(status).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), runtime_event_receiver.recv())
+            .await
+            .expect("retry status must be projected while stderr remains open")
+            .expect("retry status channel should remain open");
+        assert_eq!(event.event_type, "runtime.diagnostic");
+        assert_eq!(event.payload["diagnosticId"], "claude-api-retry");
+        assert_eq!(event.payload["code"], "runtime_api_retrying");
+        assert_eq!(event.payload["status"], "retrying");
+        assert_eq!(event.payload["attempt"], 1);
+        assert_eq!(event.payload["maxAttempts"], 10);
+        assert_eq!(event.payload["retryAfterSeconds"], 0);
+        assert!(
+            !event
+                .payload
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("api error"),
+            "raw stderr must not become public Runtime Evidence"
+        );
+
+        writer.shutdown().await.unwrap();
+        let captured = capture.await.unwrap().unwrap();
+        assert_eq!(captured.bytes, status);
+        assert_eq!(captured.total_bytes, status.len());
+    }
+
+    #[tokio::test]
+    async fn structured_api_retry_is_emitted_before_the_claude_stream_ends() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let (mut writer, reader) = tokio::io::duplex(2_048);
+        let (runtime_event_sender, mut runtime_event_receiver) = mpsc::unbounded_channel();
+        let capture = tokio::spawn(capture_claude_stream(
+            reader,
+            session_id.to_string(),
+            "claude-code:run-1:1".to_string(),
+            None,
+            Some(runtime_event_sender),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        ));
+        let retry = serde_json::json!({
+            "type": "system",
+            "subtype": "api_retry",
+            "attempt": 2,
+            "max_retries": 10,
+            "retry_delay_ms": 1_124,
+            "error_status": 429,
+            "error": "rate_limit",
+            "session_id": session_id,
+            "uuid": "private-provider-identity"
+        });
+        writer
+            .write_all(format!("{retry}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), runtime_event_receiver.recv())
+            .await
+            .expect("structured retry must be projected while stdout remains open")
+            .expect("retry status channel should remain open");
+        assert_eq!(event.event_type, "runtime.diagnostic");
+        assert_eq!(event.payload["diagnosticId"], "claude-api-retry");
+        assert_eq!(event.payload["code"], "runtime_api_retrying");
+        assert_eq!(event.payload["status"], "retrying");
+        assert_eq!(event.payload["attempt"], 2);
+        assert_eq!(event.payload["maxAttempts"], 10);
+        assert_eq!(event.payload["retryAfterSeconds"], 1);
+        assert!(event.payload.get("error_status").is_none());
+        assert!(event.payload.get("error").is_none());
+        assert!(event.payload.get("session_id").is_none());
+        assert!(event.payload.get("uuid").is_none());
+
+        writer.shutdown().await.unwrap();
+        capture.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn only_session_bound_model_events_prove_input_acceptance() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        assert!(
+            !claude_event_proves_input_accepted(
+                &json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": session_id
+                }),
+                session_id,
+            )
+            .unwrap(),
+            "process initialization is not model input acceptance"
+        );
+        assert!(
+            claude_event_proves_input_accepted(
+                &json!({
+                    "type": "stream_event",
+                    "session_id": session_id,
+                    "event": {"type": "message_start"}
+                }),
+                session_id,
+            )
+            .unwrap()
+        );
+        assert!(
+            claude_event_proves_input_accepted(
+                &json!({"type": "assistant", "session_id": session_id}),
+                session_id,
+            )
+            .unwrap()
+        );
+        assert!(
+            claude_event_proves_input_accepted(
+                &json!({
+                    "type": "assistant",
+                    "session_id": "5ade59ac-f87e-4827-8cf2-0e1f3ba720ea"
+                }),
+                session_id,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn only_identity_matched_structured_results_create_terminal_failure_proof() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let native_turn_id = "claude-code:run-1:1";
+        let terminal_failure = ClaudeCodeJsonResult {
+            subtype: Some("error".to_string()),
+            is_error: true,
+            result: "provider detail".to_string(),
+            session_id: Some(session_id.to_string()),
+            usage: Value::Null,
+            total_cost_usd: None,
+            model_calls_observed: false,
+        };
+        let error = validate_claude_terminal_result(
+            &terminal_failure,
+            session_id,
+            native_turn_id,
+            true,
+            &[],
+        )
+        .expect_err("a structured non-success result should be terminal failure proof");
+        let proof = error
+            .downcast_ref::<ClaudeCodeDeliveredFailure>()
+            .expect("the reliable failure must retain its typed proof");
+        assert_eq!(proof.native_session_id, session_id);
+        assert_eq!(proof.native_turn_id, native_turn_id);
+        assert_eq!(proof.error_code, "runtime_terminal_failure");
+        assert_eq!(proof.failure.origin, RuntimeFailureOrigin::Runtime);
+        assert_eq!(proof.failure.phase, RuntimeFailurePhase::Terminal);
+        assert_eq!(proof.failure.detail.as_deref(), Some("provider detail"));
+        let cleanup_pending = error.context(ClaudeCodeCleanupPending);
+        assert!(
+            cleanup_pending
+                .downcast_ref::<ClaudeCodeDeliveredFailure>()
+                .is_some(),
+            "resource cleanup must not erase the native failure proof"
+        );
+        assert!(
+            cleanup_pending
+                .downcast_ref::<ClaudeCodeCleanupPending>()
+                .is_some()
+        );
+
+        let mismatched = ClaudeCodeJsonResult {
+            session_id: Some("5ade59ac-f87e-4827-8cf2-0e1f3ba720ea".to_string()),
+            ..terminal_failure
+        };
+        let error =
+            validate_claude_terminal_result(&mismatched, session_id, native_turn_id, true, &[])
+                .expect_err("a different Session must be fenced");
+        let proof = error
+            .downcast_ref::<ClaudeCodeDeliveredFailure>()
+            .expect("the incompatible terminal still proves the requested one-shot turn ended");
+        assert_eq!(proof.failure.origin, RuntimeFailureOrigin::Compatibility);
+        let success = ClaudeCodeJsonResult {
+            session_id: Some(session_id.to_string()),
+            subtype: Some("success".to_string()),
+            is_error: false,
+            result: "already sent a public message".to_string(),
+            ..mismatched
+        };
+        let error =
+            validate_claude_terminal_result(&success, session_id, native_turn_id, true, &[])
+                .expect_err("nonempty final text cannot erase an unsupported questionnaire");
+        assert_eq!(
+            error
+                .downcast_ref::<ClaudeCodeDeliveredFailure>()
+                .unwrap()
+                .error_code,
+            "runtime_questionnaire_unsupported"
+        );
+        assert!(
+            validate_claude_terminal_result(&success, session_id, native_turn_id, false, &[],)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn aborted_caller_leaves_the_registered_run_to_clean_up_at_shutdown() {
+        let (root, workspace) = claude_fixture();
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let executable = fake_claude_executable(&root, "blocked", session_id, "blocked");
+        let adapter =
+            Arc::new(ClaudeCodeCliRuntimeAdapter::new(&root).expect("Adapter should initialize"));
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut request = fake_claude_request(&workspace, &executable, run_id.clone(), session_id);
+        request.prompt = "x".repeat(16 * 1024 * 1024);
+        request.session_bootstrap = Some("owned after caller abort".to_string());
+        let running_adapter = adapter.clone();
+        let task = tokio::spawn(async move { running_adapter.run(request).await });
+        wait_for_claude_fixture(|| {
+            root.join("blocked.started").exists() && claude_launch_files(&root).len() == 2
+        })
+        .await;
+
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("run task should be aborted")
+                .is_cancelled()
+        );
+        assert!(
+            claude_launch_files(&root)
+                .iter()
+                .any(|(_, bytes)| bytes == b"owned after caller abort")
+        );
+        assert!(adapter.active.lock().unwrap().contains_key(&(run_id, 1)));
+        tokio::time::timeout(Duration::from_secs(5), adapter.shutdown_all())
+            .await
+            .expect("shutdown must finish the tracked Claude Code run");
+        assert!(claude_launch_files(&root).is_empty());
+        assert!(adapter.active.lock().unwrap().is_empty());
+        remove_claude_fixture(&root).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_and_native_roots_keep_both_files_until_the_job_descendants_exit() {
+        // The shared managed-process helper starts a grandchild and lets its
+        // root exit. Both entrypoints must prove Job emptiness before deletion.
+        for entrypoint in ["cmd", "exe"] {
+            let (root, _workspace) = claude_fixture();
+            let handshake = root.join("grandchild.pid");
+            let test_exe = std::env::current_exe().unwrap();
+            let mut command = if entrypoint == "cmd" {
+                let script = root.join("claude-root.cmd");
+                std::fs::write(
+                    &script,
+                    "@echo off\r\n\"%ROVAI_TEST_EXE%\" --exact managed_process::tests::windows_job_child_helper --ignored --nocapture\r\n",
+                )
+                .unwrap();
+                Command::new(script)
+            } else {
+                let mut command = Command::new(&test_exe);
+                command.args([
+                    "--exact",
+                    "managed_process::tests::windows_job_child_helper",
+                    "--ignored",
+                    "--nocapture",
+                ]);
+                command
+            };
+            command
+                .current_dir(&root)
+                .env("ROVAI_TEST_EXE", &test_exe)
+                .env("ROVAI_MANAGED_PROCESS_HELPER_MODE", "child")
+                .env("ROVAI_MANAGED_PROCESS_HELPER_FILE", &handshake);
+            let spec = ManagedProcessLaunchSpec::capture(
+                &command,
+                ManagedProcessPurpose::RuntimeOneShot,
+                ManagedStdinPolicy::Null,
+                ManagedWindowsArgvDialect::MicrosoftCrt,
+                format!("claude-cleanup-{entrypoint}"),
+            )
+            .unwrap();
+            let bootstrap = ClaudeLaunchFile::write(&root, b"bootstrap").unwrap();
+            let settings = ClaudeLaunchFile::write(&root, br#"{"fastMode":true}"#).unwrap();
+            let mut resources = ClaudeCodeRunResources {
+                child: ManagedProcess::spawn(spec).unwrap(),
+                bootstrap_file: Some(bootstrap.into_managed_path()),
+                settings_file: Some(settings.into_managed_path()),
+            };
+            tokio::time::timeout(Duration::from_secs(10), resources.child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(handshake.exists());
+            assert!(
+                !resources.child.tree_is_empty().unwrap(),
+                "{entrypoint} root exit must leave a live Job descendant"
+            );
+            resources.child.force_terminate_tree().unwrap();
+            assert!(resources.bootstrap_file.as_ref().unwrap().exists());
+            assert!(resources.settings_file.as_ref().unwrap().exists());
+            resources
+                .finish(false, Instant::now() + CLAUDE_CLEANUP_TIMEOUT)
+                .await
+                .unwrap();
+            assert!(claude_launch_files(&root).is_empty());
+            let undeletable = root.join("undeletable-launch-path");
+            std::fs::create_dir(&undeletable).unwrap();
+            resources.bootstrap_file = Some(undeletable.clone());
+            resources
+                .finish(false, Instant::now() + CLAUDE_CLEANUP_TIMEOUT)
+                .await
+                .expect("launch-file deletion failure must not block an empty Job");
+            assert!(resources.bootstrap_file.is_some());
+            resources.bootstrap_file = None;
+            std::fs::remove_dir(&undeletable).unwrap();
+            drop(resources);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match std::fs::remove_dir_all(&root) {
+                    Ok(()) => break,
+                    Err(_error) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("Windows fixture directory remained locked: {error}"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_exit_with_empty_stderr_preserves_structured_provider_failure() {
+        use rovai_core::agent_profile::AdapterKind;
+        use rovai_core::runtime_discovery::{RuntimeSearchEnvironment, with_runtime_configuration};
+        use rovai_core::runtime_startup::{
+            RuntimeEnvironmentVariable, RuntimeStartupConfiguration,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent_background_env = std::env::var_os("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
+        let parent_memory_env = std::env::var_os("CLAUDE_CODE_DISABLE_AUTO_MEMORY");
+        let search = RuntimeSearchEnvironment::for_test_paths(
+            1,
+            vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+        )
+        .with_startup_configuration(
+            AdapterKind::ClaudeCodeCli,
+            RuntimeStartupConfiguration {
+                environment: vec![
+                    RuntimeEnvironmentVariable {
+                        name: "CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(),
+                        value: "0".into(),
+                    },
+                    RuntimeEnvironmentVariable {
+                        name: "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(),
+                        value: "0".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        // This process-boundary fixture owns the exit-status ordering regression;
+        // the pure terminal validator cannot prove that run_process reaches it.
+        for (explicit, fast, resume) in [false, true].into_iter().flat_map(|explicit| {
+            [None, Some(true), Some(false)]
+                .into_iter()
+                .flat_map(move |fast| [false, true].map(move |resume| (explicit, fast, resume)))
+        }) {
+            let root = std::env::temp_dir().join(format!(
+                "rovai-claude-nonzero-structured-failure-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let workspace = root.join("workspace");
+            std::fs::create_dir_all(&workspace).expect("workspace should be created");
+            let executable = root.join("fake-claude");
+            let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+            let native_fast = match (explicit, resume) {
+                (false, false) => Some("on"),
+                (false, true) => Some("off"),
+                (true, false) => Some("cooldown"),
+                (true, true) => None,
+            };
+            let fast_field = native_fast
+                .map(|state| format!(r#"\"fast_mode_state\":\"{state}\","#))
+                .unwrap_or_default();
+            // Existing process matrix also proves saved models/options reach the
+            // CLI when initialization omits, empties or disagrees with the catalog.
+            let models_field = match fast {
+                None => r#"\"models\":[],"#,
+                Some(true) => r#"\"models\":[{\"value\":\"another-model\"}],"#,
+                Some(false) => "",
+            };
+            std::fs::write(
+                &executable,
+                format!(
+                    r#"#!/bin/sh
+    printf 'start\n' >> "$0.starts"
+    printf '%s\n' "$@" > "$0.argv"
+    printf '%s' "$CLAUDE_CODE_DISABLE_AUTO_MEMORY" > "$0.memory-env"
+    printf '%s' "$CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" > "$0.background-env"
+    printf '%s\n%s' "$ANTHROPIC_BASE_URL" "$ANTHROPIC_API_KEY" > "$0.member-env"
+    case "$1" in --version|auth) sleep 30; exit 1;; esac
+    previous=''
+    for arg in "$@"; do
+      if [ "$previous" = '--settings' ]; then /bin/cat "$arg" > "$0.settings"; fi
+      previous="$arg"
+    done
+    IFS= read -r init
+    init_id=$(printf '%s' "$init" | /usr/bin/sed -E 's/.*"request_id":"([^"]+)".*/\1/')
+    printf '%s\n' "{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"$init_id\",\"response\":{{{fast_field}{models_field}\"commands\":[]}}}}}}"
+    IFS= read -r prompt
+    printf '%s\n' "$prompt" >> "$0.prompts"
+    printf '%s\n' '{{"type":"stream_event","session_id":"{session_id}","event":{{"type":"message_start"}}}}'
+    printf '%s\n' '{{"type":"result","subtype":"error","is_error":true,"result":"API Error: 529 overloaded; api_key=private-key","session_id":"{session_id}"}}'
+    exit 1
+    "#,
+                ),
+            )
+            .expect("fake Claude executable should be written");
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                .expect("fake Claude executable should be executable");
+            let adapter =
+                ClaudeCodeCliRuntimeAdapter::new(&root).expect("Adapter should initialize");
+            let mut request = fake_claude_request(
+                &workspace,
+                &executable,
+                uuid::Uuid::new_v4().to_string(),
+                session_id,
+            );
+            request.runtime.reported_version = None;
+            let configured_permission = match (explicit, fast) {
+                (false, None) => "manual",
+                (false, Some(true)) => "acceptEdits",
+                (false, Some(false)) => "bypassPermissions",
+                (true, None) => "dontAsk",
+                (true, Some(true)) => "plan",
+                (true, Some(false)) => "auto",
+            };
+            let legacy_read_only = explicit && fast.is_none();
+            request.runtime.permissions.values = json!({"permission_mode":configured_permission});
+            if legacy_read_only {
+                request.permission_semantics = PermissionSemantics::CoreEnforcedV1;
+                request.workspace.access = "read_only".into();
+            }
+            let member_overlay = explicit && fast == Some(false) && !resume;
+            if member_overlay {
+                let overlay = std::collections::BTreeMap::from([
+                    (
+                        "ANTHROPIC_BASE_URL".into(),
+                        "https://fixture-member.example".into(),
+                    ),
+                    ("ANTHROPIC_API_KEY".into(), "private-key".into()),
+                    ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(), "0".into()),
+                ]);
+                let mut values = overlay.clone();
+                values.insert("PATH".into(), "/usr/bin:/bin".into());
+                values.insert("HOME".into(), root.to_string_lossy().into_owned());
+                values.insert("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".into(), "1".into());
+                request.runtime.reported_version = Some("2.1.287".into());
+                request.runtime.environment =
+                    Some(rovai_core::member_environment::LaunchEnvironment {
+                        values: Some(values),
+                        overlay: Some(overlay),
+                    });
+            }
+            request.runtime.camp_fast = Some(rovai_core::camp_fast::FrozenThreadMemberFast {
+                runtime_binding_revision: "test-binding".into(),
+                fast_override: fast,
+            });
+            if resume {
+                request.new_native_session_id = None;
+                request.resumable_native_session_id = Some(session_id.into());
+            }
+            if explicit {
+                request.runtime.model.source = "explicit".to_string();
+                request.runtime.model.model_id = "provider/custom[extended]".to_string();
+                request.runtime.model.options = json!({"effort":"future-level"});
+            }
+            let (accepted_sender, mut accepted_receiver) = mpsc::unbounded_channel();
+            request.input_accepted = Some(accepted_sender);
+            let (events, mut event_receiver) = mpsc::unbounded_channel();
+            request.runtime_events = Some(events);
+
+            let error = with_runtime_configuration(
+                AdapterKind::ClaudeCodeCli,
+                &search,
+                adapter.run(request),
+            )
+            .await
+            .expect_err("structured Provider failure must remain visible on exit 1");
+            let diagnostic = format!("{error:#}");
+            let initialized = event_receiver
+                .try_recv()
+                .expect("initialization baseline precedes input events");
+            assert_eq!(initialized.event_type, "runtime.fast.initialized");
+            assert_eq!(
+                initialized.payload["enabled"].as_bool(),
+                native_fast.map(|state| state != "off"),
+                "initialization metadata is optional on both new and resumed sessions"
+            );
+            let delivered = error
+                .downcast_ref::<ClaudeCodeDeliveredFailure>()
+                .expect("structured final should prove the delivered turn ended")
+                .clone();
+            let accepted = accepted_receiver
+                .try_recv()
+                .expect("message_start should preserve accepted-input proof");
+            let argv = std::fs::read_to_string(root.join("fake-claude.argv")).unwrap();
+            if explicit {
+                assert!(argv.contains("--model\nprovider/custom[extended]\n"));
+                assert!(argv.contains("--effort\nfuture-level\n"));
+            } else {
+                assert!(
+                    !argv
+                        .lines()
+                        .any(|arg| matches!(arg, "--model" | "--effort"))
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("fake-claude.starts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "no version/auth probe or automatic replay"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("fake-claude.prompts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            let args = argv.lines().collect::<Vec<_>>();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--permission-mode", configured_permission])
+            );
+            assert!(args.contains(&if legacy_read_only {
+                "--disallowedTools=Edit,Write,NotebookEdit,AskUserQuestion"
+            } else {
+                "--disallowedTools=AskUserQuestion"
+            }));
+            assert!(argv.contains(if resume {
+                "--resume\n"
+            } else {
+                "--session-id\n"
+            }));
+            let settings: Value =
+                serde_json::from_slice(&std::fs::read(root.join("fake-claude.settings")).unwrap())
+                    .unwrap();
+            let mut expected = json!({"env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}});
+            if member_overlay {
+                expected["env"]["ANTHROPIC_BASE_URL"] = json!("https://fixture-member.example");
+                expected["env"]["ANTHROPIC_API_KEY"] = json!("private-key");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("fake-claude.member-env")).unwrap(),
+                    "https://fixture-member.example\nprivate-key"
+                );
+                assert!(!argv.contains("private-key"));
+                assert!(!diagnostic.contains("private-key"));
+            }
+            if let Some(fast) = fast {
+                expected["fastMode"] = json!(fast);
+            }
+            assert_eq!(
+                settings, expected,
+                "no permission or unrelated environment overrides"
+            );
+            assert_eq!(argv.lines().filter(|arg| *arg == "--settings").count(), 1);
+            assert_eq!(
+                std::fs::read_to_string(root.join("fake-claude.memory-env")).unwrap(),
+                "1"
+            );
+            assert_eq!(
+                std::env::var_os("CLAUDE_CODE_DISABLE_AUTO_MEMORY"),
+                parent_memory_env
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("fake-claude.background-env")).unwrap(),
+                "1"
+            );
+            assert_eq!(
+                std::env::var_os("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
+                parent_background_env
+            );
+            assert!(claude_launch_files(&root).is_empty());
+            std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+
+            assert_eq!(accepted.native_session_id, session_id);
+            assert_eq!(delivered.error_code, "runtime_terminal_failure");
+            assert_eq!(delivered.failure.origin, RuntimeFailureOrigin::Runtime);
+            assert_eq!(delivered.failure.phase, RuntimeFailurePhase::Terminal);
+            let detail = delivered.failure.detail.as_deref().expect("safe detail");
+            assert!(detail.contains("API Error: 529 overloaded"));
+            assert!(detail.contains("api_key=[redacted]"));
+            assert!(!detail.contains("private-key"));
+            assert!(diagnostic.contains("exit status: 1"));
+            assert!(diagnostic.contains("stderrBytes=0"));
+        }
+    }
+
+    #[test]
+    fn public_text_streams_and_success_fallback_create_narration_without_thinking() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let mut streamed_state = ClaudeCodeStreamState::default();
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "stream_event",
+                    "session_id": session_id,
+                    "event": {"type": "message_start"}
+                }),
+                session_id,
+                &mut streamed_state,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "stream_event",
+                    "session_id": session_id,
+                    "event": {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""}
+                    }
+                }),
+                session_id,
+                &mut streamed_state,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "stream_event",
+                    "session_id": session_id,
+                    "event": {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {
+                            "type": "thinking_delta",
+                            "thinking": "CLAUDE_PRIVATE_THINKING_MUST_NOT_LEAK"
+                        }
+                    }
+                }),
+                session_id,
+                &mut streamed_state,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let first = normalize_claude_runtime_events(
+            &json!({
+                "type": "stream_event",
+                "session_id": session_id,
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "public"}
+                }
+            }),
+            session_id,
+            &mut streamed_state,
+        )
+        .unwrap();
+        let second = normalize_claude_runtime_events(
+            &json!({
+                "type": "stream_event",
+                "session_id": session_id,
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": " reply"}
+                }
+            }),
+            session_id,
+            &mut streamed_state,
+        )
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].event_type, "agent.text.delta");
+        assert_eq!(first[0].payload["itemId"], "claude-text-1-0");
+        assert_eq!(first[0].payload["delta"], "public");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].payload["itemId"], "claude-text-1-0");
+        assert_eq!(second[0].payload["delta"], " reply");
+        let complete = normalize_claude_runtime_events(
+            &json!({"type":"assistant", "session_id":session_id,
+            "message":{"content":[{"type":"text","text":"public reply (complete)"}]}}),
+            session_id,
+            &mut streamed_state,
+        )
+        .unwrap();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].event_type, "agent.text.completed");
+        assert_eq!(complete[0].payload["itemId"], first[0].payload["itemId"]);
+        assert_eq!(complete[0].payload["text"], "public reply (complete)");
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "result": "public reply",
+                    "session_id": session_id
+                }),
+                session_id,
+                &mut streamed_state,
+            )
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type == "runtime.fast.observed"),
+            "the terminal result must not duplicate streamed public text"
+        );
+        assert!(
+            !serde_json::to_string(&[&first[0].payload, &second[0].payload])
+                .unwrap()
+                .contains("CLAUDE_PRIVATE_THINKING_MUST_NOT_LEAK")
+        );
+
+        // Claude emits assistant packets per content block: the stream text
+        // indices include thinking/tools, while each packet's array starts at 0.
+        let emit = |state: &mut ClaudeCodeStreamState, event: Value| {
+            normalize_claude_runtime_events(&event, session_id, state).unwrap()
+        };
+        for batched_completion in [false, true] {
+            let mut state = ClaudeCodeStreamState::default();
+            emit(
+                &mut state,
+                json!({"type":"stream_event","session_id":session_id,
+                "event":{"type":"message_start","message":{"id":"message-with-thinking"}}}),
+            );
+            for (kind, private_event) in [
+                ("content_block_start", "agent.thought.started"),
+                ("content_block_stop", "agent.thought.completed"),
+            ] {
+                let events = emit(
+                    &mut state,
+                    json!({"type":"stream_event","session_id":session_id,
+                        "event":{"type":kind,"index":0,"content_block":{"type":"thinking"}}}),
+                );
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].event_type, private_event);
+                assert_eq!(
+                    events[0].payload,
+                    json!({"itemId":"claude-thinking:message-with-thinking:0"})
+                );
+                assert!(!events[0].payload.to_string().contains("PRIVATE"));
+            }
+            assert!(emit(&mut state, json!({"type":"assistant","session_id":session_id,"uuid":"thinking-packet",
+                "message":{"id":"message-with-thinking","content":[{"type":"thinking","thinking":"PRIVATE"}]}})).is_empty());
+            let mut delta_ids = Vec::new();
+            let mut completed = Vec::new();
+            let phrase =
+                "三个问题的代码位置已初步确认。继续读取领取、结算和推进逻辑以验证问题 2、3。";
+            for index in [1, 3] {
+                emit(
+                    &mut state,
+                    json!({"type":"stream_event","session_id":session_id,
+                    "event":{"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}}),
+                );
+                let delta = emit(
+                    &mut state,
+                    json!({"type":"stream_event","session_id":session_id,
+                    "event":{"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":phrase}}}),
+                );
+                delta_ids.push(delta[0].payload["itemId"].clone());
+                emit(
+                    &mut state,
+                    json!({"type":"stream_event","session_id":session_id,
+                    "event":{"type":"content_block_stop","index":index}}),
+                );
+                if !batched_completion {
+                    completed.extend(emit(&mut state, json!({"type":"assistant","session_id":session_id,
+                        "uuid":format!("text-packet-{index}"),"message":{"id":"message-with-thinking",
+                        "content":[{"type":"text","text":phrase}]}})));
+                }
+                if index == 1 {
+                    emit(
+                        &mut state,
+                        json!({"type":"stream_event","session_id":session_id,
+                        "event":{"type":"content_block_start","index":2,
+                        "content_block":{"type":"tool_use","id":"read-tool","name":"Read"}}}),
+                    );
+                    emit(
+                        &mut state,
+                        json!({"type":"stream_event","session_id":session_id,
+                        "event":{"type":"content_block_stop","index":2}}),
+                    );
+                    emit(
+                        &mut state,
+                        json!({"type":"assistant","session_id":session_id,"uuid":"tool-packet",
+                        "message":{"id":"message-with-thinking","content":[{"type":"tool_use","id":"read-tool","name":"Read"}]}}),
+                    );
+                }
+            }
+            let replay_packet = if batched_completion {
+                json!({"type":"assistant","session_id":session_id,"uuid":"batched-text-packet",
+                    "message":{"id":"message-with-thinking","content":[{"type":"text","text":phrase},{"type":"text","text":phrase}]}})
+            } else {
+                json!({"type":"assistant","session_id":session_id,"uuid":"text-packet-1",
+                    "message":{"id":"message-with-thinking","content":[{"type":"text","text":phrase}]}})
+            };
+            if batched_completion {
+                completed.extend(emit(&mut state, replay_packet.clone()));
+            }
+            assert_eq!(completed.len(), 2);
+            assert_eq!(completed[0].payload["itemId"], delta_ids[0]);
+            assert_eq!(completed[1].payload["itemId"], delta_ids[1]);
+            assert_ne!(
+                delta_ids[0], delta_ids[1],
+                "equal text in different blocks remains distinct"
+            );
+            let replay = emit(&mut state, replay_packet.clone());
+            assert_eq!(replay[0].payload["itemId"], delta_ids[0]);
+            assert!(
+                !serde_json::to_string(&completed.iter().map(|e| &e.payload).collect::<Vec<_>>())
+                    .unwrap()
+                    .contains("PRIVATE")
+            );
+            let next = emit(
+                &mut state,
+                json!({"type":"assistant","session_id":session_id,"uuid":"next-packet",
+                "message":{"id":"next-message","content":[{"type":"text","text":phrase}]}}),
+            );
+            assert!(!delta_ids.contains(&next[0].payload["itemId"]));
+            let late_replay = emit(&mut state, replay_packet);
+            assert_eq!(late_replay[0].payload["itemId"], delta_ids[0]);
+            assert_eq!(state.native_message_id.as_deref(), Some("next-message"));
+        }
+        let mut packet_only = ClaudeCodeStreamState::default();
+        let mut packet_ids = Vec::new();
+        for uuid in ["packet-a", "packet-b", "packet-a"] {
+            let events = emit(
+                &mut packet_only,
+                json!({"type":"assistant","session_id":session_id,"uuid":uuid,
+                "message":{"id":"packet-only-message","content":[{"type":"text","text":"same text"}]}}),
+            );
+            packet_ids.push(events[0].payload["itemId"].clone());
+        }
+        assert_ne!(packet_ids[0], packet_ids[1]);
+        assert_eq!(packet_ids[0], packet_ids[2]);
+
+        let mut fallback_state = ClaudeCodeStreamState::default();
+        let mut complete_only = ClaudeCodeStreamState::default();
+        for (id, text) in [("message-a", "intermediate"), ("message-b", "final")] {
+            let blocks = normalize_claude_runtime_events(
+                &json!({"type":"assistant","session_id":session_id,
+                "message":{"id":id,"content":[{"type":"text","text":text}]}}),
+                session_id,
+                &mut complete_only,
+            )
+            .unwrap();
+            assert_eq!(
+                blocks[0].payload["itemId"],
+                format!("claude-text-native:{id}:0")
+            );
+            assert_eq!(blocks[0].payload["text"], text);
+        }
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({"type":"result","subtype":"success","is_error":false,
+            "session_id":session_id,"result":"final"}),
+                session_id,
+                &mut complete_only
+            )
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type == "runtime.fast.observed")
+        );
+        fallback_state.final_result = Some(
+            serde_json::from_value(json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "  fallback final  ",
+                "session_id": session_id
+            }))
+            .unwrap(),
+        );
+        let fallback = claude_final_result_fallback(&fallback_state).unwrap();
+        assert_eq!(fallback.event_type, "agent.text.delta");
+        assert_eq!(fallback.payload["itemId"], "claude-final");
+        assert_eq!(fallback.payload["delta"], "fallback final");
+        complete_only.final_result = fallback_state.final_result.take();
+        assert!(claude_final_result_fallback(&complete_only).is_none());
+
+        let mut failure_state = ClaudeCodeStreamState::default();
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": true,
+                    "result": "CLAUDE_PROVIDER_ERROR_MUST_NOT_LEAK",
+                    "session_id": session_id
+                }),
+                session_id,
+                &mut failure_state,
+            )
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type == "runtime.fast.observed")
+        );
+    }
+
+    #[test]
+    fn root_call_usage_is_numeric_and_context_pairs_latest_call_with_its_model() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let mut state = ClaudeCodeStreamState::default();
+        let emit = |state: &mut ClaudeCodeStreamState, event: Value| {
+            normalize_claude_runtime_events(&event, session_id, state).unwrap()
+        };
+        for (message, model, input) in [("call-1", "model-a", 12), ("call-2", "model-b", 5)] {
+            emit(
+                &mut state,
+                json!({"type":"stream_event","session_id":session_id,
+                "event":{"type":"message_start","message":{"id":message,"model":model,
+                    "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}),
+            );
+            let terminal = json!({"type":"result","session_id":session_id,
+                "usage":{"input_tokens":999},"modelUsage":{"model-a":{"contextWindow":100},"model-b":{"contextWindow":200}}});
+            assert!(
+                emit(&mut state, terminal.clone())
+                    .iter()
+                    .all(|v| v.event_type != "runtime.context.observed"),
+                "preliminary zeros are not a context observation"
+            );
+            let events = emit(
+                &mut state,
+                json!({"type":"stream_event","session_id":session_id,
+                "event":{"type":"message_delta","usage":{"input_tokens":input,"output_tokens":9,
+                    "cache_read_input_tokens":20,"cache_creation_input_tokens":2,"private":"PRIVATE_CANARY"}}}),
+            );
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "runtime.usage.observed");
+            assert_eq!(events[0].payload["messageId"], message);
+            assert!(!events[0].payload.to_string().contains("PRIVATE_CANARY"));
+            assert_eq!(events[1].event_type, "runtime.context.observed");
+            assert_eq!(events[1].payload["usedTokens"], input + 22);
+            assert!(
+                events[1].payload["windowTokens"].is_null(),
+                "live occupancy cannot borrow the previous call/model window"
+            );
+            assert!(!events[1].payload.to_string().contains("PRIVATE_CANARY"));
+            let context = emit(&mut state, terminal)
+                .into_iter()
+                .find(|v| v.event_type == "runtime.context.observed")
+                .unwrap();
+            assert_eq!(
+                context.payload["usedTokens"],
+                input + 22,
+                "latest call input, not aggregate or output"
+            );
+            assert_eq!(
+                context.payload["windowTokens"],
+                if model == "model-a" { 100 } else { 200 }
+            );
+            assert_eq!(context.payload["modelId"], model);
+        }
+        assert!(state.model_calls_observed);
+        emit(
+            &mut state,
+            json!({"type":"stream_event","session_id":session_id,"parent_tool_use_id":"child",
+            "event":{"type":"message_start","message":{"id":"child-call","model":"child-model","usage":{"input_tokens":1000}}}}),
+        );
+        assert_eq!(state.native_usage_message_id.as_deref(), Some("call-2"));
+        assert_eq!(state.native_message_model.as_deref(), Some("model-b"));
+        assert!(
+            emit(
+                &mut state,
+                json!({"type":"stream_event","session_id":session_id,"parent_tool_use_id":"child",
+            "event":{"type":"message_delta","usage":{"input_tokens":1000}}})
+            )
+            .is_empty()
+        );
+        assert_eq!(state.call_usage["input_tokens"], 5);
+        assert!(
+            emit(
+                &mut state,
+                json!({"type":"result","session_id":session_id,"parent_tool_use_id":"child",
+            "modelUsage":{"model-b":{"contextWindow":200}}})
+            )
+            .iter()
+            .all(|v| v.event_type != "runtime.context.observed")
+        );
+        state.call_usage.remove("cache_creation_input_tokens");
+        assert!(
+            emit(
+                &mut state,
+                json!({"type":"result","session_id":session_id,
+            "modelUsage":{"model-b":{"contextWindow":200}}})
+            )
+            .iter()
+            .all(|v| v.event_type != "runtime.context.observed")
+        );
+        emit(
+            &mut state,
+            json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"message_start","message":{"id":"call-3","model":"model-b","usage":{
+                "input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}),
+        );
+        let events = emit(
+            &mut state,
+            json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"message_delta","usage":{"input_tokens":12,"output_tokens":3,"cache_read_input_tokens":0}}}),
+        );
+        assert!(
+            events[0].payload["usage"]
+                .get("cache_creation_input_tokens")
+                .is_none(),
+            "start placeholder cannot fill missing real Usage"
+        );
+        assert!(
+            emit(
+                &mut state,
+                json!({"type":"result","session_id":session_id,
+            "modelUsage":{"model-b":{"contextWindow":200}}})
+            )
+            .iter()
+            .all(|v| v.event_type != "runtime.context.observed")
+        );
+
+        // A real delta can complete sparse buckets before any terminal result.
+        // Its explicit zero is valid; the provisional all-zero start was not.
+        let completed = emit(
+            &mut state,
+            json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"message_delta","usage":{"cache_creation_input_tokens":0}}}),
+        );
+        assert_eq!(completed[1].payload["usedTokens"], 12);
+        assert!(completed[1].payload["windowTokens"].is_null());
+        let unmatched = emit(
+            &mut state,
+            json!({"type":"result","session_id":session_id,
+            "modelUsage":{"other-model":{"contextWindow":100}}}),
+        );
+        assert_eq!(unmatched[0].payload["usedTokens"], 12);
+        assert!(unmatched[0].payload["windowTokens"].is_null());
+
+        let witness: Value = serde_json::from_str(include_str!(
+            "../../../docs/research/runtime-monitoring/fixtures/round5-native-usage-context.json"
+        ))
+        .unwrap();
+        let entry = witness["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["runtime"] == "claude-code-cli")
+            .unwrap();
+        for run in entry["runs"].as_array().unwrap() {
+            let mut state = ClaudeCodeStreamState::default();
+            for record in run["sourceRecords"].as_array().unwrap() {
+                emit(
+                    &mut state,
+                    json!({"type":"stream_event","session_id":session_id,
+                    "event":{"type":"message_start","message":{"id":record["raw"]["messageId"],"model":entry["providerModel"],
+                        "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}),
+                );
+                let events = emit(
+                    &mut state,
+                    json!({"type":"stream_event","session_id":session_id,
+                    "event":{"type":"message_delta","usage":record["raw"]["usage"]}}),
+                );
+                assert_eq!(events[0].payload["usage"], record["raw"]["usage"]);
+            }
+            let frame = &run["contextSourceRecords"][0];
+            let mut result = frame["raw"]["result"].clone();
+            result["session_id"] = json!(session_id);
+            let context = emit(&mut state, result)
+                .into_iter()
+                .find(|v| v.event_type == "runtime.context.observed")
+                .unwrap();
+            assert_eq!(
+                json!({"usedTokens":context.payload["usedTokens"],"windowTokens":context.payload["windowTokens"]}),
+                frame["expectedParsedContext"]
+            );
+        }
+
+        // Replay only native numeric journal fields through a synthetic stream
+        // envelope. The fixture separately records the real running DB/UI witness.
+        let live: Value = serde_json::from_str(include_str!(
+            "../../../docs/research/runtime-monitoring/fixtures/claude-live-context-2026-10-03.json"
+        ))
+        .unwrap();
+        let mut state = ClaudeCodeStreamState::default();
+        for record in live["rawRecords"].as_array().unwrap() {
+            let message = &record["raw"]["message"];
+            if state.native_usage_message_id.as_deref() != message["id"].as_str() {
+                emit(
+                    &mut state,
+                    json!({"type":"stream_event","session_id":session_id,
+                        "event":{"type":"message_start","message":{"id":message["id"],"model":message["model"]}}}),
+                );
+            }
+            let expected = live["expectedCallContexts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|call| call["messageId"] == message["id"])
+                .unwrap();
+            let events = emit(
+                &mut state,
+                json!({"type":"stream_event","session_id":session_id,
+                    "event":{"type":"message_delta","usage":message["usage"]}}),
+            );
+            assert_eq!(events[1].payload["usedTokens"], expected["usedTokens"]);
+            assert_eq!(events[1].payload["windowTokens"], Value::Null);
+        }
+    }
+
+    #[test]
+    fn streamed_root_thinking_rejects_unbound_items_and_completed_blocks() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let mut state = ClaudeCodeStreamState::default();
+        let emit = |state: &mut ClaudeCodeStreamState, event: Value| {
+            normalize_claude_runtime_events(&event, session_id, state).unwrap()
+        };
+        assert!(
+            emit(
+                &mut state,
+                json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"message_start","message":{"id":"native-message"}}})
+            )
+            .is_empty()
+        );
+        let started = emit(
+            &mut state,
+            json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"content_block_start","index":0,
+                "content_block":{"type":"thinking","thinking":""}}}),
+        );
+        assert_eq!(started[0].event_type, "agent.thought.started");
+        assert_eq!(started[0].payload.as_object().unwrap().len(), 1);
+        for marker in ["subagentId", "parent_tool_use_id", "replay", "snapshot"] {
+            for mut inner in [
+                json!({"type":"message_start","message":{"id":"child"}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"PRIVATE_CHILD"}}),
+                json!({"type":"content_block_stop","index":0}),
+            ] {
+                inner["_meta"] = json!({marker: true});
+                assert!(
+                    emit(
+                        &mut state,
+                        json!({"type":"stream_event","session_id":session_id,"event":inner})
+                    )
+                    .is_empty()
+                );
+            }
+        }
+        let first = emit(
+            &mut state,
+            json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"content_block_delta","index":0,
+                "delta":{"type":"thinking_delta","thinking":"🙂"}}}),
+        );
+        let second = emit(
+            &mut state,
+            json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"content_block_delta","index":0,
+                "delta":{"type":"thinking_delta","thinking":"继续"}}}),
+        );
+        assert_eq!(first[0].event_type, "agent.thought.delta");
+        assert_eq!(first[0].payload["itemId"], second[0].payload["itemId"]);
+        assert_eq!(
+            second[0].payload["itemId"],
+            "claude-thinking:native-message:0"
+        );
+        assert!(emit(&mut state, json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"PRIVATE_SIGNATURE"}}})).is_empty());
+        let stopped = emit(
+            &mut state,
+            json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"content_block_stop","index":0}}),
+        );
+        assert_eq!(stopped[0].event_type, "agent.thought.completed");
+        assert_eq!(stopped[0].payload, started[0].payload);
+        assert!(emit(&mut state, json!({"type":"stream_event","session_id":session_id,
+            "event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"LATE"}}})).is_empty());
+        let completed = emit(
+            &mut state,
+            json!({"type":"assistant","session_id":session_id,
+            "uuid":"thought-complete", "message":{"id":"native-message",
+            "content":[{"type":"thinking","thinking":"PRIVATE_FINAL"}]}}),
+        );
+        assert!(
+            completed
+                .iter()
+                .all(|event| event.event_type != "agent.thought.delta")
+        );
+        assert!(
+            emit(
+                &mut state,
+                json!({"type":"stream_event","session_id":session_id,
+            "parent_tool_use_id":"child-tool", "event":{"type":"content_block_delta",
+                "index":0,"delta":{"type":"thinking_delta","thinking":"CHILD"}}})
+            )
+            .is_empty()
+        );
+        let mut no_native_id = ClaudeCodeStreamState::default();
+        for frame in [
+            json!({"type":"stream_event","session_id":session_id,
+                "event":{"type":"message_start","message":{}}}),
+            json!({"type":"stream_event","session_id":session_id,
+                "event":{"type":"content_block_start","index":0,
+                    "content_block":{"type":"thinking","thinking":""}}}),
+            json!({"type":"stream_event","session_id":session_id,
+                "event":{"type":"content_block_delta","index":0,
+                    "delta":{"type":"thinking_delta","thinking":"UNBOUND"}}}),
+        ] {
+            assert!(emit(&mut no_native_id, frame).is_empty());
+        }
+    }
+
+    #[test]
+    fn system_init_emits_only_the_first_identity_matched_runtime_model() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let mut state = ClaudeCodeStreamState::default();
+        let first = normalize_claude_runtime_events(
+            &json!({
+                "type": "system",
+                "subtype": "init",
+                "session_id": session_id,
+                "model": " claude-sonnet-4-5 "
+            }),
+            session_id,
+            &mut state,
+        )
+        .expect("identity-matched init should normalize")
+        .into_iter()
+        .filter(|event| event.event_type != "runtime.fast.observed")
+        .collect::<Vec<_>>();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].event_type, "runtime.model.observed");
+        assert_eq!(first[0].payload["modelId"], "claude-sonnet-4-5");
+
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": session_id,
+                    "model": "claude-opus-4-1"
+                }),
+                session_id,
+                &mut state,
+            )
+            .expect("later init should remain valid")
+            .iter()
+            .all(|event| event.event_type == "runtime.fast.observed"),
+            "a Run keeps the first observed model"
+        );
+
+        let mut missing = ClaudeCodeStreamState::default();
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": session_id
+                }),
+                session_id,
+                &mut missing,
+            )
+            .expect("model omission is best-effort")
+            .iter()
+            .all(|event| event.event_type == "runtime.fast.observed")
+        );
+        assert!(
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": "5ade59ac-f87e-4827-8cf2-0e1f3ba720ea",
+                    "model": "claude-sonnet-4-5"
+                }),
+                session_id,
+                &mut ClaudeCodeStreamState::default(),
+            )
+            .is_err(),
+            "another Session must be fenced"
+        );
+    }
+
+    #[test]
+    fn structured_tool_images_stay_internal_and_are_fenced_by_session_and_replay() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let mut state = ClaudeCodeStreamState::default();
+        let mut event = json!({
+            "type":"user", "session_id":session_id, "message":{"content":[{
+                "type":"tool_result", "tool_use_id":"toolu_image", "is_error":true, "content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2UtYnl0ZXM="}},
+                    {"type":"text","text":"Saved to /tmp/not-an-image-result.png"}
+                ]
+            }]}
+        });
+        event["session_id"] = json!("other-session");
+        assert!(normalize_claude_runtime_events(&event, session_id, &mut state).is_err());
+        event["session_id"] = json!(session_id);
+        let events = normalize_claude_runtime_events(&event, session_id, &mut state).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            rovai_core::agent_run_image::IMAGE_EVENT
+        );
+        assert_eq!(events[0].payload["images"][0]["data"], "aW1hZ2UtYnl0ZXM=");
+        assert_eq!(events[1].event_type, "runtime.action");
+        let public = events[1].payload.to_string();
+        assert!(!public.contains("aW1hZ2UtYnl0ZXM="));
+        assert!(!public.contains("not-an-image-result"));
+        assert!(
+            normalize_claude_runtime_events(&event, session_id, &mut state)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mcp_text_result_is_public_without_publishing_other_content_or_metadata() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let tool_name = "mcp__exa__web_fetch_exa";
+        let mut state = ClaudeCodeStreamState::default();
+        let started = normalize_claude_runtime_events(
+            &json!({
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "toolu_exa_1",
+                    "name": tool_name,
+                    "input": {"url": "PRIVATE_MCP_INPUT"}
+                }]}
+            }),
+            session_id,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(started[0].payload["status"], "in_progress");
+        assert!(started[0].payload["input"].is_null());
+
+        let result = json!({
+            "type": "user",
+            "session_id": session_id,
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_exa_1",
+                "content": [
+                    {"type": "text", "text": "MCP_PUBLIC_MARKER"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2UtYnl0ZXM="}},
+                    {"type": "resource", "resource": {"text": "PRIVATE_RESOURCE"}},
+                    {"type": "text", "text": "第二段"}
+                ]
+            }]},
+            "tool_use_result": {"content": "PRIVATE_PROVIDER_RESULT"}
+        });
+        let completed = normalize_claude_runtime_events(&result, session_id, &mut state).unwrap();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(
+            completed[0].event_type,
+            rovai_core::agent_run_image::IMAGE_EVENT
+        );
+        let public = &completed[1].payload;
+        assert_eq!(completed[1].event_type, "runtime.action");
+        assert_eq!(public["toolName"], tool_name);
+        assert_eq!(public["status"], "completed");
+        assert_eq!(public["output"], "MCP_PUBLIC_MARKER\n第二段");
+        for private in [
+            "PRIVATE_MCP_INPUT",
+            "PRIVATE_RESOURCE",
+            "PRIVATE_PROVIDER_RESULT",
+            "aW1hZ2UtYnl0ZXM=",
+        ] {
+            assert!(!public.to_string().contains(private));
+        }
+        assert!(
+            normalize_claude_runtime_events(&result, session_id, &mut state)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mcp_skill_and_reviewed_native_text_results_are_public_without_file_content() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        for (name, failed, content, expected) in [
+            (
+                "mcp__exa__web_fetch_exa",
+                false,
+                json!("MCP_STRING_MARKER"),
+                Some("MCP_STRING_MARKER"),
+            ),
+            (
+                "mcp__exa__web_fetch_exa",
+                true,
+                json!([{"type": "text", "text": "MCP_ERROR_MARKER"}]),
+                Some("MCP_ERROR_MARKER"),
+            ),
+            (
+                "mcp__exa__web_fetch_exa",
+                false,
+                json!([{"type": "resource", "text": "PRIVATE_RESOURCE"}]),
+                None,
+            ),
+            (
+                "Skill",
+                false,
+                json!("SKILL_STRING_MARKER"),
+                Some("SKILL_STRING_MARKER"),
+            ),
+            (
+                "Skill",
+                true,
+                json!([
+                    {"type": "text", "text": "SKILL_ERROR_MARKER"},
+                    {"type": "resource", "text": "PRIVATE_SKILL_RESOURCE"}
+                ]),
+                Some("SKILL_ERROR_MARKER"),
+            ),
+            (
+                "Skill",
+                false,
+                json!([{"type": "resource", "text": "PRIVATE_SKILL_RESOURCE"}]),
+                None,
+            ),
+            (
+                "Agent",
+                false,
+                json!("AGENT_PUBLIC_MARKER"),
+                Some("AGENT_PUBLIC_MARKER"),
+            ),
+            (
+                "TaskStop",
+                true,
+                json!([{"type": "text", "text": "TASK_STOP_ERROR_MARKER"}]),
+                Some("TASK_STOP_ERROR_MARKER"),
+            ),
+            (
+                "TaskOutput",
+                false,
+                json!("TASK_OUTPUT_MARKER"),
+                Some("TASK_OUTPUT_MARKER"),
+            ),
+            (
+                "TaskList",
+                false,
+                json!("TASK_LIST_MARKER"),
+                Some("TASK_LIST_MARKER"),
+            ),
+            (
+                "WebSearch",
+                false,
+                json!("WEB_SEARCH_MARKER"),
+                Some("WEB_SEARCH_MARKER"),
+            ),
+            (
+                "ToolSearch",
+                false,
+                json!("TOOL_SEARCH_MARKER"),
+                Some("TOOL_SEARCH_MARKER"),
+            ),
+            ("Read", false, json!("PRIVATE_NATIVE_FILE_CONTENT"), None),
+            ("Grep", false, json!("PRIVATE_NATIVE_FILE_CONTENT"), None),
+            ("Glob", false, json!("PRIVATE_NATIVE_FILE_CONTENT"), None),
+            ("Edit", false, json!("PRIVATE_NATIVE_FILE_CONTENT"), None),
+            ("Write", false, json!("PRIVATE_NATIVE_FILE_CONTENT"), None),
+            (
+                "NotebookEdit",
+                false,
+                json!("PRIVATE_NATIVE_FILE_CONTENT"),
+                None,
+            ),
+            ("LSP", false, json!("PRIVATE_NATIVE_FILE_CONTENT"), None),
+            (
+                "ReadMcpResourceTool",
+                false,
+                json!("PRIVATE_NATIVE_FILE_CONTENT"),
+                None,
+            ),
+            (
+                "FutureClaudeTool",
+                false,
+                json!("PRIVATE_NATIVE_FILE_CONTENT"),
+                None,
+            ),
+        ] {
+            let mut state = ClaudeCodeStreamState::default();
+            normalize_claude_runtime_events(
+                &json!({"type": "assistant", "session_id": session_id, "message": {"content": [{
+                    "type": "tool_use", "id": "toolu_1", "name": name,
+                    "input": {"file_path": "/repo/file"}
+                }]}}),
+                session_id,
+                &mut state,
+            )
+            .unwrap();
+            let completed = normalize_claude_runtime_events(
+                &json!({"type": "user", "session_id": session_id, "message": {"content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_1", "is_error": failed, "content": content
+                }]}, "tool_use_result": {"content": "PRIVATE_PROVIDER_RESULT"}}),
+                session_id,
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(
+                completed[0].payload["status"],
+                if failed { "failed" } else { "completed" }
+            );
+            assert_eq!(
+                completed[0].payload["output"].as_str(),
+                expected,
+                "tool: {name}"
+            );
+            let public = completed[0].payload.to_string();
+            assert!(!public.contains("PRIVATE_PROVIDER_RESULT"), "tool: {name}");
+            assert!(!public.contains("PRIVATE_SKILL_RESOURCE"), "tool: {name}");
+            assert!(
+                !public.contains("PRIVATE_NATIVE_FILE_CONTENT"),
+                "tool: {name}"
+            );
+        }
+    }
+
+    // Owner: stdout framing, which is separate from the structured image parser above.
+    #[tokio::test]
+    async fn image_frame_larger_than_the_log_budget_preserves_the_terminal_result() {
+        use base64::Engine;
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_CAPTURE_BYTES]);
+        let image = json!({"type":"user","session_id":session_id,"message":{"content":[{
+            "type":"tool_result","tool_use_id":"large-image","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}
+            ]
+        }]}});
+        let result = json!({"type":"result","session_id":session_id,"subtype":"success","is_error":false,"result":"done"});
+        let wire = format!("{image}\n{result}\n");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let captured = capture_claude_stream(
+            wire.as_bytes(),
+            session_id.into(),
+            "image-turn".into(),
+            None,
+            Some(sender),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(captured.final_result.unwrap().result, "done");
+        let image = receiver.try_recv().unwrap();
+        assert_eq!(image.event_type, rovai_core::agent_run_image::IMAGE_EVENT);
+        assert_eq!(
+            image.payload["images"][0]["data"].as_str().unwrap().len(),
+            data.len()
+        );
+        while let Ok(event) = receiver.try_recv() {
+            assert!(
+                !event.payload.to_string().contains(&data),
+                "image bytes are not public evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_native_edit_result_emits_one_exact_mutation_on_the_existing_tool_activity() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let mut state = ClaudeCodeStreamState::default();
+        let started = normalize_claude_runtime_events(
+            &json!({
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "toolu_edit_1",
+                    "name": "Edit",
+                    "input": {
+                        "file_path": "/repo/src/CampWorkspace.tsx",
+                        "old_string": "const enabled = false",
+                        "new_string": "const enabled = true",
+                        "provider_private": "must-not-leak"
+                    }
+                }]}
+            }),
+            session_id,
+            &mut state,
+        )
+        .expect("assistant Edit should normalize");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].payload["toolCallId"], "toolu_edit_1");
+        assert_eq!(started[0].payload["status"], "in_progress");
+        assert!(started[0].payload["input"].is_null());
+        assert!(started[0].payload.get("runtimeDiff").is_none());
+
+        let completed = normalize_claude_runtime_events(
+            &json!({
+                "type": "user",
+                "session_id": session_id,
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_edit_1",
+                    "content": "updated"
+                }]}
+            }),
+            session_id,
+            &mut state,
+        )
+        .expect("successful Edit result should normalize");
+        assert_eq!(completed.len(), 1);
+        let payload = &completed[0].payload;
+        assert_eq!(payload["toolCallId"], "toolu_edit_1");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["toolName"], "Edit");
+        assert_eq!(
+            payload.pointer("/runtimeDiff/semanticKind"),
+            Some(&json!("exact_mutation"))
+        );
+        assert_eq!(
+            payload.pointer("/runtimeDiff/entries/0/path"),
+            Some(&json!("/repo/src/CampWorkspace.tsx"))
+        );
+        assert_eq!(
+            payload.pointer("/runtimeDiff/entries/0/oldText"),
+            Some(&json!("const enabled = false"))
+        );
+        assert_eq!(
+            payload.pointer("/runtimeFileOperation/operationKind"),
+            Some(&json!("write"))
+        );
+        let encoded = serde_json::to_string(payload).expect("payload should serialize");
+        assert!(!encoded.contains("provider_private"));
+        assert!(!encoded.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn terminal_file_tools_emit_operations_only_after_reliable_success() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        for (tool_name, operation_kind) in [
+            ("Read", Some("read")),
+            ("Write", Some("write")),
+            ("Edit", Some("write")),
+            ("Grep", None),
+            ("Glob", None),
+        ] {
+            for failed in [false, true] {
+                let tool_use_id = format!("toolu-{tool_name}-{failed}");
+                let mut state = ClaudeCodeStreamState::default();
+                normalize_claude_runtime_events(
+                    &json!({
+                        "type": "assistant",
+                        "session_id": session_id,
+                        "message": {"content": [{
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": tool_name,
+                            "input": {"file_path": "/repo/src/app.ts", "pattern": "needle"}
+                        }]}
+                    }),
+                    session_id,
+                    &mut state,
+                )
+                .unwrap();
+                let completed = normalize_claude_runtime_events(
+                    &json!({
+                        "type": "user",
+                        "session_id": session_id,
+                        "message": {"content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "is_error": failed,
+                            "content": if failed { "failed" } else { "done" }
+                        }]}
+                    }),
+                    session_id,
+                    &mut state,
+                )
+                .unwrap();
+                let projected = completed[0]
+                    .payload
+                    .pointer("/runtimeFileOperation/operationKind")
+                    .and_then(Value::as_str);
+                assert_eq!(projected, (!failed).then_some(operation_kind).flatten());
+            }
+        }
+    }
+
+    #[test]
+    fn write_result_type_classifies_update_but_does_not_promote_ambiguous_create() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        {
+            let (result_type, expected_change_kind) = ("update", "update");
+            let tool_use_id = format!("toolu-write-{result_type}");
+            let mut state = ClaudeCodeStreamState::default();
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "assistant",
+                    "session_id": session_id,
+                    "message": {"content": [{
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Write",
+                        "input": {
+                            "file_path": "/repo/src/app.ts",
+                            "content": "new content"
+                        }
+                    }]}
+                }),
+                session_id,
+                &mut state,
+            )
+            .unwrap();
+            let completed = normalize_claude_runtime_events(
+                &json!({
+                    "type": "user",
+                    "session_id": session_id,
+                    "message": {"content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "completed"
+                    }]},
+                    "tool_use_result": {
+                        "type": result_type,
+                        "filePath": "/repo/src/app.ts",
+                        "content": "must-not-be-published",
+                        "originalFile": null
+                    }
+                }),
+                session_id,
+                &mut state,
+            )
+            .unwrap();
+
+            assert_eq!(
+                completed[0]
+                    .payload
+                    .pointer("/runtimeFileOperation/changeKind"),
+                Some(&json!(expected_change_kind))
+            );
+            assert!(
+                !completed[0]
+                    .payload
+                    .to_string()
+                    .contains("must-not-be-published")
+            );
+        }
+
+        for (tool_name, result_type, result_path) in [
+            ("Write", "create", "/repo/src/app.ts"),
+            ("Write", "create", "/repo/src/other.ts"),
+            ("Write", "replace", "/repo/src/app.ts"),
+            ("Edit", "create", "/repo/src/app.ts"),
+        ] {
+            let tool_use_id = format!("toolu-no-classification-{tool_name}-{result_type}");
+            let mut state = ClaudeCodeStreamState::default();
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "assistant",
+                    "session_id": session_id,
+                    "message": {"content": [{
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": tool_name,
+                        "input": {"file_path": "/repo/src/app.ts", "content": "new content"}
+                    }]}
+                }),
+                session_id,
+                &mut state,
+            )
+            .unwrap();
+            let completed = normalize_claude_runtime_events(
+                &json!({
+                    "type": "user",
+                    "session_id": session_id,
+                    "message": {"content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "completed"
+                    }]},
+                    "tool_use_result": {"type": result_type, "filePath": result_path}
+                }),
+                session_id,
+                &mut state,
+            )
+            .unwrap();
+            assert!(
+                completed[0]
+                    .payload
+                    .pointer("/runtimeFileOperation/changeKind")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_keeps_exact_typed_queries_through_a_sparse_result() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let queries = json!(["password=公开测试词 token=也照常展示", "第二个搜索词"]);
+        let mut state = ClaudeCodeStreamState::default();
+        let started = normalize_claude_runtime_events(
+            &json!({
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "toolu_web_search_1",
+                    "name": "WebSearch",
+                    "input": {"query": queries.clone(), "providerPrivate": "must-not-leak"}
+                }]}
+            }),
+            session_id,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(started[0].payload["kind"], "web_search");
+        assert!(started[0].payload.get("query").is_none());
+        assert_eq!(
+            started[0]
+                .payload
+                .pointer("/runtimeSearchOperationCandidate/query"),
+            Some(&queries[0])
+        );
+        assert_eq!(
+            started[0]
+                .payload
+                .pointer("/runtimeSearchOperationCandidate/queries"),
+            Some(&queries)
+        );
+        assert!(started[0].payload["input"].is_null());
+        assert!(
+            !serde_json::to_string(&started[0].payload)
+                .unwrap()
+                .contains("must-not-leak")
+        );
+
+        let completed = normalize_claude_runtime_events(
+            &json!({
+                "type": "user",
+                "session_id": session_id,
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_web_search_1",
+                    "content": "completed"
+                }]}
+            }),
+            session_id,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(completed[0].payload["kind"], "web_search");
+        assert!(completed[0].payload.get("query").is_none());
+        assert_eq!(
+            completed[0]
+                .payload
+                .pointer("/runtimeSearchOperationCandidate/query"),
+            Some(&queries[0])
+        );
+        assert_eq!(
+            completed[0]
+                .payload
+                .pointer("/runtimeSearchOperationCandidate/queries"),
+            Some(&queries)
+        );
+    }
+
+    #[test]
+    fn failed_incomplete_replace_all_and_non_edit_tools_never_emit_exact_mutation() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let cases = [
+            (
+                "toolu_failed",
+                "Edit",
+                json!({
+                    "file_path": "/repo/src/app.ts",
+                    "old_string": "before",
+                    "new_string": "after"
+                }),
+                true,
+            ),
+            (
+                "toolu_replace_all",
+                "Edit",
+                json!({
+                    "file_path": "/repo/src/app.ts",
+                    "old_string": "before",
+                    "new_string": "after",
+                    "replace_all": true
+                }),
+                false,
+            ),
+            (
+                "toolu_incomplete",
+                "Edit",
+                json!({
+                    "file_path": "/repo/src/app.ts",
+                    "new_string": "after"
+                }),
+                false,
+            ),
+            (
+                "toolu_write",
+                "Write",
+                json!({
+                    "file_path": "/repo/src/app.ts",
+                    "content": "complete new file"
+                }),
+                false,
+            ),
+            (
+                "toolu_notebook",
+                "NotebookEdit",
+                json!({
+                    "notebook_path": "/repo/notebook.ipynb",
+                    "new_source": "print('updated')"
+                }),
+                false,
+            ),
+            (
+                "toolu_apply_patch",
+                "ApplyPatch",
+                json!({"patch": "*** Begin Patch\nprivate patch\n*** End Patch"}),
+                false,
+            ),
+        ];
+
+        for (tool_use_id, tool_name, input, failed) in cases {
+            let mut state = ClaudeCodeStreamState::default();
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "assistant",
+                    "session_id": session_id,
+                    "message": {"content": [{
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": tool_name,
+                        "input": input
+                    }]}
+                }),
+                session_id,
+                &mut state,
+            )
+            .expect("Tool start should normalize");
+            let completed = normalize_claude_runtime_events(
+                &json!({
+                    "type": "user",
+                    "session_id": session_id,
+                    "message": {"content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "is_error": failed,
+                        "content": if failed { "cancelled" } else { "completed" }
+                    }]}
+                }),
+                session_id,
+                &mut state,
+            )
+            .expect("Tool result should normalize");
+            assert_eq!(completed.len(), 1, "{tool_use_id}");
+            assert!(
+                completed[0].payload.get("runtimeDiff").is_none(),
+                "{tool_use_id} must remain an ordinary Tool Activity"
+            );
+        }
+
+        let mut malformed_result_state = ClaudeCodeStreamState::default();
+        normalize_claude_runtime_events(
+            &json!({
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "toolu_malformed_result",
+                    "name": "Edit",
+                    "input": {
+                        "file_path": "/repo/src/app.ts",
+                        "old_string": "before",
+                        "new_string": "after"
+                    }
+                }]}
+            }),
+            session_id,
+            &mut malformed_result_state,
+        )
+        .unwrap();
+        let malformed_result = normalize_claude_runtime_events(
+            &json!({
+                "type": "user",
+                "session_id": session_id,
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_malformed_result",
+                    "is_error": "false",
+                    "content": "ambiguous"
+                }]}
+            }),
+            session_id,
+            &mut malformed_result_state,
+        )
+        .unwrap();
+        assert!(malformed_result[0].payload.get("runtimeDiff").is_none());
+    }
+
+    #[test]
+    fn consecutive_edits_of_one_file_keep_distinct_tool_identities() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let mut state = ClaudeCodeStreamState::default();
+        let mut completed_ids = Vec::new();
+        for (tool_use_id, old_text, new_text) in [
+            ("toolu_edit_first", "false", "true"),
+            ("toolu_edit_second", "true", "enabled"),
+        ] {
+            normalize_claude_runtime_events(
+                &json!({
+                    "type": "assistant",
+                    "session_id": session_id,
+                    "message": {"content": [{
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "/repo/src/app.ts",
+                            "old_string": old_text,
+                            "new_string": new_text
+                        }
+                    }]}
+                }),
+                session_id,
+                &mut state,
+            )
+            .expect("Edit start should normalize");
+            let completed = normalize_claude_runtime_events(
+                &json!({
+                    "type": "user",
+                    "session_id": session_id,
+                    "message": {"content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "updated"
+                    }]}
+                }),
+                session_id,
+                &mut state,
+            )
+            .expect("Edit result should normalize");
+            assert_eq!(completed.len(), 1);
+            assert_eq!(
+                completed[0].payload.pointer("/runtimeDiff/entries/0/path"),
+                Some(&json!("/repo/src/app.ts"))
+            );
+            completed_ids.push(
+                completed[0].payload["toolCallId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(completed_ids, ["toolu_edit_first", "toolu_edit_second"]);
+    }
+
+    // This seam owns sustained stdout reading while native Approval is pending;
+    // the writer-only tests cannot prove ordinary parsing continues.
+    #[tokio::test]
+    async fn native_permissions_do_not_block_stdout_or_replace_the_last_result() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let session = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let (events, mut received) = mpsc::unbounded_channel();
+        let (control, ready, writes) =
+            ClaudeControl::new(session.into(), "acceptEdits".into(), Some(events.clone()));
+        let (stdin, output) = tokio::io::duplex(4096);
+        let mut input = BufReader::new(output);
+        let writer = tokio::spawn(claude_control::write_control_stream(
+            stdin,
+            control.clone(),
+            writes,
+        ));
+        let init = tokio::spawn({
+            let control = control.clone();
+            async move {
+                control.initialize().await?;
+                ready.await
+            }
+        });
+        let mut line = String::new();
+        input.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        control
+            .route(
+                &json!({"type":"control_response","response":{"subtype":"success",
+            "request_id":request["request_id"],"response":{}}}),
+            )
+            .unwrap();
+        init.await.unwrap().unwrap();
+        control.send_prompt("task").await.unwrap();
+        line.clear();
+        input.read_line(&mut line).await.unwrap();
+        let (mut stdout, reader) = tokio::io::duplex(65536);
+        let capture = tokio::spawn(capture_claude_stream(
+            reader,
+            session.into(),
+            "turn".into(),
+            None,
+            Some(events),
+            Arc::new(AtomicBool::new(false)),
+            Some(control.clone()),
+        ));
+        let tool_input = json!({"command":"rovai send --public-only --body same"});
+        let frames = [
+            json!({"type":"system","subtype":"session_state_changed","session_id":session,"state":"running"}),
+            json!({"type":"control_request","request_id":"approval","request":{"subtype":"can_use_tool",
+                "tool_use_id":"tool","tool_name":"Bash","input":tool_input}}),
+            json!({"type":"control_request","request_id":"question","request":{"subtype":"can_use_tool",
+                "tool_use_id":"question-tool","tool_name":"AskUserQuestion","input":{"questions":[]}}}),
+            json!({"type":"assistant","session_id":session,"message":{"id":"message","content":[{"type":"text","text":"Still reading"}]}}),
+            json!({"type":"result","subtype":"success","is_error":false,"result":"early","session_id":session,"usage":{"output_tokens":1}}),
+        ];
+        for frame in frames {
+            stdout
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            received.recv().await.unwrap().event_type,
+            "claude.permission_request"
+        );
+        let text = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = received.recv().await.unwrap();
+                if event.event_type == "agent.text.completed" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("pending Approval must not block stdout");
+        assert_eq!(text.payload["text"], "Still reading");
+        assert!(!capture.is_finished());
+        control
+            .respond(
+                json!("approval"),
+                json!({"behavior":"allow","updatedInput":tool_input}),
+            )
+            .await
+            .unwrap();
+        for frame in [
+            json!({"type":"assistant","session_id":session,"message":{"id":"continuation","content":[{"type":"text","text":"Continuation"}]}}),
+            json!({"type":"result","subtype":"success","is_error":false,"result":"last","session_id":session,"usage":{"output_tokens":2}}),
+            json!({"type":"system","subtype":"session_state_changed","session_id":session,"state":"idle"}),
+        ] {
+            stdout
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        writer.await.unwrap().unwrap();
+        stdout.shutdown().await.unwrap();
+        let final_result = capture.await.unwrap().unwrap().final_result.unwrap();
+        assert_eq!(final_result.result, "last");
+        assert_eq!(final_result.usage["output_tokens"], 2);
+        assert!(control.has_unsupported_questionnaire());
+        let error = validate_claude_terminal_result(
+            &final_result,
+            session,
+            "turn",
+            control.has_unsupported_questionnaire(),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ClaudeCodeDeliveredFailure>()
+                .unwrap()
+                .error_code,
+            "runtime_questionnaire_unsupported"
+        );
+        let mut responses = String::new();
+        input.read_to_string(&mut responses).await.unwrap();
+        let responses = responses
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        let question = responses
+            .iter()
+            .find(|response| response["response"]["request_id"] == "question")
+            .unwrap();
+        assert_eq!(question["response"]["response"]["behavior"], "deny");
+        assert!(
+            question["response"]["response"]
+                .get("updatedInput")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_reports_acceptance_before_the_terminal_result() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let native_turn_id = "claude-code:run-1:1";
+        let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+        let (accepted_sender, mut accepted_receiver) = mpsc::unbounded_channel();
+        let (runtime_event_sender, mut runtime_event_receiver) = mpsc::unbounded_channel();
+        let (finish_sender, finish_receiver) = oneshot::channel();
+        let session_id_for_writer = session_id.to_string();
+        let writer_task = tokio::spawn(async move {
+            for event in [
+                json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": session_id_for_writer
+                }),
+                json!({
+                    "type": "stream_event",
+                    "session_id": session_id_for_writer,
+                    "event": {"type": "message_start"}
+                }),
+                json!({
+                    "type": "stream_event",
+                    "session_id": session_id_for_writer,
+                    "event": {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "toolu_bash_1",
+                            "name": "Bash",
+                            "input": {}
+                        }
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "session_id": session_id_for_writer,
+                    "message": {"content": [{
+                        "type": "tool_use",
+                        "id": "toolu_bash_1",
+                        "name": "Bash",
+                        "input": {
+                            "command": "printf CLAUDE_PRINTF_OK",
+                            "privateProviderField": "CLAUDE_TOOL_INPUT_MUST_NOT_LEAK"
+                        }
+                    }]}
+                }),
+                json!({
+                    "type": "user",
+                    "session_id": session_id_for_writer,
+                    "message": {"content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_bash_1",
+                        "content": "fallback must not win"
+                    }]},
+                    "tool_use_result": {
+                        "stdout": "CLAUDE_PRINTF_OK",
+                        "stderr": "",
+                        "privateCommand": "CLAUDE_MUST_NOT_LEAK"
+                    }
+                }),
+                json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "result": "early result must not become public fallback",
+                    "session_id": session_id_for_writer,
+                    "usage": {"input_tokens": 1}
+                }),
+                json!({
+                    "type": "system",
+                    "subtype": "api_retry",
+                    "attempt": 1,
+                    "max_retries": 2,
+                    "retry_delay_ms": 1_000,
+                    "session_id": session_id_for_writer
+                }),
+            ] {
+                writer
+                    .write_all(format!("{event}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            finish_receiver.await.unwrap();
+            let result = json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "done",
+                "session_id": session_id_for_writer,
+                "usage": {"input_tokens": 2}
+            });
+            writer
+                .write_all(format!("{result}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let capture_task = tokio::spawn(capture_claude_stream(
+            reader,
+            session_id.to_string(),
+            native_turn_id.to_string(),
+            Some(accepted_sender),
+            Some(runtime_event_sender),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        ));
+
+        let accepted = tokio::time::timeout(Duration::from_secs(1), accepted_receiver.recv())
+            .await
+            .expect("accepted evidence should precede the terminal result")
+            .expect("acceptance channel should remain open");
+        assert_eq!(accepted.native_session_id, session_id);
+        assert_eq!(accepted.native_turn_id, native_turn_id);
+        let init_fast = tokio::time::timeout(Duration::from_secs(1), runtime_event_receiver.recv())
+            .await
+            .expect("init metadata should be emitted without waiting for a Fast field")
+            .unwrap();
+        assert_eq!(init_fast.event_type, "runtime.fast.observed");
+        assert_eq!(init_fast.payload["state"], "unknown");
+        let started = tokio::time::timeout(Duration::from_secs(1), runtime_event_receiver.recv())
+            .await
+            .expect("tool start should be emitted")
+            .expect("runtime event channel should remain open");
+        let completed = tokio::time::timeout(Duration::from_secs(1), runtime_event_receiver.recv())
+            .await
+            .expect("tool result should be emitted")
+            .expect("runtime event channel should remain open");
+        assert_eq!(started.payload["toolCallId"], "toolu_bash_1");
+        assert_eq!(started.payload["status"], "in_progress");
+        assert_eq!(started.payload["kind"], "execute");
+        assert_eq!(started.payload["input"], "printf CLAUDE_PRINTF_OK");
+        assert_eq!(completed.payload["toolCallId"], "toolu_bash_1");
+        assert_eq!(completed.payload["status"], "completed");
+        assert_eq!(completed.payload["input"], "printf CLAUDE_PRINTF_OK");
+        assert_eq!(completed.payload["output"], "CLAUDE_PRINTF_OK");
+        let early_fast =
+            tokio::time::timeout(Duration::from_secs(1), runtime_event_receiver.recv())
+                .await
+                .expect("early result metadata should precede subsequent events")
+                .unwrap();
+        assert_eq!(early_fast.event_type, "runtime.fast.observed");
+        assert_eq!(early_fast.payload["state"], "unknown");
+        let after_early_result =
+            tokio::time::timeout(Duration::from_secs(1), runtime_event_receiver.recv())
+                .await
+                .expect("events after an early result should arrive before EOF")
+                .expect("events after an early result must still be processed");
+        assert_eq!(after_early_result.event_type, "runtime.diagnostic");
+        assert_eq!(after_early_result.payload["code"], "runtime_api_retrying");
+        assert!(
+            !serde_json::to_string(&completed.payload)
+                .expect("normalized event should serialize")
+                .contains("CLAUDE_MUST_NOT_LEAK")
+        );
+        assert!(
+            !serde_json::to_string(&started.payload)
+                .expect("normalized event should serialize")
+                .contains("CLAUDE_TOOL_INPUT_MUST_NOT_LEAK")
+        );
+        assert!(
+            runtime_event_receiver.try_recv().is_err(),
+            "duplicate complete assistant tool_use must not create another start"
+        );
+        finish_sender.send(()).unwrap();
+
+        let captured = capture_task.await.unwrap().unwrap();
+        let final_result = captured.final_result.unwrap();
+        assert_eq!(final_result.result, "done");
+        assert_eq!(final_result.usage["input_tokens"], 2);
+        writer_task.await.unwrap();
+        let final_fast = runtime_event_receiver.recv().await.unwrap();
+        assert_eq!(final_fast.event_type, "runtime.fast.observed");
+        assert_eq!(final_fast.payload["state"], "unknown");
+        let fallback_narration = runtime_event_receiver
+            .recv()
+            .await
+            .expect("the success result should provide a public narration fallback");
+        assert_eq!(fallback_narration.event_type, "agent.text.delta");
+        assert_eq!(fallback_narration.payload["itemId"], "claude-final");
+        assert_eq!(fallback_narration.payload["delta"], "done");
+        assert!(runtime_event_receiver.try_recv().is_err());
+        assert!(accepted_receiver.try_recv().is_err());
+        assert_eq!(claude_tool_kind("Bash"), "execute");
+        assert_eq!(claude_tool_kind("Read"), "read");
+        assert_eq!(claude_tool_kind("Grep"), "file_search");
+        assert_eq!(claude_tool_kind("WebSearch"), "web_search");
+        assert_eq!(claude_tool_kind("Edit"), "edit");
+        assert_eq!(claude_tool_kind("Write"), "write");
+        assert_eq!(claude_tool_kind("FutureTool"), "tool");
+    }
+
+    // A later terminal failure must not be masked by an earlier success result.
+    #[tokio::test]
+    async fn later_claude_result_controls_failure_and_invalid_frames_still_fail() {
+        let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let early = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "early success",
+            "session_id": session_id
+        });
+        let cases = [
+            (
+                "terminal error",
+                json!({
+                    "type": "result", "subtype": "error", "is_error": true,
+                    "result": "provider rejected", "session_id": session_id
+                }),
+            ),
+            (
+                "missing result field",
+                json!({
+                    "type": "result", "subtype": "success", "is_error": false,
+                    "session_id": session_id
+                }),
+            ),
+            (
+                "another session",
+                json!({
+                    "type": "result", "subtype": "success", "is_error": false,
+                    "result": "foreign result",
+                    "session_id": "5ade59ac-f87e-4827-8cf2-0e1f3ba720ea"
+                }),
+            ),
+        ];
+        for (case, last) in cases {
+            let wire = format!("{early}\n{last}\n");
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let captured = capture_claude_stream(
+                wire.as_bytes(),
+                session_id.into(),
+                "claude-code:run-1:1".into(),
+                None,
+                Some(sender),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+            if case == "terminal error" {
+                let output = captured.unwrap().final_result.unwrap();
+                let failure = validate_claude_terminal_result(
+                    &output,
+                    session_id,
+                    "claude-code:run-1:1",
+                    false,
+                    &[],
+                )
+                .expect_err("the later error must determine the terminal outcome");
+                assert_eq!(
+                    failure
+                        .downcast_ref::<ClaudeCodeDeliveredFailure>()
+                        .unwrap()
+                        .failure
+                        .origin,
+                    RuntimeFailureOrigin::Runtime
+                );
+            } else {
+                assert!(captured.is_err(), "{case} must fail stream parsing");
+            }
+            while let Ok(event) = receiver.try_recv() {
+                assert_eq!(
+                    event.event_type, "runtime.fast.observed",
+                    "{case} must not publish the early success as a fallback"
+                );
+            }
+        }
+    }
+}

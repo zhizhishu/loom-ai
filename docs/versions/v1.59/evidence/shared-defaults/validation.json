@@ -1,0 +1,27 @@
+{
+  "status": "passed",
+  "sourceCommit": "ee224fa0cb7a2114183ad43abefbc89c78975178",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "packagedApp": true,
+  "legacyDesktopImport": true,
+  "webGeneralDefaults": true,
+  "webChangeVisibleInDesktop": true,
+  "newDialogSavedSelection": true,
+  "oneClickPendingCreation": true,
+  "refreshSettings": true,
+  "dialogColors": [
+    {
+      "theme": "day",
+      "background": "rgb(43, 43, 44)",
+      "foreground": "rgb(255, 255, 255)"
+    },
+    {
+      "theme": "night",
+      "background": "rgb(229, 229, 231)",
+      "foreground": "rgb(23, 23, 25)"
+    }
+  ],
+  "runtimeAvailability": "browser-fixture",
+  "realRuntime": false
+}

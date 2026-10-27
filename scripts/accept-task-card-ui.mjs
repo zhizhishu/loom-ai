@@ -1,0 +1,942 @@
+import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, join, resolve } from 'node:path'
+import { spawn } from 'node:child_process'
+import { createInterface } from 'node:readline'
+import { seedCompletedOnboardingForAcceptance } from './lib/dev-desktop.mjs'
+import { coreDataDirectoryArguments } from './lib/runtime-camp-files-root.mjs'
+
+const root = resolve(import.meta.dirname, '..')
+const appPath = resolve(process.argv[2] ?? join(root, 'dist', 'mac-arm64', 'Rovai AI.app'))
+const fixtureRoot = process.env.ROVAI_TASK_CARD_ACCEPT_FIXTURE_ROOT
+  ?? await mkdtemp(join(tmpdir(), 'rovai-task-card-ui-accept-'))
+const dataDir = join(fixtureRoot, 'user-data')
+const runtimeTempDir = process.env.ROVAI_TASK_CARD_ACCEPT_RUNTIME_TMP
+  ?? await mkdtemp('/tmp/rv-task-')
+const outputDir = process.env.ROVAI_TASK_CARD_ACCEPT_OUTPUT_DIR
+  ?? await mkdtemp(join(tmpdir(), 'rovai-task-card-ui-captures-'))
+const databasePath = join(dataDir, 'rovai.sqlite')
+const firstPort = Number(process.env.ROVAI_TASK_CARD_ACCEPT_DEBUG_PORT ?? 9501)
+
+await mkdir(dataDir, { recursive: true })
+seedCompletedOnboardingForAcceptance(dataDir)
+await mkdir(outputDir, { recursive: true })
+
+const fixture = await createFixtureCamp()
+let desktopApp = null
+let compactApp = null
+
+try {
+  desktopApp = await launchApp(firstPort, 1440, 920, false)
+  await setTheme(desktopApp.cdp, 'day')
+  await openCamp(desktopApp.cdp, fixture.threadId)
+
+  const initialSnapshot = await request(desktopApp.cdp, 'camps.snapshot', {
+    threadId: fixture.threadId
+  })
+  assert(initialSnapshot.messages.length === 0 && initialSnapshot.tasks.length === 0,
+    `Task-card fixture did not start empty: ${JSON.stringify(initialSnapshot)}`)
+  await assertTaskCreateAction(desktopApp.cdp, 0)
+
+  const createdTask = await request(desktopApp.cdp, 'tasks.create', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    title: '确认任务卡创建位置',
+    description: '这段说明只能出现在任务详情，不能出现在会话卡片。任务卡保持唯一，详情完整展示责任与审计。',
+    assigneeAgentId: fixture.primaryAssignee.id
+  })
+  const completedTaskId = createdTask.payload?.taskId
+  assert(createdTask.status === 'applied' && completedTaskId,
+    `Could not create completed-path Task: ${JSON.stringify(createdTask)}`)
+
+  await waitForTaskCard(desktopApp.cdp, '确认任务卡创建位置', '待处理', 1, '任务责任已更新')
+  await markTaskCard(desktopApp.cdp, completedTaskId)
+  await assertTaskCardProjection(desktopApp.cdp, {
+    title: '确认任务卡创建位置',
+    status: '待处理',
+    statusKey: 'pending',
+    headline: '任务责任已更新',
+    noteLabel: '当前',
+    note: '等待负责人开始；创建不会自动启动执行',
+    assigneeName: fixture.primaryAssignee.name,
+    assignment: 'assigned',
+    count: 1
+  })
+
+  let task = await getTask(desktopApp.cdp, fixture.threadId, completedTaskId)
+  const startedTask = await request(desktopApp.cdp, 'tasks.update', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    taskId: completedTaskId,
+    title: '任务卡已原地更新',
+    description: '更新后的说明仍然只能在任务详情里看到。',
+    status: 'in_progress',
+    assignee: {
+      operation: 'assign',
+      agentId: fixture.secondaryAssignee.id
+    }
+  })
+  assert(startedTask.status === 'applied',
+    `Could not update Task in place: ${JSON.stringify(startedTask)}`)
+  await waitForTaskCard(desktopApp.cdp, '任务卡已原地更新', '进行中', 1, '任务正在推进')
+  await assertMarkedTaskCard(desktopApp.cdp, completedTaskId)
+  await assertTaskCardProjection(desktopApp.cdp, {
+    title: '任务卡已原地更新',
+    status: '进行中',
+    statusKey: 'in_progress',
+    headline: '任务正在推进',
+    noteLabel: '当前',
+    note: '任务处于进行中；打开详情可查看责任与关联执行',
+    assigneeName: fixture.secondaryAssignee.name,
+    assignment: 'assigned',
+    count: 1
+  })
+
+  task = await getTask(desktopApp.cdp, fixture.threadId, completedTaskId)
+  const blockedTask = await request(desktopApp.cdp, 'tasks.update', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    taskId: completedTaskId,
+    status: 'blocked',
+    assignee: { operation: 'unchanged' },
+    blockedReason: '等待确认外部依赖的可用窗口。'
+  })
+  assert(blockedTask.status === 'applied',
+    `Could not block Task in place: ${JSON.stringify(blockedTask)}`)
+  await waitForTaskCard(desktopApp.cdp, '任务卡已原地更新', '已阻塞', 1, '任务暂时受阻')
+  await assertMarkedTaskCard(desktopApp.cdp, completedTaskId)
+  await assertTaskCardProjection(desktopApp.cdp, {
+    title: '任务卡已原地更新',
+    status: '已阻塞',
+    statusKey: 'blocked',
+    headline: '任务暂时受阻',
+    noteLabel: '阻塞原因',
+    note: '等待确认外部依赖的可用窗口。',
+    assigneeName: fixture.secondaryAssignee.name,
+    assignment: 'assigned',
+    count: 1
+  })
+
+  task = await getTask(desktopApp.cdp, fixture.threadId, completedTaskId)
+  const resumedTask = await request(desktopApp.cdp, 'tasks.update', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    taskId: completedTaskId,
+    status: 'in_progress',
+    assignee: { operation: 'unchanged' }
+  })
+  assert(resumedTask.status === 'applied',
+    `Could not resume Task in place: ${JSON.stringify(resumedTask)}`)
+  await waitForTaskCard(desktopApp.cdp, '任务卡已原地更新', '进行中', 1, '任务正在推进')
+  await assertMarkedTaskCard(desktopApp.cdp, completedTaskId)
+
+  task = await getTask(desktopApp.cdp, fixture.threadId, completedTaskId)
+  const completedTask = await request(desktopApp.cdp, 'tasks.update', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    taskId: completedTaskId,
+    status: 'completed',
+    completionSummary: '任务卡路径已验证完成。'
+  })
+  assert(completedTask.status === 'applied',
+    `Could not complete Task: ${JSON.stringify(completedTask)}`)
+  await waitForTaskCard(desktopApp.cdp, '任务卡已原地更新', '已完成', 1, '任务已经完成')
+  await assertMarkedTaskCard(desktopApp.cdp, completedTaskId)
+  await assertTaskCardProjection(desktopApp.cdp, {
+    title: '任务卡已原地更新',
+    status: '已完成',
+    statusKey: 'completed',
+    headline: '任务已经完成',
+    noteLabel: '完成摘要',
+    note: '任务卡路径已验证完成。',
+    assigneeName: fixture.secondaryAssignee.name,
+    assignment: 'assigned',
+    count: 1
+  })
+
+  const createdCancelledTask = await request(desktopApp.cdp, 'tasks.create', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    title: '取消路径仍复用原卡',
+    description: '取消后保留在任务详情与审计记录。',
+    assigneeAgentId: fixture.primaryAssignee.id
+  })
+  const cancelledTaskId = createdCancelledTask.payload?.taskId
+  assert(createdCancelledTask.status === 'applied' && cancelledTaskId,
+    `Could not create cancellation-path Task: ${JSON.stringify(createdCancelledTask)}`)
+  await waitForTaskCard(desktopApp.cdp, '取消路径仍复用原卡', '待处理', 2, '任务责任已更新')
+  await markTaskCard(desktopApp.cdp, cancelledTaskId)
+
+  task = await getTask(desktopApp.cdp, fixture.threadId, cancelledTaskId)
+  const releasedTask = await request(desktopApp.cdp, 'tasks.update', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    taskId: cancelledTaskId,
+    status: 'pending',
+    assignee: { operation: 'clear' }
+  })
+  assert(releasedTask.status === 'applied',
+    `Could not release Task responsibility: ${JSON.stringify(releasedTask)}`)
+  await waitForTaskCard(desktopApp.cdp, '取消路径仍复用原卡', '待处理', 2, '任务等待重新分配')
+  await assertMarkedTaskCard(desktopApp.cdp, cancelledTaskId)
+  await assertTaskCardProjection(desktopApp.cdp, {
+    title: '取消路径仍复用原卡',
+    status: '待处理',
+    statusKey: 'pending',
+    headline: '任务等待重新分配',
+    noteLabel: '需要处理',
+    note: '等待用户或默认负责人重新分配',
+    assigneeName: '未分配',
+    assignment: 'unassigned',
+    count: 2
+  })
+  const liveStatesCapture = join(outputDir, 'task-card-live-states-day-1440x920.png')
+  await capture(desktopApp.cdp, liveStatesCapture)
+
+  task = await getTask(desktopApp.cdp, fixture.threadId, cancelledTaskId)
+  const reassignedTask = await request(desktopApp.cdp, 'tasks.update', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    taskId: cancelledTaskId,
+    status: 'pending',
+    assignee: {
+      operation: 'assign',
+      agentId: fixture.primaryAssignee.id
+    }
+  })
+  assert(reassignedTask.status === 'applied',
+    `Could not reassign Task responsibility: ${JSON.stringify(reassignedTask)}`)
+  await waitForTaskCard(desktopApp.cdp, '取消路径仍复用原卡', '待处理', 2, '任务责任已更新')
+  await assertMarkedTaskCard(desktopApp.cdp, cancelledTaskId)
+
+  task = await getTask(desktopApp.cdp, fixture.threadId, cancelledTaskId)
+  const cancelledTask = await request(desktopApp.cdp, 'tasks.update', {
+    commandId: crypto.randomUUID(),
+    threadId: fixture.threadId,
+    taskId: cancelledTaskId,
+    status: 'cancelled',
+    cancelReason: '该责任不再需要继续。'
+  })
+  assert(cancelledTask.status === 'applied',
+    `Could not cancel Task: ${JSON.stringify(cancelledTask)}`)
+  await waitForTaskCard(desktopApp.cdp, '取消路径仍复用原卡', '已取消', 2, '任务已经取消')
+  await assertMarkedTaskCard(desktopApp.cdp, cancelledTaskId)
+  await assertTaskCardProjection(desktopApp.cdp, {
+    title: '取消路径仍复用原卡',
+    status: '已取消',
+    statusKey: 'cancelled',
+    headline: '任务已经取消',
+    noteLabel: '取消原因',
+    note: '该责任不再需要继续。',
+    assigneeName: fixture.primaryAssignee.name,
+    assignment: 'assigned',
+    count: 2
+  })
+
+  const terminalSnapshot = await request(desktopApp.cdp, 'camps.snapshot', {
+    threadId: fixture.threadId
+  })
+  assert(terminalSnapshot.tasks.length === 2 && terminalSnapshot.messages.length === 0,
+    `Task lifecycle created a CampMessage or lost a Task: ${JSON.stringify(terminalSnapshot)}`)
+  await assertTaskCreateAction(desktopApp.cdp, 2)
+
+  await openTaskDetails(desktopApp.cdp, '任务卡已原地更新')
+  await assertTerminalDetails(desktopApp.cdp, '更新后的说明仍然只能在任务详情里看到。')
+  await assertNoHorizontalOverflow(desktopApp.cdp, '1440×920')
+  const desktopCapture = join(outputDir, 'task-card-details-day-1440x920.png')
+  await capture(desktopApp.cdp, desktopCapture)
+
+  await closeApp(desktopApp)
+  desktopApp = null
+  await wait(500)
+
+  compactApp = await launchApp(firstPort + 1, 1040, 700, true)
+  await setTheme(compactApp.cdp, 'night')
+  await openCamp(compactApp.cdp, fixture.threadId)
+  await waitForTaskCard(compactApp.cdp, '任务卡已原地更新', '已完成', 2, '任务已经完成')
+  const compactCardCapture = join(outputDir, 'task-card-night-1040x700-reduced-motion.png')
+  await capture(compactApp.cdp, compactCardCapture)
+  await openTaskDetailsWithKeyboard(compactApp.cdp, '取消路径仍复用原卡')
+  await assertTerminalDetails(compactApp.cdp, '取消后保留在任务详情与审计记录。')
+  await assertNoHorizontalOverflow(compactApp.cdp, '1040×700 reduced-motion')
+  const compactCapture = join(outputDir, 'task-card-details-compact-1040x700.png')
+  await capture(compactApp.cdp, compactCapture)
+  await emulateDesktopZoom(compactApp.cdp, 1040, 700, 2)
+  await assertZoomedTaskFunctionality(compactApp.cdp)
+  const zoomCapture = join(outputDir, 'task-card-details-compact-1040x700-zoom-200.png')
+  await capture(compactApp.cdp, zoomCapture)
+  await emulateDesktopZoom(compactApp.cdp, 1440, 920, 1)
+  const editorLifecycle = await verifyTaskEditorLifecycle(compactApp.cdp, fixture)
+
+  console.log(JSON.stringify({
+    ok: true,
+    app: basename(appPath),
+    fixtureRoot,
+    outputDir,
+    verified: {
+      createProjectsExactlyOneCard: true,
+      titleStatusAndAssigneeUpdateInPlace: true,
+      pendingInProgressBlockedCompletedCancelledStates: true,
+      unassignedPendingRecoveryVariant: true,
+      completionAndCancellationReuseCard: true,
+      prototypeOnlyAnnotationsExcluded: true,
+      descriptionOnlyAppearsInDetails: true,
+      taskLifecycleCreatesNoCampMessages: true,
+      taskCardOpensCurrentTerminalDetails: true,
+      keyboardOpensTaskDetails: true,
+      responsibilityDescriptionAndAuditDetailsVisible: true,
+      taskCreateActionReplacesLegacyToolbar: true,
+      taskCreateTitleReceivesFocus: true,
+      taskCreateCancelRestoresPreviousList: true,
+      taskEditorLifecycle: editorLifecycle,
+      dayAndNightTaskCardThemes: true,
+      desktopAndCompactReducedMotionLayouts: true,
+      zoom200KeepsTaskFunctionality: true,
+      horizontalOverflow: false
+    },
+    captures: {
+      liveStates: liveStatesCapture,
+      desktop: desktopCapture,
+      compactCard: compactCardCapture,
+      compact: compactCapture,
+      zoom200: zoomCapture
+    }
+  }, null, 2))
+} finally {
+  if (desktopApp) await closeApp(desktopApp)
+  if (compactApp) await closeApp(compactApp)
+}
+
+async function createFixtureCamp() {
+  const core = startCore(dataDir)
+  try {
+    await core.request('health.check')
+    const preflight = await core.request('camps.creationPreflight')
+    const presentMembers = preflight.presentMembers
+    assert(presentMembers.length > 0,
+      `Task-card fixture has no present members: ${JSON.stringify(preflight)}`)
+    const created = await core.request('camps.create', {
+      commandId: crypto.randomUUID(),
+      name: 'v0.38 任务卡原地更新验收',
+      workspace: null,
+      memberAgentIds: presentMembers.map((member) => member.agentId),
+      defaultLeadAgentId: preflight.initialLeadAgentId,
+      collaborationMode: 'peer',
+      activationState: 'active'
+    })
+    assert(created.status === 'applied' && created.payload?.threadId,
+      `Could not create task-card fixture Camp: ${JSON.stringify(created)}`)
+    const primary = presentMembers[0]
+    const secondary = presentMembers[1] ?? primary
+    return {
+      threadId: created.payload.threadId,
+      primaryAssignee: { id: primary.agentId, name: primary.displayName },
+      secondaryAssignee: { id: secondary.agentId, name: secondary.displayName }
+    }
+  } finally {
+    await core.stop()
+  }
+}
+
+async function getTask(cdp, threadId, taskId) {
+  const task = await request(cdp, 'tasks.get', { threadId, taskId })
+  assert(task?.taskId === taskId, `Could not read Task ${taskId}: ${JSON.stringify(task)}`)
+  return task
+}
+
+async function assertTaskCreateAction(cdp, expectedTaskRows) {
+  await evaluate(cdp, `document.querySelector('.camp-detail-entry[data-detail="tasks"][aria-expanded="false"]')?.click()`)
+  await waitForExpression(cdp, `document.querySelector('.camp-detail-entry[data-detail="tasks"]')?.getAttribute('aria-expanded') === 'true'`)
+  const opened = await evaluate(cdp, `(() => {
+    const action = document.querySelector('.task-new-button')
+    const before = {
+      label: action?.textContent ?? '',
+      taskRows: document.querySelectorAll('.task-list-row').length,
+      legacyExplanation: document.querySelector('.task-panel')?.textContent?.includes('普通对话不需要 Task') ?? false
+    }
+    action?.click()
+    return { opened: Boolean(action), before }
+  })()`)
+  assert(opened.opened && opened.before.label.includes('新建任务')
+      && opened.before.taskRows === expectedTaskRows && !opened.before.legacyExplanation,
+    `Task creation entry is unavailable: ${JSON.stringify(opened)}`)
+  await waitForExpression(cdp, `(() => {
+    const dialog = document.querySelector('.task-editor-dialog')
+    const title = dialog?.querySelector('input[data-dialog-autofocus]')
+    return Boolean(dialog && title && document.activeElement === title)
+      && dialog.getAttribute('role') === 'dialog'
+  })()`)
+  await evaluate(cdp, `(() => {
+    const button = [...document.querySelectorAll('.task-editor-dialog .app-dialog-footer button')]
+      .find((candidate) => candidate.textContent === '收起')
+    button?.click()
+    return Boolean(button)
+  })()`)
+  await waitForExpression(cdp, `!document.querySelector('.task-editor-dialog')
+    && document.querySelectorAll('.task-list-row').length === ${expectedTaskRows}
+    && document.activeElement === document.querySelector('.task-new-button')`)
+}
+
+async function waitForTaskCard(cdp, title, status, count, headline) {
+  const headlineMatch = headline
+    ? `card?.textContent?.includes(${JSON.stringify(headline)})`
+    : 'true'
+  await waitForExpression(cdp, `(() => {
+    const cards = [...document.querySelectorAll('button.task-event-card')]
+    const card = cards.find((candidate) => candidate.getAttribute('aria-label')
+      === ${JSON.stringify(`打开任务：${title}`)})
+    return cards.length === ${count}
+      && card?.textContent?.includes(${JSON.stringify(status)})
+      && ${headlineMatch}
+  })()`, 20_000)
+}
+
+async function markTaskCard(cdp, taskId) {
+  const marked = await evaluate(cdp, `(() => {
+    const cards = [...document.querySelectorAll('button.task-event-card')]
+    const card = cards.at(-1)
+    if (!card) return false
+    card.dataset.acceptTaskId = ${JSON.stringify(taskId)}
+    window.__taskCardAcceptanceReferences ??= {}
+    window.__taskCardAcceptanceReferences[${JSON.stringify(taskId)}] = card
+    return true
+  })()`)
+  assert(marked, `Could not mark Task card ${taskId}`)
+}
+
+async function assertMarkedTaskCard(cdp, taskId) {
+  const retained = await evaluate(cdp, `(() => {
+    const taskId = ${JSON.stringify(taskId)}
+    const card = document.querySelector('[data-accept-task-id="' + taskId + '"]')
+    return Boolean(card && window.__taskCardAcceptanceReferences?.[taskId] === card)
+  })()`)
+  assert(retained, `Task card ${taskId} was replaced instead of updated in place`)
+}
+
+async function assertTaskCardProjection(cdp, expected) {
+  const state = await evaluate(cdp, `(() => {
+    const cards = [...document.querySelectorAll('button.task-event-card')]
+    return {
+      count: cards.length,
+      cards: cards.map((card) => ({
+        copy: card.textContent ?? '',
+        label: card.getAttribute('aria-label'),
+        statusKey: card.dataset.taskStatus,
+        assignment: card.dataset.taskAssignment,
+        headline: card.querySelector('.task-card-headline')?.textContent ?? '',
+        noteLabel: card.querySelector('.task-card-note b')?.textContent ?? '',
+        note: card.querySelector('.task-card-note span')?.textContent ?? ''
+      })),
+      widths: cards.map((card) => ({ client: card.clientWidth, scroll: card.scrollWidth })),
+      descriptionVisible: [
+        '这段说明只能出现在任务详情',
+        '更新后的说明仍然只能在任务详情',
+        '取消后保留在任务详情与审计记录'
+      ].some((description) => document.querySelector('.camp-timeline')?.textContent
+        ?.includes(description) ?? false),
+      prototypeAnnotationVisible: [
+        '任务创建于',
+        '此位置不再新增状态事件',
+        '当前快照：',
+        'task_8f2a'
+      ].some((annotation) => document.querySelector('.camp-timeline')?.textContent
+        ?.includes(annotation) ?? false)
+    }
+  })()`)
+  assert(state.count === expected.count,
+    `Task card count was ${state.count}, expected ${expected.count}: ${JSON.stringify(state)}`)
+  const card = state.cards.find((candidate) => candidate.label === `打开任务：${expected.title}`)
+  assert(card
+      && card.copy.includes(expected.title)
+      && card.copy.includes(expected.status)
+      && card.copy.includes(`负责人 · ${expected.assigneeName}`)
+      && card.statusKey === expected.statusKey
+      && card.assignment === expected.assignment
+      && card.headline === expected.headline
+      && card.noteLabel === expected.noteLabel
+      && card.note === expected.note,
+  `Task card did not project current fields: ${JSON.stringify(state)}`)
+  assert(!state.descriptionVisible,
+    `Task description leaked into the conversation card: ${JSON.stringify(state)}`)
+  assert(!state.prototypeAnnotationVisible,
+    `Prototype-only annotation leaked into the product card: ${JSON.stringify(state)}`)
+  assert(state.widths.every((width) => width.client > 0 && width.scroll <= width.client + 1),
+    `Task card overflowed horizontally: ${JSON.stringify(state.widths)}`)
+}
+
+async function openTaskDetails(cdp, title) {
+  const opened = await evaluate(cdp, `(() => {
+    const label = ${JSON.stringify(`打开任务：${title}`)}
+    const card = [...document.querySelectorAll('button.task-event-card')]
+      .find((candidate) => candidate.getAttribute('aria-label') === label)
+    card?.click()
+    return Boolean(card)
+  })()`)
+  assert(opened, `Could not open Task card ${JSON.stringify(title)}`)
+  await waitForExpression(cdp, `(() => {
+    const detail = document.querySelector('.task-detail')
+    return Boolean(detail && detail.getBoundingClientRect().height > 0)
+      && !document.querySelector('.task-editor-dialog')
+  })()`)
+}
+
+async function openTaskDetailsWithKeyboard(cdp, title) {
+  await cdp.send('Page.bringToFront')
+  const focused = await evaluate(cdp, `(() => {
+    const label = ${JSON.stringify(`打开任务：${title}`)}
+    const card = [...document.querySelectorAll('button.task-event-card')]
+      .find((candidate) => candidate.getAttribute('aria-label') === label)
+    card?.focus()
+    return Boolean(card && document.activeElement === card)
+  })()`)
+  assert(focused, `Could not focus Task card ${JSON.stringify(title)}`)
+  await cdp.send('Input.dispatchKeyEvent', {
+    type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 36
+  })
+  await cdp.send('Input.dispatchKeyEvent', {
+    type: 'char', key: 'Enter', code: 'Enter', text: '\r', unmodifiedText: '\r',
+    windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 36
+  })
+  await cdp.send('Input.dispatchKeyEvent', {
+    type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 36
+  })
+  await waitForExpression(cdp, `(() => {
+    const detail = document.querySelector('.task-detail')
+    return Boolean(detail && detail.getBoundingClientRect().height > 0)
+      && !document.querySelector('.task-editor-dialog')
+  })()`)
+}
+
+async function assertTerminalDetails(cdp, expectedDescription) {
+  const state = await evaluate(cdp, `(() => {
+    const detail = document.querySelector('.task-detail')
+    const audit = detail?.querySelector('.task-audit-disclosure')
+    if (audit) audit.open = true
+    return {
+      description: detail?.querySelector('.task-detail-copy')?.textContent ?? null,
+      editable: Boolean(detail?.querySelector('.task-detail-actions')),
+      note: detail?.querySelector('.task-terminal-note')?.textContent ?? '',
+      auditVisible: Boolean(detail?.querySelector('[aria-label="任务审计信息"]')),
+      relatedExecutionVisible: Boolean(detail?.querySelector('[aria-label="关联执行"]')),
+      visible: Boolean(detail && detail.getBoundingClientRect().height > 0)
+    }
+  })()`)
+  assert(state.visible && !state.editable && state.description === expectedDescription
+      && state.auditVisible && state.relatedExecutionVisible
+      && state.note.includes('已结束的任务保留为只读记录'),
+    `Task details did not show current terminal data: ${JSON.stringify(state)}`)
+}
+
+async function assertZoomedTaskFunctionality(cdp) {
+  const state = await evaluate(cdp, `(() => {
+    const scroll = document.querySelector('.task-panel-scroll')
+    const editor = document.querySelector('.task-detail')
+    const returnButton = document.querySelector('.task-detail-navigation button')
+    const returnButtonRect = returnButton?.getBoundingClientRect()
+    const before = scroll?.scrollTop ?? 0
+    if (scroll) scroll.scrollTop = scroll.scrollHeight
+    const after = scroll?.scrollTop ?? 0
+    if (scroll) scroll.scrollTop = before
+    return {
+      cssViewport: [window.innerWidth, window.innerHeight],
+      devicePixelRatio: window.devicePixelRatio,
+      physicalViewport: [
+        Math.round(window.innerWidth * window.devicePixelRatio),
+        Math.round(window.innerHeight * window.devicePixelRatio)
+      ],
+      editorVisible: Boolean(editor),
+      returnButtonVisible: Boolean(returnButtonRect
+        && returnButtonRect.width > 0
+        && returnButtonRect.height > 0
+        && returnButtonRect.bottom > 0
+        && returnButtonRect.top < window.innerHeight),
+      auditVisible: Boolean(editor?.querySelector('[aria-label="任务审计信息"]')),
+      relatedExecutionVisible: Boolean(editor?.querySelector('[aria-label="关联执行"]')),
+      scrollable: Boolean(scroll && scroll.scrollHeight > scroll.clientHeight && after > before)
+    }
+  })()`)
+  assert(state.cssViewport[0] === 520 && state.cssViewport[1] === 350
+      && Math.abs(state.devicePixelRatio - 2) < 0.01
+      && state.physicalViewport[0] === 1040 && state.physicalViewport[1] === 700
+      && state.editorVisible && state.returnButtonVisible
+      && state.auditVisible && state.relatedExecutionVisible && state.scrollable,
+  `200% zoom hid Task functionality: ${JSON.stringify(state)}`)
+
+  const returned = await evaluate(cdp, `(() => {
+    const button = document.querySelector('.task-detail-navigation button')
+    button?.click()
+    return Boolean(button)
+  })()`)
+  assert(returned, '200% zoom made the Task return control unavailable')
+  await waitForExpression(cdp, `(() => {
+    return !document.querySelector('.task-detail')
+      && document.querySelectorAll('button.task-event-card').length === 2
+  })()`)
+  await openTaskDetails(cdp, '取消路径仍复用原卡')
+  await assertTerminalDetails(cdp, '取消后保留在任务详情与审计记录。')
+}
+
+async function setTaskField(cdp, label, value) {
+  const updated = await evaluate(cdp, `(() => {
+    const field = [...document.querySelectorAll('.app-dialog .task-field')]
+      .find((candidate) => candidate.querySelector('span')?.textContent === ${JSON.stringify(label)})
+      ?.querySelector('input, textarea, select')
+    if (!field) return false
+    const prototype = field instanceof HTMLInputElement ? HTMLInputElement.prototype
+      : field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLSelectElement.prototype
+    Object.getOwnPropertyDescriptor(prototype, 'value').set.call(field, ${JSON.stringify(value)})
+    field.dispatchEvent(new Event(field instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }))
+    return true
+  })()`)
+  assert(updated, `Task editor field is missing: ${label}`)
+  await evaluate(cdp, `new Promise((resolveFrame) => requestAnimationFrame(() => requestAnimationFrame(resolveFrame)))`, true)
+}
+
+async function verifyTaskEditorLifecycle(cdp, fixture) {
+  await evaluate(cdp, `document.querySelector('.task-detail-navigation button')?.click()`)
+  await waitForExpression(cdp, `!document.querySelector('.task-detail')`)
+  await evaluate(cdp, `document.querySelector('.task-new-button')?.click()`)
+  await waitForExpression(cdp, `Boolean(document.querySelector('.task-editor-dialog'))`)
+  await setTaskField(cdp, '标题', '浮层编辑与草稿验收')
+  await setTaskField(cdp, '责任范围与要求', '关闭后保留的任务说明。保留草稿与版本冲突时的修改。')
+  await setTaskField(cdp, '负责人', fixture.primaryAssignee.id)
+  await evaluate(cdp, `document.querySelector('.task-editor-dialog .app-dialog-close')?.click()`)
+  await waitForExpression(cdp, `!document.querySelector('.task-editor-dialog')`)
+  await evaluate(cdp, `document.querySelector('.camp-detail-entry[data-detail="members"]')?.click()`)
+  await waitForExpression(cdp, `document.querySelector('.camp-detail-entry[data-detail="members"]')?.getAttribute('aria-expanded') === 'true'`)
+  await evaluate(cdp, `document.querySelector('.camp-detail-entry[data-detail="tasks"]')?.click()`)
+  await waitForExpression(cdp, `document.querySelector('.camp-detail-entry[data-detail="tasks"]')?.getAttribute('aria-expanded') === 'true'`)
+  await evaluate(cdp, `document.querySelector('.camp-detail-entry[data-detail="tasks"]')?.click()`)
+  await waitForExpression(cdp, `document.querySelector('.camp-detail-popover')?.hidden`)
+  await evaluate(cdp, `document.querySelector('.camp-detail-entry[data-detail="tasks"]')?.click()`)
+  await evaluate(cdp, `document.querySelector('.task-new-button')?.click()`)
+  await waitForExpression(cdp, `document.querySelector('.task-editor input')?.value === '浮层编辑与草稿验收'`)
+  const restored = await evaluate(cdp, `(() => ({
+    description: document.querySelector('.task-editor textarea')?.value,
+    assignee: document.querySelector('.task-editor select')?.value
+  }))()`)
+  assert(restored.description === '关闭后保留的任务说明。保留草稿与版本冲突时的修改。'
+    && restored.assignee === fixture.primaryAssignee.id,
+    `Switching/closing Camp details lost the Task draft: ${JSON.stringify(restored)}`)
+  await evaluate(cdp, `document.querySelector('.task-editor')?.requestSubmit()`)
+  await waitForExpression(cdp, `!document.querySelector('.task-editor-dialog')`)
+  let snapshot = await request(cdp, 'camps.snapshot', { threadId: fixture.threadId })
+  const task = snapshot.tasks.find((candidate) => candidate.title === '浮层编辑与草稿验收')
+  assert(task?.description === '关闭后保留的任务说明。保留草稿与版本冲突时的修改。',
+    'Task dialog did not submit its complete draft')
+  await evaluate(cdp, `document.querySelector('.task-list-row[data-task-id="${task.taskId}"]')?.click()`)
+  await waitForExpression(cdp, `Boolean(document.querySelector('.task-detail-actions'))`)
+  await evaluate(cdp, `document.querySelector('.task-detail-actions button')?.click()`)
+  await waitForExpression(cdp, `Boolean(document.querySelector('.task-editor-dialog'))`)
+  await setTaskField(cdp, '责任范围与要求', '我在编辑器中保留的修改')
+  await setTaskField(cdp, '状态', 'blocked')
+  await setTaskField(cdp, '阻塞原因', '等待用户验收')
+  const concurrent = await request(cdp, 'tasks.update', {
+    commandId: crypto.randomUUID(), threadId: fixture.threadId, taskId: task.taskId,
+    description: '另一次操作更新了说明',
+    assignee: { operation: 'unchanged' }
+  })
+  assert(concurrent.status === 'applied', `Could not prepare a concurrent Task patch: ${JSON.stringify(concurrent)}`)
+  await evaluate(cdp, `document.querySelector('.task-editor')?.requestSubmit()`)
+  await waitForExpression(cdp, `!document.querySelector('.task-editor-dialog')
+    && document.querySelector('.task-detail-status')?.textContent === '已阻塞'`)
+  await evaluate(cdp, `document.querySelector('.task-cancel-action')?.click()`)
+  await waitForExpression(cdp, `Boolean(document.querySelector('.task-cancel-dialog'))`)
+  await setTaskField(cdp, '取消原因', '仅用于隔离 UI 验收')
+  await evaluate(cdp, `document.querySelector('.task-cancel-dialog .danger-button')?.click()`)
+  await waitForExpression(cdp, `!document.querySelector('.task-cancel-dialog')
+    && document.querySelector('.task-detail-status')?.textContent === '已取消'`)
+  snapshot = await request(cdp, 'camps.snapshot', { threadId: fixture.threadId })
+  assert(snapshot.tasks.find((candidate) => candidate.taskId === task.taskId)?.description === '另一次操作更新了说明',
+    'A field patch overwrote a concurrently updated description')
+  const cancelled = snapshot.tasks.find((candidate) => candidate.taskId === task.taskId)
+  assert(cancelled?.cancelReason === '仅用于隔离 UI 验收'
+    && snapshot.messages.length === 0 && snapshot.agentRuns.length === 0,
+    'Task editing/cancellation created an execution or lost its cancellation reason')
+  return { draftAcrossCloseAndSwitch: true, create: true, edit: true, concurrentFieldPatch: true, cancel: true, noExecutionSideEffects: true }
+}
+
+async function emulateDesktopZoom(cdp, physicalWidth, physicalHeight, zoomFactor) {
+  const cssWidth = Math.round(physicalWidth / zoomFactor)
+  const cssHeight = Math.round(physicalHeight / zoomFactor)
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: cssWidth,
+    height: cssHeight,
+    deviceScaleFactor: zoomFactor,
+    mobile: false,
+    screenWidth: physicalWidth,
+    screenHeight: physicalHeight
+  })
+  await waitForExpression(cdp, `(() => {
+    return window.innerWidth === ${cssWidth}
+      && window.innerHeight === ${cssHeight}
+      && Math.abs(window.devicePixelRatio - ${zoomFactor}) < 0.01
+  })()`)
+}
+
+async function assertNoHorizontalOverflow(cdp, context) {
+  const state = await evaluate(cdp, `(() => {
+    const timeline = document.querySelector('.camp-timeline')
+    const inspector = document.querySelector('.camp-detail-popover')
+    return {
+      document: document.documentElement.scrollWidth > window.innerWidth + 1,
+      timeline: timeline ? timeline.scrollWidth > timeline.clientWidth + 1 : true,
+      inspector: inspector ? inspector.scrollWidth > inspector.clientWidth + 1 : true,
+      viewport: [window.innerWidth, window.innerHeight]
+    }
+  })()`)
+  assert(!state.document && !state.timeline && !state.inspector,
+    `${context} overflowed horizontally: ${JSON.stringify(state)}`)
+}
+
+async function openCamp(cdp, threadId) {
+  await waitForExpression(cdp, `(() => {
+    const target = ${JSON.stringify(`camp:${threadId}`)}
+    return [...document.querySelectorAll('[data-sidebar-menu-target]')]
+      .some((element) => element.dataset.sidebarMenuTarget === target)
+  })()`, 30_000)
+  const opened = await evaluate(cdp, `(() => {
+    const target = ${JSON.stringify(`camp:${threadId}`)}
+    const menu = [...document.querySelectorAll('[data-sidebar-menu-target]')]
+      .find((element) => element.dataset.sidebarMenuTarget === target)
+    const button = menu?.closest('.camp-nav-row')?.querySelector('.camp-nav-open')
+    button?.click()
+    return Boolean(button)
+  })()`)
+  assert(opened, `Could not open Camp ${threadId}`)
+  await waitForExpression(cdp, `Boolean(document.querySelector('.camp-workspace'))`, 30_000)
+  await evaluate(cdp, `(() => {
+    const view = [...document.querySelectorAll('.camp-conversation-view-controls button')]
+      .find((button) => button.textContent === '会话')
+    if (view?.getAttribute('aria-pressed') !== 'true') view?.click()
+  })()`)
+  await waitForExpression(cdp, `document.querySelector('.camp-timeline')?.hidden === false`)
+}
+
+async function request(cdp, method, params = {}) {
+  return evaluate(cdp,
+    `window.rovai.request(${JSON.stringify(method)}, ${JSON.stringify(params)})`, true)
+}
+
+async function setTheme(cdp, preference) {
+  await evaluate(cdp,
+    `window.rovai.appearance.setPreference(${JSON.stringify(preference)})`, true)
+  const expectedTheme = preference === 'night' ? 'night' : 'day'
+  await waitForExpression(cdp,
+    `document.documentElement.dataset.theme === ${JSON.stringify(expectedTheme)}`)
+}
+
+async function launchApp(port, width, height, reducedMotion) {
+  const executable = join(appPath, 'Contents', 'MacOS', 'Rovai AI')
+  const stderr = []
+  const child = spawn(executable, [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${dataDir}`
+  ], {
+    cwd: root,
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: { ...process.env, ROVAI_ALLOW_ISOLATED_INSTANCE: '1' }
+  })
+  child.stderr.on('data', (chunk) => stderr.push(String(chunk)))
+  let cdp = null
+  try {
+    const target = await waitForTarget(port, stderr)
+    cdp = await connectCdp(target.webSocketDebuggerUrl)
+    await cdp.send('Page.enable')
+    await cdp.send('Page.bringToFront')
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width,
+      height,
+      deviceScaleFactor: 1,
+      mobile: false
+    })
+    await cdp.send('Emulation.setEmulatedMedia', {
+      features: [{
+        name: 'prefers-reduced-motion',
+        value: reducedMotion ? 'reduce' : 'no-preference'
+      }]
+    })
+    await waitForExpression(cdp,
+      `Boolean(window.rovai && document.querySelector('.app-shell'))`, 45_000)
+    const health = await request(cdp, 'health.check')
+    assert(await realpath(health.database.path) === await realpath(databasePath),
+      `Isolated App opened the wrong database: ${JSON.stringify(health.database.path)}`)
+    return { cdp, port, child }
+  } catch (error) {
+    cdp?.close()
+    await terminateChild(child)
+    throw error
+  }
+}
+
+async function closeApp(app) {
+  try {
+    await Promise.race([app.cdp.send('Browser.close'), wait(1_000)])
+  } catch {
+    // The isolated App may already have exited.
+  }
+  app.cdp.close()
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < 5_000) {
+    try {
+      await fetch(`http://127.0.0.1:${app.port}/json`)
+    } catch {
+      await terminateChild(app.child)
+      return
+    }
+    await wait(100)
+  }
+  await terminateChild(app.child)
+  throw new Error(`Isolated packaged App did not close on debug port ${app.port}`)
+}
+
+async function terminateChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return
+  child.kill('SIGTERM')
+  await Promise.race([
+    new Promise((resolveExit) => child.once('exit', resolveExit)),
+    wait(3_000)
+  ])
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+}
+
+async function capture(cdp, path) {
+  const result = await cdp.send('Page.captureScreenshot', {
+    format: 'png',
+    captureBeyondViewport: false,
+    fromSurface: true
+  })
+  await writeFile(path, Buffer.from(result.result.data, 'base64'))
+}
+
+async function evaluate(cdp, expression, awaitPromise = false) {
+  const response = await cdp.send('Runtime.evaluate', {
+    expression,
+    awaitPromise,
+    returnByValue: true
+  })
+  if (response.result?.exceptionDetails) {
+    throw new Error(response.result.exceptionDetails.exception?.description
+      ?? response.result.exceptionDetails.text
+      ?? `Evaluation failed: ${expression}`)
+  }
+  return response.result?.result?.value
+}
+
+async function waitForExpression(cdp, expression, timeoutMs = 10_000) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await evaluate(cdp, expression)) return
+    await wait(100)
+  }
+  if (await evaluate(cdp, expression)) return
+  await capture(cdp, join(outputDir, 'task-detail-wait-failure.png'))
+  const visibleState = await evaluate(cdp, `document.body.innerText.slice(-7000)`)
+  throw new Error(`Expression did not become true within ${timeoutMs}ms: ${expression}\nVisible state: ${visibleState}`)
+}
+
+async function waitForTarget(port, stderr) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < 20_000) {
+    try {
+      const targets = await fetch(`http://127.0.0.1:${port}/json`).then((response) => response.json())
+      const target = targets.find((candidate) => candidate.type === 'page')
+      if (target) return target
+    } catch {
+      // Electron is still starting.
+    }
+    await wait(150)
+  }
+  throw new Error(`Electron DevTools target did not appear. ${stderr.join('')}`)
+}
+
+async function connectCdp(url) {
+  const socket = new WebSocket(url)
+  const pending = new Map()
+  let nextId = 1
+  await new Promise((resolveOpen, rejectOpen) => {
+    socket.addEventListener('open', resolveOpen, { once: true })
+    socket.addEventListener('error', rejectOpen, { once: true })
+  })
+  socket.addEventListener('message', (event) => {
+    const message = JSON.parse(String(event.data))
+    if (!message.id) return
+    const pendingRequest = pending.get(message.id)
+    if (!pendingRequest) return
+    pending.delete(message.id)
+    if (message.error) pendingRequest.reject(new Error(message.error.message))
+    else pendingRequest.resolve(message)
+  })
+  socket.addEventListener('close', () => {
+    for (const pendingRequest of pending.values()) {
+      pendingRequest.reject(new Error('CDP connection closed'))
+    }
+    pending.clear()
+  })
+  return {
+    send(method, params = {}) {
+      return new Promise((resolveSend, rejectSend) => {
+        const id = nextId++
+        pending.set(id, { resolve: resolveSend, reject: rejectSend })
+        socket.send(JSON.stringify({ id, method, params }))
+      })
+    },
+    close() {
+      socket.close()
+    }
+  }
+}
+
+function startCore(dataDirectory) {
+  const child = spawn(join(appPath, 'Contents', 'Resources', 'bin', 'rovai-core'), [
+    ...coreDataDirectoryArguments(dataDirectory),
+    '--skill-library-root', join(dataDirectory, 'managed-skill-library'),
+    '--mcp-config-path', join(dataDirectory, 'mcp.json')
+  ], {
+    cwd: root,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, TMPDIR: runtimeTempDir }
+  })
+  child.stderr.pipe(process.stderr)
+  const pending = new Map()
+  let nextId = 1
+  createInterface({ input: child.stdout }).on('line', (line) => {
+    const message = JSON.parse(line)
+    if (message.method) return
+    const pendingRequest = pending.get(message.id)
+    if (!pendingRequest) return
+    clearTimeout(pendingRequest.timer)
+    pending.delete(message.id)
+    if (message.error) pendingRequest.reject(new Error(message.error.message))
+    else pendingRequest.resolve(message.result)
+  })
+  const requestCore = (method, params = {}) => new Promise((resolveRequest, rejectRequest) => {
+    const id = nextId++
+    const timer = setTimeout(() => {
+      pending.delete(id)
+      rejectRequest(new Error(`Timed out waiting for ${method}`))
+    }, 30_000)
+    pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer })
+    child.stdin.write(`${JSON.stringify({ id, method, params })}\n`)
+  })
+  const stop = async () => {
+    if (child.killed || child.exitCode !== null) return
+    child.stdin.end()
+    await Promise.race([
+      new Promise((resolveClose) => child.once('close', resolveClose)),
+      wait(3_000)
+    ])
+    if (child.exitCode === null) child.kill('SIGTERM')
+  }
+  return { request: requestCore, stop }
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message)
+}
+
+function wait(milliseconds) {
+  return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds))
+}

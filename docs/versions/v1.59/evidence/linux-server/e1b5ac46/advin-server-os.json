@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "gate": "server_os",
+  "runtimeQualification": false,
+  "sourceCommit": "e1b5ac461214827ae8cd32bc6e09096152b59658",
+  "packageManifestSha256": "b42c13dfec8cdff9d6ed59baa4048adc4a3adf66f5de697936d4f8346c65116a",
+  "platform": "Linux-6.8.0-41-generic-x86_64-with-glibc2.39",
+  "libc": [
+    "glibc",
+    "2.39"
+  ],
+  "osRelease": "PRETTY_NAME=\"Ubuntu 24.04.5 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nVERSION=\"24.04.5 LTS (Noble Numbat)\"\nVERSION_CODENAME=noble\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.ubuntu.com/\"\nSUPPORT_URL=\"https://help.ubuntu.com/\"\nBUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\nPRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\nUBUNTU_CODENAME=noble\nLOGO=ubuntu-logo\n",
+  "checks": [
+    "package_hashes",
+    "web_ui",
+    "authentication",
+    "authenticated_read_write",
+    "no_node_electron_or_rust_on_host_path",
+    "exclusive_data_root",
+    "durable_sigterm",
+    "restart",
+    "persisted_data",
+    "persisted_session",
+    "persisted_token"
+  ],
+  "status": "passed"
+}

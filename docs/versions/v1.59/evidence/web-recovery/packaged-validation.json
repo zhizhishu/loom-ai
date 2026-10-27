@@ -1,0 +1,16 @@
+{
+  "status": "passed",
+  "sourceCommit": "d24a624a",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "package": "daily-ad-hoc",
+  "isolated": true,
+  "packagedDesktopReady": true,
+  "packagedHostedWeb": true,
+  "sameEditorAfterReload": true,
+  "unsavedComposerRestored": true,
+  "controlsStartLeft": true,
+  "noHealthyHostText": true,
+  "webStopKeepsCoreReady": true,
+  "noRuntime": true
+}

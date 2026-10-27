@@ -1,0 +1,1336 @@
+{
+  "backfillBatchMs": [
+    1.637916,
+    1.4809160000000001,
+    1.651416,
+    1.2974169999999998,
+    1.7169590000000001,
+    1.471333,
+    2.14025,
+    1.503208,
+    1.52775,
+    1.72875,
+    1.712167,
+    1.5875,
+    1.4720829999999998,
+    1.892667,
+    1.537625,
+    1.422792,
+    1.793792,
+    1.552833,
+    1.1850829999999999
+  ],
+  "beforeDirectoryMs": [
+    436.286291,
+    424.641875,
+    423.195083,
+    446.570292,
+    442.82712499999997,
+    458.04366600000003,
+    458.62129200000004
+  ],
+  "camps": 601,
+  "directorySamples": 7,
+  "initializedDirectoryMs": [
+    0.40558299999999997,
+    0.422917,
+    0.404416,
+    0.39891699999999997,
+    0.40037500000000004,
+    0.403167,
+    0.783333
+  ],
+  "largeColumnsRead": "directory/index initialization/summary maintenance do not select message bodies, structured content, event payloads, or Blobs; actual VM columns and schema roots are included",
+  "maintenanceSamples": 12,
+  "messages": 120000,
+  "migrationIncludingIndexMs": 208.494125,
+  "plans": {
+    "before": {
+      "queryPlan": [
+        "SCAN camp USING INDEX camp_navigation_window_idx",
+        "CORRELATED SCALAR SUBQUERY 2",
+        "MATERIALIZE public_camp_message_publication",
+        "SEARCH event_log USING COVERING INDEX event_log_entity_sequence_idx (entity_type=? AND entity_id>?)",
+        "SEARCH m USING INDEX sqlite_autoindex_camp_message_2 (camp_id=?)",
+        "SEARCH p USING AUTOMATIC COVERING INDEX (message_id=?)",
+        "USE TEMP B-TREE FOR ORDER BY",
+        "CORRELATED SCALAR SUBQUERY 2",
+        "SEARCH m USING INDEX sqlite_autoindex_camp_message_2 (camp_id=?)",
+        "SEARCH p USING AUTOMATIC COVERING INDEX (message_id=?)",
+        "USE TEMP B-TREE FOR ORDER BY",
+        "USE TEMP B-TREE FOR ORDER BY"
+      ],
+      "readOpcodes": [
+        [
+          "SorterOpen",
+          4,
+          6,
+          0,
+          "k(2,-B,B)"
+        ],
+        [
+          "OpenRead",
+          0,
+          79,
+          0,
+          "15"
+        ],
+        [
+          "OpenRead",
+          5,
+          690,
+          0,
+          "k(5,,-,-,,)"
+        ],
+        [
+          "DeferredSeek",
+          5,
+          0,
+          0,
+          null
+        ],
+        [
+          "Column",
+          5,
+          3,
+          1,
+          null
+        ],
+        [
+          "Column",
+          0,
+          1,
+          5,
+          null
+        ],
+        [
+          "OpenEphemeral",
+          2,
+          2,
+          0,
+          null
+        ],
+        [
+          "OpenRead",
+          7,
+          717,
+          0,
+          "k(5,,,,,)"
+        ],
+        [
+          "Column",
+          7,
+          2,
+          1,
+          null
+        ],
+        [
+          "Column",
+          7,
+          1,
+          16,
+          null
+        ],
+        [
+          "Column",
+          7,
+          3,
+          24,
+          null
+        ],
+        [
+          "Column",
+          7,
+          1,
+          21,
+          null
+        ],
+        [
+          "OpenEphemeral",
+          8,
+          4,
+          0,
+          "k(2,-B,B)"
+        ],
+        [
+          "OpenRead",
+          1,
+          214,
+          0,
+          "28"
+        ],
+        [
+          "OpenRead",
+          9,
+          216,
+          0,
+          "k(2,,)"
+        ],
+        [
+          "Column",
+          5,
+          3,
+          30,
+          null
+        ],
+        [
+          "DeferredSeek",
+          9,
+          0,
+          1,
+          null
+        ],
+        [
+          "Column",
+          1,
+          12,
+          31,
+          null
+        ],
+        [
+          "Column",
+          1,
+          27,
+          31,
+          "ineligible"
+        ],
+        [
+          "Column",
+          2,
+          0,
+          33,
+          null
+        ],
+        [
+          "Column",
+          1,
+          0,
+          35,
+          null
+        ],
+        [
+          "Column",
+          1,
+          14,
+          9,
+          null
+        ],
+        [
+          "Column",
+          1,
+          14,
+          31,
+          null
+        ],
+        [
+          "Column",
+          1,
+          0,
+          37,
+          null
+        ],
+        [
+          "Column",
+          8,
+          3,
+          9,
+          null
+        ],
+        [
+          "Column",
+          0,
+          9,
+          6,
+          null
+        ],
+        [
+          "OpenEphemeral",
+          11,
+          4,
+          0,
+          "k(2,-B,B)"
+        ],
+        [
+          "OpenRead",
+          1,
+          214,
+          0,
+          "28"
+        ],
+        [
+          "OpenRead",
+          12,
+          216,
+          0,
+          "k(2,,)"
+        ],
+        [
+          "Column",
+          5,
+          3,
+          45,
+          null
+        ],
+        [
+          "DeferredSeek",
+          12,
+          0,
+          1,
+          null
+        ],
+        [
+          "Column",
+          1,
+          12,
+          46,
+          null
+        ],
+        [
+          "Column",
+          1,
+          27,
+          46,
+          "ineligible"
+        ],
+        [
+          "Column",
+          2,
+          0,
+          47,
+          null
+        ],
+        [
+          "Column",
+          1,
+          0,
+          49,
+          null
+        ],
+        [
+          "Column",
+          1,
+          14,
+          43,
+          null
+        ],
+        [
+          "Column",
+          1,
+          14,
+          46,
+          null
+        ],
+        [
+          "Column",
+          1,
+          0,
+          51,
+          null
+        ],
+        [
+          "Column",
+          11,
+          3,
+          43,
+          null
+        ],
+        [
+          "Column",
+          0,
+          9,
+          41,
+          null
+        ],
+        [
+          "Column",
+          5,
+          3,
+          4,
+          null
+        ],
+        [
+          "SorterInsert",
+          4,
+          55,
+          3,
+          "4"
+        ],
+        [
+          "Column",
+          14,
+          3,
+          7,
+          null
+        ],
+        [
+          "Column",
+          14,
+          2,
+          6,
+          null
+        ],
+        [
+          "Column",
+          14,
+          1,
+          5,
+          null
+        ]
+      ],
+      "schemaObjects": [
+        [
+          "camp",
+          79,
+          "CREATE TABLE \"camp\" (\n                    id TEXT PRIMARY KEY,\n                    title TEXT NOT NULL,\n                    name_origin TEXT NOT NULL DEFAULT 'default'\n                        CHECK(name_origin IN ('default', 'generated', 'user')),\n                    collaboration_mode TEXT NOT NULL DEFAULT 'peer'\n                        CHECK(collaboration_mode IN ('peer', 'lead_coordinated')),\n                    project_binding_kind TEXT NOT NULL\n                        CHECK(project_binding_kind IN ('quick_chat', 'directory')),\n                    project_path TEXT NOT NULL,\n                    default_lead_agent_id TEXT,\n                    last_message_sequence INTEGER NOT NULL DEFAULT 0,\n                    version INTEGER NOT NULL DEFAULT 1,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL\n                , activation_state TEXT NOT NULL DEFAULT 'active'\n                CHECK(activation_state IN ('pending', 'active')), membership_generation INTEGER NOT NULL DEFAULT 1\n                CHECK(membership_generation >= 1), attachment_revision INTEGER NOT NULL DEFAULT 0\n                CHECK(attachment_revision >= 0), deletion_operation_id TEXT, deletion_requested_at TEXT, deletion_attempt_count INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attempt_count >= 0), deletion_next_attempt_at TEXT, deletion_last_error_code TEXT, deletion_attention_required INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attention_required IN (0, 1)), deletion_attention_revision INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attention_revision >= 0), navigation_activity_sequence INTEGER NOT NULL DEFAULT 0 CHECK(navigation_activity_sequence >= 0), navigation_activity_at TEXT, navigation_completion_sequence INTEGER NOT NULL DEFAULT 0 CHECK(navigation_completion_sequence >= 0), last_delivery_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_delivery_sequence>=0))"
+        ],
+        [
+          "sqlite_autoindex_camp_1",
+          80,
+          null
+        ],
+        [
+          "camp_message",
+          214,
+          "CREATE TABLE \"camp_message\" (\n                id TEXT PRIMARY KEY,\n                camp_id TEXT NOT NULL REFERENCES camp(id),\n                sequence INTEGER NOT NULL,\n                author_type TEXT NOT NULL CHECK(author_type IN ('user', 'agent', 'system', 'external_principal')),\n                author_id TEXT NOT NULL,\n                source_agent_run_id TEXT,\n                body TEXT NOT NULL,\n                address_mode TEXT NOT NULL CHECK(address_mode IN ('default', 'explicit', 'broadcast')),\n                addressed_agent_ids_json TEXT NOT NULL,\n                reply_to_camp_message_id TEXT REFERENCES \"camp_message\"(id),\n                camp_turn_id TEXT REFERENCES camp_turn(id),\n                agent_run_id TEXT REFERENCES agent_run(id),\n                tombstoned_at TEXT,\n                version INTEGER NOT NULL DEFAULT 1,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL, content_digest TEXT\n                        NOT NULL DEFAULT 'sha256:legacy-uncomputed'\n                        CHECK(length(content_digest) > 0), presentation_json TEXT, structured_content_json TEXT\n                CHECK(\n                    structured_content_json IS NULL\n                    OR json_valid(structured_content_json)\n                ), effective_recipient_ids_json TEXT NOT NULL DEFAULT '[]'\n                CHECK(json_valid(effective_recipient_ids_json)), recipient_set_digest TEXT, recipient_presentation_json TEXT NOT NULL DEFAULT '{}'\n                CHECK(json_valid(recipient_presentation_json)), source_operation_id TEXT, agent_addressing_mode TEXT\n                    CHECK(agent_addressing_mode IN ('automatic', 'public_only')), source_attachments_json TEXT NOT NULL DEFAULT '[]'\n                CHECK(json_valid(source_attachments_json)\n                    AND json_type(source_attachments_json) = 'array'), quotes_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(quotes_json) AND json_type(quotes_json)='array'), origin_kind TEXT NOT NULL DEFAULT 'legacy'\n                    CHECK(origin_kind IN (\n                        'legacy', 'local_composer', 'agent', 'automation',\n                        'channel', 'mission', 'system'\n                    )), recall_state TEXT NOT NULL DEFAULT 'ineligible'\n                    CHECK(recall_state IN ('ineligible', 'recallable', 'closed', 'withdrawn')), withdrawn_by_id TEXT, withdrawn_at TEXT,\n                UNIQUE(camp_id, sequence)\n            )"
+        ],
+        [
+          "sqlite_autoindex_camp_message_1",
+          215,
+          null
+        ],
+        [
+          "sqlite_autoindex_camp_message_2",
+          216,
+          null
+        ],
+        [
+          "event_log",
+          496,
+          "CREATE TABLE \"event_log\" (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                event_id TEXT UNIQUE,\n\n                task_id TEXT REFERENCES task(id),\n                turn_id TEXT,\n                sequence INTEGER,\n                event_type TEXT NOT NULL,\n                native_method TEXT,\n                payload_json TEXT NOT NULL,\n\n                camp_id TEXT,\n                entity_type TEXT,\n                entity_id TEXT,\n                actor_type TEXT,\n                actor_id TEXT,\n                source_agent_run_id TEXT,\n                execution_epoch INTEGER,\n\n                command_id TEXT,\n                command_type TEXT,\n                request_digest TEXT,\n                request_digest_version INTEGER,\n                result_status TEXT,\n                result_code TEXT,\n                result_payload_json TEXT,\n                result_entity_type TEXT,\n                result_entity_id TEXT,\n\n                created_at TEXT NOT NULL, global_sequence INTEGER, command_client_id TEXT,\n\n                CHECK (\n                    (event_type = 'command.result'\n                        AND command_id IS NOT NULL\n                        AND command_type IS NOT NULL\n                        \n                        \n                        AND result_status IS NOT NULL\n                        AND result_code IS NOT NULL\n                        AND result_payload_json IS NOT NULL)\n                    OR\n                    (event_type <> 'command.result'\n                        AND command_id IS NULL\n                        AND command_type IS NULL\n                        AND request_digest IS NULL\n                        AND request_digest_version IS NULL\n                        AND result_status IS NULL\n                        AND result_code IS NULL\n                        AND result_payload_json IS NULL\n                        AND result_entity_type IS NULL\n                        AND result_entity_id IS NULL)\n                ),\n                CHECK (\n                    (result_entity_type IS NULL AND result_entity_id IS NULL)\n                    OR\n                    (result_entity_type IS NOT NULL AND result_entity_id IS NOT NULL)\n                )\n            )"
+        ],
+        [
+          "sqlite_autoindex_event_log_1",
+          497,
+          null
+        ],
+        [
+          "camp_directory_project_idx",
+          534,
+          "CREATE INDEX camp_directory_project_idx\n                    ON camp(project_path)\n                    WHERE project_binding_kind = 'directory'"
+        ],
+        [
+          "camp_activation_state_idx",
+          540,
+          "CREATE INDEX camp_activation_state_idx\n                ON camp(activation_state, updated_at, id)"
+        ],
+        [
+          "camp_message_camp_identity_unique",
+          586,
+          "CREATE UNIQUE INDEX camp_message_camp_identity_unique\n                ON camp_message(camp_id, id)"
+        ],
+        [
+          "camp_message_navigation_activity_idx",
+          587,
+          "CREATE INDEX camp_message_navigation_activity_idx\n                    ON camp_message(camp_id, author_type, created_at)"
+        ],
+        [
+          "camp_message_source_operation_unique",
+          588,
+          "CREATE UNIQUE INDEX camp_message_source_operation_unique\n                ON camp_message(source_operation_id)\n                WHERE source_operation_id IS NOT NULL"
+        ],
+        [
+          "camp_deletion_operation_unique",
+          661,
+          "CREATE UNIQUE INDEX camp_deletion_operation_unique\n                ON camp(deletion_operation_id)\n                WHERE deletion_operation_id IS NOT NULL"
+        ],
+        [
+          "camp_deletion_due_idx",
+          662,
+          "CREATE INDEX camp_deletion_due_idx\n                ON camp(deletion_attention_required, deletion_next_attempt_at,\n                        deletion_requested_at, id)\n                WHERE deletion_operation_id IS NOT NULL"
+        ],
+        [
+          "notification_message_source_run",
+          681,
+          "CREATE INDEX notification_message_source_run ON camp_message(source_agent_run_id)"
+        ],
+        [
+          "camp_navigation_window_idx",
+          690,
+          "CREATE INDEX camp_navigation_window_idx ON camp (\n    CASE WHEN project_binding_kind = 'directory' THEN 'directory:' || project_path ELSE 'quick-chat' END,\n    COALESCE(navigation_activity_at, created_at) DESC,\n    navigation_activity_sequence DESC, id\n) WHERE deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_message_direct_reply_idx",
+          708,
+          "CREATE INDEX camp_message_direct_reply_idx ON camp_message(camp_id, reply_to_camp_message_id, sequence, id) WHERE reply_to_camp_message_id IS NOT NULL"
+        ],
+        [
+          "event_command_result_unique",
+          714,
+          "CREATE UNIQUE INDEX event_command_result_unique\n                ON event_log(command_id)\n                WHERE command_id IS NOT NULL"
+        ],
+        [
+          "event_global_sequence_unique",
+          715,
+          "CREATE UNIQUE INDEX event_global_sequence_unique\n                ON event_log(global_sequence)\n                WHERE global_sequence IS NOT NULL"
+        ],
+        [
+          "event_log_camp_global_sequence_idx",
+          716,
+          "CREATE INDEX event_log_camp_global_sequence_idx\n                    ON event_log(camp_id, global_sequence)\n                    WHERE camp_id IS NOT NULL AND global_sequence IS NOT NULL"
+        ],
+        [
+          "event_log_entity_sequence_idx",
+          717,
+          "CREATE INDEX event_log_entity_sequence_idx\n                ON event_log(entity_type, entity_id, event_type, global_sequence)\n                WHERE entity_type IS NOT NULL\n                  AND entity_id IS NOT NULL\n                  AND global_sequence IS NOT NULL"
+        ],
+        [
+          "event_task_idx",
+          718,
+          "CREATE INDEX event_task_idx\n                ON event_log(task_id, sequence)\n                WHERE task_id IS NOT NULL"
+        ],
+        [
+          "event_task_sequence_unique",
+          719,
+          "CREATE UNIQUE INDEX event_task_sequence_unique\n                ON event_log(task_id, sequence)\n                WHERE task_id IS NOT NULL AND sequence IS NOT NULL"
+        ]
+      ]
+    },
+    "initialized": {
+      "queryPlan": [
+        "SCAN camp USING INDEX camp_history_directory_idx"
+      ],
+      "readOpcodes": [
+        [
+          "OpenRead",
+          0,
+          79,
+          0,
+          "26"
+        ],
+        [
+          "OpenRead",
+          2,
+          86068,
+          0,
+          "k(3,-,,)"
+        ],
+        [
+          "DeferredSeek",
+          2,
+          0,
+          0,
+          null
+        ],
+        [
+          "Column",
+          2,
+          1,
+          1,
+          null
+        ],
+        [
+          "Column",
+          2,
+          1,
+          3,
+          null
+        ],
+        [
+          "Column",
+          0,
+          1,
+          4,
+          null
+        ],
+        [
+          "Column",
+          0,
+          25,
+          5,
+          null
+        ],
+        [
+          "Column",
+          0,
+          9,
+          5,
+          null
+        ]
+      ],
+      "schemaObjects": [
+        [
+          "camp",
+          79,
+          "CREATE TABLE \"camp\" (\n                    id TEXT PRIMARY KEY,\n                    title TEXT NOT NULL,\n                    name_origin TEXT NOT NULL DEFAULT 'default'\n                        CHECK(name_origin IN ('default', 'generated', 'user')),\n                    collaboration_mode TEXT NOT NULL DEFAULT 'peer'\n                        CHECK(collaboration_mode IN ('peer', 'lead_coordinated')),\n                    project_binding_kind TEXT NOT NULL\n                        CHECK(project_binding_kind IN ('quick_chat', 'directory')),\n                    project_path TEXT NOT NULL,\n                    default_lead_agent_id TEXT,\n                    last_message_sequence INTEGER NOT NULL DEFAULT 0,\n                    version INTEGER NOT NULL DEFAULT 1,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL\n                , activation_state TEXT NOT NULL DEFAULT 'active'\n                CHECK(activation_state IN ('pending', 'active')), membership_generation INTEGER NOT NULL DEFAULT 1\n                CHECK(membership_generation >= 1), attachment_revision INTEGER NOT NULL DEFAULT 0\n                CHECK(attachment_revision >= 0), deletion_operation_id TEXT, deletion_requested_at TEXT, deletion_attempt_count INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attempt_count >= 0), deletion_next_attempt_at TEXT, deletion_last_error_code TEXT, deletion_attention_required INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attention_required IN (0, 1)), deletion_attention_revision INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attention_revision >= 0), navigation_activity_sequence INTEGER NOT NULL DEFAULT 0 CHECK(navigation_activity_sequence >= 0), navigation_activity_at TEXT, navigation_completion_sequence INTEGER NOT NULL DEFAULT 0 CHECK(navigation_completion_sequence >= 0), last_delivery_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_delivery_sequence>=0), history_activity_at TEXT, history_activity_message_id TEXT, history_activity_initialized INTEGER NOT NULL DEFAULT 0 CHECK(history_activity_initialized IN (0,1)))"
+        ],
+        [
+          "sqlite_autoindex_camp_1",
+          80,
+          null
+        ],
+        [
+          "camp_message",
+          214,
+          "CREATE TABLE \"camp_message\" (\n                id TEXT PRIMARY KEY,\n                camp_id TEXT NOT NULL REFERENCES camp(id),\n                sequence INTEGER NOT NULL,\n                author_type TEXT NOT NULL CHECK(author_type IN ('user', 'agent', 'system', 'external_principal')),\n                author_id TEXT NOT NULL,\n                source_agent_run_id TEXT,\n                body TEXT NOT NULL,\n                address_mode TEXT NOT NULL CHECK(address_mode IN ('default', 'explicit', 'broadcast')),\n                addressed_agent_ids_json TEXT NOT NULL,\n                reply_to_camp_message_id TEXT REFERENCES \"camp_message\"(id),\n                camp_turn_id TEXT REFERENCES camp_turn(id),\n                agent_run_id TEXT REFERENCES agent_run(id),\n                tombstoned_at TEXT,\n                version INTEGER NOT NULL DEFAULT 1,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL, content_digest TEXT\n                        NOT NULL DEFAULT 'sha256:legacy-uncomputed'\n                        CHECK(length(content_digest) > 0), presentation_json TEXT, structured_content_json TEXT\n                CHECK(\n                    structured_content_json IS NULL\n                    OR json_valid(structured_content_json)\n                ), effective_recipient_ids_json TEXT NOT NULL DEFAULT '[]'\n                CHECK(json_valid(effective_recipient_ids_json)), recipient_set_digest TEXT, recipient_presentation_json TEXT NOT NULL DEFAULT '{}'\n                CHECK(json_valid(recipient_presentation_json)), source_operation_id TEXT, agent_addressing_mode TEXT\n                    CHECK(agent_addressing_mode IN ('automatic', 'public_only')), source_attachments_json TEXT NOT NULL DEFAULT '[]'\n                CHECK(json_valid(source_attachments_json)\n                    AND json_type(source_attachments_json) = 'array'), quotes_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(quotes_json) AND json_type(quotes_json)='array'), origin_kind TEXT NOT NULL DEFAULT 'legacy'\n                    CHECK(origin_kind IN (\n                        'legacy', 'local_composer', 'agent', 'automation',\n                        'channel', 'mission', 'system'\n                    )), recall_state TEXT NOT NULL DEFAULT 'ineligible'\n                    CHECK(recall_state IN ('ineligible', 'recallable', 'closed', 'withdrawn')), withdrawn_by_id TEXT, withdrawn_at TEXT,\n                UNIQUE(camp_id, sequence)\n            )"
+        ],
+        [
+          "sqlite_autoindex_camp_message_1",
+          215,
+          null
+        ],
+        [
+          "sqlite_autoindex_camp_message_2",
+          216,
+          null
+        ],
+        [
+          "event_log",
+          496,
+          "CREATE TABLE \"event_log\" (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                event_id TEXT UNIQUE,\n\n                task_id TEXT REFERENCES task(id),\n                turn_id TEXT,\n                sequence INTEGER,\n                event_type TEXT NOT NULL,\n                native_method TEXT,\n                payload_json TEXT NOT NULL,\n\n                camp_id TEXT,\n                entity_type TEXT,\n                entity_id TEXT,\n                actor_type TEXT,\n                actor_id TEXT,\n                source_agent_run_id TEXT,\n                execution_epoch INTEGER,\n\n                command_id TEXT,\n                command_type TEXT,\n                request_digest TEXT,\n                request_digest_version INTEGER,\n                result_status TEXT,\n                result_code TEXT,\n                result_payload_json TEXT,\n                result_entity_type TEXT,\n                result_entity_id TEXT,\n\n                created_at TEXT NOT NULL, global_sequence INTEGER, command_client_id TEXT,\n\n                CHECK (\n                    (event_type = 'command.result'\n                        AND command_id IS NOT NULL\n                        AND command_type IS NOT NULL\n                        \n                        \n                        AND result_status IS NOT NULL\n                        AND result_code IS NOT NULL\n                        AND result_payload_json IS NOT NULL)\n                    OR\n                    (event_type <> 'command.result'\n                        AND command_id IS NULL\n                        AND command_type IS NULL\n                        AND request_digest IS NULL\n                        AND request_digest_version IS NULL\n                        AND result_status IS NULL\n                        AND result_code IS NULL\n                        AND result_payload_json IS NULL\n                        AND result_entity_type IS NULL\n                        AND result_entity_id IS NULL)\n                ),\n                CHECK (\n                    (result_entity_type IS NULL AND result_entity_id IS NULL)\n                    OR\n                    (result_entity_type IS NOT NULL AND result_entity_id IS NOT NULL)\n                )\n            )"
+        ],
+        [
+          "sqlite_autoindex_event_log_1",
+          497,
+          null
+        ],
+        [
+          "camp_directory_project_idx",
+          534,
+          "CREATE INDEX camp_directory_project_idx\n                    ON camp(project_path)\n                    WHERE project_binding_kind = 'directory'"
+        ],
+        [
+          "camp_activation_state_idx",
+          540,
+          "CREATE INDEX camp_activation_state_idx\n                ON camp(activation_state, updated_at, id)"
+        ],
+        [
+          "camp_message_camp_identity_unique",
+          586,
+          "CREATE UNIQUE INDEX camp_message_camp_identity_unique\n                ON camp_message(camp_id, id)"
+        ],
+        [
+          "camp_message_navigation_activity_idx",
+          587,
+          "CREATE INDEX camp_message_navigation_activity_idx\n                    ON camp_message(camp_id, author_type, created_at)"
+        ],
+        [
+          "camp_message_source_operation_unique",
+          588,
+          "CREATE UNIQUE INDEX camp_message_source_operation_unique\n                ON camp_message(source_operation_id)\n                WHERE source_operation_id IS NOT NULL"
+        ],
+        [
+          "camp_deletion_operation_unique",
+          661,
+          "CREATE UNIQUE INDEX camp_deletion_operation_unique\n                ON camp(deletion_operation_id)\n                WHERE deletion_operation_id IS NOT NULL"
+        ],
+        [
+          "camp_deletion_due_idx",
+          662,
+          "CREATE INDEX camp_deletion_due_idx\n                ON camp(deletion_attention_required, deletion_next_attempt_at,\n                        deletion_requested_at, id)\n                WHERE deletion_operation_id IS NOT NULL"
+        ],
+        [
+          "notification_message_source_run",
+          681,
+          "CREATE INDEX notification_message_source_run ON camp_message(source_agent_run_id)"
+        ],
+        [
+          "camp_navigation_window_idx",
+          690,
+          "CREATE INDEX camp_navigation_window_idx ON camp (\n    CASE WHEN project_binding_kind = 'directory' THEN 'directory:' || project_path ELSE 'quick-chat' END,\n    COALESCE(navigation_activity_at, created_at) DESC,\n    navigation_activity_sequence DESC, id\n) WHERE deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_message_direct_reply_idx",
+          708,
+          "CREATE INDEX camp_message_direct_reply_idx ON camp_message(camp_id, reply_to_camp_message_id, sequence, id) WHERE reply_to_camp_message_id IS NOT NULL"
+        ],
+        [
+          "event_command_result_unique",
+          714,
+          "CREATE UNIQUE INDEX event_command_result_unique\n                ON event_log(command_id)\n                WHERE command_id IS NOT NULL"
+        ],
+        [
+          "event_global_sequence_unique",
+          715,
+          "CREATE UNIQUE INDEX event_global_sequence_unique\n                ON event_log(global_sequence)\n                WHERE global_sequence IS NOT NULL"
+        ],
+        [
+          "event_log_camp_global_sequence_idx",
+          716,
+          "CREATE INDEX event_log_camp_global_sequence_idx\n                    ON event_log(camp_id, global_sequence)\n                    WHERE camp_id IS NOT NULL AND global_sequence IS NOT NULL"
+        ],
+        [
+          "event_log_entity_sequence_idx",
+          717,
+          "CREATE INDEX event_log_entity_sequence_idx\n                ON event_log(entity_type, entity_id, event_type, global_sequence)\n                WHERE entity_type IS NOT NULL\n                  AND entity_id IS NOT NULL\n                  AND global_sequence IS NOT NULL"
+        ],
+        [
+          "event_task_idx",
+          718,
+          "CREATE INDEX event_task_idx\n                ON event_log(task_id, sequence)\n                WHERE task_id IS NOT NULL"
+        ],
+        [
+          "event_task_sequence_unique",
+          719,
+          "CREATE UNIQUE INDEX event_task_sequence_unique\n                ON event_log(task_id, sequence)\n                WHERE task_id IS NOT NULL AND sequence IS NOT NULL"
+        ],
+        [
+          "camp_history_uninitialized_idx",
+          727,
+          "CREATE INDEX camp_history_uninitialized_idx ON camp(id)\n    WHERE history_activity_initialized=0 AND deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_history_directory_idx",
+          86068,
+          "CREATE INDEX camp_history_directory_idx ON camp(julianday(COALESCE(history_activity_at,created_at)) DESC,id)\n    WHERE deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_message_history_activity_idx",
+          86246,
+          "CREATE INDEX camp_message_history_activity_idx ON camp_message(camp_id,julianday(created_at) DESC,id,created_at)\n    WHERE tombstoned_at IS NULL AND recall_state <> 'withdrawn'"
+        ]
+      ]
+    },
+    "perCampSeek": {
+      "queryPlan": [
+        "SEARCH camp USING COVERING INDEX sqlite_autoindex_camp_1 (id=?)",
+        "CORRELATED SCALAR SUBQUERY 2",
+        "SEARCH m USING INDEX camp_message_history_activity_idx (camp_id=?)",
+        "SEARCH e EXISTS USING COVERING INDEX event_log_entity_sequence_idx (entity_type=? AND entity_id=? AND event_type=? AND global_sequence>?)"
+      ],
+      "readOpcodes": [
+        [
+          "OpenRead",
+          3,
+          80,
+          0,
+          "k(2,,)"
+        ],
+        [
+          "OpenRead",
+          1,
+          214,
+          0,
+          "28"
+        ],
+        [
+          "OpenRead",
+          6,
+          86246,
+          0,
+          "k(5,,-,,,)"
+        ],
+        [
+          "OpenRead",
+          7,
+          717,
+          0,
+          "k(5,,,,,)"
+        ],
+        [
+          "Column",
+          3,
+          0,
+          7,
+          null
+        ],
+        [
+          "DeferredSeek",
+          6,
+          0,
+          1,
+          null
+        ],
+        [
+          "Column",
+          6,
+          2,
+          9,
+          null
+        ],
+        [
+          "OpenEphemeral",
+          8,
+          1,
+          0,
+          "k(1,B)"
+        ],
+        [
+          "Column",
+          8,
+          0,
+          10,
+          null
+        ],
+        [
+          "Column",
+          6,
+          3,
+          4,
+          null
+        ]
+      ],
+      "schemaObjects": [
+        [
+          "camp",
+          79,
+          "CREATE TABLE \"camp\" (\n                    id TEXT PRIMARY KEY,\n                    title TEXT NOT NULL,\n                    name_origin TEXT NOT NULL DEFAULT 'default'\n                        CHECK(name_origin IN ('default', 'generated', 'user')),\n                    collaboration_mode TEXT NOT NULL DEFAULT 'peer'\n                        CHECK(collaboration_mode IN ('peer', 'lead_coordinated')),\n                    project_binding_kind TEXT NOT NULL\n                        CHECK(project_binding_kind IN ('quick_chat', 'directory')),\n                    project_path TEXT NOT NULL,\n                    default_lead_agent_id TEXT,\n                    last_message_sequence INTEGER NOT NULL DEFAULT 0,\n                    version INTEGER NOT NULL DEFAULT 1,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL\n                , activation_state TEXT NOT NULL DEFAULT 'active'\n                CHECK(activation_state IN ('pending', 'active')), membership_generation INTEGER NOT NULL DEFAULT 1\n                CHECK(membership_generation >= 1), attachment_revision INTEGER NOT NULL DEFAULT 0\n                CHECK(attachment_revision >= 0), deletion_operation_id TEXT, deletion_requested_at TEXT, deletion_attempt_count INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attempt_count >= 0), deletion_next_attempt_at TEXT, deletion_last_error_code TEXT, deletion_attention_required INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attention_required IN (0, 1)), deletion_attention_revision INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attention_revision >= 0), navigation_activity_sequence INTEGER NOT NULL DEFAULT 0 CHECK(navigation_activity_sequence >= 0), navigation_activity_at TEXT, navigation_completion_sequence INTEGER NOT NULL DEFAULT 0 CHECK(navigation_completion_sequence >= 0), last_delivery_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_delivery_sequence>=0), history_activity_at TEXT, history_activity_message_id TEXT, history_activity_initialized INTEGER NOT NULL DEFAULT 0 CHECK(history_activity_initialized IN (0,1)))"
+        ],
+        [
+          "sqlite_autoindex_camp_1",
+          80,
+          null
+        ],
+        [
+          "camp_message",
+          214,
+          "CREATE TABLE \"camp_message\" (\n                id TEXT PRIMARY KEY,\n                camp_id TEXT NOT NULL REFERENCES camp(id),\n                sequence INTEGER NOT NULL,\n                author_type TEXT NOT NULL CHECK(author_type IN ('user', 'agent', 'system', 'external_principal')),\n                author_id TEXT NOT NULL,\n                source_agent_run_id TEXT,\n                body TEXT NOT NULL,\n                address_mode TEXT NOT NULL CHECK(address_mode IN ('default', 'explicit', 'broadcast')),\n                addressed_agent_ids_json TEXT NOT NULL,\n                reply_to_camp_message_id TEXT REFERENCES \"camp_message\"(id),\n                camp_turn_id TEXT REFERENCES camp_turn(id),\n                agent_run_id TEXT REFERENCES agent_run(id),\n                tombstoned_at TEXT,\n                version INTEGER NOT NULL DEFAULT 1,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL, content_digest TEXT\n                        NOT NULL DEFAULT 'sha256:legacy-uncomputed'\n                        CHECK(length(content_digest) > 0), presentation_json TEXT, structured_content_json TEXT\n                CHECK(\n                    structured_content_json IS NULL\n                    OR json_valid(structured_content_json)\n                ), effective_recipient_ids_json TEXT NOT NULL DEFAULT '[]'\n                CHECK(json_valid(effective_recipient_ids_json)), recipient_set_digest TEXT, recipient_presentation_json TEXT NOT NULL DEFAULT '{}'\n                CHECK(json_valid(recipient_presentation_json)), source_operation_id TEXT, agent_addressing_mode TEXT\n                    CHECK(agent_addressing_mode IN ('automatic', 'public_only')), source_attachments_json TEXT NOT NULL DEFAULT '[]'\n                CHECK(json_valid(source_attachments_json)\n                    AND json_type(source_attachments_json) = 'array'), quotes_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(quotes_json) AND json_type(quotes_json)='array'), origin_kind TEXT NOT NULL DEFAULT 'legacy'\n                    CHECK(origin_kind IN (\n                        'legacy', 'local_composer', 'agent', 'automation',\n                        'channel', 'mission', 'system'\n                    )), recall_state TEXT NOT NULL DEFAULT 'ineligible'\n                    CHECK(recall_state IN ('ineligible', 'recallable', 'closed', 'withdrawn')), withdrawn_by_id TEXT, withdrawn_at TEXT,\n                UNIQUE(camp_id, sequence)\n            )"
+        ],
+        [
+          "sqlite_autoindex_camp_message_1",
+          215,
+          null
+        ],
+        [
+          "sqlite_autoindex_camp_message_2",
+          216,
+          null
+        ],
+        [
+          "event_log",
+          496,
+          "CREATE TABLE \"event_log\" (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                event_id TEXT UNIQUE,\n\n                task_id TEXT REFERENCES task(id),\n                turn_id TEXT,\n                sequence INTEGER,\n                event_type TEXT NOT NULL,\n                native_method TEXT,\n                payload_json TEXT NOT NULL,\n\n                camp_id TEXT,\n                entity_type TEXT,\n                entity_id TEXT,\n                actor_type TEXT,\n                actor_id TEXT,\n                source_agent_run_id TEXT,\n                execution_epoch INTEGER,\n\n                command_id TEXT,\n                command_type TEXT,\n                request_digest TEXT,\n                request_digest_version INTEGER,\n                result_status TEXT,\n                result_code TEXT,\n                result_payload_json TEXT,\n                result_entity_type TEXT,\n                result_entity_id TEXT,\n\n                created_at TEXT NOT NULL, global_sequence INTEGER, command_client_id TEXT,\n\n                CHECK (\n                    (event_type = 'command.result'\n                        AND command_id IS NOT NULL\n                        AND command_type IS NOT NULL\n                        \n                        \n                        AND result_status IS NOT NULL\n                        AND result_code IS NOT NULL\n                        AND result_payload_json IS NOT NULL)\n                    OR\n                    (event_type <> 'command.result'\n                        AND command_id IS NULL\n                        AND command_type IS NULL\n                        AND request_digest IS NULL\n                        AND request_digest_version IS NULL\n                        AND result_status IS NULL\n                        AND result_code IS NULL\n                        AND result_payload_json IS NULL\n                        AND result_entity_type IS NULL\n                        AND result_entity_id IS NULL)\n                ),\n                CHECK (\n                    (result_entity_type IS NULL AND result_entity_id IS NULL)\n                    OR\n                    (result_entity_type IS NOT NULL AND result_entity_id IS NOT NULL)\n                )\n            )"
+        ],
+        [
+          "sqlite_autoindex_event_log_1",
+          497,
+          null
+        ],
+        [
+          "camp_directory_project_idx",
+          534,
+          "CREATE INDEX camp_directory_project_idx\n                    ON camp(project_path)\n                    WHERE project_binding_kind = 'directory'"
+        ],
+        [
+          "camp_activation_state_idx",
+          540,
+          "CREATE INDEX camp_activation_state_idx\n                ON camp(activation_state, updated_at, id)"
+        ],
+        [
+          "camp_message_camp_identity_unique",
+          586,
+          "CREATE UNIQUE INDEX camp_message_camp_identity_unique\n                ON camp_message(camp_id, id)"
+        ],
+        [
+          "camp_message_navigation_activity_idx",
+          587,
+          "CREATE INDEX camp_message_navigation_activity_idx\n                    ON camp_message(camp_id, author_type, created_at)"
+        ],
+        [
+          "camp_message_source_operation_unique",
+          588,
+          "CREATE UNIQUE INDEX camp_message_source_operation_unique\n                ON camp_message(source_operation_id)\n                WHERE source_operation_id IS NOT NULL"
+        ],
+        [
+          "camp_deletion_operation_unique",
+          661,
+          "CREATE UNIQUE INDEX camp_deletion_operation_unique\n                ON camp(deletion_operation_id)\n                WHERE deletion_operation_id IS NOT NULL"
+        ],
+        [
+          "camp_deletion_due_idx",
+          662,
+          "CREATE INDEX camp_deletion_due_idx\n                ON camp(deletion_attention_required, deletion_next_attempt_at,\n                        deletion_requested_at, id)\n                WHERE deletion_operation_id IS NOT NULL"
+        ],
+        [
+          "notification_message_source_run",
+          681,
+          "CREATE INDEX notification_message_source_run ON camp_message(source_agent_run_id)"
+        ],
+        [
+          "camp_navigation_window_idx",
+          690,
+          "CREATE INDEX camp_navigation_window_idx ON camp (\n    CASE WHEN project_binding_kind = 'directory' THEN 'directory:' || project_path ELSE 'quick-chat' END,\n    COALESCE(navigation_activity_at, created_at) DESC,\n    navigation_activity_sequence DESC, id\n) WHERE deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_message_direct_reply_idx",
+          708,
+          "CREATE INDEX camp_message_direct_reply_idx ON camp_message(camp_id, reply_to_camp_message_id, sequence, id) WHERE reply_to_camp_message_id IS NOT NULL"
+        ],
+        [
+          "event_command_result_unique",
+          714,
+          "CREATE UNIQUE INDEX event_command_result_unique\n                ON event_log(command_id)\n                WHERE command_id IS NOT NULL"
+        ],
+        [
+          "event_global_sequence_unique",
+          715,
+          "CREATE UNIQUE INDEX event_global_sequence_unique\n                ON event_log(global_sequence)\n                WHERE global_sequence IS NOT NULL"
+        ],
+        [
+          "event_log_camp_global_sequence_idx",
+          716,
+          "CREATE INDEX event_log_camp_global_sequence_idx\n                    ON event_log(camp_id, global_sequence)\n                    WHERE camp_id IS NOT NULL AND global_sequence IS NOT NULL"
+        ],
+        [
+          "event_log_entity_sequence_idx",
+          717,
+          "CREATE INDEX event_log_entity_sequence_idx\n                ON event_log(entity_type, entity_id, event_type, global_sequence)\n                WHERE entity_type IS NOT NULL\n                  AND entity_id IS NOT NULL\n                  AND global_sequence IS NOT NULL"
+        ],
+        [
+          "event_task_idx",
+          718,
+          "CREATE INDEX event_task_idx\n                ON event_log(task_id, sequence)\n                WHERE task_id IS NOT NULL"
+        ],
+        [
+          "event_task_sequence_unique",
+          719,
+          "CREATE UNIQUE INDEX event_task_sequence_unique\n                ON event_log(task_id, sequence)\n                WHERE task_id IS NOT NULL AND sequence IS NOT NULL"
+        ],
+        [
+          "camp_history_uninitialized_idx",
+          727,
+          "CREATE INDEX camp_history_uninitialized_idx ON camp(id)\n    WHERE history_activity_initialized=0 AND deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_history_directory_idx",
+          86068,
+          "CREATE INDEX camp_history_directory_idx ON camp(julianday(COALESCE(history_activity_at,created_at)) DESC,id)\n    WHERE deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_message_history_activity_idx",
+          86246,
+          "CREATE INDEX camp_message_history_activity_idx ON camp_message(camp_id,julianday(created_at) DESC,id,created_at)\n    WHERE tombstoned_at IS NULL AND recall_state <> 'withdrawn'"
+        ]
+      ]
+    },
+    "uninitialized": {
+      "queryPlan": [
+        "SCAN camp USING INDEX camp_history_directory_idx",
+        "CORRELATED SCALAR SUBQUERY 2",
+        "SEARCH m USING INDEX camp_message_history_activity_idx (camp_id=?)",
+        "SEARCH e EXISTS USING COVERING INDEX event_log_entity_sequence_idx (entity_type=? AND entity_id=? AND event_type=? AND global_sequence>?)",
+        "CORRELATED SCALAR SUBQUERY 2",
+        "SEARCH m USING INDEX camp_message_history_activity_idx (camp_id=?)",
+        "SEARCH e EXISTS USING COVERING INDEX event_log_entity_sequence_idx (entity_type=? AND entity_id=? AND event_type=? AND global_sequence>?)",
+        "USE TEMP B-TREE FOR ORDER BY"
+      ],
+      "readOpcodes": [
+        [
+          "SorterOpen",
+          3,
+          6,
+          0,
+          "k(2,-B,B)"
+        ],
+        [
+          "OpenRead",
+          0,
+          79,
+          0,
+          "28"
+        ],
+        [
+          "OpenRead",
+          4,
+          86068,
+          0,
+          "k(3,-,,)"
+        ],
+        [
+          "DeferredSeek",
+          4,
+          0,
+          0,
+          null
+        ],
+        [
+          "Column",
+          4,
+          1,
+          1,
+          null
+        ],
+        [
+          "Column",
+          0,
+          1,
+          5,
+          null
+        ],
+        [
+          "Column",
+          0,
+          27,
+          1,
+          "0"
+        ],
+        [
+          "Column",
+          0,
+          25,
+          6,
+          null
+        ],
+        [
+          "OpenRead",
+          1,
+          214,
+          0,
+          "28"
+        ],
+        [
+          "OpenRead",
+          7,
+          86246,
+          0,
+          "k(5,,-,,,)"
+        ],
+        [
+          "OpenRead",
+          8,
+          717,
+          0,
+          "k(5,,,,,)"
+        ],
+        [
+          "Column",
+          4,
+          1,
+          12,
+          null
+        ],
+        [
+          "DeferredSeek",
+          7,
+          0,
+          1,
+          null
+        ],
+        [
+          "Column",
+          7,
+          2,
+          14,
+          null
+        ],
+        [
+          "OpenEphemeral",
+          9,
+          1,
+          0,
+          "k(1,B)"
+        ],
+        [
+          "Column",
+          9,
+          0,
+          15,
+          null
+        ],
+        [
+          "Column",
+          7,
+          3,
+          10,
+          null
+        ],
+        [
+          "Column",
+          0,
+          9,
+          6,
+          null
+        ],
+        [
+          "Column",
+          0,
+          27,
+          20,
+          "0"
+        ],
+        [
+          "Column",
+          0,
+          25,
+          19,
+          null
+        ],
+        [
+          "OpenRead",
+          1,
+          214,
+          0,
+          "28"
+        ],
+        [
+          "OpenRead",
+          12,
+          86246,
+          0,
+          "k(5,,-,,,)"
+        ],
+        [
+          "OpenRead",
+          13,
+          717,
+          0,
+          "k(5,,,,,)"
+        ],
+        [
+          "Column",
+          4,
+          1,
+          24,
+          null
+        ],
+        [
+          "DeferredSeek",
+          12,
+          0,
+          1,
+          null
+        ],
+        [
+          "Column",
+          12,
+          2,
+          26,
+          null
+        ],
+        [
+          "OpenEphemeral",
+          14,
+          1,
+          0,
+          "k(1,B)"
+        ],
+        [
+          "Column",
+          14,
+          0,
+          27,
+          null
+        ],
+        [
+          "Column",
+          12,
+          3,
+          22,
+          null
+        ],
+        [
+          "Column",
+          0,
+          9,
+          19,
+          null
+        ],
+        [
+          "Column",
+          4,
+          1,
+          4,
+          null
+        ],
+        [
+          "SorterInsert",
+          3,
+          31,
+          3,
+          "4"
+        ],
+        [
+          "Column",
+          15,
+          3,
+          7,
+          null
+        ],
+        [
+          "Column",
+          15,
+          2,
+          6,
+          null
+        ],
+        [
+          "Column",
+          15,
+          1,
+          5,
+          null
+        ]
+      ],
+      "schemaObjects": [
+        [
+          "camp",
+          79,
+          "CREATE TABLE \"camp\" (\n                    id TEXT PRIMARY KEY,\n                    title TEXT NOT NULL,\n                    name_origin TEXT NOT NULL DEFAULT 'default'\n                        CHECK(name_origin IN ('default', 'generated', 'user')),\n                    collaboration_mode TEXT NOT NULL DEFAULT 'peer'\n                        CHECK(collaboration_mode IN ('peer', 'lead_coordinated')),\n                    project_binding_kind TEXT NOT NULL\n                        CHECK(project_binding_kind IN ('quick_chat', 'directory')),\n                    project_path TEXT NOT NULL,\n                    default_lead_agent_id TEXT,\n                    last_message_sequence INTEGER NOT NULL DEFAULT 0,\n                    version INTEGER NOT NULL DEFAULT 1,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL\n                , activation_state TEXT NOT NULL DEFAULT 'active'\n                CHECK(activation_state IN ('pending', 'active')), membership_generation INTEGER NOT NULL DEFAULT 1\n                CHECK(membership_generation >= 1), attachment_revision INTEGER NOT NULL DEFAULT 0\n                CHECK(attachment_revision >= 0), deletion_operation_id TEXT, deletion_requested_at TEXT, deletion_attempt_count INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attempt_count >= 0), deletion_next_attempt_at TEXT, deletion_last_error_code TEXT, deletion_attention_required INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attention_required IN (0, 1)), deletion_attention_revision INTEGER NOT NULL DEFAULT 0\n                CHECK(deletion_attention_revision >= 0), navigation_activity_sequence INTEGER NOT NULL DEFAULT 0 CHECK(navigation_activity_sequence >= 0), navigation_activity_at TEXT, navigation_completion_sequence INTEGER NOT NULL DEFAULT 0 CHECK(navigation_completion_sequence >= 0), last_delivery_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_delivery_sequence>=0), history_activity_at TEXT, history_activity_message_id TEXT, history_activity_initialized INTEGER NOT NULL DEFAULT 0 CHECK(history_activity_initialized IN (0,1)))"
+        ],
+        [
+          "sqlite_autoindex_camp_1",
+          80,
+          null
+        ],
+        [
+          "camp_message",
+          214,
+          "CREATE TABLE \"camp_message\" (\n                id TEXT PRIMARY KEY,\n                camp_id TEXT NOT NULL REFERENCES camp(id),\n                sequence INTEGER NOT NULL,\n                author_type TEXT NOT NULL CHECK(author_type IN ('user', 'agent', 'system', 'external_principal')),\n                author_id TEXT NOT NULL,\n                source_agent_run_id TEXT,\n                body TEXT NOT NULL,\n                address_mode TEXT NOT NULL CHECK(address_mode IN ('default', 'explicit', 'broadcast')),\n                addressed_agent_ids_json TEXT NOT NULL,\n                reply_to_camp_message_id TEXT REFERENCES \"camp_message\"(id),\n                camp_turn_id TEXT REFERENCES camp_turn(id),\n                agent_run_id TEXT REFERENCES agent_run(id),\n                tombstoned_at TEXT,\n                version INTEGER NOT NULL DEFAULT 1,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL, content_digest TEXT\n                        NOT NULL DEFAULT 'sha256:legacy-uncomputed'\n                        CHECK(length(content_digest) > 0), presentation_json TEXT, structured_content_json TEXT\n                CHECK(\n                    structured_content_json IS NULL\n                    OR json_valid(structured_content_json)\n                ), effective_recipient_ids_json TEXT NOT NULL DEFAULT '[]'\n                CHECK(json_valid(effective_recipient_ids_json)), recipient_set_digest TEXT, recipient_presentation_json TEXT NOT NULL DEFAULT '{}'\n                CHECK(json_valid(recipient_presentation_json)), source_operation_id TEXT, agent_addressing_mode TEXT\n                    CHECK(agent_addressing_mode IN ('automatic', 'public_only')), source_attachments_json TEXT NOT NULL DEFAULT '[]'\n                CHECK(json_valid(source_attachments_json)\n                    AND json_type(source_attachments_json) = 'array'), quotes_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(quotes_json) AND json_type(quotes_json)='array'), origin_kind TEXT NOT NULL DEFAULT 'legacy'\n                    CHECK(origin_kind IN (\n                        'legacy', 'local_composer', 'agent', 'automation',\n                        'channel', 'mission', 'system'\n                    )), recall_state TEXT NOT NULL DEFAULT 'ineligible'\n                    CHECK(recall_state IN ('ineligible', 'recallable', 'closed', 'withdrawn')), withdrawn_by_id TEXT, withdrawn_at TEXT,\n                UNIQUE(camp_id, sequence)\n            )"
+        ],
+        [
+          "sqlite_autoindex_camp_message_1",
+          215,
+          null
+        ],
+        [
+          "sqlite_autoindex_camp_message_2",
+          216,
+          null
+        ],
+        [
+          "event_log",
+          496,
+          "CREATE TABLE \"event_log\" (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                event_id TEXT UNIQUE,\n\n                task_id TEXT REFERENCES task(id),\n                turn_id TEXT,\n                sequence INTEGER,\n                event_type TEXT NOT NULL,\n                native_method TEXT,\n                payload_json TEXT NOT NULL,\n\n                camp_id TEXT,\n                entity_type TEXT,\n                entity_id TEXT,\n                actor_type TEXT,\n                actor_id TEXT,\n                source_agent_run_id TEXT,\n                execution_epoch INTEGER,\n\n                command_id TEXT,\n                command_type TEXT,\n                request_digest TEXT,\n                request_digest_version INTEGER,\n                result_status TEXT,\n                result_code TEXT,\n                result_payload_json TEXT,\n                result_entity_type TEXT,\n                result_entity_id TEXT,\n\n                created_at TEXT NOT NULL, global_sequence INTEGER, command_client_id TEXT,\n\n                CHECK (\n                    (event_type = 'command.result'\n                        AND command_id IS NOT NULL\n                        AND command_type IS NOT NULL\n                        \n                        \n                        AND result_status IS NOT NULL\n                        AND result_code IS NOT NULL\n                        AND result_payload_json IS NOT NULL)\n                    OR\n                    (event_type <> 'command.result'\n                        AND command_id IS NULL\n                        AND command_type IS NULL\n                        AND request_digest IS NULL\n                        AND request_digest_version IS NULL\n                        AND result_status IS NULL\n                        AND result_code IS NULL\n                        AND result_payload_json IS NULL\n                        AND result_entity_type IS NULL\n                        AND result_entity_id IS NULL)\n                ),\n                CHECK (\n                    (result_entity_type IS NULL AND result_entity_id IS NULL)\n                    OR\n                    (result_entity_type IS NOT NULL AND result_entity_id IS NOT NULL)\n                )\n            )"
+        ],
+        [
+          "sqlite_autoindex_event_log_1",
+          497,
+          null
+        ],
+        [
+          "camp_directory_project_idx",
+          534,
+          "CREATE INDEX camp_directory_project_idx\n                    ON camp(project_path)\n                    WHERE project_binding_kind = 'directory'"
+        ],
+        [
+          "camp_activation_state_idx",
+          540,
+          "CREATE INDEX camp_activation_state_idx\n                ON camp(activation_state, updated_at, id)"
+        ],
+        [
+          "camp_message_camp_identity_unique",
+          586,
+          "CREATE UNIQUE INDEX camp_message_camp_identity_unique\n                ON camp_message(camp_id, id)"
+        ],
+        [
+          "camp_message_navigation_activity_idx",
+          587,
+          "CREATE INDEX camp_message_navigation_activity_idx\n                    ON camp_message(camp_id, author_type, created_at)"
+        ],
+        [
+          "camp_message_source_operation_unique",
+          588,
+          "CREATE UNIQUE INDEX camp_message_source_operation_unique\n                ON camp_message(source_operation_id)\n                WHERE source_operation_id IS NOT NULL"
+        ],
+        [
+          "camp_deletion_operation_unique",
+          661,
+          "CREATE UNIQUE INDEX camp_deletion_operation_unique\n                ON camp(deletion_operation_id)\n                WHERE deletion_operation_id IS NOT NULL"
+        ],
+        [
+          "camp_deletion_due_idx",
+          662,
+          "CREATE INDEX camp_deletion_due_idx\n                ON camp(deletion_attention_required, deletion_next_attempt_at,\n                        deletion_requested_at, id)\n                WHERE deletion_operation_id IS NOT NULL"
+        ],
+        [
+          "notification_message_source_run",
+          681,
+          "CREATE INDEX notification_message_source_run ON camp_message(source_agent_run_id)"
+        ],
+        [
+          "camp_navigation_window_idx",
+          690,
+          "CREATE INDEX camp_navigation_window_idx ON camp (\n    CASE WHEN project_binding_kind = 'directory' THEN 'directory:' || project_path ELSE 'quick-chat' END,\n    COALESCE(navigation_activity_at, created_at) DESC,\n    navigation_activity_sequence DESC, id\n) WHERE deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_message_direct_reply_idx",
+          708,
+          "CREATE INDEX camp_message_direct_reply_idx ON camp_message(camp_id, reply_to_camp_message_id, sequence, id) WHERE reply_to_camp_message_id IS NOT NULL"
+        ],
+        [
+          "event_command_result_unique",
+          714,
+          "CREATE UNIQUE INDEX event_command_result_unique\n                ON event_log(command_id)\n                WHERE command_id IS NOT NULL"
+        ],
+        [
+          "event_global_sequence_unique",
+          715,
+          "CREATE UNIQUE INDEX event_global_sequence_unique\n                ON event_log(global_sequence)\n                WHERE global_sequence IS NOT NULL"
+        ],
+        [
+          "event_log_camp_global_sequence_idx",
+          716,
+          "CREATE INDEX event_log_camp_global_sequence_idx\n                    ON event_log(camp_id, global_sequence)\n                    WHERE camp_id IS NOT NULL AND global_sequence IS NOT NULL"
+        ],
+        [
+          "event_log_entity_sequence_idx",
+          717,
+          "CREATE INDEX event_log_entity_sequence_idx\n                ON event_log(entity_type, entity_id, event_type, global_sequence)\n                WHERE entity_type IS NOT NULL\n                  AND entity_id IS NOT NULL\n                  AND global_sequence IS NOT NULL"
+        ],
+        [
+          "event_task_idx",
+          718,
+          "CREATE INDEX event_task_idx\n                ON event_log(task_id, sequence)\n                WHERE task_id IS NOT NULL"
+        ],
+        [
+          "event_task_sequence_unique",
+          719,
+          "CREATE UNIQUE INDEX event_task_sequence_unique\n                ON event_log(task_id, sequence)\n                WHERE task_id IS NOT NULL AND sequence IS NOT NULL"
+        ],
+        [
+          "camp_history_uninitialized_idx",
+          727,
+          "CREATE INDEX camp_history_uninitialized_idx ON camp(id)\n    WHERE history_activity_initialized=0 AND deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_history_directory_idx",
+          86068,
+          "CREATE INDEX camp_history_directory_idx ON camp(julianday(COALESCE(history_activity_at,created_at)) DESC,id)\n    WHERE deletion_operation_id IS NULL"
+        ],
+        [
+          "camp_message_history_activity_idx",
+          86246,
+          "CREATE INDEX camp_message_history_activity_idx ON camp_message(camp_id,julianday(created_at) DESC,id,created_at)\n    WHERE tombstoned_at IS NULL AND recall_state <> 'withdrawn'"
+        ]
+      ]
+    }
+  },
+  "publicationStatementMs": [
+    1.8404999999999998,
+    1.632917,
+    1.4792500000000002,
+    1.555792,
+    1.3459590000000001,
+    1.462875,
+    1.521416,
+    1.293167,
+    1.395333,
+    1.3311250000000001,
+    1.758333,
+    1.473375
+  ],
+  "seedMs": 30155.142916999997,
+  "sqlite": "3.53.2",
+  "uninitializedDirectoryMs": [
+    4.066917,
+    2.349792,
+    2.1315,
+    2.690667,
+    2.516666,
+    2.1153750000000002,
+    2.321375
+  ],
+  "withdrawalStatementMs": [
+    0.16025,
+    0.12324999999999998,
+    0.125084,
+    0.142875,
+    0.090625,
+    0.098625,
+    0.10070799999999999,
+    0.103166,
+    0.092,
+    0.08545799999999999,
+    0.148083,
+    0.099917
+  ]
+}

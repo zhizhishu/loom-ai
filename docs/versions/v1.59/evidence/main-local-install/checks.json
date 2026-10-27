@@ -1,0 +1,107 @@
+{
+  "status": "passed",
+  "sourceCommit": "4ffb689217171521e0f1696953cb330f33b7b3dc",
+  "mergedMain": "0bfc35b0dc68d99eeb483f59406e3beca84a2840",
+  "previousDiskAppSourceCommit": "831092a069c7389640e05fcdb6965899989b2d88",
+  "scope": "macOS arm64 daily package, real isolated Electron Main/Host and packaged Web assets; no model execution or daily data fixture",
+  "checks": [
+    {
+      "command": "git pull --ff-only origin main",
+      "status": "passed",
+      "checkout": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai",
+      "result": "Already up to date; merged origin/main into rovai/unified-rust-host without conflict"
+    },
+    {
+      "command": "pnpm typecheck",
+      "status": "passed"
+    },
+    {
+      "command": "pnpm test (first run)",
+      "status": "failed",
+      "failure": "evaluation-host.test.ts:93 polling for completed still received running during concurrent release compilation; 2023 other Vitest tests passed",
+      "log": "/tmp/rovai-main-install-tests-20260914.log"
+    },
+    {
+      "command": "pnpm exec vitest run apps/desktop/src/main/evaluation-host.test.ts",
+      "status": "passed",
+      "passed": 4,
+      "implementationOrAssertionChanged": false,
+      "log": "/tmp/rovai-main-install-evaluation-retry-20260914.log"
+    },
+    {
+      "command": "pnpm test (full retry)",
+      "status": "passed",
+      "vitestFiles": 198,
+      "vitestPassed": 2024,
+      "nodePassed": 317,
+      "nodePlatformSkipped": 2,
+      "log": "/tmp/rovai-main-install-tests-retry-20260914.log"
+    },
+    {
+      "command": "pnpm package:mac:daily",
+      "status": "passed",
+      "version": "0.2.6",
+      "signature": "ad-hoc",
+      "includes": [
+        "App",
+        "rovai-host",
+        "rovai-core",
+        "rovai",
+        "138 Web files"
+      ],
+      "log": "/tmp/rovai-main-install-package-20260914.log"
+    },
+    {
+      "command": "node /tmp/rovai-main-install-acceptance-20260914.mjs",
+      "status": "passed",
+      "evidence": "validation.json",
+      "log": "/tmp/rovai-main-install-acceptance-20260914.log"
+    },
+    {
+      "command": "pnpm test:rust:pr",
+      "status": "passed",
+      "corePassed": 805,
+      "coreExistingManualIgnored": 6,
+      "cliPassed": 35,
+      "slowIntegrationPassed": 310,
+      "log": "/tmp/rovai-main-install-rust-20260914.log"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "status": "passed",
+      "log": "/tmp/rovai-main-install-clippy-20260914.log"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "status": "passed"
+    },
+    {
+      "command": "pnpm docs:test",
+      "status": "passed",
+      "passed": 10
+    },
+    {
+      "command": "pnpm docs:check",
+      "status": "passed",
+      "log": "/tmp/rovai-main-install-docs-20260914.log"
+    },
+    {
+      "command": "pnpm install:mac:daily --backup <recorded path>",
+      "status": "passed",
+      "evidence": "installation.json",
+      "log": "/tmp/rovai-main-install-promote-20260914.log"
+    },
+    {
+      "command": "DOCS_BASE_REF=c9acdee3597a9f8beeee6b6fac51f5258a8fe574 pnpm docs:check:ci",
+      "status": "passed",
+      "log": "/tmp/rovai-main-install-docs-ci-20260914.log"
+    }
+  ],
+  "limits": [
+    "Initial polling timeout cause was not established; isolated and full reruns passed without assertion changes.",
+    "Rust PR suite is the documented base/CLI/selected slow integration range, not all-features or Windows qualification.",
+    "This package smoke checks real restart/reopen and renewal metadata; 30-day/7-day time boundaries are covered by the earlier unchanged controlled-clock Session tests.",
+    "No Windows/Linux or physical phone acceptance is inferred from this install.",
+    "Installed disk bundle is new; current daily processes continue running their already-loaded version."
+  ]
+}

@@ -1,0 +1,242 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-17",
+  "userSteeringSequence": 35,
+  "scope": "Cancellation without an answer; next-instruction continuity; not questionnaire tool hiding",
+  "platform": "macOS arm64",
+  "productionSourceCommit": "e359b08721f4f363f4b53a0bf9bd414169309374",
+  "researchBaseCommit": "a093530f706f15c236cfcb95921a0581e79b752d",
+  "productionCodeChangedThisRound": false,
+  "dailyNativeConfigurationChanged": false,
+  "questionnaireToolsHidden": false,
+  "upstreamCandidateInstalled": false,
+  "controlled": {
+    "kind": "official-cli-with-deterministic-local-provider",
+    "nativeVersion": "0.6.12",
+    "status": "passed",
+    "caseCount": 12,
+    "runCount": 11,
+    "runOutcomes": {
+      "succeeded": 7,
+      "failed": 4
+    },
+    "cases": [
+      {
+        "name": "QUESTION_BASELINE",
+        "status": "passed",
+        "run": "2bd02c7d-b038-41fa-bf6e-1b6e94ecb94f"
+      },
+      {
+        "name": "ASK_SINGLE",
+        "status": "passed",
+        "run": "d6092589-1ad9-4d0c-b2d0-19e5c1d6c790",
+        "runOutcome": "failed",
+        "publicSendCount": 0,
+        "retryable": false,
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "AFTER_ASK_SINGLE",
+        "status": "passed",
+        "run": "b293d73f-afbf-4251-a640-a6e100e27897",
+        "sameSession": true,
+        "coreRestarted": false,
+        "sameCoreChildPids": true
+      },
+      {
+        "name": "ASK_MULTIPLE",
+        "status": "passed",
+        "run": "4915cc85-ee10-4cc7-8caa-f1f4112793fe",
+        "runOutcome": "failed",
+        "publicSendCount": 0,
+        "retryable": false,
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "AFTER_ASK_MULTIPLE",
+        "status": "passed",
+        "run": "12867fb3-37e4-4e11-8292-4cfc614e5b5b",
+        "sameSession": true,
+        "coreRestarted": true,
+        "sameCoreChildPids": false
+      },
+      {
+        "name": "SEND_ASK",
+        "status": "passed",
+        "run": "72046951-1d74-4dce-9d77-552dbac8154b",
+        "runOutcome": "failed",
+        "publicSendCount": 1,
+        "retryable": false,
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "AFTER_SEND_ASK",
+        "status": "passed",
+        "run": "53cf3866-abd2-4a98-b400-d3c1392a726e",
+        "sameSession": true,
+        "coreRestarted": false,
+        "sameCoreChildPids": true
+      },
+      {
+        "name": "ASK_DEFAULT",
+        "status": "passed",
+        "run": "4eec36bb-1e9a-4edf-be93-275639b2244b",
+        "runOutcome": "failed",
+        "publicSendCount": 0,
+        "retryable": false,
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "AFTER_ASK_DEFAULT",
+        "status": "passed",
+        "run": "bd865fcc-da5f-4e10-afe1-582e03acb29f",
+        "sameSession": true,
+        "coreRestarted": false,
+        "sameCoreChildPids": true
+      },
+      {
+        "name": "ordinary ALLOW after questionnaire",
+        "status": "passed",
+        "run": "d76c6755-548b-4ca4-ab3d-2103db07128f",
+        "approvals": 1
+      },
+      {
+        "name": "ordinary DENY after questionnaire",
+        "status": "passed",
+        "run": "6a7f110b-58d7-4c60-aa1e-21d0de24ec86",
+        "approvals": 1
+      },
+      {
+        "name": "native ask_user remains enabled; no synthetic answer injected",
+        "status": "passed"
+      }
+    ],
+    "hostObservation": "Core direct-child PID set; no cross-Session or concurrency qualification",
+    "command": "node scripts/smoke-minimax-runtime.mjs /absolute/path/to/mcode --questionnaires-only --fixture-root /absolute/empty-fixture",
+    "rawReportSha256": "005bef9b73e13c25ce6ee43fdfb942d42cab2a747f86b1c473f2738c3602a404"
+  },
+  "realLlm": {
+    "kind": "real-llm-development-app",
+    "nativeVersion": "0.6.12",
+    "provider": "Sub2API",
+    "model": "gpt-6",
+    "apiFormat": "openai-responses",
+    "status": "passed",
+    "cases": [
+      {
+        "name": "real ask_user cancelled without an answer",
+        "run": "cb5b0416-6446-4303-b3d6-358ce3a740f3",
+        "outcome": "failed",
+        "error": "runtime_unsettled_activity",
+        "publicSendCount": 0,
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "real successor recalls context, writes, checks and publishes",
+        "run": "dfa787af-f920-4673-b288-cf4882ec1ecd",
+        "outcome": "succeeded",
+        "publicSendCount": 1,
+        "sameSession": true
+      }
+    ],
+    "runs": [
+      {
+        "id": "cb5b0416-6446-4303-b3d6-358ce3a740f3",
+        "status": "failed",
+        "last_error_code": "runtime_unsettled_activity"
+      },
+      {
+        "id": "dfa787af-f920-4673-b288-cf4882ec1ecd",
+        "status": "succeeded",
+        "last_error_code": null
+      }
+    ],
+    "threadId": "rvcamp_01m5532jcdeqrr16a34rcsj4w6",
+    "threadTitle": "MiniMax · 问卷取消与续接",
+    "sameSession": true,
+    "hostPidObservation": "not_observed; the live probe returned empty PID arrays",
+    "fileReadAndAsserted": true,
+    "continuityMarker": "ASK-CANCEL-714",
+    "publicSuccessMarker": "MINIMAX_QUESTIONNAIRE_SUCCESSOR_OK",
+    "developmentWindowLeftOpen": true,
+    "rawReportSha256": "089737e96bf6fb4deb40305befe093dae6b1c512f61801b679c1bea43b0f5e4c"
+  },
+  "fallbackScope": {
+    "nativePermissionQuestionnaireObserved": false,
+    "existingExtendedTestOwner": "acp::tests::approval_selects_the_exact_native_option_id",
+    "reason": "Public upstream normalizes allowOther=true, which is ineligible for permission fallback; guard is separately tested"
+  },
+  "otherRuntimeComparison": "Source inspection only; no new live Pi/Cursor/ZCode/Claude qualification",
+  "limitations": [
+    "Current questionnaire Run fails; no automatic continuation or conversion to Thread text",
+    "Tools remain visible; a future model turn may ask again",
+    "Usage remains partial or unknown, not a complete bill",
+    "Preview and existing CLI/Skills/MCP/platform qualification limits remain"
+  ],
+  "validation": [
+    {
+      "command": "node --check scripts/smoke-minimax-runtime.mjs",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests acp::tests::approval_selects_the_exact_native_option_id -- --exact",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests pi::tests::unsupported_native_extension_ui_is_cancelled_without_managed_interpretation -- --exact",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "pnpm docs:test",
+      "passed": 10,
+      "failed": 0
+    },
+    {
+      "command": "pnpm docs:check",
+      "status": "passed"
+    },
+    {
+      "command": "DOCS_BASE_REF=a093530f706f15c236cfcb95921a0581e79b752d pnpm docs:check:ci",
+      "status": "passed"
+    },
+    {
+      "command": "pnpm test:rust:pr",
+      "passed": 473,
+      "failed": 0,
+      "ignored": 1,
+      "newRustTestsAdded": 0
+    }
+  ]
+}

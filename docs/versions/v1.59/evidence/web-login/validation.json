@@ -1,0 +1,34 @@
+{
+  "passed": true,
+  "actualRustHost": true,
+  "productionWebUI": true,
+  "layouts": [
+    "day/night 1440x920",
+    "day/night 390x844",
+    "day 844x390"
+  ],
+  "invalidToken": true,
+  "networkFailure": true,
+  "revealKeyboard": true,
+  "busy": true,
+  "refresh": true,
+  "reauthSameComposer": true,
+  "reauthSameEditor": true,
+  "scan": true,
+  "separateBrowserDrafts": true,
+  "reducedMotion": true,
+  "realRuntime": false,
+  "sourceCommit": "831092a069c7389640e05fcdb6965899989b2d88",
+  "version": "0.2.6",
+  "architecture": "macOS arm64",
+  "binarySource": "daily package Contents/Resources/bin/rovai-host",
+  "uiSource": "same daily package Contents/Resources/web-ui",
+  "testIsolation": "temporary Core data root, Skill Library, MCP config and two Chrome profiles",
+  "physicalPhoneTested": false,
+  "htmlRegression": {
+    "command": "ROVAI_HOST_BIN=<daily package>/Contents/Resources/bin/rovai-host pnpm test:host-web-html",
+    "result": "1 passed",
+    "uiMatchesPackagedDirectory": true
+  },
+  "scriptCorrections": "Initial acceptance clicked Camp before authorized navigation finished loading. Added actual list readiness waits at both click sites; no product change for this fixture correction."
+}

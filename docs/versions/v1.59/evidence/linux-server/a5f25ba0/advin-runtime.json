@@ -1,0 +1,361 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "a5f25ba00e8866dbbf4d13d3733a610399eacbe8",
+  "fullQualification": false,
+  "reports": [
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "codebuddy-cli",
+      "sourceCommit": "a5f25ba00e8866dbbf4d13d3733a610399eacbe8",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-codebuddy-cli-4/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-codebuddy-cli-4/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-codebuddy-cli-4/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "bd5a712a-4350-4706-9b38-59cc8fc096e2",
+          "status": "succeeded",
+          "conversationId": "b05d044a-5651-4ccf-aef7-d7c190e73fec",
+          "nativeBinding": {
+            "native_session_id": "01a0a045-6a44-7eca-a03e-4a46c3c1d4f1",
+            "native_binding_id": "0271b4b8-1b5e-4cd2-9e70-e5bdef1ede6f",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "2f588203-7e72-4bf5-a12e-802053d3bf06",
+          "status": "succeeded",
+          "conversationId": "b05d044a-5651-4ccf-aef7-d7c190e73fec",
+          "nativeBinding": {
+            "native_session_id": "01a0a045-6a44-7eca-a03e-4a46c3c1d4f1",
+            "native_binding_id": "0271b4b8-1b5e-4cd2-9e70-e5bdef1ede6f",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "5a8723db-bdd2-4a13-ba2b-803b20e02183",
+          "status": "succeeded",
+          "conversationId": "b05d044a-5651-4ccf-aef7-d7c190e73fec",
+          "nativeBinding": {
+            "native_session_id": "01a0a045-6a44-7eca-a03e-4a46c3c1d4f1",
+            "native_binding_id": "0271b4b8-1b5e-4cd2-9e70-e5bdef1ede6f",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "5d05571c-3fdb-4cdc-b10a-3ebf3904f47e",
+          "status": "succeeded",
+          "conversationId": "b05d044a-5651-4ccf-aef7-d7c190e73fec",
+          "nativeBinding": {
+            "native_session_id": "01a0a045-6a44-7eca-a03e-4a46c3c1d4f1",
+            "native_binding_id": "0271b4b8-1b5e-4cd2-9e70-e5bdef1ede6f",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "2.150.0",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": false,
+        "childReaped": true
+      },
+      "status": "passed",
+      "attempt": "codebuddy-cli-4"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "zcode-app",
+      "sourceCommit": "a5f25ba00e8866dbbf4d13d3733a610399eacbe8",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-zcode-app-3/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-zcode-app-3/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-zcode-app-3/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message"
+      ],
+      "runs": [
+        {
+          "id": "1fab668b-6346-4500-b81a-2187023b3bd7",
+          "status": "succeeded",
+          "conversationId": "c4d42209-070e-43b7-a436-247f896c078c",
+          "nativeBinding": {
+            "native_session_id": "sess_1355db90-0700-4512-b6b6-0b2fe5c14f17",
+            "native_binding_id": "5b6bfd77-c04d-413c-8065-27fbcb13f6e9",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "374e2f39-8f97-496d-b687-4deea5fc538e",
+          "status": "succeeded",
+          "conversationId": "c4d42209-070e-43b7-a436-247f896c078c",
+          "nativeBinding": {
+            "native_session_id": "sess_1355db90-0700-4512-b6b6-0b2fe5c14f17",
+            "native_binding_id": "5b6bfd77-c04d-413c-8065-27fbcb13f6e9",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "4b40ec37-8bc5-4500-b5ee-81e089779fa1",
+          "status": "succeeded",
+          "conversationId": "c4d42209-070e-43b7-a436-247f896c078c",
+          "nativeBinding": {
+            "native_session_id": "sess_1355db90-0700-4512-b6b6-0b2fe5c14f17",
+            "native_binding_id": "5b6bfd77-c04d-413c-8065-27fbcb13f6e9",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "5531fd5d-c0fb-4e65-855a-52a729caaf4f",
+          "status": "succeeded",
+          "conversationId": "c4d42209-070e-43b7-a436-247f896c078c",
+          "nativeBinding": {
+            "native_session_id": "sess_1355db90-0700-4512-b6b6-0b2fe5c14f17",
+            "native_binding_id": "5b6bfd77-c04d-413c-8065-27fbcb13f6e9",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "0.16.5",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "Write",
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "Read",
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": true
+      },
+      "status": "failed",
+      "error": "Cancellation must reap the fixture child\n+ actual - expected\n\n+ [\n+   80878\n+ ]\n- []\n",
+      "attempt": "zcode-app-3"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "zcode-app",
+      "sourceCommit": "a5f25ba00e8866dbbf4d13d3733a610399eacbe8",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-zcode-app-4/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-zcode-app-4/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-zcode-app-4/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message"
+      ],
+      "runs": [
+        {
+          "id": "e362285b-3392-4937-9085-eae7407a431e",
+          "status": "succeeded",
+          "conversationId": "b7d15dbd-8acf-4edd-81f2-ecb9fca48a6d",
+          "nativeBinding": {
+            "native_session_id": "sess_97c5dffc-1bb1-4758-a452-bb6afdf57ba2",
+            "native_binding_id": "1999040f-728b-4eed-bc97-fc33e0618de3",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "cfb3caaa-14d9-49cc-b6e4-dc6afb126ee1",
+          "status": "succeeded",
+          "conversationId": "b7d15dbd-8acf-4edd-81f2-ecb9fca48a6d",
+          "nativeBinding": {
+            "native_session_id": "sess_97c5dffc-1bb1-4758-a452-bb6afdf57ba2",
+            "native_binding_id": "1999040f-728b-4eed-bc97-fc33e0618de3",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "b382a369-1789-4f40-911a-a70fa55ac793",
+          "status": "succeeded",
+          "conversationId": "b7d15dbd-8acf-4edd-81f2-ecb9fca48a6d",
+          "nativeBinding": {
+            "native_session_id": "sess_97c5dffc-1bb1-4758-a452-bb6afdf57ba2",
+            "native_binding_id": "1999040f-728b-4eed-bc97-fc33e0618de3",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "b44789bb-81f9-4edb-bd50-8023b7046b62",
+          "status": "succeeded",
+          "conversationId": "b7d15dbd-8acf-4edd-81f2-ecb9fca48a6d",
+          "nativeBinding": {
+            "native_session_id": "sess_97c5dffc-1bb1-4758-a452-bb6afdf57ba2",
+            "native_binding_id": "1999040f-728b-4eed-bc97-fc33e0618de3",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "0.16.5",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "Write",
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": true
+      },
+      "status": "failed",
+      "error": "Cancellation must reap the fixture child\n+ actual - expected\n\n+ [\n+   82242\n+ ]\n- []\n",
+      "attempt": "zcode-app-4"
+    }
+  ],
+  "memoryGuards": [
+    {
+      "name": "server-codebuddy-cli-4",
+      "initial": {
+        "availableKiB": 7506116,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 6619980,
+      "peakTestUserRssKiB": 1163124,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 948539392,
+      "cgroupCurrentBytes": 806805504,
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 66.4,
+      "final": {
+        "availableKiB": 7470228,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-zcode-app-3",
+      "initial": {
+        "availableKiB": 7513668,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 5840980,
+      "peakTestUserRssKiB": 1993652,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1735053312,
+      "cgroupCurrentBytes": 852336640,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 80.12,
+      "final": {
+        "availableKiB": 7503108,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-zcode-app-4",
+      "initial": {
+        "availableKiB": 7518124,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 5756280,
+      "peakTestUserRssKiB": 2055644,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1789292544,
+      "cgroupCurrentBytes": 826097664,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 71.53,
+      "final": {
+        "availableKiB": 7516112,
+        "swapUsedKiB": 0
+      }
+    }
+  ]
+}

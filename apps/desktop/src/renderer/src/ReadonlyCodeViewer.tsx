@@ -1,0 +1,209 @@
+import { uiAttribute, useInterfaceLanguage } from './interface-language'
+import { APPEARANCE_READING_CHANGED } from './reduced-motion'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import CodeMirror from '@uiw/react-codemirror'
+import { EditorView } from '@codemirror/view'
+import { useFileFindAdapter } from './FilePreviewFind'
+import { codeFileFindAdapter } from './file-find-code'
+import { isPreviewSelectAll } from './file-preview-selection'
+import type { FileLocationTarget, ResolvedTheme } from '@contracts'
+import {
+  loadSourceLanguageForFilename,
+  sourceCodeMirrorTheme,
+  sourceReaderExtensions,
+  sourceTargetLocalLines
+} from './source-preview'
+
+interface LoadedLanguage {
+  filename: string
+  support: Awaited<ReturnType<typeof loadSourceLanguageForFilename>>
+}
+
+export function ReadonlyCodeViewer({
+  fileName,
+  text,
+  startLine = 1,
+  target,
+  theme,
+  readingLine,
+  onReadingLine,
+  findScopeLabel = ''
+}: {
+  fileName: string
+  text: string
+  startLine?: number
+  target?: FileLocationTarget
+  theme: ResolvedTheme
+  readingLine?: number
+  onReadingLine?(line: number): void
+  findScopeLabel?: string
+}): React.JSX.Element {
+  const interfaceLanguage = useInterfaceLanguage()
+  const viewRef = useRef<EditorView | null>(null)
+  const readingLineRef = useRef(readingLine)
+  readingLineRef.current = readingLine
+  const previousThemeRef = useRef(theme)
+  const themeAnchorRef = useRef<{ theme: ResolvedTheme; view: EditorView; position: number } | null>(null)
+  const [editor, setEditor] = useState<EditorView | null>(null)
+  const scheduledTargetRef = useRef<{
+    view: EditorView
+    text: string
+    startLine: number
+    line: number
+    endLine?: number
+    target?: FileLocationTarget
+  } | null>(null)
+  const [loadedLanguage, setLoadedLanguage] = useState<LoadedLanguage | null>(null)
+  const languageSettled = loadedLanguage?.filename === fileName
+  const language = languageSettled ? loadedLanguage.support : null
+  const targetLine = target?.line
+  const targetEndLine = target?.endLine
+
+  useEffect(() => {
+    let active = true
+    void loadSourceLanguageForFilename(fileName).then((support) => {
+      if (active) setLoadedLanguage({ filename: fileName, support })
+    })
+    return () => {
+      active = false
+    }
+  }, [fileName])
+
+  useEffect(() => {
+    const measure = (): void => viewRef.current?.requestMeasure()
+    document.addEventListener(APPEARANCE_READING_CHANGED, measure)
+    return () => document.removeEventListener(APPEARANCE_READING_CHANGED, measure)
+  }, [])
+
+  useEffect(() => {
+    const line = readingLineRef.current
+    if (!editor || line === undefined) return
+    let frame = 0
+    const restore = (): void => {
+      if (!editor.scrollDOM.clientHeight) return
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => {
+        const local = Math.max(1, Math.min(editor.state.doc.lines, line - startLine + 1))
+        editor.dispatch({ effects: EditorView.scrollIntoView(editor.state.doc.line(local).from, { y: 'start', yMargin: 0 }) })
+        observer.disconnect()
+      })
+    }
+    const observer = new ResizeObserver(restore)
+    observer.observe(editor.scrollDOM)
+    restore()
+    return () => { observer.disconnect(); cancelAnimationFrame(frame) }
+  }, [editor, text, startLine])
+
+  const findAdapter = useMemo(() => editor ? codeFileFindAdapter(editor, findScopeLabel) : null, [editor, text, findScopeLabel])
+  useFileFindAdapter(findAdapter)
+
+  const extensions = useMemo(() => sourceReaderExtensions({
+    ariaLabel: uiAttribute("{0} 内容", String(fileName)),
+    language,
+    startLine,
+    target,
+    theme
+  }), [fileName, interfaceLanguage, language, startLine, targetEndLine, targetLine, theme])
+
+  const targetScrollTop = useCallback((view: EditorView): number | null => {
+    const local = sourceTargetLocalLines(startLine, view.state.doc.lines, target)
+    if (!local) return null
+    const block = view.lineBlockAt(view.state.doc.line(local.from).from)
+    return Math.max(0, block.top - (view.scrollDOM.clientHeight - block.height) / 2)
+  }, [startLine, targetEndLine, targetLine])
+
+  const scheduleTargetScroll = useCallback((view: EditorView): void => {
+    if (!targetLine) return
+    const scheduled = scheduledTargetRef.current
+    if (scheduled?.view === view && scheduled.text === text && scheduled.startLine === startLine
+      && scheduled.line === targetLine && scheduled.endLine === targetEndLine && scheduled.target === target) return
+    window.requestAnimationFrame(() => {
+      if (viewRef.current !== view || !view.dom.isConnected) return
+      view.requestMeasure({
+        read: view => view.scrollDOM.clientHeight > 0 ? targetScrollTop(view) : null,
+        write: (scrollTop) => {
+          if (scrollTop === null || viewRef.current !== view || !view.dom.isConnected) return
+          scheduledTargetRef.current = { view, text, startLine, line: targetLine, endLine: targetEndLine, target }
+          view.scrollDOM.scrollTop = scrollTop
+        }
+      })
+    })
+  }, [startLine, target, targetEndLine, targetLine, targetScrollTop, text])
+
+  useEffect(() => {
+    if (!editor || !languageSettled || !targetLine) return
+    // A retained document may finish loading while hidden. Apply its new explicit
+    // target once it has a measurable viewport, never on subsequent warm returns.
+    const position = (): void => scheduleTargetScroll(editor)
+    const observer = new ResizeObserver(position)
+    observer.observe(editor.scrollDOM)
+    position()
+    return () => observer.disconnect()
+  }, [editor, languageSettled, targetLine, scheduleTargetScroll])
+
+  useLayoutEffect(() => {
+    if (previousThemeRef.current === theme) return undefined
+    previousThemeRef.current = theme
+    const view = viewRef.current
+    if (!view) return undefined
+    const scrollerBounds = view.scrollDOM.getBoundingClientRect()
+    const visibleLine = [...view.contentDOM.querySelectorAll<HTMLElement>('.cm-line')]
+      .find(line => line.getBoundingClientRect().bottom > scrollerBounds.top)
+    // A virtualized editor may still have old layout estimates during theme reconfiguration.
+    // Resolve the rendered line through its DOM position instead of estimated screen coordinates.
+    const anchor = visibleLine ? view.posAtDOM(visibleLine) : view.lineBlockAtHeight(view.scrollDOM.scrollTop).from
+    themeAnchorRef.current = { theme, view, position: anchor }
+    return undefined
+  }, [theme])
+
+  useEffect(() => {
+    const anchor = themeAnchorRef.current
+    if (!anchor || anchor.theme !== theme) return undefined
+    const frame = window.requestAnimationFrame(() => {
+      if (viewRef.current === anchor.view && anchor.view.dom.isConnected) {
+        anchor.view.dispatch({ effects: EditorView.scrollIntoView(anchor.position, { y: 'start', yMargin: 0 }) })
+      }
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [theme])
+
+  return (
+    <div
+      className="file-preview-code"
+      role="region"
+      aria-label={uiAttribute("{0} 内容", String(fileName))}
+      tabIndex={0}
+      onScrollCapture={(event) => {
+        const view = viewRef.current
+        if (!view || event.target !== view.scrollDOM || !view.scrollDOM.clientHeight || !onReadingLine) return
+        const height = Math.max(0, (view.scrollDOM.getBoundingClientRect().top - view.documentTop) / view.scaleY)
+        onReadingLine(startLine + view.state.doc.lineAt(view.lineBlockAtHeight(height).from).number - 1)
+      }}
+      onKeyDown={(event) => {
+        const view = viewRef.current
+        if (!view || !isPreviewSelectAll(event)) return
+        event.preventDefault()
+        event.stopPropagation()
+        view.focus()
+        view.dispatch({ selection: { anchor: 0, head: view.state.doc.length }, userEvent: 'select' })
+      }}
+    >
+      <CodeMirror
+        className="file-preview-code-mirror"
+        value={text}
+        width="100%"
+        height="100%"
+        theme={sourceCodeMirrorTheme(theme)}
+        extensions={extensions}
+        basicSetup={false}
+        indentWithTab={false}
+        readOnly
+        editable={false}
+        onCreateEditor={(view) => {
+          viewRef.current = view
+          setEditor(view)
+        }}
+      />
+    </div>
+  )
+}

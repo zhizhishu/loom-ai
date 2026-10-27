@@ -1,0 +1,2153 @@
+{
+  "scope": "User seq30; current transports; macOS arm64; no daily App install",
+  "generatedAt": "2026-10-14T14:31:45.336557+00:00",
+  "baseline": "d6afc8c484b1d30dfe5cf112a05e9ce7169097dc",
+  "products": [
+    {
+      "attempt": "kiro-cancel-01",
+      "adapter": "kiro-cli",
+      "scenario": "cancel-only",
+      "status": "passed",
+      "error": "",
+      "startedAt": "2026-10-14T14:07:05.891Z",
+      "finishedAt": "2026-10-14T14:07:35.556Z",
+      "coreSha256": "20696677dcd6080255ca4e00dc64e3f24433f1cbb2c93dbf3aeac245e5d1766a",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [
+        {
+          "name": "cancel with in-flight steer: no later side effect or successor",
+          "status": "passed",
+          "delivery": [
+            {
+              "id": "abf3cb5d-e36e-41db-9e45-f985fad61322",
+              "recipient_agent_id": "agent_1",
+              "status": "failed",
+              "requested_mode": "steer",
+              "claimed_agent_run_id": "0d319d43-5cb9-4c66-ab9f-42c077af7de5",
+              "failure_code": "input_delivery_unknown"
+            }
+          ],
+          "inputs": [
+            {
+              "id": "1750f521-9c6b-4688-b0ac-9a5ab948e79c",
+              "status": "accepted",
+              "input_kind": "start",
+              "native_input_id": "acp-prompt-2f7aa0a5-309e-4d3d-ab8c-cf15365470d1-3",
+              "source_delivery_id": null,
+              "input_sequence": 0
+            },
+            {
+              "id": "df3e38ed-4407-4c81-8762-7887521b7422",
+              "status": "delivery_unknown",
+              "input_kind": "steer",
+              "native_input_id": null,
+              "source_delivery_id": "abf3cb5d-e36e-41db-9e45-f985fad61322",
+              "input_sequence": 1
+            }
+          ]
+        }
+      ],
+      "finalInputs": [
+        {
+          "id": "1750f521-9c6b-4688-b0ac-9a5ab948e79c",
+          "agent_run_id": "0d319d43-5cb9-4c66-ab9f-42c077af7de5",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-2f7aa0a5-309e-4d3d-ab8c-cf15365470d1-3",
+          "last_error": null
+        },
+        {
+          "id": "df3e38ed-4407-4c81-8762-7887521b7422",
+          "agent_run_id": "0d319d43-5cb9-4c66-ab9f-42c077af7de5",
+          "status": "delivery_unknown",
+          "input_kind": "steer",
+          "native_input_id": null,
+          "last_error": "Kiro target ended before confirming steering injection"
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "0d319d43-5cb9-4c66-ab9f-42c077af7de5",
+          "agent_id": "agent_1",
+          "status": "cancelled",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "70d821f185798eb3d71ed9448d55583a442b3829fe1611ab87c39eebdd2cb57e"
+    },
+    {
+      "attempt": "kiro-full-01",
+      "adapter": "kiro-cli",
+      "scenario": "full",
+      "status": "failed",
+      "error": "Error: Timed out: text input accepted",
+      "startedAt": "2026-10-14T14:00:39.668Z",
+      "finishedAt": "2026-10-14T14:02:09.869Z",
+      "coreSha256": "b4f1d65e78818d73d547bf613d92e9441f203eda899d26fef7476ebbd5a2303f",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [],
+      "finalInputs": [
+        {
+          "id": "db66c098-b8a6-4a79-8528-58b8c5560226",
+          "agent_run_id": "97ce5f47-af88-44e8-84a9-287ccea4872d",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-36aee94b-6aa2-43bd-806b-5cb2df6dac66-3",
+          "last_error": null
+        },
+        {
+          "id": "7487c4cc-01ce-421b-a18b-be0b90498a4f",
+          "agent_run_id": "97ce5f47-af88-44e8-84a9-287ccea4872d",
+          "status": "prepared",
+          "input_kind": "steer",
+          "native_input_id": null,
+          "last_error": null
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "97ce5f47-af88-44e8-84a9-287ccea4872d",
+          "agent_id": "agent_1",
+          "status": "running",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "f54b72550fd9bbaf52acd09011e826abf095f5b9cb64ae27f096289d9d5ded70"
+    },
+    {
+      "attempt": "kiro-full-02",
+      "adapter": "kiro-cli",
+      "scenario": "full",
+      "status": "failed",
+      "error": "AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:",
+      "startedAt": "2026-10-14T14:05:33.206Z",
+      "finishedAt": "2026-10-14T14:07:17.570Z",
+      "coreSha256": "20696677dcd6080255ca4e00dc64e3f24433f1cbb2c93dbf3aeac245e5d1766a",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [
+        {
+          "name": "same-run text + attachment-only",
+          "status": "passed",
+          "inputs": [
+            {
+              "id": "8a1be9df-bea1-4a31-a5ca-bdd9e9274dc1",
+              "status": "accepted",
+              "input_kind": "start",
+              "native_input_id": "acp-prompt-0dba9db0-e401-4359-8005-57ea843a993e-3",
+              "source_delivery_id": null,
+              "input_sequence": 0
+            },
+            {
+              "id": "af7cc5c5-fdb5-473f-a47f-8fe94a5538d1",
+              "status": "accepted",
+              "input_kind": "steer",
+              "native_input_id": "steer-bc19f6d726754f4985b441415d7cff59",
+              "source_delivery_id": "996a929c-fc1f-4171-aef7-1e210836d6a7",
+              "input_sequence": 1
+            },
+            {
+              "id": "d3b399fa-8ec7-4f62-a582-d6ecde041e62",
+              "status": "accepted",
+              "input_kind": "steer",
+              "native_input_id": "steer-c2c10d334f324576b05c2b68f3bcd345",
+              "source_delivery_id": "3288787b-27b5-473e-808b-6c0be4e407a2",
+              "input_sequence": 2
+            }
+          ]
+        },
+        {
+          "name": "ordinary queue separation",
+          "status": "passed"
+        }
+      ],
+      "finalInputs": [
+        {
+          "id": "8a1be9df-bea1-4a31-a5ca-bdd9e9274dc1",
+          "agent_run_id": "6244203c-f33f-4eb7-873d-c745130e03e1",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-0dba9db0-e401-4359-8005-57ea843a993e-3",
+          "last_error": null
+        },
+        {
+          "id": "af7cc5c5-fdb5-473f-a47f-8fe94a5538d1",
+          "agent_run_id": "6244203c-f33f-4eb7-873d-c745130e03e1",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "steer-bc19f6d726754f4985b441415d7cff59",
+          "last_error": null
+        },
+        {
+          "id": "d3b399fa-8ec7-4f62-a582-d6ecde041e62",
+          "agent_run_id": "6244203c-f33f-4eb7-873d-c745130e03e1",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "steer-c2c10d334f324576b05c2b68f3bcd345",
+          "last_error": null
+        },
+        {
+          "id": "c95c2e6b-7d33-4008-97ad-ea85ec218903",
+          "agent_run_id": "abfab1e4-d636-496a-b285-b3f70184fef5",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-32a2efd0-c535-4911-8f1e-1aefabb06589-3",
+          "last_error": null
+        },
+        {
+          "id": "cbfa4491-59fd-489d-8802-ac6e9e310384",
+          "agent_run_id": "27e1a74e-ecf2-4731-a92e-93ba8e7e9e03",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-becd9812-8eba-4707-a186-89fae31350f2-3",
+          "last_error": null
+        },
+        {
+          "id": "661884a6-38b6-4d2d-b5a2-66501b137d77",
+          "agent_run_id": "05708074-d07f-48ec-849f-4ac07f01b587",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-cf736443-ee59-44f9-8124-88b92b2cec0b-3",
+          "last_error": null
+        },
+        {
+          "id": "7b8d7840-6801-411a-a566-73b680cb3025",
+          "agent_run_id": "05708074-d07f-48ec-849f-4ac07f01b587",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "steer-c38b505517164f7693a040921e4ef4d7",
+          "last_error": null
+        },
+        {
+          "id": "bb7a1a0b-d277-4d24-acba-960b52316a8a",
+          "agent_run_id": "8a1ed409-59ae-42f3-a7b4-0e661d22a901",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-5b23ab2a-2b4f-4eab-9517-c5a06e1b4854-3",
+          "last_error": null
+        },
+        {
+          "id": "6c262692-7ba6-4343-88da-bebf1463e026",
+          "agent_run_id": "45c454a2-4637-4aae-a232-624bf3e9802b",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-becd9812-8eba-4707-a186-89fae31350f2-4",
+          "last_error": null
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "6244203c-f33f-4eb7-873d-c745130e03e1",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "abfab1e4-d636-496a-b285-b3f70184fef5",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "05708074-d07f-48ec-849f-4ac07f01b587",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "27e1a74e-ecf2-4731-a92e-93ba8e7e9e03",
+          "agent_id": "agent_2",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "8a1ed409-59ae-42f3-a7b4-0e661d22a901",
+          "agent_id": "agent_3",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "45c454a2-4637-4aae-a232-624bf3e9802b",
+          "agent_id": "agent_2",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "dc5d6c842c4d271b81a32790e21d88406a0a4bf9d264cb6621495ca4e042d6b2"
+    },
+    {
+      "attempt": "kiro-mixed-03",
+      "adapter": "kiro-cli",
+      "scenario": "mixed-only",
+      "status": "passed",
+      "error": "",
+      "startedAt": "2026-10-14T14:08:29.598Z",
+      "finishedAt": "2026-10-14T14:09:22.958Z",
+      "coreSha256": "20696677dcd6080255ca4e00dc64e3f24433f1cbb2c93dbf3aeac245e5d1766a",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [
+        {
+          "name": "one public multi-mention: capable busy / unsupported busy / idle",
+          "status": "passed",
+          "routes": [
+            {
+              "id": "99032535-f404-4152-a969-53ea14845958",
+              "recipient_agent_id": "agent_1",
+              "status": "claimed",
+              "requested_mode": "steer",
+              "claimed_agent_run_id": "8d2d4a9d-4c29-438c-8428-82c42168adea",
+              "failure_code": null
+            },
+            {
+              "id": "bf2f1d08-15a6-46fe-81d1-87d13329db54",
+              "recipient_agent_id": "agent_2",
+              "status": "waiting",
+              "requested_mode": "start",
+              "claimed_agent_run_id": null,
+              "failure_code": null
+            },
+            {
+              "id": "cf2e16b2-c285-4166-904f-7789dbbf0035",
+              "recipient_agent_id": "agent_3",
+              "status": "claimed",
+              "requested_mode": "start",
+              "claimed_agent_run_id": "264a42f1-6b36-4227-a624-b1c72427d080",
+              "failure_code": null
+            }
+          ]
+        }
+      ],
+      "finalInputs": [
+        {
+          "id": "79e412f9-7935-43cd-b1cd-e03877c08e94",
+          "agent_run_id": "dcd78ff3-d26a-4776-8eda-b1bb6122a873",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-e69da9ca-e5d4-4592-9515-2e9c6fed533b-3",
+          "last_error": null
+        },
+        {
+          "id": "dd2bdd6d-8ad0-439f-865b-5f0bc19fcc3c",
+          "agent_run_id": "8d2d4a9d-4c29-438c-8428-82c42168adea",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-e0b405d5-8298-4511-9f77-ad3398e13b58-3",
+          "last_error": null
+        },
+        {
+          "id": "c4f6a246-86cb-4dff-8d8b-f72963a36ff7",
+          "agent_run_id": "8d2d4a9d-4c29-438c-8428-82c42168adea",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "steer-bfeaab861c51408d81a4a13f46284ea7",
+          "last_error": null
+        },
+        {
+          "id": "8f99be0b-37b8-4f9c-8e1b-3724028be4be",
+          "agent_run_id": "264a42f1-6b36-4227-a624-b1c72427d080",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-4fbffb6d-9f2a-485c-939e-ef02dd395711-3",
+          "last_error": null
+        },
+        {
+          "id": "99b50c6d-8102-4656-a811-f249b3d7f6bd",
+          "agent_run_id": "e197f1c8-3401-45c3-b4c1-f727cc797529",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-e69da9ca-e5d4-4592-9515-2e9c6fed533b-4",
+          "last_error": null
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "8d2d4a9d-4c29-438c-8428-82c42168adea",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "dcd78ff3-d26a-4776-8eda-b1bb6122a873",
+          "agent_id": "agent_2",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "264a42f1-6b36-4227-a624-b1c72427d080",
+          "agent_id": "agent_3",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "e197f1c8-3401-45c3-b4c1-f727cc797529",
+          "agent_id": "agent_2",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "d212b758962c1f2accbbc181fbf109de82260841baee22a0d27840c89cc02fbf"
+    },
+    {
+      "attempt": "kiro-steer-debug",
+      "adapter": "kiro-cli",
+      "scenario": "steer-only",
+      "status": "failed",
+      "error": "Error: Timed out: text input accepted",
+      "startedAt": "2026-10-14T14:03:17.436Z",
+      "finishedAt": "2026-10-14T14:04:44.096Z",
+      "coreSha256": "a9a4319243a28ff08029219ad084039c23377dfa986578ea8150751e61189c5f",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "kiro-cli",
+          "version": "kiro-cli 2.21.1",
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [],
+      "finalInputs": [
+        {
+          "id": "3c029734-1270-4afd-8ff1-4da8b2a3cb38",
+          "agent_run_id": "e39a7d02-1f51-4d51-90ba-baaaa2eadbee",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-3c997570-6e40-453d-97c8-331b91a58395-3",
+          "last_error": null
+        },
+        {
+          "id": "ff6e7ad5-6f75-4038-bee3-359cc107bae8",
+          "agent_run_id": "e39a7d02-1f51-4d51-90ba-baaaa2eadbee",
+          "status": "prepared",
+          "input_kind": "steer",
+          "native_input_id": null,
+          "last_error": null
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "e39a7d02-1f51-4d51-90ba-baaaa2eadbee",
+          "agent_id": "agent_1",
+          "status": "running",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "6c96a927845d7217faa1e0b468fe13dcd4134655d5ab2e3ac8a2641c89b038a2"
+    },
+    {
+      "attempt": "zcode-cancel-01",
+      "adapter": "zcode-app",
+      "scenario": "cancel-only",
+      "status": "passed",
+      "error": "",
+      "startedAt": "2026-10-14T14:04:32.574Z",
+      "finishedAt": "2026-10-14T14:04:58.254Z",
+      "coreSha256": "a9a4319243a28ff08029219ad084039c23377dfa986578ea8150751e61189c5f",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [
+        {
+          "name": "cancel with in-flight steer: no later side effect or successor",
+          "status": "passed",
+          "delivery": [
+            {
+              "id": "4c8ff744-1482-414d-b9b3-74ec11115d03",
+              "recipient_agent_id": "agent_1",
+              "status": "failed",
+              "requested_mode": "steer",
+              "claimed_agent_run_id": "b928c28f-5d75-4e4d-a6a4-844ad6274431",
+              "failure_code": "input_delivery_unknown"
+            }
+          ],
+          "inputs": [
+            {
+              "id": "db77b501-62a6-448e-8ae1-1c592d6172b2",
+              "status": "accepted",
+              "input_kind": "start",
+              "native_input_id": "acp-prompt-c0408f7f-57c6-4ff7-a572-896ee0744bf7-3",
+              "source_delivery_id": null,
+              "input_sequence": 0
+            },
+            {
+              "id": "29a5c013-8d22-4a63-b3be-ce48471e30f8",
+              "status": "delivery_unknown",
+              "input_kind": "steer",
+              "native_input_id": null,
+              "source_delivery_id": "4c8ff744-1482-414d-b9b3-74ec11115d03",
+              "input_sequence": 1
+            }
+          ]
+        }
+      ],
+      "finalInputs": [
+        {
+          "id": "db77b501-62a6-448e-8ae1-1c592d6172b2",
+          "agent_run_id": "b928c28f-5d75-4e4d-a6a4-844ad6274431",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-c0408f7f-57c6-4ff7-a572-896ee0744bf7-3",
+          "last_error": null
+        },
+        {
+          "id": "29a5c013-8d22-4a63-b3be-ce48471e30f8",
+          "agent_run_id": "b928c28f-5d75-4e4d-a6a4-844ad6274431",
+          "status": "delivery_unknown",
+          "input_kind": "steer",
+          "native_input_id": null,
+          "last_error": "ACP error -32000: Official ZCode request failed: ZCode steering cancelled before consumption"
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "b928c28f-5d75-4e4d-a6a4-844ad6274431",
+          "agent_id": "agent_1",
+          "status": "cancelled",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": true,
+      "privateReportSha256": "718a254d152fcdd1ff810e23e6bfe8e29489bda49d0eef34b5e6c675afb1e5c0"
+    },
+    {
+      "attempt": "zcode-cancel-02",
+      "adapter": "zcode-app",
+      "scenario": "cancel-only",
+      "status": "passed",
+      "error": "",
+      "startedAt": "2026-10-14T14:12:50.920Z",
+      "finishedAt": "2026-10-14T14:13:18.978Z",
+      "coreSha256": "c062abbffbd2daeac36eec30c0e679a753815aa12d9ad47176cd8d44e2f26499",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [
+        {
+          "name": "cancel with in-flight steer: no later side effect or successor",
+          "status": "passed",
+          "delivery": [
+            {
+              "id": "b9d7d74b-bc70-40d3-af7a-61fcc46a342b",
+              "recipient_agent_id": "agent_1",
+              "status": "failed",
+              "requested_mode": "steer",
+              "claimed_agent_run_id": "35e1da63-d955-4ab0-a8e0-2a22b6c998ea",
+              "failure_code": "input_delivery_unknown"
+            }
+          ],
+          "inputs": [
+            {
+              "id": "eb0302a4-0c87-4fa2-8699-82722b543d80",
+              "status": "accepted",
+              "input_kind": "start",
+              "native_input_id": "acp-prompt-d0eda1d3-dc47-4927-b487-6f15124a00f1-3",
+              "source_delivery_id": null,
+              "input_sequence": 0
+            },
+            {
+              "id": "88d5e439-a5ad-438d-b696-ce1d9ed0f858",
+              "status": "delivery_unknown",
+              "input_kind": "steer",
+              "native_input_id": null,
+              "source_delivery_id": "b9d7d74b-bc70-40d3-af7a-61fcc46a342b",
+              "input_sequence": 1
+            }
+          ]
+        }
+      ],
+      "finalInputs": [
+        {
+          "id": "eb0302a4-0c87-4fa2-8699-82722b543d80",
+          "agent_run_id": "35e1da63-d955-4ab0-a8e0-2a22b6c998ea",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-d0eda1d3-dc47-4927-b487-6f15124a00f1-3",
+          "last_error": null
+        },
+        {
+          "id": "88d5e439-a5ad-438d-b696-ce1d9ed0f858",
+          "agent_run_id": "35e1da63-d955-4ab0-a8e0-2a22b6c998ea",
+          "status": "delivery_unknown",
+          "input_kind": "steer",
+          "native_input_id": null,
+          "last_error": "ACP error -32000: Official ZCode request failed: ZCode steering cancelled before consumption"
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "35e1da63-d955-4ab0-a8e0-2a22b6c998ea",
+          "agent_id": "agent_1",
+          "status": "cancelled",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "68d07fa4b87cf88e0a47385d5d62aece90c352af6af801c9fdd85b43817cb3c9"
+    },
+    {
+      "attempt": "zcode-full-01",
+      "adapter": "zcode-app",
+      "scenario": "full",
+      "status": "passed",
+      "error": "",
+      "startedAt": "2026-10-14T14:00:39.668Z",
+      "finishedAt": "2026-10-14T14:03:30.787Z",
+      "coreSha256": "b4f1d65e78818d73d547bf613d92e9441f203eda899d26fef7476ebbd5a2303f",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [
+        {
+          "name": "same-run text + attachment-only",
+          "status": "passed",
+          "inputs": [
+            {
+              "id": "8645417f-fb5e-44c5-b379-8e44be89b23e",
+              "status": "accepted",
+              "input_kind": "start",
+              "native_input_id": "acp-prompt-7e1b9872-d37e-4611-9ee3-9c3a4a137db0-3",
+              "source_delivery_id": null,
+              "input_sequence": 0
+            },
+            {
+              "id": "62400a81-ab8d-4d0d-a5f7-05a390fd994f",
+              "status": "accepted",
+              "input_kind": "steer",
+              "native_input_id": "62400a81-ab8d-4d0d-a5f7-05a390fd994f",
+              "source_delivery_id": "8c424a9f-4662-4bde-a1cb-e6fc55a0a5c0",
+              "input_sequence": 1
+            },
+            {
+              "id": "47cb8b31-3cec-4b8c-9e96-cbae8231277e",
+              "status": "accepted",
+              "input_kind": "steer",
+              "native_input_id": "47cb8b31-3cec-4b8c-9e96-cbae8231277e",
+              "source_delivery_id": "d83f507c-b109-4138-8812-fab2919995b7",
+              "input_sequence": 2
+            }
+          ]
+        },
+        {
+          "name": "ordinary queue separation",
+          "status": "passed"
+        },
+        {
+          "name": "one public multi-mention: capable busy / unsupported busy / idle",
+          "status": "passed",
+          "routes": [
+            {
+              "id": "95ca302e-259e-45ad-9602-d39e54f1a688",
+              "recipient_agent_id": "agent_1",
+              "status": "claimed",
+              "requested_mode": "steer",
+              "claimed_agent_run_id": "9ee5c2f3-e6bc-4c3b-8029-163fa00a9251",
+              "failure_code": null
+            },
+            {
+              "id": "f9c59bf8-a913-4699-84c6-e13254b2d7f3",
+              "recipient_agent_id": "agent_2",
+              "status": "waiting",
+              "requested_mode": "start",
+              "claimed_agent_run_id": null,
+              "failure_code": null
+            },
+            {
+              "id": "57499775-b793-4592-93e0-38be8b64ff4c",
+              "recipient_agent_id": "agent_3",
+              "status": "claimed",
+              "requested_mode": "start",
+              "claimed_agent_run_id": "a1ecbd05-bdcd-455d-89f4-70387d3ccb3d",
+              "failure_code": null
+            }
+          ]
+        }
+      ],
+      "finalInputs": [
+        {
+          "id": "8645417f-fb5e-44c5-b379-8e44be89b23e",
+          "agent_run_id": "8618315d-f788-4c28-8eac-2e6ed206eb4e",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-7e1b9872-d37e-4611-9ee3-9c3a4a137db0-3",
+          "last_error": null
+        },
+        {
+          "id": "62400a81-ab8d-4d0d-a5f7-05a390fd994f",
+          "agent_run_id": "8618315d-f788-4c28-8eac-2e6ed206eb4e",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "62400a81-ab8d-4d0d-a5f7-05a390fd994f",
+          "last_error": null
+        },
+        {
+          "id": "47cb8b31-3cec-4b8c-9e96-cbae8231277e",
+          "agent_run_id": "8618315d-f788-4c28-8eac-2e6ed206eb4e",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "47cb8b31-3cec-4b8c-9e96-cbae8231277e",
+          "last_error": null
+        },
+        {
+          "id": "d4583760-ddd3-4620-b931-e1e2302acaec",
+          "agent_run_id": "bd9b3ee2-ec5d-4697-8095-8730aebc378f",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-1b0edb38-642b-4182-b7c7-8954b7600311-3",
+          "last_error": null
+        },
+        {
+          "id": "c9499529-5c6c-48f9-a166-088b4a23e496",
+          "agent_run_id": "9ee5c2f3-e6bc-4c3b-8029-163fa00a9251",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-1b0edb38-642b-4182-b7c7-8954b7600311-4",
+          "last_error": null
+        },
+        {
+          "id": "733e0017-2f65-4a9a-9108-24b84c9e9a78",
+          "agent_run_id": "9f06bf2f-9f4e-4bc6-9a88-87aa2aad7734",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-0586b427-a81f-4fee-93ac-2da4f675d288-3",
+          "last_error": null
+        },
+        {
+          "id": "708e102d-065f-453a-97ff-fb92661acd01",
+          "agent_run_id": "9ee5c2f3-e6bc-4c3b-8029-163fa00a9251",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "708e102d-065f-453a-97ff-fb92661acd01",
+          "last_error": null
+        },
+        {
+          "id": "570cf38b-fddf-4936-99a9-4e4c9664352e",
+          "agent_run_id": "a1ecbd05-bdcd-455d-89f4-70387d3ccb3d",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-c2b316e9-72bd-48c7-8141-918cf190e082-3",
+          "last_error": null
+        },
+        {
+          "id": "5d7307c5-ae3b-4a36-945b-4d95280b3bb2",
+          "agent_run_id": "f639f00d-912e-4189-af86-638f5510b0e0",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-0586b427-a81f-4fee-93ac-2da4f675d288-4",
+          "last_error": null
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "8618315d-f788-4c28-8eac-2e6ed206eb4e",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "bd9b3ee2-ec5d-4697-8095-8730aebc378f",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "9ee5c2f3-e6bc-4c3b-8029-163fa00a9251",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "9f06bf2f-9f4e-4bc6-9a88-87aa2aad7734",
+          "agent_id": "agent_2",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "a1ecbd05-bdcd-455d-89f4-70387d3ccb3d",
+          "agent_id": "agent_3",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "f639f00d-912e-4189-af86-638f5510b0e0",
+          "agent_id": "agent_2",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "cb959ef1202f07e87933d5e7bc9cf0ddbaa4ac946f8f062b4c490b5e117d898d"
+    },
+    {
+      "attempt": "zcode-full-02",
+      "adapter": "zcode-app",
+      "scenario": "full",
+      "status": "failed",
+      "error": "Error: Execution failed while waiting for Codex tool boundary: {\"id\":\"ab29a53a-54e3-4020-b0e9-541ccdf9e976\",\"status\":\"failed\",\"last_error_code\":\"runtime_prompt_runtime_error\",\"public_runtime_failure_json\":\"{\\\"runtimeKind\\\":\\\"zcode-app\\\",\\\"origin\\\":\\\"runtime\\\",\\\"phase\\\":\\\"execution\\\",\\\"code\\\":\\\"runtime_prompt_runtime_error\\\",\\\"summary\\\":\\\"ZCode 未能完成运行\\\",\\\"detail\\\":\\\"ACP error -32000: Official ZCode request failed: Official ZCode Turn failed\\\",\\\"retryable\\\":false}\"}",
+      "startedAt": "2026-10-14T14:10:53.383Z",
+      "finishedAt": "2026-10-14T14:11:17.326Z",
+      "coreSha256": "62203d9e6a2534a3cbcb44674f2c6b4ec287a20d4fc15fa0b5f218ad4f672aa8",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [],
+      "cases": [],
+      "finalInputs": [
+        {
+          "id": "6901325b-30f6-426d-87a7-da662f0997ac",
+          "agent_run_id": "ab29a53a-54e3-4020-b0e9-541ccdf9e976",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-6e053607-bb8a-4012-a140-1960820d1da0-3",
+          "last_error": null
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "ab29a53a-54e3-4020-b0e9-541ccdf9e976",
+          "agent_id": "agent_1",
+          "status": "failed",
+          "execution_epoch": 1,
+          "last_error_code": "runtime_prompt_runtime_error"
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "695ad6ed1efd70e5d9ce39f88748b6275f150cb09139c243481161726ae9cda4"
+    },
+    {
+      "attempt": "zcode-full-03",
+      "adapter": "zcode-app",
+      "scenario": "full",
+      "status": "passed",
+      "error": "",
+      "startedAt": "2026-10-14T14:14:00.082Z",
+      "finishedAt": "2026-10-14T14:16:52.897Z",
+      "coreSha256": "2daa4acdd22ed3003286a903a438dfccc6636258cb829b1d39012bbd52fb4f64",
+      "runtimes": [
+        {
+          "agentId": "agent_1",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_2",
+          "adapter": "opencode-cli",
+          "version": "opencode v2.0.25",
+          "model": {
+            "mode": "runtime_default"
+          }
+        },
+        {
+          "agentId": "agent_3",
+          "adapter": "zcode-app",
+          "version": null,
+          "model": {
+            "mode": "runtime_default"
+          }
+        }
+      ],
+      "runtimeChecks": [
+        {
+          "adapter": "zcode-app",
+          "result": {
+            "completed": true,
+            "outcome": "stable_failure",
+            "ready": false,
+            "runtimeKind": "zcode-app",
+            "scheduled": true,
+            "status": "stable_failure"
+          }
+        },
+        {
+          "adapter": "opencode-cli",
+          "result": {
+            "completed": true,
+            "outcome": "ready",
+            "ready": true,
+            "runtimeKind": "opencode-cli",
+            "scheduled": true,
+            "status": "ready"
+          }
+        }
+      ],
+      "cases": [
+        {
+          "name": "same-run text + attachment-only",
+          "status": "passed",
+          "inputs": [
+            {
+              "id": "74ea30fd-7955-4e4e-a4fd-f4fed8583f2b",
+              "status": "accepted",
+              "input_kind": "start",
+              "native_input_id": "acp-prompt-224cae38-45aa-450d-9fb8-4296852e17a3-3",
+              "source_delivery_id": null,
+              "input_sequence": 0
+            },
+            {
+              "id": "5568bce2-5bef-4ec3-be1f-cae96a5f0bdb",
+              "status": "accepted",
+              "input_kind": "steer",
+              "native_input_id": "5568bce2-5bef-4ec3-be1f-cae96a5f0bdb",
+              "source_delivery_id": "3e3cd629-0614-4755-8cb0-cb1b1d7bd194",
+              "input_sequence": 1
+            },
+            {
+              "id": "011a5b21-671b-4800-b442-e7e8992af40f",
+              "status": "accepted",
+              "input_kind": "steer",
+              "native_input_id": "011a5b21-671b-4800-b442-e7e8992af40f",
+              "source_delivery_id": "bdeee73b-3388-4e1c-a220-c376c08bfa91",
+              "input_sequence": 2
+            }
+          ]
+        },
+        {
+          "name": "ordinary queue separation",
+          "status": "passed"
+        },
+        {
+          "name": "one public multi-mention: capable busy / unsupported busy / idle",
+          "status": "passed",
+          "routes": [
+            {
+              "id": "1c1bf91b-2038-4cd7-88b8-fb01a448b681",
+              "recipient_agent_id": "agent_1",
+              "status": "claimed",
+              "requested_mode": "steer",
+              "claimed_agent_run_id": "b950b2ed-ad7b-49d6-a9ab-4b498551d744",
+              "failure_code": null
+            },
+            {
+              "id": "914b452e-aafd-4fc8-9717-d9813dda920d",
+              "recipient_agent_id": "agent_2",
+              "status": "waiting",
+              "requested_mode": "start",
+              "claimed_agent_run_id": null,
+              "failure_code": null
+            },
+            {
+              "id": "44182a11-c2cf-49ff-9b8c-500b8f1a604d",
+              "recipient_agent_id": "agent_3",
+              "status": "claimed",
+              "requested_mode": "start",
+              "claimed_agent_run_id": "3854ba3f-b260-461e-9a70-7f0aa3c42e05",
+              "failure_code": null
+            }
+          ]
+        }
+      ],
+      "finalInputs": [
+        {
+          "id": "74ea30fd-7955-4e4e-a4fd-f4fed8583f2b",
+          "agent_run_id": "58d7a19d-bd93-415d-b201-f4e86f9c42d1",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-224cae38-45aa-450d-9fb8-4296852e17a3-3",
+          "last_error": null
+        },
+        {
+          "id": "5568bce2-5bef-4ec3-be1f-cae96a5f0bdb",
+          "agent_run_id": "58d7a19d-bd93-415d-b201-f4e86f9c42d1",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "5568bce2-5bef-4ec3-be1f-cae96a5f0bdb",
+          "last_error": null
+        },
+        {
+          "id": "011a5b21-671b-4800-b442-e7e8992af40f",
+          "agent_run_id": "58d7a19d-bd93-415d-b201-f4e86f9c42d1",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "011a5b21-671b-4800-b442-e7e8992af40f",
+          "last_error": null
+        },
+        {
+          "id": "4d57d1d8-0060-4d3e-a926-1a0a7cc37e4d",
+          "agent_run_id": "1786d908-0800-48e9-84c0-92cb707d03e2",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-d0fe7ee4-c043-47ef-9421-bdbc1b0b9c27-3",
+          "last_error": null
+        },
+        {
+          "id": "7ccf9c64-21c7-4cd3-823c-d0e4a0f3f812",
+          "agent_run_id": "b950b2ed-ad7b-49d6-a9ab-4b498551d744",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-d0fe7ee4-c043-47ef-9421-bdbc1b0b9c27-4",
+          "last_error": null
+        },
+        {
+          "id": "276e404e-d5ba-4631-af47-809a515b4fc5",
+          "agent_run_id": "6fe745e6-df07-4d7b-b00b-71e02c6354e4",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-585f1bc0-3a67-449d-a55c-df905d714450-3",
+          "last_error": null
+        },
+        {
+          "id": "b53437c1-8477-4ac3-bc9d-80ca864f1943",
+          "agent_run_id": "b950b2ed-ad7b-49d6-a9ab-4b498551d744",
+          "status": "accepted",
+          "input_kind": "steer",
+          "native_input_id": "b53437c1-8477-4ac3-bc9d-80ca864f1943",
+          "last_error": null
+        },
+        {
+          "id": "79f6f0c2-9acf-4bda-b061-54825cb23370",
+          "agent_run_id": "3854ba3f-b260-461e-9a70-7f0aa3c42e05",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-1c1d3d37-d297-4779-8dcf-dbfdbeabd54c-3",
+          "last_error": null
+        },
+        {
+          "id": "d3bebde6-3a25-4bb7-933b-33b4d54f5591",
+          "agent_run_id": "5c7444bf-f25e-40d7-9349-8624075bbaab",
+          "status": "accepted",
+          "input_kind": "start",
+          "native_input_id": "acp-prompt-585f1bc0-3a67-449d-a55c-df905d714450-4",
+          "last_error": null
+        }
+      ],
+      "finalRuns": [
+        {
+          "id": "58d7a19d-bd93-415d-b201-f4e86f9c42d1",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "1786d908-0800-48e9-84c0-92cb707d03e2",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "b950b2ed-ad7b-49d6-a9ab-4b498551d744",
+          "agent_id": "agent_1",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "6fe745e6-df07-4d7b-b00b-71e02c6354e4",
+          "agent_id": "agent_2",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "3854ba3f-b260-461e-9a70-7f0aa3c42e05",
+          "agent_id": "agent_3",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        },
+        {
+          "id": "5c7444bf-f25e-40d7-9349-8624075bbaab",
+          "agent_id": "agent_2",
+          "status": "succeeded",
+          "execution_epoch": 1,
+          "last_error_code": null
+        }
+      ],
+      "coreExitCode": 0,
+      "cleanupRetryObserved": false,
+      "privateReportSha256": "380b4a19cefd0fa8a886ca62695e23a829b2133251c7ddea6a0acc6c75a85474"
+    }
+  ],
+  "protocol": [
+    {
+      "runtime": "Antigravity",
+      "version": "1.3.5",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:03:58.656761+00:00",
+      "finishedAt": "2026-10-14T14:04:31.410358+00:00",
+      "attempt": "antigravity-control-01",
+      "privateReportSha256": "45f6ecc3799b81f4a522032609457a654d0c478e867d2e71db745ce7c2366b03",
+      "steeringAdvertisement": null,
+      "agentInfo": null,
+      "results": [
+        {
+          "status": "SUCCESS",
+          "response": "ORIGINAL_028\n",
+          "error": null,
+          "num_turns": 1
+        },
+        {
+          "status": "ERROR",
+          "response": "ORIGINAL_028\n",
+          "error": "stream input message event \"control_request\" is not supported yet",
+          "num_turns": 1
+        }
+      ],
+      "exitCode": 2,
+      "executableSha256Before": "ebd71c4db14f79fca3fd0160332a38d9037146737422dcfc1f1d21ba01a13fff",
+      "executableSha256After": "ebd71c4db14f79fca3fd0160332a38d9037146737422dcfc1f1d21ba01a13fff"
+    },
+    {
+      "runtime": "Antigravity",
+      "version": "1.3.5",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:01:39.320302+00:00",
+      "finishedAt": "2026-10-14T14:02:33.283184+00:00",
+      "attempt": "antigravity-events-01",
+      "privateReportSha256": "67d3df82f44b5f00ea688cbd32827eee634cefbaa61b08f02c2a1d42cc5371f1",
+      "steeringAdvertisement": null,
+      "agentInfo": null,
+      "results": [
+        {
+          "status": "SUCCESS",
+          "response": "ORIGINAL_028\n",
+          "error": null,
+          "num_turns": 1
+        },
+        {
+          "status": "SUCCESS",
+          "response": "STEER_028_成功\n",
+          "error": null,
+          "num_turns": 2
+        }
+      ],
+      "exitCode": 0,
+      "executableSha256Before": "ebd71c4db14f79fca3fd0160332a38d9037146737422dcfc1f1d21ba01a13fff",
+      "executableSha256After": "ebd71c4db14f79fca3fd0160332a38d9037146737422dcfc1f1d21ba01a13fff"
+    },
+    {
+      "runtime": "dsh",
+      "label": "dsh-extension-discovery",
+      "version": "0.2.1-alpha.1",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:10:41.356039+00:00",
+      "attempt": "dsh-extension-discovery",
+      "privateReportSha256": "a40ec2eda88b52dd41ddc9ff1b71ba801d12ce83b53d86d7c9c85a79099f5c72",
+      "steeringAdvertisement": null,
+      "agentInfo": {
+        "name": "deepseek-harness-acp",
+        "version": "0.0.1"
+      },
+      "methodProbes": {
+        "_session/steering": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steering",
+            "data": {
+              "method": "_session/steering"
+            }
+          }
+        },
+        "_session/steer": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steer",
+            "data": {
+              "method": "_session/steer"
+            }
+          }
+        }
+      }
+    },
+    {
+      "runtime": "kimi",
+      "label": "kimi-extension-discovery",
+      "version": "2.1.1",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:10:41.357489+00:00",
+      "attempt": "kimi-extension-discovery",
+      "privateReportSha256": "7ddba3c9ce4ee4ddfea3a99a32785e0b1e40f0e5d1d87273907ac8f9e470820d",
+      "steeringAdvertisement": null,
+      "agentInfo": {
+        "name": "Kimi Code CLI",
+        "version": "2.1.1"
+      },
+      "methodProbes": {
+        "_session/steering": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steering",
+            "data": {
+              "method": "_session/steering"
+            }
+          }
+        },
+        "_session/steer": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steer",
+            "data": {
+              "method": "_session/steer"
+            }
+          }
+        }
+      }
+    },
+    {
+      "runtime": "opencode",
+      "label": "opencode-extension-discovery",
+      "version": "opencode v2.0.25",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:10:41.357602+00:00",
+      "attempt": "opencode-extension-discovery",
+      "privateReportSha256": "037fe3d38e8e636dfac165f9ceda1a2b6dd49e23baa6b6e26528595672116527",
+      "steeringAdvertisement": null,
+      "agentInfo": {
+        "name": "OpenCode",
+        "version": "2.0.25"
+      },
+      "methodProbes": {
+        "_session/steering": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steering",
+            "data": {
+              "method": "_session/steering"
+            }
+          }
+        },
+        "_session/steer": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steer",
+            "data": {
+              "method": "_session/steer"
+            }
+          }
+        }
+      }
+    },
+    {
+      "runtime": "qoder",
+      "label": "qoder-1.1.71-01",
+      "version": "1.1.71",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:03:34.466680+00:00",
+      "finishedAt": "2026-10-14T14:05:10.166739+00:00",
+      "attempt": "qoder-1.1.71-01",
+      "privateReportSha256": "2c982861bc1258fd13287fb7917ae79767cb59d9236140c26f4b785734e5e7ce",
+      "steeringAdvertisement": null,
+      "agentInfo": {
+        "name": "qoder-cli",
+        "title": "Qoder CLI",
+        "version": "1.1.71"
+      },
+      "extensionProbes": {
+        "_session/steer": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steer",
+            "data": {
+              "method": "_session/steer"
+            }
+          }
+        },
+        "_session/steering": {
+          "jsonrpc": "2.0",
+          "id": 5,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steering",
+            "data": {
+              "method": "_session/steering"
+            }
+          }
+        },
+        "session/steer": {
+          "jsonrpc": "2.0",
+          "id": 6,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": session/steer",
+            "data": {
+              "method": "session/steer"
+            }
+          }
+        }
+      },
+      "toolBoundary": {
+        "ready": true,
+        "firstPromptStillPending": true
+      },
+      "assistantText": "我会先检查当前目录的 `hold.py`，再运行它验证文件等待逻辑，不改动脚本。\n脚本会创建 `ready`，每 0.05 秒检查一次 `release`，并在文件出现或达到 100 秒后退出；当前没有 `release`，我将运行并记录耗时和输出。\n脚本已输出 `HOLD_COMPLETE`，耗时约 0.45 秒；我会检查标记文件，确认是否因 `release` 出现而提前结束等待。\nORIGINAL_028STEER_028_成功",
+      "responseOrder": [
+        {
+          "index": 139,
+          "responseTo": 3,
+          "stopReason": "end_turn",
+          "error": null
+        },
+        {
+          "index": 146,
+          "responseTo": 7,
+          "stopReason": "end_turn",
+          "error": null
+        }
+      ]
+    },
+    {
+      "runtime": "qoder",
+      "label": "qoder-current-01",
+      "version": "1.1.65",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:01:28.181674+00:00",
+      "finishedAt": "2026-10-14T14:02:56.315633+00:00",
+      "attempt": "qoder-current-01",
+      "privateReportSha256": "124e0857e7d35d16be45591a6330942f7841de1ba9352c7eff6fe91f1669940f",
+      "steeringAdvertisement": null,
+      "agentInfo": {
+        "name": "qoder-cli",
+        "title": "Qoder CLI",
+        "version": "1.1.65"
+      },
+      "extensionProbes": {
+        "_session/steer": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steer",
+            "data": {
+              "method": "_session/steer"
+            }
+          }
+        },
+        "_session/steering": {
+          "jsonrpc": "2.0",
+          "id": 5,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": _session/steering",
+            "data": {
+              "method": "_session/steering"
+            }
+          }
+        },
+        "session/steer": {
+          "jsonrpc": "2.0",
+          "id": 6,
+          "error": {
+            "code": -32601,
+            "message": "\"Method not found\": session/steer",
+            "data": {
+              "method": "session/steer"
+            }
+          }
+        }
+      },
+      "toolBoundary": {
+        "ready": true,
+        "firstPromptStillPending": true
+      },
+      "assistantText": "我会先检查当前目录的 `hold.py`，再在不改动脚本的前提下执行它，验证文件等待逻辑和 100 秒上限。\n脚本会写入 `ready`，每 0.05 秒检查一次 `release`，出现该文件或等待达到 100 秒后输出 `HOLD_COMPLETE`；当前目录没有 `release`，我将执行脚本并记录耗时。\nORIGINAL_028STEER_028_成功",
+      "responseOrder": [
+        {
+          "index": 120,
+          "responseTo": 3,
+          "stopReason": "end_turn",
+          "error": null
+        },
+        {
+          "index": 127,
+          "responseTo": 7,
+          "stopReason": "end_turn",
+          "error": null
+        }
+      ]
+    },
+    {
+      "runtime": "trae",
+      "label": "trae-0.120.52-discovery",
+      "version": "trae-cli version 0.120.52\nbuild date: 2026-08-12T01:31:30Z\nbuild commit: 6756e52a9238b6d493928e55b05127957dbfefb4\ncommit date: 2026-08-10T08:15:57Z",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:09:51.162569+00:00",
+      "attempt": "trae-0.120.52-discovery",
+      "privateReportSha256": "7a97a2653de67c8266f74b7543fd6ddf6b1a5f9159c371b108bfa8f0ebac7d90",
+      "steeringAdvertisement": null,
+      "agentInfo": null,
+      "methodProbes": {
+        "_session/steering": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "error": {
+            "code": -32601,
+            "message": "Method not found",
+            "data": {
+              "method": "_session/steering"
+            }
+          }
+        },
+        "_session/steer": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "error": {
+            "code": -32601,
+            "message": "Method not found",
+            "data": {
+              "method": "_session/steer"
+            }
+          }
+        }
+      }
+    },
+    {
+      "runtime": "trae",
+      "label": "trae-0.209.1-01",
+      "version": "traecli 0.209.1\ninstallation: public",
+      "status": "inconclusive",
+      "failure": {
+        "type": "KeyError",
+        "message": "'result'"
+      },
+      "startedAt": "2026-10-14T14:08:29.329384+00:00",
+      "finishedAt": "2026-10-14T14:08:33.324997+00:00",
+      "attempt": "trae-0.209.1-01",
+      "privateReportSha256": "ba1167d1024ea7163e95634e08148577b232a566aa90163d206d5d40cb6cb74c",
+      "steeringAdvertisement": {
+        "supported": true
+      },
+      "agentInfo": {
+        "name": "traecli-acp",
+        "title": "TRAE CLI",
+        "version": "0.209.1"
+      },
+      "sessionError": {
+        "code": -32000,
+        "message": "Authentication required"
+      }
+    },
+    {
+      "runtime": "trae",
+      "label": "trae-0.209.1-discovery",
+      "version": "traecli 0.209.1\ninstallation: public",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:09:52.330214+00:00",
+      "attempt": "trae-0.209.1-discovery",
+      "privateReportSha256": "49840b25b10bca218caf4d4fab6a8b4c624ccb2e5933d18ef9bde5c84e943c71",
+      "steeringAdvertisement": {
+        "supported": true
+      },
+      "agentInfo": {
+        "name": "traecli-acp",
+        "title": "TRAE CLI",
+        "version": "0.209.1"
+      },
+      "methodProbes": {
+        "_session/steering": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "error": {
+            "code": -32000,
+            "message": "Authentication required"
+          }
+        },
+        "_session/steer": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "error": {
+            "code": -32601,
+            "message": "Method not found",
+            "data": "_session/steer"
+          }
+        }
+      }
+    },
+    {
+      "runtime": "ZCode App",
+      "version": "3.14.5",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:05:45.766386+00:00",
+      "finishedAt": "2026-10-14T14:05:47.547539+00:00",
+      "attempt": "zcode-cleanup-01",
+      "privateReportSha256": "8180ae98d04769e257685edc4feb436e26a10ccef437c6e6d2150b8f66127887",
+      "steeringAdvertisement": null,
+      "agentInfo": null,
+      "nativeTurnEvents": [],
+      "cleanup": {
+        "confirmed": true,
+        "pendingGroups": 0,
+        "signalFailed": false,
+        "signalErrors": []
+      }
+    },
+    {
+      "runtime": "ZCode App",
+      "version": "3.14.5",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:07:57.638743+00:00",
+      "finishedAt": "2026-10-14T14:08:16.310284+00:00",
+      "attempt": "zcode-cleanup-02",
+      "privateReportSha256": "523802dc4a9c88f06037273c82f5a1444679d4454c8b64b96801b7fc45f0b148",
+      "steeringAdvertisement": null,
+      "agentInfo": null,
+      "nativeTurnEvents": [
+        {
+          "sessionId": "sess_1aa9b416-7b62-47fc-956d-8fe8acc06719",
+          "seq": 2,
+          "turnId": "turn_4b3bdc3b-0f97-4d0d-aee3-091896ba66a0",
+          "type": "turn.started"
+        },
+        {
+          "sessionId": "sess_1aa9b416-7b62-47fc-956d-8fe8acc06719",
+          "seq": 31,
+          "turnId": "turn_4b3bdc3b-0f97-4d0d-aee3-091896ba66a0",
+          "type": "turn.steerQueued"
+        },
+        {
+          "sessionId": "sess_1aa9b416-7b62-47fc-956d-8fe8acc06719",
+          "seq": 36,
+          "turnId": "turn_4b3bdc3b-0f97-4d0d-aee3-091896ba66a0",
+          "type": "turn.steerDrained"
+        },
+        {
+          "sessionId": "sess_1aa9b416-7b62-47fc-956d-8fe8acc06719",
+          "seq": 43,
+          "turnId": "turn_4b3bdc3b-0f97-4d0d-aee3-091896ba66a0",
+          "type": "turn.completed"
+        }
+      ],
+      "cleanup": {
+        "confirmed": false,
+        "pendingGroups": 0,
+        "signalFailed": true,
+        "signalErrors": [
+          {
+            "code": "EPERM",
+            "pid": 97221
+          }
+        ]
+      }
+    },
+    {
+      "runtime": "ZCode App",
+      "version": "3.14.5",
+      "status": "observed",
+      "startedAt": "2026-10-14T14:15:21.012421+00:00",
+      "finishedAt": "2026-10-14T14:15:46.670534+00:00",
+      "attempt": "zcode-cleanup-03",
+      "privateReportSha256": "98eea753d5f94b95515f3b03dcd982cdc774185e46003c2d62dd47e8cd4173a4",
+      "steeringAdvertisement": null,
+      "agentInfo": null,
+      "nativeTurnEvents": [
+        {
+          "sessionId": "sess_18531bc2-b4cd-4482-9d03-9ebf0cb1acaa",
+          "seq": 2,
+          "turnId": "turn_5cf7b16d-9873-4bf8-a4e6-440511a08c8d",
+          "type": "turn.started"
+        },
+        {
+          "sessionId": "sess_18531bc2-b4cd-4482-9d03-9ebf0cb1acaa",
+          "seq": 31,
+          "turnId": "turn_5cf7b16d-9873-4bf8-a4e6-440511a08c8d",
+          "type": "turn.steerQueued"
+        },
+        {
+          "sessionId": "sess_18531bc2-b4cd-4482-9d03-9ebf0cb1acaa",
+          "seq": 36,
+          "turnId": "turn_5cf7b16d-9873-4bf8-a4e6-440511a08c8d",
+          "type": "turn.steerDrained"
+        },
+        {
+          "sessionId": "sess_18531bc2-b4cd-4482-9d03-9ebf0cb1acaa",
+          "seq": 43,
+          "turnId": "turn_5cf7b16d-9873-4bf8-a4e6-440511a08c8d",
+          "type": "turn.completed"
+        }
+      ],
+      "cleanup": {
+        "confirmed": true,
+        "pendingGroups": 0,
+        "signalFailed": false,
+        "signalErrors": []
+      }
+    }
+  ],
+  "runtimeReadiness": [
+    {
+      "attempt": "before_probe_cleanup_fix",
+      "result": {
+        "completed": true,
+        "outcome": "stable_failure",
+        "ready": false,
+        "runtimeKind": "zcode-app",
+        "scheduled": true,
+        "status": "stable_failure"
+      },
+      "diagnosticCode": "runtime_probe_transient_failure"
+    },
+    {
+      "attempt": "zcode-readiness-fixed",
+      "startedAt": "2026-10-14T14:25:18.963Z",
+      "result": {
+        "completed": true,
+        "outcome": "ready",
+        "ready": true,
+        "runtimeKind": "zcode-app",
+        "scheduled": true,
+        "status": "ready"
+      },
+      "probeStatus": "ready",
+      "version": "0.16.9",
+      "diagnosticCode": null,
+      "status": "passed",
+      "coreExitCode": 0,
+      "stderrDigest": "8052ed171dc93252dc09902fa5a8f7999f290abfec64c4494f99c2b1e9ab3c32",
+      "finishedAt": "2026-10-14T14:25:33.783Z"
+    },
+    {
+      "attempt": "zcode-readiness-final",
+      "startedAt": "2026-10-14T14:27:20.252Z",
+      "result": {
+        "completed": true,
+        "outcome": "ready",
+        "ready": true,
+        "runtimeKind": "zcode-app",
+        "scheduled": true,
+        "status": "ready"
+      },
+      "probeStatus": "ready",
+      "version": "0.16.9",
+      "diagnosticCode": null,
+      "status": "passed",
+      "coreExitCode": 0,
+      "stderrDigest": "62ee70b20aecf85e16ddadef06863be477d259dff212892c11dcc0901692f316",
+      "finishedAt": "2026-10-14T14:27:42.255Z"
+    }
+  ],
+  "finalProbeCoreSha256": "b7a0eab7b93e9de75e520a4ba7ca3676ed05decbaf08a661cde17f800ee04fcc",
+  "validation": [
+    {
+      "name": "test-workspace-final.log",
+      "sha256": "57e611e6f24498e3b23d3cd5144b3c271e9e766cc941330aa9b3614b057f7f64",
+      "rustTests": {
+        "passed": 471,
+        "failed": 0,
+        "ignored": 1,
+        "groups": 10
+      }
+    },
+    {
+      "name": "test-acp-final.log",
+      "sha256": "a696c8a2f4693528491e5105ce953028fb4b4118db69a0bcce84caed95a7a0a3",
+      "rustTests": {
+        "passed": 77,
+        "failed": 0,
+        "ignored": 2,
+        "groups": 1
+      }
+    },
+    {
+      "name": "test-receipt-final.log",
+      "sha256": "8b421a9cdff4bc00561734c189acbd28f6e17827f1a2fcdee501e72b6b18cd3b",
+      "rustTests": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "groups": 1
+      }
+    },
+    {
+      "name": "test-zcode-final.log",
+      "sha256": "c4c6d9423c66d82cf54b2101a2019b238a7cbc0e197e1970bc87cf11778ea299",
+      "rustTests": {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "groups": 1
+      }
+    },
+    {
+      "name": "test-zcode-owner-final.log",
+      "sha256": "843efce28818622669419d0c812bed12ab0e140a95561e85435afe88e805c8c4",
+      "summaryLines": [
+        "✔ ZCode version metadata succeeds without creating an execution watcher (110.406167ms)",
+        "✔ ZCode retains closed-shell groups until descendants exit or Host closes (3615.475584ms)",
+        "ℹ tests 3",
+        "ℹ pass 2",
+        "ℹ fail 0",
+        "ℹ skipped 1"
+      ],
+      "nodeTests": {
+        "tests": 3,
+        "pass": 2,
+        "fail": 0,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "test-zcode-owner-race.log",
+      "sha256": "c4821e959a20de75eef8347bcc5177254875191262b145d35df7fd7a0bf7bd63",
+      "summaryLines": [
+        "✔ ZCode version metadata succeeds without creating an execution watcher (92.657625ms)",
+        "✖ ZCode retains closed-shell groups until descendants exit or Host closes (1679.81525ms)",
+        "ℹ tests 3",
+        "ℹ pass 1",
+        "ℹ fail 1",
+        "ℹ skipped 1",
+        "✖ failing tests:",
+        "✖ ZCode retains closed-shell groups until descendants exit or Host closes (1679.81525ms)",
+        "  SyntaxError [Error]: Unexpected end of JSON input"
+      ],
+      "nodeTests": {
+        "tests": 3,
+        "pass": 1,
+        "fail": 1,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "check-final.log",
+      "sha256": "aa72c4e90bff40770721828cadd882eed3e0ee9a38efef893174eb25fdaf9b86",
+      "summaryLines": [
+        "    Finished `dev` profile [unoptimized] target(s) in 7.70s"
+      ]
+    },
+    {
+      "name": "docs-test.log",
+      "sha256": "22d2961681f887a95c24c9ed25e6f9845275c5f378ac86f56ed4535487da28a0",
+      "summaryLines": [
+        "✔ migrated historical links can be repaired without changing the immutable manifest (198.687542ms)",
+        "✔ missing and duplicate migration targets are rejected (165.937209ms)",
+        "✔ missing current-authority coverage is rejected (88.670667ms)",
+        "✔ coverage actions, authority anchors, and migration resolutions are enforced (311.086291ms)",
+        "✔ migration resolutions remain valid after their source version becomes historical (93.541667ms)",
+        "✔ PR gate runs one diff-aware documentation check without a main push trigger (7.745583ms)",
+        "✔ numbered ADR files and unmanifested ADR headings are rejected (157.134292ms)",
+        "✔ version decision IDs require matching versions and explicit anchors (290.564833ms)",
+        "ℹ tests 10",
+        "ℹ pass 10",
+        "ℹ fail 0",
+        "ℹ skipped 0"
+      ],
+      "nodeTests": {
+        "tests": 10,
+        "pass": 10,
+        "fail": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "name": "docs-check.log",
+      "sha256": "0d39f442454060901df3d78e426eb9c1f2c7e3a47e10eb12bcfaa499403e6c68",
+      "summaryLines": [
+        "Documentation version checks passed for v1.72 across 172 version directories.",
+        "Decision governance checks passed: 220 archived ADRs, 151 source ADRs audited, 391 normative kernels (309 migrated, 80 replaced, 2 retired), 151 version decision files."
+      ]
+    },
+    {
+      "name": "docs-ci.log",
+      "sha256": "289f24954390438e26234c6b9092b70b7ec154146c0618bf1fb8f8c439b5a554",
+      "summaryLines": [
+        "Documentation version checks passed for v1.72 across 172 version directories.",
+        "Decision governance checks passed: 220 archived ADRs, 151 source ADRs audited, 391 normative kernels (309 migrated, 80 replaced, 2 retired), 151 version decision files."
+      ]
+    }
+  ],
+  "cleanup": {
+    "checkedAt": "2026-10-14T14:31:20.684211+00:00",
+    "scope": "/private/tmp/rovai-steer-extensions-20261014",
+    "method": "lsof cwd scoped to this private acceptance root",
+    "remaining": []
+  },
+  "recoveredFixtureCleanup": {
+    "checkedAt": "2026-10-14T14:29:57.780274+00:00",
+    "pid": 24131,
+    "processGroup": 24129,
+    "startedAt": "2026-10-14 22:27:56 +08:00",
+    "fixture": "Node owner signal-denial case before the close-handshake fix",
+    "cleanup": "terminated the exact sleep 600 identity after matching start time, command and current checkout cwd"
+  },
+  "sources": [
+    {
+      "name": "dsh-acp-current.txt",
+      "sha256": "6e944674ec48d24d168a9fadde83f979338eb6ebe6e90cb1d5afebadf5a6639e",
+      "bytes": 22633
+    },
+    {
+      "name": "dsh-tags.txt",
+      "sha256": "c83227a1ee7cd3cb8854eb83300b94a1cf55e53423160171242777c884eb02c3",
+      "bytes": 7290
+    },
+    {
+      "name": "kimi-acp-current.txt",
+      "sha256": "f3dad9c59f1b2a717fbf410a97f8812cc01590292e40deb2d9b7e54029acda75",
+      "bytes": 6939
+    },
+    {
+      "name": "kimi-releases.txt",
+      "sha256": "5b4cd812b8031e8df9adde434e5705ad04653d7b22ba33dde5c4b40978ad5ea7",
+      "bytes": 703939
+    },
+    {
+      "name": "kimi-steering-pr.txt",
+      "sha256": "7cf13c5bef97511f7feaffdadce5dc60c6d0c455cc7937b5313476ee1cf4b513",
+      "bytes": 16646
+    },
+    {
+      "name": "metadata.json",
+      "sha256": "e62dda7ffabe25bb611b2631a35af8c7eef92973787d95e2911c7f007df52e31",
+      "bytes": 9158
+    },
+    {
+      "name": "opencode-2.0.29-agent.ts",
+      "sha256": "2a1e8e62a1a87b9463675292342f4dc01ce377b4a57a2983a2c6ab5bf69a8258",
+      "bytes": 4992
+    },
+    {
+      "name": "opencode-2.0.29-capabilities.ts",
+      "sha256": "bb4849e6ba46203f397d6a3086bc784172fb5f86056e9b41e7e18d282137d35e",
+      "bytes": 633
+    },
+    {
+      "name": "opencode-2.0.29-connection.ts",
+      "sha256": "8193136406765f0a7ff919c62d9f8095f0192e06afbefc2ab6ede895a26c580e",
+      "bytes": 2906
+    },
+    {
+      "name": "opencode-2.0.29-prompt.ts",
+      "sha256": "02f2e1f42dc5ea4be5f2815220315f0532cdb36126b720eca4e118aef054d524",
+      "bytes": 2703
+    },
+    {
+      "name": "opencode-2.0.29-turn.ts",
+      "sha256": "74b72ef7c50c9d1f20a4a3f002c866ec80fb64aa287f301670afd87cf0ba0d16",
+      "bytes": 17375
+    },
+    {
+      "name": "opencode-releases.txt",
+      "sha256": "0983c36e0b28c5c5e81f148124e1885544bc58c50c9e572cb807fc722ca9e4fd",
+      "bytes": 642873
+    },
+    {
+      "name": "opencode-tags.txt",
+      "sha256": "be01daaf5c338490fe3c92188c1c95fad86668d27abc1d442f0cbc2c1ab7d8bc",
+      "bytes": 12831
+    },
+    {
+      "name": "opencode-v2.0.29-tree.json",
+      "sha256": "4ac66748a3f3501ac065e14faf89dc1fc82b3a54f0069cb4f694e86257e9c3d3",
+      "bytes": 2530424
+    },
+    {
+      "name": "qoder-acp.txt",
+      "sha256": "91bc99fce1076fe5516b347bbab19f546bfd1a6f40adce94de299ec2cf2ecd32",
+      "bytes": 5370
+    },
+    {
+      "name": "qoder-release.txt",
+      "sha256": "ffc55ec7e3aecbedfd8de38c1fa86311fdc67ec71f7a18d0770e786f8b4384ae",
+      "bytes": 109653
+    },
+    {
+      "name": "trae-acp.txt",
+      "sha256": "16625c9229aefac9d33fc646415d36df47c1a6705afab20f37d210b554eb754b",
+      "bytes": 57762
+    },
+    {
+      "name": "trae-install-v2.sh",
+      "sha256": "d86c84066bb493d40f6d671733b6243dddb9c39df1a9084676470736548b5be8",
+      "bytes": 55228
+    },
+    {
+      "name": "trae-v2-latest.json",
+      "sha256": "e7a00fdaac1c9aafe4a153714392890dddf7527b00fe345736deb3b93619d24d",
+      "bytes": 5108
+    },
+    {
+      "name": "trae-v2-public-stable-latest.json",
+      "sha256": "a26d1114a60afcf0dba4fe02dd6e2d0bb846bc2bafa4a88add50d9ff486464a5",
+      "bytes": 5110
+    }
+  ],
+  "sourceHashes": {
+    "crates/rovai-core/src/acp.rs": "865732b2c132174ce01d974e9791ad584322fb88679f2504466e9dd603c7e58d",
+    "crates/rovai-core/src/steer.rs": "10db2daa8b5670d433980fac6620bbcd1e24125f1d10ac26bbeb12bf060acee6",
+    "crates/rovai-core/src/zcode/events.rs": "c31af2d7bfde34052bac771a040599e0da90ba33a96beaccb575a7c9df3f39e6",
+    "crates/rovai-core/src/zcode/transport.rs": "833b4f2fc47c2a816ba7510fbcde7775e6e256a8d1447fdbcf0e2920f64b9340",
+    "crates/rovai-core/src/zcode/stdio-owner.cjs": "af6cb2d27163fb9943de1e5b88b1bcf95f3e9f5270ef37d7f0219084f8dbdca4",
+    "scripts/smoke-steer.mjs": "977ca6d4aed74b460ccf4bbac2c2249099cc726876088c8d4e4ba0349416b8cb",
+    "scripts/test-zcode-owner.mjs": "e5a4e282f5ba94f0c5af59c4847bf6c2925636d2a59f6d9d4dbe65108efc81b1"
+  },
+  "scripts": {
+    "antigravity_control_probe.py": "68375e4bce943664cd800e4e9f7e027a8e71173ffe78dc7490bbb9b4bef968fc",
+    "zcode_readiness.mjs": "65e9da0f7392f013d4ab7c5a86021df6a8ef272ad66fc6e4a3a515147eb5d4d6",
+    "zcode_cleanup_probe.py": "63fb29e50bcd9eb94d143cdcb89ab268765096ea9f0270bfb22da028eb29e295",
+    "zcode_cleanup_fixed_probe.py": "8e7a739623f195770ad72116470ac037f1990dfe5047fed2355004231db23bb8",
+    "zcode_cleanup_model_probe.py": "2a531bee6174dde7d83f7df5dd15a85adf38329c99855ba41ce88c58dfc43f70",
+    "antigravity_probe.py": "069d42c5ce4353bea3ff6dee1c73b9d589caa23522ebac68a407ec61ce005b14",
+    "acp_probe.py": "764b209bf3fb4854619a2ed97c37007dd19b3779d906c11b7154dd3a348a3e46",
+    "trae_discovery.py": "a9c1a28d2085a5030f6a5d4d728ba012ca57be345e876d87491111af88f116d8",
+    "export_results.py": "72dc8d8d939681f9092af6335533bdc161a93567ed793186777a43fa21d8deed",
+    "qoder_latest_probe.py": "df4daba2fd93bbd3bebc537438c9646a49a7d78ba17063e4cfe6ae858f353bbd",
+    "trae_latest_probe.py": "9af567bec014b2d2e7a897e6a7a98639e58b8194f7ea887b7ceea7cb5abfc5da",
+    "acp_discovery.py": "8712b37b2a33725db0ff6fbd3e2012b5b7d504bb0320e4323b511b9a69970cde"
+  }
+}

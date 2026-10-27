@@ -1,0 +1,36 @@
+{
+  "command": "node scripts/measure-host-web-resources.mjs",
+  "status": "passed",
+  "sourceCommit": "2ace68a6a7c514d143005ab75f2cf2657266235e",
+  "baselineSource": "6c1aa1bf (same implementation as 7d497e25; later commit only records prior delivery evidence)",
+  "profile": "debug, macOS arm64",
+  "before": {
+    "build": "before",
+    "bytes": 20971520,
+    "pages": 80,
+    "openMs": 93.01604099999986,
+    "pageMs": 13761.285333,
+    "downloadPayloadBytes": 27962080
+  },
+  "after": {
+    "build": "after",
+    "bytes": 20971520,
+    "pages": 80,
+    "openMs": 131.21537500000022,
+    "pageMs": 7169.937,
+    "downloadPayloadBytes": 20971520
+  },
+  "verified": [
+    "All 80 pages equal their original byte ranges with correct startLine",
+    "Raw download equals all 20 MiB original bytes",
+    "No Base64 payload expansion on the new download endpoint"
+  ],
+  "retention": {
+    "chunkBytes": 65536,
+    "maximumPageWindowBytes": 262147,
+    "sparseLineEntriesMaximum": 320,
+    "metadataRetainsFullBody": false,
+    "eachRequestStillHashesWholeSource": true
+  },
+  "timingLimits": "Single-machine observations, not a controlled paired benchmark, not a timing gate. Final sample ran during package signing; no speedup percentage, physical-disk-volume or real-phone-performance claim is made."
+}

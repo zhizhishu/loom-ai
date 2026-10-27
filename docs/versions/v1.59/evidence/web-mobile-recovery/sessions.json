@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "sequentialTabClosesAndReopens": 40,
+  "persistentBrowserReopen": true,
+  "activeTabsRetainSessionsAndDrafts": 2,
+  "freshEditorsWithoutInheritedDrafts": true,
+  "finalSessionCount": 32,
+  "runtime": false,
+  "platform": "macOS Chrome",
+  "fixture": "/private/var/folders/49/z0f8w56s28j4pfc7t80cm3w80000gq/T/rovai-session-tabs-eaLHIO"
+}

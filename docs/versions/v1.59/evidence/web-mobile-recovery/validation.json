@@ -1,0 +1,30 @@
+{
+  "status": "passed",
+  "sourceCommit": "7d497e2560df557cf7db43b2723deb0313a08925",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "package": "daily-ad-hoc",
+  "isolated": true,
+  "fixture": "/private/var/folders/49/z0f8w56s28j4pfc7t80cm3w80000gq/T/rovai-recovery-install-0BafNL",
+  "appPath": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-web-recovery/dist/mac-arm64/Rovai AI.app",
+  "packagedHostWithIsolatedSkillAndMcp": true,
+  "seededExistingInstallationOnboarding": true,
+  "freshBrowserEditorDoesNotInheritDraft": true,
+  "normalAppAndHostRestartKeepsTokenBearerAndEditor": true,
+  "browserReopenWithoutLongToken": true,
+  "sessionLifetimeDays": 30,
+  "renewalWindowDays": 7,
+  "renewalOutsideWindowNoOp": true,
+  "privateCredentialFileWithoutRawBearerOrProof": true,
+  "sameEditorAndDraftAfterRefresh": true,
+  "mobileFiveTabsAndNoOverflow": true,
+  "explicitWebStopRevokesAllAndKeepsCoreReady": true,
+  "revokedSessionRenewalRejected": true,
+  "originalLongTokenRelogin": true,
+  "noRuntime": true,
+  "timeWindowTests": "Controlled-clock source tests cover renewal, expiry, capacity, restart and revocation; this package smoke does not fast-forward the Host clock.",
+  "limits": [
+    "macOS arm64 only",
+    "Mobile Chrome viewport simulation, no physical phone"
+  ]
+}

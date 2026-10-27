@@ -1,0 +1,204 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "windows-x64-deepseek-harness-v1",
+  "capturedAt": "2026-09-17",
+  "platform": "windows-x64",
+  "hostEnvelope": {
+    "os": "Windows 10 Pro 22H2",
+    "build": "10.0.19045",
+    "architecture": "x64",
+    "filesystem": "healthy local fixed NTFS volume"
+  },
+  "baseRevision": "f74c14e2063ac3a26c06024d554071a5d1e9766d",
+  "qualifiedRuntimeKinds": [
+    "deepseek-harness"
+  ],
+  "runtimeEvidence": {
+    "runtimeVersion": "0.1.5-rc.2",
+    "minimumVersion": ">=0.1.5-rc.2",
+    "protocol": "acp-v1",
+    "package": "@deepseek-ai/dsh@0.1.5-rc.2",
+    "packageIntegrity": "sha512-8Xc8hCQHcIWRmTCVU/xZdp6/qMsWMeAd2ObChKDEsfhUPJFXx6H0lgeb1DxUMD86HZrrVN+1bCvn1ppjZ/fOxw==",
+    "executableFingerprint": "sha256:0ff7f1d72c4e0cbe14001709c81e20a04b70464118a7f78568952988e28f2ac5",
+    "realProvider": "MiniMax-M3 through the official Anthropic-compatible endpoint and native llm-pi-ai route",
+    "credentialUse": "User-authorized acceptance only; process-local isolated child environment; no secret in argv, repository or public evidence"
+  },
+  "acceptance": {
+    "status": "qualified",
+    "platformScope": "Windows 10 x64 with a local NTFS workspace only",
+    "referenceMatrix": "docs/research/deepseek-harness-runtime/acp-0.1.5-parity.md",
+    "axes": {
+      "authProviderModel": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Pinned official package, native isolated DSH configuration, grouped model catalog and real MiniMax-M3 generation passed; no credential was copied into repository evidence."
+      },
+      "hostFleetLru": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Same-Host warm reuse, native A/B/A, concurrent distinct Hosts and Sessions, exact switch-back, crash recovery, production 30-minute idle eviction and planned shutdown passed. Idle eviction completed in 1,852,042 ms, reaped three exact pre-idle descendants and resumed the exact Native Session."
+      },
+      "nativeSessionContinuation": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Warm, Core cold and post-compaction exact resume passed with a changed Host identity, no historical Action or Approval replay, and one continuity-lost plus one replacement Session for an invalid persisted identity."
+      },
+      "bootstrapContext": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "The official systemPrompt section read exact Session-bound SHA-256-verified Bootstrap bytes at every model step; A/B/A, cold and all compaction generations retained the correct identity."
+      },
+      "compactionContinuity": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Manual, pressure, context-overflow, automatic pressure and controlled overflow plus native retry advanced generation 0 to 5; fail and cancel retained generation 5. Every checkpoint loaded fresh Skill content and called MCP once with zero synthetic Approvals."
+      },
+      "skills": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native discovery and invocation, managed import, project-owned conflict preservation, update, delete, disable and restart passed. Windows bundled Skill reveal also covered every nested built-in Skill."
+      },
+      "externalMcp": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Real native stdio and HTTP calls, whole-definition collision, update with exact resume, adjacent isolation, unassign, reassign, delete and native restoration passed. Three native-authority cases produced three effects and zero Core-synthetic Approvals."
+      },
+      "toolActionCommandOutput": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "PowerShell stdout, stderr, mixed, empty, nonzero, large and public truncation passed. Real read, add, edit and empty-file cases preserved exact content and projected relative paths; add was +1/-0, edit +1/-1 and empty edit +1/-0."
+      },
+      "narrationFinalMissingSend": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Committed ACP public/thought separation and end_turn passed; real zero-send publication, accepted-send suppression and tool-to-final recovery all passed."
+      },
+      "permissionApprovalWorkspace": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "All six frozen sandbox and approval combinations passed with native PowerShell and file tools. Post-compaction workspace-write plus never denied an owned out-of-workspace write with zero side effects and zero synthetic Approvals."
+      },
+      "builtinRovaiCli": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Current contract-v25 and ipc-v2 passed all 22 catalog operations, 70 evidence rows and 35 output-reduction samples through the native terminal, including three input sources, exact addressing, Gather, history, attachments and initial/successor Run lease fencing."
+      },
+      "usageCacheCost": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Independent native observation matched Core per-call buckets and per-Run attribution. Warm used two Runs, three calls and one automatic summary; cold used three Runs, five calls and two automatic summaries. Exact cold resume and zero replay passed; unreported fields remained unknown."
+      },
+      "retryQueueCancelCleanup": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Accepted-input, queue and lease ownership, native overflow retry, compaction fail/cancel, running PowerShell cancellation, invalid resume fallback, crash cleanup and planned shutdown passed with no late file effect."
+      },
+      "readyVersionPlatform": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "CLI minimum 0.1.5-rc.2, executable fingerprint, initialize, new, exact resume, native catalog and current Core admission projection are distinct checks. This evidence qualifies only the stated Windows 10 x64 local-NTFS envelope."
+      }
+    },
+    "realCamp": {
+      "passed": true,
+      "fileCount": 2,
+      "additions": 4,
+      "deletions": 1,
+      "createdFile": {
+        "pathProjection": "relative",
+        "changeKind": "add",
+        "additions": 3,
+        "deletions": 0
+      },
+      "modifiedFile": {
+        "pathProjection": "relative",
+        "changeKind": "update",
+        "additions": 1,
+        "deletions": 1
+      }
+    },
+    "idleEviction": {
+      "passed": true,
+      "ttl": "production 30 minutes",
+      "elapsedMs": 1852042,
+      "descendantsReaped": 3,
+      "exactResume": true,
+      "processIdentity": "PID plus WMI CreationDate"
+    },
+    "plannedShutdown": {
+      "passed": true,
+      "descendantsReaped": 3
+    },
+    "regression": {
+      "windowsVerbatimPathOwners": "3 passed",
+      "dshRustOwners": "4 passed",
+      "windowsBundledSkillInstallAndReveal": "passed for every bundled Skill",
+      "runtimeFleetRustOwners": "17 passed",
+      "windowsManagedProcess": "12 passed; 7 subprocess helper tests ignored by design",
+      "processIdentityNodeOwners": "3 passed",
+      "rustfmt": "passed",
+      "cargoCheckRovaiCore": "passed",
+      "nodeSyntax": "passed for all changed qualification scripts",
+      "realFileOperationMatrix": "passed",
+      "realCommandOutputMatrix": "passed",
+      "realBuiltinCliCurrentContract": "passed",
+      "fullRustPrGate": "not claimed on this host: exact base revision reproduces the Windows-incompatible /repo absolute-path fixture failure; parallel full-suite storage tests also require protected-DACL fixtures not supplied by this shell",
+      "clippyAllTargetsDenyWarnings": "not claimed: six pre-existing warnings remain in unmodified base files"
+    }
+  },
+  "privateReportSha256": {
+    "fleetProductionIdle": "3e0d29e44f43fc6fee5da14d9f019ff2c6ea6276658a53661c9ec93ec2a86244",
+    "nativeParity": "903d0f3357011046cb8263e7b646563a494b978d9694f1e77bcc76d949633f0e",
+    "missingSend": "eed7bf916bd3d0b14a7eaafac031d1fabaf281940e12fec8d286c9864c2cf83e",
+    "realCampProjection": "dabb32fdc124f1252e074fb755fd7500c9e74f8d02f06b264f9f310eb1e6c244",
+    "realCampScreenshot": "cff429b3180d48d2df7f44b75641df9819fbc1a50bed713a2de3b984020ff4ca"
+  },
+  "implementationSourceSha256": {
+    "crates/rovai-core/src/dsh.rs": "aebf442652f1a20721a1f5bdd960b4afe76fa78f899bc6ea7ecd325852efabb1",
+    "crates/rovai-core/src/dsh/bootstrap.mjs": "0b7056e1edbc28f6d289449de15273e7c9fa507b9ea8c3220bcca84bba5689f0",
+    "crates/rovai-core/src/acp.rs": "9b94b10705b9834218c0498ab1626cbc63eba27d5906f514da5a973c23201f51",
+    "crates/rovai-core/src/runtime_fleet.rs": "5746d717ae66e52b2a9963665e02f80625e73be857d31a09901cb4ba9dca0f4b",
+    "crates/rovai-core/src/monitoring.rs": "97f574ba8fe19b998966ee1bca94267af7769f7d68d765b561b72b125955d12c",
+    "crates/rovai-core/src/runtime_failure.rs": "372af77cf7a6b044d345c49443451a3800fca2cccac63a8a3f1f232e39884708",
+    "crates/rovai-core/src/application.rs": "287dc89cdf6ab2b0f09ab312161180037c1152664604a3e95bfe996c3cd3e16d",
+    "crates/rovai-core/src/runtime_diff.rs": "39fa88f56f47d6ab3bcde20fd166c950d6f1919d637c6000215a18fe46353eb4",
+    "crates/rovai-core/src/runtime_file_operation.rs": "add4d8d6238666450c8e511825481300a578d722c0780d9ef480c1518e00491c",
+    "crates/rovai-core/src/skill.rs": "5f5662d8e118eddffdf5d9fabec73ab843177cf2b1a270d8af6b44442ecddbb3",
+    "crates/rovai-core/src/agent_runtime_adapter.rs": "a5586366238fe7fa34a0d11125fb6653b9f52deea4aa4aafd3e2cfafdf5ebae2",
+    "scripts/lib/qualification-core.mjs": "2f6d0ad9ebd847b3b2748b9d428f70d707158f6eeb8b52f17ebd8533387ac1d8",
+    "scripts/lib/qualification-core.test.mjs": "546b9d1d53dbddc85aa2cd72635b49357e0e7b1606e2519226bcd5cf21807a83",
+    "scripts/probe-dsh-runtime.mjs": "4cdb9383ff2d4f1d963cfa48254f9b64a13166c9c1454cf9c9ad1f216cdacf70",
+    "scripts/smoke-dsh-fleet.mjs": "069b9c8808c8a5250c6057341715a05cb4120926d8d716b47712d115ff1de166",
+    "scripts/smoke-dsh-safety.mjs": "ef662041ca74ea84dde83ed52574bcfea623e5c364873752b1d4b2fb1ad22fa8",
+    "scripts/smoke-dsh-usage.mjs": "b7552aeb796e8d6716b1a4646168db3094620f5bcf90f3d7202bae715344416f",
+    "scripts/smoke-acp-runtime.mjs": "dbd30df2c97229af5bfc77a1511aed95ad7a2b95049279d1af581d9b1507b106",
+    "scripts/smoke-builtin-cli.mjs": "f390bc958d69296e9a6129259e80b7d785385304ed16d7f07e9209fde738e2ad",
+    "scripts/smoke-skills.mjs": "9196f9c3b056ef268f060e844a47e339dbe1c456c070f29ee3f78599be9740ac",
+    "scripts/smoke-mcp-projection.mjs": "42d1eccf5e3810092d5967a175a90473770e0c41f74864f78f0620443be8693d",
+    "scripts/smoke-trae-cold-resume.mjs": "87bddda361cf05d203da05a78af32b6ba6a893786fb5f9e6b782545859bef7e1",
+    "scripts/smoke-missing-send-recovery.mjs": "083e2dee26968af2a2e56b3589424958cc34ba14116bf793d7fdd70b68e21802"
+  },
+  "limitations": [
+    "The evidence scope is Windows 10 x64 on a healthy local fixed NTFS volume; Windows 11, network filesystems, macOS x64 and Linux x64 are not inferred.",
+    "An earlier production-TTL observation tracked Windows descendants by PID alone and could not distinguish PID reuse. It is not used as evidence; the accepted rerun tracked PID plus WMI CreationDate and passed the same production 30-minute TTL.",
+    "ACP still lacks session/load, additionalDirectories, a manual compact command, compaction lifecycle, MCP SSE/resources/prompts and client filesystem/terminal bridges.",
+    "The controlled overflow injects one context-window error at the official llm/stream seam and exercises the real native summarizer and automatic retry; it does not claim a naturally exhausted provider window.",
+    "Missing cache-write, reasoning and cost fields remain unknown as reported by the provider.",
+    "Credentials, raw prompts, machine paths, Native Session IDs, Run IDs and full tool output are excluded."
+  ],
+  "qualificationBasis": {
+    "type": "reproducible-target-host-golden-flows",
+    "decision": "All 14 Runtime integration axes are independently verified on the stated Windows x64 host envelope. This is Adapter behavior qualification, not a packaged application release or a cross-platform claim.",
+    "versionDecision": "docs/versions/v1.59/decisions.md#v1-59-d10"
+  },
+  "notQualified": [
+    {
+      "platform": "macos-x64",
+      "reason": "No DSH target-host qualification evidence"
+    },
+    {
+      "platform": "linux-x64",
+      "reason": "No DSH target-host qualification evidence"
+    }
+  ]
+}

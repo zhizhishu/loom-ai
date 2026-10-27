@@ -1,0 +1,19 @@
+{
+  "sourceCommit": "2ace68a6a7c514d143005ab75f2cf2657266235e",
+  "mergedMain": "0bfc35b0dc68d99eeb483f59406e3beca84a2840",
+  "version": "0.2.6",
+  "platform": "darwin",
+  "arch": "arm64",
+  "buildCommand": "CARGO_BUILD_JOBS=2 pnpm package:mac:daily",
+  "buildLog": "/tmp/rovai-perf-package-20260914.log",
+  "packageSha256": {
+    "Contents/Resources/app.asar": "05f180a2b7db33ebb4ecb4d690f8fe46f91bd36aa8bf0ac801052a3b2920c573",
+    "Contents/Resources/bin/rovai-host": "ccc98042860f9a9beef408207e0b6a778b4bae6c023e9da7b2d53fa22585e416",
+    "Contents/Resources/bin/rovai-core": "27f313b5bb93026dc9e89467100805cd6b20de6f4de1485e07f9cb9c95ea6549",
+    "Contents/Resources/bin/rovai": "acabda226432e733dae4e7ac6ddcc05112230d961daea67382aaa411e9d7462b"
+  },
+  "webFileCount": 139,
+  "acceptanceCommand": "node /tmp/rovai-perf-install-acceptance-20260914.mjs",
+  "acceptanceScriptSha256": "5518a36efaea1248bb6648673bae59e43752cf419d535f054d85446e11342ca9",
+  "acceptanceLog": "/tmp/rovai-perf-install-acceptance-final-20260914.log"
+}

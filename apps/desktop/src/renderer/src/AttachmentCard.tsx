@@ -1,0 +1,590 @@
+import { AttachmentLocationItems, useAttachmentLocation } from './attachment-location'
+import { useThreadClient } from './camp-client'
+import { useEffect, useRef, useState, type JSX, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
+import * as Dialog from '@radix-ui/react-dialog'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
+import type { ThreadMessageAttachmentView, LocalAttachmentAvailability, LocalAttachmentOwnerLocator } from '@contracts'
+import { useOptionalFilePreview } from './FilePreviewContext'
+import { formatByteSize } from './ui-model'
+import {
+  AgentArtifactIcon, FileExtensionLabel, UserFileIcon,
+  attachmentBaseName, attachmentFormatLabel, classifyAttachmentDisplay
+} from './attachment-presentation'
+import { UiText, uiAttribute } from './interface-language'
+import { ImageContextMenu, type ImageAction, type ImageMenuPosition } from './ImageContextMenu'
+import { writeClipboardImage } from './clipboard'
+
+type AttachmentKind = 'file' | 'directory'
+
+export function attachmentRevealLabel(platform: NodeJS.Platform): string {
+  return platform === 'darwin'
+    ?uiAttribute("在 Finder 中显示")
+    : platform === 'win32'
+      ?uiAttribute("在文件资源管理器中显示")
+      :uiAttribute("显示所在位置")
+}
+
+function AttachmentFolderGlyph(): JSX.Element {
+  return (
+    <svg className="attachment-folder-glyph" viewBox="0 0 24 24">
+      <path className="fill" d="M3.8 7.2c0-1.1.9-2 2-2h4l2 2.1h6.5c1.1 0 2 .9 2 2v7.4c0 1.1-.9 2-2 2H5.8c-1.1 0-2-.9-2-2Z" />
+      <path d="M3.8 8.2V7.1c0-1 .8-1.8 1.8-1.8h4.1l2.1 2.1h6.4c1.1 0 2 .9 2 2v7.3c0 1.1-.9 2-2 2H5.8c-1.1 0-2-.9-2-2V8.2Z" />
+    </svg>
+  )
+}
+
+function localAttachmentLocatorKey(locator: LocalAttachmentOwnerLocator): string {
+  if (locator.owner === 'composer') {
+    return `composer:${locator.threadId}:${locator.attachmentRefId}`
+  }
+  if (locator.owner === 'message') {
+    return `message:${locator.threadId}:${locator.messageId}:${locator.attachmentRefId}`
+  }
+  if (locator.owner === 'mission') {
+    return `mission:${locator.threadId}:${locator.missionId}:${locator.attachmentRefId}`
+  }
+  if (locator.owner === 'pending') {
+    return `pending:${locator.threadId}:${locator.pendingInputId}:${locator.attachmentRefId}`
+  }
+  if (locator.owner === 'pending_edit') {
+    return `pending-edit:${locator.threadId}:${locator.pendingInputId}:${locator.editToken}:${locator.attachmentRefId}`
+  }
+  if (locator.owner === 'single_chat_composer') {
+    return `single-chat-composer:${locator.threadId}:${locator.conversationId}:${locator.attachmentRefId}`
+  }
+  if (locator.owner === 'single_chat_message') {
+    return `single-chat-message:${locator.threadId}:${locator.conversationId}:${locator.conversationMessageId}:${locator.attachmentRefId}`
+  }
+  if (locator.owner === 'single_chat_pending') {
+    return `single-chat-pending:${locator.threadId}:${locator.conversationId}:${locator.pendingInputId}:${locator.attachmentRefId}`
+  }
+  return `single-chat-pending-edit:${locator.threadId}:${locator.conversationId}:${locator.pendingInputId}:${locator.editToken}:${locator.attachmentRefId}`
+}
+
+export function AttachmentCard({
+  attachment,
+  onRemove,
+  locator,
+  onNotify = () => undefined,
+  disabled = false,
+  menuItems,
+  presentation = 'composer'
+}: {
+  attachment: ThreadMessageAttachmentView
+  onRemove?: () => void
+  locator: LocalAttachmentOwnerLocator
+  onNotify?: (message: string) => void
+  disabled?: boolean
+  menuItems?: ReactNode
+  presentation?: 'composer' | 'user-timeline' | 'agent-timeline'
+}): JSX.Element {
+  const client = useThreadClient()
+  const filePreview = useOptionalFilePreview()
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [previewFailed, setPreviewFailed] = useState(false)
+  const [previewOpen, setPreviewOpen] = useState(false)
+  const [attachmentAction, setAttachmentAction] = useState<'open' | 'reveal' | null>(null)
+  const [availability, setAvailability] = useState<LocalAttachmentAvailability>(attachment.availability)
+  const [contextMenuOpen, setContextMenuOpen] = useState(false)
+  const [contextAnchor, setContextAnchor] = useState({ x: 0, y: 0 })
+  const [imageMenu, setImageMenu] = useState<ImageMenuPosition | null>(null)
+  const [imageReady, setImageReady] = useState(false)
+  const [imageAction, setImageAction] = useState<ImageAction | null>(null)
+  const [imageNotice, setImageNotice] = useState<string | null>(null)
+  const imageActionPending = useRef(false)
+  const attachmentActionPending = useRef(false)
+  const attachmentButtonRef = useRef<HTMLButtonElement>(null)
+  const locatorRef = useRef(locator)
+  locatorRef.current = locator
+  const timeline = presentation !== 'composer'
+  const composerImage = presentation === 'composer' && attachment.previewKind === 'image'
+  const contextMenuAvailable = composerImage || timeline || locator.owner === 'composer' || Boolean(menuItems)
+  const primaryActionAvailable = contextMenuAvailable || attachment.previewKind !== 'image'
+  const agentPresentation = presentation === 'agent-timeline'
+  const displayClassification = classifyAttachmentDisplay(attachment)
+  const baseName = attachmentBaseName(attachment.displayName, attachment.kind)
+  const formatLabel = attachmentFormatLabel(attachment.displayName, attachment.kind)
+  const rendererPlatform = typeof window === 'undefined' ? 'darwin' : client.platform
+  const locatorKey = localAttachmentLocatorKey(locator)
+  const fileLocation = useAttachmentLocation(locator)
+  useEffect(() => {
+    if (attachment.previewKind !== 'image') return
+    if (timeline && attachment.availability === 'unknown') return
+    let active = true
+    let objectUrl: string | null = null
+    setPreviewUrl(null)
+    setPreviewFailed(false)
+    setImageReady(false)
+    setPreviewOpen(false)
+    setImageMenu(null)
+    void client.composerAttachments.preview(locatorRef.current)
+      .then((result) => {
+        if (active) setAvailability(result.availability)
+        if (!active || !result.preview) {
+          if (active) setPreviewFailed(true)
+          return
+        }
+        const preview = result.preview
+        objectUrl = URL.createObjectURL('blob' in preview ? preview.blob : new Blob(
+          [Uint8Array.from(preview.bytes).buffer],
+          { type: preview.mediaType }
+        ))
+        setPreviewUrl(objectUrl)
+      })
+      .catch(() => {
+        if (active) setPreviewFailed(true)
+      })
+    return () => {
+      active = false
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [client, attachment.availability, attachment.id, attachment.previewKind, locatorKey, timeline])
+
+  useEffect(() => {
+    if (!imageNotice || imageAction || imageMenu) return
+    const timer = window.setTimeout(() => setImageNotice(null), 3200)
+    return () => window.clearTimeout(timer)
+  }, [imageNotice, imageAction, imageMenu])
+
+  const showImageMenu = (event: MouseEvent<HTMLElement> | ReactKeyboardEvent<HTMLElement>): void => {
+    if (disabled) return
+    const keyboard = event.type === 'keydown'
+    if (keyboard && !('key' in event && (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')))) return
+    event.preventDefault()
+    event.stopPropagation()
+    const origin = event.currentTarget.classList.contains('attachment-card')
+      ? attachmentButtonRef.current! : event.currentTarget
+    const bounds = origin.getBoundingClientRect()
+    const pointer = 'clientX' in event && (event.clientX !== 0 || event.clientY !== 0)
+    setImageMenu({ x: pointer ? event.clientX : bounds.left, y: pointer ? event.clientY : bounds.bottom, origin })
+  }
+
+  const runImageAction = async (action: ImageAction): Promise<void> => {
+    if (disabled || !imageReady || !previewUrl || imageActionPending.current) return
+    if (action !== 'copy' && action !== 'save') return
+    imageActionPending.current = true
+    setImageAction(action)
+    setImageNotice(action === 'copy' ? uiAttribute('正在复制图片…') : null)
+    try {
+      if (action === 'copy') {
+        const image = attachmentButtonRef.current?.querySelector('img')
+        if (!image) throw new Error('image_unavailable')
+        await writeClipboardImage(image)
+        setImageNotice(uiAttribute('已复制图片'))
+      } else {
+        const link = document.createElement('a')
+        link.href = previewUrl
+        link.download = attachment.displayName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim() || 'image'
+        document.body.appendChild(link)
+        link.click()
+        link.remove()
+      }
+    } catch {
+      setImageNotice(action === 'copy' ? uiAttribute('未能复制图片，请重试或保存图片。') : uiAttribute('未能保存图片，请重试。'))
+    } finally {
+      imageActionPending.current = false
+      setImageAction(null)
+    }
+  }
+
+  const imageContextMenu = composerImage && <ImageContextMenu position={imageMenu}
+    onClose={() => setImageMenu(null)} displayName={attachment.displayName}
+    ready={imageReady && !disabled} busy={imageAction} hasPath={false}
+    onAction={action => { void runImageAction(action) }} />
+
+  const runAttachmentAction = async (
+    action: 'open' | 'reveal',
+    forceSystem = false
+  ): Promise<void> => {
+    if (!primaryActionAvailable || disabled || attachmentActionPending.current) return
+    attachmentActionPending.current = true
+    setAttachmentAction(action)
+    try {
+      if (action === 'open') {
+        if (!forceSystem && attachment.kind === 'file' && filePreview) {
+          const outcome = await filePreview.open({
+            kind: 'attachment',
+            threadId: locator.threadId,
+            locator
+          }, undefined, { fileName: attachment.displayName })
+          if (outcome.kind === 'error') {
+            if (outcome.error.code === 'attachment_missing') setAvailability('missing')
+            else if (outcome.error.code === 'attachment_unreadable') setAvailability('unreadable')
+            else if (outcome.error.code === 'attachment_kind_changed') setAvailability('kind_changed')
+            onNotify(outcome.error.message)
+          } else setAvailability('available')
+          return
+        }
+        const result = client.attachments.kind === 'download'
+          ? await client.attachments.download(locator)
+          : await client.attachments.open(locator)
+        setAvailability(result.availability)
+        if (result.error === 'target_unavailable') onNotify(uiAttribute('此附件当前不可用'))
+        else if (result.error) onNotify(client.attachments.kind === 'download' ?uiAttribute("下载附件失败") :uiAttribute("无法使用系统应用打开此附件"))
+      } else if (client.attachments.kind === 'native') {
+        const result = await client.attachments.reveal(locator)
+        setAvailability(result.availability)
+        if (result.error === 'target_unavailable') onNotify(uiAttribute('此附件当前不可用'))
+        else if (result.error) {
+          onNotify(rendererPlatform === 'darwin'
+            ?uiAttribute("无法在 Finder 中显示此附件")
+            : rendererPlatform === 'win32'
+              ?uiAttribute("无法在文件资源管理器中显示此附件")
+              :uiAttribute("无法显示此附件所在位置"))
+        }
+      }
+    } catch (error) {
+      if (client.attachments.kind === 'download' && error instanceof Error) { onNotify(error.message); return }
+      onNotify(action === 'open'
+        ? (client.attachments.kind === 'download' ?uiAttribute("下载附件失败") :uiAttribute("无法使用系统应用打开此附件"))
+        :uiAttribute("无法显示此附件所在位置"))
+    } finally {
+      attachmentActionPending.current = false
+      setAttachmentAction(null)
+    }
+  }
+
+  const revealLabel = attachmentRevealLabel(rendererPlatform)
+  const systemOpenLabel = client.attachments.kind === 'download' ? uiAttribute('下载文件') : attachment.kind === 'directory'
+    ? uiAttribute('打开文件夹')
+    : uiAttribute('使用系统应用打开')
+  const hasImagePreview = attachment.previewKind === 'image' && previewUrl !== null && !previewFailed
+  const showAttachmentContextMenu = (x: number, y: number): void => {
+    fileLocation.inspect()
+    setContextAnchor({ x, y })
+    setContextMenuOpen(true)
+  }
+  const showAttachmentKeyboardMenu = (): void => {
+    const bounds = attachmentButtonRef.current?.getBoundingClientRect()
+    showAttachmentContextMenu(bounds?.left ?? 8, bounds?.bottom ?? 8)
+  }
+
+  const availabilityLabel = availability === 'missing'
+    ? uiAttribute('文件已不可用')
+    : availability === 'unreadable'
+      ? uiAttribute('文件无法读取')
+      : availability === 'kind_changed'
+        ? uiAttribute('文件类型已变化')
+        : null
+
+  const pastedText = attachment.kind === 'file' && typeof attachment.pastedTextPreview === 'string'
+  const title = pastedText ? attachment.pastedTextPreview || uiAttribute('空白文本') : baseName
+  const detailLabel = availabilityLabel ?? (pastedText ? uiAttribute('粘贴内容') : agentPresentation
+    ? attachment.kind === 'directory'
+      ? `${attachment.fileCount === null ? uiAttribute('文件数未知') : uiAttribute("{0} 个文件", String(attachment.fileCount))} · ${attachment.byteSize === null ? uiAttribute('大小未知') : formatByteSize(attachment.byteSize)}`
+      : `${formatLabel} · ${attachment.byteSize === null ? uiAttribute('大小未知') : formatByteSize(attachment.byteSize)}`
+    : null)
+
+  const content = composerImage
+    ? (
+        <span className="attachment-visual composer-image-preview" aria-hidden="true">
+          {previewUrl && !previewFailed
+            ? <img src={previewUrl} alt="" onLoad={() => setImageReady(true)}
+                onError={() => { setImageReady(false); setPreviewFailed(true) }} />
+            : !previewFailed ? <i className="attachment-loading" /> : <b>!</b>}
+        </span>
+      )
+    : (
+        <>
+          {agentPresentation
+            ? <AgentArtifactIcon type={displayClassification.agentDisplayType} />
+            : (
+                <UserFileIcon
+                  type={displayClassification.userDisplayType === 'image'
+                    ? 'document'
+                    : displayClassification.userDisplayType}
+                />
+              )}
+          <span className="attachment-copy">
+            <span className="attachment-title-line">
+              <strong title={fileLocation.label ?? attachment.displayName}>{title}</strong>
+              {!agentPresentation && !pastedText && <FileExtensionLabel>{formatLabel}</FileExtensionLabel>}
+            </span>
+            {detailLabel && <small>{detailLabel}</small>}
+          </span>
+
+        </>
+      )
+
+  return (
+    <div
+      className={`attachment-card ${presentation === 'composer' ? 'composer-attachment-card' : presentation} ${composerImage ? 'composer-image-attachment' : ''} type-${displayClassification.agentDisplayType} ${availabilityLabel ? `attachment-availability-${availability}` : ''}`}
+      aria-label={availabilityLabel ? `${attachment.displayName}：${availabilityLabel}` : undefined}
+      onMouseEnter={fileLocation.inspect}
+      onFocus={fileLocation.inspect}
+      title={fileLocation.label}
+      data-context-open={contextMenuOpen || imageMenu ? 'true' : undefined}
+      onContextMenu={contextMenuAvailable && !disabled
+        ? composerImage ? showImageMenu : (event) => {
+            event.preventDefault()
+            if (event.clientX === 0 && event.clientY === 0) showAttachmentKeyboardMenu()
+            else showAttachmentContextMenu(event.clientX, event.clientY)
+          }
+        : undefined}
+    >
+      {primaryActionAvailable
+        ? (
+            <>
+              <button
+                className={`attachment-open ${hasImagePreview ? 'is-preview' : ''}`}
+                type="button"
+                aria-busy={attachmentAction !== null || imageAction !== null || (composerImage && !imageReady && !previewFailed)}
+                aria-disabled={composerImage && !imageReady ? true : undefined}
+                aria-label={composerImage && previewFailed ? uiAttribute('图片已不可用') : composerImage || hasImagePreview
+                  ? uiAttribute("预览附件 {0}", String(attachment.displayName))
+                  : attachment.kind === 'file' && filePreview
+                    ? uiAttribute("打开文件预览 {0}", String(attachment.displayName))
+                    : `${systemOpenLabel} ${attachment.displayName}`}
+                disabled={disabled || attachmentAction !== null}
+                onClick={() => {
+                  if (composerImage) {
+                    if (imageReady) { setImageMenu(null); setPreviewOpen(true) }
+                    return
+                  }
+                  if (!timeline && hasImagePreview) setPreviewOpen(true)
+                  else if (attachment.kind === 'file' && filePreview) void runAttachmentAction('open')
+                  else if (hasImagePreview) setPreviewOpen(true)
+                  else void runAttachmentAction('open')
+                }}
+                onKeyDown={composerImage ? showImageMenu : contextMenuAvailable
+                  ? (event) => {
+                      if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return
+                      event.preventDefault()
+                      showAttachmentKeyboardMenu()
+                    }
+                  : undefined}
+                ref={attachmentButtonRef}
+              >
+                {content}
+                {attachmentAction && <i className="attachment-action-loading" aria-hidden="true" />}
+              </button>
+              {contextMenuAvailable && !composerImage && (
+                <DropdownMenu.Root open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
+                  <DropdownMenu.Trigger asChild>
+                    <span
+                      className="attachment-context-anchor"
+                      style={{ left: contextAnchor.x, top: contextAnchor.y }}
+                    />
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Portal>
+                    <DropdownMenu.Content
+                      className={`attachment-context-menu${agentPresentation ? '' : ' user-attachment-context-menu'}`}
+                      aria-label={uiAttribute("附件操作：{0}", String(attachment.displayName))}
+                      align="start"
+                      side="right"
+                      sideOffset={4}
+                      collisionPadding={8}
+                      loop
+                      onCloseAutoFocus={(event) => {
+                        event.preventDefault()
+                        attachmentButtonRef.current?.focus()
+                      }}
+                    >
+                      <DropdownMenu.Label className="attachment-context-menu-label">
+                        <strong>{attachment.displayName}</strong>
+                        <small>{attachment.kind === 'directory' ? uiAttribute("文件夹") : attachmentTypeLabel(attachment.mediaType)}</small>
+                      </DropdownMenu.Label>
+                      <AttachmentLocationItems path={fileLocation.location?.path} label={fileLocation.label} onNotify={onNotify} />
+                      {client.attachments.kind === 'native' && <DropdownMenu.Item
+                        className="attachment-context-menu-item"
+                        disabled={disabled || attachmentAction !== null}
+                        onSelect={() => void runAttachmentAction('open', true)}
+                      >
+                        <AttachmentOpenGlyph kind={attachment.kind} />
+                        <span>{systemOpenLabel}</span>
+                      </DropdownMenu.Item>}
+                      {client.attachments.kind === 'native' && <>
+                      <DropdownMenu.Separator className="attachment-context-menu-separator" />
+                      <DropdownMenu.Item
+                        className="attachment-context-menu-item"
+                        disabled={disabled || attachmentAction !== null}
+                        onSelect={() => void runAttachmentAction('reveal')}
+                      >
+                        <AttachmentRevealGlyph />
+                        <span>{revealLabel}</span>
+                      </DropdownMenu.Item>
+                      </>}
+                      {menuItems && <>
+                        <DropdownMenu.Separator className="attachment-context-menu-separator" />
+                        {menuItems}
+                      </>}
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Portal>
+                </DropdownMenu.Root>
+              )}
+            </>
+          )
+        : hasImagePreview
+          ? (
+              <button
+                className="attachment-open is-preview"
+                type="button"
+                aria-label={uiAttribute("预览附件 {0}", String(attachment.displayName))}
+                disabled={disabled}
+                onClick={() => setPreviewOpen(true)}
+              >
+                {content}
+              </button>
+            )
+          : <div className="attachment-open">{content}</div>}
+
+      {!previewOpen && imageContextMenu}
+      {imageNotice && createPortal(<div className="image-action-notice" role="status" aria-hidden={previewOpen || undefined}>{imageNotice}</div>, document.body)}
+      {hasImagePreview && (
+            <Dialog.Root open={previewOpen} onOpenChange={open => { setPreviewOpen(open); if (!open) setImageMenu(null) }}>
+              <Dialog.Portal>
+                <Dialog.Overlay className="attachment-lightbox-overlay" />
+                <Dialog.Content className={`attachment-lightbox ${composerImage ? 'composer-image-lightbox' : ''}`} aria-describedby={undefined}>
+                  <Dialog.Title>{attachment.displayName}</Dialog.Title>
+                  {composerImage && <span className="sr-only" role="status">{imageNotice}</span>}
+                  <img src={previewUrl} alt={attachment.displayName}
+                    tabIndex={composerImage ? 0 : undefined}
+                    onContextMenu={composerImage ? showImageMenu : undefined}
+                    onKeyDown={composerImage ? showImageMenu : undefined} />
+                  <Dialog.Close className="attachment-lightbox-close" aria-label={uiAttribute("关闭附件预览")}>×</Dialog.Close>
+                  {previewOpen && imageContextMenu}
+                </Dialog.Content>
+              </Dialog.Portal>
+            </Dialog.Root>
+      )}
+      {onRemove && (
+        <button
+          className="attachment-remove"
+          type="button"
+          aria-label={uiAttribute("移除附件 {0}", String(attachment.displayName))}
+          disabled={disabled}
+          onClick={onRemove}
+        >
+          ×
+        </button>
+      )}
+    </div>
+  )
+}
+
+function AttachmentOpenGlyph({ kind }: { kind: 'file' | 'directory' }): JSX.Element {
+  return kind === 'directory'
+    ? (
+        <svg className="attachment-menu-icon" viewBox="0 0 18 18" aria-hidden="true">
+          <path d="M2.8 5.8h4l1.5 1.7h6.9v6.7H2.8z" />
+          <path d="M2.8 7.5V4.8h4.4l1.3 1.5" />
+        </svg>
+      )
+    : (
+        <svg className="attachment-menu-icon" viewBox="0 0 18 18" aria-hidden="true">
+          <path d="M3.4 3.2h7.2l4 4v7.6H3.4z" />
+          <path d="M10.6 3.2v4h4M6.2 11.1h5.7M9.7 8.8l2.2 2.3-2.2 2.2" />
+        </svg>
+      )
+}
+
+function AttachmentRevealGlyph(): JSX.Element {
+  return (
+    <svg className="attachment-menu-icon" viewBox="0 0 18 18" aria-hidden="true">
+      <path d="M2.8 5.8h4l1.5 1.7h6.9v6.7H2.8z" />
+      <circle cx="11.9" cy="11.2" r="2.1" />
+      <path d="m13.4 12.7 1.8 1.8" />
+    </svg>
+  )
+}
+
+export function ComposerAttachmentStrip({ children, ariaLabel = '待发送附件，使用左右方向键浏览' }: {
+  children: ReactNode
+  ariaLabel?: string
+}): JSX.Element {
+  const stripRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const strip = stripRef.current
+    if (!strip) return
+    const onWheel = (event: WheelEvent): void => scrollAttachmentStripOnWheel(strip, event)
+    strip.addEventListener('wheel', onWheel, { passive: false })
+    return () => strip.removeEventListener('wheel', onWheel)
+  }, [])
+  return (
+    <div
+      className="composer-attachment-strip"
+      role="group"
+      aria-label={ariaLabel}
+      tabIndex={0}
+      onKeyDown={scrollAttachmentStripOnKeyDown}
+      ref={stripRef}
+    >
+      {children}
+    </div>
+  )
+}
+
+function scrollAttachmentStripOnKeyDown(event: ReactKeyboardEvent<HTMLDivElement>): void {
+  const strip = event.currentTarget
+  const step = Math.max(144, Math.round(strip.clientWidth * 0.64))
+  if (event.key === 'ArrowLeft') strip.scrollBy({ left: -step })
+  else if (event.key === 'ArrowRight') strip.scrollBy({ left: step })
+  else if (event.key === 'Home') strip.scrollTo({ left: 0 })
+  else if (event.key === 'End') strip.scrollTo({ left: strip.scrollWidth })
+  else return
+  event.preventDefault()
+}
+
+function scrollAttachmentStripOnWheel(strip: HTMLDivElement, event: WheelEvent): void {
+  if (event.ctrlKey || Math.abs(event.deltaX) >= Math.abs(event.deltaY) || event.deltaY === 0) return
+  const nextScrollLeft = Math.max(0, Math.min(
+    strip.scrollWidth - strip.clientWidth,
+    strip.scrollLeft + event.deltaY
+  ))
+  if (nextScrollLeft === strip.scrollLeft) return
+  strip.scrollLeft = nextScrollLeft
+  event.preventDefault()
+}
+
+export function AttachmentPlaceholder({
+  name,
+  kind,
+  state,
+  detail,
+  onRemove
+}: {
+  name: string
+  kind: AttachmentKind
+  state: 'preparing' | 'error'
+  detail?: string
+  onRemove?: () => void
+}): JSX.Element {
+  return (
+    <div className={`attachment-card composer-attachment-card attachment-${state}`}>
+      <span className="attachment-visual" aria-hidden="true">
+        {kind === 'directory'
+          ? (
+              <span className="attachment-folder-state">
+                <AttachmentFolderGlyph />
+                {state === 'preparing'
+                  ? <i className="attachment-loading" />
+                  : <b>!</b>}
+              </span>
+            )
+          : state === 'preparing' ? <i className="attachment-loading" /> : '!'}
+      </span>
+      <span className="attachment-copy">
+        <strong title={name}>{name}</strong>
+        <small title={detail}>
+          {state === 'preparing'
+            ? kind === 'directory' ? uiAttribute("正在添加文件夹…") : uiAttribute("正在添加…")
+            : detail ?? uiAttribute("附件处理失败")}
+        </small>
+      </span>
+      {onRemove && (
+        <button className="attachment-remove" type="button" aria-label={uiAttribute("移除失败附件 {0}", String(name))} onClick={onRemove}>×</button>
+      )}
+    </div>
+  )
+}
+
+function attachmentTypeLabel(mediaType: string | null): string {
+  if (!mediaType) return uiAttribute("文件")
+  if (mediaType === 'inode/directory') return uiAttribute("文件夹")
+  if (mediaType.startsWith('image/')) return uiAttribute("图片")
+  if (mediaType === 'application/pdf') return 'PDF'
+  if (mediaType.includes('zip')) return uiAttribute("压缩文件")
+  if (mediaType.startsWith('text/')) return uiAttribute("文本")
+  return uiAttribute("文件")
+}

@@ -1,0 +1,27 @@
+[package]
+name = "rovai-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+os_pipe = "1.2"
+dirs = "6"
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+rovai-core = { path = "../rovai-core" }
+rovai-web = { path = "../rovai-web" }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+chrono = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

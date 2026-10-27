@@ -1,0 +1,122 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "macos-arm64-deepseek-harness-v2",
+  "supersedesEvidenceId": "macos-arm64-deepseek-harness-v1",
+  "capturedAt": "2026-09-16",
+  "platform": "macos-arm64",
+  "hostEnvelope": {
+    "os": "macOS 26.3",
+    "build": "25D125",
+    "architecture": "arm64"
+  },
+  "baseRevision": "5d2e855b4da94913459b331c568712d9a0952d61",
+  "qualifiedRuntimeKinds": [
+    "deepseek-harness"
+  ],
+  "runtimeEvidence": {
+    "runtimeVersion": "0.1.5-rc.2",
+    "minimumVersion": ">=0.1.5-rc.2",
+    "protocol": "acp-v1",
+    "package": "@deepseek-ai/dsh@0.1.5-rc.2",
+    "packageIntegrity": "sha512-8Xc8hCQHcIWRmTCVU/xZdp6/qMsWMeAd2ObChKDEsfhUPJFXx6H0lgeb1DxUMD86HZrrVN+1bCvn1ppjZ/fOxw==",
+    "executableFingerprint": "sha256:0ff7f1d72c4e0cbe14001709c81e20a04b70464118a7f78568952988e28f2ac5",
+    "realProvider": "MiniMax-M3 through the official Anthropic-compatible endpoint and native llm-pi-ai route",
+    "credentialUse": "User-authorized acceptance only; process-local isolated child environment; no secret in argv, repository or public evidence"
+  },
+  "acceptance": {
+    "status": "qualified",
+    "platformScope": "macos-arm64 only",
+    "priorStableEvidence": {
+      "evidenceId": "macos-arm64-deepseek-harness-v1",
+      "sha256": "1ffbc11ca99a2430212153bea02b6982ba03df9952ad299c66c99a2cf94c14c5",
+      "preservedAxes": "The original 14-axis Host, Session, Bootstrap, compaction, Skills, MCP, permissions, CLI, usage, recovery and cleanup qualification remains immutable historical evidence."
+    },
+    "hostFleetNativeLock": {
+      "result": "passed",
+      "detail": "The shared ACP Fleet retains warm multi-Session reuse. An incompatible idle Host is confirmed reaped before replacement; a busy Host completes its current Run, is then confirmed reaped, and only then permits replacement exact resume. A failed reap blocks replacement."
+    },
+    "nativePermissionAuthority": {
+      "result": "passed",
+      "detail": "sandbox_mode and approval_policy keep their native names and values from the member surface through persistence and Host patching. Rovai relays only native DSH permission requests and does not infer MCP safety, override read-only behavior or synthesize a second Approval layer.",
+      "syntheticMcpApprovalCount": 0,
+      "nativeMcpEffectCountAcrossThreeCases": 3
+    },
+    "externalMcpLifecycle": {
+      "result": "passed",
+      "detail": "Whole-definition projection, Host update/fencing, exact Session resume, adjacent assignment isolation, unassign/reassign/delete and native definition restoration passed with the real DSH/Core protocol path and a deterministic model provider."
+    },
+    "nativeMcpStartup": {
+      "result": "passed",
+      "detail": "DSH 0.1.5-rc.2 may expose ACP stdio before a sibling native MCP Loader entry finishes. The managed ACP entry now waits on a Bootstrap readiness service published after the official MCP entry lifecycle settles; no fixed delay or prompt replay is used. The pre-fix zero-delay diagnostic failed 5/30, the post-fix diagnostic passed 30/30, and the full projection lifecycle passed.",
+      "toolRegistryEvent": "tools/change"
+    },
+    "genericToolAndDiff": {
+      "result": "passed",
+      "detail": "Known DSH tools map at ingress to shared execute/read/write/edit/file-search/web-search/fetch/tool semantics. The official tools/result observer contributes only exact structured facts. Complete write/edit Before/After becomes a standard ACP terminal Diff; missing, unchanged or oversized state remains path-only.",
+      "realProviderCases": {
+        "read": "typed file.read; no Diff",
+        "add": "typed file.write; path-only fallback; no invented Diff",
+        "edit": "update; additions=1; deletions=1",
+        "editEmpty": "update; additions=1; deletions=0"
+      }
+    },
+    "sharedPresentation": {
+      "result": "passed",
+      "detail": "Desktop and Mobile share the same native permission selector and incompatible-version projection. Unsupported DSH reports a minimum of 0.1.5-rc.2. No DSH-specific Command, file-change or Diff UI was introduced."
+    },
+    "regression": {
+      "rustLibraryFunctional": "816 passed; 6 existing manual Runtime smokes ignored; 0 failed after integration with current main",
+      "postSealEvidenceDigestOwner": "passed",
+      "rendererFocused": "2 files, 55 tests passed",
+      "typecheck": "passed",
+      "nodeObserver": "2 passed",
+      "scriptedMcpProjection": "passed, including native MCP startup readiness and the complete replacement/isolation lifecycle",
+      "realProviderFileOperationMatrix": "passed with byte-exact fail-closed content assertions",
+      "rustfmt": "passed",
+      "documentationGovernance": "passed"
+    }
+  },
+  "evidenceSourceSha256": {
+    "qualification/runtime-platform/macos-arm64-deepseek-harness-v1.json": "1ffbc11ca99a2430212153bea02b6982ba03df9952ad299c66c99a2cf94c14c5",
+    "docs/research/deepseek-harness-runtime/acp-0.1.5-convergence-evidence.json": "a12a0d461d62fde1dd3a2ec86da4c07ba757c64ae9c72c440cab8519b67ee80a"
+  },
+  "implementationSourceSha256": {
+    "crates/rovai-core/src/dsh.rs": "22b5b29749e81e913199fca1c07cf8bf2541987d7609eacb4f37b9867d6c4570",
+    "crates/rovai-core/src/dsh/bootstrap.mjs": "f1907f9d9f0e5bb54a2edfaae00e89de78598b80abc1e202f323b5410f0d05bb",
+    "crates/rovai-core/src/acp.rs": "c943218606b488afa58fa48433cdd7d9ab1b676e24505758d8198b2ae8ce54bb",
+    "crates/rovai-core/src/runtime_fleet.rs": "5746d717ae66e52b2a9963665e02f80625e73be857d31a09901cb4ba9dca0f4b",
+    "crates/rovai-core/src/agent_runtime_adapter.rs": "7fb53c50619e55d654bef6714bbcb3c7412514c9a577d17feaf024cb49afd776",
+    "scripts/lib/dsh-host.test.mjs": "3dd0e38e7648be9e40728283bed6ce2055b4b985ada8342f409cfe3f56e44330",
+    "scripts/smoke-mcp-projection.mjs": "42d1eccf5e3810092d5967a175a90473770e0c41f74864f78f0620443be8693d",
+    "scripts/smoke-acp-runtime.mjs": "883ee0f20b88dd087b3804bb2d8464e6397cfb0a588429879158ee2c2d9da58c",
+    "apps/desktop/src/renderer/src/MemberRuntimeParameters.tsx": "b915a9cfad4c0544c92659e41b828439ca5816b0fb0be4bcdd09b1118d501abf",
+    "apps/desktop/src/renderer/src/RuntimeParameterSelect.tsx": "fa1b4b63396807d8d92b5f842b47212078730d99d8e23671c9631a500e2bb59b",
+    "apps/desktop/src/renderer/src/runtime-status.ts": "e5d3067cc3abe91a4118b94de88389360a4c1627c4baf53df1f1d120bd86f000"
+  },
+  "limitations": [
+    "The scripted MCP provider is deterministic protocol evidence and not provider-generation qualification.",
+    "ACP still lacks session/load, additionalDirectories, a manual compact command, compaction lifecycle, MCP SSE/resources/prompts and client filesystem/terminal bridges.",
+    "A missing, unchanged or oversized native Before/After remains path-only and does not claim line counts.",
+    "No macOS x64, Windows x64 or Linux x64 qualification is inferred.",
+    "Credentials, raw prompts, local paths, Native Session IDs, Run IDs and full tool output are excluded."
+  ],
+  "qualificationBasis": {
+    "type": "incremental-target-host-golden-flows",
+    "decision": "The v1 14-axis qualification remains the stable base; this v2 artifact binds the 2026-09-16 native-authority, Host-lock and common-Diff convergence without expanding platform scope.",
+    "versionDecision": "docs/versions/v1.59/decisions.md#v1-59-d10"
+  },
+  "notQualified": [
+    {
+      "platform": "macos-x64",
+      "reason": "No DSH target-host qualification evidence"
+    },
+    {
+      "platform": "windows-x64",
+      "reason": "No DSH target-host qualification evidence"
+    },
+    {
+      "platform": "linux-x64",
+      "reason": "No DSH target-host qualification evidence"
+    }
+  ]
+}

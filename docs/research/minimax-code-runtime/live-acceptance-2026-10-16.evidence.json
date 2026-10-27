@@ -1,0 +1,967 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-16",
+  "evidenceKind": "real-llm-production-core-visible-development-app",
+  "adapter": "minimax-code-cli",
+  "nativeVersion": "0.6.12",
+  "platform": "macos-arm64",
+  "baseImplementation": "02e38cfbf55c230b72007931025f252b3f8310fe",
+  "qualification": "Preview",
+  "firstClassPromoted": false,
+  "other18RuntimesRerun": false,
+  "app": {
+    "channel": "pnpm dev",
+    "threadId": "rvcamp_01m52cmtmsfbgbwe4reaxpc759",
+    "threadName": "MiniMax · 真实模型与文件验收",
+    "dailyAppUntouched": true,
+    "isolatedUserData": true,
+    "isolatedSkillLibrary": true,
+    "isolatedMcp": true,
+    "retainedForUser": true,
+    "fixtureRoot": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-minimax-live-20261016-42gis255",
+    "currentModel": "m:custom_provider%3Asub2api-rovai:gpt-6:v:thinking"
+  },
+  "nativeAuthentication": {
+    "source": "official native home",
+    "initialCopiedAuthHomeFailed": true,
+    "nativeDefaultGenerationSucceeded": true,
+    "laterQuotaExceeded": true,
+    "automaticRetryAfterQuotaExceeded": false
+  },
+  "sub2api": {
+    "connectionAndGeneration": {
+      "endpoint": "http://127.0.0.1:18080",
+      "format": "openai-responses",
+      "model": "gpt-6",
+      "officialProviderConfiguration": true,
+      "isolatedNativeHome": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-minimax-live-20261016-42gis255/sub2api-native",
+      "providerAddExit": 0,
+      "providerAddSummary": "Provider added and selected: sub2api-rovai",
+      "generationExit": 0,
+      "markerObserved": true,
+      "generationResponseBytes": 545
+    },
+    "nativeConfiguration": {
+      "exit": 0,
+      "providerPresent": true,
+      "defaultModelUnchanged": true,
+      "managedProviderUnchanged": true,
+      "configPrivateMode": "600"
+    },
+    "appModelObserved": true,
+    "keyIncluded": false
+  },
+  "runs": [
+    {
+      "id": "28549ad6-f79d-41a5-b66b-77cd68793275",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:custom_provider%3Asub2api-rovai:gpt-6:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "e4cf422b-d17d-41a4-b29e-ea58f08d6854",
+      "status": "failed",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": {
+        "code": "runtime_quota_exceeded",
+        "detail": "ACP error -32603: Internal error: MiniMax Code Runtime failed: insufficient balance (1008)",
+        "origin": "runtime",
+        "phase": "execution",
+        "retryable": false,
+        "runtimeKind": "minimax-code-cli",
+        "summary": "账户配额不足"
+      }
+    },
+    {
+      "id": "56d31568-23a8-4f08-a255-7ee3f330ee18",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:custom_provider%3Asub2api-rovai:gpt-6:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "3ddb2c79-4de0-4a29-85f7-6f14ee86532f",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:custom_provider%3Asub2api-rovai:gpt-6:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "5dd359fd-0334-4ab0-a843-21c7c2435fd1",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "dbba6fc5-5620-4353-8d08-2f53d87eabe7",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "54b62846-681e-478a-9250-c0fd0c280f91",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "c2b1c559-7b3a-4d3b-90d2-a47bcc0ab4aa",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "52fea1ef-2a25-41da-9820-5507facdd020",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "4466f744-794f-4bf1-a7a6-a4b3bba3b95e",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    },
+    {
+      "id": "ab95e481-5ffa-4bc8-9270-f598125aa4b5",
+      "status": "succeeded",
+      "executionEpoch": 1,
+      "runtimeModel": {
+        "adapterKind": "minimax-code-cli",
+        "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+        "reasoningEffort": null
+      },
+      "failure": null
+    }
+  ],
+  "nativeBindings": [
+    {
+      "agentRunId": "ab95e481-5ffa-4bc8-9270-f598125aa4b5",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": false
+    },
+    {
+      "agentRunId": "4466f744-794f-4bf1-a7a6-a4b3bba3b95e",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "52fea1ef-2a25-41da-9820-5507facdd020",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "c2b1c559-7b3a-4d3b-90d2-a47bcc0ab4aa",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "54b62846-681e-478a-9250-c0fd0c280f91",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "dbba6fc5-5620-4353-8d08-2f53d87eabe7",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "5dd359fd-0334-4ab0-a843-21c7c2435fd1",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "3ddb2c79-4de0-4a29-85f7-6f14ee86532f",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "56d31568-23a8-4f08-a255-7ee3f330ee18",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "e4cf422b-d17d-41a4-b29e-ea58f08d6854",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    },
+    {
+      "agentRunId": "28549ad6-f79d-41a5-b66b-77cd68793275",
+      "nativeSessionId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "nativeBindingGeneration": 1,
+      "bindingReused": true
+    }
+  ],
+  "hostStartObservations": [
+    {
+      "agentRunId": "c2b1c559-7b3a-4d3b-90d2-a47bcc0ab4aa",
+      "hostInstanceId": "eda59943-c317-471f-a0ec-3497bc6e9924",
+      "nativeThreadId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "modelId": "minimax-code-cli://runtime-default",
+      "executionEpoch": 1
+    },
+    {
+      "agentRunId": "54b62846-681e-478a-9250-c0fd0c280f91",
+      "hostInstanceId": "eda59943-c317-471f-a0ec-3497bc6e9924",
+      "nativeThreadId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "modelId": "minimax-code-cli://runtime-default",
+      "executionEpoch": 1
+    },
+    {
+      "agentRunId": "dbba6fc5-5620-4353-8d08-2f53d87eabe7",
+      "hostInstanceId": "eda59943-c317-471f-a0ec-3497bc6e9924",
+      "nativeThreadId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "modelId": "minimax-code-cli://runtime-default",
+      "executionEpoch": 1
+    },
+    {
+      "agentRunId": "3ddb2c79-4de0-4a29-85f7-6f14ee86532f",
+      "hostInstanceId": "c0337836-ef90-4e83-b397-704d24964761",
+      "nativeThreadId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "modelId": "m:custom_provider%3Asub2api-rovai:gpt-6:v:thinking",
+      "executionEpoch": 1
+    },
+    {
+      "agentRunId": "56d31568-23a8-4f08-a255-7ee3f330ee18",
+      "hostInstanceId": "6871ae00-fc63-495e-80b5-76de90ee8352",
+      "nativeThreadId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "modelId": "minimax-code-cli://runtime-default",
+      "executionEpoch": 1
+    },
+    {
+      "agentRunId": "e4cf422b-d17d-41a4-b29e-ea58f08d6854",
+      "hostInstanceId": "6871ae00-fc63-495e-80b5-76de90ee8352",
+      "nativeThreadId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "modelId": "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+      "executionEpoch": 1
+    },
+    {
+      "agentRunId": "28549ad6-f79d-41a5-b66b-77cd68793275",
+      "hostInstanceId": "6871ae00-fc63-495e-80b5-76de90ee8352",
+      "nativeThreadId": "mvs_5f813aaad46b4c14930d3a76c9b0bbce",
+      "modelId": "m:custom_provider%3Asub2api-rovai:gpt-6:v:thinking",
+      "executionEpoch": 1
+    }
+  ],
+  "steer": [
+    {
+      "messageId": "9ed3a83d-eafb-4a16-bf3f-c0137c0ac720",
+      "targetAgentRunId": "ab95e481-5ffa-4bc8-9270-f598125aa4b5",
+      "requestedMode": "steer",
+      "inputDeliveryStatus": "accepted",
+      "dispatchAttemptCount": 1,
+      "status": "settled"
+    },
+    {
+      "messageId": "a9a069ac-8a75-4311-9fa0-4264641d7fc9",
+      "targetAgentRunId": "dbba6fc5-5620-4353-8d08-2f53d87eabe7",
+      "requestedMode": "steer",
+      "inputDeliveryStatus": "accepted",
+      "dispatchAttemptCount": 1,
+      "status": "settled"
+    }
+  ],
+  "image": {
+    "runId": "dbba6fc5-5620-4353-8d08-2f53d87eabe7",
+    "nativeReadObserved": true,
+    "answerInPrompt": false,
+    "observedDigits": "731",
+    "left": "blue square",
+    "right": "red circle",
+    "expectedAnswerMatched": true,
+    "inputSha256": "fa71d0d5e26d657f28543f0a945b62424923605dd158ab5f13aad9b722c5fc09",
+    "invalidEarlierAttempts": 2,
+    "earlierAttemptReason": "fixture omitted execution; no Steer Delivery was created"
+  },
+  "fileChecks": {
+    "文件矩阵/编辑 file.txt": {
+      "exactExpectedContent": true,
+      "bytes": 316,
+      "sha256": "db17e9a7cc238127bab0568abf7072aa31191b598befd15520e4fb240236fb33"
+    },
+    "文件矩阵/新增 file.txt": {
+      "exactExpectedContent": true,
+      "bytes": 13,
+      "sha256": "410a9af48a4c76f6d008df3cbf861d53b488f122c9563dd8ae5f7149c452b5ef"
+    },
+    "文件矩阵/覆盖 file.txt": {
+      "exactExpectedContent": true,
+      "bytes": 17,
+      "sha256": "dc28565dbf9458d5e9d8994d2aa3e7762839ebba26e45b890649d8d966d7619c"
+    },
+    "文件矩阵/空 file.txt": {
+      "exactExpectedContent": true,
+      "bytes": 11,
+      "sha256": "aceb31f6fe079c1d59cd067d5208d13e474af9b8e090581cd29d10bb15be36d6"
+    }
+  },
+  "fileChanges": [
+    {
+      "agentRunId": "ab95e481-5ffa-4bc8-9270-f598125aa4b5",
+      "completedAt": "2026-10-16T13:00:45.771810+00:00",
+      "executionEpoch": 1,
+      "fileCount": 7,
+      "files": [
+        {
+          "changeKind": "add",
+          "evidenceFileId": "ef_01a144ccf76574f285a4398f810e41ec",
+          "operationCount": 1,
+          "path": "/tmp/minimax_acceptance_briefing.md",
+          "presentationKind": "operation_only"
+        },
+        {
+          "changeKind": "add",
+          "evidenceFileId": "ef_01a144ccf76574f285a4399f4a256ef9",
+          "operationCount": 1,
+          "path": "/tmp/minimax_acceptance_briefing_2.md",
+          "presentationKind": "operation_only"
+        },
+        {
+          "changeKind": "add",
+          "evidenceFileId": "ef_01a144ccf76574f285a439a50804a5f2",
+          "operationCount": 1,
+          "path": "文件矩阵/新增 file.txt",
+          "presentationKind": "operation_only"
+        },
+        {
+          "additions": 1,
+          "changeKind": "update",
+          "deletions": 0,
+          "evidenceFileId": "ef_01a144ccf76574f285a439b3e491b861",
+          "operationCount": 1,
+          "path": "文件矩阵/空 file.txt",
+          "presentationKind": "full_net_diff"
+        },
+        {
+          "additions": 1,
+          "changeKind": "update",
+          "deletions": 1,
+          "evidenceFileId": "ef_01a144ccf76574f285a439c13ba819aa",
+          "operationCount": 1,
+          "path": "文件矩阵/编辑 file.txt",
+          "presentationKind": "full_net_diff"
+        },
+        {
+          "additions": 1,
+          "changeKind": "update",
+          "deletions": 1,
+          "evidenceFileId": "ef_01a144ccf76574f285a439d02a082317",
+          "operationCount": 1,
+          "path": "文件矩阵/覆盖 file.txt",
+          "presentationKind": "full_net_diff"
+        },
+        {
+          "additions": 2,
+          "changeKind": "update",
+          "deletions": 1,
+          "evidenceFileId": "ef_01a144ccf76574f285a439e32ade4b3f",
+          "operationCount": 3,
+          "path": "验收结果.md",
+          "presentationKind": "operation_history"
+        }
+      ],
+      "isStale": false,
+      "operationCount": 9,
+      "revision": 1,
+      "schemaVersion": 3,
+      "sourceChangeSequence": 143
+    },
+    {
+      "agentRunId": "52fea1ef-2a25-41da-9820-5507facdd020",
+      "completedAt": "2026-10-16T13:09:34.082518+00:00",
+      "executionEpoch": 1,
+      "fileCount": 1,
+      "files": [
+        {
+          "changeKind": "add",
+          "evidenceFileId": "ef_01a144d507187361a9afc1c281bfa784",
+          "operationCount": 1,
+          "path": "/tmp/minimax_matrix_briefing.md",
+          "presentationKind": "operation_only"
+        }
+      ],
+      "isStale": false,
+      "operationCount": 1,
+      "revision": 1,
+      "schemaVersion": 3,
+      "sourceChangeSequence": 39
+    },
+    {
+      "agentRunId": "dbba6fc5-5620-4353-8d08-2f53d87eabe7",
+      "completedAt": "2026-10-16T13:13:51.899656+00:00",
+      "executionEpoch": 1,
+      "fileCount": 1,
+      "files": [
+        {
+          "changeKind": "add",
+          "evidenceFileId": "ef_01a144d8f63375a0a3e94c6c16a17abc",
+          "operationCount": 1,
+          "path": "/tmp/image_steer_result.md",
+          "presentationKind": "operation_only"
+        }
+      ],
+      "isStale": false,
+      "operationCount": 1,
+      "revision": 1,
+      "schemaVersion": 3,
+      "sourceChangeSequence": 19
+    },
+    {
+      "agentRunId": "5dd359fd-0334-4ab0-a843-21c7c2435fd1",
+      "completedAt": "2026-10-16T13:19:53.378399+00:00",
+      "executionEpoch": 1,
+      "fileCount": 1,
+      "files": [
+        {
+          "changeKind": "add",
+          "evidenceFileId": "ef_01a144de7a3775c0b97b7b4e902d22df",
+          "operationCount": 1,
+          "path": "/tmp/cold_compact_result.md",
+          "presentationKind": "operation_only"
+        }
+      ],
+      "isStale": false,
+      "operationCount": 1,
+      "revision": 1,
+      "schemaVersion": 3,
+      "sourceChangeSequence": 18
+    },
+    {
+      "agentRunId": "3ddb2c79-4de0-4a29-85f7-6f14ee86532f",
+      "completedAt": "2026-10-16T13:21:59.431827+00:00",
+      "executionEpoch": 1,
+      "fileCount": 1,
+      "files": [
+        {
+          "changeKind": "add",
+          "evidenceFileId": "ef_01a144e0669e7e22acb3d5356fcabc79",
+          "operationCount": 1,
+          "path": "sub2api-result.md",
+          "presentationKind": "operation_only"
+        }
+      ],
+      "isStale": false,
+      "operationCount": 1,
+      "revision": 1,
+      "schemaVersion": 3,
+      "sourceChangeSequence": 17
+    }
+  ],
+  "commands": [
+    {
+      "command": "node -e 'console.log(\"MATRIX_STDOUT\")'",
+      "outcome": "succeeded",
+      "outputPreviewBytes": 14,
+      "outputTruncated": false,
+      "outputMarkerPresent": true
+    },
+    {
+      "command": "node -e 'console.error(\"MATRIX_STDERR\")'",
+      "outcome": "succeeded",
+      "outputPreviewBytes": 14,
+      "outputTruncated": false,
+      "outputMarkerPresent": true
+    },
+    {
+      "command": "node -e 'console.log(\"MATRIX_MIX_OUT\");console.error(\"MATRIX_MIX_ERR\")'",
+      "outcome": "succeeded",
+      "outputPreviewBytes": 30,
+      "outputTruncated": false,
+      "outputMarkerPresent": true
+    },
+    {
+      "command": "node -e 'process.exit(0)'",
+      "outcome": "succeeded",
+      "outputPreviewBytes": 11,
+      "outputTruncated": false,
+      "outputMarkerPresent": true
+    },
+    {
+      "command": "node -e 'console.error(\"MATRIX_NONZERO\");process.exit(7)'",
+      "outcome": "failed",
+      "outputPreviewBytes": 43,
+      "outputTruncated": false,
+      "outputMarkerPresent": true
+    },
+    {
+      "command": "node -e 'console.log(\"MATRIX_LARGE_START\"+\"x\".repeat(100000)+\"MATRIX_LARGE_END\")'",
+      "outcome": "succeeded",
+      "outputPreviewBytes": 7680,
+      "outputTruncated": true,
+      "outputMarkerPresent": true
+    }
+  ],
+  "mcp": {
+    "stdioEchoActual": true,
+    "coldAfterCompactEchoActual": true,
+    "assignmentRemovalObserved": true,
+    "reassignmentEchoActual": true,
+    "callMarkerCount": 3,
+    "httpCollisionAndFailureMatrix": "unverified"
+  },
+  "skills": {
+    "projectNativeRead": true,
+    "coldRead": true,
+    "updatedMarker": "SKILL_UPDATED_42GIS255",
+    "nativeReadAfterUpdate": true,
+    "fullMultiRootMatrix": "unverified"
+  },
+  "compact": {
+    "method": "official ACP session/prompt /compact on idle product Session",
+    "result": {
+      "stopReason": "end_turn"
+    },
+    "nativeSummary": "Compaction completed.\nMessages: 97 → 1\nTokens: 71,311 → 17,827",
+    "coldAppCoreResume": true,
+    "charterCountAfterCold": 1,
+    "bootstrapDigestBefore": "d26a14ef5ebf5d6d2bc9ec6d1320ad963b93250277e5591283955b02cc55e4f8",
+    "bootstrapDigestAfter": "d26a14ef5ebf5d6d2bc9ec6d1320ad963b93250277e5591283955b02cc55e4f8",
+    "automaticThresholdOverflowRetry": "unverified",
+    "rovaiCompactionUi": "not implemented"
+  },
+  "monitoring": {
+    "runs": [
+      {
+        "agentRunId": "28549ad6-f79d-41a5-b66b-77cd68793275",
+        "cacheReadTokens": 27136,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:25:49.436146+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:25:35.963+00:00",
+        "outputTokens": 111,
+        "promptInputTotalTokens": 29284
+      },
+      {
+        "agentRunId": "e4cf422b-d17d-41a4-b29e-ea58f08d6854",
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:24:29.180080+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": null,
+        "outputTokens": null,
+        "promptInputTotalTokens": null
+      },
+      {
+        "agentRunId": "56d31568-23a8-4f08-a255-7ee3f330ee18",
+        "cacheReadTokens": 26752,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:22:56.469071+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:22:45.493+00:00",
+        "outputTokens": 210,
+        "promptInputTotalTokens": 53889
+      },
+      {
+        "agentRunId": "3ddb2c79-4de0-4a29-85f7-6f14ee86532f",
+        "cacheReadTokens": 74112,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:21:59.431827+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:21:44.817+00:00",
+        "outputTokens": 333,
+        "promptInputTotalTokens": 100098
+      },
+      {
+        "agentRunId": "5dd359fd-0334-4ab0-a843-21c7c2435fd1",
+        "cacheReadTokens": 41216,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:19:53.378399+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:19:48.190+00:00",
+        "outputTokens": 737,
+        "promptInputTotalTokens": 61077
+      },
+      {
+        "agentRunId": "dbba6fc5-5620-4353-8d08-2f53d87eabe7",
+        "cacheReadTokens": 188580,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:13:51.899656+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:13:43.861+00:00",
+        "outputTokens": 527,
+        "promptInputTotalTokens": 191039
+      },
+      {
+        "agentRunId": "54b62846-681e-478a-9250-c0fd0c280f91",
+        "cacheReadTokens": 44442,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:11:58.654038+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:11:22.710+00:00",
+        "outputTokens": 229,
+        "promptInputTotalTokens": 45629
+      },
+      {
+        "agentRunId": "c2b1c559-7b3a-4d3b-90d2-a47bcc0ab4aa",
+        "cacheReadTokens": 41086,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:10:33.849726+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:10:12.874+00:00",
+        "outputTokens": 696,
+        "promptInputTotalTokens": 42537
+      },
+      {
+        "agentRunId": "52fea1ef-2a25-41da-9820-5507facdd020",
+        "cacheReadTokens": 150483,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:09:34.082518+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:09:14.236+00:00",
+        "outputTokens": 1991,
+        "promptInputTotalTokens": 157795
+      },
+      {
+        "agentRunId": "4466f744-794f-4bf1-a7a6-a4b3bba3b95e",
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:03:24.975087+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": null,
+        "outputTokens": null,
+        "promptInputTotalTokens": null
+      },
+      {
+        "agentRunId": "ab95e481-5ffa-4bc8-9270-f598125aa4b5",
+        "cacheReadTokens": 499904,
+        "cacheWriteTokens": 0,
+        "executionEpoch": 1,
+        "finalizedAt": "2026-10-16T13:00:45.771810+00:00",
+        "inputOutputComplete": false,
+        "lastObservedAt": "2026-10-16T13:00:29.522+00:00",
+        "outputTokens": 7865,
+        "promptInputTotalTokens": 529353
+      }
+    ],
+    "schemaVersion": 1,
+    "sessions": [
+      {
+        "agentId": "agent_2",
+        "conversationId": "4b1cb16c-39e9-4b86-801b-0ce26b515c78",
+        "dialectId": "acp-session-context-gauge-v1",
+        "modelKey": "m:custom_provider%3Asub2api-rovai:gpt-6:v:thinking",
+        "nativeRatio": null,
+        "observedAt": "2026-10-16T13:25:49.426344+00:00",
+        "runtimeKind": "minimax-code-cli",
+        "sessionGeneration": 1,
+        "source": "runtime_event",
+        "usedTokens": 29491,
+        "windowTokens": 200000
+      }
+    ]
+  },
+  "builtinCli": {
+    "status": "passed",
+    "coverage": "21-operation regression subset, not all 29 current operations",
+    "model": "gpt-6 through MiniMax Code official custom_provider/Sub2API",
+    "uncoveredOperations": [
+      "member.list",
+      "member.get",
+      "member.update",
+      "thread.runs",
+      "mission.list",
+      "mission.get",
+      "mission.update",
+      "mission.status"
+    ],
+    "result": {
+      "ok": true,
+      "contractVersion": 41,
+      "ipcProtocolVersion": 3,
+      "runtimeCount": 1,
+      "operationCountPerRuntime": 21,
+      "expectedOperations": [
+        "automation.close",
+        "automation.create",
+        "automation.delete",
+        "automation.get",
+        "automation.list",
+        "automation.run",
+        "automation.update",
+        "history.search",
+        "member.create",
+        "memory.read",
+        "memory.search",
+        "memory.view",
+        "memory.write",
+        "team.create_task",
+        "team.get_task",
+        "team.list_tasks",
+        "team.update_task",
+        "thread.list",
+        "thread.message.send",
+        "thread.read",
+        "thread.search"
+      ],
+      "historyEvidence": {
+        "threadId": "rvcamp_01m52emhkzesrvw6tenp41m2d5",
+        "seedAdapterKind": "minimax-code-cli",
+        "publicA2aMessageId": "9b443623-0786-46b7-82c2-840dbd42d44b",
+        "publicA2aDeliveryId": "97863a5e-06fa-4b14-b0ce-ff70cde62a77",
+        "attachmentMessageId": "9cad0c39-b59b-419e-87ff-2e5728b1036f",
+        "attachmentId": "6e92f54e-d489-4db4-80de-9febde41644a"
+      },
+      "results": [
+        {
+          "adapterKind": "minimax-code-cli",
+          "reportedVersion": "0.6.12",
+          "selectedModel": "m:custom_provider%3Asub2api-rovai:gpt-6:v:thinking",
+          "sourceAgentRunId": "41b34820-3dd3-4913-884e-4dcf5fdf225d",
+          "resumedAgentRunId": "2dbf94cb-f2c9-496c-b133-3243cd12d94e",
+          "recipientAgentRunId": "960d61d9-51f4-40ad-ae67-5ed77ccbb2d8",
+          "recipientRunStatusAtObservation": "running",
+          "operations": [
+            "automation.close",
+            "automation.create",
+            "automation.delete",
+            "automation.get",
+            "automation.list",
+            "automation.run",
+            "automation.update",
+            "history.search",
+            "member.create",
+            "memory.read",
+            "memory.search",
+            "memory.view",
+            "memory.write",
+            "team.create_task",
+            "team.get_task",
+            "team.list_tasks",
+            "team.update_task",
+            "thread.list",
+            "thread.message.send",
+            "thread.read",
+            "thread.search"
+          ],
+          "fullRunEvidenceCount": 35,
+          "legacySendFlagRejected": true,
+          "legacySendJsonRejected": true,
+          "sendInputSources": [
+            "direct_flags",
+            "input_file"
+          ],
+          "exactAddressingVerifiedInSuccessorRun": true,
+          "crossCampManifestId": "4f94135a-efaa-487f-bf20-477a16fa0fd3",
+          "historicalPublicA2aMessageId": "9b443623-0786-46b7-82c2-840dbd42d44b",
+          "historicalAttachmentMessageId": "9cad0c39-b59b-419e-87ff-2e5728b1036f",
+          "historicalAttachmentId": "6e92f54e-d489-4db4-80de-9febde41644a",
+          "successorExactReadCount": 3,
+          "staleVersionConflict": true,
+          "initialLeaseFenced": true,
+          "resumedLeaseFenced": true,
+          "logicalConversationContinued": true,
+          "nativeSessionContinued": true
+        }
+      ],
+      "fixtureRetained": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-GnwvEz"
+    },
+    "attempts": [
+      {
+        "attempt": 1,
+        "status": "failed",
+        "cause": "retired composerDraft API",
+        "llm": "official MiniMax when generation was reached",
+        "logSha256": "7fa8bbf807ddb09a6921d3d129b81e8a25daee2510e4dc10130438137a94e341",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-8U3KpK"
+      },
+      {
+        "attempt": 2,
+        "status": "failed",
+        "cause": "publication event is now camp_message.sent",
+        "llm": "official MiniMax when generation was reached",
+        "logSha256": "61defb11413a6bd6b2ba4fc45e7b5d6ef69a02f8ce7a091a6145e8079eac444d",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-S3x4xw"
+      },
+      {
+        "attempt": 3,
+        "status": "failed",
+        "cause": "retired frozen history list assertion",
+        "llm": "official MiniMax when generation was reached",
+        "logSha256": "2b7aeb6e998e77aee08b80227d55e4f4458f62f98569b26f8ab7c1f3758135f0",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-SS3Uos"
+      },
+      {
+        "attempt": 4,
+        "status": "failed",
+        "cause": "User attention flag/help drift",
+        "llm": "official MiniMax when generation was reached",
+        "logSha256": "9ba1e10d25865801d6f521c2285032b2ca8f3ccbc6a3d078e67b845d35667dd4",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-ymY7nL"
+      },
+      {
+        "attempt": 5,
+        "status": "failed",
+        "cause": "retired Gather help/operation",
+        "llm": "official MiniMax when generation was reached",
+        "logSha256": "536bc765ed52ad8c77144a66a38335a45568db14fcbf6bdfad3de907be21b2af",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-ewu9am"
+      },
+      {
+        "attempt": 6,
+        "status": "failed",
+        "cause": "automation admission is now asynchronous",
+        "llm": "official MiniMax when generation was reached",
+        "logSha256": "0e258e6ed633a4a1c119dd0c365a38f3bcbadfab4f25992f23bd2e504ad53ef5",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-uDHcjW"
+      },
+      {
+        "attempt": 7,
+        "status": "failed",
+        "cause": "senderType public message projection",
+        "llm": "official MiniMax when generation was reached",
+        "logSha256": "37c61ba7d0580ff2edae1958151af5bb45833f8ab083d712eb95cc479ad965dc",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-pVXCfQ"
+      },
+      {
+        "attempt": 8,
+        "status": "failed",
+        "cause": "official account quota exhausted",
+        "llm": "official MiniMax when generation was reached",
+        "logSha256": "e684e98411ffa16e88fb5592708a3e8ef149f60f96c5903393d47c2ea00d772b",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-oK6s3t"
+      },
+      {
+        "attempt": 9,
+        "status": "failed",
+        "cause": "attachment retains actual text/plain media type",
+        "llm": "Sub2API gpt-6",
+        "logSha256": "6816ed0423510a8fecb8b41bbcc8ff3fd198fa352fa40b70e2fc719d1d2c5140",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-IR8KiC"
+      },
+      {
+        "attempt": 10,
+        "status": "failed",
+        "cause": "successor read uses mentions rather than addressing",
+        "llm": "Sub2API gpt-6",
+        "logSha256": "03b15b601c9d9d4e802a45b2b135c13abd48f73c6b4f2445155e2d259e96b710",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-g96KcH"
+      },
+      {
+        "attempt": 11,
+        "status": "passed",
+        "cause": "passed",
+        "llm": "Sub2API gpt-6",
+        "logSha256": "3b6510f1e6e89339b8f33d2dffbb0acad99bcf625ce74fdc07efac569947e095",
+        "retainedFixture": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-builtin-cli-smoke-GnwvEz"
+      }
+    ]
+  },
+  "limits": [
+    "automatic compaction threshold/overflow/retry",
+    "cross-session switch/concurrency/LRU",
+    "full permission and failure matrix",
+    "full Skills/MCP matrix",
+    "remaining CLI operations",
+    "native external credential hot refresh",
+    "other platforms"
+  ],
+  "validation": {
+    "rustTargetedRegisterDigest": {
+      "passed": 1,
+      "failed": 0
+    },
+    "rustDefaultLibrary": {
+      "passed": 427,
+      "failed": 0,
+      "ignored": 1,
+      "durationSeconds": 186.12
+    },
+    "docsTest": {
+      "passed": 10,
+      "failed": 0
+    },
+    "docsCheck": "passed",
+    "docsCiBase": "02e38cfbf55c230b72007931025f252b3f8310fe",
+    "docsCi": "passed",
+    "scriptSyntax": "passed",
+    "diffCheck": "passed"
+  },
+  "desktopEvidence": {
+    "screenshot": "minimax-dev-live-image-diff-20261016.png",
+    "sha256": "c46418a9fef7ca522f745426bf256b5bd97a4a24b0c45eb89734de654c31cf3c",
+    "visualInspection": "image answer visible alongside native +1/-1 edit diff after App restart; no loading placeholder",
+    "sourceReferenceImageReadVerified": true,
+    "legacyEmptyAttachmentViewRecovered": {
+      "state": "ready",
+      "generation": 2,
+      "entryCount": 0,
+      "lastError": null
+    },
+    "retained": true
+  },
+  "cleanup": {
+    "removedOwnedNativeCopies": [
+      "native",
+      "sub2api-native"
+    ],
+    "nativeOfficialHomePreserved": true
+  }
+}

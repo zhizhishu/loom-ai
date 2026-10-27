@@ -1,0 +1,220 @@
+{
+  "schemaVersion": 1,
+  "observedAt": "2026-10-16T15:23:59.145Z",
+  "implementationCommit": "c2640d0176b7345a57102bbaf97cd5c870e02b36",
+  "runtime": {
+    "package": "@minimax-ai/code",
+    "version": "0.6.12",
+    "platform": "macos-arm64",
+    "model": "gpt-6",
+    "providerApi": "openai-responses",
+    "llm": "real-sub2api",
+    "admission": "preview"
+  },
+  "scope": {
+    "productionCore": true,
+    "manualCompactCalled": false,
+    "rendererStartedThisFollowup": false,
+    "previousDevAppPreserved": true,
+    "other18Adapters": "code-audit-only"
+  },
+  "automaticCompaction": {
+    "status": "passed",
+    "contextLimit": 65536,
+    "maxOutputTokens": 4096,
+    "expectedThresholdTokens": 49152,
+    "threadId": "rvcamp_01m52m90h1eqh8gxyfk97wjqss",
+    "nativeSessionId": "mvs_d45aab1abd4b4bd48e5ad26bcb5340c6",
+    "historyGenerations": 2,
+    "compactions": [
+      {
+        "messageId": "msg-HT8XCVtXgb4lInexUFApiHyu2EbHvKMcLz3mIZDf_ZE",
+        "tokensBefore": 58388,
+        "timestamp": 1792163608281,
+        "artifactGeneration": 1
+      },
+      {
+        "messageId": "msg-0wohJ7lKCXCuujrb6deek7u_W-Pd1BIqpNWKqGNWZHs",
+        "tokensBefore": 56911,
+        "timestamp": 1792163646469,
+        "artifactGeneration": 2
+      }
+    ],
+    "firstMainInputAfterSecondCompaction": 44002,
+    "bootstrap": {
+      "charterCount": 1,
+      "sha256": "e8ed64cfcd4b29cdf2bea06aa6e23e1d9ae71dfe0e2017e71568acd20df00b58",
+      "unchangedAcrossAllRecordedRounds": true
+    },
+    "continuity": {
+      "messageId": "fc456881-3403-4d24-9108-3c1e0c026a09",
+      "body": "ORCHID-4821-TEAL AUTO_CONTINUITY_OK",
+      "runId": "d741e704-eaef-4dd4-9ae7-19614c666563"
+    },
+    "rounds": [
+      {
+        "label": "baseline",
+        "runId": "e264e562-b463-46fd-9f90-5afb1578c500",
+        "status": "failed",
+        "lastErrorCode": "runtime_missing_final_output",
+        "hostPids": [
+          39863
+        ]
+      },
+      {
+        "label": "baseline",
+        "runId": "2c332db1-7542-4daa-b9cc-0592cb6e2f4e",
+        "status": "succeeded",
+        "lastErrorCode": null,
+        "hostPids": [
+          40301
+        ]
+      },
+      {
+        "label": "padding-1",
+        "runId": "24f12160-f906-46fb-a4f1-47e1cfd1ace2",
+        "status": "succeeded",
+        "lastErrorCode": null,
+        "hostPids": [
+          40301
+        ]
+      },
+      {
+        "label": "padding-2",
+        "runId": "e1369977-c7de-459b-9d6e-bf8e84fbf949",
+        "status": "succeeded",
+        "lastErrorCode": null,
+        "hostPids": [
+          40301
+        ]
+      },
+      {
+        "label": "padding-3",
+        "runId": "fd8be52d-02c4-421a-91ee-7b173e93de9f",
+        "status": "succeeded",
+        "lastErrorCode": null,
+        "hostPids": [
+          40301
+        ]
+      },
+      {
+        "label": "continuity",
+        "runId": "d741e704-eaef-4dd4-9ae7-19614c666563",
+        "status": "succeeded",
+        "lastErrorCode": null,
+        "hostPids": [
+          40301
+        ]
+      }
+    ],
+    "notCovered": [
+      "default-large-window-threshold",
+      "overflow-plus-retry",
+      "compaction-cancellation",
+      "product-compaction-ui"
+    ]
+  },
+  "providerRefresh": {
+    "status": "passed",
+    "providerIdentity": "custom_provider:rovai-auto (unchanged)",
+    "credentialMethod": "synthetic native-facing keys A/B; relays use unchanged authorized upstream credential",
+    "changed": [
+      "baseURL",
+      "apiKey"
+    ],
+    "sameHost": true,
+    "sameNativeSession": true,
+    "warmTurnRequests": [
+      {
+        "label": "B",
+        "path": "/v1/responses/input_tokens",
+        "keyMatched": true
+      },
+      {
+        "label": "B",
+        "path": "/v1/responses/input_tokens",
+        "keyMatched": true
+      },
+      {
+        "label": "B",
+        "path": "/v1/responses",
+        "keyMatched": true
+      }
+    ],
+    "rounds": [
+      {
+        "label": "enabled-baseline",
+        "runId": "ea90ec28-52b0-4faa-a03f-53eb1e760978",
+        "status": "succeeded",
+        "lastErrorCode": null,
+        "hostPids": [
+          42117
+        ]
+      },
+      {
+        "label": "warm-config-change",
+        "runId": "64862b52-d4b0-4c9c-b15f-32615a5fe1bd",
+        "status": "failed",
+        "lastErrorCode": "runtime_missing_final_output",
+        "hostPids": [
+          42117
+        ]
+      },
+      {
+        "label": "cold-config-disabled",
+        "runId": "46704b5f-691a-487f-bd4c-00d295439639",
+        "status": "succeeded",
+        "lastErrorCode": null,
+        "hostPids": [
+          42253
+        ]
+      }
+    ],
+    "notCovered": [
+      "OAuth-account-switch",
+      "active-turn-refresh",
+      "global-default-provider-resets-selected-session-model"
+    ]
+  },
+  "askUser": {
+    "recommendation": "disable-by-default-for-Rovai-managed-use",
+    "productDefaultChanged": false,
+    "officialSwitch": "askUser.enabled=false",
+    "warmSwitch": {
+      "sameHost": true,
+      "sameNativeSession": true,
+      "toolExposedBefore": true,
+      "toolExposedAfter": false
+    },
+    "invocation": {
+      "realModelCalled": true,
+      "runId": "64862b52-d4b0-4c9c-b15f-32615a5fe1bd",
+      "runStatus": "failed",
+      "errorCode": "runtime_missing_final_output",
+      "questionnaireId": "ask_c9d45906d62b25ab0dff4c52",
+      "nativeSessionId": "mvs_8bb3caf6716d41b9a09ed2a1c69f4ac2",
+      "status": "dismissed",
+      "dismissDelayMs": 1,
+      "answered": false,
+      "replyRecorded": false,
+      "injected": false,
+      "coreApprovals": 0
+    },
+    "disabledColdFollowup": {
+      "runId": "46704b5f-691a-487f-bd4c-00d295439639",
+      "status": "succeeded",
+      "toolExposed": false,
+      "sameNativeSession": true
+    }
+  },
+  "attempts": {
+    "initialBaseline": "Public send committed; empty model final caused runtime_missing_final_output; retained as failure",
+    "initialAskCollector": "Harness array-shape bug corrected; original private evidence retained"
+  },
+  "privateEvidenceDigests": {
+    "auto-evidence.private.json": "a171bdf5ecdb74cedc8b12d92eb0b5a17563e617d60a3c06683d449627e9c117",
+    "ask-evidence.private.json": "0b66947a59b99294b4b2b0d6d00dc88b10c01165177a26d4ae983e2a37e93b73",
+    "provider-evidence.private.json": "e0294ec3db193d86cf0106b89a3220dc4911979e151a702322bb440134870e6d",
+    "ask-initial-harness-failure.private.json": "89ec9dd8cfa89791d3ca2ca1dda5cb43cbd8206736cd7a132a9f9e5af3ca5797"
+  }
+}

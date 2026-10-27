@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "64b5278425dadc2169a4c7deabe426ae062d142f",
+  "packageManifestSha256": "07aee6c0088a8113ecdeed46ed148cc16ef8b73e363cb4afc44e532918cb3430",
+  "fullQualification": false,
+  "reports": [
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "zcode-app",
+      "sourceCommit": "64b5278425dadc2169a4c7deabe426ae062d142f",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-zcode-app-5/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-zcode-app-5/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-zcode-app-5/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "e5caa2a8-8df4-473e-816f-c42ceebd9c14",
+          "status": "succeeded",
+          "conversationId": "8a88f417-af4b-4d55-be58-119e7b58909f",
+          "nativeBinding": {
+            "native_session_id": "sess_df5ab3f2-46ef-4aa0-bca5-5ae1cda1cea7",
+            "native_binding_id": "1c179238-f056-4eb6-ad1e-87e52d0974e3",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "a1a4097b-7d34-44c7-a600-478c252464cf",
+          "status": "succeeded",
+          "conversationId": "8a88f417-af4b-4d55-be58-119e7b58909f",
+          "nativeBinding": {
+            "native_session_id": "sess_df5ab3f2-46ef-4aa0-bca5-5ae1cda1cea7",
+            "native_binding_id": "1c179238-f056-4eb6-ad1e-87e52d0974e3",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "7c1dbcdd-23b6-4691-8784-66578ebaa73b",
+          "status": "succeeded",
+          "conversationId": "8a88f417-af4b-4d55-be58-119e7b58909f",
+          "nativeBinding": {
+            "native_session_id": "sess_df5ab3f2-46ef-4aa0-bca5-5ae1cda1cea7",
+            "native_binding_id": "1c179238-f056-4eb6-ad1e-87e52d0974e3",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "9ae401de-a037-44ea-b861-ff2bb52f4c7a",
+          "status": "succeeded",
+          "conversationId": "8a88f417-af4b-4d55-be58-119e7b58909f",
+          "nativeBinding": {
+            "native_session_id": "sess_df5ab3f2-46ef-4aa0-bca5-5ae1cda1cea7",
+            "native_binding_id": "1c179238-f056-4eb6-ad1e-87e52d0974e3",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "0.16.5",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "Write",
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "Read",
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": true,
+        "childReaped": true
+      },
+      "status": "passed",
+      "attempt": "zcode-app-5"
+    }
+  ],
+  "memoryGuards": [
+    {
+      "name": "server-zcode-app-5",
+      "initial": {
+        "availableKiB": 7417856,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 5808276,
+      "peakTestUserRssKiB": 2041524,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1721004032,
+      "cgroupCurrentBytes": 691568640,
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 67.01,
+      "final": {
+        "availableKiB": 7485096,
+        "swapUsedKiB": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "sourceCommit": "7d497e2560df557cf7db43b2723deb0313a08925",
+  "mergedMain": "0bfc35b0dc68d99eeb483f59406e3beca84a2840",
+  "version": "0.2.6",
+  "platform": "darwin",
+  "arch": "arm64",
+  "buildCommand": "CARGO_BUILD_JOBS=2 pnpm package:mac:daily",
+  "buildLog": "/tmp/rovai-recovery-package-20260914.log",
+  "packageSha256": {
+    "Contents/Resources/app.asar": "7d376cef7783e3e46d6208e4d6b38ca4a08c3c680a5cc7e3fbf9248157257d80",
+    "Contents/Resources/bin/rovai-host": "ca7f9693c10113a315c7b207dac74038e6bf5a89ba93f0c3489110448c3ad452",
+    "Contents/Resources/bin/rovai-core": "27f313b5bb93026dc9e89467100805cd6b20de6f4de1485e07f9cb9c95ea6549",
+    "Contents/Resources/bin/rovai": "acabda226432e733dae4e7ac6ddcc05112230d961daea67382aaa411e9d7462b"
+  },
+  "webFileCount": 138,
+  "acceptanceCommand": "node /tmp/rovai-recovery-install-acceptance-20260914.mjs",
+  "acceptanceScriptSha256": "c400fa3e3bd3bd1282a6a91b9dda06c59d5a6d0ad968b9d08fa16863e605943a",
+  "acceptanceLog": "/tmp/rovai-recovery-install-acceptance-20260914-retry.log"
+}

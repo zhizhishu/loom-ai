@@ -1,0 +1,313 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "ae872240f42437d8f581a5e011a0b50981e2a758",
+  "fullQualification": false,
+  "reports": [
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "opencode-cli",
+      "sourceCommit": "ae872240f42437d8f581a5e011a0b50981e2a758",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-opencode-cli-3/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-opencode-cli-3/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-opencode-cli-3/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "c2a2f7ed-b605-4e64-8db0-def90032ffea",
+          "status": "succeeded",
+          "conversationId": "fd193e66-608f-46b2-ac60-b363416baa07",
+          "nativeBinding": {
+            "native_session_id": "ses_f5fc757fcffeI3qgmnTWHsw0Kd",
+            "native_binding_id": "bfbf229f-1d71-4122-9e5c-79e9fb07e694",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "58985eaf-6a8a-437f-a8c4-b36f88642136",
+          "status": "succeeded",
+          "conversationId": "fd193e66-608f-46b2-ac60-b363416baa07",
+          "nativeBinding": {
+            "native_session_id": "ses_f5fc757fcffeI3qgmnTWHsw0Kd",
+            "native_binding_id": "bfbf229f-1d71-4122-9e5c-79e9fb07e694",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "255d8ddf-cad9-4ec8-a50a-fceb35a64974",
+          "status": "succeeded",
+          "conversationId": "fd193e66-608f-46b2-ac60-b363416baa07",
+          "nativeBinding": {
+            "native_session_id": "ses_f5fc757fcffeI3qgmnTWHsw0Kd",
+            "native_binding_id": "bfbf229f-1d71-4122-9e5c-79e9fb07e694",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "81af89be-a007-4f31-9159-90154cee018a",
+          "status": "succeeded",
+          "conversationId": "fd193e66-608f-46b2-ac60-b363416baa07",
+          "nativeBinding": {
+            "native_session_id": "ses_f5fc757fcffeI3qgmnTWHsw0Kd",
+            "native_binding_id": "bfbf229f-1d71-4122-9e5c-79e9fb07e694",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "1.18.30",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": false,
+        "childReaped": true
+      },
+      "status": "passed",
+      "attempt": "opencode-cli-3"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "qoder-cli",
+      "sourceCommit": "ae872240f42437d8f581a5e011a0b50981e2a758",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-qoder-cli-3/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-qoder-cli-3/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-qoder-cli-3/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation",
+        "builtin_cli_public_camp_message",
+        "http_cancel_active_native_tool"
+      ],
+      "runs": [
+        {
+          "id": "41ee1262-76d8-4497-8dca-deb2039d7d94",
+          "status": "succeeded",
+          "conversationId": "f2782a09-203d-4d8d-b979-f72d88a31a50",
+          "nativeBinding": {
+            "native_session_id": "e256a90a-52ac-4e19-8dd0-84a12d40ca2e",
+            "native_binding_id": "5aab8179-503d-4d97-9574-6d41fd5c4678",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "1dff4e5d-d4cd-4773-aa97-2ff4cf902954",
+          "status": "succeeded",
+          "conversationId": "f2782a09-203d-4d8d-b979-f72d88a31a50",
+          "nativeBinding": {
+            "native_session_id": "e256a90a-52ac-4e19-8dd0-84a12d40ca2e",
+            "native_binding_id": "5aab8179-503d-4d97-9574-6d41fd5c4678",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "3e5c98ed-bcf7-4008-8657-d056e1a5559c",
+          "status": "succeeded",
+          "conversationId": "f2782a09-203d-4d8d-b979-f72d88a31a50",
+          "nativeBinding": {
+            "native_session_id": "e256a90a-52ac-4e19-8dd0-84a12d40ca2e",
+            "native_binding_id": "5aab8179-503d-4d97-9574-6d41fd5c4678",
+            "native_binding_generation": 1
+          }
+        },
+        {
+          "id": "31378ffa-37b2-4782-883f-e4dedd7f2779",
+          "status": "succeeded",
+          "conversationId": "f2782a09-203d-4d8d-b979-f72d88a31a50",
+          "nativeBinding": {
+            "native_session_id": "e256a90a-52ac-4e19-8dd0-84a12d40ca2e",
+            "native_binding_id": "5aab8179-503d-4d97-9574-6d41fd5c4678",
+            "native_binding_generation": 1
+          }
+        }
+      ],
+      "runtimeVersion": "1.1.51",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": null,
+          "outcome": "succeeded"
+        }
+      ],
+      "cancellation": {
+        "nativeToolObserved": true,
+        "childProcessObserved": true,
+        "commandInputProjected": true,
+        "childReaped": true
+      },
+      "status": "passed",
+      "attempt": "qoder-cli-3"
+    },
+    {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "antigravity-app",
+      "sourceCommit": "ae872240f42437d8f581a5e011a0b50981e2a758",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-antigravity-app-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-antigravity-app-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-antigravity-app-2/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions"
+      ],
+      "runs": [],
+      "runtimeVersion": "1.2.2",
+      "admission": null,
+      "status": "failed",
+      "error": "Runtime run failed: see private fixture",
+      "failure": {
+        "code": "runtime_terminal_failure",
+        "detail": "Your current account is not eligible for Gemini Code Assist for individuals because it is not currently available in your location.",
+        "origin": "runtime",
+        "phase": "terminal",
+        "retryable": true,
+        "runtimeKind": "antigravity-app",
+        "summary": "Antigravity 返回了失败结果"
+      },
+      "attempt": "antigravity-app-2"
+    }
+  ],
+  "memoryGuards": [
+    {
+      "name": "server-opencode-cli-3",
+      "initial": {
+        "availableKiB": 7495904,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 6090844,
+      "peakTestUserRssKiB": 1797796,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1515311104,
+      "cgroupCurrentBytes": 1454186496,
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 71.94,
+      "final": {
+        "availableKiB": 7438140,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-qoder-cli-3",
+      "initial": {
+        "availableKiB": 7486936,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 5917840,
+      "peakTestUserRssKiB": 1992144,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 1702301696,
+      "cgroupCurrentBytes": 1650163712,
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 109.28,
+      "final": {
+        "availableKiB": 7517360,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "server-antigravity-app-2",
+      "initial": {
+        "availableKiB": 7519308,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 7300900,
+      "peakTestUserRssKiB": 556340,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "initialCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "finalCgroupEvents": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "cgroupPeakBytes": 261992448,
+      "cgroupCurrentBytes": 87465984,
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 9.56,
+      "final": {
+        "availableKiB": 7417508,
+        "swapUsedKiB": 0
+      }
+    }
+  ]
+}

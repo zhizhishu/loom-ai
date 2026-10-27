@@ -1,0 +1,77 @@
+---
+document_type: runtime-research
+runtime: pi
+upstream: earendil-works/pi
+authority: research-evidence-only
+status: implementation-evidence
+last_updated: 2026-09-07
+---
+
+# Pi Runtime 重新接入 Parity Matrix
+
+本矩阵记录重新接入后的实现与证据边界。v1.44 原生普通 Prompt 收敛的 implementation baseline 为
+`main@81d209eab733ecd520ab016440609c1886788a24`；其前置 revision 3 baseline 为
+`main@72ecbce9f4892433727d01e348da9a56c5926863`。旧实现只读取
+`codex/pi-runtime-integration@3e04b4f3b2555bb488e1df37f306beaae52a8894` 的 Pi 专属协议与安全证据，
+不 merge、rebase 或 cherry-pick。上游源码证据来自
+`@earendil-works/pi-coding-agent@0.84.4` 的发布包；真实行为 smoke 使用一次性安装的 0.84.4 和隔离
+`PI_CODING_AGENT_DIR`，没有把 PATH 上的 0.84.2 结果外推到 0.84.4 或其他平台。
+
+状态词遵循 [Runtime 接入 Checklist](../development/runtime-integration-checklist.md)：只有
+`Verified + Implemented` 或“可靠证明上游 Unsupported 且由当前版本接受差异”才能通过。deterministic fixture 只证明
+Core parser、fence 和状态机，不替代目标版本真实 Runtime smoke。下表最后一列冻结 2026-09-03 Preview 阶段的
+补强清单；维护者随后确认三个目标平台的验收均已完成并批准发布，2026-09-05 的精确平台 artifact 与
+[V1.49-D02](../versions/v1.49/decisions.md#v1-49-d02)已把三行晋升为 `qualified`。尚列出的项目继续作为回归和能力
+增强清单，不被改写成这次提交重新跑出的证据。
+
+| 核心能力轴 | 当前 main 的标准 | 旧 Pi 分支做法 | Pi 0.84.4 真实能力 | 本次实现 | Preview 阶段补强清单 |
+| --- | --- | --- | --- | --- | --- |
+| Auth / Provider / Model | 使用目标 Runtime 原生 auth/provider/default；真实 catalog；显式模型启动后核对；secret 不持久化或公开；drift 精确 fence | 最终 revision 改为继承用户 Pi 原生 Home，通过 `get_available_models`、`set_model`、`get_state` 管理；早期 Claude/MiniMax overlay 已被决定替代 | 原生 OAuth、subscription、API key 与 `models.json`；RPC 提供完整 model catalog、显式 set 和当前 state | 正式 Host 只使用 Pi 官方配置；runtime-default 不发送 sentinel；显式 provider/model 逐 Session set+readback；provider/model/installation identity 进入 binding fence。0.84.4 官方配置的 MiniMax M3 直接请求与所有本机 Pi smoke 成功；secret 未进入仓库/trace | 真实显式 model override、运行中 auth/provider/model drift 后的 Host/Session fence 尚未跑完整矩阵 |
+| Host / Fleet / LRU | 明确 Host 策略；可驻留 Runtime 进入统一 Fleet；只复用 healthy、idle、process-compatible Host；失败/取消/漂移停止；统一 shutdown/reap | 独立 Pi JSONL Host 接入 Fleet；后期采用 workspace/process resident、多 Session 串行切换；旧接口落后当前 planned shutdown protocol 3 | RPC 进程可长期驻留；`new_session`、exact `switch_session` 会 teardown/rebind Session runtime；`get_state` 暴露 idle/queue 状态 | `resident_multi_session`；公共 Fleet 以计入容量的 Starting reservation 短锁 Reserve、锁外 Spawn、短锁 Commit，同 Run 等待同一 completion，不同 Run/Runtime 并发。复用 identity 为 canonical workspace + process digest，当前 Camp/member invalidation scope 随领取更新；shutdown/删除先退役 in-flight start，MCP Assignment 不进入 compatibility 或 LRU | idle TTL/capacity eviction、packaged App shutdown 与 Core crash recovery 尚未取得真实进程树证据；macOS x64/Windows 尚未验证 |
+| Native Session / Continuation | Conversation 稳定绑定 Native Session；warm、Host restart、Core restart 都 exact；恢复失败 continuity lost 且最多一个 replacement；禁止 recent/partial/fuzzy | 保存 full UUID 与 canonical session file；实际 `switch_session(exact file)` 后 `get_state` 核对；完整 locator 仅 Core 私有；Probe 使用独立 session dir | `get_state` 返回 full `sessionId`/`sessionFile`；`switch_session(sessionPath)` 精确加载；Session JSONL 原生持久 | 接入 `New / Compatible / Controlled` 并把 activation 分成 `ResumeContinuityLost / ActivationFailed / HostFailed / ConfigurationFailed`；只有 locator/文件/identity/cwd 或明确 switch target 不可用才 replacement，其他错误直接返回。真实 cold/warm/A→B→A 证据与公开 locator 隐私不变 | 错 locator后的单 replacement 仍是 deterministic coverage；macOS x64/Windows 尚无真实 continuation |
+| Bootstrap / Context | Session Charter/Identity/Memory 位于 system/developer 等价高权限层；每 Prompt 绑定冻结 Manifest、Bootstrap、membership、attachments、Skills、delivery、epoch、binding | managed extension 在 `before_agent_start` 追加 `managed_system_prompt`；旧 V1 receipt 试图证明完整 base/effective prompt、Skills 与 native Tools | 官方 `before_agent_start` 可读取 chained system prompt 与结构化 prompt options，并返回替换后的 system prompt；后加载 extension 仍可继续修改 | v7 在自身 hook 位置每轮读取当前 binding 并追加 exact Bootstrap；只校验基本 shape/digest，失败诊断后允许原生执行。Formatter 22 payload 逐字节成为 `prompt.message`；不提交 Receipt，也不声明后续 extension 未改写 provider payload | 后加载 extension mutation、Bootstrap 读取失败和 replacement Session 的完整真实 Golden Flow 尚未完成 |
+| Compaction | 明确三选一策略；manual、threshold、overflow+retry、失败/cancel、compact 后 cold resume 都保持 Bootstrap/Skill/permission | 选择 `native_system_prompt_preserved` 候选，但旧分支未完成 Golden Flow，保持 Disabled | RPC 有 `compact`、`compaction_start/end`、`session_compact_failed` 与 retry；Pi 的 system prompt 独立于被压缩 message history | 选择 `native_system_prompt_preserved`；不走 first-payload redelivery；下一 Prompt 由同一 v7 hook 重新读取 binding 并追加 Bootstrap，生命周期 parser/fence 已实现 | manual、threshold、overflow+retry、失败/cancel、compact 后 cold exact resume 的 0.84.4 真实矩阵全部尚未完成，因此此轴仍阻止 First-Class 准入 |
+| Skills / Context / Templates | 复用 Skill Library 与 delivery group，同时不覆盖 Runtime 自有资源；资源调用入口必须真实可用 | `pi -> .pi/skills` 曾作为唯一 Skill 来源，完整 catalog 写入 V1 receipt；原生 Context/Templates/Extensions 被启动参数关闭 | Pi 原生发现用户/项目 Skills、Context files、Prompt templates 与 Extensions；`get_commands` 可返回 prompt/skill/extension command 来源 | 正式启动恢复 Pi 原生资源；Rovai 只把 frozen Skill 写入 workspace `.pi/skills`，不通过 extension 追加 path、不读取 `get_commands`、不验证完整 catalog。2026-09-07 的 Pi 0.84.4 macOS arm64 真实 smoke 调用私有随机标记 Skill，并覆盖更新、禁用/恢复、取消分配/恢复、重启、同名 shadow、相邻 Session 无泄漏与硬删除不可见；因此 managed Skill discovery 为 `Verified + Implemented`。Rovai `/...` 一律作为普通文本，不读取或展开 Skill/Prompt/Extension command | 完整 native catalog attestation、原生多资源组合、后加载 extension mutation、compaction 后 catalog 连续性及 macOS x64/Windows 仍需完整真实矩阵；这些缺口不降低已实测的 managed `.pi/skills` delivery group |
+| External MCP | Runtime 可以明确接受 `Unsupported` 差异；此时不得形成 projection 或隐式依赖 | 旧分支曾实现 Pi 专用 Core bridge，现已整体删除 | Pi 核心没有原生 MCP；官方 Extension 的通用 Tool API 不等于产品必须自建 transport | `Unsupported`；Pi dispatch 在 MCP preparation 前分流，静默忽略保存的 Assignment，不读配置、不启动 Server、不转换/调用 MCP Tool，且 MCP 不参与 compatibility、LRU 或 exact resume；Assignment/UI/其他 Runtime 不变 | 当前版本明确接受差异，不作为 Pi 平台资格缺口 |
+| Tool / Action / Command Output | 稳定 native ID；唯一 started→terminal；重放/累计不重复；六类 command output；command 必须进入 Action payload；未知 shape 不猜 | managed extension 报告 Tool；Core bridge approval；旧 bash 曾硬编码 `/bin/zsh -lc` | `tool_execution_start/update/end` 带稳定 `toolCallId`；update 累计、end 权威；Pi shell backend 由用户/平台配置 | 所有 Tool 按 Pi 原生语义执行，Rovai 不解析 shell 或拦截 input；Core 继续从原生结构化 events 形成唯一 Action lifecycle。历史真实 Bash/output/allow-deny smoke 只保留为 wire 证据，不再宣称当前 Approval；大输出 public preview 与完整 Blob 路径不变 | 真实 cumulative/replayed wire 故障注入、未知 Extension Tool 组合及 macOS x64/Windows 尚未完成 |
+| Narration / Final / Missing-Send | thinking/debug 私有；明确权威 final；stream/snapshot 去重；zero-send、accepted suppression、tool→final；无可靠 final 不启用恢复 | `message_end` 保存 assistant snapshot；只认 `agent_settled` 成功；旧分支 tool→final 不完整 | 0.84.4 的 `agent_settled` 表示 retry、compaction retry、queue 全部收敛；`message_end.message` 是完整 assistant snapshot | delta 只作 live narration，terminal snapshot 去重；唯一 authenticated `agent_settled` 才成功。真实 Pi zero-send、accepted-send suppression 与原生 Read tool→final 三条专项 flow 已通过，Bash matrix 另证实多 Tool 后 final | retry/compaction/queued follow-up/cancel 下 settled 唯一性仍主要为 deterministic evidence；需纳入完整 Golden Flow |
+| Permission / Approval / Workspace | 权限声明必须与实际覆盖面一致；不能把部分拦截包装成 sandbox 或完整治理 | Pi `managed` 曾固定完整 native tool 集并阻止未知 mutation | 上游无 sandbox、无 permission popup；Extension `tool_call` 可执行前 block，但后加载 handler 可继续改写；Tool 使用 Pi 进程 OS 权限 | Pi 明确无 Rovai Approval/sandbox/permission option；profile 与非终态 Run 的 schema value 为 `{}`，执行时忽略，compatibility digest 不含 approval。`--approve` 只信任本次项目资源，全部 Tool 使用 Pi 进程原生权限 | read-only/attachment/temp/workspace escape 及 Windows/macOS x64 仍无完整真实安全矩阵；这些是原生 Pi 风险披露，不被伪装为 Rovai enforcement |
+| Built-in `rovai` CLI | 当前 bundled CLI、operation catalog、Charter 与 per-Run lease；真实正式 operation smoke | 通过受管 Bash 与 Fleet builtin process config；旧 smoke 曾受 provider 并发预算中断 | Pi 可通过原生 shell Tool 调用 bundled CLI；无 Pi 专有 Built-in transport | 复用当前 Built-in Tool Runtime/lease/env；真实 0.84.4 完成当前 15-operation full Run 和 resumed/new-lease Run，覆盖三种输入、Gather、exact successor read、conflict 与 lease fencing；Pi shell 本身不经过 Rovai Approval | 另外两个平台及 packaged shutdown 未验证；本机能力本身已是 `Verified + Implemented` |
+| Usage / Cache / Cost | 有结构化 usage 就实现；字段保留 source/scope/counter/input semantics/session/turn；baseline/dedupe；未知保持 NULL；不推价格 | 旧分支因未完成归因而 Disabled | `message_end.message.usage` 是该 assistant response 的权威 usage；字段含 input/output/cacheRead/cacheWrite 与 provider cost；session stats 是全 Session total | 仅 terminal assistant `message_end.message.usage` 形成 `model_call/delta/exclusive_buckets`，按 session+prompt+message digest 去重；session stats/update 不计量。真实 MiniMax Monitoring 观察到 input/output；未知 cache/reasoning/cost 保持 NULL | cache read/write 非零语义、provider cost、retry/compaction/cold resume 去重的真实计量矩阵尚未完成；不消费未证明的 ToolResult/compaction nested usage |
+| Prompt / Images / Queue / Cleanup | accepted 使用 native evidence；图片必须绑定当前授权输入；queue/retry/late event fenced；业务 cancelled 先提交；host quiescent 才进 LRU | 只发送纯文本 prompt；prompt response + V1 receipt 作为 accepted；abort+Fleet stop | RPC 原生支持 `prompt.images`、steer/follow-up/clear_queue、modes、messages/entries、stats/name、compact、auto-compaction 与 export | Formatter 22 payload 不变地发送；图片只从 ContextManifest refs/授权取得，按原顺序发送 exact base64 bytes，模型能力、MIME/digest/size 漂移在 prompt 前失败，每项 schema-2 evidence 直接绑定 Delivery。Prompt response 不接受 Delivery；首个 owner-fenced `agent_start` 原子接受并幂等发布 started。cancel/late fence 和 planned shutdown 保留 | steer/follow-up 产品 ingress、真实 queue/retry late event、compaction/export 授权、crash/invalid JSON/timeout、idle eviction、packaged shutdown 与 Core crash recovery尚未完成 |
+| Ready / Version / Platform | availability、authenticated Ready、capability、platform qualification 分离；专属 immutable evidence；每 shipped platform独立 Golden Flow | 旧分支有 deep probe/validator，但曾提前把 macOS arm64 qualified；后加 exact switch 与独立 session dir | `--version`、RPC state/catalog/extension handshake 可证明 machine ready，但不能自动证明行为资格 | Pi 专属 deep probe 已在本机 0.84.4 真实通过；维护者确认三平台目标主机验收完成后，macOS arm64、macOS x64 与 Windows x64 分别绑定 `macos-arm64-pi-v1`、`macos-x64-pi-v1`、`windows-x64-pi-v1` immutable evidence 并晋升为 `qualified`。缺安装由统一 Availability 报告 missing，`runtime.pi` 只覆盖私有初始化；Fast 仍 hidden | 未来平台或不兼容 Pi 版本必须重新取得独立 artifact；本次晋升不把一个平台结果外推给另一个平台，也不撤销普通 Machine Ready 与 Dispatch 门禁 |
+
+## 实施结论
+
+- Host 策略固定为 `resident_multi_session`，但同一 Host 任一时刻只允许一个 Active Prompt；并发必须取得另一 Host。
+- 统一 Fleet 默认保留 Camp/member-scoped identity；Pi 的显式例外使用 canonical workspace + process digest 复用，当前
+  独占 lease 的 Camp/member invalidation scope 随领取更新。可动态刷新的 Session、Prompt、model、Bootstrap、Skill与
+  Built-in lease 不进入 process compatibility digest；MCP Assignment 完全不参与 Pi compatibility。
+- Pi 是独立 `pi-jsonl-rpc` transport，不进入 ACP storage/init，也不继承 ACP capability 或平台资格。
+- Pi 未安装或不在 Runtime search environment 时由统一 Availability 报告 missing，不降级 `runtime.pi`；Core 与其他
+  optional subsystem 正常启动。Pi 自有私有存储初始化失败仍只降级 `runtime.pi`。
+- External MCP 固定为 `Unsupported`；Pi 静默忽略 Assignment，Core 不为 Pi 建立 transport 或 Tool bridge。
+- 正式 Pi 以本次进程 `--approve` 信任项目并恢复原生 Built-in tools、Extensions、Skills、Context files 与 Prompt
+  templates；v7 extension 只上报 Session 状态并逐轮注入 Bootstrap，不再审批 Tool、提交 Receipt 或发现 catalog。
+- Prompt response 只结束 RPC command；首个精确匹配的 `agent_start` 才接受 Delivery 并发布一次 started。历史 Receipt
+  表与行保留，但新 Run、Host health、reuse 与 resume 都不再读取。
+- Rovai 不模拟 Pi TUI：不读取 `get_commands`，不解析 `/...`，Formatter 22 payload 原样成为 `prompt.message`；
+  图片只从结构化 ContextManifest refs 生成并直接绑定 Delivery evidence。
+- Compaction 使用 `native_system_prompt_preserved`，不把高权限 Bootstrap 降格为普通 first payload。
+- Pi 0.84.4 已有可归因的 model-call Usage，因此不允许继续把整个 Usage 轴标为 Disabled。
+- Prompt images 通过原生 RPC 与当前附件授权接入；Web Search 与 Fast 在没有 Pi 专属结构化事件/资格前明确 Unsupported，
+  不从正文、路径、MCP 名或普通 query 推断。
+- 平台资格和实现完成分开：Pi 当前三个 shipped platform 各自绑定 immutable evidence 并为 `qualified`；未来没有
+  精确平台 evidence 的行仍不得从现有平台外推，最多按当时的当前版本决定进入 `preview`。
+
+当前产品结论是 Pi 在 macOS arm64、macOS x64 与 Windows x64 均为 platform `qualified`。本矩阵继续保留晋升前的
+补强项与已接受差异，用于后续回归和能力增强；本次发布确认不会把未在提交内重跑的私有目标主机流程描述成新证据，
+也不会把 qualified 平台行解释为新增 External MCP、Web Search、Fast、Approval 或 sandbox 能力。
+
+## 上游证据入口
+
+- [Pi RPC mode](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
+- [Pi extensions](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)
+- [Pi security model](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/security.md)
+- [Pi skills](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)
+- [Pi compaction](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/compaction.md)

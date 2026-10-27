@@ -1,0 +1,270 @@
+{
+  "simulation": true,
+  "realHost": false,
+  "styleSource": "production SettingsSidebarNavigation, SettingsPageHeader, GeneralSettings, AppearanceSettings and theme.css",
+  "views": [
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "state": "enabled",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(243, 244, 244)",
+        "canvas": "rgb(255, 255, 255)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "state": "off",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(243, 244, 244)",
+        "canvas": "rgb(255, 255, 255)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "state": "error",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(243, 244, 244)",
+        "canvas": "rgb(255, 255, 255)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "state": "loading",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(243, 244, 244)",
+        "canvas": "rgb(255, 255, 255)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "state": "enabled",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(243, 244, 244)",
+        "canvas": "rgb(255, 255, 255)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "state": "offline",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(243, 244, 244)",
+        "canvas": "rgb(255, 255, 255)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "state": "expired",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(243, 244, 244)",
+        "canvas": "rgb(255, 255, 255)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "state": "enabled",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(17, 22, 26)",
+        "canvas": "rgb(24, 29, 33)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "state": "off",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(17, 22, 26)",
+        "canvas": "rgb(24, 29, 33)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "state": "error",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(17, 22, 26)",
+        "canvas": "rgb(24, 29, 33)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "state": "loading",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(17, 22, 26)",
+        "canvas": "rgb(24, 29, 33)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "state": "enabled",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(17, 22, 26)",
+        "canvas": "rgb(24, 29, 33)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "state": "offline",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(17, 22, 26)",
+        "canvas": "rgb(24, 29, 33)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "state": "expired",
+      "geometry": {
+        "rail": 270,
+        "top": 50,
+        "titleSize": "24px",
+        "titleWeight": "620",
+        "titleX": 409,
+        "titleY": 32,
+        "railColor": "rgb(17, 22, 26)",
+        "canvas": "rgb(24, 29, 33)",
+        "overflow": false,
+        "nativeBridge": "undefined"
+      }
+    }
+  ],
+  "checks": [
+    "icon-copy-success-without-page-notice-and-resets",
+    "token-show-hide-copy-only-icon-controls",
+    "field-validation-focus-and-edit-retention",
+    "one-switch-start-with-cleartext-notice",
+    "submitting-disables-repeat",
+    "token-masked-and-readable-after-navigation",
+    "interface-selection-preserves-token",
+    "token-readable-before-start-and-after-stop-and-navigation",
+    "stop-without-confirmation",
+    "pending-port-survives-navigation-and-applies-only-on-next-start",
+    "QR-decodes-to-selected-address-only-in-both-themes",
+    "QR-Escape-restores-focus",
+    "empty-discovery-disables-copy-and-QR",
+    "copy-failure-allows-manual-address-copy-without-exposing-token",
+    "compact-switch-without-duplicate-headings-or-start-success-notice",
+    "browser-relogin-form-without-host-administration",
+    "1040x700-and-2560x1440",
+    "720x460-layout-equivalent-to-200-percent-of-1440x920",
+    "reduced-motion"
+  ],
+  "artifactSha256": {
+    "product": "a602b3fce7acdd2ed31c76a1622618e238b6d351797032e621c454bee6263531",
+    "viewer": "bddcb79728d13f3e5e74fb98d3e4991ff0fc0eb52f41336e673b6574e20675ea"
+  }
+}

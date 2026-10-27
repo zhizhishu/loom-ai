@@ -1,0 +1,177 @@
+import { mkdtemp, mkdir, readFile, rm, writeFile, copyFile, access, symlink } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+import { expect, it } from 'vitest'
+import type { AutomationView, CoreMethod } from '@contracts'
+import { EvaluationHostService } from './evaluation-host'
+import { digest } from '../../../../packages/evaluation/src/daily'
+
+// These integration tests hash the real Node executable and launch real workers.
+// Use the same 20s budget for setup, terminal observation and process cleanup.
+// Synthetic worker result: proves Host ownership/lifecycle only, never Agent quality.
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), 'rovai-evaluation-host-test-')), source = join(root, 'source'), workspace = join(root, 'workspace')
+  for (const path of ['scripts/lib', 'packages/evaluation', 'docs/contracts/schemas', 'docs/versions/v0.34/schemas', 'docs/versions/v0.36/schemas']) await mkdir(join(source, path), { recursive: true })
+  await mkdir(workspace)
+  await writeFile(join(source, 'package.json'), JSON.stringify({ name: 'rovai-ai', type: 'module' }))
+  await writeFile(join(source, 'pnpm-lock.yaml'), 'fixture: true')
+  await copyFile(resolve('scripts/eval-host.mjs'), join(source, 'scripts/eval-host.mjs'))
+  await copyFile(resolve('scripts/eval-wait.mjs'), join(source, 'scripts/eval-wait.mjs'))
+  await copyFile(resolve('scripts/lib/windows-process-table.mjs'), join(source, 'scripts/lib/windows-process-table.mjs'))
+  await copyFile(resolve('scripts/lib/eval-host-build-path.mjs'), join(source, 'scripts/lib/eval-host-build-path.mjs'))
+  await writeFile(join(source, 'scripts/lib/context-weekly.mjs'), "export { runPlan as runWeekly } from './context-evaluation.mjs'\n")
+  await writeFile(join(source, 'scripts/lib/context-evaluation.mjs'), `
+import {mkdir, readFile, writeFile} from 'node:fs/promises';
+import {spawn} from 'node:child_process';
+export async function validatePlanInputs() {}
+export async function buildProduct(source, directory) { await mkdir(directory); await writeFile(directory+'/product.json','{}'); return {core:directory+'/core'}; }
+export async function freezePlan(config, output) { await writeFile(output, JSON.stringify({...config,planDigest:'fixture-plan'})); }
+export async function runPlan(planFile, directory) {
+  const plan = JSON.parse(await readFile(planFile, 'utf8'));
+  await mkdir(directory, {recursive:true});
+  if(plan.pause) {
+    const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {detached:true, stdio:'ignore'});
+    await writeFile(directory+'/fixture-child.pid', String(child.pid));
+    await new Promise(resolve => child.on('exit', resolve));
+  }
+  await writeFile(directory+'/report.json', JSON.stringify({fixture:true, status:'insufficient'}));
+  return {directory, report:{status:'insufficient', planDigest:plan.planDigest}};
+}
+`)
+  let automation = { automationId: 'automation-1', version: 1, enabled: true, schedule: { kind: 'once' }, projectRef: { kind: 'directory', path: workspace } } as AutomationView
+  let timeoutSeconds: number | null = 3600
+  let runs: unknown[] = []
+  const calls: string[] = []
+  const service = new EvaluationHostService(join(root, 'owner'), { async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
+    calls.push(method)
+    if (method === 'automations.get') return automation as T
+    if (method === 'automations.configureTimeLimit') {
+      const command = (params as { command: { expectedVersion: number; timeoutSeconds: number | null } }).command
+      expect(command.expectedVersion).toBe(automation.version)
+      if (timeoutSeconds !== command.timeoutSeconds) {
+        timeoutSeconds = command.timeoutSeconds
+        automation = { ...automation, version: automation.version + 1 }
+      }
+      return { status: 'applied', payload: { automationVersion: automation.version, timeoutSeconds: command.timeoutSeconds } } as T
+    }
+    if (method === 'automations.runs.list') {
+      const limit = (params as { limit: number }).limit
+      if (limit < 1 || limit > 50) throw new Error('Automation history limit must be between 1 and 50')
+      return { runs, truncated: false, nextCursor: null } as T
+    }
+    throw new Error('Unexpected Core request')
+  } })
+  async function plan(mode = 'weekly', extra = {}) {
+    const payload = { schemaVersion: 1, mode, budget: { wallSeconds: 60 }, products: { candidate: { repository: source } }, suite: { path: 'fixture-suite' }, ...extra }
+    const path = join(root, `${mode}-${Math.random()}.json`)
+    await writeFile(path, JSON.stringify({ ...payload, planDigest: digest(payload) }))
+    return path
+  }
+  return { root, source, workspace, service, calls, plan,
+    setRuns(value: unknown[]) { runs = value }, disable() { automation = { ...automation, enabled: false, version: automation.version + 1 } },
+    consumeOnce() { automation = { ...automation, enabled: false } },
+    async close() { await service.stop(); await rm(root, { recursive: true, force: true }) } }
+}
+
+async function processHasLiveExecution(pid: number): Promise<boolean> {
+  try { process.kill(pid, 0) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
+    throw error
+  }
+  // An orphaned process may remain as a zombie until the CI host reaps it.
+  // It has exited and can no longer execute, although kill(pid, 0) succeeds.
+  if (process.platform === 'linux') {
+    const stat = await readFile(`/proc/${pid}/stat`, 'utf8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null
+      throw error
+    })
+    if (stat === null) return false
+    if (/^\d+ \(.+\) [ZX] /.test(stat)) return false
+  }
+  return true
+}
+
+it('does no Core queries or writes until configured; freezes installation and manual job identity independently of Gate verdict', async () => {
+  const f = await fixture()
+  try {
+    await f.service.tick()
+    expect(f.calls).toEqual([])
+    await expect(access(join(f.root, 'owner'))).rejects.toThrow()
+    await f.service.configure({ source: f.source, node: process.execPath })
+    const params = { jobId: 'manual-1', plan: await f.plan('gate'), output: join(f.workspace, 'manual') }
+    await expect(f.service.start({ ...params, command: 'arbitrary' }, 'gate')).rejects.toThrow('Unsupported')
+    await f.service.start(params, 'gate')
+    await expect.poll(async () => (await f.service.status({ jobId: params.jobId }) as { state: string }).state).toBe('completed')
+    const result = await f.service.status({ jobId: params.jobId }) as { reportStatus: string }
+    expect(result.reportStatus).toBe('insufficient')
+    expect(await f.service.start(params, 'gate')).toEqual(await f.service.status({ jobId: params.jobId }))
+    await expect(f.service.start({ ...params, output: join(f.workspace, 'other') }, 'gate')).rejects.toThrow('reused')
+    await writeFile(join(f.source, 'scripts/lib/context-evaluation.mjs'), '// changed')
+    await expect(f.service.start({ ...params, jobId: 'manual-2' }, 'gate')).rejects.toThrow('installation changed')
+  } finally { await f.close() }
+}, 20000)
+
+it('binds an existing Automation and consumes each accepted run once, exposing only the matching Thread receipt', async () => {
+  const f = await fixture()
+  try {
+    await f.service.configure({ source: f.source, node: process.execPath })
+    const plan = await f.plan('weekly', { budget: { wallSeconds: null }, execution: { judgeSeconds: null } }), output = join(f.workspace, 'reports')
+    await expect(f.service.schedule({ automationId: 'automation-1', plan, output: join(f.root, 'outside') })).rejects.toThrow('inside')
+    const binding = await f.service.schedule({ automationId: 'automation-1', plan, output })
+    expect(binding.timeoutSeconds).toBeNull()
+    expect(binding.automationVersion).toBe(2)
+    expect(f.calls).toContain('automations.configureTimeLimit')
+    const now = new Date(Date.now() + 1000)
+    f.setRuns([{ runId: 'auto-run-1', threadId: 'camp-1', status: 'running', createdAt: now.toISOString() }])
+    f.consumeOnce() // Core consumes once schedules without an owner version change.
+    await f.service.tick(now)
+    await expect.poll(async () => (await f.service.status({ jobId: 'auto-run-1' }) as { state: string }).state).toBe('completed')
+    await f.service.tick(new Date(now.getTime() + 6000))
+    const receipt = JSON.parse(await readFile(join(output, 'automation/camp-1.json'), 'utf8'))
+    expect(receipt).toMatchObject({ jobId: 'auto-run-1', threadId: 'camp-1', state: 'completed', reportStatus: 'insufficient' })
+    expect(receipt).not.toHaveProperty('engine')
+    await expect(access(join(output, 'automation/camp-2.json'))).rejects.toThrow()
+    await expect(f.service.schedule({ automationId: 'automation-1', plan: await f.plan('weekly', { budget: { wallSeconds: 3000 } }), output })).rejects.toThrow('2700')
+    const outside = join(f.root, 'external'); await mkdir(outside)
+    await symlink(outside, join(f.workspace, 'escape'))
+    await expect(f.service.schedule({ automationId: 'automation-1', plan, output: join(f.workspace, 'escape/reports') })).rejects.toThrow('inside')
+  } finally { await f.close() }
+}, 20000)
+
+it.each(['cancel', 'stop'] as const)('stops the actual worker and its detached descendant on %s, retaining an interrupted attempt', async (operation) => {
+  const f = await fixture()
+  try {
+    await f.service.configure({ source: f.source, node: process.execPath })
+    const output = join(f.workspace, 'long')
+    await f.service.start({ jobId: 'cancel-1', plan: await f.plan('weekly', { pause: true, budget: { wallSeconds: null }, execution: { judgeSeconds: null } }), output }, 'weekly')
+    await expect.poll(async () => readFile(join(output, 'fixture-child.pid'), 'utf8').catch(() => null)).not.toBeNull()
+    const pid = Number(await readFile(join(output, 'fixture-child.pid'), 'utf8'))
+    if (operation === 'cancel') await f.service.cancel({ jobId: 'cancel-1' })
+    else await f.service.stop()
+    await expect.poll(async () => (await f.service.status({ jobId: 'cancel-1' }) as { state: string }).state, { timeout: 15000 }).toBe('interrupted')
+    await expect.poll(() => processHasLiveExecution(pid), { timeout: 5000 }).toBe(false)
+    expect(await f.service.status({ jobId: 'cancel-1' })).toMatchObject({ reason: operation === 'cancel' ? 'cancelled_by_owner' : 'app_shutdown', reportStatus: null })
+  } finally { await f.close() }
+}, 20000)
+
+it('publishes configuration drift as a terminal failure and never relaunches a job after App restart', async () => {
+  const f = await fixture()
+  try {
+    await f.service.configure({ source: f.source, node: process.execPath })
+    const output = join(f.workspace, 'reports')
+    await f.service.schedule({ automationId: 'automation-1', plan: await f.plan(), output })
+    await writeFile(join(f.source, 'scripts/eval-wait.mjs'), '// changed')
+    const now = new Date(Date.now() + 1000)
+    f.setRuns([{ runId: 'drift-1', threadId: 'camp-drift', status: 'running', createdAt: now.toISOString() }])
+    await f.service.tick(now)
+    expect(await f.service.status({ jobId: 'drift-1' })).toMatchObject({ state: 'failed', reportStatus: null })
+    const jobFile = join(f.root, 'owner/evaluation/jobs/drift-1/job.json')
+    const job = JSON.parse(await readFile(jobFile, 'utf8'))
+    await writeFile(jobFile, JSON.stringify({ ...job, state: 'running' }))
+    const restarted = new EvaluationHostService(join(f.root, 'owner'), { async request<T>(): Promise<T> { return null as T } })
+    await restarted.tick(now)
+    expect(await restarted.status({ jobId: 'drift-1' })).toMatchObject({ state: 'interrupted', reason: 'app_restarted' })
+    await restarted.stop()
+  } finally { await f.close() }
+}, 20000)

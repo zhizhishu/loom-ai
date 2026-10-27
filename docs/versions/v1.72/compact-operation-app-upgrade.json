@@ -1,0 +1,98 @@
+{
+  "ok": true,
+  "fixtureSchema": 149,
+  "candidateSchema": 153,
+  "oldBodyDigest": "7de957107018c3d73c46deacee0b3d84e50626fe13531a9c17556b1aa77cbfe6",
+  "evidence": [
+    {
+      "stage": "startup",
+      "ms": 1113.456458,
+      "schema": 153
+    },
+    {
+      "stage": "file-preview",
+      "runId": "preview-run",
+      "path": "src/probe-1-0.ts",
+      "displayPath": "src/probe-1-0.ts"
+    },
+    {
+      "stage": "old-history",
+      "rows": 512,
+      "pages": [
+        12,
+        12
+      ],
+      "groupCount": 512
+    },
+    {
+      "stage": "output-budget",
+      "savedOutputBytes": 7680,
+      "clippedSuffixFilesChecked": 614,
+      "clippedSuffixFound": false
+    },
+    {
+      "stage": "file-preview",
+      "runId": "beab9f42-3e55-44c9-9d25-5cff229826cd",
+      "path": "new-storage-file.txt",
+      "displayPath": "new-storage-file.txt"
+    },
+    {
+      "stage": "file-preview",
+      "runId": "preview-run",
+      "path": "src/probe-1-0.ts",
+      "displayPath": "src/probe-1-0.ts"
+    },
+    {
+      "stage": "old-history",
+      "rows": 512,
+      "pages": [
+        12,
+        12
+      ],
+      "groupCount": 512
+    },
+    {
+      "stage": "new-write",
+      "runId": "beab9f42-3e55-44c9-9d25-5cff229826cd",
+      "operations": 2,
+      "activityCopies": 0,
+      "directoryCopies": 0,
+      "truncated": true
+    },
+    {
+      "stage": "startup",
+      "ms": 508.7352089999986,
+      "schema": 153
+    },
+    {
+      "stage": "file-preview",
+      "runId": "preview-run",
+      "path": "src/probe-1-0.ts",
+      "displayPath": "src/probe-1-0.ts"
+    },
+    {
+      "stage": "old-history",
+      "rows": 512,
+      "pages": [
+        12,
+        12
+      ],
+      "groupCount": 512
+    },
+    {
+      "stage": "file-preview",
+      "runId": "beab9f42-3e55-44c9-9d25-5cff229826cd",
+      "path": "new-storage-file.txt",
+      "displayPath": "new-storage-file.txt"
+    },
+    {
+      "stage": "restart",
+      "oldBodyHashUnchanged": true,
+      "newOperationReadable": true,
+      "inputSubmissions": 1
+    }
+  ],
+  "buildBaseCommit": "be6ae4868fc8858e0775645fefbc80d8a6f1216d",
+  "runtime": "synthetic Codex protocol fixture; no real model",
+  "isolation": "Fresh temporary userData and Skill Library; physical inputs ignored in the acceptance page; daily App unchanged."
+}

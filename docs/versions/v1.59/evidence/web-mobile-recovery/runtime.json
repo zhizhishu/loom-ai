@@ -1,0 +1,24 @@
+{
+  "verifiedAt": "2026-09-14T10:16:26.909Z",
+  "simulation": false,
+  "realRuntime": true,
+  "setup": "Empty Desktop-managed Host; Runtime check, member configuration and Camp creation use the production browser UI.",
+  "entry": "desktop",
+  "checks": {
+    "browserRuntimeMemberAndCampSetup": true,
+    "mobileCommandVisibleWhileRunning": true,
+    "webCommandVisibleWhileRunning": true
+  },
+  "screenshots": {
+    "mobile-live-command.png": "996caa31688c0ae15e7e120a644f2fde2c5fee23b5d70e073c6a7745223fe179",
+    "web-live-command.png": "a8deb14b205d98116bf9c55e8c4ced33bad7db14e66b716ce99d15001789dd32",
+    "mobile-command-completed.png": "696411d0396a1d3ddf0e48b5d1a987a15e193a5ed606183199750c128efe577c"
+  },
+  "notVerified": [
+    "Second physical device/LAN",
+    "Other platforms",
+    "Physical sleep/wake"
+  ],
+  "campId": "rvcamp_01m2fppewbeks928359emcp7bj",
+  "status": "passed"
+}

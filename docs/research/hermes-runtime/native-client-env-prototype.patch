@@ -1,0 +1,190 @@
+diff --git a/acp_adapter/gateway_server.py b/acp_adapter/gateway_server.py
+index d539cfead8..f815f0b5b3 100644
+--- a/acp_adapter/gateway_server.py
++++ b/acp_adapter/gateway_server.py
+@@ -634 +634 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
+-        prepared = await self._prepare_submit(session_id, prompt)
++        prepared = await self._prepare_submit(session_id, prompt, kwargs.get('hermes.clientEnv', []))
+@@ -638 +638 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
+-        text, attachments = staged
++        text, attachments, client_tool_env = staged
+@@ -644,0 +645,2 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
++        if client_tool_env:
++            submit['client_tool_env'] = client_tool_env
+@@ -746 +748 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
+-    async def _prepare_submit(self, session_id, prompt):
++    async def _prepare_submit(self, session_id, prompt, env_names=None):
+@@ -770 +772,3 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
+-        return retry_key, uuid.uuid4().hex, staged
++        from agent.session_client_env import prompt_client_env
++        import os
++        return retry_key, uuid.uuid4().hex, (*staged, prompt_client_env(os.environ, env_names or []))
+diff --git a/agent/session_client_env.py b/agent/session_client_env.py
+index 63b6573af5..7b7d6693fa 100644
+--- a/agent/session_client_env.py
++++ b/agent/session_client_env.py
+@@ -40,0 +41,16 @@ _BOUND: ContextVar = ContextVar('session_client_env', default=None)
++def prompt_client_env(environ, names):
++    """Prototype: explicit local ACP tool names, never a system-prompt overlay."""
++    import re
++    if not isinstance(names, list) or len(names) > _MAX_NAMES or any(
++            not isinstance(n, str) or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', n) is None
++            or not _travels(n) for n in names):
++        raise ValueError('invalid client tool environment names')
++    return normalise_client_env({n: environ[n] for n in names if n in environ}, None)
++
++
++def admitted_tool_env():
++    from gateway.session_cli_turn import _cli_turn
++    bound = _cli_turn.get()
++    return {} if bound is None else dict(bound[1].get('client_tool_env', {}))
++
++
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 3e678bed20..4cc3c24cae 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -5148,0 +5149 @@ export interface CanonicalSubmitParams {
++  client_tool_env?: Record<string, string> | null
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index d5fd22f4ad..c44e778034 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -11398,0 +11399,15 @@
++          },
++          "client_tool_env": {
++            "anyOf": [
++              {
++                "additionalProperties": {
++                  "type": "string"
++                },
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Client Tool Env"
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index fe9edf5be5..e7fffb96d5 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -657 +657 @@ class SessionAuthority:
+-                'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
++                'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch', 'client_tool_env'}
+diff --git a/gateway/session_cli_turn.py b/gateway/session_cli_turn.py
+index 62140b3b70..384f3a6a0f 100644
+--- a/gateway/session_cli_turn.py
++++ b/gateway/session_cli_turn.py
+@@ -15 +15 @@ from hermes_state_runtime import RuntimeStoreError
+-_SUBMIT_FIELDS = ('turn_author', 'api_text', 'model_override', 'clarify_batch')
++_SUBMIT_FIELDS = ('turn_author', 'api_text', 'model_override', 'clarify_batch', 'client_tool_env')
+@@ -27,0 +28,7 @@ def admit_cli_turn(params):
++    if 'client_tool_env' in params:
++        from agent.session_client_env import prompt_client_env, normalise_client_env
++        try:
++            values = normalise_client_env(params['client_tool_env'], None)
++            committed['client_tool_env'] = prompt_client_env(values, list(values))
++        except ValueError as exc:
++            raise RuntimeStoreError('invalid_params') from exc
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index 417f4d6cf9..cc6252bf77 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -753 +753 @@ class AuthorityConnection:
+-                                   'turn_author', 'api_text', 'model_override', 'clarify_batch'}
++                                   'turn_author', 'api_text', 'model_override', 'clarify_batch', 'client_tool_env'}
+@@ -755,0 +756,4 @@ class AuthorityConnection:
++        if 'client_tool_env' in params:
++            source = self.authority.sessions[ref.session_id].source
++            if not self.native_owner or source is None or source.user_id != self.actor.subject:
++                raise RuntimeStoreError('permission_denied')
+diff --git a/tests/acp_adapter/test_gateway_submit_retry.py b/tests/acp_adapter/test_gateway_submit_retry.py
+index 59c4a4444c..e899be356d 100644
+--- a/tests/acp_adapter/test_gateway_submit_retry.py
++++ b/tests/acp_adapter/test_gateway_submit_retry.py
+@@ -41 +41,2 @@ class Wire:
+-async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatch, settled_before_retry):
++@pytest.mark.parametrize('declared_env', [False, True])
++async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatch, settled_before_retry, declared_env):
+@@ -56 +57 @@ async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatc
+-    authority.sessions['s'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='retry'), 's')
++    authority.sessions['s'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='retry', user_id='editor'), 's')
+@@ -58 +59,2 @@ async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatc
+-    wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor'})
++    wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor', 'native_bootstrap': True})
++    authority.sessions['s'].source.user_id = wire.viewer.actor.subject
+@@ -71,0 +74,2 @@ async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatc
++        env_meta = {'hermes.clientEnv': ['CLIENT_RUN_CONTEXT']} if declared_env else {}
++        monkeypatch.setenv('CLIENT_RUN_CONTEXT', 'old-run')
+@@ -73 +77,2 @@ async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatc
+-            await agent.prompt([acp.text_block('same words')], 's')
++            await agent.prompt([acp.text_block('same words')], 's', **env_meta)
++        monkeypatch.setenv('CLIENT_RUN_CONTEXT', 'new-run')
+@@ -78 +83 @@ async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatc
+-        response = await asyncio.wait_for(agent.prompt([acp.text_block('same words')], 's'), 5)
++        response = await asyncio.wait_for(agent.prompt([acp.text_block('same words')], 's', **env_meta), 5)
+@@ -81,0 +87,2 @@ async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatc
++        if declared_env:
++            assert rows[0]['payload']['cli_turn_v1']['client_tool_env'] == {'CLIENT_RUN_CONTEXT': 'old-run'}
+diff --git a/tests/gateway/test_session_client_env.py b/tests/gateway/test_session_client_env.py
+index 550394fc7c..fe60c40772 100644
+--- a/tests/gateway/test_session_client_env.py
++++ b/tests/gateway/test_session_client_env.py
+@@ -434,0 +435,34 @@ def test_auto_started_gateway_does_not_inherit_client_behaviour_env(tmp_path, mo
++
++
++def test_admission_tool_env_rotation_and_shell_snapshot(tmp_path):
++    """Issue #142671 prototype: a resumed shell and an old execution differ."""
++    from contextvars import copy_context
++    from gateway.session_cli_turn import admit_cli_turn, cli_turn_scope
++    from tools.environments.local import LocalEnvironment
++    first = admit_cli_turn({'client_tool_env': {'CLIENT_RUN_CONTEXT': 'old'}})['cli_turn_v1']
++    second = admit_cli_turn({'client_tool_env': {'CLIENT_RUN_CONTEXT': 'new'}})['cli_turn_v1']
++    with cli_turn_scope('old-admission', first):
++        shell = LocalEnvironment(cwd=str(tmp_path))
++        old_execution = copy_context()
++        result = shell.execute('printf "CTX:%s" "$CLIENT_RUN_CONTEXT"; export CLIENT_RUN_CONTEXT=stale_snapshot')
++        assert result['returncode'] == 0 and 'CTX:old' in result['output']
++    try:
++        with cli_turn_scope('new-admission', second):
++            result = shell.execute('printf "CTX:%s" "$CLIENT_RUN_CONTEXT"')
++            assert result['returncode'] == 0 and 'CTX:new' in result['output']
++            old_result = old_execution.run(shell.execute, 'printf "CTX:%s" "$CLIENT_RUN_CONTEXT"')
++            assert old_result['returncode'] == 0 and 'CTX:old' in old_result['output']
++    finally:
++        shell.cleanup()
++
++
++def test_prompt_env_names_are_explicit_nonsecret_and_retry_payload_is_distinct():
++    from agent.session_client_env import prompt_client_env
++    from gateway.session_cli_turn import admit_cli_turn
++    assert prompt_client_env({'CLIENT_RUN_CONTEXT': 'a', 'UNDECLARED': 'x'}, ['CLIENT_RUN_CONTEXT']) == {'CLIENT_RUN_CONTEXT': 'a'}
++    for name in ['PRIVATE_TOKEN', 'HERMES_HOME', 'not valid']:
++        with pytest.raises(ValueError):
++            prompt_client_env({name: 'x'}, [name])
++    a = admit_cli_turn({'client_tool_env': {'CLIENT_RUN_CONTEXT': 'a'}})
++    b = admit_cli_turn({'client_tool_env': {'CLIENT_RUN_CONTEXT': 'b'}})
++    assert a != b
+diff --git a/tools/environments/base.py b/tools/environments/base.py
+index a74ebd2bff..e6e30c18f1 100644
+--- a/tools/environments/base.py
++++ b/tools/environments/base.py
+@@ -373,0 +374,3 @@ class BaseEnvironment(ABC):
++        if self.is_local:
++            from agent.session_client_env import admitted_tool_env
++            self._snapshot_passthrough_names.update(admitted_tool_env())
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 53c83db700..020d82c5c7 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -301,0 +302,2 @@ def _finalize_child_env(env: dict) -> dict:
++    from agent.session_client_env import admitted_tool_env
++    env.update(_scrub_credentials(admitted_tool_env(), inherit_credentials=False))
+diff --git a/tui_gateway/contracts/canonical_sessions.py b/tui_gateway/contracts/canonical_sessions.py
+index db394b039b..87fd5db2f0 100644
+--- a/tui_gateway/contracts/canonical_sessions.py
++++ b/tui_gateway/contracts/canonical_sessions.py
+@@ -230,0 +231 @@ class CanonicalSubmitParams(CanonicalSessionParams):
++    client_tool_env: dict[str, str] | None = None

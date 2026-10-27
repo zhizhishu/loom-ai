@@ -1,0 +1,387 @@
+import { describe, expect, it } from 'vitest'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { connect } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { CoreMethod } from '@contracts'
+import {
+  dispatchUserAutomation,
+  startUserAutomationOptional,
+  UserAutomationError,
+  UserAutomationServer,
+  userAutomationAvailableOnPlatform,
+  WINDOWS_USER_AUTOMATION_QUALIFICATION_ENV
+} from './user-automation'
+
+it('routes only closed evaluation operations to Host without granting generic Core execution', async () => {
+  const calls: unknown[] = []
+  const invoke = async (name: string, params: unknown) => { calls.push([name, params]); return { state: 'running' } }
+  const dependencies = {
+    core: { async request<T>(): Promise<T> { throw new Error('Evaluation dispatch must not call generic Core') } },
+    openThread: async (threadId: string) => ({ threadId, opened: true as const }), appVersion: 'test',
+    evaluation: {
+      configure: (params: unknown) => invoke('configure', params),
+      schedule: (params: unknown) => invoke('schedule', params),
+      start: (params: unknown, mode: 'gate' | 'weekly') => invoke(mode, params),
+      status: (params: unknown) => invoke('status', params),
+      cancel: (params: unknown) => invoke('cancel', params)
+    }
+  }
+  for (const operation of ['configure', 'gate', 'weekly', 'schedule', 'status', 'cancel']) await dispatchUserAutomation(`eval.${operation}`, {}, dependencies)
+  expect(calls).toHaveLength(6)
+  await expect(dispatchUserAutomation('eval.exec', {}, dependencies)).rejects.toThrow()
+  await expect(dispatchUserAutomation('eval.gate', {}, { ...dependencies, evaluation: undefined })).rejects.toThrow('unavailable')
+})
+
+async function socketRequest(path: string, request: unknown): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(path)
+    let response = ''
+    socket.setEncoding('utf8')
+    socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`))
+    socket.on('data', (chunk: string) => { response += chunk })
+    socket.on('end', () => {
+      try {
+        resolve(JSON.parse(response.trim()) as Record<string, unknown>)
+      } catch (error) {
+        reject(error)
+      }
+    })
+    socket.on('error', reject)
+  })
+}
+
+describe('User Automation transport', () => {
+  it('exports Trace only through a bounded Core read operation with explicit source filters', async () => {
+    const calls: Array<{ method: CoreMethod; params: unknown }> = []
+    const dependencies = {
+      core: { async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
+        calls.push({ method, params })
+        return { schemaVersion: 1, facts: {}, metrics: {} } as T
+      } },
+      openThread: async () => { throw new Error('Trace export must not navigate') },
+      appVersion: 'test'
+    }
+    await dispatchUserAutomation('trace.export', {
+      since: '2020-01-01T16:00:00Z', until: '2020-01-02T16:00:00Z',
+      excludeAutomationIds: ['daily-analysis'], excludeThreadIds: ['rvcamp_trial']
+    }, dependencies)
+    expect(calls).toEqual([{ method: 'executionTrace.export', params: {
+      since: '2020-01-01T16:00:00Z', until: '2020-01-02T16:00:00Z', threadIds: [],
+      excludeAutomationIds: ['daily-analysis'], excludeThreadIds: ['rvcamp_trial']
+    } }])
+    await expect(dispatchUserAutomation('trace.export', {
+      since: '2020-01-01T16:00:00Z', until: '2020-01-02T16:00:00Z', rawSql: 'SELECT 1'
+    }, dependencies)).rejects.toMatchObject({ code: 'automation_invalid_input' })
+    expect(calls).toHaveLength(1)
+    await dispatchUserAutomation('trace.export', {
+      since: '2020-01-01T16:00:00Z', until: '2020-01-02T16:00:00Z', excludeCampIds: ['legacy-exclusion']
+    }, dependencies)
+    expect(calls[1].params).toMatchObject({ excludeThreadIds: ['legacy-exclusion'] })
+    await expect(dispatchUserAutomation('trace.export', {
+      since: '2020-01-01T16:00:00Z', until: '2020-01-02T16:00:00Z', campIds: [], threadIds: []
+    }, dependencies)).rejects.toMatchObject({ code: 'automation_invalid_input' })
+  })
+
+  it('sends through one atomic Core operation and maps only the closed V1 launch shape', async () => {
+    const calls: Array<{ method: CoreMethod; params: unknown }> = []
+    const core = {
+      async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
+        calls.push({ method, params })
+        if (method === 'userAutomation.thread.send') {
+          return {
+            commandResult: {
+              status: 'accepted',
+              payload: {
+                threadMessageId: 'rvmsg_1',
+                threadTurnId: 'rvturn_1',
+                agentRunIds: ['rvrun_1'],
+                executionBudget: { deadlineAt: '2026-08-21T10:30:00Z' }
+              }
+            },
+            replayed: false,
+            preflight: null,
+            pendingExecution: null
+          } as T
+        }
+        throw new Error(`unexpected ${method}`)
+      }
+    }
+    const result = await dispatchUserAutomation(
+      'thread.send',
+      {
+        commandId: 'command-1',
+        threadId: 'rvcamp_test',
+        agentId: 'agent_1',
+        body: 'task',
+        executionBudget: {
+          elapsedSeconds: 1_800,
+          maxAgentRunResponsibilities: 1,
+          maxAcceptedA2a: 0
+        }
+      },
+      { core, openThread: async (threadId) => ({ threadId, opened: true }), appVersion: 'test' }
+    )
+
+    expect(result).toEqual({
+      status: 'dispatched',
+      threadMessageId: 'rvmsg_1',
+      threadTurnId: 'rvturn_1',
+      agentRunIds: ['rvrun_1'],
+      executionBudget: { deadlineAt: '2026-08-21T10:30:00Z' },
+      replayed: false
+    })
+    expect(calls.map(({ method }) => method)).toEqual(['userAutomation.thread.send'])
+    expect(calls[0].params).toMatchObject({
+      execution: {
+        budget: {
+          elapsedSeconds: 1_800,
+          maxAgentRunResponsibilities: 1,
+          maxAcceptedA2a: 0
+        }
+      }
+    })
+  })
+
+  it('fails closed when Core ever returns Pending Execution', async () => {
+    const core = {
+      async request<T>(method: CoreMethod): Promise<T> {
+        expect(method).toBe('userAutomation.thread.send')
+        return {
+          commandResult: null,
+          replayed: false,
+          preflight: null,
+          pendingExecution: { id: 'intent-1' }
+        } as T
+      }
+    }
+
+    await expect(dispatchUserAutomation(
+      'thread.send',
+      { commandId: 'c', threadId: 'rvcamp_test', agentId: 'agent_1', body: 'task' },
+      { core, openThread: async (threadId) => ({ threadId, opened: true }), appVersion: 'test' }
+    )).rejects.toMatchObject({ code: 'automation_contract_upgrade_required' })
+  })
+
+  it('does not expose a generic Core invoke operation', async () => {
+    const core = { request: async <T>() => ({} as T) }
+    await expect(dispatchUserAutomation(
+      'core.invoke',
+      { method: 'members.runtime.set' },
+      { core, openThread: async (threadId) => ({ threadId, opened: true }), appVersion: 'test' }
+    )).rejects.toBeInstanceOf(UserAutomationError)
+  })
+
+  it('maps Runtime inspection and member configuration to the closed Core methods', async () => {
+    const calls: Array<{ method: CoreMethod; params: unknown }> = []
+    const core = {
+      async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
+        calls.push({ method, params })
+        return { status: 'applied' } as T
+      }
+    }
+    const dependencies = {
+      core,
+      openThread: async (threadId: string) => ({ threadId, opened: true as const }),
+      appVersion: 'test'
+    }
+
+    await dispatchUserAutomation('runtime.check', { adapterKind: 'opencode-cli' }, dependencies)
+    await dispatchUserAutomation('runtime.models', { adapterKind: 'kiro-cli' }, dependencies)
+    await dispatchUserAutomation('member.create', {
+      commandId: 'create-command',
+      displayName: '开栈',
+      avatarRef: null,
+      teamRole: 'Runtime 验证员',
+      professionalResponsibilities: '验证 OpenCode Runtime。',
+      personalityTraits: ['严谨', '直接'],
+      workingPrinciples: '先取证，再下结论。',
+      growthTopic: ''
+    }, dependencies)
+    await dispatchUserAutomation('member.runtime.set', {
+      commandId: 'runtime-command',
+      agentId: 'agent_12',
+      expectedVersion: 1,
+      adapterKind: 'opencode-cli',
+      model: { mode: 'explicit', modelId: 'minimax/MiniMax-M3', options: {} },
+      permissions: {
+        adapterKind: 'opencode-cli',
+        schemaVersion: 1,
+        values: { permission_mode: 'allow' }
+      }
+    }, dependencies)
+    await dispatchUserAutomation('member.runtime.clear', {
+      commandId: 'clear-command',
+      agentId: 'agent_12',
+      expectedVersion: 2
+    }, dependencies)
+
+    expect(calls).toEqual([
+      {
+        method: 'runtime.product.check',
+        params: { runtimeKind: 'opencode-cli' }
+      },
+      {
+        method: 'runtime.modelCatalog.open',
+        params: { runtimeKind: 'kiro-cli' }
+      },
+      {
+        method: 'members.create',
+        params: {
+          commandId: 'create-command',
+          command: {
+            displayName: '开栈',
+            avatarRef: null,
+            teamRole: 'Runtime 验证员',
+            professionalResponsibilities: '验证 OpenCode Runtime。',
+            personalityTraits: ['严谨', '直接'],
+            workingPrinciples: '先取证，再下结论。',
+            growthTopic: ''
+          }
+        }
+      },
+      {
+        method: 'members.runtime.set',
+        params: {
+          commandId: 'runtime-command',
+          command: {
+            agentId: 'agent_12',
+            expectedVersion: 1,
+            adapterKind: 'opencode-cli',
+            model: { mode: 'explicit', modelId: 'minimax/MiniMax-M3', options: {} },
+            permissions: {
+              adapterKind: 'opencode-cli',
+              schemaVersion: 1,
+              values: { permission_mode: 'allow' }
+            }
+          }
+        }
+      },
+      {
+        method: 'members.runtime.clear',
+        params: {
+          commandId: 'clear-command',
+          command: { agentId: 'agent_12', expectedVersion: 2 }
+        }
+      }
+    ])
+
+  })
+
+  it('rejects mismatched Runtime permission adapters before calling Core', async () => {
+    const calls: CoreMethod[] = []
+    const core = {
+      async request<T>(method: CoreMethod): Promise<T> {
+        calls.push(method)
+        return {} as T
+      }
+    }
+
+    await expect(dispatchUserAutomation('member.runtime.set', {
+      commandId: 'runtime-command',
+      agentId: 'agent_12',
+      expectedVersion: 1,
+      adapterKind: 'opencode-cli',
+      model: { mode: 'runtime_default' },
+      permissions: { adapterKind: 'kiro-cli', schemaVersion: 1, values: {} }
+    }, {
+      core,
+      openThread: async (threadId) => ({ threadId, opened: true }),
+      appVersion: 'test'
+    })).rejects.toMatchObject({ code: 'automation_invalid_input' })
+    expect(calls).toEqual([])
+  })
+
+  it('keeps Desktop available when the optional Automation server cannot start', async () => {
+    const unavailable = new Error('injected endpoint bind failure')
+    const diagnostics: unknown[] = []
+    const server = {
+      async start(): Promise<void> { throw unavailable },
+      async stop(): Promise<void> {}
+    }
+
+    const started = await startUserAutomationOptional(
+      () => server,
+      (error) => diagnostics.push(error)
+    )
+
+    expect(started).toBeNull()
+    expect(diagnostics).toEqual([unavailable])
+  })
+
+  it(
+    'binds each local IPC request to the published App instance and removes discovery on stop',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'rovai-automation-'))
+      const previousQualification = process.env[WINDOWS_USER_AUTOMATION_QUALIFICATION_ENV]
+      if (process.platform === 'win32') {
+        process.env[WINDOWS_USER_AUTOMATION_QUALIFICATION_ENV] = '1'
+      }
+      const core = {
+        async request<T>(method: CoreMethod): Promise<T> {
+          if (method === 'app.info') return { version: 'core-test' } as T
+          throw new Error(`unexpected ${method}`)
+        }
+      }
+      const server = new UserAutomationServer(root, {
+        core,
+        openThread: async (threadId) => ({ threadId, opened: true }),
+        appVersion: 'app-test'
+      })
+      try {
+        await server.start()
+        const context = JSON.parse(await readFile(server.contextPath, 'utf8')) as {
+          contractVersion: number
+          instanceId: string
+          credential: string
+          endpoint: { path?: string; name?: string }
+        }
+        const endpoint = context.endpoint.path ?? context.endpoint.name
+        expect(endpoint).toBeTruthy()
+        const accepted = await socketRequest(endpoint!, {
+          contractVersion: context.contractVersion,
+          instanceId: context.instanceId,
+          credential: context.credential,
+          requestId: 'request-1',
+          operation: 'status',
+          params: {}
+        })
+        expect(accepted).toMatchObject({
+          requestId: 'request-1',
+          ok: true,
+          result: { appRunning: true, instanceId: context.instanceId }
+        })
+
+        const rejected = await socketRequest(endpoint!, {
+          contractVersion: context.contractVersion,
+          instanceId: 'another-instance',
+          credential: context.credential,
+          requestId: 'request-2',
+          operation: 'status',
+          params: {}
+        })
+        expect(rejected).toMatchObject({
+          requestId: 'request-2',
+          ok: false,
+          error: { code: 'automation_unauthorized' }
+        })
+      } finally {
+        await server.stop()
+        await expect(readFile(server.contextPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+        await rm(root, { recursive: true, force: true })
+        if (previousQualification === undefined) {
+          delete process.env[WINDOWS_USER_AUTOMATION_QUALIFICATION_ENV]
+        } else {
+          process.env[WINDOWS_USER_AUTOMATION_QUALIFICATION_ENV] = previousQualification
+        }
+      }
+    }
+  )
+
+  it('keeps Windows Automation behind the explicit local qualification gate', () => {
+    expect(userAutomationAvailableOnPlatform('win32', undefined)).toBe(false)
+    expect(userAutomationAvailableOnPlatform('win32', '0')).toBe(false)
+    expect(userAutomationAvailableOnPlatform('win32', '1')).toBe(true)
+    expect(userAutomationAvailableOnPlatform('darwin', undefined)).toBe(true)
+  })
+})

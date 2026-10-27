@@ -1,0 +1,6451 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Timelike, Utc};
+use rusqlite::{
+    Connection, OptionalExtension,
+    functions::{Aggregate, Context as SqlFunctionContext, FunctionFlags},
+    params, params_from_iter,
+    types::Value as SqlValue,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::{
+    agent_profile::AdapterKind,
+    db::Database,
+    runtime::AgentRunExecution,
+    runtime_pricing::{CodexTokenBuckets, estimate_codex_api_price, supports_codex_price_estimate},
+};
+
+const USAGE_SCHEMA_VERSION: i64 = 2;
+
+pub(crate) const ASYNC_SETTLEMENT_TRIGGER: &str = "CREATE TRIGGER runtime_usage_agent_run_terminal
+    AFTER UPDATE OF status ON agent_run
+    WHEN NEW.status IN ('succeeded', 'failed', 'cancelled')
+     AND OLD.status NOT IN ('succeeded', 'failed', 'cancelled')
+    BEGIN
+        UPDATE runtime_usage_run_summary
+        SET finalized_at = COALESCE(finalized_at, NEW.ended_at, NEW.updated_at)
+        WHERE collection_epoch = (SELECT collection_epoch FROM runtime_usage_collection_state WHERE singleton_id = 1)
+          AND agent_run_id = NEW.id;
+    END";
+
+#[cfg(test)]
+pub(crate) fn async_settlement_schema_matches(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<bool> {
+    let actual: Option<String> = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='runtime_usage_agent_run_terminal'",
+        [], |row| row.get(0),
+    ).optional()?;
+    let normalize = |sql: &str| sql.split_whitespace().collect::<String>();
+    Ok(actual.as_deref().map(normalize) == Some(normalize(ASYNC_SETTLEMENT_TRIGGER)))
+}
+const USAGE_PARSER_VERSION: i64 = 5;
+const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const CHECKPOINT_TTL_HOURS: i64 = 72;
+const RETENTION_DAYS: i64 = 45;
+const MODEL_TOP_N: usize = 10;
+
+const ELIGIBLE_PROMPT_INPUT_TOTAL: i64 = 0x001;
+const ELIGIBLE_UNCACHED_INPUT: i64 = 0x002;
+const ELIGIBLE_CACHE_READ: i64 = 0x004;
+const ELIGIBLE_CACHE_WRITE: i64 = 0x008;
+const ELIGIBLE_OUTPUT: i64 = 0x010;
+const ELIGIBLE_REASONING_OUTPUT: i64 = 0x020;
+const ELIGIBLE_REQUEST_CACHE_HIT: i64 = 0x040;
+const ELIGIBLE_COST: i64 = 0x080;
+
+struct DecimalSum;
+
+impl Aggregate<Option<String>, Option<String>> for DecimalSum {
+    fn init(&self, _context: &mut SqlFunctionContext<'_>) -> rusqlite::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn step(
+        &self,
+        context: &mut SqlFunctionContext<'_>,
+        accumulator: &mut Option<String>,
+    ) -> rusqlite::Result<()> {
+        let Some(value) = context.get::<Option<String>>(0)? else {
+            return Ok(());
+        };
+        let next = add_decimal(accumulator.as_deref().unwrap_or("0"), &value).map_err(|error| {
+            rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            )))
+        })?;
+        *accumulator = Some(next);
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _context: &mut SqlFunctionContext<'_>,
+        accumulator: Option<Option<String>>,
+    ) -> rusqlite::Result<Option<String>> {
+        Ok(accumulator.flatten())
+    }
+}
+
+pub(crate) fn register_monitoring_sql_functions(connection: &Connection) -> Result<()> {
+    connection
+        .create_aggregate_function(
+            "rovai_decimal_sum",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            DecimalSum,
+        )
+        .context("failed to register Runtime Usage decimal aggregate")?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeUsageCounterMode {
+    Delta,
+    Cumulative,
+    Gauge,
+}
+
+impl RuntimeUsageCounterMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Delta => "delta",
+            Self::Cumulative => "cumulative",
+            Self::Gauge => "gauge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeInputSemantics {
+    ExclusiveBuckets,
+    CacheInclusiveTotal,
+    Unknown,
+}
+
+impl RuntimeInputSemantics {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExclusiveBuckets => "exclusive_buckets",
+            Self::CacheInclusiveTotal => "cache_inclusive_total",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeUsageFields {
+    pub input_tokens: Option<i64>,
+    pub uncached_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
+    pub context_used_tokens: Option<i64>,
+    pub context_size_tokens: Option<i64>,
+    pub native_context_ratio: Option<f64>,
+}
+
+impl RuntimeUsageFields {
+    fn is_empty(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.uncached_input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.reasoning_output_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_write_input_tokens.is_none()
+            && self.context_used_tokens.is_none()
+            && self.context_size_tokens.is_none()
+            && self.native_context_ratio.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeUsageCost {
+    pub amount: String,
+    pub currency: String,
+    pub quality: String,
+    pub grain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedRuntimeUsage {
+    pub identity_suffix: String,
+    pub dialect_id: String,
+    pub source: String,
+    pub scope: String,
+    pub counter_mode: RuntimeUsageCounterMode,
+    pub input_semantics: RuntimeInputSemantics,
+    pub native_session_id: Option<String>,
+    pub native_turn_id: Option<String>,
+    pub fields: RuntimeUsageFields,
+    pub cost: Option<RuntimeUsageCost>,
+    /// Actual native model identity, never the configured routing alias.
+    #[serde(default)]
+    pub context_model_id: Option<String>,
+    pub occurred_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UsageCounters {
+    prompt_input_total_tokens: Option<i64>,
+    uncached_input_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    reasoning_output_tokens: Option<i64>,
+    cache_observable_request_count: Option<i64>,
+    cache_hit_request_count: Option<i64>,
+}
+
+impl UsageCounters {
+    fn any_observed(&self) -> bool {
+        [
+            self.prompt_input_total_tokens,
+            self.uncached_input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+            self.cache_observable_request_count,
+            self.cache_hit_request_count,
+        ]
+        .into_iter()
+        .any(|value| value.is_some())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UsageRunKey {
+    agent_run_id: String,
+    execution_epoch: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeUsageRun {
+    key: UsageRunKey,
+    runtime_kind: AdapterKind,
+    runtime_version: Option<String>,
+    provider_key: Option<String>,
+    model_key: Option<String>,
+    service_tier: Option<String>,
+}
+
+impl RuntimeUsageRun {
+    fn from_execution(execution: &AgentRunExecution) -> Self {
+        Self {
+            key: UsageRunKey {
+                agent_run_id: execution.agent_run_id.clone(),
+                execution_epoch: execution.execution_epoch,
+            },
+            runtime_kind: execution.runtime.adapter_kind,
+            runtime_version: execution.runtime.reported_version.clone(),
+            provider_key: string_option(
+                &execution.runtime.model.options,
+                &["providerKey", "provider"],
+            ),
+            model_key: non_empty(execution.runtime.model.model_id.clone()),
+            service_tier: string_option(
+                &execution.runtime.model.options,
+                &["serviceTier", "service_tier"],
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BufferedUsageKey {
+    run: UsageRunKey,
+    identity_suffix: String,
+    dialect_id: String,
+    source: String,
+    scope: String,
+    counter_mode: RuntimeUsageCounterMode,
+    input_semantics: RuntimeInputSemantics,
+    native_session_id: Option<String>,
+    native_turn_id: Option<String>,
+    cost_currency: Option<String>,
+    cost_quality: Option<String>,
+    cost_grain: Option<String>,
+}
+
+impl BufferedUsageKey {
+    fn new(run: &UsageRunKey, usage: &ParsedRuntimeUsage) -> Self {
+        Self {
+            run: run.clone(),
+            identity_suffix: usage.identity_suffix.clone(),
+            dialect_id: usage.dialect_id.clone(),
+            source: usage.source.clone(),
+            scope: usage.scope.clone(),
+            counter_mode: usage.counter_mode,
+            input_semantics: usage.input_semantics,
+            native_session_id: usage.native_session_id.clone(),
+            native_turn_id: usage.native_turn_id.clone(),
+            cost_currency: usage.cost.as_ref().map(|cost| cost.currency.clone()),
+            cost_quality: usage.cost.as_ref().map(|cost| cost.quality.clone()),
+            cost_grain: usage.cost.as_ref().map(|cost| cost.grain.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BufferedUsageRecord {
+    key: BufferedUsageKey,
+    usage: ParsedRuntimeUsage,
+    normalized: UsageCounters,
+    source_identities: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeUsageFlushBatch {
+    run: RuntimeUsageRun,
+    records: Vec<BufferedUsageRecord>,
+    pending_since: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeUsageFlushTarget {
+    Periodic,
+    Run {
+        agent_run_id: String,
+        execution_epoch: i64,
+    },
+    All,
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeUsageBuffer {
+    runs: BTreeMap<UsageRunKey, RuntimeUsageRun>,
+    finished: BTreeSet<UsageRunKey>,
+    native_tails: BTreeSet<UsageRunKey>,
+    pending: BTreeMap<BufferedUsageKey, Vec<BufferedUsageRecord>>,
+    pending_since: BTreeMap<UsageRunKey, Instant>,
+    seen_source_identities: BTreeSet<(BufferedUsageKey, String)>,
+    latest_context_sources: BTreeMap<
+        (UsageRunKey, String, Option<String>),
+        (String, RuntimeUsageFields, Option<String>),
+    >,
+}
+
+impl RuntimeUsageBuffer {
+    pub fn begin_native_tail(&mut self, agent_run_id: &str, execution_epoch: i64) -> bool {
+        let key = UsageRunKey {
+            agent_run_id: agent_run_id.to_string(),
+            execution_epoch,
+        };
+        self.runs.contains_key(&key) && self.native_tails.insert(key)
+    }
+
+    pub fn end_native_tail(&mut self, agent_run_id: &str, execution_epoch: i64) {
+        self.native_tails.remove(&UsageRunKey {
+            agent_run_id: agent_run_id.to_string(),
+            execution_epoch,
+        });
+    }
+
+    pub fn finish_run(&mut self, agent_run_id: &str, execution_epoch: i64) {
+        let key = UsageRunKey {
+            agent_run_id: agent_run_id.to_string(),
+            execution_epoch,
+        };
+        if self.runs.contains_key(&key) {
+            self.finished.insert(key);
+        }
+    }
+
+    pub fn accepts_native_poll(&self, agent_run_id: &str, execution_epoch: i64) -> bool {
+        let key = UsageRunKey {
+            agent_run_id: agent_run_id.to_string(),
+            execution_epoch,
+        };
+        self.runs.contains_key(&key) && !self.finished.contains(&key)
+    }
+
+    pub fn register_run(&mut self, run: RuntimeUsageRun) {
+        self.runs.insert(run.key.clone(), run);
+    }
+
+    pub fn observe_registered_run(
+        &mut self,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        source_identity: &str,
+        observations: &[ParsedRuntimeUsage],
+        now: Instant,
+    ) -> Result<bool> {
+        let key = UsageRunKey {
+            agent_run_id: agent_run_id.to_string(),
+            execution_epoch,
+        };
+        let Some(run) = self.runs.get(&key).cloned() else {
+            return Ok(false);
+        };
+        self.observe_run(&run, source_identity, observations, now)?;
+        Ok(true)
+    }
+
+    pub fn observe_run(
+        &mut self,
+        run: &RuntimeUsageRun,
+        source_identity: &str,
+        observations: &[ParsedRuntimeUsage],
+        now: Instant,
+    ) -> Result<()> {
+        self.runs.insert(run.key.clone(), run.clone());
+        for usage in observations {
+            let mut usage = usage.clone();
+            if usage.occurred_at.is_none() {
+                usage.occurred_at = Some(Utc::now().to_rfc3339());
+            }
+            let normalized = normalize_usage(&usage)?;
+            let key = BufferedUsageKey::new(&run.key, &usage);
+            if usage.scope == "session" && usage.counter_mode == RuntimeUsageCounterMode::Gauge {
+                let context_key = (
+                    run.key.clone(),
+                    usage.dialect_id.clone(),
+                    usage.native_session_id.clone(),
+                );
+                if self
+                    .latest_context_sources
+                    .get(&context_key)
+                    .is_some_and(|last| {
+                        last.0 == source_identity
+                            && last.1 == usage.fields
+                            && last.2 == usage.context_model_id
+                    })
+                {
+                    continue;
+                }
+                self.latest_context_sources.insert(
+                    context_key,
+                    (
+                        source_identity.to_string(),
+                        usage.fields.clone(),
+                        usage.context_model_id.clone(),
+                    ),
+                );
+            } else if !self
+                .seen_source_identities
+                .insert((key.clone(), source_identity.to_string()))
+            {
+                continue;
+            }
+            self.pending_since.entry(run.key.clone()).or_insert(now);
+            let incoming = BufferedUsageRecord {
+                key: key.clone(),
+                usage,
+                normalized,
+                source_identities: vec![source_identity.to_string()],
+            };
+            merge_buffered_record(&mut self.pending, incoming);
+        }
+        Ok(())
+    }
+
+    pub fn drain(&mut self, target: RuntimeUsageFlushTarget) -> Vec<RuntimeUsageFlushBatch> {
+        let selected: BTreeSet<_> = match &target {
+            RuntimeUsageFlushTarget::Periodic => self.pending_since.keys().cloned().collect(),
+            RuntimeUsageFlushTarget::Run {
+                agent_run_id,
+                execution_epoch,
+            } => [UsageRunKey {
+                agent_run_id: agent_run_id.clone(),
+                execution_epoch: *execution_epoch,
+            }]
+            .into_iter()
+            .collect(),
+            RuntimeUsageFlushTarget::All => self.pending_since.keys().cloned().collect(),
+        };
+        let mut records = BTreeMap::<UsageRunKey, Vec<BufferedUsageRecord>>::new();
+        let keys = self
+            .pending
+            .keys()
+            .filter(|key| selected.contains(&key.run))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(pending) = self.pending.remove(&key) {
+                records.entry(key.run.clone()).or_default().extend(pending);
+            }
+        }
+        records
+            .into_iter()
+            .filter_map(|(key, mut records)| {
+                records.sort_by_key(|record| {
+                    record
+                        .usage
+                        .occurred_at
+                        .as_deref()
+                        .and_then(|at| parse_time(at).ok())
+                });
+                Some(RuntimeUsageFlushBatch {
+                    run: self.runs.get(&key)?.clone(),
+                    records,
+                    pending_since: self.pending_since.remove(&key)?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn restore(&mut self, batches: Vec<RuntimeUsageFlushBatch>) -> Result<()> {
+        let newer = std::mem::take(&mut self.pending);
+        for batch in batches {
+            self.runs.insert(batch.run.key.clone(), batch.run.clone());
+            self.pending_since
+                .entry(batch.run.key.clone())
+                .and_modify(|current| *current = (*current).min(batch.pending_since))
+                .or_insert(batch.pending_since);
+            for record in batch.records {
+                merge_buffered_record(&mut self.pending, record);
+            }
+        }
+        for record in newer.into_values().flatten() {
+            merge_buffered_record(&mut self.pending, record);
+        }
+        Ok(())
+    }
+
+    pub fn finish_idle_target_after_flush(&mut self, target: &RuntimeUsageFlushTarget) {
+        let candidates: BTreeSet<UsageRunKey> = match target {
+            RuntimeUsageFlushTarget::Run {
+                agent_run_id,
+                execution_epoch,
+            } => [UsageRunKey {
+                agent_run_id: agent_run_id.clone(),
+                execution_epoch: *execution_epoch,
+            }]
+            .into_iter()
+            .collect(),
+            RuntimeUsageFlushTarget::All => self.runs.keys().cloned().collect(),
+            RuntimeUsageFlushTarget::Periodic => self.finished.clone(),
+        };
+        let idle = candidates
+            .into_iter()
+            .filter(|run| !self.pending_since.contains_key(run) && !self.native_tails.contains(run))
+            .collect::<BTreeSet<_>>();
+        self.runs.retain(|run, _| !idle.contains(run));
+        self.finished.retain(|run| !idle.contains(run));
+        self.seen_source_identities
+            .retain(|(key, _)| !idle.contains(&key.run));
+        self.latest_context_sources
+            .retain(|(run, _, _), _| !idle.contains(run));
+    }
+}
+
+fn merge_buffered_record(
+    pending: &mut BTreeMap<BufferedUsageKey, Vec<BufferedUsageRecord>>,
+    incoming: BufferedUsageRecord,
+) {
+    // Group only for flushing. Every independent call has already been
+    // normalized: another call cannot supply its missing buckets or turn three
+    // cache-observable requests into one. Keep cumulative observations ordered
+    // too, including initial baselines and resets, even within one flush.
+    pending
+        .entry(incoming.key.clone())
+        .or_default()
+        .push(incoming);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringFilter {
+    pub range: String,
+    #[serde(default)]
+    pub runtime_kind: Option<AdapterKind>,
+    #[serde(default)]
+    pub provider_key: Option<String>,
+    #[serde(default)]
+    pub model_key: Option<String>,
+    #[serde(default)]
+    pub cost_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MonitoringExecutionParams {
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub agent_run_ids: Vec<String>,
+}
+
+impl MonitoringFilter {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.range.as_str(), "24h" | "7d" | "30d") {
+            anyhow::bail!("Runtime Usage range must be one of 24h, 7d, or 30d");
+        }
+        for (name, value) in [
+            ("providerKey", self.provider_key.as_deref()),
+            ("modelKey", self.model_key.as_deref()),
+            ("costKind", self.cost_kind.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty() || value.len() > 160) {
+                anyhow::bail!("Runtime Usage {name} filter is invalid");
+            }
+        }
+        Ok(())
+    }
+
+    fn duration(&self) -> Duration {
+        match self.range.as_str() {
+            "24h" => Duration::hours(24),
+            "7d" => Duration::days(7),
+            "30d" => Duration::days(30),
+            _ => unreachable!("validated Runtime Usage range"),
+        }
+    }
+}
+
+fn execution_run_usage_rows(
+    connection: &rusqlite::Connection,
+    params: &MonitoringExecutionParams,
+) -> Result<Vec<Value>> {
+    let mut run_query = connection.prepare(r#"
+            SELECT ar.id, ar.execution_epoch, s.prompt_input_total_tokens, s.output_tokens,
+                   s.cache_read_tokens, s.cache_write_tokens,
+                   s.finalized_at, s.last_observed_at,
+                   COALESCE(s.parser_version >= 5 AND s.usage_quality = 'runtime_reported', 0)
+            FROM json_each(?2) requested
+            JOIN agent_run ar ON ar.id = requested.value
+            JOIN conversation c ON c.id = ar.conversation_id
+            JOIN runtime_usage_run_summary s ON s.agent_run_id = ar.id
+                AND s.collection_epoch = (
+                    SELECT collection_epoch FROM runtime_usage_collection_state WHERE singleton_id = 1
+                )
+            WHERE c.camp_id = ?1
+            ORDER BY requested.key
+        "#)?;
+    let rows = run_query
+        .query_map(
+            params![
+                params.camp_id,
+                serde_json::to_string(&params.agent_run_ids)?
+            ],
+            |row| {
+                Ok(json!({
+                    "agentRunId": row.get::<_, String>(0)?,
+                    "executionEpoch": row.get::<_, i64>(1)?,
+                    "promptInputTotalTokens": row.get::<_, Option<i64>>(2)?,
+                    "outputTokens": row.get::<_, Option<i64>>(3)?,
+                    "cacheReadTokens": row.get::<_, Option<i64>>(4)?,
+                    "cacheWriteTokens": row.get::<_, Option<i64>>(5)?,
+                    "finalizedAt": row.get::<_, Option<String>>(6)?,
+                    "lastObservedAt": row.get::<_, Option<String>>(7)?,
+                    "inputOutputComplete": row.get::<_, bool>(8)?,
+                }))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub struct MonitoringService;
+
+// Opt-in scalar evidence for isolated App acceptance. Never log native payloads.
+pub(crate) fn context_acceptance_trace(value: impl FnOnce() -> Value) {
+    if context_acceptance_trace_enabled() {
+        // Serialize before writing: Electron prefixes stderr chunks, so a
+        // streaming JSON formatter could fragment one scalar record.
+        let line = format!("ROVAI_CONTEXT_ACCEPTANCE {}", value());
+        eprintln!("{line}");
+    }
+}
+
+fn context_acceptance_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ROVAI_ALLOW_ISOLATED_INSTANCE").as_deref() == Ok("1")
+            && std::env::var("ROVAI_INTERNAL_CONTEXT_ACCEPTANCE_TRACE").as_deref() == Ok("1")
+    })
+}
+
+impl MonitoringService {
+    pub fn execution_snapshot(
+        database: &Database,
+        params: &MonitoringExecutionParams,
+    ) -> Result<Value> {
+        validate_key(&params.camp_id, "Thread ID")?;
+        anyhow::ensure!(
+            params.agent_run_ids.len() <= 500,
+            "too many AgentRuns requested"
+        );
+        for agent_run_id in &params.agent_run_ids {
+            validate_key(agent_run_id, "AgentRun ID")?;
+        }
+        let connection = database.connection();
+        let runs = execution_run_usage_rows(connection, params)?;
+        let mut session_query = connection.prepare(
+            r#"
+            SELECT c.id, c.agent_id, x.native_binding_generation, x.runtime_kind,
+                   x.model_key, x.context_used_tokens, x.context_window_tokens,
+                   x.source, x.dialect_id, x.observed_at, x.native_context_ratio
+            FROM conversation c
+            JOIN runtime_session_context_latest x ON x.conversation_id = c.id
+                AND x.native_binding_id = c.native_binding_id
+                AND x.native_binding_generation = c.native_binding_generation
+                AND x.native_session_id = c.native_session_id
+            JOIN agent_run source_run ON source_run.id = x.source_agent_run_id
+            WHERE c.camp_id = ?1
+              AND NOT EXISTS (
+                  SELECT 1 FROM native_session_compaction_observation compacted
+                  WHERE compacted.native_binding_id = c.native_binding_id
+                    AND compacted.native_binding_generation = c.native_binding_generation
+                    AND compacted.committed_at > x.observed_at
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_run newer
+                  JOIN runtime_input_delivery nd ON nd.agent_run_id = newer.id
+                      AND nd.execution_epoch = newer.execution_epoch
+                  WHERE newer.conversation_id = c.id
+                    AND nd.native_binding_id = c.native_binding_id
+                    AND nd.native_binding_generation = c.native_binding_generation
+                    AND (newer.started_at > source_run.started_at
+                        OR (newer.started_at = source_run.started_at AND newer.id > source_run.id))
+                    AND (newer.runtime_host_config_digest IS NOT x.effective_config_digest
+                        OR newer.runtime_model_selection_json IS NOT source_run.runtime_model_selection_json
+                        OR (newer.runtime_observed_model_id IS NOT NULL
+                            AND x.model_key IS NOT NULL
+                            AND newer.runtime_observed_model_id <> x.model_key))
+              )
+        "#,
+        )?;
+        let sessions = session_query
+            .query_map([&params.camp_id], |row| {
+                Ok(json!({
+                    "conversationId": row.get::<_, String>(0)?,
+                    "agentId": row.get::<_, String>(1)?,
+                    "sessionGeneration": row.get::<_, i64>(2)?,
+                    "runtimeKind": row.get::<_, String>(3)?,
+                    "modelKey": row.get::<_, Option<String>>(4)?,
+                    "usedTokens": row.get::<_, Option<i64>>(5)?,
+                    "windowTokens": row.get::<_, Option<i64>>(6)?,
+                    "source": row.get::<_, String>(7)?,
+                    "dialectId": row.get::<_, String>(8)?,
+                    "observedAt": row.get::<_, String>(9)?,
+                    "nativeRatio": row.get::<_, Option<f64>>(10)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!({"schemaVersion": 1, "runs": runs, "sessions": sessions}))
+    }
+
+    pub fn enroll_run(
+        database: &mut Database,
+        execution: &AgentRunExecution,
+    ) -> Result<Option<RuntimeUsageRun>> {
+        let (collection_epoch, collection_started_at) = collection_identity(database)?;
+        let created_at: Option<String> = database
+            .connection()
+            .query_row(
+                "SELECT created_at FROM agent_run WHERE id = ?1",
+                [&execution.agent_run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(created_at) = created_at else {
+            return Ok(None);
+        };
+        if parse_time(&created_at)? < parse_time(&collection_started_at)? {
+            return Ok(None);
+        }
+        let run = RuntimeUsageRun::from_execution(execution);
+        let now = Utc::now().to_rfc3339();
+        database.connection().execute(
+            r#"
+            INSERT OR IGNORE INTO runtime_usage_run_summary(
+                collection_epoch, agent_run_id, runtime_kind, runtime_version,
+                provider_key, model_key, service_tier, parser_version,
+                eligible_mask, input_semantics, usage_source, usage_quality,
+                prompt_input_total_tokens, uncached_input_tokens,
+                cache_read_tokens, cache_write_tokens, output_tokens,
+                reasoning_output_tokens, cache_observable_request_count,
+                cache_hit_request_count, cost_amount_decimal, cost_currency,
+                cost_kind, cost_source, pricing_catalog_version,
+                enrolled_at, first_observed_at, last_observed_at, finalized_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'unknown', NULL, NULL,
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL, NULL, ?10, NULL, NULL, NULL
+            )
+            "#,
+            params![
+                collection_epoch,
+                run.key.agent_run_id,
+                run.runtime_kind.as_str(),
+                run.runtime_version,
+                run.provider_key,
+                run.model_key,
+                run.service_tier,
+                USAGE_PARSER_VERSION,
+                eligible_mask_for_run(&run, parse_time(&now)?),
+                now,
+            ],
+        )?;
+        Self::enrolled_usage_run(database, &execution.agent_run_id, execution.execution_epoch)
+    }
+
+    pub fn enrolled_usage_run(
+        database: &Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<Option<RuntimeUsageRun>> {
+        let row = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT runtime_kind, runtime_version, provider_key, model_key, service_tier
+                FROM runtime_usage_run_summary
+                WHERE collection_epoch = (
+                    SELECT collection_epoch
+                    FROM runtime_usage_collection_state
+                    WHERE singleton_id = 1
+                ) AND agent_run_id = ?1
+                "#,
+                [agent_run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((runtime_kind, runtime_version, provider_key, model_key, service_tier)) = row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RuntimeUsageRun {
+            key: UsageRunKey {
+                agent_run_id: agent_run_id.to_string(),
+                execution_epoch,
+            },
+            runtime_kind: runtime_kind.parse()?,
+            runtime_version,
+            provider_key,
+            model_key,
+            service_tier,
+        }))
+    }
+
+    pub fn record_usage(
+        database: &mut Database,
+        execution: &AgentRunExecution,
+        source_identity: &str,
+        usage: &ParsedRuntimeUsage,
+    ) -> Result<bool> {
+        let run = RuntimeUsageRun::from_execution(execution);
+        let batch = RuntimeUsageFlushBatch {
+            run: run.clone(),
+            records: vec![BufferedUsageRecord {
+                key: BufferedUsageKey::new(&run.key, usage),
+                normalized: normalize_usage(usage)?,
+                usage: usage.clone(),
+                source_identities: vec![source_identity.to_string()],
+            }],
+            pending_since: Instant::now(),
+        };
+        Ok(Self::record_usage_batches(database, &[batch])? > 0)
+    }
+
+    pub fn record_late_session_context(
+        database: &mut Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        adapter_kind: AdapterKind,
+        source_identity: &str,
+        usage: &ParsedRuntimeUsage,
+    ) -> Result<bool> {
+        if usage.scope != "session" || usage.counter_mode != RuntimeUsageCounterMode::Gauge {
+            return Ok(false);
+        }
+        let Some(run) = Self::enrolled_usage_run(database, agent_run_id, execution_epoch)? else {
+            return Ok(false);
+        };
+        if run.runtime_kind != adapter_kind {
+            return Ok(false);
+        }
+        let batch = RuntimeUsageFlushBatch {
+            records: vec![BufferedUsageRecord {
+                key: BufferedUsageKey::new(&run.key, usage),
+                normalized: normalize_usage(usage)?,
+                usage: usage.clone(),
+                source_identities: vec![source_identity.to_string()],
+            }],
+            run,
+            pending_since: Instant::now(),
+        };
+        Ok(Self::record_usage_batches(database, &[batch])? > 0)
+    }
+
+    pub fn record_service_tier(
+        database: &mut Database,
+        execution: &AgentRunExecution,
+        tier: &str,
+        observed: bool,
+    ) -> Result<()> {
+        if execution.runtime.adapter_kind != AdapterKind::CodexCli {
+            return Ok(());
+        }
+        let tier = match tier {
+            "fast" | "priority" => "priority",
+            "standard" | "default" => "default",
+            _ => "unknown",
+        };
+        let (collection_epoch, _) = collection_identity(database)?;
+        let transaction = database.connection_mut().transaction()?;
+        let sql = if observed {
+            "UPDATE runtime_usage_run_summary SET observed_service_tier = ?3 WHERE collection_epoch = ?1 AND agent_run_id = ?2"
+        } else {
+            "UPDATE runtime_usage_run_summary SET service_tier = ?3 WHERE collection_epoch = ?1 AND agent_run_id = ?2"
+        };
+        transaction.execute(sql, params![collection_epoch, execution.agent_run_id, tier])?;
+        project_codex_run_cost(
+            &transaction,
+            &collection_epoch,
+            &RuntimeUsageRun::from_execution(execution),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_usage_batches(
+        database: &mut Database,
+        batches: &[RuntimeUsageFlushBatch],
+    ) -> Result<usize> {
+        if batches.is_empty() {
+            return Ok(0);
+        }
+        let (collection_epoch, _) = collection_identity(database)?;
+        let transaction = database.connection_mut().transaction()?;
+        let mut changed = 0;
+        let mut context_evidence = Vec::new();
+        let trace_enabled = context_acceptance_trace_enabled();
+        for batch in batches {
+            // Context follows the current Session binding, independently of
+            // input acknowledgement and native consumption settlement.
+            for record in &batch.records {
+                if persist_usage_record(&transaction, &collection_epoch, &batch.run, record)? {
+                    changed += 1;
+                    if trace_enabled && record.usage.counter_mode == RuntimeUsageCounterMode::Gauge
+                    {
+                        // Borrow only until commit; no second state or history.
+                        context_evidence.push((&batch.run, &record.usage));
+                    }
+                }
+            }
+            project_codex_run_cost(&transaction, &collection_epoch, &batch.run)?;
+        }
+        transaction.commit()?;
+        context_acceptance_trace(|| {
+            json!({
+                "kind": "context_commit", "committedAt": Utc::now().to_rfc3339(),
+                "observations": context_evidence.iter().map(|(run, usage)| json!({
+                    "runId": run.key.agent_run_id, "sessionId": usage.native_session_id,
+                    "observedAt": usage.occurred_at, "modelId": usage.context_model_id,
+                    "used": usage.fields.context_used_tokens, "window": usage.fields.context_size_tokens,
+                    "ratio": usage.fields.native_context_ratio
+                })).collect::<Vec<_>>()
+            })
+        });
+        Ok(changed)
+    }
+
+    pub fn finalize_usage_run(database: &mut Database, agent_run_id: &str) -> Result<bool> {
+        let (collection_epoch, _) = collection_identity(database)?;
+        let transaction = database.connection_mut().transaction()?;
+        let changed = finalize_run_in_transaction(&transaction, &collection_epoch, agent_run_id)?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Derived summaries settle in the existing Usage worker. Their schema or
+    /// persistence failures cannot roll back an AgentRun status transition.
+    pub fn finalize_settled_runs(database: &mut Database) -> Result<usize> {
+        Ok(database.connection_mut().execute(
+            "UPDATE runtime_usage_run_summary
+             SET finalized_at = COALESCE((SELECT ended_at FROM agent_run WHERE id=agent_run_id), datetime('now'))
+             WHERE finalized_at IS NULL AND EXISTS (
+                 SELECT 1 FROM agent_run WHERE id=agent_run_id
+                 AND status IN ('succeeded','failed','cancelled')
+             )", [],
+        )?)
+    }
+
+    pub fn purge_expired(database: &mut Database) -> Result<usize> {
+        let now = Utc::now();
+        let cutoff = (now - Duration::days(RETENTION_DAYS)).to_rfc3339();
+        let now = now.to_rfc3339();
+        let transaction = database.connection_mut().transaction()?;
+        let mut deleted = 0;
+        deleted += transaction.execute(
+            r#"
+            DELETE FROM runtime_usage_checkpoint
+            WHERE rowid IN (
+                SELECT rowid FROM runtime_usage_checkpoint
+                WHERE expires_at < ?1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM agent_run
+                    WHERE agent_run.id = runtime_usage_checkpoint.agent_run_id
+                      AND agent_run.status IN ('queued', 'running', 'waiting')
+                  )
+                ORDER BY expires_at LIMIT 1000
+            )
+            "#,
+            [&now],
+        )?;
+        deleted += transaction.execute(
+            r#"
+            DELETE FROM runtime_usage_run_summary
+            WHERE rowid IN (
+                SELECT rowid FROM runtime_usage_run_summary
+                WHERE finalized_at IS NOT NULL
+                  AND COALESCE(last_observed_at, finalized_at, enrolled_at) < ?1
+                ORDER BY COALESCE(last_observed_at, finalized_at, enrolled_at)
+                LIMIT 1000
+            )
+            "#,
+            [&cutoff],
+        )?;
+        deleted += transaction.execute(
+            r#"
+            DELETE FROM runtime_usage_hourly
+            WHERE rowid IN (
+                SELECT rowid FROM runtime_usage_hourly
+                WHERE bucket_start_at < ?1
+                ORDER BY bucket_start_at LIMIT 1000
+            )
+            "#,
+            [&cutoff],
+        )?;
+        deleted += transaction.execute(
+            r#"
+            DELETE FROM runtime_cost_reconciliation_bucket
+            WHERE rowid IN (
+                SELECT rowid FROM runtime_cost_reconciliation_bucket
+                WHERE bucket_end_at < ?1
+                ORDER BY bucket_end_at LIMIT 1000
+            )
+            "#,
+            [&cutoff],
+        )?;
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
+    pub fn snapshot(database: &mut Database, filter: &MonitoringFilter) -> Result<Value> {
+        filter.validate()?;
+        let (collection_epoch, collection_started_at) = collection_identity(database)?;
+        let observed_at = Utc::now();
+        let requested_from = observed_at - filter.duration();
+        let collection_start = parse_time(&collection_started_at)?;
+        let from = requested_from.max(collection_start);
+        let to = observed_at;
+        let scope = Scope::new(&collection_epoch, from, to, filter);
+        let summary = load_summary(database.connection(), &scope)?;
+        let coverage = load_coverage(database.connection(), &scope)?;
+        let run_cost = load_run_cost(database.connection(), &scope)?;
+        let reconciliation = if filter.runtime_kind.is_none()
+            && filter.model_key.is_none()
+            && filter.cost_kind.is_none()
+        {
+            load_reconciliation_cost(database.connection(), &scope)?
+        } else {
+            ReconciliationCost::default()
+        };
+        let cost = cost_summary(run_cost, reconciliation)?;
+        let trend = load_trend(database.connection(), &scope)?;
+        let by_runtime = load_breakdown(database.connection(), &scope, BreakdownKind::Runtime)?;
+        let by_model = load_breakdown(database.connection(), &scope, BreakdownKind::Model)?;
+        Ok(json!({
+            "schemaVersion": USAGE_SCHEMA_VERSION,
+            "collection": {
+                "epoch": collection_epoch,
+                "startedAt": collection_started_at,
+            },
+            "range": {
+                "from": from.to_rfc3339(),
+                "to": to.to_rfc3339(),
+            },
+            "summary": {
+                "promptInputTotalTokens": summary.prompt_input_total_tokens,
+                "uncachedInputTokens": summary.uncached_input_tokens,
+                "cacheReadTokens": summary.cache_read_tokens,
+                "cacheWriteTokens": summary.cache_write_tokens,
+                "outputTokens": summary.output_tokens,
+                "reasoningOutputTokens": summary.reasoning_output_tokens,
+                "cacheReadShare": ratio(
+                    summary.cache_read_tokens,
+                    summary.prompt_input_total_tokens,
+                ),
+                "requestCacheHitRate": ratio(
+                    summary.cache_hit_request_count,
+                    summary.cache_observable_request_count,
+                ),
+                "cost": cost,
+            },
+            "trend": trend,
+            "byRuntime": by_runtime,
+            "byModel": by_model,
+            "coverage": coverage,
+        }))
+    }
+}
+
+fn persist_usage_record(
+    transaction: &rusqlite::Transaction<'_>,
+    collection_epoch: &str,
+    run: &RuntimeUsageRun,
+    record: &BufferedUsageRecord,
+) -> Result<bool> {
+    let normalized = &record.normalized;
+    let enrolled: bool = transaction.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM runtime_usage_run_summary
+            WHERE collection_epoch = ?1 AND agent_run_id = ?2
+        )
+        "#,
+        params![collection_epoch, run.key.agent_run_id],
+        |row| row.get(0),
+    )?;
+    if !enrolled {
+        return Ok(false);
+    }
+    if record.usage.scope == "session"
+        && record.usage.counter_mode == RuntimeUsageCounterMode::Gauge
+        && !normalized.any_observed()
+        && record.usage.cost.is_none()
+    {
+        // Context has one latest row, no cumulative baseline or value history.
+        return persist_session_context(transaction, run, &record.usage);
+    }
+    let source_key = checkpoint_key(run, &record.usage)?;
+    let checkpoint_key = if record.usage.counter_mode == RuntimeUsageCounterMode::Delta {
+        // A checkpoint belongs to a native call, not to whichever calls happened
+        // to share a timer tick. Replaying a committed batch is idempotent too.
+        crate::command::canonical_json_digest(&json!({
+            "source": source_key, "identities": record.source_identities,
+        }))?
+    } else {
+        source_key
+    };
+    let event_digest = crate::command::canonical_json_digest(&json!({
+        "identities": record.source_identities,
+        "dialect": record.usage.dialect_id,
+        "suffix": record.usage.identity_suffix,
+    }))?;
+    let existing = load_checkpoint(
+        transaction,
+        collection_epoch,
+        &run.key.agent_run_id,
+        run.key.execution_epoch,
+        &checkpoint_key,
+    )?;
+    if existing
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.last_event_digest == event_digest)
+    {
+        return Ok(false);
+    }
+    if record.usage.fields.context_used_tokens.is_some()
+        || record.usage.fields.context_size_tokens.is_some()
+        || record.usage.fields.native_context_ratio.is_some()
+    {
+        persist_session_context(transaction, run, &record.usage)?;
+    }
+    let (delta, cost_delta) = match record.usage.counter_mode {
+        RuntimeUsageCounterMode::Delta => (normalized.clone(), record.usage.cost.clone()),
+        RuntimeUsageCounterMode::Cumulative | RuntimeUsageCounterMode::Gauge => {
+            let delta = existing
+                .as_ref()
+                .map(|checkpoint| subtract_counters(normalized, &checkpoint.baseline))
+                .unwrap_or_else(|| {
+                    // This verified dialect identifies a root message started
+                    // inside this Run. Its first cumulative call observation
+                    // starts at zero; session/run counters still need history.
+                    if run.runtime_kind == AdapterKind::ClaudeCodeCli
+                        && record.usage.scope == "model_call"
+                        && record.usage.dialect_id == "claude-stream-call-usage-v1"
+                    {
+                        normalized.clone()
+                    } else {
+                        UsageCounters::default()
+                    }
+                });
+            let cost_delta = match (record.usage.cost.as_ref(), existing.as_ref()) {
+                (Some(current), Some(checkpoint))
+                    if checkpoint.cost_currency.as_deref() == Some(current.currency.as_str()) =>
+                {
+                    match checkpoint.cost_baseline.as_deref() {
+                        Some(baseline) => subtract_decimal_nonnegative(&current.amount, baseline)?
+                            .filter(|amount| !decimal_is_zero(amount))
+                            .map(|amount| RuntimeUsageCost {
+                                amount,
+                                ..current.clone()
+                            }),
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            (delta, cost_delta)
+        }
+    };
+    let now = Utc::now().to_rfc3339();
+    let occurred_at = record.usage.occurred_at.as_deref().unwrap_or(&now);
+    parse_time(occurred_at)?;
+    if delta.any_observed() || cost_delta.is_some() {
+        update_run_summary(
+            transaction,
+            collection_epoch,
+            run,
+            &record.usage,
+            &delta,
+            cost_delta.as_ref(),
+            delta.any_observed().then(|| {
+                normalized.prompt_input_total_tokens.is_some()
+                    && normalized.output_tokens.is_some()
+                    // This is a reliable root-prompt sum, but does not cover
+                    // native delegated Sessions. Reuse the existing partial
+                    // quality instead of advertising a complete Run total.
+                    && record.usage.dialect_id != "opencode-acp-root-prompt-usage-v2"
+                    // Native journals are sampled asynchronously; neither the
+                    // initial cursor nor the final tail is a completion barrier.
+                    && record.usage.identity_suffix != "native_model_call"
+                    && existing.as_ref().is_none_or(|checkpoint| {
+                        record.usage.counter_mode == RuntimeUsageCounterMode::Delta
+                            || (checkpoint.baseline.prompt_input_total_tokens.is_some()
+                                && checkpoint.baseline.output_tokens.is_some())
+                    })
+            }),
+            occurred_at,
+            &now,
+        )?;
+        update_hourly(
+            transaction,
+            collection_epoch,
+            run,
+            &delta,
+            occurred_at,
+            &now,
+        )?;
+    }
+    upsert_checkpoint(
+        transaction,
+        collection_epoch,
+        run,
+        &record.usage,
+        &checkpoint_key,
+        &event_digest,
+        normalized,
+        &now,
+    )?;
+    Ok(true)
+}
+
+fn persist_session_context(
+    transaction: &rusqlite::Transaction<'_>,
+    run: &RuntimeUsageRun,
+    usage: &ParsedRuntimeUsage,
+) -> Result<bool> {
+    let Some(native_session_id) = usage.native_session_id.as_deref() else {
+        return Ok(false);
+    };
+    if usage.scope != "session" || usage.counter_mode != RuntimeUsageCounterMode::Gauge {
+        return Ok(false);
+    }
+    let used = usage.fields.context_used_tokens;
+    let mut window = usage.fields.context_size_tokens.filter(|value| *value > 0);
+    let mut native_ratio = usage
+        .fields
+        .native_context_ratio
+        .filter(|n| n.is_finite() && (0.0..=1.0).contains(n));
+    if used.is_none() && usage.fields.context_size_tokens.is_none() && native_ratio.is_none() {
+        return Ok(false);
+    }
+    let observed_at = usage
+        .occurred_at
+        .as_deref()
+        .context("Context observation has no time")?;
+    let observed_time = parse_time(observed_at)?;
+    // The delivery row supplies the immutable dispatch binding, NOT acceptance.
+    // An active, failed or cancelled prompt can all observe its current Session.
+    let owner = transaction.query_row(r#"
+        SELECT c.id, d.native_binding_id, d.native_binding_generation,
+               NULLIF(ar.runtime_observed_model_id, ''), ar.runtime_host_config_digest, ar.runtime_model_selection_json
+        FROM agent_run ar
+        JOIN runtime_input_delivery d ON d.agent_run_id=ar.id AND d.execution_epoch=ar.execution_epoch AND d.input_kind='start'
+        JOIN conversation c ON c.id=ar.conversation_id
+        WHERE ar.id=?1 AND ar.execution_epoch=?2 AND c.native_session_id=?3
+          AND c.native_binding_id=d.native_binding_id
+          AND c.native_binding_generation=d.native_binding_generation
+          AND NOT EXISTS (
+              SELECT 1 FROM agent_run newer
+              JOIN runtime_input_delivery nd ON nd.agent_run_id=newer.id AND nd.execution_epoch=newer.execution_epoch
+              WHERE newer.conversation_id=ar.conversation_id
+                AND nd.native_binding_id=d.native_binding_id
+                AND nd.native_binding_generation=d.native_binding_generation
+                AND (newer.started_at>ar.started_at OR (newer.started_at=ar.started_at AND newer.id>ar.id))
+          )
+    "#, params![run.key.agent_run_id, run.key.execution_epoch, native_session_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, Option<String>>(5)?))
+    }).optional()?;
+    let Some((conversation, binding, generation, observed_model, config, model_config)) = owner
+    else {
+        return Ok(false);
+    };
+    let previous = transaction
+        .query_row(
+            r#"
+        SELECT x.model_key, x.effective_config_digest, x.context_window_tokens, x.observed_at, previous.runtime_model_selection_json
+        FROM runtime_session_context_latest x JOIN agent_run previous ON previous.id=x.source_agent_run_id
+        WHERE x.conversation_id=?1 AND x.native_binding_id=?2 AND x.native_binding_generation=?3
+          AND x.native_session_id=?4 AND x.runtime_kind=?5
+    "#,
+            params![
+                conversation,
+                binding,
+                generation,
+                native_session_id,
+                run.runtime_kind.as_str()
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let mut model = usage
+        .context_model_id
+        .clone()
+        .and_then(non_empty)
+        .or(observed_model);
+    if let Some((old_model, old_config, old_window, old_time, old_model_config)) = previous {
+        if observed_time < parse_time(&old_time)? {
+            return Ok(false);
+        }
+        // Host identity deliberately excludes turn-scoped model options. Check
+        // the frozen selection too (provider/options, including window overrides).
+        // A configured routing alias alone never establishes actual model identity.
+        let same_config =
+            config.is_some() && config == old_config && model_config == old_model_config;
+        if same_config && model.is_none() {
+            model = old_model.clone();
+        }
+        if usage.fields.context_size_tokens.is_none()
+            && same_config
+            && model.is_some()
+            && model == old_model
+        {
+            window = old_window;
+        }
+    }
+    if used.zip(window).is_some_and(|(used, window)| used > window) {
+        // Preserve the measured occupancy; this denominator is no longer valid.
+        window = None;
+        native_ratio = None;
+    }
+    // Occupancy and a native ratio are observations, not reusable capacity.
+    // Neither is inherited from an earlier call when a new observation arrives.
+    let changed = transaction.execute(
+        r#"
+        INSERT INTO runtime_session_context_latest (
+            conversation_id,native_binding_id,native_binding_generation,native_session_id,
+            runtime_kind,runtime_version,model_key,effective_config_digest,
+            context_used_tokens,context_window_tokens,source,dialect_id,observed_at,
+            source_agent_run_id,source_execution_epoch,native_context_ratio
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+        ON CONFLICT(conversation_id) DO UPDATE SET
+            native_binding_id=excluded.native_binding_id,
+            native_binding_generation=excluded.native_binding_generation,
+            native_session_id=excluded.native_session_id,
+            runtime_kind=excluded.runtime_kind,
+            runtime_version=excluded.runtime_version,
+            model_key=excluded.model_key,
+            effective_config_digest=excluded.effective_config_digest,
+            context_used_tokens=excluded.context_used_tokens,
+            context_window_tokens=excluded.context_window_tokens,
+            source=excluded.source, dialect_id=excluded.dialect_id,
+            observed_at=excluded.observed_at, source_agent_run_id=excluded.source_agent_run_id,
+            source_execution_epoch=excluded.source_execution_epoch,
+            native_context_ratio=excluded.native_context_ratio
+    "#,
+        params![
+            conversation,
+            binding,
+            generation,
+            native_session_id,
+            run.runtime_kind.as_str(),
+            run.runtime_version,
+            model,
+            config,
+            used,
+            window,
+            usage.source,
+            usage.dialect_id,
+            observed_at,
+            run.key.agent_run_id,
+            run.key.execution_epoch,
+            native_ratio
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+#[derive(Debug, Default)]
+struct Checkpoint {
+    last_event_digest: String,
+    baseline: UsageCounters,
+    cost_baseline: Option<String>,
+    cost_currency: Option<String>,
+}
+
+fn load_checkpoint(
+    transaction: &rusqlite::Transaction<'_>,
+    collection_epoch: &str,
+    agent_run_id: &str,
+    execution_epoch: i64,
+    checkpoint_key: &str,
+) -> Result<Option<Checkpoint>> {
+    transaction
+        .query_row(
+            r#"
+            SELECT last_event_digest, prompt_input_total_baseline,
+                   uncached_input_baseline, cache_read_baseline,
+                   cache_write_baseline, output_baseline,
+                   reasoning_output_baseline,
+                   cache_observable_request_baseline,
+                   cache_hit_request_baseline,
+                   cumulative_cost_baseline_decimal,
+                   cumulative_cost_currency
+            FROM runtime_usage_checkpoint
+            WHERE collection_epoch = ?1 AND agent_run_id = ?2
+              AND execution_epoch = ?3 AND checkpoint_key = ?4
+            "#,
+            params![
+                collection_epoch,
+                agent_run_id,
+                execution_epoch,
+                checkpoint_key
+            ],
+            |row| {
+                Ok(Checkpoint {
+                    last_event_digest: row.get(0)?,
+                    baseline: UsageCounters {
+                        prompt_input_total_tokens: row.get(1)?,
+                        uncached_input_tokens: row.get(2)?,
+                        cache_read_tokens: row.get(3)?,
+                        cache_write_tokens: row.get(4)?,
+                        output_tokens: row.get(5)?,
+                        reasoning_output_tokens: row.get(6)?,
+                        cache_observable_request_count: row.get(7)?,
+                        cache_hit_request_count: row.get(8)?,
+                    },
+                    cost_baseline: row.get(9)?,
+                    cost_currency: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_checkpoint(
+    transaction: &rusqlite::Transaction<'_>,
+    collection_epoch: &str,
+    run: &RuntimeUsageRun,
+    usage: &ParsedRuntimeUsage,
+    checkpoint_key: &str,
+    event_digest: &str,
+    baseline: &UsageCounters,
+    now: &str,
+) -> Result<()> {
+    let expires_at = (parse_time(now)? + Duration::hours(CHECKPOINT_TTL_HOURS)).to_rfc3339();
+    transaction.execute(
+        r#"
+        INSERT INTO runtime_usage_checkpoint(
+            collection_epoch, agent_run_id, execution_epoch, checkpoint_key,
+            runtime_kind, parser_version, source_kind, counter_mode,
+            last_event_digest, prompt_input_total_baseline,
+            uncached_input_baseline, cache_read_baseline, cache_write_baseline,
+            output_baseline, reasoning_output_baseline,
+            cache_observable_request_baseline, cache_hit_request_baseline,
+            cumulative_cost_baseline_decimal, cumulative_cost_currency,
+            updated_at, expires_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+        )
+        ON CONFLICT(
+            collection_epoch, agent_run_id, execution_epoch, checkpoint_key
+        ) DO UPDATE SET
+            last_event_digest = excluded.last_event_digest,
+            prompt_input_total_baseline = excluded.prompt_input_total_baseline,
+            uncached_input_baseline = excluded.uncached_input_baseline,
+            cache_read_baseline = excluded.cache_read_baseline,
+            cache_write_baseline = excluded.cache_write_baseline,
+            output_baseline = excluded.output_baseline,
+            reasoning_output_baseline = excluded.reasoning_output_baseline,
+            cache_observable_request_baseline =
+                excluded.cache_observable_request_baseline,
+            cache_hit_request_baseline = excluded.cache_hit_request_baseline,
+            cumulative_cost_baseline_decimal =
+                excluded.cumulative_cost_baseline_decimal,
+            cumulative_cost_currency = excluded.cumulative_cost_currency,
+            updated_at = excluded.updated_at,
+            expires_at = excluded.expires_at
+        "#,
+        params![
+            collection_epoch,
+            run.key.agent_run_id,
+            run.key.execution_epoch,
+            checkpoint_key,
+            run.runtime_kind.as_str(),
+            USAGE_PARSER_VERSION,
+            format!("{}:{}:{}", usage.source, usage.scope, usage.dialect_id),
+            usage.counter_mode.as_str(),
+            event_digest,
+            baseline.prompt_input_total_tokens,
+            baseline.uncached_input_tokens,
+            baseline.cache_read_tokens,
+            baseline.cache_write_tokens,
+            baseline.output_tokens,
+            baseline.reasoning_output_tokens,
+            baseline.cache_observable_request_count,
+            baseline.cache_hit_request_count,
+            usage.cost.as_ref().map(|cost| cost.amount.as_str()),
+            usage.cost.as_ref().map(|cost| cost.currency.as_str()),
+            now,
+            expires_at,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_run_summary(
+    transaction: &rusqlite::Transaction<'_>,
+    collection_epoch: &str,
+    run: &RuntimeUsageRun,
+    usage: &ParsedRuntimeUsage,
+    delta: &UsageCounters,
+    cost_delta: Option<&RuntimeUsageCost>,
+    input_output_complete: Option<bool>,
+    occurred_at: &str,
+    updated_at: &str,
+) -> Result<()> {
+    transaction.execute(
+        r#"
+        UPDATE runtime_usage_run_summary
+        SET input_semantics = CASE
+                WHEN input_semantics = 'unknown'
+                     AND ?3 <> 'unknown' THEN ?3
+                ELSE input_semantics
+            END,
+            usage_source = CASE
+                WHEN usage_source IS NULL THEN ?4
+                WHEN usage_source = ?4 THEN usage_source
+                ELSE 'mixed'
+            END,
+            usage_quality = CASE
+                WHEN ?14 IS NULL THEN usage_quality
+                WHEN ?14 = 0 OR usage_quality = 'runtime_reported_partial'
+                    THEN 'runtime_reported_partial'
+                WHEN usage_quality IS NULL THEN 'runtime_reported'
+                WHEN usage_quality = 'runtime_reported' THEN usage_quality
+                ELSE 'mixed'
+            END,
+            prompt_input_total_tokens = CASE WHEN ?5 IS NULL
+                THEN prompt_input_total_tokens
+                ELSE COALESCE(prompt_input_total_tokens, 0) + ?5 END,
+            uncached_input_tokens = CASE WHEN ?6 IS NULL
+                THEN uncached_input_tokens
+                ELSE COALESCE(uncached_input_tokens, 0) + ?6 END,
+            cache_read_tokens = CASE WHEN ?7 IS NULL
+                THEN cache_read_tokens
+                ELSE COALESCE(cache_read_tokens, 0) + ?7 END,
+            cache_write_tokens = CASE WHEN ?8 IS NULL
+                THEN cache_write_tokens
+                ELSE COALESCE(cache_write_tokens, 0) + ?8 END,
+            output_tokens = CASE WHEN ?9 IS NULL
+                THEN output_tokens
+                ELSE COALESCE(output_tokens, 0) + ?9 END,
+            reasoning_output_tokens = CASE WHEN ?10 IS NULL
+                THEN reasoning_output_tokens
+                ELSE COALESCE(reasoning_output_tokens, 0) + ?10 END,
+            cache_observable_request_count = CASE WHEN ?11 IS NULL
+                THEN cache_observable_request_count
+                ELSE COALESCE(cache_observable_request_count, 0) + ?11 END,
+            cache_hit_request_count = CASE WHEN ?12 IS NULL
+                THEN cache_hit_request_count
+                ELSE COALESCE(cache_hit_request_count, 0) + ?12 END,
+            first_observed_at = COALESCE(first_observed_at, ?13),
+            last_observed_at = CASE
+                WHEN last_observed_at IS NULL OR last_observed_at < ?13 THEN ?13
+                ELSE last_observed_at
+            END
+        WHERE collection_epoch = ?1 AND agent_run_id = ?2
+        "#,
+        params![
+            collection_epoch,
+            run.key.agent_run_id,
+            usage.input_semantics.as_str(),
+            usage.source,
+            delta.prompt_input_total_tokens,
+            delta.uncached_input_tokens,
+            delta.cache_read_tokens,
+            delta.cache_write_tokens,
+            delta.output_tokens,
+            delta.reasoning_output_tokens,
+            delta.cache_observable_request_count,
+            delta.cache_hit_request_count,
+            occurred_at,
+            input_output_complete,
+        ],
+    )?;
+    if let Some(cost) = cost_delta {
+        update_best_run_cost(
+            transaction,
+            collection_epoch,
+            &run.key.agent_run_id,
+            cost,
+            updated_at,
+        )?;
+    }
+    Ok(())
+}
+
+fn update_best_run_cost(
+    transaction: &rusqlite::Transaction<'_>,
+    collection_epoch: &str,
+    agent_run_id: &str,
+    incoming: &RuntimeUsageCost,
+    updated_at: &str,
+) -> Result<()> {
+    let current = transaction.query_row(
+        r#"
+        SELECT cost_amount_decimal, cost_currency, cost_kind, cost_source
+        FROM runtime_usage_run_summary
+        WHERE collection_epoch = ?1 AND agent_run_id = ?2
+        "#,
+        params![collection_epoch, agent_run_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        },
+    )?;
+    let should_replace = current.0.is_none()
+        || cost_quality_rank(&incoming.quality)
+            > cost_quality_rank(current.3.as_deref().unwrap_or(""));
+    let amount = if !should_replace
+        && current.1.as_deref() == Some(incoming.currency.as_str())
+        && current.2.as_deref() == Some(incoming.grain.as_str())
+        && current.3.as_deref() == Some(incoming.quality.as_str())
+    {
+        add_decimal(current.0.as_deref().unwrap_or("0"), &incoming.amount)?
+    } else if should_replace {
+        incoming.amount.clone()
+    } else {
+        return Ok(());
+    };
+    transaction.execute(
+        r#"
+        UPDATE runtime_usage_run_summary
+        SET cost_amount_decimal = ?3, cost_currency = ?4,
+            cost_kind = ?5, cost_source = ?6,
+            last_observed_at = COALESCE(last_observed_at, ?7)
+        WHERE collection_epoch = ?1 AND agent_run_id = ?2
+        "#,
+        params![
+            collection_epoch,
+            agent_run_id,
+            amount,
+            incoming.currency,
+            incoming.grain,
+            incoming.quality,
+            updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_codex_run_cost(
+    transaction: &rusqlite::Transaction<'_>,
+    collection_epoch: &str,
+    run: &RuntimeUsageRun,
+) -> Result<()> {
+    if run.runtime_kind != AdapterKind::CodexCli {
+        return Ok(());
+    }
+    let row = transaction
+        .query_row(
+            r#"
+            SELECT model_key, COALESCE(observed_service_tier, service_tier), enrolled_at,
+                   uncached_input_tokens, cache_read_tokens,
+                   cache_write_tokens, output_tokens,
+                   cost_kind, cost_source
+            FROM runtime_usage_run_summary
+            WHERE collection_epoch = ?1 AND agent_run_id = ?2
+            "#,
+            params![collection_epoch, run.key.agent_run_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        model_key,
+        service_tier,
+        enrolled_at,
+        Some(uncached_input),
+        Some(cache_read),
+        Some(cache_write),
+        Some(output),
+        current_kind,
+        current_source,
+    )) = row
+    else {
+        return Ok(());
+    };
+    if current_kind.is_some()
+        && (current_kind.as_deref() != Some("price_estimated")
+            || current_source.as_deref() != Some("price_catalog"))
+    {
+        return Ok(());
+    }
+    let Some(estimate) = estimate_codex_api_price(
+        model_key.as_deref(),
+        service_tier.as_deref(),
+        parse_time(&enrolled_at)?,
+        CodexTokenBuckets {
+            uncached_input,
+            cache_read,
+            cache_write,
+            output,
+        },
+    ) else {
+        // A newly observed unknown tier must also withdraw an earlier requested-tier estimate.
+        transaction.execute(
+            "UPDATE runtime_usage_run_summary SET cost_amount_decimal = NULL, cost_currency = NULL,
+                cost_kind = NULL, cost_source = NULL, pricing_catalog_version = NULL
+             WHERE collection_epoch = ?1 AND agent_run_id = ?2 AND cost_kind = 'price_estimated' AND cost_source = 'price_catalog'",
+            params![collection_epoch, run.key.agent_run_id],
+        )?;
+        return Ok(());
+    };
+    transaction.execute(
+        r#"
+        UPDATE runtime_usage_run_summary
+        SET cost_amount_decimal = ?3, cost_currency = 'USD',
+            cost_kind = 'price_estimated', cost_source = 'price_catalog',
+            pricing_catalog_version = ?4,
+            eligible_mask = eligible_mask | ?5
+        WHERE collection_epoch = ?1 AND agent_run_id = ?2
+        "#,
+        params![
+            collection_epoch,
+            run.key.agent_run_id,
+            estimate.amount_decimal,
+            estimate.catalog_version,
+            ELIGIBLE_COST,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_hourly(
+    transaction: &rusqlite::Transaction<'_>,
+    collection_epoch: &str,
+    run: &RuntimeUsageRun,
+    delta: &UsageCounters,
+    occurred_at: &str,
+    updated_at: &str,
+) -> Result<()> {
+    if !delta.any_observed() {
+        return Ok(());
+    }
+    let bucket = hour_bucket(parse_time(occurred_at)?).to_rfc3339();
+    let changed = transaction.execute(
+        r#"
+        UPDATE runtime_usage_hourly
+        SET prompt_input_total_tokens = CASE WHEN ?6 IS NULL
+                THEN prompt_input_total_tokens
+                ELSE COALESCE(prompt_input_total_tokens, 0) + ?6 END,
+            uncached_input_tokens = CASE WHEN ?7 IS NULL
+                THEN uncached_input_tokens
+                ELSE COALESCE(uncached_input_tokens, 0) + ?7 END,
+            cache_read_tokens = CASE WHEN ?8 IS NULL
+                THEN cache_read_tokens
+                ELSE COALESCE(cache_read_tokens, 0) + ?8 END,
+            cache_write_tokens = CASE WHEN ?9 IS NULL
+                THEN cache_write_tokens
+                ELSE COALESCE(cache_write_tokens, 0) + ?9 END,
+            output_tokens = CASE WHEN ?10 IS NULL
+                THEN output_tokens
+                ELSE COALESCE(output_tokens, 0) + ?10 END,
+            reasoning_output_tokens = CASE WHEN ?11 IS NULL
+                THEN reasoning_output_tokens
+                ELSE COALESCE(reasoning_output_tokens, 0) + ?11 END,
+            cache_observable_request_count = CASE WHEN ?12 IS NULL
+                THEN cache_observable_request_count
+                ELSE COALESCE(cache_observable_request_count, 0) + ?12 END,
+            cache_hit_request_count = CASE WHEN ?13 IS NULL
+                THEN cache_hit_request_count
+                ELSE COALESCE(cache_hit_request_count, 0) + ?13 END,
+            last_updated_at = ?14
+        WHERE collection_epoch = ?1 AND bucket_start_at = ?2
+          AND runtime_kind = ?3 AND provider_key IS ?4 AND model_key IS ?5
+        "#,
+        params![
+            collection_epoch,
+            bucket,
+            run.runtime_kind.as_str(),
+            run.provider_key,
+            run.model_key,
+            delta.prompt_input_total_tokens,
+            delta.uncached_input_tokens,
+            delta.cache_read_tokens,
+            delta.cache_write_tokens,
+            delta.output_tokens,
+            delta.reasoning_output_tokens,
+            delta.cache_observable_request_count,
+            delta.cache_hit_request_count,
+            updated_at,
+        ],
+    )?;
+    if changed == 0 {
+        transaction.execute(
+            r#"
+            INSERT INTO runtime_usage_hourly(
+                collection_epoch, bucket_start_at, runtime_kind,
+                provider_key, model_key, prompt_input_total_tokens,
+                uncached_input_tokens, cache_read_tokens, cache_write_tokens,
+                output_tokens, reasoning_output_tokens,
+                cache_observable_request_count, cache_hit_request_count,
+                last_updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13, ?14
+            )
+            "#,
+            params![
+                collection_epoch,
+                bucket,
+                run.runtime_kind.as_str(),
+                run.provider_key,
+                run.model_key,
+                delta.prompt_input_total_tokens,
+                delta.uncached_input_tokens,
+                delta.cache_read_tokens,
+                delta.cache_write_tokens,
+                delta.output_tokens,
+                delta.reasoning_output_tokens,
+                delta.cache_observable_request_count,
+                delta.cache_hit_request_count,
+                updated_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn finalize_run_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    collection_epoch: &str,
+    agent_run_id: &str,
+) -> Result<bool> {
+    // Late periodic batches still need the baseline and deduplication keys.
+    // The existing bounded retention job owns checkpoint removal.
+    let changed = transaction.execute(
+        r#"
+        UPDATE runtime_usage_run_summary
+        SET finalized_at = COALESCE(finalized_at, ?3)
+        WHERE collection_epoch = ?1 AND agent_run_id = ?2
+        "#,
+        params![collection_epoch, agent_run_id, Utc::now().to_rfc3339()],
+    )?;
+    Ok(changed > 0)
+}
+
+fn checkpoint_key(run: &RuntimeUsageRun, usage: &ParsedRuntimeUsage) -> Result<String> {
+    crate::command::canonical_json_digest(&json!({
+        "runtimeKind": run.runtime_kind,
+        "dialect": usage.dialect_id,
+        "suffix": usage.identity_suffix,
+        "scope": usage.scope,
+        "source": usage.source,
+        "nativeSession": usage.native_session_id,
+        "nativeTurn": usage.native_turn_id,
+    }))
+}
+
+fn normalize_usage(usage: &ParsedRuntimeUsage) -> Result<UsageCounters> {
+    validate_usage(usage)?;
+    let read = usage.fields.cache_read_input_tokens;
+    let write = usage.fields.cache_write_input_tokens;
+    let input = usage.fields.input_tokens;
+    let (prompt_total, derived_uncached) = match usage.input_semantics {
+        RuntimeInputSemantics::CacheInclusiveTotal => {
+            if let (Some(total), Some(read), Some(write)) = (input, read, write) {
+                let cached = read
+                    .checked_add(write)
+                    .context("Runtime Usage cache bucket overflow")?;
+                if cached > total {
+                    anyhow::bail!("Runtime Usage cache buckets exceed prompt input total");
+                }
+                (Some(total), Some(total - cached))
+            } else {
+                (input, None)
+            }
+        }
+        RuntimeInputSemantics::ExclusiveBuckets => {
+            let prompt_total = match (input, read, write) {
+                (Some(uncached), Some(read), Some(write)) => Some(
+                    uncached
+                        .checked_add(read)
+                        .and_then(|value| value.checked_add(write))
+                        .context("Runtime Usage prompt input total overflow")?,
+                ),
+                _ => None,
+            };
+            (prompt_total, input)
+        }
+        RuntimeInputSemantics::Unknown => (None, None),
+    };
+    let uncached = match (usage.fields.uncached_input_tokens, derived_uncached) {
+        (Some(reported), Some(derived)) if reported != derived => {
+            anyhow::bail!("Runtime Usage uncached input conflicts with bucket arithmetic")
+        }
+        (Some(reported), _) => Some(reported),
+        (None, derived) => derived,
+    };
+    if let (Some(reasoning), Some(output)) = (
+        usage.fields.reasoning_output_tokens,
+        usage.fields.output_tokens,
+    ) && reasoning > output
+    {
+        anyhow::bail!("Runtime Usage reasoning output exceeds output total");
+    }
+    // Only an individual model call with an observed cache-read bucket proves
+    // a hit or a miss. Cache-write alone and turn/session totals cannot do so.
+    let cache_observable = (usage.scope == "model_call" && read.is_some()).then_some(1);
+    let cache_hit = cache_observable.and_then(|_| read.map(|read| i64::from(read > 0)));
+    Ok(UsageCounters {
+        prompt_input_total_tokens: prompt_total,
+        uncached_input_tokens: uncached,
+        cache_read_tokens: read,
+        cache_write_tokens: write,
+        output_tokens: usage.fields.output_tokens,
+        reasoning_output_tokens: usage.fields.reasoning_output_tokens,
+        cache_observable_request_count: cache_observable,
+        cache_hit_request_count: cache_hit,
+    })
+}
+
+fn subtract_counters(current: &UsageCounters, baseline: &UsageCounters) -> UsageCounters {
+    UsageCounters {
+        prompt_input_total_tokens: counter_delta(
+            current.prompt_input_total_tokens,
+            baseline.prompt_input_total_tokens,
+        ),
+        uncached_input_tokens: counter_delta(
+            current.uncached_input_tokens,
+            baseline.uncached_input_tokens,
+        ),
+        cache_read_tokens: counter_delta(current.cache_read_tokens, baseline.cache_read_tokens),
+        cache_write_tokens: counter_delta(current.cache_write_tokens, baseline.cache_write_tokens),
+        output_tokens: counter_delta(current.output_tokens, baseline.output_tokens),
+        reasoning_output_tokens: counter_delta(
+            current.reasoning_output_tokens,
+            baseline.reasoning_output_tokens,
+        ),
+        cache_observable_request_count: counter_delta(
+            current.cache_observable_request_count,
+            baseline.cache_observable_request_count,
+        ),
+        cache_hit_request_count: counter_delta(
+            current.cache_hit_request_count,
+            baseline.cache_hit_request_count,
+        ),
+    }
+}
+
+fn counter_delta(current: Option<i64>, baseline: Option<i64>) -> Option<i64> {
+    match (current, baseline) {
+        (Some(current), Some(baseline)) if current > baseline => Some(current - baseline),
+        _ => None,
+    }
+}
+
+fn validate_usage(usage: &ParsedRuntimeUsage) -> Result<()> {
+    validate_key(&usage.identity_suffix, "source identity")?;
+    validate_key(&usage.dialect_id, "dialect")?;
+    if !matches!(
+        usage.source.as_str(),
+        "runtime_event"
+            | "runtime_result"
+            | "runtime_private_extension"
+            | "provider_usage_api"
+            | "local_tokenizer"
+    ) {
+        anyhow::bail!("Runtime Usage source is unsupported");
+    }
+    if !matches!(
+        usage.scope.as_str(),
+        "model_call" | "turn" | "run" | "session"
+    ) {
+        anyhow::bail!("Runtime Usage scope is unsupported");
+    }
+    for value in [
+        usage.fields.input_tokens,
+        usage.fields.uncached_input_tokens,
+        usage.fields.output_tokens,
+        usage.fields.reasoning_output_tokens,
+        usage.fields.cache_read_input_tokens,
+        usage.fields.cache_write_input_tokens,
+        usage.fields.context_used_tokens,
+        usage.fields.context_size_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value < 0 || value as u64 > JS_MAX_SAFE_INTEGER {
+            anyhow::bail!("Runtime Usage token field is outside the safe integer range");
+        }
+    }
+    if let Some(cost) = &usage.cost {
+        validate_decimal(&cost.amount)?;
+        validate_currency(&cost.currency)?;
+        if !matches!(
+            cost.grain.as_str(),
+            "model_call" | "turn" | "run" | "session" | "billing_bucket" | "unknown"
+        ) {
+            anyhow::bail!("Runtime Usage cost grain is unsupported");
+        }
+        if !matches!(
+            cost.quality.as_str(),
+            "runtime_reported"
+                | "runtime_estimate"
+                | "price_estimated"
+                | "tokenizer_price_estimated"
+        ) {
+            anyhow::bail!("Runtime Usage cost quality is unsupported");
+        }
+    }
+    Ok(())
+}
+
+fn eligible_mask_for_run(run: &RuntimeUsageRun, enrolled_at: DateTime<Utc>) -> i64 {
+    let mut mask = eligible_mask(run.runtime_kind, run.runtime_version.as_deref());
+    if run.runtime_kind == AdapterKind::CodexCli
+        && supports_codex_price_estimate(
+            run.model_key.as_deref(),
+            run.service_tier.as_deref(),
+            enrolled_at,
+        )
+    {
+        mask |= ELIGIBLE_COST;
+    }
+    mask
+}
+
+fn eligible_mask(runtime: AdapterKind, _runtime_version: Option<&str>) -> i64 {
+    // Coverage describes fields the format can carry, not a version allowlist.
+    // Actual observations still validate sparse fields, ownership and semantics.
+    let full_tokens = ELIGIBLE_PROMPT_INPUT_TOTAL
+        | ELIGIBLE_UNCACHED_INPUT
+        | ELIGIBLE_CACHE_READ
+        | ELIGIBLE_CACHE_WRITE
+        | ELIGIBLE_OUTPUT
+        | ELIGIBLE_REASONING_OUTPUT
+        | ELIGIBLE_REQUEST_CACHE_HIT;
+    match runtime {
+        AdapterKind::CodexCli
+        | AdapterKind::OpencodeCli
+        | AdapterKind::Pi
+        | AdapterKind::GrokBuild
+        | AdapterKind::AntigravityApp => full_tokens,
+        AdapterKind::ClaudeCodeCli | AdapterKind::CopilotCli => full_tokens | ELIGIBLE_COST,
+        AdapterKind::CodebuddyCli => (full_tokens & !ELIGIBLE_CACHE_WRITE) | ELIGIBLE_COST,
+        AdapterKind::QwenCode => {
+            (full_tokens & !(ELIGIBLE_UNCACHED_INPUT | ELIGIBLE_CACHE_WRITE)) | ELIGIBLE_COST
+        }
+        AdapterKind::KiroCli | AdapterKind::QoderCli => ELIGIBLE_COST,
+        AdapterKind::TraeCnCli => {
+            ELIGIBLE_COST | ELIGIBLE_PROMPT_INPUT_TOTAL | ELIGIBLE_OUTPUT | ELIGIBLE_CACHE_READ
+        }
+        AdapterKind::ZcodeApp => {
+            ELIGIBLE_PROMPT_INPUT_TOTAL | ELIGIBLE_CACHE_READ | ELIGIBLE_OUTPUT
+        }
+        AdapterKind::ClineCli => full_tokens,
+        AdapterKind::CommandCodeCli => {
+            full_tokens & !(ELIGIBLE_REASONING_OUTPUT | ELIGIBLE_REQUEST_CACHE_HIT)
+        }
+        AdapterKind::DeepseekHarness => {
+            ELIGIBLE_UNCACHED_INPUT
+                | ELIGIBLE_CACHE_READ
+                | ELIGIBLE_CACHE_WRITE
+                | ELIGIBLE_OUTPUT
+                | ELIGIBLE_REASONING_OUTPUT
+        }
+        AdapterKind::KimiCodeCli => full_tokens & !ELIGIBLE_REASONING_OUTPUT,
+        AdapterKind::HermesCli => {
+            ELIGIBLE_PROMPT_INPUT_TOTAL
+                | ELIGIBLE_CACHE_READ
+                | ELIGIBLE_OUTPUT
+                | ELIGIBLE_REASONING_OUTPUT
+        }
+        AdapterKind::MinimaxCodeCli => {
+            (full_tokens & !(ELIGIBLE_REASONING_OUTPUT | ELIGIBLE_REQUEST_CACHE_HIT))
+                | ELIGIBLE_COST
+        }
+        AdapterKind::CursorAgent => 0,
+    }
+}
+
+#[derive(Debug)]
+struct Scope {
+    where_sql: String,
+    params: Vec<SqlValue>,
+    collection_epoch: String,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    runtime_kind: Option<String>,
+    provider_key: Option<String>,
+    model_key: Option<String>,
+    cost_kind: Option<String>,
+    daily_trend: bool,
+}
+
+impl Scope {
+    fn new(
+        collection_epoch: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        filter: &MonitoringFilter,
+    ) -> Self {
+        let mut where_sql = String::from(
+            "collection_epoch = ? AND enrolled_at < ? AND COALESCE(last_observed_at, enrolled_at) >= ?",
+        );
+        let mut params = vec![
+            SqlValue::Text(collection_epoch.to_string()),
+            SqlValue::Text(to.to_rfc3339()),
+            SqlValue::Text(from.to_rfc3339()),
+        ];
+        if let Some(runtime) = filter.runtime_kind {
+            where_sql.push_str(" AND runtime_kind = ?");
+            params.push(SqlValue::Text(runtime.as_str().to_string()));
+        }
+        if let Some(provider) = &filter.provider_key {
+            where_sql.push_str(" AND provider_key = ?");
+            params.push(SqlValue::Text(provider.clone()));
+        }
+        if let Some(model) = &filter.model_key {
+            where_sql.push_str(" AND model_key = ?");
+            params.push(SqlValue::Text(model.clone()));
+        }
+        Self {
+            where_sql,
+            params,
+            collection_epoch: collection_epoch.to_string(),
+            from,
+            to,
+            runtime_kind: filter
+                .runtime_kind
+                .map(|runtime| runtime.as_str().to_string()),
+            provider_key: filter.provider_key.clone(),
+            model_key: filter.model_key.clone(),
+            cost_kind: filter.cost_kind.clone(),
+            daily_trend: filter.range != "24h",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SummaryAggregate {
+    prompt_input_total_tokens: Option<i64>,
+    uncached_input_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    reasoning_output_tokens: Option<i64>,
+    cache_observable_request_count: Option<i64>,
+    cache_hit_request_count: Option<i64>,
+}
+
+fn load_summary(connection: &Connection, scope: &Scope) -> Result<SummaryAggregate> {
+    let sql = format!(
+        r#"
+        SELECT SUM(prompt_input_total_tokens), SUM(uncached_input_tokens),
+               SUM(cache_read_tokens), SUM(cache_write_tokens),
+               SUM(output_tokens), SUM(reasoning_output_tokens),
+               SUM(cache_observable_request_count), SUM(cache_hit_request_count)
+        FROM runtime_usage_run_summary WHERE {}
+        "#,
+        scope.where_sql
+    );
+    connection
+        .query_row(&sql, params_from_iter(scope.params.clone()), |row| {
+            Ok(SummaryAggregate {
+                prompt_input_total_tokens: row.get(0)?,
+                uncached_input_tokens: row.get(1)?,
+                cache_read_tokens: row.get(2)?,
+                cache_write_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                reasoning_output_tokens: row.get(5)?,
+                cache_observable_request_count: row.get(6)?,
+                cache_hit_request_count: row.get(7)?,
+            })
+        })
+        .map_err(Into::into)
+}
+
+fn load_coverage(connection: &Connection, scope: &Scope) -> Result<Value> {
+    let cost_observed = if scope.cost_kind.is_some() {
+        "COALESCE(SUM(CASE WHEN cost_amount_decimal IS NOT NULL AND cost_kind = ? THEN 1 ELSE 0 END), 0)"
+    } else {
+        "COUNT(cost_amount_decimal)"
+    };
+    let sql = format!(
+        r#"
+        SELECT
+            COALESCE(SUM((eligible_mask & {prompt}) <> 0), 0), COUNT(prompt_input_total_tokens),
+            COALESCE(SUM((eligible_mask & {uncached}) <> 0), 0), COUNT(uncached_input_tokens),
+            COALESCE(SUM((eligible_mask & {read}) <> 0), 0), COUNT(cache_read_tokens),
+            COALESCE(SUM((eligible_mask & {write}) <> 0), 0), COUNT(cache_write_tokens),
+            COALESCE(SUM((eligible_mask & {output}) <> 0), 0), COUNT(output_tokens),
+            COALESCE(SUM((eligible_mask & {reasoning}) <> 0), 0), COUNT(reasoning_output_tokens),
+            COALESCE(SUM((eligible_mask & {hit}) <> 0), 0),
+                COUNT(cache_observable_request_count),
+            COALESCE(SUM((eligible_mask & {cost}) <> 0), 0), {cost_observed}
+        FROM runtime_usage_run_summary WHERE {}
+        "#,
+        scope.where_sql,
+        prompt = ELIGIBLE_PROMPT_INPUT_TOTAL,
+        uncached = ELIGIBLE_UNCACHED_INPUT,
+        read = ELIGIBLE_CACHE_READ,
+        write = ELIGIBLE_CACHE_WRITE,
+        output = ELIGIBLE_OUTPUT,
+        reasoning = ELIGIBLE_REASONING_OUTPUT,
+        hit = ELIGIBLE_REQUEST_CACHE_HIT,
+        cost = ELIGIBLE_COST,
+    );
+    let mut query_params = scope.params.clone();
+    if let Some(kind) = &scope.cost_kind {
+        query_params.insert(0, SqlValue::Text(kind.clone()));
+    }
+    connection
+        .query_row(&sql, params_from_iter(query_params), |row| {
+            Ok(json!({
+                "promptInputTotalTokens": coverage_value(row.get(0)?, row.get(1)?),
+                "uncachedInputTokens": coverage_value(row.get(2)?, row.get(3)?),
+                "cacheReadTokens": coverage_value(row.get(4)?, row.get(5)?),
+                "cacheWriteTokens": coverage_value(row.get(6)?, row.get(7)?),
+                "outputTokens": coverage_value(row.get(8)?, row.get(9)?),
+                "reasoningOutputTokens": coverage_value(row.get(10)?, row.get(11)?),
+                "requestCacheHitRate": coverage_value(row.get(12)?, row.get(13)?),
+                "cost": coverage_value(row.get(14)?, row.get(15)?),
+            }))
+        })
+        .map_err(Into::into)
+}
+
+fn coverage_value(eligible_runs: i64, observed_runs: i64) -> Value {
+    json!({
+        "eligibleRuns": eligible_runs,
+        "observedRuns": observed_runs,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct Money {
+    amount: String,
+    currency: String,
+    kind: String,
+    source: String,
+}
+
+fn load_run_cost(connection: &Connection, scope: &Scope) -> Result<Vec<Money>> {
+    let mut sql = format!(
+        r#"
+        SELECT cost_currency, cost_kind, cost_source,
+               rovai_decimal_sum(cost_amount_decimal)
+        FROM runtime_usage_run_summary
+        WHERE {} AND cost_amount_decimal IS NOT NULL
+        "#,
+        scope.where_sql
+    );
+    let mut query_params = scope.params.clone();
+    if let Some(kind) = &scope.cost_kind {
+        sql.push_str(" AND cost_kind = ?");
+        query_params.push(SqlValue::Text(kind.clone()));
+    }
+    sql.push_str(" GROUP BY cost_currency, cost_kind, cost_source ORDER BY cost_currency, cost_kind, cost_source");
+    let mut statement = connection.prepare(&sql)?;
+    statement
+        .query_map(params_from_iter(query_params), |row| {
+            Ok(Money {
+                currency: row.get(0)?,
+                kind: row.get(1)?,
+                source: row.get(2)?,
+                amount: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+#[derive(Debug, Default)]
+struct ReconciliationCost {
+    values: Vec<Money>,
+    latest_reconciled_at: Option<String>,
+}
+
+fn load_reconciliation_cost(connection: &Connection, scope: &Scope) -> Result<ReconciliationCost> {
+    let mut sql = String::from(
+        r#"
+        SELECT currency, rovai_decimal_sum(provider_cost_decimal),
+               MAX(reconciled_through_at)
+        FROM runtime_cost_reconciliation_bucket
+        WHERE collection_epoch = ? AND bucket_end_at > ? AND bucket_start_at < ?
+        "#,
+    );
+    let mut params = vec![
+        SqlValue::Text(scope.collection_epoch.clone()),
+        SqlValue::Text(scope.from.to_rfc3339()),
+        SqlValue::Text(scope.to.to_rfc3339()),
+    ];
+    if let Some(provider) = &scope.provider_key {
+        sql.push_str(" AND provider_key = ?");
+        params.push(SqlValue::Text(provider.clone()));
+    }
+    sql.push_str(" GROUP BY currency ORDER BY currency");
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(params_from_iter(params), |row| {
+            Ok((
+                Money {
+                    currency: row.get(0)?,
+                    amount: row.get(1)?,
+                    kind: "billing_bucket".to_string(),
+                    source: "provider_reconciled".to_string(),
+                },
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ReconciliationCost {
+        latest_reconciled_at: rows.iter().map(|(_, value)| value.clone()).max(),
+        values: rows.into_iter().map(|(money, _)| money).collect(),
+    })
+}
+
+fn cost_summary(run: Vec<Money>, reconciliation: ReconciliationCost) -> Result<Value> {
+    if run.is_empty() && reconciliation.values.is_empty() {
+        return Ok(Value::Null);
+    }
+    let mut run_by_currency = BTreeMap::new();
+    for value in &run {
+        let entry = run_by_currency
+            .entry(value.currency.clone())
+            .or_insert_with(|| "0".to_string());
+        *entry = add_decimal(entry, &value.amount)?;
+    }
+    let mut differences = Vec::new();
+    for value in &reconciliation.values {
+        if let Some(run_amount) = run_by_currency.get(&value.currency) {
+            differences.push(json!({
+                "currency": value.currency,
+                "amount": subtract_decimal_signed(&value.amount, run_amount)?,
+            }));
+        }
+    }
+    Ok(json!({
+        "run": run.into_iter().map(money_json).collect::<Vec<_>>(),
+        "reconciliation": reconciliation.values.into_iter().map(money_json).collect::<Vec<_>>(),
+        "latestReconciledAt": reconciliation.latest_reconciled_at,
+        "difference": differences,
+    }))
+}
+
+fn money_json(value: Money) -> Value {
+    json!({
+        "amount": value.amount,
+        "currency": value.currency,
+        "kind": value.kind,
+        "source": value.source,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BreakdownKind {
+    Runtime,
+    Model,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Breakdown {
+    runtime_kind: String,
+    provider_key: Option<String>,
+    model_key: Option<String>,
+    counters: UsageCounters,
+    eligible_runs: i64,
+    observed_runs: i64,
+    cost: Vec<Money>,
+}
+
+fn load_breakdown(
+    connection: &Connection,
+    scope: &Scope,
+    kind: BreakdownKind,
+) -> Result<Vec<Value>> {
+    let group = match kind {
+        BreakdownKind::Runtime => "runtime_kind",
+        BreakdownKind::Model => "runtime_kind, provider_key, model_key",
+    };
+    let select = match kind {
+        BreakdownKind::Runtime => "runtime_kind, NULL, NULL",
+        BreakdownKind::Model => "runtime_kind, provider_key, model_key",
+    };
+    let sql = format!(
+        r#"
+        SELECT {select},
+               SUM(prompt_input_total_tokens), SUM(uncached_input_tokens),
+               SUM(cache_read_tokens), SUM(cache_write_tokens),
+               SUM(output_tokens), SUM(reasoning_output_tokens),
+               SUM(cache_observable_request_count), SUM(cache_hit_request_count),
+               COUNT(*),
+               SUM(CASE WHEN prompt_input_total_tokens IS NOT NULL
+                         OR output_tokens IS NOT NULL
+                         OR cache_read_tokens IS NOT NULL
+                         OR cache_write_tokens IS NOT NULL
+                         OR cost_amount_decimal IS NOT NULL
+                        THEN 1 ELSE 0 END)
+        FROM runtime_usage_run_summary
+        WHERE {}
+        GROUP BY {group}
+        "#,
+        scope.where_sql
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement
+        .query_map(params_from_iter(scope.params.clone()), |row| {
+            Ok(Breakdown {
+                runtime_kind: row.get(0)?,
+                provider_key: row.get(1)?,
+                model_key: row.get(2)?,
+                counters: UsageCounters {
+                    prompt_input_total_tokens: row.get(3)?,
+                    uncached_input_tokens: row.get(4)?,
+                    cache_read_tokens: row.get(5)?,
+                    cache_write_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    reasoning_output_tokens: row.get(8)?,
+                    cache_observable_request_count: row.get(9)?,
+                    cache_hit_request_count: row.get(10)?,
+                },
+                eligible_runs: row.get(11)?,
+                observed_runs: row.get(12)?,
+                cost: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    attach_breakdown_cost(connection, scope, kind, &mut rows)?;
+    if matches!(kind, BreakdownKind::Model) && rows.len() > MODEL_TOP_N {
+        rows.sort_by_key(|row| {
+            std::cmp::Reverse(
+                row.counters
+                    .prompt_input_total_tokens
+                    .unwrap_or(0)
+                    .saturating_add(row.counters.output_tokens.unwrap_or(0)),
+            )
+        });
+        let rest = rows.split_off(MODEL_TOP_N);
+        let mut other = Breakdown {
+            runtime_kind: "other".to_string(),
+            model_key: Some("其他".to_string()),
+            ..Breakdown::default()
+        };
+        for row in rest {
+            merge_breakdown(&mut other, row)?;
+        }
+        rows.push(other);
+    }
+    Ok(rows.into_iter().map(breakdown_json).collect())
+}
+
+fn attach_breakdown_cost(
+    connection: &Connection,
+    scope: &Scope,
+    kind: BreakdownKind,
+    rows: &mut [Breakdown],
+) -> Result<()> {
+    let group = match kind {
+        BreakdownKind::Runtime => "runtime_kind, cost_currency, cost_kind, cost_source",
+        BreakdownKind::Model => {
+            "runtime_kind, provider_key, model_key, cost_currency, cost_kind, cost_source"
+        }
+    };
+    let select = match kind {
+        BreakdownKind::Runtime => "runtime_kind, NULL, NULL",
+        BreakdownKind::Model => "runtime_kind, provider_key, model_key",
+    };
+    let mut sql = format!(
+        r#"
+        SELECT {select}, cost_currency, cost_kind, cost_source,
+               rovai_decimal_sum(cost_amount_decimal)
+        FROM runtime_usage_run_summary
+        WHERE {} AND cost_amount_decimal IS NOT NULL
+        "#,
+        scope.where_sql
+    );
+    let mut query_params = scope.params.clone();
+    if let Some(cost_kind) = &scope.cost_kind {
+        sql.push_str(" AND cost_kind = ?");
+        query_params.push(SqlValue::Text(cost_kind.clone()));
+    }
+    sql.push_str(&format!(" GROUP BY {group}"));
+    let mut statement = connection.prepare(&sql)?;
+    let costs = statement
+        .query_map(params_from_iter(query_params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                Money {
+                    currency: row.get(3)?,
+                    kind: row.get(4)?,
+                    source: row.get(5)?,
+                    amount: row.get(6)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (runtime, provider, model, money) in costs {
+        if let Some(row) = rows.iter_mut().find(|row| {
+            row.runtime_kind == runtime && row.provider_key == provider && row.model_key == model
+        }) {
+            row.cost.push(money);
+        }
+    }
+    Ok(())
+}
+
+fn merge_breakdown(target: &mut Breakdown, incoming: Breakdown) -> Result<()> {
+    merge_counter(
+        &mut target.counters.prompt_input_total_tokens,
+        incoming.counters.prompt_input_total_tokens,
+    )?;
+    merge_counter(
+        &mut target.counters.uncached_input_tokens,
+        incoming.counters.uncached_input_tokens,
+    )?;
+    merge_counter(
+        &mut target.counters.cache_read_tokens,
+        incoming.counters.cache_read_tokens,
+    )?;
+    merge_counter(
+        &mut target.counters.cache_write_tokens,
+        incoming.counters.cache_write_tokens,
+    )?;
+    merge_counter(
+        &mut target.counters.output_tokens,
+        incoming.counters.output_tokens,
+    )?;
+    merge_counter(
+        &mut target.counters.reasoning_output_tokens,
+        incoming.counters.reasoning_output_tokens,
+    )?;
+    merge_counter(
+        &mut target.counters.cache_observable_request_count,
+        incoming.counters.cache_observable_request_count,
+    )?;
+    merge_counter(
+        &mut target.counters.cache_hit_request_count,
+        incoming.counters.cache_hit_request_count,
+    )?;
+    target.eligible_runs += incoming.eligible_runs;
+    target.observed_runs += incoming.observed_runs;
+    for money in incoming.cost {
+        if let Some(existing) = target.cost.iter_mut().find(|existing| {
+            existing.currency == money.currency
+                && existing.kind == money.kind
+                && existing.source == money.source
+        }) {
+            existing.amount = add_decimal(&existing.amount, &money.amount)?;
+        } else {
+            target.cost.push(money);
+        }
+    }
+    Ok(())
+}
+
+fn merge_counter(target: &mut Option<i64>, incoming: Option<i64>) -> Result<()> {
+    if let Some(incoming) = incoming {
+        *target = Some(
+            target
+                .unwrap_or(0)
+                .checked_add(incoming)
+                .context("Runtime Usage breakdown overflow")?,
+        );
+    }
+    Ok(())
+}
+
+fn breakdown_json(row: Breakdown) -> Value {
+    json!({
+        "runtimeKind": row.runtime_kind,
+        "providerKey": row.provider_key,
+        "modelKey": row.model_key,
+        "promptInputTotalTokens": row.counters.prompt_input_total_tokens,
+        "uncachedInputTokens": row.counters.uncached_input_tokens,
+        "cacheReadTokens": row.counters.cache_read_tokens,
+        "cacheWriteTokens": row.counters.cache_write_tokens,
+        "outputTokens": row.counters.output_tokens,
+        "reasoningOutputTokens": row.counters.reasoning_output_tokens,
+        "cacheReadShare": ratio(
+            row.counters.cache_read_tokens,
+            row.counters.prompt_input_total_tokens,
+        ),
+        "requestCacheHitRate": ratio(
+            row.counters.cache_hit_request_count,
+            row.counters.cache_observable_request_count,
+        ),
+        "cost": row.cost.into_iter().map(money_json).collect::<Vec<_>>(),
+        "coverage": {
+            "eligibleRuns": row.eligible_runs,
+            "observedRuns": row.observed_runs,
+        },
+    })
+}
+
+fn load_trend(connection: &Connection, scope: &Scope) -> Result<Vec<Value>> {
+    let hourly_bucket = if scope.daily_trend {
+        "substr(bucket_start_at, 1, 10) || 'T00:00:00+00:00'"
+    } else {
+        "bucket_start_at"
+    };
+    let mut sql = format!(
+        r#"
+        SELECT {hourly_bucket},
+               SUM(prompt_input_total_tokens), SUM(uncached_input_tokens),
+               SUM(cache_read_tokens), SUM(cache_write_tokens),
+               SUM(output_tokens), SUM(reasoning_output_tokens),
+               SUM(cache_observable_request_count), SUM(cache_hit_request_count)
+        FROM runtime_usage_hourly
+        WHERE collection_epoch = ? AND bucket_start_at >= ? AND bucket_start_at < ?
+        "#
+    );
+    let mut params = vec![
+        SqlValue::Text(scope.collection_epoch.clone()),
+        SqlValue::Text(scope.from.to_rfc3339()),
+        SqlValue::Text(scope.to.to_rfc3339()),
+    ];
+    if let Some(runtime) = &scope.runtime_kind {
+        sql.push_str(" AND runtime_kind = ?");
+        params.push(SqlValue::Text(runtime.clone()));
+    }
+    if let Some(provider) = &scope.provider_key {
+        sql.push_str(" AND provider_key = ?");
+        params.push(SqlValue::Text(provider.clone()));
+    }
+    if let Some(model) = &scope.model_key {
+        sql.push_str(" AND model_key = ?");
+        params.push(SqlValue::Text(model.clone()));
+    }
+    sql.push_str(" GROUP BY 1 ORDER BY 1");
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(params_from_iter(params), |row| {
+            let cache_read: Option<i64> = row.get(3)?;
+            let prompt_total: Option<i64> = row.get(1)?;
+            let observable: Option<i64> = row.get(7)?;
+            let hits: Option<i64> = row.get(8)?;
+            Ok(json!({
+                "bucketStartAt": row.get::<_, String>(0)?,
+                "promptInputTotalTokens": prompt_total,
+                "uncachedInputTokens": row.get::<_, Option<i64>>(2)?,
+                "cacheReadTokens": cache_read,
+                "cacheWriteTokens": row.get::<_, Option<i64>>(4)?,
+                "outputTokens": row.get::<_, Option<i64>>(5)?,
+                "reasoningOutputTokens": row.get::<_, Option<i64>>(6)?,
+                "cacheReadShare": ratio(cache_read, prompt_total),
+                "requestCacheHitRate": ratio(hits, observable),
+                "cost": Value::Null,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut points = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row["bucketStartAt"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                row,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let summary_bucket = if scope.daily_trend {
+        "substr(COALESCE(last_observed_at, enrolled_at), 1, 10) || 'T00:00:00+00:00'"
+    } else {
+        "substr(COALESCE(last_observed_at, enrolled_at), 1, 13) || ':00:00+00:00'"
+    };
+    let mut cost_sql = format!(
+        r#"
+        SELECT {summary_bucket}, cost_currency, cost_kind, cost_source,
+               rovai_decimal_sum(cost_amount_decimal)
+        FROM runtime_usage_run_summary
+        WHERE {} AND cost_amount_decimal IS NOT NULL
+        "#,
+        scope.where_sql
+    );
+    let mut cost_params = scope.params.clone();
+    if let Some(kind) = &scope.cost_kind {
+        cost_sql.push_str(" AND cost_kind = ?");
+        cost_params.push(SqlValue::Text(kind.clone()));
+    }
+    cost_sql.push_str(" GROUP BY 1, cost_currency, cost_kind, cost_source ORDER BY 1");
+    let mut cost_statement = connection.prepare(&cost_sql)?;
+    let cost_rows = cost_statement
+        .query_map(params_from_iter(cost_params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Money {
+                    currency: row.get(1)?,
+                    kind: row.get(2)?,
+                    source: row.get(3)?,
+                    amount: row.get(4)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut costs = BTreeMap::<String, Vec<Money>>::new();
+    for (bucket, money) in cost_rows {
+        costs.entry(bucket).or_default().push(money);
+    }
+    for (bucket, values) in costs {
+        let point = points.entry(bucket.clone()).or_insert_with(|| {
+            json!({
+                "bucketStartAt": bucket,
+                "promptInputTotalTokens": Value::Null,
+                "uncachedInputTokens": Value::Null,
+                "cacheReadTokens": Value::Null,
+                "cacheWriteTokens": Value::Null,
+                "outputTokens": Value::Null,
+                "reasoningOutputTokens": Value::Null,
+                "cacheReadShare": Value::Null,
+                "requestCacheHitRate": Value::Null,
+                "cost": Value::Null,
+            })
+        });
+        point["cost"] = Value::Array(values.into_iter().map(money_json).collect());
+    }
+    Ok(points.into_values().collect())
+}
+
+fn ratio(numerator: Option<i64>, denominator: Option<i64>) -> Option<f64> {
+    match (numerator, denominator) {
+        (Some(numerator), Some(denominator)) if denominator > 0 => {
+            Some(numerator as f64 / denominator as f64)
+        }
+        _ => None,
+    }
+}
+
+fn collection_identity(database: &Database) -> Result<(String, String)> {
+    database
+        .connection()
+        .query_row(
+            r#"
+            SELECT collection_epoch, collection_started_at
+            FROM runtime_usage_collection_state WHERE singleton_id = 1
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(Into::into)
+}
+
+fn parse_time(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("invalid Runtime Usage timestamp {value}"))?
+        .with_timezone(&Utc))
+}
+
+fn hour_bucket(value: DateTime<Utc>) -> DateTime<Utc> {
+    value
+        .with_minute(0)
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .expect("valid UTC hour")
+}
+
+fn validate_key(value: &str, name: &str) -> Result<()> {
+    if value.trim().is_empty() || value.len() > 256 {
+        anyhow::bail!("Runtime Usage {name} is invalid");
+    }
+    Ok(())
+}
+
+fn validate_currency(value: &str) -> Result<()> {
+    if value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        anyhow::bail!("Runtime Usage currency must be a three-letter uppercase code");
+    }
+    Ok(())
+}
+
+fn validate_decimal(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.contains(['e', 'E', '+', '-'])
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.split('.').count() > 2
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        anyhow::bail!("Runtime Usage decimal must be an unsigned base-10 value");
+    }
+    Ok(())
+}
+
+fn add_decimal(left: &str, right: &str) -> Result<String> {
+    validate_decimal(left)?;
+    validate_decimal(right)?;
+    let (left_whole, left_fraction) = decimal_parts(left);
+    let (right_whole, right_fraction) = decimal_parts(right);
+    let scale = left_fraction.len().max(right_fraction.len());
+    let left_digits = format!(
+        "{}{left_fraction:0<scale$}",
+        left_whole.trim_start_matches('0')
+    );
+    let right_digits = format!(
+        "{}{right_fraction:0<scale$}",
+        right_whole.trim_start_matches('0')
+    );
+    let mut carry = 0_u8;
+    let mut result = Vec::new();
+    let width = left_digits.len().max(right_digits.len());
+    let left = format!("{left_digits:0>width$}");
+    let right = format!("{right_digits:0>width$}");
+    for (left, right) in left.bytes().rev().zip(right.bytes().rev()) {
+        let sum = (left - b'0') + (right - b'0') + carry;
+        result.push((sum % 10) + b'0');
+        carry = sum / 10;
+    }
+    if carry > 0 {
+        result.push(carry + b'0');
+    }
+    result.reverse();
+    decimal_from_digits(String::from_utf8(result)?, scale)
+}
+
+fn subtract_decimal_nonnegative(left: &str, right: &str) -> Result<Option<String>> {
+    validate_decimal(left)?;
+    validate_decimal(right)?;
+    let (left_digits, right_digits, scale) = aligned_decimal_digits(left, right);
+    if left_digits.len() < right_digits.len()
+        || (left_digits.len() == right_digits.len() && left_digits < right_digits)
+    {
+        return Ok(None);
+    }
+    Ok(Some(subtract_aligned_digits(
+        &left_digits,
+        &right_digits,
+        scale,
+    )?))
+}
+
+fn subtract_decimal_signed(left: &str, right: &str) -> Result<String> {
+    if let Some(value) = subtract_decimal_nonnegative(left, right)? {
+        return Ok(value);
+    }
+    Ok(format!(
+        "-{}",
+        subtract_decimal_nonnegative(right, left)?.context("decimal ordering must be total")?
+    ))
+}
+
+fn aligned_decimal_digits(left: &str, right: &str) -> (String, String, usize) {
+    let (left_whole, left_fraction) = decimal_parts(left);
+    let (right_whole, right_fraction) = decimal_parts(right);
+    let scale = left_fraction.len().max(right_fraction.len());
+    let left = format!(
+        "{}{left_fraction:0<scale$}",
+        left_whole.trim_start_matches('0')
+    );
+    let right = format!(
+        "{}{right_fraction:0<scale$}",
+        right_whole.trim_start_matches('0')
+    );
+    let width = left.len().max(right.len()).max(1);
+    (
+        format!("{left:0>width$}"),
+        format!("{right:0>width$}"),
+        scale,
+    )
+}
+
+fn subtract_aligned_digits(left: &str, right: &str, scale: usize) -> Result<String> {
+    let mut borrow = 0_i16;
+    let mut result = Vec::with_capacity(left.len());
+    for (left, right) in left.bytes().rev().zip(right.bytes().rev()) {
+        let mut digit = i16::from(left - b'0') - borrow - i16::from(right - b'0');
+        if digit < 0 {
+            digit += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        result.push(u8::try_from(digit)? + b'0');
+    }
+    result.reverse();
+    decimal_from_digits(String::from_utf8(result)?, scale)
+}
+
+fn decimal_from_digits(mut digits: String, scale: usize) -> Result<String> {
+    if digits.is_empty() {
+        digits.push('0');
+    }
+    if scale == 0 {
+        let whole = digits.trim_start_matches('0');
+        return Ok(if whole.is_empty() { "0" } else { whole }.to_string());
+    }
+    if digits.len() <= scale {
+        digits = format!("{digits:0>width$}", width = scale + 1);
+    }
+    let fraction_start = digits.len() - scale;
+    let (whole, fraction) = digits.split_at(fraction_start);
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = fraction.trim_end_matches('0');
+    Ok(if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    })
+}
+
+fn decimal_parts(value: &str) -> (&str, &str) {
+    value.split_once('.').unwrap_or((value, ""))
+}
+
+fn decimal_is_zero(value: &str) -> bool {
+    value
+        .chars()
+        .all(|character| character == '0' || character == '.')
+}
+
+fn cost_quality_rank(value: &str) -> u8 {
+    match value {
+        "runtime_reported" => 4,
+        "runtime_estimate" => 3,
+        "price_estimated" | "price_catalog" => 2,
+        "tokenizer_price_estimated" => 1,
+        _ => 0,
+    }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn string_option(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn safe_integer(value: Option<&Value>) -> Option<i64> {
+    value
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= JS_MAX_SAFE_INTEGER)
+        .map(|value| value as i64)
+}
+
+fn value_at_any<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a Value> {
+    pointers.iter().find_map(|pointer| value.pointer(pointer))
+}
+
+fn integer_at_any(value: &Value, pointers: &[&str]) -> Option<i64> {
+    safe_integer(value_at_any(value, pointers))
+}
+
+fn string_at_any(value: &Value, pointers: &[&str]) -> Option<String> {
+    value_at_any(value, pointers)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn cost_from_value(
+    value: Option<&Value>,
+    currency: &str,
+    quality: &str,
+    grain: &str,
+) -> Option<RuntimeUsageCost> {
+    validate_currency(currency).ok()?;
+    let amount = match value? {
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        _ => return None,
+    };
+    let amount = add_decimal("0", &amount).ok()?;
+    Some(RuntimeUsageCost {
+        amount,
+        currency: currency.to_string(),
+        quality: quality.to_string(),
+        grain: grain.to_string(),
+    })
+}
+
+pub fn parse_codex_usage_message(method: &str, params: &Value) -> Vec<ParsedRuntimeUsage> {
+    if method != "thread/tokenUsage/updated" {
+        return Vec::new();
+    }
+    let value = &params["tokenUsage"]["last"];
+    let native_session_id = string_at_any(params, &["/threadId"]);
+    let fields = RuntimeUsageFields {
+        input_tokens: integer_at_any(value, &["/inputTokens"]),
+        uncached_input_tokens: None,
+        output_tokens: integer_at_any(value, &["/outputTokens"]),
+        reasoning_output_tokens: integer_at_any(value, &["/reasoningOutputTokens"]),
+        cache_read_input_tokens: integer_at_any(value, &["/cachedInputTokens"]),
+        cache_write_input_tokens: integer_at_any(value, &["/cacheWriteInputTokens"]),
+        context_used_tokens: None,
+        context_size_tokens: None,
+        native_context_ratio: None,
+    };
+    let mut observations = Vec::new();
+    if !fields.is_empty() {
+        observations.push(ParsedRuntimeUsage {
+            identity_suffix: "last".to_string(),
+            dialect_id: "codex-thread-token-usage-v2".to_string(),
+            source: "runtime_event".to_string(),
+            scope: "model_call".to_string(),
+            counter_mode: RuntimeUsageCounterMode::Delta,
+            input_semantics: RuntimeInputSemantics::CacheInclusiveTotal,
+            native_session_id: native_session_id.clone(),
+            native_turn_id: string_at_any(params, &["/turnId"]),
+            fields,
+            cost: None,
+            context_model_id: None,
+            occurred_at: None,
+        });
+    }
+    let used = integer_at_any(params, &["/tokenUsage/last/totalTokens"]);
+    let window = integer_at_any(params, &["/tokenUsage/modelContextWindow"]);
+    if used.is_some() || window.is_some() {
+        observations.push(ParsedRuntimeUsage {
+            identity_suffix: "context".to_string(),
+            dialect_id: "codex-thread-context-v2".to_string(),
+            source: "runtime_event".to_string(),
+            scope: "session".to_string(),
+            counter_mode: RuntimeUsageCounterMode::Gauge,
+            input_semantics: RuntimeInputSemantics::Unknown,
+            native_session_id,
+            native_turn_id: None,
+            fields: RuntimeUsageFields {
+                context_used_tokens: used,
+                context_size_tokens: window,
+                ..Default::default()
+            },
+            cost: None,
+            context_model_id: None,
+            occurred_at: None,
+        });
+    }
+    observations
+}
+
+pub fn codex_usage_source_identity(params: &Value) -> Result<String> {
+    let thread_id = params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .context("Codex Usage notification is missing threadId")?;
+    let total = params
+        .pointer("/tokenUsage/total")
+        .context("Codex Usage notification is missing tokenUsage.total")?;
+    crate::command::canonical_json_digest(&json!({
+        "dialectId": "codex-thread-token-usage-v2",
+        "threadId": thread_id,
+        "total": total,
+    }))
+}
+
+pub fn codex_context_source_identity(params: &Value) -> Result<String> {
+    let thread_id = params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .context("Codex Context notification is missing threadId")?;
+    // Context may change while cumulative Usage is unchanged. Conversely, a
+    // later notification with the same Context and new cumulative Usage should
+    // refresh observation time. Exact native replays retain one identity.
+    crate::command::canonical_json_digest(&json!({
+        "dialectId": "codex-thread-context-v2",
+        "threadId": thread_id,
+        "turnId": params.get("turnId"),
+        "last": params.pointer("/tokenUsage/last"),
+        "total": params.pointer("/tokenUsage/total"),
+        "modelContextWindow": params.pointer("/tokenUsage/modelContextWindow"),
+    }))
+}
+
+/// Per-step observations only; Antigravity's result.usage is Session cumulative.
+/// The adapter has already checked the conversation and current input step.
+pub fn parse_antigravity_step_usage(step: &Value) -> Option<ParsedRuntimeUsage> {
+    if step["state"] != "DONE"
+        || !matches!(
+            step["step_type"].as_str(),
+            Some("agent_response" | "checkpoint")
+        )
+        || !crate::runtime::is_root_output(step)
+        || step.get("subagent_info").is_some_and(|v| !v.is_null())
+    {
+        return None;
+    }
+    let session = step["conversation_id"].as_str().filter(|s| !s.is_empty())?;
+    let index = step["step_index"].as_u64()?;
+    let raw = step.get("usage")?;
+    let output = integer_at_any(raw, &["/output_tokens"]);
+    let read = integer_at_any(raw, &["/cache_read_tokens"]);
+    if output.is_none() && read.is_none() {
+        return None;
+    }
+    Some(ParsedRuntimeUsage {
+        identity_suffix: format!("native_step:{index}"),
+        dialect_id: "antigravity-native-step-usage-v1".into(),
+        source: "runtime_event".into(),
+        scope: "model_call".into(),
+        counter_mode: RuntimeUsageCounterMode::Delta,
+        // The wire total excludes cache reads. Do not assume missing cache
+        // classifications are zero or turn that total into inclusive Input.
+        input_semantics: RuntimeInputSemantics::Unknown,
+        native_session_id: Some(session.into()),
+        native_turn_id: None,
+        fields: RuntimeUsageFields {
+            input_tokens: integer_at_any(raw, &["/input_tokens"]),
+            output_tokens: output,
+            reasoning_output_tokens: integer_at_any(raw, &["/thinking_tokens"])
+                .filter(|n| output.is_some_and(|out| *n <= out)),
+            cache_read_input_tokens: read,
+            ..Default::default()
+        },
+        cost: None,
+        context_model_id: None,
+        occurred_at: None,
+    })
+}
+
+fn dsh_exact_prompt_total(usage: &Value, fields: &RuntimeUsageFields) -> Option<i64> {
+    let total = integer_at_any(usage, &["/totalTokens"])?;
+    let input = total.checked_sub(fields.output_tokens?)?;
+    let known = fields
+        .uncached_input_tokens?
+        .checked_add(fields.cache_read_input_tokens.unwrap_or(0))?
+        .checked_add(fields.cache_write_input_tokens.unwrap_or(0))?;
+    if input < known
+        || (fields.cache_read_input_tokens.is_some()
+            && fields.cache_write_input_tokens.is_some()
+            && input != known)
+    {
+        return None;
+    }
+    Some(input)
+}
+
+pub fn parse_acp_usage_message(
+    adapter_kind: AdapterKind,
+    runtime_version: Option<&str>,
+    method: &str,
+    params: &Value,
+) -> Vec<ParsedRuntimeUsage> {
+    if adapter_kind == AdapterKind::KiroCli && method == "_kiro.dev/metadata" {
+        let Some(ratio) = params
+            .get("contextUsagePercentage")
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && (0.0..=100.0).contains(n))
+            .filter(|_| crate::runtime::is_root_output(params))
+            .map(|n| n / 100.0)
+        else {
+            return Vec::new();
+        };
+        return vec![ParsedRuntimeUsage {
+            identity_suffix: "native_context_ratio".into(),
+            dialect_id: "kiro-acp-context-percentage-v1".into(),
+            source: "runtime_private_extension".into(),
+            scope: "session".into(),
+            counter_mode: RuntimeUsageCounterMode::Gauge,
+            input_semantics: RuntimeInputSemantics::Unknown,
+            native_session_id: string_at_any(params, &["/sessionId"]),
+            native_turn_id: None,
+            fields: RuntimeUsageFields {
+                native_context_ratio: Some(ratio),
+                ..Default::default()
+            },
+            cost: None,
+            context_model_id: None,
+            occurred_at: None,
+        }];
+    }
+    if adapter_kind == AdapterKind::CopilotCli {
+        if method == "rovai/acp_prompt_completed" {
+            // Native ACP JTn(session.usage) restates earlier prompts in this
+            // process. Subscribed per-call events own this Run's consumption.
+            return Vec::new();
+        }
+        if method == "github.com/copilot/sessionEvent" {
+            if params["type"] != "assistant.usage"
+                || params.get("agentId").is_some_and(|v| !v.is_null())
+                || params.get("dataOmitted").is_some()
+            {
+                return Vec::new();
+            }
+            let Some(time) = params["timestamp"]
+                .as_str()
+                .filter(|s| DateTime::parse_from_rfc3339(s).is_ok())
+            else {
+                return Vec::new();
+            };
+            let data = &params["data"];
+            let fields = RuntimeUsageFields {
+                input_tokens: integer_at_any(data, &["/inputTokens"]),
+                output_tokens: integer_at_any(data, &["/outputTokens"]),
+                cache_read_input_tokens: integer_at_any(data, &["/cacheReadTokens"]),
+                cache_write_input_tokens: integer_at_any(data, &["/cacheWriteTokens"]),
+                reasoning_output_tokens: integer_at_any(data, &["/reasoningTokens"]),
+                ..Default::default()
+            };
+            if fields.is_empty() {
+                return Vec::new();
+            }
+            return vec![ParsedRuntimeUsage {
+                identity_suffix: "native_model_call".into(),
+                dialect_id: "copilot-native-call-usage-v1".into(),
+                source: "runtime_private_extension".into(),
+                scope: "model_call".into(),
+                counter_mode: RuntimeUsageCounterMode::Delta,
+                input_semantics: RuntimeInputSemantics::CacheInclusiveTotal,
+                native_session_id: string_at_any(params, &["/sessionId"]),
+                native_turn_id: None,
+                fields,
+                cost: None,
+                context_model_id: None,
+                occurred_at: Some(time.into()),
+            }];
+        }
+    }
+    if adapter_kind == AdapterKind::GrokBuild
+        && method == "_x.ai/session_notification"
+        && params.pointer("/update/sessionUpdate") == Some(&json!("turn_completed"))
+    {
+        let update = &params["update"];
+        let native_turn_id = string_at_any(update, &["/prompt_id"]);
+        if native_turn_id.is_none() {
+            return Vec::new();
+        }
+        let usage = &update["usage"];
+        let fields = RuntimeUsageFields {
+            input_tokens: integer_at_any(usage, &["/inputTokens"]),
+            output_tokens: integer_at_any(usage, &["/outputTokens"]),
+            cache_read_input_tokens: integer_at_any(usage, &["/cachedReadTokens"]),
+            cache_write_input_tokens: integer_at_any(usage, &["/cacheCreationTokens"]),
+            reasoning_output_tokens: integer_at_any(usage, &["/reasoningTokens"]),
+            ..Default::default()
+        };
+        if fields.is_empty() {
+            return Vec::new();
+        }
+        return vec![ParsedRuntimeUsage {
+            identity_suffix: "turn_completed".to_string(),
+            dialect_id: "grok-turn-completed-usage-v1".to_string(),
+            source: "runtime_private_extension".to_string(),
+            scope: "turn".to_string(),
+            counter_mode: RuntimeUsageCounterMode::Delta,
+            input_semantics: RuntimeInputSemantics::CacheInclusiveTotal,
+            native_session_id: string_at_any(params, &["/sessionId"]),
+            native_turn_id,
+            fields,
+            cost: None,
+            context_model_id: None,
+            occurred_at: None,
+        }];
+    }
+    if adapter_kind == AdapterKind::ClineCli && method == "session/update" {
+        return params
+            .pointer("/update/_meta/clineObservations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|record| record["sessionId"] == params["sessionId"])
+            .flat_map(crate::cline::parse_observations)
+            .collect();
+    }
+    if adapter_kind == AdapterKind::DeepseekHarness && method == "session/update" {
+        let update = &params["update"];
+        if update["sessionUpdate"] != "usage_update" {
+            return Vec::new();
+        }
+        let mut observations = Vec::new();
+        if let Some(records) = update.pointer("/_meta/dshUsage").and_then(Value::as_array) {
+            for record in records {
+                let (Some(seq), Some(turn)) = (record["seq"].as_u64(), record["turn"].as_u64())
+                else {
+                    continue;
+                };
+                if record["schemaVersion"] != 1 || record["sessionId"] != params["sessionId"] {
+                    continue;
+                }
+                let source = match record["sourceEvent"]
+                    .as_str()
+                    .unwrap_or("assistant/message")
+                {
+                    "assistant/message" => "native_assistant",
+                    "compaction/summary" => "native_compaction",
+                    _ => continue,
+                };
+                let usage = &record["usage"];
+                let mut fields = RuntimeUsageFields {
+                    // DSH TokenUsage defines input/cache buckets as disjoint.
+                    input_tokens: integer_at_any(usage, &["/inputTokens"]),
+                    uncached_input_tokens: integer_at_any(usage, &["/inputTokens"]),
+                    output_tokens: integer_at_any(usage, &["/outputTokens"]),
+                    cache_read_input_tokens: integer_at_any(usage, &["/cacheReadTokens"]),
+                    cache_write_input_tokens: integer_at_any(usage, &["/cacheWriteTokens"]),
+                    reasoning_output_tokens: integer_at_any(usage, &["/reasoningTokens"]),
+                    ..Default::default()
+                };
+                if fields.is_empty() {
+                    continue;
+                }
+                // Native TokenUsage.totalTokens is the exact full-call total,
+                // including cached prompt tokens. Optional cache buckets can
+                // be absent even when that aggregate is authoritative. Preserve
+                // their absence while using total - output for inclusive Input.
+                let input_semantics = if usage.get("totalTokens").is_some() {
+                    match dsh_exact_prompt_total(usage, &fields) {
+                        Some(total) => {
+                            fields.input_tokens = Some(total);
+                            RuntimeInputSemantics::CacheInclusiveTotal
+                        }
+                        None => RuntimeInputSemantics::Unknown,
+                    }
+                } else {
+                    RuntimeInputSemantics::ExclusiveBuckets
+                };
+                observations.push(ParsedRuntimeUsage {
+                    identity_suffix: format!("{source}:{seq}"),
+                    dialect_id: "dsh-committed-call-usage-v3".to_string(),
+                    source: "runtime_event".to_string(),
+                    scope: "turn".to_string(),
+                    counter_mode: RuntimeUsageCounterMode::Delta,
+                    input_semantics,
+                    native_session_id: string_at_any(params, &["/sessionId"]),
+                    native_turn_id: Some(turn.to_string()),
+                    fields,
+                    cost: None,
+                    context_model_id: None,
+                    occurred_at: None,
+                });
+            }
+        }
+        let used = integer_at_any(update, &["/used"]);
+        let size = integer_at_any(update, &["/size"]);
+        if used.is_some() || size.is_some() {
+            observations.push(ParsedRuntimeUsage {
+                identity_suffix: "context_occupancy".to_string(),
+                dialect_id: "dsh-acp-context-gauge-v1".to_string(),
+                source: "runtime_event".to_string(),
+                scope: "session".to_string(),
+                counter_mode: RuntimeUsageCounterMode::Gauge,
+                input_semantics: RuntimeInputSemantics::Unknown,
+                native_session_id: string_at_any(params, &["/sessionId"]),
+                native_turn_id: None,
+                fields: RuntimeUsageFields {
+                    context_used_tokens: used,
+                    context_size_tokens: size,
+                    ..Default::default()
+                },
+                cost: None,
+                context_model_id: None,
+                occurred_at: None,
+            });
+        }
+        return observations;
+    }
+    if adapter_kind == AdapterKind::ZcodeApp && method == "session/update" {
+        let update = &params["update"];
+        if update["sessionUpdate"] == "usage_update"
+            && let (Some(seq), Some(revision)) = (
+                update
+                    .pointer("/_meta/zcodeContext/eventSeq")
+                    .and_then(Value::as_u64),
+                update
+                    .pointer("/_meta/zcodeContext/stateRevision")
+                    .and_then(Value::as_u64),
+            )
+        {
+            return vec![ParsedRuntimeUsage {
+                identity_suffix: format!("native_context:{seq}:{revision}"),
+                dialect_id: "zcode-native-session-context-v1".into(),
+                source: "runtime_private_extension".into(),
+                scope: "session".into(),
+                counter_mode: RuntimeUsageCounterMode::Gauge,
+                input_semantics: RuntimeInputSemantics::Unknown,
+                native_session_id: string_at_any(params, &["/sessionId"]),
+                native_turn_id: None,
+                fields: RuntimeUsageFields {
+                    context_used_tokens: integer_at_any(update, &["/used"]),
+                    context_size_tokens: integer_at_any(update, &["/size"]),
+                    ..Default::default()
+                },
+                cost: None,
+                context_model_id: string_at_any(update, &["/_meta/zcodeContext/modelId"]),
+                occurred_at: None,
+            }];
+        }
+        let usage = &update["_meta"]["zcodeUsage"];
+        if update["sessionUpdate"] == "usage_update"
+            && usage["source"] == "provider"
+            && let (Some(turn), Some(event)) = (
+                update
+                    .pointer("/_meta/nativeTurnId")
+                    .and_then(Value::as_str),
+                update
+                    .pointer("/_meta/nativeEventId")
+                    .and_then(Value::as_str),
+            )
+        {
+            let input = integer_at_any(usage, &["/inputTokens"]);
+            let cached = integer_at_any(usage, &["/cacheReadTokens"]);
+            return vec![ParsedRuntimeUsage {
+                identity_suffix: format!("native_turn:{event}"),
+                dialect_id: "zcode-native-turn-usage-v1".to_string(),
+                source: "runtime_private_extension".to_string(),
+                scope: "turn".to_string(),
+                counter_mode: RuntimeUsageCounterMode::Delta,
+                input_semantics: RuntimeInputSemantics::CacheInclusiveTotal,
+                native_session_id: string_at_any(params, &["/sessionId"]),
+                native_turn_id: Some(turn.to_string()),
+                fields: RuntimeUsageFields {
+                    input_tokens: input,
+                    // Unknown cache-write usage prevents deriving uncached input.
+                    uncached_input_tokens: None,
+                    output_tokens: integer_at_any(usage, &["/outputTokens"]),
+                    cache_read_input_tokens: cached,
+                    // The native aggregator fills absent provider fields with 0.
+                    // Those zeros do not establish observed cache-write/reasoning usage.
+                    cache_write_input_tokens: None,
+                    reasoning_output_tokens: None,
+                    context_used_tokens: None,
+                    context_size_tokens: None,
+                    native_context_ratio: None,
+                },
+                cost: None,
+                context_model_id: None,
+                occurred_at: None,
+            }];
+        }
+        return Vec::new();
+    }
+    if method == "session/update" {
+        let update = &params["update"];
+        let update_kind = update.get("sessionUpdate").and_then(Value::as_str);
+        let mut observations = Vec::new();
+
+        if adapter_kind == AdapterKind::GrokBuild
+            && crate::runtime::is_root_output(params)
+            && crate::runtime::is_root_output(update)
+            && let Some(used) = integer_at_any(params, &["/_meta/totalTokens"])
+        {
+            // Grok's per-notification metadata is current context, distinct
+            // from result._meta.usage's cumulative consumption.
+            observations.push(ParsedRuntimeUsage {
+                identity_suffix: "context_occupancy".into(),
+                dialect_id: "grok-acp-meta-context-v1".into(),
+                source: "runtime_event".into(),
+                scope: "session".into(),
+                counter_mode: RuntimeUsageCounterMode::Gauge,
+                input_semantics: RuntimeInputSemantics::Unknown,
+                native_session_id: string_at_any(params, &["/sessionId"]),
+                native_turn_id: None,
+                fields: RuntimeUsageFields {
+                    context_used_tokens: Some(used),
+                    ..Default::default()
+                },
+                cost: None,
+                context_model_id: None,
+                occurred_at: None,
+            });
+        }
+
+        if adapter_kind == AdapterKind::CodebuddyCli && update_kind == Some("usage_update") {
+            let usage = update.pointer("/_meta/usage").unwrap_or(&Value::Null);
+            let fields = RuntimeUsageFields {
+                input_tokens: integer_at_any(usage, &["/prompt_tokens"]),
+                uncached_input_tokens: integer_at_any(usage, &["/prompt_cache_miss_tokens"]),
+                output_tokens: integer_at_any(usage, &["/completion_tokens"]),
+                reasoning_output_tokens: integer_at_any(
+                    usage,
+                    &["/completion_tokens_details/reasoning_tokens"],
+                ),
+                cache_read_input_tokens: integer_at_any(
+                    usage,
+                    &[
+                        "/prompt_cache_hit_tokens",
+                        "/prompt_tokens_details/cached_tokens",
+                    ],
+                ),
+                cache_write_input_tokens: None,
+                context_used_tokens: None,
+                context_size_tokens: None,
+                native_context_ratio: None,
+            };
+            if !fields.is_empty() {
+                observations.push(ParsedRuntimeUsage {
+                    identity_suffix: "private_usage".to_string(),
+                    dialect_id: "codebuddy-acp-private-usage-v1".to_string(),
+                    source: "runtime_private_extension".to_string(),
+                    scope: "model_call".to_string(),
+                    counter_mode: RuntimeUsageCounterMode::Delta,
+                    input_semantics: RuntimeInputSemantics::CacheInclusiveTotal,
+                    native_session_id: string_at_any(params, &["/sessionId"]),
+                    native_turn_id: string_at_any(update, &["/_meta/codebuddy.ai~1requestId"]),
+                    fields,
+                    cost: None,
+                    context_model_id: None,
+                    occurred_at: None,
+                });
+            }
+        }
+
+        if adapter_kind == AdapterKind::QwenCode && update_kind == Some("agent_message_chunk") {
+            let usage = update.pointer("/_meta/usage").unwrap_or(&Value::Null);
+            let fields = RuntimeUsageFields {
+                input_tokens: integer_at_any(usage, &["/inputTokens"]),
+                uncached_input_tokens: None,
+                output_tokens: integer_at_any(usage, &["/outputTokens"]),
+                reasoning_output_tokens: integer_at_any(usage, &["/thoughtTokens"]),
+                cache_read_input_tokens: integer_at_any(usage, &["/cachedReadTokens"]),
+                cache_write_input_tokens: None,
+                context_used_tokens: None,
+                context_size_tokens: None,
+                native_context_ratio: None,
+            };
+            if !fields.is_empty() {
+                observations.push(ParsedRuntimeUsage {
+                    identity_suffix: "private_usage".to_string(),
+                    dialect_id: "qwen-acp-private-usage-v1".to_string(),
+                    source: "runtime_private_extension".to_string(),
+                    scope: "model_call".to_string(),
+                    counter_mode: RuntimeUsageCounterMode::Delta,
+                    input_semantics: RuntimeInputSemantics::CacheInclusiveTotal,
+                    native_session_id: string_at_any(params, &["/sessionId"]),
+                    native_turn_id: None,
+                    fields,
+                    cost: None,
+                    context_model_id: None,
+                    occurred_at: None,
+                });
+            }
+        }
+
+        let cost = if matches!(
+            adapter_kind,
+            AdapterKind::OpencodeCli | AdapterKind::CommandCodeCli
+        ) {
+            // These adapters report total Session cost here, not the current
+            // Turn/Run cost. A Run projection requires a Native Session-scoped
+            // baseline, which the minimal Usage model intentionally does not own.
+            None
+        } else {
+            let currency = string_at_any(update, &["/cost/currency"]);
+            currency.as_deref().and_then(|currency| {
+                cost_from_value(
+                    value_at_any(update, &["/cost/amount"]),
+                    currency,
+                    "runtime_reported",
+                    "session",
+                )
+            })
+        };
+        let context = RuntimeUsageFields {
+            context_used_tokens: integer_at_any(update, &["/used"]),
+            context_size_tokens: integer_at_any(update, &["/size"]),
+            ..Default::default()
+        };
+        if !context.is_empty() {
+            observations.push(ParsedRuntimeUsage {
+                identity_suffix: format!(
+                    "context:{}:{}",
+                    context
+                        .context_used_tokens
+                        .map_or("missing".to_string(), |value| value.to_string()),
+                    context
+                        .context_size_tokens
+                        .map_or("missing".to_string(), |value| value.to_string()),
+                ),
+                dialect_id: "acp-session-context-gauge-v1".to_string(),
+                source: "runtime_event".to_string(),
+                scope: "session".to_string(),
+                counter_mode: RuntimeUsageCounterMode::Gauge,
+                input_semantics: RuntimeInputSemantics::Unknown,
+                native_session_id: string_at_any(params, &["/sessionId"]),
+                native_turn_id: None,
+                fields: context,
+                cost: None,
+                context_model_id: None,
+                occurred_at: None,
+            });
+        }
+        if let Some(cost) = cost {
+            observations.push(ParsedRuntimeUsage {
+                identity_suffix: "usage_update_cost".to_string(),
+                dialect_id: "acp-usage-update-v2".to_string(),
+                source: "runtime_event".to_string(),
+                scope: "session".to_string(),
+                counter_mode: RuntimeUsageCounterMode::Gauge,
+                input_semantics: RuntimeInputSemantics::Unknown,
+                native_session_id: string_at_any(params, &["/sessionId"]),
+                native_turn_id: None,
+                fields: RuntimeUsageFields::default(),
+                cost: Some(cost),
+                context_model_id: None,
+                occurred_at: None,
+            });
+        }
+        return observations;
+    }
+
+    if method != "rovai/acp_prompt_completed" {
+        return Vec::new();
+    }
+    if adapter_kind == AdapterKind::OpencodeCli
+        && crate::opencode_compat::Generation::from_version(runtime_version)
+            != Some(crate::opencode_compat::Generation::V2)
+    {
+        // V1's verified per-call database reader owns consumption. Unknown
+        // dialects cannot borrow V2's root-prompt aggregate semantics.
+        return Vec::new();
+    }
+    if !crate::runtime::is_root_output(params) || !crate::runtime::is_root_output(&params["result"])
+    {
+        return Vec::new();
+    }
+    let usage = params
+        .pointer(if adapter_kind == AdapterKind::CommandCodeCli {
+            "/result/_meta/usage"
+        } else {
+            "/result/usage"
+        })
+        .unwrap_or(&Value::Null);
+    let (dialect_id, input_semantics, fields) = match adapter_kind {
+        AdapterKind::OpencodeCli => {
+            // V2 separates reasoning from output and both cache buckets from
+            // input. totalTokens covers this root prompt, not delegated Sessions.
+            let reasoning = integer_at_any(usage, &["/thoughtTokens"]);
+            let output = integer_at_any(usage, &["/outputTokens"])
+                .and_then(|output| output.checked_add(reasoning.unwrap_or(0)));
+            let total_input = integer_at_any(usage, &["/totalTokens"])
+                .zip(output)
+                .and_then(|(total, output)| total.checked_sub(output))
+                .filter(|input| *input >= 0);
+            (
+                "opencode-acp-root-prompt-usage-v2",
+                RuntimeInputSemantics::CacheInclusiveTotal,
+                RuntimeUsageFields {
+                    input_tokens: total_input,
+                    uncached_input_tokens: integer_at_any(usage, &["/inputTokens"]),
+                    output_tokens: output,
+                    reasoning_output_tokens: reasoning,
+                    cache_read_input_tokens: integer_at_any(usage, &["/cachedReadTokens"]),
+                    cache_write_input_tokens: integer_at_any(usage, &["/cachedWriteTokens"]),
+                    ..Default::default()
+                },
+            )
+        }
+        // Official Hermes ACP reports Session counters, not a prompt delta.
+        // Without a native per-prompt baseline, consumption remains unknown.
+        AdapterKind::CommandCodeCli => (
+            "command-code-acp-prompt-usage-v1",
+            RuntimeInputSemantics::CacheInclusiveTotal,
+            RuntimeUsageFields {
+                input_tokens: integer_at_any(usage, &["/inputTokens"]),
+                output_tokens: integer_at_any(usage, &["/outputTokens"]),
+                cache_read_input_tokens: integer_at_any(usage, &["/cacheReadTokens"]),
+                cache_write_input_tokens: integer_at_any(usage, &["/cacheWriteTokens"]),
+                ..Default::default()
+            },
+        ),
+        AdapterKind::CopilotCli => (
+            "acp-copilot-usage-v2",
+            RuntimeInputSemantics::CacheInclusiveTotal,
+            RuntimeUsageFields {
+                input_tokens: integer_at_any(usage, &["/inputTokens", "/input_tokens"]),
+                uncached_input_tokens: None,
+                output_tokens: integer_at_any(usage, &["/outputTokens", "/output_tokens"]),
+                reasoning_output_tokens: integer_at_any(
+                    usage,
+                    &[
+                        "/thoughtTokens",
+                        "/reasoningOutputTokens",
+                        "/reasoning_output_tokens",
+                    ],
+                ),
+                cache_read_input_tokens: integer_at_any(
+                    usage,
+                    &[
+                        "/cachedReadTokens",
+                        "/cacheReadInputTokens",
+                        "/cache_read_input_tokens",
+                    ],
+                ),
+                cache_write_input_tokens: integer_at_any(
+                    usage,
+                    &[
+                        "/cachedWriteTokens",
+                        "/cacheWriteInputTokens",
+                        "/cache_write_input_tokens",
+                    ],
+                ),
+                context_used_tokens: None,
+                context_size_tokens: None,
+                native_context_ratio: None,
+            },
+        ),
+        _ => return Vec::new(),
+    };
+    let cost = if adapter_kind == AdapterKind::OpencodeCli {
+        None
+    } else {
+        let currency = string_at_any(usage, &["/cost/currency"]);
+        currency.as_deref().and_then(|currency| {
+            cost_from_value(
+                value_at_any(usage, &["/cost/amount"]),
+                currency,
+                "runtime_reported",
+                "turn",
+            )
+        })
+    };
+    if fields.is_empty() && cost.is_none() {
+        return Vec::new();
+    }
+    vec![ParsedRuntimeUsage {
+        identity_suffix: "terminal_usage".to_string(),
+        dialect_id: dialect_id.to_string(),
+        source: "runtime_result".to_string(),
+        scope: "turn".to_string(),
+        counter_mode: RuntimeUsageCounterMode::Delta,
+        input_semantics,
+        native_session_id: string_at_any(params, &["/sessionId"]),
+        native_turn_id: string_at_any(params, &["/turnId", "/promptId"]),
+        fields,
+        cost,
+        context_model_id: None,
+        occurred_at: None,
+    }]
+}
+
+pub fn acp_usage_source_identity(
+    adapter_kind: AdapterKind,
+    method: &str,
+    params: &Value,
+) -> Result<Option<String>> {
+    let stable = match (adapter_kind, method) {
+        (AdapterKind::CopilotCli, "github.com/copilot/sessionEvent") => {
+            (params["type"] == "assistant.usage").then(|| {
+                json!({
+                    "dialect": "copilot-native-call-usage-v1",
+                    "sessionId": params.get("sessionId"), "timestamp": params.get("timestamp"),
+                    "input": params.pointer("/data/inputTokens"),
+                    "output": params.pointer("/data/outputTokens"),
+                    "read": params.pointer("/data/cacheReadTokens"),
+                    "write": params.pointer("/data/cacheWriteTokens"),
+                    "reasoning": params.pointer("/data/reasoningTokens"),
+                })
+            })
+        }
+        (AdapterKind::CodebuddyCli, "session/update") => {
+            let usage = params.pointer("/update/_meta/usage");
+            let request_id = params.pointer("/update/_meta/codebuddy.ai~1requestId");
+            request_id.or(usage).map(|identity| {
+                json!({
+                    "dialect": "codebuddy-acp-private-usage-v1",
+                    "sessionId": params.get("sessionId"),
+                    "identity": identity,
+                })
+            })
+        }
+        (AdapterKind::QwenCode, "session/update") => {
+            params.pointer("/update/_meta/usage").map(|usage| {
+                json!({
+                    "dialect": "qwen-acp-private-usage-v1",
+                    "sessionId": params.get("sessionId"),
+                    "usage": usage,
+                })
+            })
+        }
+        (AdapterKind::OpencodeCli, "rovai/acp_prompt_completed") => {
+            let usage = params.pointer("/result/usage");
+            let prompt_id = params.get("promptId");
+            prompt_id.or(usage).map(|identity| {
+                json!({
+                    "dialect": "opencode-acp-terminal-usage-v1",
+                    "sessionId": params.get("sessionId"),
+                    "identity": identity,
+                })
+            })
+        }
+        (AdapterKind::GrokBuild, "_x.ai/session_notification")
+            if params.pointer("/update/sessionUpdate") == Some(&json!("turn_completed")) =>
+        {
+            params.pointer("/update/prompt_id").map(|prompt_id| {
+                json!({
+                    "dialect": "grok-turn-completed-usage-v1",
+                    "sessionId": params.get("sessionId"),
+                    "promptId": prompt_id,
+                })
+            })
+        }
+        _ => None,
+    };
+    stable
+        .map(|stable| crate::command::canonical_json_digest(&stable))
+        .transpose()
+}
+
+/// Parse only Pi's terminal assistant-message snapshot. The top-level Usage on
+/// `message_update` is cumulative while a provider is streaming and must not be
+/// projected as an additional model call.
+pub fn parse_pi_usage_message(
+    event: &Value,
+    native_session_id: &str,
+    native_prompt_id: &str,
+) -> Vec<ParsedRuntimeUsage> {
+    if event.get("type").and_then(Value::as_str) == Some("rovai.context_usage") {
+        return vec![ParsedRuntimeUsage {
+            identity_suffix: "context".to_string(),
+            dialect_id: "pi-native-context-estimate-v1".to_string(),
+            source: "runtime_private_extension".to_string(),
+            scope: "session".to_string(),
+            counter_mode: RuntimeUsageCounterMode::Gauge,
+            input_semantics: RuntimeInputSemantics::Unknown,
+            native_session_id: Some(native_session_id.to_string()),
+            native_turn_id: None,
+            fields: RuntimeUsageFields {
+                context_used_tokens: integer_at_any(event, &["/usedTokens"]),
+                context_size_tokens: integer_at_any(event, &["/windowTokens"]),
+                ..Default::default()
+            },
+            cost: None,
+            context_model_id: string_at_any(event, &["/modelId"]),
+            occurred_at: None,
+        }];
+    }
+    if event.get("type").and_then(Value::as_str) != Some("message_end") {
+        return Vec::new();
+    }
+    let message = event.get("message").unwrap_or(&Value::Null);
+    if message.get("role").and_then(Value::as_str) != Some("assistant")
+        || safe_integer(message.get("timestamp")).is_none()
+    {
+        return Vec::new();
+    }
+    let usage = message.get("usage").unwrap_or(&Value::Null);
+    let fields = RuntimeUsageFields {
+        input_tokens: integer_at_any(usage, &["/input"]),
+        uncached_input_tokens: None,
+        output_tokens: integer_at_any(usage, &["/output"]),
+        reasoning_output_tokens: integer_at_any(usage, &["/reasoning"]),
+        cache_read_input_tokens: integer_at_any(usage, &["/cacheRead"]),
+        cache_write_input_tokens: integer_at_any(usage, &["/cacheWrite"]),
+        context_used_tokens: None,
+        context_size_tokens: None,
+        native_context_ratio: None,
+    };
+    if fields.is_empty() {
+        return Vec::new();
+    }
+    vec![ParsedRuntimeUsage {
+        identity_suffix: "assistant_message".to_string(),
+        dialect_id: "pi-message-end-usage-v1".to_string(),
+        source: "runtime_event".to_string(),
+        scope: "model_call".to_string(),
+        counter_mode: RuntimeUsageCounterMode::Delta,
+        input_semantics: RuntimeInputSemantics::ExclusiveBuckets,
+        native_session_id: Some(native_session_id.to_string()),
+        native_turn_id: Some(native_prompt_id.to_string()),
+        fields,
+        // Pi's model catalog calculates monetary cost. It is not provider
+        // billing evidence, so it deliberately remains unprojected.
+        cost: None,
+        context_model_id: None,
+        occurred_at: None,
+    }]
+}
+
+pub fn pi_usage_source_identity(
+    event: &Value,
+    native_session_id: &str,
+    native_prompt_id: &str,
+) -> Result<Option<String>> {
+    if event.get("type").and_then(Value::as_str) != Some("message_end") {
+        return Ok(None);
+    }
+    let message = event
+        .get("message")
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"));
+    let Some(message) = message else {
+        return Ok(None);
+    };
+    let timestamp = message
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .filter(|timestamp| *timestamp <= JS_MAX_SAFE_INTEGER)
+        .context("Pi assistant message_end is missing a stable timestamp")?;
+    if message.get("usage").is_none() {
+        return Ok(None);
+    }
+    crate::command::canonical_json_digest(&json!({
+        "dialect": "pi-message-end-usage-v1",
+        "nativeSessionId": native_session_id,
+        "nativePromptId": native_prompt_id,
+        "timestamp": timestamp,
+        "provider": message.get("provider"),
+        "model": message.get("model"),
+        "stopReason": message.get("stopReason"),
+        "usage": message.get("usage"),
+    }))
+    .map(Some)
+}
+
+pub fn parse_claude_result_usage(result: &Value) -> Vec<ParsedRuntimeUsage> {
+    let usage = result.get("usage").unwrap_or(&Value::Null);
+    let mut fields = RuntimeUsageFields {
+        input_tokens: integer_at_any(usage, &["/input_tokens"]),
+        uncached_input_tokens: None,
+        output_tokens: integer_at_any(usage, &["/output_tokens"]),
+        reasoning_output_tokens: integer_at_any(
+            usage,
+            &["/reasoning_output_tokens", "/thinking_tokens"],
+        ),
+        cache_read_input_tokens: integer_at_any(usage, &["/cache_read_input_tokens"]),
+        cache_write_input_tokens: integer_at_any(
+            usage,
+            &["/cache_creation_input_tokens", "/cache_write_input_tokens"],
+        ),
+        context_used_tokens: None,
+        context_size_tokens: None,
+        native_context_ratio: None,
+    };
+    let cost = cost_from_value(
+        value_at_any(result, &["/total_cost_usd", "/cost_usd"]),
+        "USD",
+        "runtime_estimate",
+        "run",
+    );
+    if result.get("model_calls_observed").and_then(Value::as_bool) == Some(true) {
+        fields = RuntimeUsageFields::default();
+    }
+    if fields.is_empty() && cost.is_none() {
+        return Vec::new();
+    }
+    vec![ParsedRuntimeUsage {
+        identity_suffix: "terminal_result".to_string(),
+        dialect_id: "claude-result-usage-v2".to_string(),
+        source: "runtime_result".to_string(),
+        scope: "run".to_string(),
+        counter_mode: RuntimeUsageCounterMode::Delta,
+        input_semantics: RuntimeInputSemantics::ExclusiveBuckets,
+        native_session_id: string_at_any(result, &["/session_id"]),
+        native_turn_id: string_at_any(result, &["/turn_id"]),
+        fields,
+        cost,
+        context_model_id: None,
+        occurred_at: None,
+    }]
+}
+
+pub fn parse_claude_observed_usage(event_type: &str, payload: &Value) -> Vec<ParsedRuntimeUsage> {
+    let Some(session) = string_at_any(payload, &["/sessionId"]) else {
+        return Vec::new();
+    };
+    let Some(message) = string_at_any(payload, &["/messageId"]) else {
+        return Vec::new();
+    };
+    let (suffix, dialect, mode, semantics, fields) = match event_type {
+        "runtime.usage.observed" => (
+            format!("message:{message}"),
+            "claude-stream-call-usage-v1",
+            RuntimeUsageCounterMode::Cumulative,
+            RuntimeInputSemantics::ExclusiveBuckets,
+            RuntimeUsageFields {
+                input_tokens: integer_at_any(payload, &["/usage/input_tokens"]),
+                output_tokens: integer_at_any(payload, &["/usage/output_tokens"]),
+                cache_read_input_tokens: integer_at_any(
+                    payload,
+                    &["/usage/cache_read_input_tokens"],
+                ),
+                cache_write_input_tokens: integer_at_any(
+                    payload,
+                    &["/usage/cache_creation_input_tokens"],
+                ),
+                ..Default::default()
+            },
+        ),
+        "runtime.context.observed" => (
+            "context".to_string(),
+            "claude-last-call-context-input-v1",
+            RuntimeUsageCounterMode::Gauge,
+            RuntimeInputSemantics::Unknown,
+            RuntimeUsageFields {
+                context_used_tokens: integer_at_any(payload, &["/usedTokens"]),
+                context_size_tokens: integer_at_any(payload, &["/windowTokens"]),
+                ..Default::default()
+            },
+        ),
+        _ => return Vec::new(),
+    };
+    if fields.is_empty() {
+        return Vec::new();
+    }
+    vec![ParsedRuntimeUsage {
+        identity_suffix: suffix,
+        dialect_id: dialect.to_string(),
+        source: if mode == RuntimeUsageCounterMode::Gauge {
+            "runtime_private_extension"
+        } else {
+            "runtime_event"
+        }
+        .to_string(),
+        scope: if mode == RuntimeUsageCounterMode::Gauge {
+            "session"
+        } else {
+            "model_call"
+        }
+        .to_string(),
+        counter_mode: mode,
+        input_semantics: semantics,
+        native_session_id: Some(session),
+        native_turn_id: None,
+        fields,
+        cost: None,
+        context_model_id: string_at_any(payload, &["/modelId"]),
+        occurred_at: None,
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(
+        mode: RuntimeUsageCounterMode,
+        semantics: RuntimeInputSemantics,
+        input: Option<i64>,
+        read: Option<i64>,
+        write: Option<i64>,
+        output: Option<i64>,
+    ) -> ParsedRuntimeUsage {
+        ParsedRuntimeUsage {
+            identity_suffix: "fixture".to_string(),
+            dialect_id: "fixture-v1".to_string(),
+            source: "runtime_event".to_string(),
+            scope: "turn".to_string(),
+            counter_mode: mode,
+            input_semantics: semantics,
+            native_session_id: Some("session-1".to_string()),
+            native_turn_id: Some("turn-1".to_string()),
+            fields: RuntimeUsageFields {
+                input_tokens: input,
+                uncached_input_tokens: None,
+                output_tokens: output,
+                reasoning_output_tokens: None,
+                cache_read_input_tokens: read,
+                cache_write_input_tokens: write,
+                context_used_tokens: None,
+                context_size_tokens: None,
+                native_context_ratio: None,
+            },
+            cost: None,
+            context_model_id: None,
+            occurred_at: None,
+        }
+    }
+
+    #[test]
+    fn pi_usage_uses_terminal_assistant_messages_and_deduplicates_replays() {
+        let message = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "provider": "minimax",
+                "model": "MiniMax-M2.1",
+                "timestamp": 1_788_355_216_000_u64,
+                "stopReason": "toolUse",
+                "usage": {
+                    "input": 10,
+                    "output": 7,
+                    "reasoning": 3,
+                    "cacheRead": 20,
+                    "cacheWrite": 2,
+                    "totalTokens": 39,
+                    "cost": {"total": 99.0}
+                }
+            }
+        });
+        let parsed = parse_pi_usage_message(&message, "session-pi", "prompt-pi");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].counter_mode, RuntimeUsageCounterMode::Delta);
+        assert_eq!(parsed[0].scope, "model_call");
+        assert_eq!(
+            parsed[0].input_semantics,
+            RuntimeInputSemantics::ExclusiveBuckets
+        );
+        assert_eq!(parsed[0].fields.input_tokens, Some(10));
+        assert_eq!(parsed[0].fields.output_tokens, Some(7));
+        assert_eq!(parsed[0].fields.reasoning_output_tokens, Some(3));
+        assert_eq!(parsed[0].fields.cache_read_input_tokens, Some(20));
+        assert_eq!(parsed[0].fields.cache_write_input_tokens, Some(2));
+        assert_eq!(parsed[0].cost, None);
+        let normalized = normalize_usage(&parsed[0]).unwrap();
+        assert_eq!(normalized.prompt_input_total_tokens, Some(32));
+        assert_eq!(normalized.uncached_input_tokens, Some(10));
+
+        let run = RuntimeUsageRun {
+            key: UsageRunKey {
+                agent_run_id: "pi-run".to_string(),
+                execution_epoch: 1,
+            },
+            runtime_kind: AdapterKind::Pi,
+            runtime_version: Some("0.84.4".to_string()),
+            provider_key: Some("minimax".to_string()),
+            model_key: Some("MiniMax-M2.1".to_string()),
+            service_tier: None,
+        };
+        let identity = pi_usage_source_identity(&message, "session-pi", "prompt-pi")
+            .unwrap()
+            .unwrap();
+        let mut buffer = RuntimeUsageBuffer::default();
+        buffer
+            .observe_run(&run, &identity, &parsed, Instant::now())
+            .unwrap();
+        buffer
+            .observe_run(&run, &identity, &parsed, Instant::now())
+            .unwrap();
+
+        let second = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "provider": "minimax",
+                "model": "MiniMax-M2.1",
+                "timestamp": 1_788_355_216_001_u64,
+                "stopReason": "stop",
+                "usage": {"input": 4, "output": 2, "cacheRead": 1, "cacheWrite": 0}
+            }
+        });
+        let second_parsed = parse_pi_usage_message(&second, "session-pi", "prompt-pi");
+        let second_identity = pi_usage_source_identity(&second, "session-pi", "prompt-pi")
+            .unwrap()
+            .unwrap();
+        buffer
+            .observe_run(&run, &second_identity, &second_parsed, Instant::now())
+            .unwrap();
+        let batches = buffer.drain(RuntimeUsageFlushTarget::Run {
+            agent_run_id: "pi-run".to_string(),
+            execution_epoch: 1,
+        });
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].records.len(), 2);
+        let totals = batches[0].records.iter().fold((0, 0, 0), |sum, record| {
+            (
+                sum.0 + record.normalized.prompt_input_total_tokens.unwrap(),
+                sum.1 + record.normalized.output_tokens.unwrap(),
+                sum.2 + record.normalized.cache_observable_request_count.unwrap(),
+            )
+        });
+        assert_eq!(totals, (37, 9, 2));
+
+        assert!(
+            parse_pi_usage_message(
+                &json!({
+                    "type": "message_update",
+                    "usage": {"input": 999}
+                }),
+                "session-pi",
+                "prompt-pi"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            eligible_mask(AdapterKind::Pi, Some("0.84.4")) & ELIGIBLE_COST,
+            0
+        );
+        assert_eq!(
+            eligible_mask(AdapterKind::Pi, Some("0.84.3")),
+            eligible_mask(AdapterKind::Pi, None)
+        );
+        let gauge = parse_pi_usage_message(
+            &json!({"type":"rovai.context_usage","usedTokens":32,"windowTokens":100}),
+            "session-pi",
+            "prompt-pi",
+        );
+        assert_eq!(gauge[0].counter_mode, RuntimeUsageCounterMode::Gauge);
+        assert_eq!(gauge[0].fields.context_used_tokens, Some(32));
+        assert!(
+            !normalize_usage(&gauge[0]).unwrap().any_observed(),
+            "native context estimate never enters billing"
+        );
+        let unknown = parse_pi_usage_message(
+            &json!({"type":"rovai.context_usage","usedTokens":null,"windowTokens":100}),
+            "session-pi",
+            "prompt-pi",
+        );
+        assert_eq!(unknown[0].fields.context_used_tokens, None);
+    }
+
+    #[test]
+    fn usage_core_semantics_preserve_unknown_zero_and_partial_buckets() {
+        let unknown = normalize_usage(&usage(
+            RuntimeUsageCounterMode::Delta,
+            RuntimeInputSemantics::CacheInclusiveTotal,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(unknown, UsageCounters::default());
+
+        let zero = normalize_usage(&usage(
+            RuntimeUsageCounterMode::Delta,
+            RuntimeInputSemantics::CacheInclusiveTotal,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+        ))
+        .unwrap();
+        assert_eq!(zero.prompt_input_total_tokens, Some(0));
+        assert_eq!(zero.uncached_input_tokens, Some(0));
+
+        let partial = normalize_usage(&usage(
+            RuntimeUsageCounterMode::Delta,
+            RuntimeInputSemantics::CacheInclusiveTotal,
+            Some(100),
+            Some(40),
+            None,
+            Some(20),
+        ))
+        .unwrap();
+        assert_eq!(partial.prompt_input_total_tokens, Some(100));
+        assert_eq!(partial.cache_read_tokens, Some(40));
+        assert_eq!(partial.uncached_input_tokens, None);
+
+        assert!(
+            normalize_usage(&usage(
+                RuntimeUsageCounterMode::Delta,
+                RuntimeInputSemantics::CacheInclusiveTotal,
+                Some(30),
+                Some(20),
+                Some(20),
+                Some(10),
+            ))
+            .is_err()
+        );
+
+        let mut conflicting = usage(
+            RuntimeUsageCounterMode::Delta,
+            RuntimeInputSemantics::CacheInclusiveTotal,
+            Some(100),
+            Some(40),
+            Some(10),
+            Some(20),
+        );
+        conflicting.fields.uncached_input_tokens = Some(60);
+        assert!(normalize_usage(&conflicting).is_err());
+    }
+
+    #[test]
+    fn cumulative_checkpoint_delta_and_decimal_arithmetic_are_exact() {
+        let current = UsageCounters {
+            prompt_input_total_tokens: Some(150),
+            cache_read_tokens: Some(60),
+            output_tokens: Some(30),
+            ..UsageCounters::default()
+        };
+        let baseline = UsageCounters {
+            prompt_input_total_tokens: Some(100),
+            cache_read_tokens: Some(40),
+            output_tokens: Some(20),
+            ..UsageCounters::default()
+        };
+        let delta = subtract_counters(&current, &baseline);
+        assert_eq!(delta.prompt_input_total_tokens, Some(50));
+        assert_eq!(delta.cache_read_tokens, Some(20));
+        assert_eq!(delta.output_tokens, Some(10));
+        assert_eq!(
+            subtract_decimal_nonnegative("15.25", "10.20").unwrap(),
+            Some("5.05".to_string())
+        );
+        assert_eq!(add_decimal("10", "5").unwrap(), "15");
+        assert_eq!(subtract_decimal_signed("10", "12.5").unwrap(), "-2.5");
+    }
+
+    #[test]
+    fn execution_usage_batch_keeps_requested_scope_collection_and_sparse_fields() {
+        for key in ["threadId", "campId"] {
+            let input = json!({key: "camp-a", "agentRunIds": ["run-a"]});
+            let parsed: MonitoringExecutionParams = serde_json::from_value(input).unwrap();
+            assert_eq!(parsed.camp_id, "camp-a");
+            assert_eq!(parsed.agent_run_ids, ["run-a"]);
+        }
+        assert!(
+            serde_json::from_value::<MonitoringExecutionParams>(json!({
+                "threadId": "camp-a", "campId": "camp-a", "agentRunIds": []
+            }))
+            .is_err()
+        );
+        // Lowest-cost owner of the SQL read seam; no migrations, Runtime or historical bodies.
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(r#"
+            CREATE TABLE conversation (id TEXT PRIMARY KEY, camp_id TEXT);
+            CREATE TABLE agent_run (id TEXT PRIMARY KEY, conversation_id TEXT, execution_epoch INTEGER, status TEXT);
+            CREATE TABLE runtime_usage_collection_state (singleton_id INTEGER, collection_epoch TEXT);
+            CREATE TABLE runtime_usage_run_summary (
+                agent_run_id TEXT, collection_epoch TEXT, prompt_input_total_tokens INTEGER,
+                output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+                finalized_at TEXT, last_observed_at TEXT, parser_version INTEGER, usage_quality TEXT
+            );
+            INSERT INTO conversation VALUES ('conversation-a', 'camp-a'), ('conversation-b', 'camp-b');
+            INSERT INTO agent_run VALUES ('run-a', 'conversation-a', 2, 'succeeded'), ('run-b', 'conversation-a', 1, 'running'), ('foreign', 'conversation-b', 1, 'failed');
+            INSERT INTO runtime_usage_collection_state VALUES (1, 'current');
+            INSERT INTO runtime_usage_run_summary VALUES
+                ('run-a', 'current', 100, 20, NULL, 0, 'final', 'observed', 5, 'runtime_reported'),
+                ('run-a', 'old', 999, 999, 999, 999, 'old', 'old', 4, 'runtime_reported'),
+                ('run-b', 'current', NULL, NULL, NULL, NULL, NULL, NULL, 5, NULL),
+                ('foreign', 'current', 200, 40, 10, 0, 'final', 'observed', 5, 'runtime_reported');
+        "#).unwrap();
+        let params = |ids: Vec<&str>| MonitoringExecutionParams {
+            camp_id: "camp-a".into(),
+            agent_run_ids: ids.into_iter().map(String::from).collect(),
+        };
+        let rows = execution_run_usage_rows(
+            &connection,
+            &params(vec!["run-b", "foreign", "missing", "run-a"]),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["agentRunId"], "run-b");
+        assert_eq!(rows[0]["promptInputTotalTokens"], Value::Null);
+        assert_eq!(rows[1]["agentRunId"], "run-a");
+        assert_eq!(rows[1]["executionEpoch"], 2);
+        assert_eq!(rows[1]["promptInputTotalTokens"], 100);
+        assert_eq!(rows[1]["cacheReadTokens"], Value::Null);
+        assert_eq!(rows[1]["cacheWriteTokens"], 0);
+        assert_eq!(rows[1]["finalizedAt"], "final");
+        assert_eq!(rows[1]["inputOutputComplete"], true);
+        assert_eq!(rows[0]["inputOutputComplete"], false);
+        for (version, quality) in [(5, "runtime_reported_partial"), (4, "runtime_reported")] {
+            connection.execute("UPDATE runtime_usage_run_summary SET parser_version=?1, usage_quality=?2 WHERE agent_run_id='run-a'", params![version,quality]).unwrap();
+            let read = execution_run_usage_rows(&connection, &params(vec!["run-a"])).unwrap();
+            assert_eq!(read[0]["promptInputTotalTokens"], 100, "keep observed sums");
+            assert_eq!(
+                read[0]["inputOutputComplete"], false,
+                "partial or legacy unknown is not a complete total"
+            );
+        }
+        assert!(
+            execution_run_usage_rows(&connection, &params(vec![]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            execution_run_usage_rows(&connection, &params(vec!["run-a' OR 1=1 --"]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn session_context_rejects_late_observations_after_binding_rotation() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(r#"
+            CREATE TABLE conversation (
+                id TEXT PRIMARY KEY, native_session_id TEXT, native_binding_id TEXT,
+                native_binding_generation INTEGER
+            );
+            CREATE TABLE agent_run (
+                id TEXT PRIMARY KEY, conversation_id TEXT, execution_epoch INTEGER,
+                started_at TEXT, runtime_observed_model_id TEXT, runtime_host_config_digest TEXT
+            );
+            CREATE TABLE runtime_input_delivery (
+                agent_run_id TEXT, execution_epoch INTEGER, native_binding_id TEXT,
+                native_binding_generation INTEGER, status TEXT
+            );
+            CREATE TABLE runtime_session_context_latest (
+                conversation_id TEXT PRIMARY KEY, native_binding_id TEXT,
+                native_binding_generation INTEGER, native_session_id TEXT,
+                runtime_kind TEXT, runtime_version TEXT, model_key TEXT,
+                effective_config_digest TEXT, context_used_tokens INTEGER,
+                context_window_tokens INTEGER, source TEXT, dialect_id TEXT,
+                observed_at TEXT, source_agent_run_id TEXT, source_execution_epoch INTEGER, native_context_ratio REAL
+            );
+            INSERT INTO conversation VALUES ('conversation', 'session-a', 'binding-a', 1);
+            INSERT INTO agent_run VALUES ('run-a', 'conversation', 1, '2026-09-28T00:00:00Z', NULL, NULL);
+            INSERT INTO runtime_input_delivery(agent_run_id,execution_epoch,native_binding_id,native_binding_generation,status) VALUES ('run-a', 1, 'binding-a', 1, 'accepted');
+            INSERT INTO agent_run VALUES ('run-b', 'conversation', 1, '2026-09-28T00:01:00Z', NULL, NULL);
+            INSERT INTO runtime_input_delivery(agent_run_id,execution_epoch,native_binding_id,native_binding_generation,status) VALUES ('run-b', 1, 'binding-b', 2, 'accepted');
+            ALTER TABLE runtime_input_delivery ADD COLUMN input_kind TEXT NOT NULL DEFAULT 'start';
+            ALTER TABLE agent_run ADD COLUMN runtime_model_selection_json TEXT DEFAULT '{}';
+        "#).unwrap();
+        let run = |id: &str| RuntimeUsageRun {
+            key: UsageRunKey {
+                agent_run_id: id.to_string(),
+                execution_epoch: 1,
+            },
+            runtime_kind: AdapterKind::CodexCli,
+            runtime_version: Some("0.157.1".to_string()),
+            provider_key: None,
+            model_key: None,
+            service_tier: None,
+        };
+        let observation = |session: &str, used: i64, at: &str| ParsedRuntimeUsage {
+            identity_suffix: "context".to_string(),
+            dialect_id: "fixture-context-v1".to_string(),
+            source: "runtime_event".to_string(),
+            scope: "session".to_string(),
+            counter_mode: RuntimeUsageCounterMode::Gauge,
+            input_semantics: RuntimeInputSemantics::Unknown,
+            native_session_id: Some(session.to_string()),
+            native_turn_id: None,
+            fields: RuntimeUsageFields {
+                context_used_tokens: Some(used),
+                context_size_tokens: Some(1000),
+                ..Default::default()
+            },
+            cost: None,
+            context_model_id: None,
+            occurred_at: Some(at.to_string()),
+        };
+        let tx = connection.transaction().unwrap();
+        let mut live = parse_claude_observed_usage(
+            "runtime.context.observed",
+            &json!({"sessionId":"session-a","messageId":"live-call","modelId":"native-model",
+                "usedTokens":115268,"windowTokens":null}),
+        )
+        .remove(0);
+        live.occurred_at = Some("2026-09-28T00:00:10Z".into());
+        assert!(!normalize_usage(&live).unwrap().any_observed());
+        let claude_run = RuntimeUsageRun {
+            runtime_kind: AdapterKind::ClaudeCodeCli,
+            runtime_version: Some("2.1.280".into()),
+            ..run("run-a")
+        };
+        persist_session_context(&tx, &claude_run, &live).unwrap();
+        let saved: (Option<i64>, Option<i64>, Option<f64>) = tx.query_row(
+            "SELECT context_used_tokens,context_window_tokens,native_context_ratio FROM runtime_session_context_latest",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(
+            saved,
+            (Some(115268), None, None),
+            "live used survives without a terminal/window"
+        );
+        persist_session_context(
+            &tx,
+            &run("run-a"),
+            &observation("session-a", 400, "2026-09-28T00:00:30Z"),
+        )
+        .unwrap();
+        persist_session_context(
+            &tx,
+            &run("run-a"),
+            &observation("session-a", 100, "2026-09-28T00:00:20Z"),
+        )
+        .unwrap();
+        let used: i64 = tx
+            .query_row(
+                "SELECT context_used_tokens FROM runtime_session_context_latest",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            used, 400,
+            "an older observation must not overwrite a newer one"
+        );
+
+        // Pending and uncertain input acknowledgement do not gate Session Context.
+        // Metrics never change delivery/retry state, even when a Run later fails.
+        for (index, status) in ["prepared", "delivery_unknown", "not_accepted"]
+            .iter()
+            .enumerate()
+        {
+            tx.execute(
+                "UPDATE runtime_input_delivery SET status=?1 WHERE agent_run_id='run-a'",
+                [status],
+            )
+            .unwrap();
+            let gauge = observation(
+                "session-a",
+                260,
+                &format!("2026-09-28T00:00:3{}Z", index + 1),
+            );
+            assert!(persist_session_context(&tx, &run("run-a"), &gauge).unwrap());
+            assert_eq!(
+                tx.query_row(
+                    "SELECT context_used_tokens FROM runtime_session_context_latest",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                260
+            );
+            assert_eq!(
+                tx.query_row(
+                    "SELECT status FROM runtime_input_delivery WHERE agent_run_id='run-a'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                *status
+            );
+        }
+
+        let mut native_only = observation("session-a", 0, "2026-09-28T00:00:35Z");
+        native_only.fields = RuntimeUsageFields {
+            native_context_ratio: Some(0.125),
+            ..Default::default()
+        };
+        persist_session_context(&tx, &run("run-a"), &native_only).unwrap();
+        let saved: (Option<i64>, Option<i64>, Option<f64>) = tx.query_row(
+            "SELECT context_used_tokens,context_window_tokens,native_context_ratio FROM runtime_session_context_latest",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(
+            saved,
+            (None, None, Some(0.125)),
+            "a ratio neither infers nor stitches old quantities"
+        );
+        native_only.fields.native_context_ratio = Some(1.01);
+        native_only.occurred_at = Some("2026-09-28T00:00:40Z".into());
+        persist_session_context(&tx, &run("run-a"), &native_only).unwrap();
+        assert_eq!(
+            tx.query_row(
+                "SELECT native_context_ratio FROM runtime_session_context_latest",
+                [],
+                |r| r.get::<_, f64>(0)
+            )
+            .unwrap(),
+            0.125
+        );
+        native_only.fields.native_context_ratio = Some(0.0);
+        persist_session_context(&tx, &run("run-a"), &native_only).unwrap();
+        native_only.occurred_at = Some("2026-09-28T00:00:45Z".into());
+        persist_session_context(&tx, &run("run-a"), &native_only).unwrap();
+        assert_eq!(
+            tx.query_row(
+                "SELECT observed_at FROM runtime_session_context_latest",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "2026-09-28T00:00:45Z",
+            "same ratio at a fresh native time updates freshness"
+        );
+        tx.execute("UPDATE conversation SET native_session_id='session-b', native_binding_id='binding-b', native_binding_generation=2 WHERE id='conversation'", []).unwrap();
+        persist_session_context(
+            &tx,
+            &run("run-a"),
+            &observation("session-a", 600, "2026-09-28T00:02:00Z"),
+        )
+        .unwrap();
+        let current_count: i64 = tx.query_row("SELECT COUNT(*) FROM conversation c JOIN runtime_session_context_latest x ON x.conversation_id=c.id AND x.native_binding_id=c.native_binding_id AND x.native_binding_generation=c.native_binding_generation AND x.native_session_id=c.native_session_id", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            current_count, 0,
+            "the old Session context must disappear from the current read"
+        );
+        persist_session_context(
+            &tx,
+            &run("run-b"),
+            &observation("session-b", 200, "2026-09-28T00:02:10Z"),
+        )
+        .unwrap();
+        let current: (String, i64) = tx
+            .query_row(
+                "SELECT native_session_id, context_used_tokens FROM runtime_session_context_latest",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current, ("session-b".to_string(), 200));
+        // Reuse only confirmed actual model/configuration on the current binding.
+        tx.execute(
+            "UPDATE agent_run SET runtime_host_config_digest='provider-config-a' WHERE id='run-b'",
+            [],
+        )
+        .unwrap();
+        let mut actual = observation("session-b", 128, "2026-09-28T00:04:00Z");
+        actual.context_model_id = Some("actual-model-a".into());
+        persist_session_context(&tx, &run("run-b"), &actual).unwrap();
+        let read_context = || {
+            tx.query_row("SELECT context_used_tokens,context_window_tokens,model_key,native_context_ratio FROM runtime_session_context_latest", [], |r| Ok((r.get::<_,Option<i64>>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<f64>>(3)?))).unwrap()
+        };
+        actual.fields.context_used_tokens = Some(150);
+        actual.fields.context_size_tokens = None;
+        actual.context_model_id = None; // Omitted model inherits the confirmed binding identity.
+        actual.occurred_at = Some("2026-09-28T00:04:01Z".into());
+        persist_session_context(&tx, &run("run-b"), &actual).unwrap();
+        assert_eq!(
+            read_context(),
+            (Some(150), Some(1000), Some("actual-model-a".into()), None)
+        );
+        actual.context_model_id = Some("actual-model-b".into());
+        actual.occurred_at = Some("2026-09-28T00:04:02Z".into());
+        persist_session_context(&tx, &run("run-b"), &actual).unwrap();
+        assert_eq!(
+            read_context(),
+            (Some(150), None, Some("actual-model-b".into()), None)
+        );
+        actual.fields.context_size_tokens = Some(2000);
+        actual.occurred_at = Some("2026-09-28T00:04:03Z".into());
+        persist_session_context(&tx, &run("run-b"), &actual).unwrap();
+        actual.fields.context_size_tokens = None;
+        tx.execute(
+            "UPDATE agent_run SET runtime_host_config_digest='provider-config-b' WHERE id='run-b'",
+            [],
+        )
+        .unwrap();
+        actual.occurred_at = Some("2026-09-28T00:04:04Z".into());
+        persist_session_context(&tx, &run("run-b"), &actual).unwrap();
+        assert_eq!(
+            read_context().1,
+            None,
+            "configuration change revokes capacity"
+        );
+        actual.fields.context_size_tokens = Some(100);
+        actual.fields.native_context_ratio = Some(0.4);
+        actual.occurred_at = Some("2026-09-28T00:04:05Z".into());
+        persist_session_context(&tx, &run("run-b"), &actual).unwrap();
+        assert_eq!(
+            read_context(),
+            (Some(150), None, Some("actual-model-b".into()), None),
+            "used is not clipped/discarded with a contradictory denominator"
+        );
+        // Same Session, next pending Run inherits actual identity despite an alias.
+        actual.fields.context_size_tokens = Some(2000);
+        actual.fields.native_context_ratio = None;
+        actual.occurred_at = Some("2026-09-28T00:04:06Z".into());
+        persist_session_context(&tx, &run("run-b"), &actual).unwrap();
+        tx.execute_batch("INSERT INTO agent_run VALUES ('run-c','conversation',1,'2026-09-28T00:05:00Z',NULL,'provider-config-b','{}'); INSERT INTO runtime_input_delivery(agent_run_id,execution_epoch,native_binding_id,native_binding_generation,status) VALUES ('run-c',1,'binding-b',2,'prepared');").unwrap();
+        actual.context_model_id = None;
+        actual.fields.context_used_tokens = Some(200);
+        actual.fields.context_size_tokens = None;
+        actual.occurred_at = Some("2026-09-28T00:05:01Z".into());
+        let mut alias_run = run("run-c");
+        alias_run.model_key = Some("auto".into());
+        persist_session_context(&tx, &alias_run, &actual).unwrap();
+        assert_eq!(
+            read_context(),
+            (Some(200), Some(2000), Some("actual-model-b".into()), None)
+        );
+        assert!(
+            !persist_session_context(&tx, &run("run-b"), &actual).unwrap(),
+            "old owner cannot overwrite a current unaccepted Run"
+        );
+        actual.occurred_at = Some("2026-09-28T00:06:01Z".into());
+        tx.execute_batch(r#"INSERT INTO agent_run VALUES ('run-d','conversation',1,'2026-09-28T00:06:00Z',NULL,'provider-config-b','{"options":{"contextWindow":4000}}'); INSERT INTO runtime_input_delivery(agent_run_id,execution_epoch,native_binding_id,native_binding_generation,status) VALUES ('run-d',1,'binding-b',2,'prepared');"#).unwrap();
+        persist_session_context(&tx, &run("run-d"), &actual).unwrap();
+        assert_eq!(
+            read_context().1,
+            None,
+            "model options change revokes the old window despite identical Host/model"
+        );
+        actual.fields.context_size_tokens = Some(2000);
+        actual.occurred_at = Some("2026-09-28T00:06:02Z".into());
+        persist_session_context(&tx, &run("run-d"), &actual).unwrap();
+        actual.fields.context_size_tokens = Some(0);
+        actual.occurred_at = Some("2026-09-28T00:06:03Z".into());
+        persist_session_context(&tx, &run("run-d"), &actual).unwrap();
+        assert_eq!(read_context().0, Some(200));
+        assert_eq!(
+            read_context().1,
+            None,
+            "explicit zero capacity is not omission"
+        );
+        alias_run.key.execution_epoch = 2;
+        assert!(!persist_session_context(&tx, &alias_run, &actual).unwrap());
+        tx.commit().unwrap();
+    }
+
+    #[cfg(feature = "extended-tests")]
+    #[test]
+    fn call_normalization_and_request_counts_do_not_depend_on_flush_partition() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-usage-partitions-{}", uuid::Uuid::new_v4()));
+        let mut database = Database::open(&directory).unwrap();
+        let (epoch, started_at) = collection_identity(&database).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/runtime-usage/flush-partitions.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let mode: RuntimeUsageCounterMode =
+                serde_json::from_value(case["counterMode"].clone()).unwrap();
+            let semantics = serde_json::from_value(case["inputSemantics"].clone()).unwrap();
+            let calls = case["rawCalls"].as_array().unwrap();
+            let expected = &case["expected"];
+            for partition in 0..(1 << (calls.len() - 1)) {
+                let run = RuntimeUsageRun {
+                    key: UsageRunKey {
+                        agent_run_id: format!("{name}-{partition}"),
+                        execution_epoch: 1,
+                    },
+                    runtime_kind: AdapterKind::OpencodeCli,
+                    runtime_version: None,
+                    provider_key: Some(format!("{name}-{partition}")),
+                    model_key: None,
+                    service_tier: None,
+                };
+                database.connection().execute(
+                    "INSERT INTO runtime_usage_run_summary(collection_epoch,agent_run_id,runtime_kind,parser_version,eligible_mask,input_semantics,enrolled_at) VALUES(?1,?2,'opencode-cli',?3,127,'unknown',?4)",
+                    params![epoch,run.key.agent_run_id,USAGE_PARSER_VERSION,started_at]).unwrap();
+                let mut buffer = RuntimeUsageBuffer::default();
+                let mut failed = None;
+                let mut injected_failure = false;
+                for (index, raw) in calls.iter().enumerate() {
+                    let mut call = usage(mode, semantics, None, None, None, None);
+                    call.fields = serde_json::from_value(raw.clone()).unwrap();
+                    call.scope = case["scope"].as_str().unwrap().into();
+                    call.occurred_at = Some(started_at.clone());
+                    // Same native session/turn/buffer key; distinct root model calls.
+                    for _ in 0..2 {
+                        buffer
+                            .observe_run(
+                                &run,
+                                &format!("call-{index}"),
+                                &[call.clone()],
+                                Instant::now(),
+                            )
+                            .unwrap();
+                    }
+                    if index + 1 == calls.len() {
+                        assert!(buffer.accepts_native_poll(&run.key.agent_run_id, 1));
+                        assert!(buffer.begin_native_tail(&run.key.agent_run_id, 1));
+                        assert!(!buffer.begin_native_tail(&run.key.agent_run_id, 1));
+                        buffer.finish_run(&run.key.agent_run_id, 1);
+                        assert!(!buffer.accepts_native_poll(&run.key.agent_run_id, 1));
+                    }
+                    if index + 1 == calls.len() || partition & (1 << index) != 0 {
+                        if let Some(batches) = failed.take() {
+                            // Older failed records precede newer arrivals, including baselines/resets.
+                            buffer.restore(batches).unwrap();
+                        }
+                        let batches = buffer.drain(RuntimeUsageFlushTarget::Periodic);
+                        if !injected_failure {
+                            database.connection().execute_batch("CREATE TEMP TRIGGER reject_usage_flush BEFORE INSERT ON runtime_usage_checkpoint BEGIN SELECT RAISE(ABORT, 'injected usage flush failure'); END;").unwrap();
+                            assert!(
+                                MonitoringService::record_usage_batches(&mut database, &batches)
+                                    .is_err()
+                            );
+                            database
+                                .connection()
+                                .execute_batch("DROP TRIGGER reject_usage_flush;")
+                                .unwrap();
+                            let observed: bool = database.connection().query_row("SELECT last_observed_at IS NOT NULL FROM runtime_usage_run_summary WHERE agent_run_id=?1", [&run.key.agent_run_id], |row| row.get(0)).unwrap();
+                            assert!(
+                                !observed,
+                                "summary and checkpoint writes must roll back together"
+                            );
+                            assert!(
+                                buffer.runs.contains_key(&run.key),
+                                "failed flush keeps its owner"
+                            );
+                            injected_failure = true;
+                            if index + 1 < calls.len() {
+                                failed = Some(batches);
+                                continue;
+                            }
+                        }
+                        buffer.restore(batches).unwrap();
+                        let batches = buffer.drain(RuntimeUsageFlushTarget::Periodic);
+                        MonitoringService::record_usage_batches(&mut database, &batches).unwrap();
+                        if index + 1 == calls.len() {
+                            buffer
+                                .finish_idle_target_after_flush(&RuntimeUsageFlushTarget::Periodic);
+                            assert!(
+                                buffer.runs.contains_key(&run.key),
+                                "bounded tail retains only its statistics owner"
+                            );
+                            buffer.end_native_tail(&run.key.agent_run_id, 1);
+                        }
+                        buffer.finish_idle_target_after_flush(&RuntimeUsageFlushTarget::Periodic);
+                        assert_eq!(buffer.runs.contains_key(&run.key), index + 1 < calls.len());
+                        if mode == RuntimeUsageCounterMode::Delta {
+                            assert_eq!(
+                                MonitoringService::record_usage_batches(&mut database, &batches)
+                                    .unwrap(),
+                                0,
+                                "retrying committed calls cannot charge them twice"
+                            );
+                        }
+                    }
+                }
+                MonitoringService::finalize_usage_run(&mut database, &run.key.agent_run_id)
+                    .unwrap();
+                let actual = database.connection().query_row(
+                    "SELECT prompt_input_total_tokens,uncached_input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,cache_observable_request_count,cache_hit_request_count,usage_quality FROM runtime_usage_run_summary WHERE agent_run_id=?1",
+                    [&run.key.agent_run_id], |row| Ok(json!([
+                        row.get::<_,Option<i64>>(0)?,row.get::<_,Option<i64>>(1)?,row.get::<_,Option<i64>>(2)?,
+                        row.get::<_,Option<i64>>(3)?,row.get::<_,Option<i64>>(4)?,row.get::<_,Option<i64>>(5)?,
+                        row.get::<_,Option<i64>>(6)?,row.get::<_,Option<String>>(7)?
+                    ]))).unwrap();
+                assert_eq!(&actual, expected, "{name}, flush partition {partition}");
+                let hourly = database.connection().query_row(
+                    "SELECT SUM(prompt_input_total_tokens),SUM(uncached_input_tokens),SUM(cache_read_tokens),SUM(cache_write_tokens),SUM(output_tokens),SUM(cache_observable_request_count),SUM(cache_hit_request_count) FROM runtime_usage_hourly WHERE provider_key=?1",
+                    [&run.key.agent_run_id], |row| (0..7).map(|i| row.get::<_,Option<i64>>(i)).collect::<rusqlite::Result<Vec<_>>>()).unwrap();
+                assert_eq!(
+                    json!(hourly),
+                    json!(&expected.as_array().unwrap()[..7]),
+                    "hourly: {name}, partition {partition}"
+                );
+            }
+        }
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cumulative_checkpoint_dedupes_resets_resume_and_late_terminal_batches() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-runtime-usage-checkpoint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = Database::open(&directory).unwrap();
+        let (epoch, started_at) = collection_identity(&database).unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO runtime_usage_run_summary(
+                    collection_epoch, agent_run_id, runtime_kind,
+                    parser_version, eligible_mask, input_semantics, enrolled_at
+                ) VALUES(?1, 'run-1', 'codex-cli', 2, 127, 'unknown', ?2)
+                "#,
+                params![epoch, started_at],
+            )
+            .unwrap();
+        let run = RuntimeUsageRun {
+            key: UsageRunKey {
+                agent_run_id: "run-1".to_string(),
+                execution_epoch: 1,
+            },
+            runtime_kind: AdapterKind::CodexCli,
+            runtime_version: Some("1.0".to_string()),
+            provider_key: Some("openai".to_string()),
+            model_key: Some("gpt-test".to_string()),
+            service_tier: None,
+        };
+        let persist = |database: &mut Database,
+                       run: &RuntimeUsageRun,
+                       source_identity: &str,
+                       input: i64,
+                       read: i64,
+                       output: i64| {
+            let parsed = usage(
+                RuntimeUsageCounterMode::Cumulative,
+                RuntimeInputSemantics::CacheInclusiveTotal,
+                Some(input),
+                Some(read),
+                None,
+                Some(output),
+            );
+            MonitoringService::record_usage_batches(
+                database,
+                &[RuntimeUsageFlushBatch {
+                    run: run.clone(),
+                    records: vec![BufferedUsageRecord {
+                        key: BufferedUsageKey::new(&run.key, &parsed),
+                        normalized: normalize_usage(&parsed).unwrap(),
+                        usage: parsed,
+                        source_identities: vec![source_identity.to_string()],
+                    }],
+                    pending_since: Instant::now(),
+                }],
+            )
+            .unwrap();
+        };
+
+        persist(&mut database, &run, "event-1", 100, 40, 20);
+        persist(&mut database, &run, "event-2", 100, 40, 20);
+        let before_advance: (Option<i64>, Option<i64>, Option<i64>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT prompt_input_total_tokens, cache_read_tokens, output_tokens
+                FROM runtime_usage_run_summary WHERE agent_run_id = 'run-1'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(before_advance, (None, None, None));
+
+        persist(&mut database, &run, "event-3", 150, 60, 30);
+        persist(&mut database, &run, "event-4", 150, 60, 30);
+        let after_advance: (Option<i64>, Option<i64>, Option<i64>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT prompt_input_total_tokens, cache_read_tokens, output_tokens
+                FROM runtime_usage_run_summary WHERE agent_run_id = 'run-1'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after_advance, (Some(50), Some(20), Some(10)));
+        let checkpoint_count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM runtime_usage_checkpoint", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(checkpoint_count, 1);
+
+        // A restarted native counter only establishes a new baseline. The next
+        // advance belongs to this Run; a resumed execution uses its own baseline.
+        persist(&mut database, &run, "event-reset", 10, 2, 1);
+        persist(&mut database, &run, "event-after-reset", 30, 7, 6);
+        let mut resumed = run.clone();
+        resumed.key.execution_epoch = 2;
+        persist(&mut database, &resumed, "event-resume-baseline", 80, 20, 8);
+        persist(&mut database, &resumed, "event-resume-advance", 100, 25, 10);
+        let after_resume: (Option<i64>, Option<i64>, Option<i64>) = database
+            .connection()
+            .query_row(
+                "SELECT prompt_input_total_tokens, cache_read_tokens, output_tokens FROM runtime_usage_run_summary WHERE agent_run_id='run-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after_resume, (Some(90), Some(30), Some(17)));
+
+        assert!(MonitoringService::finalize_usage_run(&mut database, "run-1").unwrap());
+        let checkpoint_count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM runtime_usage_checkpoint", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            checkpoint_count, 2,
+            "terminal retains both execution baselines"
+        );
+        persist(&mut database, &resumed, "event-resume-advance", 100, 25, 10);
+        persist(
+            &mut database,
+            &resumed,
+            "late-terminal-advance",
+            120,
+            30,
+            12,
+        );
+        persist(
+            &mut database,
+            &resumed,
+            "late-terminal-advance",
+            120,
+            30,
+            12,
+        );
+        let retained: (Option<i64>, Option<i64>, Option<i64>, bool) = database
+            .connection()
+            .query_row(
+                "SELECT prompt_input_total_tokens, cache_read_tokens, output_tokens, finalized_at IS NOT NULL FROM runtime_usage_run_summary WHERE agent_run_id='run-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (Some(110), Some(35), Some(19), true));
+        database.connection().execute("INSERT INTO runtime_usage_run_summary(collection_epoch,agent_run_id,runtime_kind,parser_version,eligible_mask,input_semantics,enrolled_at) VALUES(?1,'claude-run','claude-code-cli',2,127,'unknown',?2)", params![epoch, started_at]).unwrap();
+        let mut claude_run = run.clone();
+        claude_run.key.agent_run_id = "claude-run".into();
+        claude_run.runtime_kind = AdapterKind::ClaudeCodeCli;
+        for (message, input, output, read) in [
+            ("call-1", 10, 3, 4),
+            ("call-1", 10, 3, 4),
+            ("call-1", 10, 6, 4),
+            ("call-2", 2, 1, 0),
+        ] {
+            let parsed = parse_claude_observed_usage("runtime.usage.observed", &json!({"sessionId":"session-1","messageId":message,
+                "usage":{"input_tokens":input,"output_tokens":output,"cache_read_input_tokens":read,"cache_creation_input_tokens":0}})).remove(0);
+            MonitoringService::record_usage_batches(
+                &mut database,
+                &[RuntimeUsageFlushBatch {
+                    run: claude_run.clone(),
+                    records: vec![BufferedUsageRecord {
+                        key: BufferedUsageKey::new(&claude_run.key, &parsed),
+                        normalized: normalize_usage(&parsed).unwrap(),
+                        usage: parsed,
+                        source_identities: vec![format!("{message}:{output}")],
+                    }],
+                    pending_since: Instant::now(),
+                }],
+            )
+            .unwrap();
+        }
+        let calls:(i64,i64,i64,i64) = database.connection().query_row("SELECT prompt_input_total_tokens,output_tokens,cache_read_tokens,cache_write_tokens FROM runtime_usage_run_summary WHERE agent_run_id='claude-run'", [], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(
+            calls,
+            (16, 7, 4, 0),
+            "new call starts at zero; repeated cumulative fields add only their difference"
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn codex_complete_buckets_project_versioned_public_price_without_double_charging_reasoning() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-codex-price-projection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = Database::open(&directory).unwrap();
+        let (epoch, _) = collection_identity(&database).unwrap();
+        let enrolled_at = "2026-08-17T00:00:00Z";
+        let run = RuntimeUsageRun {
+            key: UsageRunKey {
+                agent_run_id: "codex-price-run".to_string(),
+                execution_epoch: 1,
+            },
+            runtime_kind: AdapterKind::CodexCli,
+            runtime_version: Some("codex-cli 0.147.0".to_string()),
+            provider_key: Some("openai".to_string()),
+            model_key: Some("gpt-5.6-terra".to_string()),
+            service_tier: Some("default".into()),
+        };
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO runtime_usage_run_summary(
+                    collection_epoch, agent_run_id, runtime_kind, runtime_version,
+                    provider_key, model_key, service_tier, parser_version, eligible_mask,
+                    input_semantics, enrolled_at
+                ) VALUES(?1, ?2, 'codex-cli', ?3, 'openai', ?4, 'default', ?5, ?6, 'unknown', ?7)
+                "#,
+                params![
+                    epoch,
+                    run.key.agent_run_id,
+                    run.runtime_version,
+                    run.model_key,
+                    USAGE_PARSER_VERSION,
+                    eligible_mask_for_run(&run, parse_time(enrolled_at).unwrap()),
+                    enrolled_at,
+                ],
+            )
+            .unwrap();
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/runtime-usage/codex.json"))
+                .unwrap();
+        let parsed =
+            parse_codex_usage_message(fixture["method"].as_str().unwrap(), &fixture["params"])
+                .remove(0);
+        MonitoringService::record_usage_batches(
+            &mut database,
+            &[RuntimeUsageFlushBatch {
+                run: run.clone(),
+                records: vec![BufferedUsageRecord {
+                    key: BufferedUsageKey::new(&run.key, &parsed),
+                    normalized: normalize_usage(&parsed).unwrap(),
+                    usage: parsed,
+                    source_identities: vec!["codex-price-source".to_string()],
+                }],
+                pending_since: Instant::now(),
+            }],
+        )
+        .unwrap();
+        let cost: (String, String, String, String, String) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT cost_amount_decimal, cost_currency, cost_kind, cost_source,
+                       pricing_catalog_version
+                FROM runtime_usage_run_summary WHERE agent_run_id = ?1
+                "#,
+                [&run.key.agent_run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(cost.0, "0.000533");
+        assert_eq!(cost.1, "USD");
+        assert_eq!(cost.2, "price_estimated");
+        assert_eq!(cost.3, "price_catalog");
+        assert_eq!(cost.4, "openai-api-standard-2026-07-30-gpt-5.6-terra");
+        for (observed, expected) in [
+            (Some("default"), Some(cost.0.clone())),
+            (Some("unknown"), None),
+        ] {
+            let transaction = database.connection_mut().transaction().unwrap();
+            transaction.execute("UPDATE runtime_usage_run_summary SET service_tier = 'priority', observed_service_tier = ?1 WHERE agent_run_id = ?2", params![observed, run.key.agent_run_id]).unwrap();
+            project_codex_run_cost(&transaction, &epoch, &run).unwrap();
+            let amount: Option<String> = transaction.query_row("SELECT cost_amount_decimal FROM runtime_usage_run_summary WHERE agent_run_id = ?1", [&run.key.agent_run_id], |row| row.get(0)).unwrap();
+            assert_eq!(
+                amount, expected,
+                "native fallback/unknown must override the requested Fast price"
+            );
+            transaction.commit().unwrap();
+        }
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_parsers_emit_sparse_usage_without_antigravity_inference() {
+        let hermes = parse_acp_usage_message(
+            AdapterKind::HermesCli,
+            Some("0.22.4"),
+            "rovai/acp_prompt_completed",
+            &json!({"sessionId":"hermes","promptId":"turn-2",
+            "result":{"usage":{"inputTokens":100,"outputTokens":12,"cachedReadTokens":40,"thoughtTokens":2}}}),
+        );
+        assert!(
+            hermes.is_empty(),
+            "Session counters cannot be charged as this prompt's usage"
+        );
+        let failed = parse_acp_usage_message(
+            AdapterKind::HermesCli,
+            Some("0.22.4"),
+            "rovai/acp_prompt_completed",
+            &json!({"sessionId":"hermes","promptId":"failed-turn","error":"API failed",
+                "hermesExecution":{"admissionId":"admission","executionGeneration":2,
+                    "usage":{"inputTokens":100,"outputTokens":12,"cachedReadTokens":40}}}),
+        );
+        assert!(
+            failed.is_empty(),
+            "Official ACP supplies no failed-turn usage delta"
+        );
+        let root_prompt = json!({"sessionId":"root", "promptId":"prompt-1", "result":{"usage":{
+            "inputTokens":100,"cachedReadTokens":40,"cachedWriteTokens":20,
+            "outputTokens":10,"thoughtTokens":5,"totalTokens":175}}});
+        for version in [None, Some("1.18.32"), Some("unknown")] {
+            assert!(
+                parse_acp_usage_message(
+                    AdapterKind::OpencodeCli,
+                    version,
+                    "rovai/acp_prompt_completed",
+                    &root_prompt
+                )
+                .is_empty()
+            );
+        }
+        let parsed = parse_acp_usage_message(
+            AdapterKind::OpencodeCli,
+            Some("opencode v2.0.26"),
+            "rovai/acp_prompt_completed",
+            &root_prompt,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].scope, "turn");
+        assert_eq!(parsed[0].dialect_id, "opencode-acp-root-prompt-usage-v2");
+        let normalized = normalize_usage(&parsed[0]).unwrap();
+        assert_eq!(normalized.prompt_input_total_tokens, Some(160));
+        assert_eq!(normalized.uncached_input_tokens, Some(100));
+        assert_eq!(normalized.output_tokens, Some(15));
+        assert_eq!(normalized.reasoning_output_tokens, Some(5));
+        assert!(parsed[0].cost.is_none());
+        for missing in [json!({}), json!({"inputTokens":100,"outputTokens":10})] {
+            let mut sparse = root_prompt.clone();
+            sparse["result"]["usage"] = missing;
+            for usage in parse_acp_usage_message(
+                AdapterKind::OpencodeCli,
+                Some("2.99.0"),
+                "rovai/acp_prompt_completed",
+                &sparse,
+            ) {
+                assert_eq!(usage.fields.cache_read_input_tokens, None);
+                assert_eq!(usage.fields.reasoning_output_tokens, None);
+                assert_eq!(usage.fields.input_tokens, None);
+            }
+        }
+        let mut child = root_prompt;
+        child["_meta"] = json!({"opencode/child-session":{"sessionId":"child"}});
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::OpencodeCli,
+                Some("2.0.26"),
+                "rovai/acp_prompt_completed",
+                &child
+            )
+            .is_empty()
+        );
+        let mut step = json!({"conversation_id":"native-session","step_index":5,"state":"DONE",
+            "step_type":"agent_response","text_delta":"PRIVATE_AGY_CANARY","usage":{
+                "input_tokens":4211,"output_tokens":133,"thinking_tokens":13,"cache_read_tokens":12206,"total_tokens":4344}});
+        let usage = parse_antigravity_step_usage(&step).unwrap();
+        let normalized = normalize_usage(&usage).unwrap();
+        assert_eq!(normalized.prompt_input_total_tokens, None);
+        assert_eq!(normalized.output_tokens, Some(133));
+        assert_eq!(normalized.reasoning_output_tokens, Some(13));
+        assert_eq!(normalized.cache_read_tokens, Some(12206));
+        assert_eq!(normalized.cache_write_tokens, None);
+        assert!(
+            !serde_json::to_string(&usage)
+                .unwrap()
+                .contains("PRIVATE_AGY_CANARY")
+        );
+        for field in ["output_tokens", "cache_read_tokens"] {
+            let mut missing = step.clone();
+            missing["usage"].as_object_mut().unwrap().remove(field);
+            assert!(parse_antigravity_step_usage(&missing).is_some());
+        }
+        step["state"] = json!("ACTIVE");
+        assert!(parse_antigravity_step_usage(&step).is_none());
+        step["state"] = json!("DONE");
+        step["parentAgentId"] = json!("child");
+        assert!(parse_antigravity_step_usage(&step).is_none());
+
+        let mut zcode = json!({
+            "sessionId": "native-session",
+            "update": {"sessionUpdate":"usage_update", "_meta":{
+                "nativeTurnId":"native-turn", "nativeEventId":"native-event",
+                "zcodeUsage":{"source":"provider", "inputTokens":120,
+                    "cacheReadTokens":100, "outputTokens":30,
+                    "cacheWriteTokens":0, "reasoningTokens":0}
+            }}
+        });
+        let parsed = parse_acp_usage_message(
+            AdapterKind::ZcodeApp,
+            Some("0.16.5"),
+            "session/update",
+            &zcode,
+        );
+        assert_eq!(parsed.len(), 1);
+        let normalized = normalize_usage(&parsed[0]).unwrap();
+        assert_eq!(normalized.prompt_input_total_tokens, Some(120));
+        assert_eq!(normalized.uncached_input_tokens, None);
+        assert_eq!(normalized.cache_read_tokens, Some(100));
+        assert_eq!(normalized.output_tokens, Some(30));
+        assert_eq!(normalized.cache_write_tokens, None);
+        assert_eq!(normalized.reasoning_output_tokens, None);
+        assert_eq!(normalized.cache_observable_request_count, None);
+        assert_eq!(normalized.cache_hit_request_count, None);
+        assert!(parsed[0].cost.is_none());
+        assert_eq!(
+            eligible_mask(AdapterKind::ZcodeApp, Some("0.16.5")),
+            ELIGIBLE_PROMPT_INPUT_TOTAL | ELIGIBLE_CACHE_READ | ELIGIBLE_OUTPUT
+        );
+        assert_eq!(
+            eligible_mask(AdapterKind::ZcodeApp, None),
+            eligible_mask(AdapterKind::ZcodeApp, Some("0.16.5"))
+        );
+        zcode["update"]["_meta"]["zcodeUsage"]["source"] = json!("estimated");
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::ZcodeApp,
+                Some("0.16.5"),
+                "session/update",
+                &zcode,
+            )
+            .is_empty()
+        );
+
+        let codex: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/runtime-usage/codex.json"))
+                .unwrap();
+        let parsed = parse_codex_usage_message(codex["method"].as_str().unwrap(), &codex["params"]);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].counter_mode, RuntimeUsageCounterMode::Delta);
+        assert_eq!(parsed[0].fields.input_tokens, Some(120));
+        assert_eq!(parsed[1].scope, "session");
+        assert_eq!(parsed[1].fields.context_size_tokens, Some(200000));
+        assert_eq!(parsed[1].fields.context_used_tokens, Some(150));
+        assert_eq!(
+            eligible_mask(AdapterKind::CodexCli, None) & ELIGIBLE_CACHE_WRITE,
+            ELIGIBLE_CACHE_WRITE,
+            "reported version cannot block fields present in a recognized shape"
+        );
+        assert_ne!(
+            eligible_mask(AdapterKind::CodexCli, Some("codex-cli 0.145.0")) & ELIGIBLE_CACHE_WRITE,
+            0
+        );
+
+        let copilot: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/runtime-usage/copilot.json"))
+                .unwrap();
+        let copilot_usage = parse_acp_usage_message(
+            AdapterKind::CopilotCli,
+            None,
+            copilot["method"].as_str().unwrap(),
+            &copilot["params"],
+        );
+        assert!(copilot_usage.is_empty());
+
+        let native = json!({"sessionId":"copilot-session","type":"assistant.usage",
+            "timestamp":"2026-10-01T00:00:00Z","data":{"inputTokens":100,"outputTokens":10,
+            "cacheReadTokens":40,"cacheWriteTokens":0,"reasoningTokens":3}});
+        let parse = |frame: &Value| {
+            parse_acp_usage_message(
+                AdapterKind::CopilotCli,
+                Some("1.0.83"),
+                "github.com/copilot/sessionEvent",
+                frame,
+            )
+        };
+        let call = parse(&native);
+        assert_eq!(call.len(), 1);
+        assert_eq!(
+            normalize_usage(&call[0]).unwrap().prompt_input_total_tokens,
+            Some(100)
+        );
+        assert_eq!(normalize_usage(&call[0]).unwrap().output_tokens, Some(10));
+        assert_eq!(call[0].fields.cache_write_input_tokens, Some(0));
+        for version in [None, Some("unknown"), Some("0.1.0"), Some("99.0.0")] {
+            let parsed = parse_acp_usage_message(
+                AdapterKind::CopilotCli,
+                version,
+                "github.com/copilot/sessionEvent",
+                &native,
+            );
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].fields.input_tokens, Some(100));
+            let kiro = parse_acp_usage_message(
+                AdapterKind::KiroCli,
+                version,
+                "_kiro.dev/metadata",
+                &json!({"sessionId":"kiro-session","contextUsagePercentage":2.179}),
+            );
+            assert_eq!(kiro.len(), 1);
+            assert!((kiro[0].fields.native_context_ratio.unwrap() - 0.02179).abs() < 1e-12);
+            assert_eq!(kiro[0].fields.context_used_tokens, None);
+            assert_eq!(kiro[0].fields.context_size_tokens, None);
+            assert!(!normalize_usage(&kiro[0]).unwrap().any_observed());
+        }
+        for invalid in [json!(-1), json!(101), json!("2.179"), Value::Null] {
+            assert!(
+                parse_acp_usage_message(
+                    AdapterKind::KiroCli,
+                    None,
+                    "_kiro.dev/metadata",
+                    &json!({"sessionId":"kiro-session","contextUsagePercentage":invalid})
+                )
+                .is_empty()
+            );
+        }
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::KiroCli,
+                None,
+                "_kiro.dev/metadata",
+                &json!({"sessionId":"kiro-session","agentId":"child","contextUsagePercentage":2})
+            )
+            .is_empty()
+        );
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::CopilotCli,
+                Some("1.0.83"),
+                copilot["method"].as_str().unwrap(),
+                &copilot["params"]
+            )
+            .is_empty(),
+            "process cumulative terminal cannot be counted again"
+        );
+        for (key, value) in [
+            ("agentId", json!("child")),
+            ("dataOmitted", json!("too-large")),
+            ("type", json!("assistant.reasoning_delta")),
+            ("timestamp", json!("invalid")),
+        ] {
+            let mut invalid = native.clone();
+            invalid[key] = value;
+            assert!(parse(&invalid).is_empty());
+        }
+        let mut missing = native.clone();
+        missing["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cacheWriteTokens");
+        assert_eq!(parse(&missing)[0].fields.cache_write_input_tokens, None);
+        let mut later = native.clone();
+        later["timestamp"] = json!("2026-10-01T00:00:01Z");
+        assert_ne!(
+            acp_usage_source_identity(
+                AdapterKind::CopilotCli,
+                "github.com/copilot/sessionEvent",
+                &native
+            )
+            .unwrap(),
+            acp_usage_source_identity(
+                AdapterKind::CopilotCli,
+                "github.com/copilot/sessionEvent",
+                &later
+            )
+            .unwrap()
+        );
+        let grok = parse_acp_usage_message(
+            AdapterKind::GrokBuild,
+            Some("grok 1.0.44 (5b807183dd79)"),
+            "session/update",
+            &json!({"sessionId":"grok-session","_meta":{"totalTokens":125},"update":{"sessionUpdate":"agent_message_chunk"}}),
+        );
+        assert_eq!(grok[0].fields.context_used_tokens, Some(125));
+        assert_eq!(grok[0].counter_mode, RuntimeUsageCounterMode::Gauge);
+        assert!(!normalize_usage(&grok[0]).unwrap().any_observed());
+        for source in [
+            include_str!(
+                "../../../docs/research/runtime-monitoring/fixtures/round6-native-context-ratio.json"
+            ),
+            include_str!(
+                "../../../docs/research/runtime-monitoring/fixtures/round7-native-boundaries.json"
+            ),
+        ] {
+            let native_witness: Value = serde_json::from_str(source).unwrap();
+            for entry in native_witness["entries"].as_array().unwrap() {
+                let adapter = match entry["runtime"].as_str().unwrap() {
+                    "copilot-cli" => AdapterKind::CopilotCli,
+                    "grok-build" => AdapterKind::GrokBuild,
+                    _ => continue,
+                };
+                for run in entry["runs"].as_array().unwrap() {
+                    for record in run["sourceRecords"].as_array().unwrap() {
+                        let raw = &record["raw"];
+                        let parsed = parse_acp_usage_message(
+                            adapter,
+                            entry["version"].as_str(),
+                            raw["method"].as_str().unwrap(),
+                            &raw["params"],
+                        );
+                        assert_eq!(parsed.len(), 1);
+                        let normalized = normalize_usage(&parsed[0]).unwrap();
+                        assert_eq!(
+                            json!({"promptInputTotalTokens":normalized.prompt_input_total_tokens,
+                            "outputTokens":normalized.output_tokens,
+                            "cacheReadTokens":normalized.cache_read_tokens,
+                            "cacheWriteTokens":normalized.cache_write_tokens}),
+                            record["expectedParsed"]
+                        );
+                    }
+                    let raw = &run["rawContext"];
+                    let parsed = parse_acp_usage_message(
+                        adapter,
+                        entry["version"].as_str(),
+                        raw["method"].as_str().unwrap(),
+                        &raw["params"],
+                    );
+                    assert_eq!(
+                        parsed[0].fields.context_used_tokens.map(|n| json!(n)),
+                        Some(run["expectedContext"]["usedTokens"].clone())
+                    );
+                    assert!(!normalize_usage(&parsed[0]).unwrap().any_observed());
+                }
+            }
+        }
+        let witness: Value = serde_json::from_str(include_str!(
+            "../../../docs/research/runtime-monitoring/fixtures/round8-native-format-compatibility.json"
+        )).unwrap();
+        for entry in witness["entries"].as_array().unwrap() {
+            for run in entry["runs"].as_array().unwrap() {
+                match entry["runtime"].as_str().unwrap() {
+                    "kiro-cli" => {
+                        let mut latest = None;
+                        for raw in run["sourceRecords"].as_array().unwrap() {
+                            let parsed = parse_acp_usage_message(
+                                AdapterKind::KiroCli,
+                                entry["version"].as_str(),
+                                raw["method"].as_str().unwrap(),
+                                &raw["params"],
+                            );
+                            assert_eq!(parsed.len(), 1);
+                            assert!(!normalize_usage(&parsed[0]).unwrap().any_observed());
+                            assert_eq!(parsed[0].fields.context_used_tokens, None);
+                            assert_eq!(parsed[0].fields.context_size_tokens, None);
+                            latest = parsed[0].fields.native_context_ratio;
+                        }
+                        assert_eq!(
+                            latest,
+                            run["expectedSessionProjection"][0]["nativeRatio"].as_f64()
+                        );
+                    }
+                    "antigravity-app" => {
+                        let mut output = 0;
+                        let mut read = 0;
+                        for raw in run["sourceRecords"].as_array().unwrap() {
+                            let Some(parsed) = parse_antigravity_step_usage(&raw["step_update"])
+                            else {
+                                continue;
+                            };
+                            let normalized = normalize_usage(&parsed).unwrap();
+                            assert_eq!(normalized.prompt_input_total_tokens, None);
+                            assert_eq!(normalized.cache_write_tokens, None);
+                            output += normalized.output_tokens.unwrap();
+                            read += normalized.cache_read_tokens.unwrap();
+                        }
+                        assert_eq!(
+                            json!({"promptInputTotalTokens":null,"outputTokens":output,
+                            "cacheReadTokens":read,"cacheWriteTokens":null}),
+                            run["expectedRunProjection"]
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let renderer_witness: Value = serde_json::from_str(include_str!(
+            "../../../docs/research/runtime-monitoring/fixtures/round6-native-context-renderer.json"
+        ))
+        .unwrap();
+        for app in renderer_witness["apps"].as_array().unwrap() {
+            if app["runtime"] != "copilot-cli" {
+                continue;
+            }
+            for record in app["sourceRecords"].as_array().unwrap() {
+                let raw = &record["raw"];
+                let parsed = parse_acp_usage_message(
+                    AdapterKind::CopilotCli,
+                    app["version"].as_str(),
+                    raw["method"].as_str().unwrap(),
+                    &raw["params"],
+                );
+                assert_eq!(parsed.len(), 1);
+                assert_eq!(
+                    normalize_usage(&parsed[0])
+                        .unwrap()
+                        .prompt_input_total_tokens
+                        .map(|n| json!(n)),
+                    Some(record["expectedParsed"]["promptInputTotalTokens"].clone())
+                );
+                let identity = acp_usage_source_identity(
+                    AdapterKind::CopilotCli,
+                    raw["method"].as_str().unwrap(),
+                    &raw["params"],
+                )
+                .unwrap();
+                let mut without_summary = raw["params"].clone();
+                without_summary["data"]["reasoningSummary"] = json!("PRIVATE_CANARY");
+                assert_eq!(
+                    identity,
+                    acp_usage_source_identity(
+                        AdapterKind::CopilotCli,
+                        raw["method"].as_str().unwrap(),
+                        &without_summary
+                    )
+                    .unwrap(),
+                    "private payload must not enter the numeric source identity"
+                );
+            }
+        }
+        let claude: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/runtime-usage/claude.json"))
+                .unwrap();
+        let claude_usage = parse_claude_result_usage(&claude);
+        assert_eq!(claude_usage[0].fields.cache_read_input_tokens, Some(25));
+        assert_eq!(claude_usage[0].cost.as_ref().unwrap().amount, "0.0042");
+        let mut observed_claude = claude.clone();
+        observed_claude["model_calls_observed"] = json!(true);
+        let result = parse_claude_result_usage(&observed_claude);
+        assert!(
+            result[0].fields.is_empty(),
+            "terminal aggregate must not recount streamed calls"
+        );
+        assert_eq!(result[0].cost.as_ref().unwrap().amount, "0.0042");
+        let call = parse_claude_observed_usage(
+            "runtime.usage.observed",
+            &json!({"sessionId":"session","messageId":"call",
+            "usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":0}}),
+        );
+        assert_eq!(call[0].counter_mode, RuntimeUsageCounterMode::Cumulative);
+        assert_eq!(call[0].scope, "model_call");
+        assert_eq!(
+            normalize_usage(&call[0]).unwrap().prompt_input_total_tokens,
+            Some(14)
+        );
+        let context = parse_claude_observed_usage(
+            "runtime.context.observed",
+            &json!({"sessionId":"session","messageId":"call","usedTokens":14,"windowTokens":100}),
+        );
+        assert!(!normalize_usage(&context[0]).unwrap().any_observed());
+
+        for (runtime, fixture) in [
+            (
+                AdapterKind::KiroCli,
+                include_str!("../tests/fixtures/runtime-usage/kiro.json"),
+            ),
+            (
+                AdapterKind::QoderCli,
+                include_str!("../tests/fixtures/runtime-usage/qoder.json"),
+            ),
+            (
+                AdapterKind::TraeCnCli,
+                include_str!("../tests/fixtures/runtime-usage/trae.json"),
+            ),
+        ] {
+            let fixture: Value = serde_json::from_str(fixture).unwrap();
+            let observations = parse_acp_usage_message(
+                runtime,
+                None,
+                fixture["method"].as_str().unwrap(),
+                &fixture["params"],
+            );
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].scope, "session");
+            assert_eq!(observations[0].fields.input_tokens, None);
+            assert_eq!(observations[0].fields.output_tokens, None);
+        }
+
+        let gauge = parse_acp_usage_message(
+            AdapterKind::DeepseekHarness,
+            Some("0.1.5-rc.2"),
+            "session/update",
+            &json!({"sessionId":"dsh-session","update":{"sessionUpdate":"usage_update","used":720,"size":1000}}),
+        );
+        assert_eq!(gauge[0].counter_mode, RuntimeUsageCounterMode::Gauge);
+        assert_eq!(gauge[0].fields.context_used_tokens, Some(720));
+        assert_eq!(gauge[0].fields.input_tokens, None);
+        assert_eq!(gauge[0].fields.cache_read_input_tokens, None);
+        assert!(gauge[0].cost.is_none());
+        assert_eq!(
+            eligible_mask(AdapterKind::DeepseekHarness, Some("0.1.5-rc.2")) & ELIGIBLE_COST,
+            0
+        );
+        let dsh = parse_acp_usage_message(
+            AdapterKind::DeepseekHarness,
+            Some("0.1.5-rc.2"),
+            "session/update",
+            &json!({"sessionId":"dsh-session","update":{"sessionUpdate":"usage_update","_meta":{"dshUsage":[
+                {"schemaVersion":1,"sessionId":"wrong-session","seq":8,"turn":1,"usage":{"inputTokens":99}},
+                {"schemaVersion":1,"sessionId":"dsh-session","seq":9,"turn":1,"usage":{"inputTokens":20,"outputTokens":7,"cacheReadTokens":80}},
+                {"schemaVersion":1,"sessionId":"dsh-session","seq":10,"turn":1,"sourceEvent":"compaction/summary","usage":{"inputTokens":30,"outputTokens":5,"cacheWriteTokens":50}},
+                {"schemaVersion":1,"sessionId":"dsh-session","seq":11,"turn":1,"sourceEvent":"unknown","usage":{"inputTokens":999}}
+            ]}}}),
+        );
+        assert_eq!(dsh.len(), 2);
+        assert_eq!(dsh[0].counter_mode, RuntimeUsageCounterMode::Delta);
+        assert_eq!(
+            dsh[0].input_semantics,
+            RuntimeInputSemantics::ExclusiveBuckets
+        );
+        assert_eq!(dsh[0].fields.uncached_input_tokens, Some(20));
+        assert_eq!(dsh[0].fields.cache_read_input_tokens, Some(80));
+        assert_eq!(dsh[0].fields.cache_write_input_tokens, None);
+        assert_eq!(dsh[0].fields.reasoning_output_tokens, None);
+        assert!(dsh[0].cost.is_none());
+        assert_eq!(dsh[1].identity_suffix, "native_compaction:10");
+        assert_eq!(dsh[1].native_turn_id.as_deref(), Some("1"));
+        assert_eq!(dsh[1].fields.uncached_input_tokens, Some(30));
+        assert_eq!(dsh[1].fields.cache_write_input_tokens, Some(50));
+
+        // Native exact totals can establish Input even when an optional cache
+        // bucket is omitted. Missing is still missing in the cache projection.
+        for (usage, expected) in [
+            (
+                json!({"inputTokens":258,"outputTokens":115,"totalTokens":13429,"cacheReadTokens":13056}),
+                Some(13314),
+            ),
+            (
+                json!({"inputTokens":0,"outputTokens":0,"totalTokens":0}),
+                Some(0),
+            ),
+            (
+                json!({"inputTokens":20,"outputTokens":7,"cacheReadTokens":80}),
+                None,
+            ),
+            (
+                json!({"inputTokens":20,"outputTokens":7,"cacheReadTokens":80,"cacheWriteTokens":5}),
+                Some(105),
+            ),
+            (
+                json!({"inputTokens":20,"outputTokens":7,"totalTokens":6}),
+                None,
+            ),
+            (
+                json!({"inputTokens":20,"outputTokens":7,"totalTokens":100,"cacheReadTokens":80}),
+                None,
+            ),
+            (
+                json!({"inputTokens":20,"outputTokens":7,"totalTokens":110,"cacheReadTokens":80,"cacheWriteTokens":5}),
+                None,
+            ),
+            (json!({"inputTokens":20,"totalTokens":110}), None),
+            (
+                json!({"inputTokens":20,"outputTokens":7,"totalTokens":"107"}),
+                None,
+            ),
+        ] {
+            let raw = json!({"sessionId":"dsh-session","update":{"sessionUpdate":"usage_update","_meta":{"dshUsage":[
+                {"schemaVersion":1,"sessionId":"dsh-session","seq":12,"turn":2,"usage":usage}
+            ]}}});
+            let parsed =
+                parse_acp_usage_message(AdapterKind::DeepseekHarness, None, "session/update", &raw);
+            let normalized = normalize_usage(&parsed[0]).unwrap();
+            assert_eq!(normalized.prompt_input_total_tokens, expected, "{usage}");
+            assert_eq!(
+                normalized.cache_write_tokens,
+                usage["cacheWriteTokens"].as_i64()
+            );
+            assert_eq!(normalized.output_tokens, usage["outputTokens"].as_i64());
+        }
+        // Command Code result.usage is cumulative across the native Session;
+        // only _meta.usage is a current-prompt delta. Warm reuse must not
+        // double-charge previous turns or turn a context gauge into input.
+        let mut command = json!({"sessionId":"command-session","result":{
+            "usage":{"inputTokens":9000,"outputTokens":1000},
+            "_meta":{"usage":{"inputTokens":105,"outputTokens":7,"cacheReadTokens":80,"cacheWriteTokens":5}}}});
+        let parsed = parse_acp_usage_message(
+            AdapterKind::CommandCodeCli,
+            Some("1.74.1"),
+            "rovai/acp_prompt_completed",
+            &command,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].counter_mode, RuntimeUsageCounterMode::Delta);
+        assert_eq!(
+            normalize_usage(&parsed[0])
+                .unwrap()
+                .prompt_input_total_tokens,
+            Some(105)
+        );
+        assert_eq!(parsed[0].fields.reasoning_output_tokens, None);
+        command["result"]["_meta"] = json!({});
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::CommandCodeCli,
+                None,
+                "rovai/acp_prompt_completed",
+                &command
+            )
+            .is_empty()
+        );
+        let command_context = parse_acp_usage_message(
+            AdapterKind::CommandCodeCli,
+            Some("1.74.1"),
+            "session/update",
+            &json!({"sessionId":"command-session","update":{"sessionUpdate":"usage_update","used":720,"size":1000000,"cost":{"amount":0.004,"currency":"USD"}}}),
+        );
+        assert_eq!(
+            command_context[0].counter_mode,
+            RuntimeUsageCounterMode::Gauge
+        );
+        assert_eq!(command_context[0].fields.context_size_tokens, Some(1000000));
+        assert_eq!(command_context[0].fields.input_tokens, None);
+        assert_eq!(
+            command_context.len(),
+            1,
+            "Session cumulative cost must not be charged to this Run"
+        );
+        assert!(command_context[0].cost.is_none());
+
+        let cline = parse_acp_usage_message(
+            AdapterKind::ClineCli,
+            Some("3.0.65"),
+            "session/update",
+            &json!({"sessionId":"cline-session","update":{"sessionUpdate":"usage_update","_meta":{"clineObservations":[
+                {"schemaVersion":1,"kind":"model_completed","sessionId":"other-session","runId":"wrong","messageId":"wrong","metrics":{"inputTokens":900}},
+                {"schemaVersion":1,"kind":"model_completed","sessionId":"cline-session","runId":"native-run","messageId":"model-message","metrics":{"inputTokens":110,"cacheReadTokens":100,"cacheWriteTokens":0,"outputTokens":7}}
+            ]}}}),
+        );
+        assert_eq!(cline.len(), 2);
+        assert_eq!(cline[0].identity_suffix, "native-run:model-message");
+        assert_eq!(cline[0].native_session_id.as_deref(), Some("cline-session"));
+        let cline_normalized = normalize_usage(&cline[0]).unwrap();
+        assert_eq!(cline_normalized.prompt_input_total_tokens, Some(110));
+        assert_eq!(cline_normalized.uncached_input_tokens, Some(10));
+        assert_eq!(cline_normalized.cache_read_tokens, Some(100));
+        assert_eq!(cline_normalized.output_tokens, Some(7));
+        assert!(cline[0].cost.is_none());
+        assert_eq!(cline[0].scope, "model_call");
+        assert_eq!(cline_normalized.cache_observable_request_count, Some(1));
+        assert_eq!(cline_normalized.cache_hit_request_count, Some(1));
+        assert_eq!(cline[1].counter_mode, RuntimeUsageCounterMode::Gauge);
+        assert_eq!(cline[1].fields.context_used_tokens, Some(110));
+        assert_eq!(cline[1].fields.context_size_tokens, None);
+        assert_eq!(
+            normalize_usage(&cline[1]).unwrap(),
+            UsageCounters::default()
+        );
+
+        // ACP terminal Usage can be a single final call. It must never become
+        // a complete Run merely because a version differs from the witness.
+        for fixture in [
+            include_str!("../tests/fixtures/runtime-usage/opencode-cache-write.json"),
+            include_str!("../tests/fixtures/runtime-usage/opencode.json"),
+        ] {
+            let fixture: Value = serde_json::from_str(fixture).unwrap();
+            let message = fixture.get("messages").map_or(&fixture, |items| &items[1]);
+            for version in [
+                None,
+                Some("1.18.15"),
+                Some("1.18.30"),
+                Some("1.18.32"),
+                Some("99.0.0"),
+            ] {
+                assert!(
+                    parse_acp_usage_message(
+                        AdapterKind::OpencodeCli,
+                        version,
+                        message["method"].as_str().unwrap(),
+                        &message["params"]
+                    )
+                    .is_empty()
+                );
+            }
+        }
+        let opencode: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/runtime-usage/opencode.json"
+        ))
+        .unwrap();
+
+        let codebuddy: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/runtime-usage/codebuddy.json"
+        ))
+        .unwrap();
+        let codebuddy_messages = codebuddy["messages"].as_array().unwrap();
+        let codebuddy_usage = codebuddy_messages
+            .iter()
+            .map(|message| {
+                parse_acp_usage_message(
+                    AdapterKind::CodebuddyCli,
+                    codebuddy["runtimeVersion"].as_str(),
+                    message["method"].as_str().unwrap(),
+                    &message["params"],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(codebuddy_usage.iter().all(|usage| usage.len() == 2));
+        assert_eq!(codebuddy_usage[0][0].fields.input_tokens, Some(26073));
+        assert_eq!(codebuddy_usage[0][0].fields.output_tokens, Some(101));
+        assert_eq!(
+            codebuddy_usage[0][0].fields.reasoning_output_tokens,
+            Some(90)
+        );
+        assert_eq!(
+            codebuddy_usage[0][0].fields.cache_read_input_tokens,
+            Some(0)
+        );
+        assert_eq!(
+            normalize_usage(&codebuddy_usage[0][0])
+                .unwrap()
+                .uncached_input_tokens,
+            Some(26073)
+        );
+        let codebuddy_identities = codebuddy_messages
+            .iter()
+            .map(|message| {
+                acp_usage_source_identity(
+                    AdapterKind::CodebuddyCli,
+                    message["method"].as_str().unwrap(),
+                    &message["params"],
+                )
+                .unwrap()
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(codebuddy_identities[0], codebuddy_identities[1]);
+        let codebuddy_run = RuntimeUsageRun {
+            key: UsageRunKey {
+                agent_run_id: "codebuddy-run-fixture".to_string(),
+                execution_epoch: 1,
+            },
+            runtime_kind: AdapterKind::CodebuddyCli,
+            runtime_version: Some("2.133.1".to_string()),
+            provider_key: None,
+            model_key: None,
+            service_tier: None,
+        };
+        let mut codebuddy_buffer = RuntimeUsageBuffer::default();
+        for (identity, usage) in codebuddy_identities.iter().zip(&codebuddy_usage) {
+            codebuddy_buffer
+                .observe_run(&codebuddy_run, identity, usage, Instant::now())
+                .unwrap();
+        }
+        let mut changed_context = codebuddy_messages[0].clone();
+        changed_context["params"]["update"]["used"] = json!(30000);
+        let changed_observations = parse_acp_usage_message(
+            AdapterKind::CodebuddyCli,
+            codebuddy["runtimeVersion"].as_str(),
+            "session/update",
+            &changed_context["params"],
+        );
+        codebuddy_buffer
+            .observe_run(
+                &codebuddy_run,
+                &codebuddy_identities[0],
+                &changed_observations,
+                Instant::now(),
+            )
+            .unwrap();
+        let codebuddy_batches = codebuddy_buffer.drain(RuntimeUsageFlushTarget::Run {
+            agent_run_id: "codebuddy-run-fixture".to_string(),
+            execution_epoch: 1,
+        });
+        assert_eq!(codebuddy_batches.len(), 1);
+        assert_eq!(codebuddy_batches[0].records.len(), 3);
+        assert_eq!(
+            codebuddy_batches[0]
+                .records
+                .iter()
+                .find(|record| record.usage.scope == "model_call")
+                .unwrap()
+                .usage
+                .fields
+                .output_tokens,
+            Some(101),
+            "duplicate final Usage updates must not double-count the model call"
+        );
+        assert_eq!(
+            codebuddy_batches[0]
+                .records
+                .iter()
+                .filter(|record| record.usage.scope == "session")
+                .map(|record| record.usage.fields.context_used_tokens)
+                .collect::<Vec<_>>(),
+            vec![Some(26073), Some(30000)],
+            "a changed Session gauge must pass even if the private request ID repeats"
+        );
+
+        let qwen: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/runtime-usage/qwen.json"))
+                .unwrap();
+        let qwen_message = &qwen["messages"][0];
+        let qwen_usage = parse_acp_usage_message(
+            AdapterKind::QwenCode,
+            qwen["runtimeVersion"].as_str(),
+            qwen_message["method"].as_str().unwrap(),
+            &qwen_message["params"],
+        );
+        assert_eq!(qwen_usage.len(), 1);
+        assert_eq!(qwen_usage[0].fields.input_tokens, Some(37573));
+        assert_eq!(qwen_usage[0].fields.output_tokens, Some(65));
+        assert_eq!(qwen_usage[0].fields.reasoning_output_tokens, Some(55));
+        assert_eq!(qwen_usage[0].fields.cache_read_input_tokens, Some(0));
+        assert_eq!(qwen_usage[0].fields.cache_write_input_tokens, None);
+
+        for (runtime, version, expected, absent, _previous_unversioned) in [
+            (
+                AdapterKind::KimiCodeCli,
+                "2.1.1",
+                ELIGIBLE_PROMPT_INPUT_TOTAL
+                    | ELIGIBLE_UNCACHED_INPUT
+                    | ELIGIBLE_OUTPUT
+                    | ELIGIBLE_CACHE_READ
+                    | ELIGIBLE_CACHE_WRITE
+                    | ELIGIBLE_REQUEST_CACHE_HIT,
+                ELIGIBLE_COST | ELIGIBLE_REASONING_OUTPUT,
+                0,
+            ),
+            (
+                AdapterKind::OpencodeCli,
+                opencode["runtimeVersion"].as_str().unwrap(),
+                ELIGIBLE_PROMPT_INPUT_TOTAL
+                    | ELIGIBLE_UNCACHED_INPUT
+                    | ELIGIBLE_CACHE_READ
+                    | ELIGIBLE_CACHE_WRITE
+                    | ELIGIBLE_OUTPUT
+                    | ELIGIBLE_REASONING_OUTPUT
+                    | ELIGIBLE_REQUEST_CACHE_HIT,
+                ELIGIBLE_COST,
+                0,
+            ),
+            (
+                AdapterKind::CodebuddyCli,
+                codebuddy["runtimeVersion"].as_str().unwrap(),
+                ELIGIBLE_PROMPT_INPUT_TOTAL
+                    | ELIGIBLE_UNCACHED_INPUT
+                    | ELIGIBLE_CACHE_READ
+                    | ELIGIBLE_OUTPUT
+                    | ELIGIBLE_REASONING_OUTPUT
+                    | ELIGIBLE_REQUEST_CACHE_HIT,
+                ELIGIBLE_CACHE_WRITE,
+                ELIGIBLE_COST,
+            ),
+            (
+                AdapterKind::QwenCode,
+                qwen["runtimeVersion"].as_str().unwrap(),
+                ELIGIBLE_PROMPT_INPUT_TOTAL
+                    | ELIGIBLE_CACHE_READ
+                    | ELIGIBLE_OUTPUT
+                    | ELIGIBLE_REASONING_OUTPUT
+                    | ELIGIBLE_REQUEST_CACHE_HIT,
+                ELIGIBLE_UNCACHED_INPUT | ELIGIBLE_CACHE_WRITE,
+                ELIGIBLE_COST,
+            ),
+        ] {
+            let mask = eligible_mask(runtime, Some(version));
+            assert_eq!(mask & expected, expected);
+            assert_eq!(mask & absent, 0);
+            assert_eq!(
+                eligible_mask(runtime, None),
+                mask,
+                "coverage cannot depend on a reported version string"
+            );
+        }
+        let acp_cost = json!({
+            "sessionId": "session-1",
+            "update": {
+                "sessionUpdate": "usage_update",
+                "cost": { "amount": "1.25", "currency": "USD" }
+            }
+        });
+        let acp_cost_usage = parse_acp_usage_message(
+            AdapterKind::OpencodeCli,
+            Some("1.18.15"),
+            "session/update",
+            &acp_cost,
+        );
+        assert!(
+            acp_cost_usage.is_empty(),
+            "OpenCode totalSessionCost must not be projected as Run cost"
+        );
+        let acp_cost_usage =
+            parse_acp_usage_message(AdapterKind::CopilotCli, None, "session/update", &acp_cost);
+        assert_eq!(
+            acp_cost_usage[0].counter_mode,
+            RuntimeUsageCounterMode::Gauge
+        );
+        assert_eq!(acp_cost_usage[0].cost.as_ref().unwrap().amount, "1.25");
+        let mut missing_currency = acp_cost;
+        missing_currency["update"]["cost"] = json!({ "amount": "1.25" });
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::CopilotCli,
+                None,
+                "session/update",
+                &missing_currency,
+            )
+            .is_empty()
+        );
+
+        let antigravity: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/runtime-usage/antigravity.json"
+        ))
+        .unwrap();
+        assert!(parse_claude_result_usage(&antigravity).is_empty());
+    }
+
+    #[test]
+    fn codex_context_changes_independently_of_cumulative_run_usage() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/runtime-usage/codex.json"))
+                .unwrap();
+        let first = &fixture["params"];
+        let mut changed = first.clone();
+        changed["tokenUsage"]["last"]["totalTokens"] = json!(90);
+        let run_identity = codex_usage_source_identity(first).unwrap();
+        assert_eq!(run_identity, codex_usage_source_identity(&changed).unwrap());
+        assert_ne!(
+            codex_context_source_identity(first).unwrap(),
+            codex_context_source_identity(&changed).unwrap()
+        );
+        let mut same_used_new_turn = first.clone();
+        same_used_new_turn["turnId"] = json!("later-turn");
+        assert_ne!(
+            codex_context_source_identity(first).unwrap(),
+            codex_context_source_identity(&same_used_new_turn).unwrap(),
+            "a new native turn may refresh Context even when used is unchanged"
+        );
+        let mut changed_window = first.clone();
+        changed_window["tokenUsage"]["modelContextWindow"] = json!(300000);
+        assert_ne!(
+            codex_context_source_identity(first).unwrap(),
+            codex_context_source_identity(&changed_window).unwrap()
+        );
+
+        let run = RuntimeUsageRun {
+            key: UsageRunKey {
+                agent_run_id: "run".to_string(),
+                execution_epoch: 1,
+            },
+            runtime_kind: AdapterKind::CodexCli,
+            runtime_version: Some("0.157.1".to_string()),
+            provider_key: None,
+            model_key: Some("gpt-6-sol".to_string()),
+            service_tier: None,
+        };
+        let mut buffer = RuntimeUsageBuffer::default();
+        for params in [first, &changed, &changed] {
+            let parsed = parse_codex_usage_message("thread/tokenUsage/updated", params);
+            buffer
+                .observe_run(&run, &run_identity, &parsed[..1], Instant::now())
+                .unwrap();
+            buffer
+                .observe_run(
+                    &run,
+                    &codex_context_source_identity(params).unwrap(),
+                    &parsed[1..],
+                    Instant::now(),
+                )
+                .unwrap();
+        }
+        let batches = buffer.drain(RuntimeUsageFlushTarget::Run {
+            agent_run_id: "run".to_string(),
+            execution_epoch: 1,
+        });
+        assert_eq!(batches.len(), 1);
+        let context = batches[0]
+            .records
+            .iter()
+            .filter(|record| record.usage.scope == "session")
+            .collect::<Vec<_>>();
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].usage.fields.context_used_tokens, Some(150));
+        assert_eq!(context[1].usage.fields.context_used_tokens, Some(90));
+        assert!(
+            context
+                .iter()
+                .all(|record| record.source_identities.len() == 1)
+        );
+        let run_usage = batches[0]
+            .records
+            .iter()
+            .find(|record| record.usage.scope == "model_call")
+            .unwrap();
+        assert_eq!(run_usage.source_identities.len(), 1);
+        assert_eq!(run_usage.usage.fields.input_tokens, Some(120));
+
+        // Actual native auto-compaction: cumulative consumption is unchanged,
+        // while last.totalTokens decreases. Repeating the frame must not add
+        // consumption or prevent the smaller current Context from winning.
+        let witness: Value = serde_json::from_str(include_str!(
+            "../../../docs/research/runtime-monitoring/fixtures/round7-native-boundaries.json"
+        ))
+        .unwrap();
+        let entry = witness["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["runtime"] == "codex-cli")
+            .unwrap();
+        let frames = entry["contextDecreasePair"]["frames"].as_array().unwrap();
+        let mut run = run;
+        run.runtime_version = Some("0.159.2".to_string());
+        run.model_key = Some("gpt-6.1-sol".to_string());
+        let mut buffer = RuntimeUsageBuffer::default();
+        let first = &frames[0]["params"];
+        let changed = &frames[1]["params"];
+        assert_eq!(
+            codex_usage_source_identity(first).unwrap(),
+            codex_usage_source_identity(changed).unwrap()
+        );
+        assert_ne!(
+            codex_context_source_identity(first).unwrap(),
+            codex_context_source_identity(changed).unwrap()
+        );
+        for params in [first, changed, changed] {
+            let parsed = parse_codex_usage_message("thread/tokenUsage/updated", params);
+            buffer
+                .observe_run(
+                    &run,
+                    &codex_usage_source_identity(params).unwrap(),
+                    &parsed[..1],
+                    Instant::now(),
+                )
+                .unwrap();
+            buffer
+                .observe_run(
+                    &run,
+                    &codex_context_source_identity(params).unwrap(),
+                    &parsed[1..],
+                    Instant::now(),
+                )
+                .unwrap();
+        }
+        let batches = buffer.drain(RuntimeUsageFlushTarget::Run {
+            agent_run_id: "run".to_string(),
+            execution_epoch: 1,
+        });
+        assert_eq!(batches.len(), 1);
+        let context = batches[0]
+            .records
+            .iter()
+            .filter(|record| record.usage.scope == "session")
+            .collect::<Vec<_>>();
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].usage.fields.context_used_tokens, Some(20620));
+        assert_eq!(context[1].usage.fields.context_used_tokens, Some(13262));
+        assert_eq!(context[1].usage.fields.context_size_tokens, Some(258400));
+        assert!(
+            context
+                .iter()
+                .all(|record| record.source_identities.len() == 1)
+        );
+        let run_usage = batches[0]
+            .records
+            .iter()
+            .find(|record| record.usage.scope == "model_call")
+            .unwrap();
+        assert_eq!(run_usage.source_identities.len(), 1);
+        // Run consumption uses native last-call buckets; total identifies the
+        // call and establishes resume continuity, not this call's input amount.
+        assert_eq!(run_usage.usage.fields.input_tokens, Some(20592));
+        assert_eq!(run_usage.usage.fields.output_tokens, Some(28));
+    }
+
+    #[test]
+    fn kimi_native_context_gauge_and_dsh_incomplete_input_stay_distinct() {
+        let kimi: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/runtime-usage/kimi-context.json"
+        ))
+        .unwrap();
+        let observations = parse_acp_usage_message(
+            AdapterKind::KimiCodeCli,
+            kimi["runtimeVersion"].as_str(),
+            kimi["method"].as_str().unwrap(),
+            &kimi["params"],
+        );
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].scope, "session");
+        assert_eq!(observations[0].fields.context_used_tokens, Some(18913));
+        assert_eq!(observations[0].fields.context_size_tokens, Some(262144));
+        assert!(observations[0].fields.input_tokens.is_none());
+
+        let dsh: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/runtime-usage/dsh-sub2api.json"
+        ))
+        .unwrap();
+        let projected = &dsh["acpProjection"];
+        let observations = parse_acp_usage_message(
+            AdapterKind::DeepseekHarness,
+            dsh["runtimeVersion"].as_str(),
+            projected["method"].as_str().unwrap(),
+            &projected["params"],
+        );
+        assert_eq!(observations.len(), 1);
+        let normalized = normalize_usage(&observations[0]).unwrap();
+        assert_eq!(normalized.uncached_input_tokens, Some(11386));
+        assert_eq!(normalized.prompt_input_total_tokens, None);
+        assert_eq!(normalized.output_tokens, Some(24));
+        assert_eq!(normalized.cache_read_tokens, None);
+        assert_eq!(normalized.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn grok_terminal_usage_uses_one_aggregate_after_response_usage() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/runtime-usage/grok.json"))
+                .unwrap();
+        let version = fixture["runtimeVersion"].as_str();
+        let response = &fixture["responseCompleted"];
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::GrokBuild,
+                version,
+                response["method"].as_str().unwrap(),
+                &response["params"],
+            )
+            .is_empty()
+        );
+        let terminal = &fixture["turnCompleted"];
+        let parsed = parse_acp_usage_message(
+            AdapterKind::GrokBuild,
+            version,
+            terminal["method"].as_str().unwrap(),
+            &terminal["params"],
+        );
+        assert_eq!(parsed.len(), 1);
+        let normalized = normalize_usage(&parsed[0]).unwrap();
+        assert_eq!(normalized.prompt_input_total_tokens, Some(16799));
+        assert_eq!(normalized.output_tokens, Some(13));
+        assert_eq!(normalized.cache_read_tokens, Some(0));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.uncached_input_tokens, Some(16799));
+        for reported_version in [Some("1.0.40"), Some("99.0.0"), None] {
+            assert_eq!(
+                parse_acp_usage_message(
+                    AdapterKind::GrokBuild,
+                    reported_version,
+                    terminal["method"].as_str().unwrap(),
+                    &terminal["params"]
+                ),
+                parsed
+            );
+        }
+        let identity = acp_usage_source_identity(
+            AdapterKind::GrokBuild,
+            terminal["method"].as_str().unwrap(),
+            &terminal["params"],
+        )
+        .unwrap()
+        .unwrap();
+        let run = RuntimeUsageRun {
+            key: UsageRunKey {
+                agent_run_id: "run".to_string(),
+                execution_epoch: 1,
+            },
+            runtime_kind: AdapterKind::GrokBuild,
+            runtime_version: Some("1.0.41".to_string()),
+            provider_key: None,
+            model_key: Some("gpt-6-sol".to_string()),
+            service_tier: None,
+        };
+        let mut buffer = RuntimeUsageBuffer::default();
+        buffer
+            .observe_run(&run, &identity, &parsed, Instant::now())
+            .unwrap();
+        buffer
+            .observe_run(&run, &identity, &parsed, Instant::now())
+            .unwrap();
+        let batches = buffer.drain(RuntimeUsageFlushTarget::Run {
+            agent_run_id: "run".to_string(),
+            execution_epoch: 1,
+        });
+        assert_eq!(batches[0].records.len(), 1);
+        assert_eq!(batches[0].records[0].usage.fields.input_tokens, Some(16799));
+    }
+
+    #[test]
+    fn snapshot_contract_contains_usage_only() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-runtime-usage-snapshot-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = Database::open(&directory).unwrap();
+        let now = Utc::now();
+        let collection_started_at = (now - Duration::days(40)).to_rfc3339();
+        database
+            .connection()
+            .execute(
+                "UPDATE runtime_usage_collection_state SET collection_started_at = ?1",
+                [&collection_started_at],
+            )
+            .unwrap();
+        let (epoch, _) = collection_identity(&database).unwrap();
+        let empty = MonitoringService::snapshot(
+            &mut database,
+            &MonitoringFilter {
+                range: "24h".to_string(),
+                runtime_kind: None,
+                provider_key: None,
+                model_key: None,
+                cost_kind: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(empty["summary"]["promptInputTotalTokens"], Value::Null);
+        assert_eq!(
+            empty["coverage"]["promptInputTotalTokens"]["eligibleRuns"],
+            0
+        );
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO runtime_usage_run_summary(
+                    collection_epoch, agent_run_id, runtime_kind, runtime_version,
+                    provider_key, model_key, service_tier, parser_version,
+                    eligible_mask, input_semantics, usage_source, usage_quality,
+                    prompt_input_total_tokens, uncached_input_tokens,
+                    cache_read_tokens, cache_write_tokens, output_tokens,
+                    reasoning_output_tokens, cache_observable_request_count,
+                    cache_hit_request_count, cost_amount_decimal, cost_currency,
+                    cost_kind, cost_source, pricing_catalog_version,
+                    enrolled_at, first_observed_at, last_observed_at, finalized_at
+                ) VALUES (
+                    ?1, 'run-1', 'codex-cli', '1.0', 'openai', 'gpt-test',
+                    NULL, 2, 255, 'cache_inclusive_total',
+                    'runtime_event', 'runtime_reported',
+                    100, NULL, 40, NULL, 20, 5, 1, 1,
+                    NULL, NULL, NULL, NULL, NULL, ?2, ?2, ?2, ?2
+                )
+                "#,
+                params![epoch, now.to_rfc3339()],
+            )
+            .unwrap();
+        for age in [1_i64, 48, 240] {
+            let bucket = hour_bucket(now - Duration::hours(age)).to_rfc3339();
+            database
+                .connection()
+                .execute(
+                    r#"
+                    INSERT INTO runtime_usage_hourly(
+                        collection_epoch, bucket_start_at, runtime_kind,
+                        provider_key, model_key, prompt_input_total_tokens,
+                        last_updated_at
+                    ) VALUES(?1, ?2, 'codex-cli', 'openai', 'gpt-test', 10, ?3)
+                    "#,
+                    params![epoch, bucket, now.to_rfc3339()],
+                )
+                .unwrap();
+        }
+        let filter = |range: &str| MonitoringFilter {
+            range: range.to_string(),
+            runtime_kind: None,
+            provider_key: None,
+            model_key: None,
+            cost_kind: None,
+        };
+        let snapshot = MonitoringService::snapshot(&mut database, &filter("24h")).unwrap();
+        assert_eq!(snapshot["schemaVersion"], 2);
+        assert_eq!(snapshot["summary"]["promptInputTotalTokens"], 100);
+        assert_eq!(snapshot["summary"]["uncachedInputTokens"], Value::Null);
+        assert_eq!(snapshot["trend"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            MonitoringService::snapshot(&mut database, &filter("7d")).unwrap()["trend"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            MonitoringService::snapshot(&mut database, &filter("30d")).unwrap()["trend"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(snapshot.get("reliability").is_none());
+        assert!(snapshot.get("sessions").is_none());
+        assert!(snapshot.get("toolDuration").is_none());
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}

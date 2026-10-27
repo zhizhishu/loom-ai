@@ -1,0 +1,15 @@
+.splitter-feedback {
+  position: fixed;
+  z-index: 180;
+  max-width: min(232px, calc(100vw - 16px));
+  padding: 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  box-shadow: var(--shadow-float);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}

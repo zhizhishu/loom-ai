@@ -1,0 +1,124 @@
+{
+  "ok": true,
+  "fixtureSchema": 149,
+  "candidateSchema": 152,
+  "oldBodyDigest": "0bdd2a07e5a97e4b3cd254c13a17b4d161d3c842a08965b7694a466dfbfb1518",
+  "evidence": [
+    {
+      "stage": "startup",
+      "ms": 1085.690083,
+      "schema": 152
+    },
+    {
+      "stage": "file-preview",
+      "runId": "preview-run",
+      "path": "src/probe-1-0.ts",
+      "displayPath": "src/probe-1-0.ts"
+    },
+    {
+      "stage": "old-history",
+      "rows": 512,
+      "pages": [
+        12,
+        12
+      ],
+      "groupCount": 512
+    },
+    {
+      "stage": "output-budget",
+      "savedOutputBytes": 7680,
+      "clippedSuffixFilesChecked": 614,
+      "clippedSuffixFound": false
+    },
+    {
+      "stage": "file-preview",
+      "runId": "75fc56b9-1342-4f39-85e8-844b0d626b26",
+      "path": "new-storage-file.txt",
+      "displayPath": "new-storage-file.txt"
+    },
+    {
+      "stage": "file-preview",
+      "runId": "preview-run",
+      "path": "src/probe-1-0.ts",
+      "displayPath": "src/probe-1-0.ts"
+    },
+    {
+      "stage": "old-history",
+      "rows": 512,
+      "pages": [
+        12,
+        12
+      ],
+      "groupCount": 512
+    },
+    {
+      "stage": "new-write",
+      "runId": "75fc56b9-1342-4f39-85e8-844b0d626b26",
+      "operations": 2,
+      "activityCopies": 0,
+      "directoryCopies": 0,
+      "truncated": true
+    },
+    {
+      "stage": "startup",
+      "ms": 523.1905420000003,
+      "schema": 152
+    },
+    {
+      "stage": "file-preview",
+      "runId": "preview-run",
+      "path": "src/probe-1-0.ts",
+      "displayPath": "src/probe-1-0.ts"
+    },
+    {
+      "stage": "old-history",
+      "rows": 512,
+      "pages": [
+        12,
+        12
+      ],
+      "groupCount": 512
+    },
+    {
+      "stage": "file-preview",
+      "runId": "75fc56b9-1342-4f39-85e8-844b0d626b26",
+      "path": "new-storage-file.txt",
+      "displayPath": "new-storage-file.txt"
+    },
+    {
+      "stage": "restart",
+      "oldBodyHashUnchanged": true,
+      "newOperationReadable": true,
+      "inputSubmissions": 1
+    }
+  ],
+  "environment": {
+    "platform": "macOS 26.6 arm64",
+    "electron": "43.1.1",
+    "sqlite": "3.53.2",
+    "build": "pnpm package:mac",
+    "targetBase": "2c8c30d8c3d4ab2379bfa22128127d170273a1e4"
+  },
+  "packagedBinariesSha256": {
+    "rovai-host": "6a1befd6b80833cd5c8874de66dc206f96133aa43c29b61416a8c432bd5d373c",
+    "rovai-core": "8b3e08aa83669e2f7056ef61c18d45415af09e1eac50d3de9fb34ced4cfd9716",
+    "rovai": "668508770d2fc832967e0ff5893647f8800f7869d31cd76404f88028e0543df7"
+  },
+  "scope": {
+    "source": "synthetic schema-149 fixture exported by existing Rust upgrade test helpers",
+    "runtime": "explicitly selected synthetic Codex app-server; executable asserted before sending input",
+    "oldPublicMessages": 60,
+    "oldOperations": 512,
+    "newOperations": 2,
+    "progressEvents": 40,
+    "actualFileEntry": "production Renderer preload -> Main filePreview.open/readText -> Core authority",
+    "oldBodyValidation": "selected preview columns and Blob identities hashed before startup and after restart; selected full diff read on demand",
+    "startupTiming": "single wall-clock launch-to-health-ready sample, includes Desktop/Host and upgrade; not a startup performance distribution",
+    "limitations": [
+      "No daily App or database used",
+      "No real-model compatibility matrix",
+      "No historical content cleanup or compaction",
+      "Does not prove zero SQLite page IO: query plans and column evidence are in file-authority-query-comparison.json"
+    ]
+  }
+}

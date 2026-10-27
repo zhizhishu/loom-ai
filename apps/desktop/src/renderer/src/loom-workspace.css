@@ -1,0 +1,44 @@
+/* LOOM adds a quiet work surface inside the existing Mission activity preview. */
+.loom-workspace { display: flex; min-height: 0; flex: 1; flex-direction: column; color: var(--ink); background: var(--surface); }
+.loom-section-tabs { display: flex; flex: 0 0 49px; align-items: stretch; gap: 22px; padding: 0 24px; border-bottom: 1px solid var(--line); }
+.loom-section-tabs button { position: relative; display: inline-flex; align-items: center; gap: 5px; padding: 0 2px; border: 0; color: var(--muted); background: transparent; font-size: 12px; cursor: pointer; }
+.loom-section-tabs button::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: transparent; content: ''; }
+.loom-section-tabs button:hover { color: var(--ink); }
+.loom-section-tabs button[aria-pressed='true'] { color: var(--ink); font-weight: 550; }
+.loom-section-tabs button[aria-pressed='true']::after { background: var(--conversation-action-ink); }
+.loom-section-tabs .mission-icon { width: 14px; height: 14px; }
+.loom-section-body { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
+.loom-section-body > :is(.loom-delivery,.mission-activity-document) { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.loom-section-body > .mission-activity-document { padding: 24px; }
+.loom-section-body > [hidden] { display: none; }
+.loom-section-body > .mission-activity-document > .mission-delivery-panel { padding: 0; overflow: visible; }
+.loom-section-body > .mission-activity-document > div > .mission-activity-panel { margin-top: 28px; padding: 0; overflow: visible; }
+.loom-plan,.loom-delivery { max-width: 860px; padding: 30px 28px 36px; }
+.loom-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.loom-section-heading h2 { margin: 4px 0 0; font-size: 19px; font-weight: 550; letter-spacing: -.02em; line-height: 1.5; }
+.loom-eyebrow { color: var(--faint); font: 10.5px ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing: .04em; }
+.loom-number { padding-top: 4px; color: var(--faint); font: 11px ui-monospace,SFMono-Regular,Menlo,monospace; }
+.loom-intro { max-width: 62ch; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.loom-empty { margin: 44px 0 32px; padding: 30px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.loom-empty-mark { display: flex; align-items: center; gap: 13px; height: 18px; margin-bottom: 22px; }
+.loom-empty-mark i { display: block; width: 7px; height: 7px; border: 1px solid var(--faint); border-radius: 50%; }
+.loom-empty-mark i:first-child { border-color: var(--muted); background: var(--muted); }
+.loom-empty-mark i + i::before { display: block; width: 13px; margin: 2px 0 0 -14px; border-top: 1px solid var(--line-strong); content: ''; }
+.loom-empty h3 { margin: 0 0 9px; font-size: 14px; font-weight: 550; }
+.loom-empty p { max-width: 58ch; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.loom-foundation { display: grid; grid-template-columns: minmax(0,1fr) 80px 80px; gap: 20px; padding-top: 18px; }
+.loom-foundation > div { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
+.loom-foundation span { color: var(--faint); font-size: 11px; }
+.loom-foundation strong { overflow-wrap: anywhere; font-size: 12px; font-weight: 500; line-height: 1.6; }
+.loom-review-state { display: flex; align-items: flex-start; gap: 12px; margin-top: 24px; padding: 16px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.loom-review-mark { width: 9px; height: 9px; flex: 0 0 9px; margin-top: 5px; border: 1.5px solid var(--attention); border-radius: 50%; }
+.loom-review-state strong { font-size: 12px; font-weight: 550; }
+.loom-review-state p { margin: 4px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.7; }
+.loom-criteria { padding: 21px 0 4px; }
+.loom-criteria h3 { margin: 0 0 7px; font-size: 12px; font-weight: 550; }
+.loom-criteria p { display: flex; flex-direction: column; gap: 3px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.loom-criteria p span { color: var(--faint); font-size: 11px; }
+.loom-delivery > .mission-delivery-panel { padding: 24px 0 0; overflow: visible; }
+.loom-delivery .mission-delivery-section h3 { font-size: 12px; }
+@media(max-width:640px) { .loom-section-tabs { padding-inline: 18px; }.loom-section-body > .mission-activity-document { padding: 18px; }.loom-plan,.loom-delivery { padding: 24px 20px; }.loom-foundation { grid-template-columns: minmax(0,1fr) 64px 64px; gap: 12px; } }
+@media(prefers-reduced-motion:reduce) { .loom-section-tabs button { transition: none; } }

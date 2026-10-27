@@ -1,0 +1,1358 @@
+{
+  "simulation": true,
+  "hostExecutionVerified": false,
+  "viewport": {
+    "width": 1440,
+    "height": 920
+  },
+  "checks": [
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "scenario": "camp",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "simulated-send-appends-message-and-clears-this-draft"
+      ]
+    },
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "scenario": "new",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行\n新对话\n\n选择工作目录、队员与负责人。对话名称可选。\n\n工作目录\n使用快速对话\n队员\n洛\n木\n2 位队员\n负责人\n洛\n洛可\n添加对话名称\n可选\n以后使用此队伍一键新建\n取消\n新建",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "simulated-authorized-workspace-picker",
+        "select-one-member",
+        "create-and-open-fresh-camp"
+      ]
+    },
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "scenario": "running",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n1\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n执行\n收起\n1 位执行中 · 1 位队员\n洛\n移到底部\n洛\n洛可 Codex CLI\nAgent 运行时默认\n\n1 次执行\n\n停止\n10:30–现在\n执行中\n当前执行\n\n已读取会话组件。准备运行工作区测试，再检查失败路径。\n\npnpm test -- --run\nEsc\n收起\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "production-current-command-and-icon",
+        "collapsed-running-highlight",
+        "expanded-static-result",
+        "collapse-retains-reading-anchor",
+        "touch-cue-and-44px-target",
+        "reduced-motion"
+      ]
+    },
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "scenario": "approval",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n◆ 待审批 1\n执行\n1\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n运行工作区测试\n洛可 · Codex CLI\n⌃\n\nRun pnpm test in the selected workspace.\n\n{\n  \"command\": \"pnpm test -- --run\",\n  \"cwd\": \"/review/rovai-workspace\"\n}\nAllow once\nAllow for this session\nDeny\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [],
+      "buttons": [
+        {
+          "text": "新对话",
+          "label": "新对话"
+        },
+        {
+          "text": "队员",
+          "label": "队员"
+        },
+        {
+          "text": "记忆",
+          "label": "记忆"
+        },
+        {
+          "text": "定时任务",
+          "label": "定时任务"
+        },
+        {
+          "text": "跳转到对话…⌘K",
+          "label": null
+        },
+        {
+          "text": "＋",
+          "label": "选择工作目录"
+        },
+        {
+          "text": "rovai-workspace",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "管理项目“rovai-workspace”"
+        },
+        {
+          "text": "＋",
+          "label": "在“rovai-workspace”中新建对话"
+        },
+        {
+          "text": "Camp 页面与审批流程核对",
+          "label": "Camp 页面与审批流程核对"
+        },
+        {
+          "text": "",
+          "label": "管理“Camp 页面与审批流程核对”"
+        },
+        {
+          "text": "快速对话",
+          "label": null
+        },
+        {
+          "text": "＋",
+          "label": "在“快速对话”中新建对话"
+        },
+        {
+          "text": "设置",
+          "label": "设置，打开上次保留的设置页面"
+        },
+        {
+          "text": "◆ 待审批 1",
+          "label": "待审批 1，定位输入框上方审批"
+        },
+        {
+          "text": "执行1",
+          "label": null
+        },
+        {
+          "text": "任务0",
+          "label": null
+        },
+        {
+          "text": "队员2",
+          "label": null
+        },
+        {
+          "text": "单聊0",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "展开文件预览"
+        },
+        {
+          "text": "你",
+          "label": "查看维护者的个人资料"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "洛",
+          "label": "查看洛可的基础信息"
+        },
+        {
+          "text": "洛可",
+          "label": "查看洛可的基础信息"
+        },
+        {
+          "text": "interaction-reviewMD文本 · 1.0 KB打开",
+          "label": "打开文件预览 interaction-review.md"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "",
+          "label": "回复这条消息"
+        },
+        {
+          "text": "你",
+          "label": "查看维护者的个人资料"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "收起",
+          "label": "收起会话详情"
+        },
+        {
+          "text": "",
+          "label": "向左查看更多队员"
+        },
+        {
+          "text": "洛",
+          "label": "打开洛可的执行过程，等待处理"
+        },
+        {
+          "text": "",
+          "label": "向右查看更多队员"
+        },
+        {
+          "text": "移到底部",
+          "label": "将执行台移到会话底部并记住此位置"
+        },
+        {
+          "text": "＋ 新建",
+          "label": null
+        },
+        {
+          "text": "＋ 邀请",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "洛可的队员操作"
+        },
+        {
+          "text": "",
+          "label": "木瓦的队员操作"
+        },
+        {
+          "text": "",
+          "label": "收起单聊"
+        },
+        {
+          "text": "洛洛可游学者",
+          "label": null
+        },
+        {
+          "text": "结束",
+          "label": "结束与洛可的单聊"
+        },
+        {
+          "text": "",
+          "label": "添加文件"
+        },
+        {
+          "text": "",
+          "label": "发送消息"
+        },
+        {
+          "text": "⌃",
+          "label": "收起审批详情"
+        },
+        {
+          "text": "Allow once",
+          "label": "Allow once"
+        },
+        {
+          "text": "Allow for this session",
+          "label": "Allow for this session"
+        },
+        {
+          "text": "Deny",
+          "label": "Deny"
+        },
+        {
+          "text": "",
+          "label": "添加文件"
+        },
+        {
+          "text": "",
+          "label": "发送消息"
+        }
+      ],
+      "simulatedResolution": "native-once"
+    },
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "scenario": "file",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\ninteraction-review.md\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\ndocs\n/\ninteraction-review.md\n交互核对\n\n本文件是宽屏对照稿中的固定示例，不来自真实工作区。\n\n本次检查\n路径\t预期\nCamp\t导航、正文、Composer 共用生产组件\n审批\t展示 Runtime 提供的选项，提交时防止重复点击\n文件\t按受授权资源读取，显示来源与失效状态\nconst client = useCampClient()\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行\n左右方向键调整 24px，按住 Shift 调整 80px；Delete 或 Backspace 关闭；双击恢复默认比例；Escape 取消拖动。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": []
+    },
+    {
+      "surface": "desktop",
+      "theme": "day",
+      "scenario": "member",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\n你\n维护者\n个人资料\n队员\n2\n洛\n洛可\n游学者\n木\n木瓦\n鉴定士\n256 px\n左右方向键调整；最窄时按左方向键折叠，右方向键展开，回车切换折叠，Home 恢复默认。也可使用名册选项和展开折叠按钮。\n洛\n洛可\n\n游学者\n\n在队\nCodex CLI\n队员信息\n名称\n最多 80 个字符。\n团队角色\n最多 120 个字符。\n专业职责\n最多 300 个字符。\n性格底色\n好奇\n灵活\n勤勉\n回车或逗号添加标签，最多 6 项，每项最多 16 个字符。\n洛\n更换角色图片\n工作准则与成长课题\n未填写\n当前信息已保存\n放弃更改\n保存\n运行配置\n用于之后开始的新执行\nAgent 运行时\nCodex CLI\n可用\n模型策略\n默认\n文件系统访问\ndanger-full-access (no sandbox)\n审批策略\nnever (no approval prompts)\n当前配置已保存\n放弃更改\n保存",
+        "composer": false,
+        "dialog": false
+      },
+      "actions": [
+        "production-runtime-form-saves-simulated-versioned-configuration"
+      ]
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "scenario": "camp",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "simulated-send-appends-message-and-clears-this-draft"
+      ]
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "scenario": "new",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行\n新对话\n\n选择工作目录、队员与负责人。对话名称可选。\n\n工作目录\n使用快速对话\n队员\n洛\n木\n2 位队员\n负责人\n洛\n洛可\n添加对话名称\n可选\n以后使用此队伍一键新建\n取消\n新建",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "simulated-authorized-workspace-picker",
+        "select-one-member",
+        "create-and-open-fresh-camp"
+      ]
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "scenario": "running",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n1\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n执行\n收起\n1 位执行中 · 1 位队员\n洛\n移到底部\n洛\n洛可 Codex CLI\nAgent 运行时默认\n\n1 次执行\n\n停止\n10:30–现在\n执行中\n当前执行\n\n已读取会话组件。准备运行工作区测试，再检查失败路径。\n\npnpm test -- --run\nEsc\n收起\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "production-current-command-and-icon",
+        "collapsed-running-highlight",
+        "expanded-static-result",
+        "collapse-retains-reading-anchor",
+        "touch-cue-and-44px-target",
+        "reduced-motion"
+      ]
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "scenario": "approval",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n◆ 待审批 1\n执行\n1\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n运行工作区测试\n洛可 · Codex CLI\n⌃\n\nRun pnpm test in the selected workspace.\n\n{\n  \"command\": \"pnpm test -- --run\",\n  \"cwd\": \"/review/rovai-workspace\"\n}\nAllow once\nAllow for this session\nDeny\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [],
+      "buttons": [
+        {
+          "text": "新对话",
+          "label": "新对话"
+        },
+        {
+          "text": "队员",
+          "label": "队员"
+        },
+        {
+          "text": "记忆",
+          "label": "记忆"
+        },
+        {
+          "text": "定时任务",
+          "label": "定时任务"
+        },
+        {
+          "text": "跳转到对话…⌘K",
+          "label": null
+        },
+        {
+          "text": "＋",
+          "label": "选择工作目录"
+        },
+        {
+          "text": "rovai-workspace",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "管理项目“rovai-workspace”"
+        },
+        {
+          "text": "＋",
+          "label": "在“rovai-workspace”中新建对话"
+        },
+        {
+          "text": "Camp 页面与审批流程核对",
+          "label": "Camp 页面与审批流程核对"
+        },
+        {
+          "text": "",
+          "label": "管理“Camp 页面与审批流程核对”"
+        },
+        {
+          "text": "快速对话",
+          "label": null
+        },
+        {
+          "text": "＋",
+          "label": "在“快速对话”中新建对话"
+        },
+        {
+          "text": "设置",
+          "label": "设置，打开上次保留的设置页面"
+        },
+        {
+          "text": "◆ 待审批 1",
+          "label": "待审批 1，定位输入框上方审批"
+        },
+        {
+          "text": "执行1",
+          "label": null
+        },
+        {
+          "text": "任务0",
+          "label": null
+        },
+        {
+          "text": "队员2",
+          "label": null
+        },
+        {
+          "text": "单聊0",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "展开文件预览"
+        },
+        {
+          "text": "你",
+          "label": "查看维护者的个人资料"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "洛",
+          "label": "查看洛可的基础信息"
+        },
+        {
+          "text": "洛可",
+          "label": "查看洛可的基础信息"
+        },
+        {
+          "text": "interaction-reviewMD文本 · 1.0 KB打开",
+          "label": "打开文件预览 interaction-review.md"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "",
+          "label": "回复这条消息"
+        },
+        {
+          "text": "你",
+          "label": "查看维护者的个人资料"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "收起",
+          "label": "收起会话详情"
+        },
+        {
+          "text": "",
+          "label": "向左查看更多队员"
+        },
+        {
+          "text": "洛",
+          "label": "打开洛可的执行过程，等待处理"
+        },
+        {
+          "text": "",
+          "label": "向右查看更多队员"
+        },
+        {
+          "text": "移到底部",
+          "label": "将执行台移到会话底部并记住此位置"
+        },
+        {
+          "text": "＋ 新建",
+          "label": null
+        },
+        {
+          "text": "＋ 邀请",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "洛可的队员操作"
+        },
+        {
+          "text": "",
+          "label": "木瓦的队员操作"
+        },
+        {
+          "text": "",
+          "label": "收起单聊"
+        },
+        {
+          "text": "洛洛可游学者",
+          "label": null
+        },
+        {
+          "text": "结束",
+          "label": "结束与洛可的单聊"
+        },
+        {
+          "text": "",
+          "label": "添加文件"
+        },
+        {
+          "text": "",
+          "label": "发送消息"
+        },
+        {
+          "text": "⌃",
+          "label": "收起审批详情"
+        },
+        {
+          "text": "Allow once",
+          "label": "Allow once"
+        },
+        {
+          "text": "Allow for this session",
+          "label": "Allow for this session"
+        },
+        {
+          "text": "Deny",
+          "label": "Deny"
+        },
+        {
+          "text": "",
+          "label": "添加文件"
+        },
+        {
+          "text": "",
+          "label": "发送消息"
+        }
+      ],
+      "simulatedResolution": "native-once"
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "scenario": "file",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\ninteraction-review.md\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\ndocs\n/\ninteraction-review.md\n交互核对\n\n本文件是宽屏对照稿中的固定示例，不来自真实工作区。\n\n本次检查\n路径\t预期\nCamp\t导航、正文、Composer 共用生产组件\n审批\t展示 Runtime 提供的选项，提交时防止重复点击\n文件\t按受授权资源读取，显示来源与失效状态\nconst client = useCampClient()\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行\n左右方向键调整 24px，按住 Shift 调整 80px；Delete 或 Backspace 关闭；双击恢复默认比例；Escape 取消拖动。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": []
+    },
+    {
+      "surface": "desktop",
+      "theme": "night",
+      "scenario": "member",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\n你\n维护者\n个人资料\n队员\n2\n洛\n洛可\n游学者\n木\n木瓦\n鉴定士\n256 px\n左右方向键调整；最窄时按左方向键折叠，右方向键展开，回车切换折叠，Home 恢复默认。也可使用名册选项和展开折叠按钮。\n洛\n洛可\n\n游学者\n\n在队\nCodex CLI\n队员信息\n名称\n最多 80 个字符。\n团队角色\n最多 120 个字符。\n专业职责\n最多 300 个字符。\n性格底色\n好奇\n灵活\n勤勉\n回车或逗号添加标签，最多 6 项，每项最多 16 个字符。\n洛\n更换角色图片\n工作准则与成长课题\n未填写\n当前信息已保存\n放弃更改\n保存\n运行配置\n用于之后开始的新执行\nAgent 运行时\nCodex CLI\n可用\n模型策略\n默认\n文件系统访问\ndanger-full-access (no sandbox)\n审批策略\nnever (no approval prompts)\n当前配置已保存\n放弃更改\n保存",
+        "composer": false,
+        "dialog": false
+      },
+      "actions": [
+        "production-runtime-form-saves-simulated-versioned-configuration"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "scenario": "camp",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "simulated-send-appends-message-and-clears-this-draft"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "scenario": "new",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行\n新对话\n\n选择工作目录、队员与负责人。对话名称可选。\n\n工作目录\n使用快速对话\n队员\n洛\n木\n2 位队员\n负责人\n洛\n洛可\n添加对话名称\n可选\n以后使用此队伍一键新建\n取消\n新建",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "simulated-authorized-workspace-picker",
+        "select-one-member",
+        "create-and-open-fresh-camp"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "scenario": "running",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n1\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n执行\n收起\n1 位执行中 · 1 位队员\n洛\n移到底部\n洛\n洛可 Codex CLI\nAgent 运行时默认\n\n1 次执行\n\n停止\n10:30–现在\n执行中\n当前执行\n\n已读取会话组件。准备运行工作区测试，再检查失败路径。\n\npnpm test -- --run\nEsc\n收起\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "production-current-command-and-icon",
+        "collapsed-running-highlight",
+        "expanded-static-result",
+        "collapse-retains-reading-anchor",
+        "touch-cue-and-44px-target",
+        "reduced-motion"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "scenario": "approval",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n◆ 待审批 1\n执行\n1\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n运行工作区测试\n洛可 · Codex CLI\n⌃\n\nRun pnpm test in the selected workspace.\n\n{\n  \"command\": \"pnpm test -- --run\",\n  \"cwd\": \"/review/rovai-workspace\"\n}\nAllow once\nAllow for this session\nDeny\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [],
+      "buttons": [
+        {
+          "text": "新对话",
+          "label": "新对话"
+        },
+        {
+          "text": "队员",
+          "label": "队员"
+        },
+        {
+          "text": "记忆",
+          "label": "记忆"
+        },
+        {
+          "text": "定时任务",
+          "label": "定时任务"
+        },
+        {
+          "text": "跳转到对话…⌘K",
+          "label": null
+        },
+        {
+          "text": "＋",
+          "label": "选择工作目录"
+        },
+        {
+          "text": "rovai-workspace",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "管理项目“rovai-workspace”"
+        },
+        {
+          "text": "＋",
+          "label": "在“rovai-workspace”中新建对话"
+        },
+        {
+          "text": "Camp 页面与审批流程核对",
+          "label": "Camp 页面与审批流程核对"
+        },
+        {
+          "text": "",
+          "label": "管理“Camp 页面与审批流程核对”"
+        },
+        {
+          "text": "快速对话",
+          "label": null
+        },
+        {
+          "text": "＋",
+          "label": "在“快速对话”中新建对话"
+        },
+        {
+          "text": "设置",
+          "label": "设置，打开上次保留的设置页面"
+        },
+        {
+          "text": "◆ 待审批 1",
+          "label": "待审批 1，定位输入框上方审批"
+        },
+        {
+          "text": "执行1",
+          "label": null
+        },
+        {
+          "text": "任务0",
+          "label": null
+        },
+        {
+          "text": "队员2",
+          "label": null
+        },
+        {
+          "text": "单聊0",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "展开文件预览"
+        },
+        {
+          "text": "你",
+          "label": "查看维护者的个人资料"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "洛",
+          "label": "查看洛可的基础信息"
+        },
+        {
+          "text": "洛可",
+          "label": "查看洛可的基础信息"
+        },
+        {
+          "text": "interaction-reviewMD文本 · 1.0 KB打开",
+          "label": "打开文件预览 interaction-review.md"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "",
+          "label": "回复这条消息"
+        },
+        {
+          "text": "你",
+          "label": "查看维护者的个人资料"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "收起",
+          "label": "收起会话详情"
+        },
+        {
+          "text": "",
+          "label": "向左查看更多队员"
+        },
+        {
+          "text": "洛",
+          "label": "打开洛可的执行过程，等待处理"
+        },
+        {
+          "text": "",
+          "label": "向右查看更多队员"
+        },
+        {
+          "text": "移到底部",
+          "label": "将执行台移到会话底部并记住此位置"
+        },
+        {
+          "text": "＋ 新建",
+          "label": null
+        },
+        {
+          "text": "＋ 邀请",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "洛可的队员操作"
+        },
+        {
+          "text": "",
+          "label": "木瓦的队员操作"
+        },
+        {
+          "text": "",
+          "label": "收起单聊"
+        },
+        {
+          "text": "洛洛可游学者",
+          "label": null
+        },
+        {
+          "text": "结束",
+          "label": "结束与洛可的单聊"
+        },
+        {
+          "text": "",
+          "label": "添加文件"
+        },
+        {
+          "text": "",
+          "label": "发送消息"
+        },
+        {
+          "text": "⌃",
+          "label": "收起审批详情"
+        },
+        {
+          "text": "Allow once",
+          "label": "Allow once"
+        },
+        {
+          "text": "Allow for this session",
+          "label": "Allow for this session"
+        },
+        {
+          "text": "Deny",
+          "label": "Deny"
+        },
+        {
+          "text": "",
+          "label": "添加文件"
+        },
+        {
+          "text": "",
+          "label": "发送消息"
+        }
+      ],
+      "simulatedResolution": "native-once"
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "scenario": "file",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\ninteraction-review.md\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\ndocs\n/\ninteraction-review.md\n交互核对\n\n本文件是宽屏对照稿中的固定示例，不来自真实工作区。\n\n本次检查\n路径\t预期\nCamp\t导航、正文、Composer 共用生产组件\n审批\t展示 Runtime 提供的选项，提交时防止重复点击\n文件\t按受授权资源读取，显示来源与失效状态\nconst client = useCampClient()\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行\n左右方向键调整 24px，按住 Shift 调整 80px；Delete 或 Backspace 关闭；双击恢复默认比例；Escape 取消拖动。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "production-markdown-preview",
+        "explicit-download-adapter-saves-fixed-sample"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "day",
+      "scenario": "member",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\n你\n维护者\n个人资料\n队员\n2\n洛\n洛可\n游学者\n木\n木瓦\n鉴定士\n256 px\n左右方向键调整；最窄时按左方向键折叠，右方向键展开，回车切换折叠，Home 恢复默认。也可使用名册选项和展开折叠按钮。\n洛\n洛可\n\n游学者\n\n在队\nCodex CLI\n队员信息\n名称\n最多 80 个字符。\n团队角色\n最多 120 个字符。\n专业职责\n最多 300 个字符。\n性格底色\n好奇\n灵活\n勤勉\n回车或逗号添加标签，最多 6 项，每项最多 16 个字符。\n洛\n更换角色图片\n工作准则与成长课题\n未填写\n当前信息已保存\n放弃更改\n保存\n运行配置\n用于之后开始的新执行\nAgent 运行时\nCodex CLI\n可用\n模型策略\n默认\n文件系统访问\ndanger-full-access (no sandbox)\n审批策略\nnever (no approval prompts)\n当前配置已保存\n放弃更改\n保存",
+        "composer": false,
+        "dialog": false
+      },
+      "actions": [
+        "production-runtime-form-saves-simulated-versioned-configuration"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "scenario": "camp",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "simulated-send-appends-message-and-clears-this-draft"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "scenario": "new",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行\n新对话\n\n选择工作目录、队员与负责人。对话名称可选。\n\n工作目录\n使用快速对话\n队员\n洛\n木\n2 位队员\n负责人\n洛\n洛可\n添加对话名称\n可选\n以后使用此队伍一键新建\n取消\n新建",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "simulated-authorized-workspace-picker",
+        "select-one-member",
+        "create-and-open-fresh-camp"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "scenario": "running",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n1\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n执行\n收起\n1 位执行中 · 1 位队员\n洛\n移到底部\n洛\n洛可 Codex CLI\nAgent 运行时默认\n\n1 次执行\n\n停止\n10:30–现在\n执行中\n当前执行\n\n已读取会话组件。准备运行工作区测试，再检查失败路径。\n\npnpm test -- --run\nEsc\n收起\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "production-current-command-and-icon",
+        "collapsed-running-highlight",
+        "expanded-static-result",
+        "collapse-retains-reading-anchor",
+        "touch-cue-and-44px-target",
+        "reduced-motion"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "scenario": "approval",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n◆ 待审批 1\n执行\n1\n任务\n0\n队员\n2\n单聊\n0\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\n运行工作区测试\n洛可 · Codex CLI\n⌃\n\nRun pnpm test in the selected workspace.\n\n{\n  \"command\": \"pnpm test -- --run\",\n  \"cwd\": \"/review/rovai-workspace\"\n}\nAllow once\nAllow for this session\nDeny\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [],
+      "buttons": [
+        {
+          "text": "新对话",
+          "label": "新对话"
+        },
+        {
+          "text": "队员",
+          "label": "队员"
+        },
+        {
+          "text": "记忆",
+          "label": "记忆"
+        },
+        {
+          "text": "定时任务",
+          "label": "定时任务"
+        },
+        {
+          "text": "跳转到对话…⌘K",
+          "label": null
+        },
+        {
+          "text": "＋",
+          "label": "选择工作目录"
+        },
+        {
+          "text": "rovai-workspace",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "管理项目“rovai-workspace”"
+        },
+        {
+          "text": "＋",
+          "label": "在“rovai-workspace”中新建对话"
+        },
+        {
+          "text": "Camp 页面与审批流程核对",
+          "label": "Camp 页面与审批流程核对"
+        },
+        {
+          "text": "",
+          "label": "管理“Camp 页面与审批流程核对”"
+        },
+        {
+          "text": "快速对话",
+          "label": null
+        },
+        {
+          "text": "＋",
+          "label": "在“快速对话”中新建对话"
+        },
+        {
+          "text": "设置",
+          "label": "设置，打开上次保留的设置页面"
+        },
+        {
+          "text": "◆ 待审批 1",
+          "label": "待审批 1，定位输入框上方审批"
+        },
+        {
+          "text": "执行1",
+          "label": null
+        },
+        {
+          "text": "任务0",
+          "label": null
+        },
+        {
+          "text": "队员2",
+          "label": null
+        },
+        {
+          "text": "单聊0",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "展开文件预览"
+        },
+        {
+          "text": "你",
+          "label": "查看维护者的个人资料"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "洛",
+          "label": "查看洛可的基础信息"
+        },
+        {
+          "text": "洛可",
+          "label": "查看洛可的基础信息"
+        },
+        {
+          "text": "interaction-reviewMD文本 · 1.0 KB打开",
+          "label": "打开文件预览 interaction-review.md"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "",
+          "label": "回复这条消息"
+        },
+        {
+          "text": "你",
+          "label": "查看维护者的个人资料"
+        },
+        {
+          "text": "",
+          "label": "复制这条消息"
+        },
+        {
+          "text": "收起",
+          "label": "收起会话详情"
+        },
+        {
+          "text": "",
+          "label": "向左查看更多队员"
+        },
+        {
+          "text": "洛",
+          "label": "打开洛可的执行过程，等待处理"
+        },
+        {
+          "text": "",
+          "label": "向右查看更多队员"
+        },
+        {
+          "text": "移到底部",
+          "label": "将执行台移到会话底部并记住此位置"
+        },
+        {
+          "text": "＋ 新建",
+          "label": null
+        },
+        {
+          "text": "＋ 邀请",
+          "label": null
+        },
+        {
+          "text": "",
+          "label": "洛可的队员操作"
+        },
+        {
+          "text": "",
+          "label": "木瓦的队员操作"
+        },
+        {
+          "text": "",
+          "label": "收起单聊"
+        },
+        {
+          "text": "洛洛可游学者",
+          "label": null
+        },
+        {
+          "text": "结束",
+          "label": "结束与洛可的单聊"
+        },
+        {
+          "text": "",
+          "label": "添加文件"
+        },
+        {
+          "text": "",
+          "label": "发送消息"
+        },
+        {
+          "text": "⌃",
+          "label": "收起审批详情"
+        },
+        {
+          "text": "Allow once",
+          "label": "Allow once"
+        },
+        {
+          "text": "Allow for this session",
+          "label": "Allow for this session"
+        },
+        {
+          "text": "Deny",
+          "label": "Deny"
+        },
+        {
+          "text": "",
+          "label": "添加文件"
+        },
+        {
+          "text": "",
+          "label": "发送消息"
+        }
+      ],
+      "simulatedResolution": "native-once"
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "scenario": "file",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "topbar": 38,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\nrovai-workspace\n›\nCamp 页面与审批流程核对\n执行\n0\n任务\n0\n队员\n2\n单聊\n0\ninteraction-review.md\n2026年9月12日\n你\n维护者\n10:30\n\n请检查 Camp 的主要操作是否完整，保留现在的界面和阅读密度。\n\n洛\n洛可\nCodex CLI\n10:30\n\n已确认导航、消息和 Composer 的位置。\n\n接下来核对：\n\n执行详情与原生审批选项\n附件和文件阅读\n队员与 Runtime 配置\n\n检查记录见 \n交互核对.md\n。\n\ninteraction-review\nMD\n文本 · 1.0 KB\n打开\n你\n维护者\n10:30\n\n同意，先把这些路径走完。\n\ndocs\n/\ninteraction-review.md\n交互核对\n\n本文件是宽屏对照稿中的固定示例，不来自真实工作区。\n\n本次检查\n路径\t预期\nCamp\t导航、正文、Composer 共用生产组件\n审批\t展示 Runtime 提供的选项，提交时防止重复点击\n文件\t按受授权资源读取，显示来源与失效状态\nconst client = useCampClient()\n\n默认由队长 @洛可 接收\n\n继续核对审批和文件预览，保留现有交互。\n\nEnter 发送，Shift+Enter 换行\n↵\n发送\n·\n⇧↵\n换行\n左右方向键调整 24px，按住 Shift 调整 80px；Delete 或 Backspace 关闭；双击恢复默认比例；Escape 取消拖动。",
+        "composer": true,
+        "dialog": true
+      },
+      "actions": [
+        "production-markdown-preview",
+        "explicit-download-adapter-saves-fixed-sample"
+      ]
+    },
+    {
+      "surface": "web",
+      "theme": "night",
+      "scenario": "member",
+      "state": {
+        "nativeBridge": "undefined",
+        "require": "undefined",
+        "viewport": [
+          1440,
+          920
+        ],
+        "rail": 270,
+        "overflow": false,
+        "text": "Rovai AI\n新对话\n队员\n记忆\n定时任务\n跳转到对话…\n⌘K\n项目\n＋\nrovai-workspace\n＋\nCamp 页面与审批流程核对\n快速对话\n＋\n\n还没有对话\n\n设置\n你\n维护者\n个人资料\n队员\n2\n洛\n洛可\n游学者\n木\n木瓦\n鉴定士\n256 px\n左右方向键调整；最窄时按左方向键折叠，右方向键展开，回车切换折叠，Home 恢复默认。也可使用名册选项和展开折叠按钮。\n洛\n洛可\n\n游学者\n\n在队\nCodex CLI\n队员信息\n名称\n最多 80 个字符。\n团队角色\n最多 120 个字符。\n专业职责\n最多 300 个字符。\n性格底色\n好奇\n灵活\n勤勉\n回车或逗号添加标签，最多 6 项，每项最多 16 个字符。\n洛\n更换角色图片\n工作准则与成长课题\n未填写\n当前信息已保存\n放弃更改\n保存\n运行配置\n用于之后开始的新执行\nAgent 运行时\nCodex CLI\n可用\n模型策略\n默认\n文件系统访问\ndanger-full-access (no sandbox)\n审批策略\nnever (no approval prompts)\n当前配置已保存\n放弃更改\n保存",
+        "composer": false,
+        "dialog": false
+      },
+      "actions": [
+        "production-runtime-form-saves-simulated-versioned-configuration"
+      ]
+    }
+  ],
+  "viewer": {
+    "simulation": true,
+    "file": "rovai-desktop-web-parity.html",
+    "checks": [
+      "two-production-frames",
+      "isolated-surface-state",
+      "theme-and-scenario-reset",
+      "inactive-frame-does-not-create-blank-scroll-page"
+    ]
+  }
+}

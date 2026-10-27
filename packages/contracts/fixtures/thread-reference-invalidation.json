@@ -1,0 +1,115 @@
+[
+  {
+    "method": "navigation.invalidated",
+    "params": {
+      "reason": "camps.rename"
+    },
+    "expected": true
+  },
+  {
+    "method": "navigation.invalidated",
+    "params": {
+      "reason": "camps.delete_accepted"
+    },
+    "expected": true
+  },
+  {
+    "method": "navigation.invalidated",
+    "params": {
+      "reason": "camp.deleted"
+    },
+    "expected": true
+  },
+  {
+    "method": "navigation.invalidated",
+    "params": {
+      "reason": "delivery_batch.claimed"
+    },
+    "expected": false
+  },
+  {
+    "method": "navigation.invalidated",
+    "params": {
+      "reason": "navigation.campViewed"
+    },
+    "expected": false
+  },
+  {
+    "method": "navigation.invalidated",
+    "params": {
+      "reason": "agent_run.started"
+    },
+    "expected": false
+  },
+  {
+    "method": "navigation.invalidated",
+    "params": {
+      "reason": "camps.members.add"
+    },
+    "expected": false
+  },
+  {
+    "method": "navigation.invalidated",
+    "params": {
+      "reason": "camps.create"
+    },
+    "expected": false
+  },
+  {
+    "method": "missions.invalidated",
+    "params": {
+      "reason": "missions.update"
+    },
+    "expected": true
+  },
+  {
+    "method": "missions.invalidated",
+    "params": {
+      "reason": "missions.updateWithAttachments"
+    },
+    "expected": true
+  },
+  {
+    "method": "missions.invalidated",
+    "params": {
+      "reason": "missions.status"
+    },
+    "expected": false
+  },
+  {
+    "method": "missions.invalidated",
+    "params": {
+      "reason": "missions.start"
+    },
+    "expected": false
+  },
+  {
+    "method": "missions.invalidated",
+    "params": {
+      "reason": "missions.linkPr"
+    },
+    "expected": false
+  },
+  {
+    "method": "missions.invalidated",
+    "params": {
+      "reason": "mission.workspace.cleanup.finished"
+    },
+    "expected": false
+  },
+  {
+    "method": "monitoring.changed",
+    "params": {
+      "reason": "camps.rename"
+    },
+    "expected": false
+  },
+  {
+    "method": "missions.invalidated",
+    "params": {
+      "reason": "missions.agentUpdated",
+      "threadId": "mission-owner"
+    },
+    "expected": true
+  }
+]

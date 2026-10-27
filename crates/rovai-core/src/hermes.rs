@@ -1,0 +1,175 @@
+//! Official Hermes ACP, native Home and native logical Session identity.
+use anyhow::{Context, Result};
+use serde_json::Value;
+use tokio::process::Command;
+
+pub fn supported_version(version: Option<&str>) -> bool {
+    version
+        .and_then(crate::agent_runtime_adapter::parse_reported_runtime_version)
+        .is_some_and(|(version, _)| version >= [0, 22, 4])
+}
+
+/// Compare the native choice without changing the ID sent to session/set_model.
+/// A generic custom:<model> report may omit the configured custom provider name.
+pub fn model_selection_matches(selected: &str, current: Option<&str>) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    if selected == current {
+        return true;
+    }
+    fn parts(id: &str) -> (Option<&str>, &str) {
+        let Some((provider, model)) = id.split_once(':') else {
+            return (None, id);
+        };
+        if provider == "custom"
+            && let Some((name, model)) = model.split_once(':')
+        {
+            return (Some(&id[.."custom:".len() + name.len()]), model);
+        }
+        (Some(provider), model)
+    }
+    let (selected_provider, selected_model) = parts(selected);
+    let (current_provider, current_model) = parts(current);
+    selected_model == current_model
+        && (selected_provider.is_none()
+            || selected_provider == current_provider
+            || selected_provider == Some("custom") && current.starts_with("custom:")
+            || current_provider == Some("custom") && selected.starts_with("custom:"))
+}
+
+/// Only launch selection: never copy config, write native instructions, or own
+/// the user's Gateway. The native launcher keeps its own bootstrap semantics.
+pub fn configure_command(command: &mut Command) -> Result<()> {
+    let home = dirs::home_dir().context("Hermes requires the current user's Home")?;
+    command
+        .args(["--profile", "default", "acp"])
+        .env("HOME", &home)
+        .env("HERMES_HOME", home.join(".hermes"))
+        .env_remove("HERMES_PROFILE")
+        .env_remove("HERMES_DATA_DIR_SUFFIX");
+    for key in ["ROVAI_CLI_CONTEXT", "ROVAI_AGENT_CLI", "ROVAI_RUN_TMP"] {
+        command.env_remove(key);
+    }
+    Ok(())
+}
+
+/// LOCAL source chat_id is the logical ACP Session. HERMES_SESSION_ID names
+/// the physical transcript and is deliberately not a fallback after compaction.
+pub fn native_session_id(platform: Option<&str>, chat_id: Option<&str>) -> Option<String> {
+    if platform != Some("local") {
+        return None;
+    }
+    chat_id
+        .filter(|id| !id.trim().is_empty() && id.len() <= 512 && !id.contains('\0'))
+        .map(str::to_owned)
+}
+
+/// A cancellation can precede submit; a transport error can follow admission.
+/// Neither proves that an otherwise unobserved input was accepted or rejected.
+/// The shared ACP client matches the response and keeps its terminal outcome.
+pub fn input_acceptance_uncertain(message: &Value) -> bool {
+    message
+        .pointer("/result/stopReason")
+        .and_then(Value::as_str)
+        == Some("cancelled")
+        || message.get("error").is_some()
+            && !matches!(message["error"]["code"].as_i64(), Some(-32600 | -32602))
+            && message
+                .pointer("/error/data/details")
+                .and_then(Value::as_str)
+                != Some("admitted_turn_failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_selection_matches_native_provider_forms_without_suffix_matching() {
+        for (selected, current, matches) in [
+            ("custom:sub2api:A", "custom:A", true),
+            ("custom:sub2api:A", "custom:sub2api:A", true),
+            ("A", "custom:A", true),
+            ("custom:sub2api:A", "custom:other:A", false),
+            ("custom:sub2api:B", "custom:A", false),
+            ("A", "custom:sub2api:A", true),
+            ("A", "openai:A", true),
+            ("openai:A", "openai:A", true),
+            ("openai:A", "anthropic:A", false),
+            ("openai:A", "custom:A", false),
+            ("custom:A", "custom:sub2api:A", true),
+            ("custom:sub2api:A", "A", false),
+            ("custom:sub2api:org/A", "custom:org/A", true),
+            ("org/A", "custom:sub2api:org/A", true),
+            ("A", "custom:org/A", false),
+            ("custom:sub2api:A", "custom:other:prefix:A", false),
+            ("custom:sub2api:A:v1", "custom:sub2api:A:v2", false),
+            ("custom:sub2api:A", "custom:sub2api:a", false),
+        ] {
+            assert_eq!(
+                model_selection_matches(selected, Some(current)),
+                matches,
+                "{selected} / {current}"
+            );
+        }
+        assert!(!model_selection_matches("A", None));
+    }
+
+    #[test]
+    fn native_entry_preserves_the_launcher_and_uses_logical_session_identity() {
+        let mut command = Command::new("/native/hermes");
+        command.env("HERMES_EPHEMERAL_SYSTEM_PROMPT", "native instruction");
+        configure_command(&mut command).unwrap();
+        assert_eq!(command.as_std().get_program(), "/native/hermes");
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            ["--profile", "default", "acp"]
+        );
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(k, v)| k == "HERMES_EPHEMERAL_SYSTEM_PROMPT"
+                    && v == Some(std::ffi::OsStr::new("native instruction")))
+        );
+        assert_eq!(
+            native_session_id(Some("local"), Some("local-session")),
+            Some("local-session".into())
+        );
+        for (platform, id) in [
+            (None, Some("session")),
+            (Some("telegram"), Some("session")),
+            (Some("local"), Some("")),
+            (Some("local"), None),
+        ] {
+            assert_eq!(native_session_id(platform, id), None);
+        }
+        assert!(!supported_version(Some("0.22.2")));
+        for version in [
+            "0.22.4",
+            "Hermes Agent v0.22.5 (new source)",
+            "0.23.0",
+            "1.0.0",
+        ] {
+            assert!(supported_version(Some(version)));
+        }
+        assert!(!supported_version(None));
+        assert!(!input_acceptance_uncertain(
+            &json!({"result":{"stopReason":"end_turn"}})
+        ));
+        assert!(input_acceptance_uncertain(
+            &json!({"result":{"stopReason":"cancelled"}})
+        ));
+        assert!(!input_acceptance_uncertain(
+            &json!({"error":{"code":-32602}})
+        ));
+        assert!(!input_acceptance_uncertain(
+            &json!({"error":{"code":-32603,"data":{"details":"admitted_turn_failed"}}})
+        ));
+        assert!(input_acceptance_uncertain(
+            &json!({"error":{"code":-32603,"data":{"details":"connection_lost"}}})
+        ));
+    }
+}

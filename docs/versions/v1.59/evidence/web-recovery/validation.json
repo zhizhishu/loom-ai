@@ -1,0 +1,14 @@
+{
+  "status": "passed",
+  "platform": "darwin",
+  "realHost": true,
+  "productionWeb": true,
+  "noRuntime": true,
+  "sameEditorAfterReload": true,
+  "unsavedComposerRestored": true,
+  "browserAndPageNavigation": true,
+  "forwardAfterRefresh": true,
+  "copiedTabIndependent": true,
+  "copiedLogoutKeepsOriginal": true,
+  "controlsStartLeft": true
+}

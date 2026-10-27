@@ -1,0 +1,296 @@
+---
+document_type: ui-theme
+authority: renderer-theme
+status: accepted
+theme_id: porcelain-day
+mode: light
+last_updated: 2026-10-25
+---
+
+# Porcelain Day
+
+## Identity
+
+- `theme_id`: `porcelain-day`
+- Display name: `Porcelain Day`
+- Runtime mapping: `ThemeId = "day"`, `ResolvedTheme = "day"`
+
+## Mode
+
+Light. `color-scheme: light`.
+
+## Design intent
+
+冷瓷灰 Canvas、近白纸面与低饱和 Steel 品牌色。普通操作使用深色动作 Token，选中区域保持安静。
+
+## Surface hierarchy
+
+`canvas → rail/surface → raised/input` 形成主要层级。会话、Inspector 与 Quick Chat 主区使用
+独立语义 surface token，以便结构清楚而不依赖阴影。普通列表与消息保持平面。
+
+控件、品牌、状态、身份和 Memory 的色彩职责继承 [DESIGN.md](../../../DESIGN.md#colors)。
+
+## Complete semantic token assignments
+
+### Surfaces, text and structure
+
+| Token | Value |
+|---|---:|
+| `--canvas` | `#eceeef` |
+| `--surface` | `#fbfbfa` |
+| `--surface-raised` | `#ffffff` |
+| `--surface-subtle` | `#f0f2f4` |
+| `--surface-muted` | `#e7eaed` |
+| `--surface-selected` | `#e9ecee` |
+| `--scrollbar-thumb` | `#e9ecee` |
+| `--surface-hover` | `#e8eaea` |
+| `--surface-sunken` | `#e4e8eb` |
+| `--workspace-surface-subtle` | `#f4f5f4` |
+| `--workspace-surface-raised` | `#ffffff` |
+| `--workspace-surface-hover` | `#e8ebec` |
+| `--workspace-surface-selected` | `#e4eaee` |
+| `--workspace-line` / `--workspace-line-strong` | `#d5dadd` / `#bdc6ca` |
+| `--workspace-steel` / `--workspace-steel-ink` | `#476b85` / `#34576f` |
+| `--workspace-attention-soft` | `#f4ecdf` |
+| `--workspace-faint` | `#71808a` |
+| `--conversation-surface` | `#ffffff` |
+| `--conversation-user-message-surface` | `#f5f5f4` |
+| `--conversation-user-message-line` | `#f5f5f4` |
+| `--execution-running-surface` | `#fafafa` |
+| `--conversation-find-match` | `#f4e4c3` |
+| `--conversation-find-current` | `#edc66f` |
+| `--conversation-find-line` | `#bd8a38` |
+| `--inspector-surface` | `#ffffff` |
+| `--conversation-inspector-line` | `#c7cfd6` |
+| `--home-surface` | `#ffffff` |
+| `--settings-choice-selected-surface` | `#ffffff` |
+| `--topbar` | `#fbfbfa` |
+| `--input` | `#ffffff` |
+| `--ink` | `#171b20` |
+| `--muted` | `#616a73` |
+| `--faint` | `#6e7382` |
+| `--line` | `#dfe4e8` |
+| `--resize-line` | `#777777` |
+| `--line-strong` | `#c7cfd6` |
+| `--control-line` | `#8b9389` |
+| `--new-camp-picker-surface` | `#ffffff` |
+| `--new-camp-picker-soft` | `#e9eef3` |
+| `--new-camp-picker-hover` | `#edf2f5` |
+| `--new-camp-picker-line-strong` | `#8296a4` |
+| `--rail` | `#f3f4f4` |
+| `--rail-ink` | `#626b72` |
+| `--rail-line` | `#dadde0` |
+| `--rail-logo` | `#526f88` |
+
+### Settings controls and usage series
+
+| Token | Value |
+|---|---:|
+| `--settings-choice-line` | `#e0e4e7` |
+| `--settings-choice-selected-line` | `#a5adb4` |
+| `--settings-choice-hover` | `#fafbfb` |
+| `--settings-field-line` | `#cbd1d6` |
+| `--settings-switch-off` | `#8c939a` |
+| `--settings-switch-thumb` | `#ffffff` |
+| `--settings-select-arrow` | SVG chevron stroke `#616b74` |
+| `--monitoring-input` | `#393b3d` |
+| `--monitoring-output` | `#657f9b` |
+| `--monitoring-read` | `#698273` |
+| `--monitoring-write` | `#997b4d` |
+
+### Brand, mention and supporting accents
+
+| Token | Value |
+|---|---:|
+| `--brand` | `#526f88` |
+| `--brand-hover` | `#3d5874` |
+| `--brand-contrast` | `#ffffff` |
+| `--brand-soft` | `#e9eef3` |
+| `--brand-ink` | `#405f7e` |
+| `--resource-link` | `#2b66d9` |
+| `--resource-link-hover` | `#1e4fb8` |
+| `--mention-ink` | `#2f61c8` |
+| `--mention-ink-hover` | `#244ea7` |
+| `--mention-feedback` | `rgba(47, 97, 200, 0.08)` |
+| `--mention-popover-portrait-scrim` | `rgba(32, 36, 56, 0.10)` |
+| `--mention-popover-label-line` | `rgba(255, 255, 255, 0.45)` |
+| `--mention-popover-label-surface` | `rgba(32, 36, 56, 0.34)` |
+| `--aurora` | `#719d94` |
+| `--aurora-soft` | `#e7f0ec` |
+| `--violet` | `#9082b4` |
+| `--violet-soft` | `#efebf6` |
+| `--ember` | `#d3a45f` |
+| `--ember-soft` | `#f8edda` |
+
+### Conversation controls
+
+These local tokens cover sidebar selection, Composer and the execution/task/member controls.
+Rail and selected surfaces stay unchanged; status, identity and evidence keep their own colors.
+
+| Token | Value |
+|---|---:|
+| `--memory-rail` | `#f3f3f3` |
+| `--memory-overlay` | `rgba(24, 24, 24, .42)` |
+| `--memory-canvas` | `#ffffff` |
+| `--memory-surface` | `#f5f5f5` |
+| `--memory-raised` | `#ffffff` |
+| `--memory-selected` | `#ededed` |
+| `--memory-hover` | `#f3f3f3` |
+| `--memory-line` | `#e2e2e2` |
+| `--memory-ink` | `#222222` |
+| `--memory-muted` | `#626262` |
+| `--memory-input-line` | `#dedede` |
+| `--neutral-selected` | `#eeeef0` |
+| `--neutral-hover` | `#f3f3f4` |
+| `--conversation-action` | `#2b2b2c` |
+| `--conversation-action-hover` | `#1a1a1b` |
+| `--conversation-action-contrast` | `#ffffff` |
+| `--conversation-control-line` | `#949494` |
+| `--conversation-focus` | `#2b2b2c` |
+| `--conversation-focus-soft` | `rgba(43, 43, 44, 0.12)` |
+| `--conversation-route-accent` | `#7a7d80` |
+| `--conversation-unread` | `#1683ff` |
+| `--update-progress-fill` | `#2879e8` |
+| `--mission-unread-ink` | `#0967d2` |
+| `--file-update-marker` | `#b7791f` |
+
+### Semantic state
+
+| Role | Foreground | Soft | Contrast |
+|---|---:|---:|---:|
+| success | `#3e775c` | `#e7f1ea` | `#ffffff` |
+| attention | `#8a6226` | `#f8edda` | `#ffffff` |
+| danger | `#a24c46` | `#f7e6e3` | `#ffffff` |
+| info | `#416c86` | `#e5eef3` | `#ffffff` |
+| neutral | `#5f6678` | `#ecefe9` | — |
+
+`--approval-line` is `#d8bd87`; `--focus` is `#526f88`; `--focus-soft` is
+`rgba(82, 111, 136, 0.16)`.
+
+### Identity
+
+| Token | Value | Token | Value |
+|---|---:|---|---:|
+| `--identity-1` | `#a65f4a` | `--identity-5` | `#4f729b` |
+| `--identity-2` | `#39777a` | `--identity-6` | `#8a5c75` |
+| `--identity-3` | `#74628f` | `--identity-7` | `#547245` |
+| `--identity-4` | `#9a6a32` | `--identity-8` | `#8c6146` |
+
+### Mission labels
+
+Mission labels retain their normalized-text stable eight-slot hash but use a dedicated palette so changing label
+readability does not recolor members, Skills or MCP servers.
+
+| Token | Value | Token | Value |
+|---|---:|---|---:|
+| `--mission-label-1` | `#ae4e3e` | `--mission-label-5` | `#3f6fa7` |
+| `--mission-label-2` | `#27777b` | `--mission-label-6` | `#914f78` |
+| `--mission-label-3` | `#71579a` | `--mission-label-7` | `#4d752f` |
+| `--mission-label-4` | `#95610f` | `--mission-label-8` | `#98542e` |
+
+### Agent artifact families
+
+Agent 交付文件的图形色只表达格式家族，不表达状态、身份或可写权限；用户附件继续使用中性单色图形。
+
+| Token | Value | Token | Value |
+|---|---:|---|---:|
+| `--attachment-web` | `#a65f4a` | `--attachment-code` | `#39777a` |
+| `--attachment-notes` | `#5f6678` | `--attachment-pdf` | `#9a4b46` |
+| `--attachment-word` | `#4e6ea8` | `--attachment-sheet` | `#3e775c` |
+| `--attachment-slide` | `#9a6a32` | `--attachment-image` | `#74628f` |
+| `--attachment-archive` | `#8c6146` | `--attachment-generic` | `#616a73` |
+
+### Evidence and diff
+
+| Token | Value |
+|---|---:|
+| `--inline-code-canvas` | `#e9eceb` |
+| `--conversation-inline-code-canvas` | `#eef0f1` |
+| `--conversation-code-block-canvas` | `#f4f5f5` |
+| `--conversation-code-line` | `#d9dee1` |
+| `--shell-result-canvas` | `#f3f4f3` |
+| `--code-block-canvas` | `#eef2f5` |
+| `--evidence-canvas` | `#f4f6f3` |
+| `--evidence-surface` | `#ffffff` |
+| `--evidence-ink` | `#252a36` |
+| `--evidence-muted` | `#5f6678` |
+| `--evidence-line` | `#d5dad3` |
+| `--diff-add` / `--diff-add-soft` | `#137333` / `#d9f1e2` |
+| `--diff-remove` / `--diff-remove-soft` | `#b3261e` / `#f5dede` |
+| `--diff-hunk-soft` | `#f3f4f4` |
+| `--file-change-surface` | `#ffffff` |
+| `--file-change-hover` | `#f3f4f4` |
+| `--file-change-selected` | `#eeefef` |
+| `--file-change-selected-line` | `#d6d9dc` |
+| `--file-change-add-soft` | `#ecf7f0` |
+| `--file-change-remove-soft` | `#fcf0ef` |
+| `--file-change-hunk` | `#f5f5f4` |
+
+### Overlay and lightbox
+
+`--overlay` is `rgba(28, 32, 43, 0.42)` and `--shadow-float` is
+`0 18px 56px rgba(38, 45, 58, 0.14)`. The lightbox uses `#10171d` surface,
+`#f7fafb` ink, `rgb(255 255 255 / 18%)` line, `rgb(255 255 255 / 10%)` control and
+`0 28px 80px rgb(0 0 0 / 42%)` shadow over `rgb(12 18 24 / 72%)`.
+
+### Dialog fields
+
+| Token | Value |
+|---|---:|
+| `--dialog-field-label` | `#707070` |
+| `--dialog-field-line` | `#e2e4e7` |
+| `--dialog-field-line-hover` | `#bcc3ca` |
+
+Labels use regular weight. Fields retain a 1px border, input surface and visible focus outline;
+higher contrast preferences use the stronger control line and ink. Import MCP source JSON reuses
+`--conversation-code-block-canvas`, with no extra left margin.
+
+### Shared aliases and geometry
+
+| Token | Value |
+|---|---:|
+| `--rail-width` | `270px` |
+| `--project-menu-slot` / `--project-create-slot` | `24px` / `26px` |
+| `--mention-popover-arrow-x` | `28px` |
+| `--mention-popover-accent` | `var(--brand)` |
+| `--shadow-menu` / `--shadow-dialog` | `var(--shadow-float)` |
+| `--shadow-card` | `none` |
+| `--member-avatar-size` | `32px` |
+| `--member-avatar-accent` | `var(--identity-1)` |
+| `--identity-clamp-lines` | `3` |
+| `--conversation-prose-width` | `76ch` |
+| `--conversation-artifact-width` | `930px` |
+| `--conversation-wide-width` | `1040px` |
+| `--conversation-composer-width` | `1040px`; viewport `>= 1800px` 时为 `1440px` |
+| `--conversation-user-message-max-width` | `690px` |
+| `--conversation-user-message-width-offset` | `36px`; viewport `<= 1080px` 时为 `18.667px`，紧凑会话列为 `16px` |
+
+## Brand, semantic, identity, and evidence color rules
+
+Inherit [DESIGN.md](../../../DESIGN.md#colors). Inline code, Shell results and fenced evidence use their
+respective code tokens. Conversation prose, process copy and Markdown files use the dedicated
+`--conversation-inline-code-canvas`, `--conversation-code-block-canvas` and `--conversation-code-line` layer;
+release notes and Tool results keep shared SafeMarkdown defaults.
+Public user/Agent messages and Single Chat user bubbles share `--conversation-user-message-surface`
+and its matching 1px border allocation; private Agent narrative stays transparent.
+
+## Contrast requirements
+
+Normal text must meet 4.5:1; control boundaries and non-text state indicators must meet 3:1.
+Focus behavior follows the [accessibility baseline](../qa/accessibility.md).
+State cannot rely on color alone. Identity colors are tested on the production surfaces where they appear.
+
+## Prohibited substitutions
+
+Do not replace Steel with status colors, collapse eight identities to one Steel mark, use `--line` as the
+sole control boundary, or add theme-specific component behavior.
+
+## Implementation source
+
+The `:root` block in [`theme.css`](../../../packages/ui/src/theme.css) is the production
+source. This document is a reviewable contract, not a second CSS source.
+
+## Visual verification
+
+Run the Renderer theme-token tests and the shared [theme matrix](../qa/theme-matrix.md), including
+`1040×700`, `1440×920`, `2560×1440`, keyboard focus, 200% zoom and reduced motion.

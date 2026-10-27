@@ -1,0 +1,63 @@
+{
+  "stage": "managed-desktop-web-passed",
+  "simulation": false,
+  "realRuntime": false,
+  "desktopFocusEmulated": true,
+  "campId": "rvcamp_01m2bket5mf8085c69xp5r9j1h",
+  "geometry": {
+    "viewport": [
+      1440,
+      920
+    ],
+    "sidebar": 270,
+    "header": 38,
+    "composer": 1022
+  },
+  "draftOwners": [
+    "web",
+    "web",
+    "desktop"
+  ],
+  "sameComposerAfterReauth": true,
+  "nativeBridgeInBrowser": false,
+  "ownerModel": {
+    "desktopSettingsStart": true,
+    "pendingPortAppliesOnlyOnNextStart": true,
+    "stopWithoutConfirmation": true,
+    "copiedAddressAndToken": true,
+    "copyIconFeedbackWithoutPageNotice": true,
+    "tokenReadableBeforeStartAndAfterStop": true,
+    "tokenPreservedOnRestart": true,
+    "actualInterfaceAddress": true,
+    "nonLoopbackOrigin": true,
+    "directoryPickerWithoutPreauthorization": true,
+    "sameMachineBrowsers": true,
+    "secondPhysicalDevice": false
+  },
+  "management": {
+    "notificationPreferenceSavedThroughUi": true,
+    "monitoringReadAndDownload": true,
+    "relativeMarkdownImageAndChild": true,
+    "diagnosticsReadAndDownload": true,
+    "channelNativeCapabilityExplicit": true,
+    "memoryCreateReviseRetire": true,
+    "automationCreateClose": true,
+    "mcpCreate": true,
+    "skillDirectoryImport": true,
+    "builtinPortraitAndManagedAvatarUpload": true,
+    "taskCreateUpdateCancel": true,
+    "privateDraftAndAttachmentIsolation": true,
+    "privateReauthenticationPreservesEditor": true
+  },
+  "mainSync": {
+    "browserGeneralPreferences": true,
+    "nativeWindowControlsAbsent": true,
+    "browserZoomExplicit": true,
+    "previewSelectAllScoped": true,
+    "finalLineQuoteAccepted": true,
+    "pendingReturnScopedToCurrentClient": true,
+    "pendingAttachmentsAddedInComposer": true,
+    "pendingFixture": "one needs_repair row in isolated database; no Runtime"
+  },
+  "coreAliveAfterWebStop": true
+}

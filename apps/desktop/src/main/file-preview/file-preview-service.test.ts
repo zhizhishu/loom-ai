@@ -1,0 +1,1363 @@
+import { EventEmitter } from 'node:events'
+import { request as httpRequest } from 'node:http'
+import { mkdir, mkdtemp, realpath, rm, symlink, truncate, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { OpenFilePreviewRequest } from '@contracts'
+import { RootWatchRegistry } from './file-preview-watchers'
+import * as fileAccess from './file-preview-access'
+import { CoreFilePreviewSourceAuthority } from './file-preview-authority'
+import { previewPathIsVisible } from '../../renderer/src/file-preview-tab-presentation'
+import {
+  FilePreviewService,
+  type FilePreviewNativeActions,
+  type FilePreviewSourceAuthority
+} from './file-preview-service'
+
+vi.mock('node:os', async (importOriginal) => {
+  const os = await importOriginal<typeof import('node:os')>()
+  return { ...os, homedir: vi.fn(os.homedir) }
+})
+
+const defaultHomeDirectory = homedir()
+
+class FakeWatcher extends EventEmitter {
+  close = vi.fn()
+}
+
+let directories: string[] = []
+let services: FilePreviewService[] = []
+
+beforeEach(() => {
+  directories = []
+  services = []
+  vi.mocked(homedir).mockReturnValue(defaultHomeDirectory)
+})
+
+afterEach(async () => {
+  await Promise.all(services.map((service) => service.closeAll()))
+  await Promise.all(directories.map((directory) => rm(directory, { recursive: true, force: true })))
+})
+
+async function fixture(): Promise<{
+  root: string
+  authority: FilePreviewSourceAuthority
+  native: FilePreviewNativeActions
+  openPath: ReturnType<typeof vi.fn>
+  registry: RootWatchRegistry
+  service: FilePreviewService
+}> {
+  const root = await mkdtemp(join(tmpdir(), 'rovai-file-preview-'))
+  directories.push(root)
+  // Keep the host user's home out of synthetic path-presentation assertions.
+  // Home-relative behavior is covered by tests that explicitly override this.
+  const home = await mkdtemp(join(tmpdir(), 'rovai-preview-home-'))
+  directories.push(home)
+  vi.mocked(homedir).mockReturnValue(home)
+  const authority: FilePreviewSourceAuthority = {
+    async resolve(request) {
+      if (request.kind !== 'camp_workspace' && request.kind !== 'message_reference') return null
+      return {
+        kind: 'file_target',
+        threadId: request.threadId,
+        sourceKind: request.kind,
+        sourceIdentity: request.kind === 'message_reference'
+          ? `message:${request.messageId}`
+          : `${request.threadId}:${request.rawReference}`,
+        rootPath: root,
+        basePath: root,
+        rawReference: request.rawReference,
+        allowChildren: true
+      }
+    }
+  }
+  const openPath = vi.fn(async () => '')
+  const native: FilePreviewNativeActions = {
+    selectRoot: vi.fn(async () => null),
+    confirmOpen: vi.fn(async () => true),
+    openPath,
+    revealPath: vi.fn(),
+    copyText: vi.fn(),
+    publishExternalUpdate: vi.fn()
+  }
+  const registry = new RootWatchRegistry({
+    notify: vi.fn(),
+    watchFactory: () => new FakeWatcher() as never
+  })
+  const service = new FilePreviewService(authority, native, registry)
+  services.push(service)
+  await service.bindThread(1, 'camp-1')
+  return { root, authority, native, openPath, registry, service }
+}
+
+function request(rawReference: string): OpenFilePreviewRequest {
+  return { kind: 'camp_workspace', threadId: 'camp-1', rawReference }
+}
+
+describe('FilePreviewService', () => {
+  it('reuses only the latest line location within its candidate handle', async () => {
+    const reads: Array<{ position: number; bytes: number }> = []
+    const openFile = fileAccess.openPreviewFile
+    const spy = vi.spyOn(fileAccess, 'openPreviewFile').mockImplementation(async (...args) => {
+      const opened = await openFile(...args)
+      const read = opened.file.read.bind(opened.file)
+      // Count actual file reads; classification is excluded by resetting after reload.
+      vi.spyOn(opened.file, 'read').mockImplementation((async (buffer: Buffer, offset: number, length: number, position: number | null) => {
+        const result = await read(buffer, offset, length, position)
+        reads.push({ position: position as number, bytes: result.bytesRead })
+        return result
+      }) as typeof opened.file.read)
+      return opened
+    })
+    try {
+      const { root, service } = await fixture()
+      await writeFile(join(root, 'large.log'), 'hello!\n'.repeat(800_000))
+      const opened = await service.open(1, request('large.log'))
+      if (!opened.ok || opened.value.kind !== 'file_preview') throw new Error('Expected a file')
+      const old = opened.value.file
+      const fresh = await service.reload(1, { handleId: old.handleId, reopenToken: old.reopenToken, expectedGeneration: old.contentGeneration })
+      if (!fresh.ok) throw new Error('Expected a candidate')
+      const candidate = { handleId: fresh.value.handleId, expectedGeneration: fresh.value.contentGeneration }
+      reads.length = 0
+      const located = await service.resolveLine(1, { ...candidate, line: 524_289 })
+      if (!located.ok) throw new Error('Expected a location')
+      expect(reads.reduce((sum, read) => sum + read.bytes, 0)).toBe(3.5 * 1024 * 1024)
+      reads.length = 0
+      expect(await service.readPage(1, { ...candidate, offset: located.value.offset }))
+        .toMatchObject({ ok: true, value: { startLine: 524_289, text: expect.stringMatching(/^hello!\n/) } })
+      expect(reads).toEqual([{ position: located.value.offset, bytes: 256 * 1024 }])
+
+      await service.resolveLine(1, { ...candidate, line: 850 })
+      reads.length = 0
+      expect(await service.readPage(1, { ...candidate, offset: located.value.offset }))
+        .toMatchObject({ ok: true, value: { startLine: 524_289 } })
+      expect(reads.filter(read => read.position < located.value.offset).reduce((sum, read) => sum + read.bytes, 0))
+        .toBe(located.value.offset)
+
+      // Another handle must locate independently, even before the file changes.
+      reads.length = 0
+      expect(await service.readPage(1, { handleId: old.handleId, expectedGeneration: old.contentGeneration, offset: located.value.offset }))
+        .toMatchObject({ ok: true, value: { startLine: 524_289 } })
+      expect(reads.some(read => read.position === 0)).toBe(true)
+      await writeFile(join(root, 'large.log'), 'shortened\n')
+      expect(await service.readPage(1, { ...candidate, offset: 0 })).toMatchObject({ ok: false })
+    } finally { spy.mockRestore() }
+  })
+
+  it('publishes a real watcher save and reads fresh bytes through the existing reload candidate', async () => {
+    const { root, authority, native } = await fixture()
+    const service = new FilePreviewService(authority, native)
+    services.push(service)
+    await service.bindThread(1, 'camp-1')
+    await writeFile(join(root, 'live.txt'), 'before')
+    const opened = await service.open(1, request('live.txt'))
+    if (!opened.ok || opened.value.kind !== 'file_preview') throw new Error('Expected a file')
+    const old = opened.value.file
+    await writeFile(join(root, 'live.txt'), 'after saving the actual file')
+    await vi.waitFor(() => expect(native.publishExternalUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      threadId: 'camp-1', previewKeys: [old.previewKey]
+    })))
+    const fresh = await service.reload(1, { handleId: old.handleId, reopenToken: old.reopenToken, expectedGeneration: old.contentGeneration })
+    if (!fresh.ok) throw new Error('Expected a candidate')
+    expect(fresh.value.handleId).not.toBe(old.handleId)
+    expect(await service.readText(1, { handleId: fresh.value.handleId, expectedGeneration: fresh.value.contentGeneration }))
+      .toMatchObject({ ok: true, value: { text: 'after saving the actual file' } })
+  })
+
+  it('reclaims background handles by user LRU, protecting visible and busy handles under concurrent allocation', async () => {
+    const { root, service, native } = await fixture()
+    native.publishResourcesReleased = vi.fn()
+    await Promise.all(Array.from({ length: 66 }, (_, i) => writeFile(join(root, `${i}.txt`), `file ${i}`)))
+    const files = []
+    for (let i = 0; i < 64; i++) {
+      const result = await service.open(1, request(`${i}.txt`))
+      if (!result.ok || result.value.kind !== 'file_preview') throw new Error('expected file')
+      files.push(result.value.file)
+    }
+    await service.updateRetention(1, { sessions: [{ threadId: 'camp-1', previewSessionId: 'session-1' }],
+      handles: files.map((file, i) => ({ handleId: file.handleId, previewSessionId: 'session-1', tabId: `${i}`,
+        lastUsed: i, visible: i === 0, busy: i === 1, recoverable: true })) })
+    // Background I/O does not promote the user-action order.
+    await service.readText(1, { handleId: files[2].handleId, expectedGeneration: files[2].contentGeneration })
+    const results = await Promise.all([service.open(1, request('64.txt')), service.open(1, request('65.txt'))])
+    expect(results.every(result => result.ok)).toBe(true)
+    expect(service.handleCount).toBe(64)
+    expect(native.publishResourcesReleased).toHaveBeenNthCalledWith(1, 1, [files[2].handleId])
+    expect(native.publishResourcesReleased).toHaveBeenNthCalledWith(2, 1, [files[3].handleId])
+    expect((await service.readText(1, { handleId: files[0].handleId, expectedGeneration: files[0].contentGeneration })).ok).toBe(true)
+    expect((await service.readText(1, { handleId: files[1].handleId, expectedGeneration: files[1].contentGeneration })).ok).toBe(true)
+  })
+
+  it('retains Markdown resource tokens across Thread switches, idle descriptor retirement and failed refresh candidates', async () => {
+    const { root, service } = await fixture()
+    await writeFile(join(root, 'notes.md'), '![image](image.svg)')
+    await writeFile(join(root, 'image.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>')
+    const opened = await service.open(1, request('notes.md'))
+    if (!opened.ok || opened.value.kind !== 'file_preview') throw new Error('expected file')
+    const file = opened.value.file
+    const prepared = await service.prepareHtml(1, { handleId: file.handleId, expectedGeneration: file.contentGeneration })
+    if (!prepared.ok) throw new Error('expected markdown')
+    const url = `rovai-preview://asset/${prepared.value.tabToken}/image.svg`
+    await service.bindThread(1, 'camp-2')
+    expect(service.authorizeHtmlAsset(1, 'GET', url)).toBe(true)
+    const now = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 60 * 60 * 1000)
+    try {
+      const candidate = await service.reload(1, { handleId: file.handleId, reopenToken: file.reopenToken, expectedGeneration: file.contentGeneration })
+      if (!candidate.ok) throw new Error('expected candidate')
+      await service.prepareHtml(1, { handleId: candidate.value.handleId, expectedGeneration: candidate.value.contentGeneration })
+      await service.release(1, { handleId: candidate.value.handleId })
+      expect(service.authorizeHtmlAsset(1, 'GET', url)).toBe(true)
+      expect((await service.serveHtmlAsset(new Request(url))).status).toBe(200)
+      expect((await service.readText(1, { handleId: file.handleId, expectedGeneration: file.contentGeneration })).ok).toBe(true)
+    } finally { clock.mockRestore() }
+  })
+
+  it('projects desktop private-store exclusions into the HTTP resource service', async () => {
+    const { root, service, native } = await fixture()
+    const privateRoot = join(root, 'app-data')
+    await mkdir(privateRoot)
+    await writeFile(join(privateRoot, 'credentials.json'), '{"secret":"test-only"}')
+    await writeFile(join(root, 'index.html'), '<h1>public entry</h1>')
+    native.previewProtectedRoots = () => [privateRoot]
+    const opened = await service.open(1, request('index.html'))
+    if (!opened.ok || opened.value.kind !== 'file_preview') throw new Error('expected file')
+    const file = opened.value.file
+    const prepared = await service.prepareHtmlSite(1, { handleId: file.handleId, expectedGeneration: file.contentGeneration })
+    if (!prepared.ok) throw new Error('expected site')
+    const origin = new URL(prepared.value.origin)
+    const read = (path: string, cookie?: string) => new Promise<{ status: number; cookie?: string; body: string }>((resolve, reject) => {
+      const request = httpRequest({ hostname: '127.0.0.1', port: origin.port, path,
+        headers: { host: origin.host, ...(cookie ? { cookie } : {}) } }, response => {
+        const chunks: Buffer[] = []
+        response.on('data', chunk => chunks.push(chunk))
+        response.on('end', () => resolve({ status: response.statusCode!, cookie: response.headers['set-cookie']?.[0].split(';')[0], body: Buffer.concat(chunks).toString() }))
+      })
+      request.on('error', reject); request.end()
+    })
+    const bootstrap = await read(new URL(prepared.value.entryUrl).pathname)
+    expect(bootstrap.status).toBe(302)
+    expect(bootstrap.cookie).toBeTruthy()
+    expect((await read('/index.html', bootstrap.cookie)).status).toBe(200)
+    const denied = await read('/app-data/credentials.json', bootstrap.cookie)
+    expect(denied.status).toBe(403)
+    expect(denied.body).not.toContain('test-only')
+  })
+
+  it('binds HTTP preview sites to the existing handle, generation, window and Thread lifetime', async () => {
+    const { root, service } = await fixture()
+    await writeFile(join(root, 'index.html'), '<h1>site</h1>')
+    const opened = await service.open(1, request('index.html?tab=all#focus'))
+    if (!opened.ok || opened.value.kind !== 'file_preview') throw new Error('expected file')
+    const file = opened.value.file
+    const input = { handleId:file.handleId, expectedGeneration:file.contentGeneration }
+    expect((await service.prepareHtmlSite(2,input)).ok).toBe(false)
+    const prepared = await service.prepareHtmlSite(1,input)
+    if (!prepared.ok) throw new Error('expected site')
+    expect(new URL(prepared.value.documentUrl).search).toBe('?tab=all')
+    expect(new URL(prepared.value.documentUrl).hash).toBe('#focus')
+    expect(service.ownsHtmlPreviewOrigin(1,prepared.value.entryUrl)).toBe(true)
+    await service.releaseHtmlSite(2,{previewId:prepared.value.previewId})
+    expect(service.ownsHtmlPreviewOrigin(1,prepared.value.entryUrl)).toBe(true)
+    const reloaded = await service.reload(1,{...input,reopenToken:file.reopenToken})
+    if (!reloaded.ok) throw new Error('expected reload')
+    expect(service.ownsHtmlPreviewOrigin(1,prepared.value.entryUrl)).toBe(true)
+    expect(reloaded.value.handleId).not.toBe(file.handleId)
+    const next = await service.prepareHtmlSite(1,{handleId:reloaded.value.handleId,expectedGeneration:reloaded.value.contentGeneration})
+    if (!next.ok) throw new Error('expected fresh site')
+    expect(next.value.origin).not.toBe(prepared.value.origin)
+    await service.bindThread(1,'camp-2')
+    expect(service.ownsHtmlPreviewOrigin(1,next.value.entryUrl)).toBe(true)
+    await service.release(1, { handleId: reloaded.value.handleId })
+    expect(service.ownsHtmlPreviewOrigin(1,next.value.entryUrl)).toBe(false)
+    expect(service.ownsHtmlPreviewOrigin(1,prepared.value.entryUrl)).toBe(true)
+    await service.updateRetention(1, { sessions: [], handles: [] })
+    expect(service.ownsHtmlPreviewOrigin(1,prepared.value.entryUrl)).toBe(false)
+  })
+
+  it('keeps a retained HTML site alive without requests across the idle deadline', async () => {
+    const { root, service } = await fixture()
+    await writeFile(join(root, 'index.html'), '<h1>retained</h1>')
+    const opened = await service.open(1, request('index.html'))
+    if (!opened.ok || opened.value.kind !== 'file_preview') throw new Error('expected file')
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const prepared = await service.prepareHtmlSite(1, { handleId: opened.value.file.handleId, expectedGeneration: opened.value.file.contentGeneration })
+      if (!prepared.ok) throw new Error('expected site')
+      await service.bindThread(1, 'camp-2')
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000)
+      expect(service.ownsHtmlPreviewOrigin(1, prepared.value.entryUrl)).toBe(true)
+      await service.release(1, { handleId: opened.value.file.handleId })
+      expect(service.ownsHtmlPreviewOrigin(1, prepared.value.entryUrl)).toBe(false)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('prepares HTML above the source budget without relaxing source reads or document protection', async () => {
+    const { root, service } = await fixture()
+    const html = '<h1>大文件网页</h1>' + ' '.repeat(4 * 1024 * 1024)
+    await writeFile(join(root, 'large.html'), html)
+    const opened = await service.open(1, request('large.html'))
+    expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview', file: { kind: 'html' } } })
+    if (!opened.ok || opened.value.kind !== 'file_preview') throw new Error('expected file preview')
+    const readRequest = { handleId: opened.value.file.handleId, expectedGeneration: opened.value.file.contentGeneration }
+    const prepared = await service.prepareHtmlSite(1, readRequest)
+    expect(prepared.ok).toBe(true)
+    if (!prepared.ok) throw new Error('expected HTML document')
+    expect(new URL(prepared.value.documentUrl).pathname).toBe('/large.html')
+    expect(service.ownsHtmlPreviewOrigin(1, prepared.value.entryUrl)).toBe(true)
+    expect(service.ownsHtmlPreviewOrigin(2, prepared.value.entryUrl)).toBe(false)
+    expect(await service.readText(1, readRequest)).toMatchObject({ ok: false, error: { code: 'file_too_large' } })
+    await service.release(1, { handleId: readRequest.handleId })
+    expect(service.ownsHtmlPreviewOrigin(1, prepared.value.entryUrl)).toBe(false)
+    expect(await service.prepareHtmlSite(1, readRequest)).toMatchObject({ ok: false })
+
+    for (const [path, size] of [['oversized.html', 32 * 1024 * 1024 + 1], ['large.md', 4 * 1024 * 1024 + 1]] as const) {
+      await writeFile(join(root, path), '# oversized')
+      await truncate(join(root, path), size)
+      const oversized = await service.open(1, request(path))
+      expect(oversized).toMatchObject({ ok: true, value: { kind: 'file_preview', file: { kind: 'paged_text' } } })
+      if (!oversized.ok || oversized.value.kind !== 'file_preview') throw new Error('expected paged preview')
+      expect(await service[path.endsWith('.html') ? 'prepareHtmlSite' : 'prepareHtml'](1, {
+        handleId: oversized.value.file.handleId, expectedGeneration: oversized.value.file.contentGeneration
+      })).toMatchObject({ ok: false, error: { code: 'file_too_large' } })
+    }
+  })
+
+  it.each([
+    ['README.md', 'project_relative', 'README.md', true],
+    ['docs/guide.md', 'project_relative', 'docs/guide.md', true],
+    ['../Downloads/rovai-preview-plan-simple.md', 'external', '~/Downloads/rovai-preview-plan-simple.md', true],
+    ['../Downloads/rovai-preview-simple.html', 'external', '~/Downloads/rovai-preview-simple.html', false]
+  ] as const)('shows the actual source attachment path for %s', async (path, presentation, displayPath, hasWorkspace) => {
+    const { root, native, registry } = await fixture()
+    const project = join(root, 'project')
+    const source = join(project, path)
+    await mkdir(project, { recursive: true })
+    await mkdir(join(source, '..'), { recursive: true })
+    await writeFile(source, '# source attachment')
+    vi.mocked(homedir).mockReturnValue(root)
+    const attachmentId = '8b85752a-76a5-4b9d-92d8-a70b6285a0d0'
+    let canShowPath = true
+    const authority = new CoreFilePreviewSourceAuthority({
+      async request<T>(method: string, params: unknown): Promise<T> {
+        if (method === 'thread.attachments.desktopOpenTarget') return {
+          attachmentId, displayName: basename(source), kind: 'file', mediaType: 'text/plain',
+          path: source, openRisk: 'normal', canShowPath
+        } as T
+        expect(method).toBe('filePreview.resolveSource')
+        const request = params as Extract<OpenFilePreviewRequest, { kind: 'camp_workspace' }>
+        return (hasWorkspace ? {
+          kind: 'file_target', threadId: request.threadId, sourceKind: 'camp_workspace',
+          sourceIdentity: 'workspace:camp-1', rootPath: project, basePath: project,
+          rawReference: request.rawReference, allowChildren: true
+        } : null) as T
+      }
+    })
+    const service = new FilePreviewService(authority, native, registry)
+    services.push(service)
+    await service.bindThread(2, 'camp-1')
+    const request: OpenFilePreviewRequest = {
+      kind: 'attachment', threadId: 'camp-1',
+      locator: { owner: 'message', threadId: 'camp-1', messageId: 'first-message', attachmentRefId: attachmentId }
+    }
+    const result = await service.open(2, request)
+    expect(result).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+      pathPresentation: presentation, displayPath
+    } } })
+    if (!result.ok || result.value.kind !== 'file_preview') return
+    const file = result.value.file
+    expect(previewPathIsVisible(file)).toBe(true)
+    expect(await service.copyPath(2, { handleId: file.handleId, format: 'absolute' }))
+      .toEqual({ ok: true, value: { copied: true } })
+    expect(native.copyText).toHaveBeenLastCalledWith(await realpath(source))
+    expect(await service.revealInFolder(2, { handleId: file.handleId }))
+      .toEqual({ ok: true, value: { revealed: true } })
+    expect(native.revealPath).toHaveBeenLastCalledWith(await realpath(source))
+    canShowPath = false
+    expect(await service.copyPath(2, { handleId: file.handleId, format: 'absolute' }))
+      .toMatchObject({ ok: false, error: { code: 'source_not_authorized' } })
+    expect(native.copyText).toHaveBeenCalledTimes(1)
+    canShowPath = true
+    expect(file.capabilities).toContain('read_child')
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    await service.bindThread(2, 'camp-2')
+    await service.bindThread(2, 'camp-1')
+    expect(await service.restore(2, request)).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+      pathPresentation: presentation, displayPath
+    } } })
+  })
+
+  it('repairs a prose colon only after verifying the file and keeps the original message authority', async () => {
+    vi.useFakeTimers()
+    try {
+      const { root, service, authority, native } = await fixture()
+      await mkdir(join(root, 'tests'))
+      const path = join(root, 'tests', 'test_accrual_supporting_audit_script.py')
+      await writeFile(path, 'assert True')
+      const originalRequest: OpenFilePreviewRequest = {
+        kind: 'message_reference', threadId: 'camp-1', messageId: 'message-1',
+        rawReference: 'tests/test_accrual_supporting_audit_script.py:'
+      }
+      const resolveSource = vi.spyOn(authority, 'resolve')
+      const opened = await service.open(1, originalRequest)
+      expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+        fileName: 'test_accrual_supporting_audit_script.py', target: undefined
+      } } })
+      if (!opened.ok || opened.value.kind !== 'file_preview') return
+      const file = opened.value.file
+      vi.setSystemTime(Date.now() + 31 * 60 * 1_000)
+      expect(await service.readText(1, { handleId: file.handleId, expectedGeneration: file.contentGeneration }))
+        .toMatchObject({ ok: true, value: { text: 'assert True' } })
+      expect(await service.revealInFolder(1, { handleId: file.handleId })).toEqual({ ok: true, value: { revealed: true } })
+      expect(native.revealPath).toHaveBeenCalledWith(await realpath(path))
+      await writeFile(path, 'assert 1 == 1')
+      const reloaded = await service.reload(1, {
+        handleId: file.handleId, reopenToken: file.reopenToken, expectedGeneration: file.contentGeneration
+      })
+      expect(reloaded).toMatchObject({ ok: true, value: { fileName: file.fileName } })
+      expect(resolveSource.mock.calls.every(([input]) => input === originalRequest)).toBe(true)
+      resolveSource.mockResolvedValueOnce(null)
+      expect(await service.revealInFolder(1, { handleId: file.handleId })).toMatchObject({ ok: false })
+      expect(native.revealPath).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([
+    './missing.py:', './report.py::', './report.py:1:', './report.py:1:2:', './report.py:1-2:',
+    './report.py:#L1', './report.py:#L1C2', './report.py:#L1-L2', './folder:', './javascript:payload:'
+  ])('does not guess a different file for %s', async (rawReference) => {
+    const { root, service, native, registry } = await fixture()
+    await writeFile(join(root, 'report.py'), 'assert True')
+    await mkdir(join(root, 'folder'))
+    const opened = await service.open(1, request(rawReference))
+    expect(opened).toMatchObject({ ok: false, error: { code: 'file_not_found' } })
+    expect(service.handleCount).toBe(0)
+    expect(registry.rootCount).toBe(0)
+    expect(native.revealPath).not.toHaveBeenCalled()
+    expect(native.openPath).not.toHaveBeenCalled()
+  })
+
+  it.skipIf(process.platform === 'win32')('prefers an existing literal colon filename to a punctuation correction', async () => {
+    const { root, service, native } = await fixture()
+    await writeFile(join(root, 'notes.txt'), 'without colon')
+    await writeFile(join(root, 'notes.txt:'), 'literal filename')
+    const opened = await service.open(1, request('./notes.txt:'))
+    expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview', file: { fileName: 'notes.txt:' } } })
+    if (!opened.ok || opened.value.kind !== 'file_preview') return
+    expect(await service.readText(1, {
+      handleId: opened.value.file.handleId, expectedGeneration: opened.value.file.contentGeneration
+    })).toMatchObject({ ok: true, value: { text: 'literal filename' } })
+    expect(native.openPath).not.toHaveBeenCalled()
+  })
+
+  it('opens repaired references when they resolve to one concrete external file', async () => {
+    const { root, service, native, registry } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-preview-colon-outside-'))
+    directories.push(outside)
+    const path = join(outside, 'notes.txt')
+    await writeFile(path, 'outside')
+    await symlink(path, join(root, 'link.txt'))
+    for (const rawReference of [`${path}:`, './link.txt:']) {
+      const opened = await service.open(1, request(rawReference))
+      expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+        displayPath: await realpath(path), pathPresentation: 'external', fileName: 'notes.txt'
+      } } })
+      if (!opened.ok || opened.value.kind !== 'file_preview') continue
+      expect(await service.readText(1, {
+        handleId: opened.value.file.handleId,
+        expectedGeneration: opened.value.file.contentGeneration
+      })).toMatchObject({ ok: true, value: { text: 'outside' } })
+    }
+    expect(service.handleCount).toBe(2)
+    expect(registry.rootCount).toBe(1)
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    expect(native.openPath).not.toHaveBeenCalled()
+    expect(native.revealPath).not.toHaveBeenCalled()
+  })
+
+  it('reveals explicit outside directories without granting read access or launching app bundles', async () => {
+    const { service, authority, registry, native } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-preview-directory-home-'))
+    directories.push(outside)
+    const downloads = join(outside, 'Downloads')
+    const bundle = join(outside, 'Untrusted.app')
+    await mkdir(downloads)
+    await mkdir(bundle)
+    await writeFile(join(downloads, 'private.txt'), 'not authorized by a directory reveal')
+    vi.mocked(homedir).mockReturnValueOnce(outside)
+    const resolveSource = vi.spyOn(authority, 'resolve')
+    for (const rawReference of ['~/Downloads/', downloads, pathToFileURL(downloads).href, bundle]) {
+      const input: OpenFilePreviewRequest = {
+        kind: 'message_reference', threadId: 'camp-1', messageId: 'message-1', rawReference
+      }
+      expect(await service.open(1, input)).toMatchObject({ ok: true, value: { kind: 'opened_in_system' } })
+      expect(resolveSource).toHaveBeenLastCalledWith(input)
+    }
+    expect(native.revealPath).toHaveBeenCalledTimes(4)
+    expect(native.revealPath).toHaveBeenCalledWith(await realpath(downloads))
+    expect(native.openPath).not.toHaveBeenCalled()
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    expect(service.handleCount).toBe(0)
+    expect(registry.rootCount).toBe(0)
+    expect(await service.open(1, request(join(downloads, 'private.txt'))))
+      .toMatchObject({ ok: true, value: { kind: 'file_preview', file: { fileName: 'private.txt' } } })
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    resolveSource.mockResolvedValueOnce(null)
+    expect(await service.open(1, request(downloads))).toMatchObject({ ok: false, error: { code: 'source_not_authorized' } })
+    expect(native.revealPath).toHaveBeenCalledTimes(4)
+  })
+
+  it('shows authorized directories in the file manager without a tab, watcher, or app launch', async () => {
+    const { root, service, registry, native, openPath } = await fixture()
+    await mkdir(join(root, 'reports'))
+    await mkdir(join(root, 'Untrusted.app'))
+    for (const path of [root, 'reports', 'Untrusted.app']) {
+      expect(await service.open(1, request(path))).toMatchObject({ ok: true, value: { kind: 'opened_in_system' } })
+    }
+    expect(native.revealPath).toHaveBeenCalledTimes(3)
+    expect(openPath).not.toHaveBeenCalled()
+    expect(service.handleCount).toBe(0)
+    expect(registry.rootCount).toBe(0)
+    await service.closeAll()
+  })
+
+  it('does not reveal missing, escaped, or inactive-Thread directories', async () => {
+    const { root, service, native } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-preview-directory-outside-'))
+    directories.push(outside)
+    await symlink(outside, join(root, 'outside'))
+    expect(await service.open(1, request('missing'))).toMatchObject({ ok: false, error: { code: 'file_not_found' } })
+    for (const path of ['outside', join(root, 'outside'), join(await realpath(root), 'outside')]) {
+      expect(await service.open(1, request(path))).toMatchObject({ ok: false, error: { code: 'authorization_required' } })
+    }
+    await service.bindThread(1, 'camp-2')
+    expect(await service.open(1, request(root))).toMatchObject({ ok: false })
+    expect(native.revealPath).not.toHaveBeenCalled()
+    await service.closeAll()
+  })
+
+  it.each(['attachment', 'run_evidence', 'run_activity_file'] as const)('does not reveal a directory from %s', async (kind) => {
+    const { root, service, authority, native } = await fixture()
+    vi.spyOn(authority, 'resolve').mockResolvedValue({
+      kind: 'file_target', threadId: 'camp-1', sourceKind: kind, sourceIdentity: 'source-1',
+      rootPath: root, basePath: root, allowChildren: kind !== 'attachment',
+      ...(kind === 'attachment' ? { candidatePath: root } : { rawReference: root })
+    })
+    const input: OpenFilePreviewRequest = kind === 'attachment'
+      ? { kind, threadId: 'camp-1', locator: { owner: 'message', threadId: 'camp-1', messageId: 'message-1', attachmentRefId: 'attachment-1' } }
+      : kind === 'run_evidence'
+        ? { kind, threadId: 'camp-1', agentRunId: 'run-1', executionEpoch: 1, evidenceFileId: 'file-1', action: 'open_current' }
+        : { kind, threadId: 'camp-1', agentRunId: 'run-1', executionEpoch: 1, evidenceId: 'evidence-1', rawReference: root }
+    expect(await service.open(1, input)).toMatchObject({ ok: false, error: { code: 'not_regular_file' } })
+    expect(native.revealPath).not.toHaveBeenCalled()
+  })
+
+  it('keeps noninteractive preview children from opening a directory in the file manager', async () => {
+    const { root, service, native } = await fixture()
+    await writeFile(join(root, 'README.md'), '# Guide')
+    await mkdir(join(root, 'reports'))
+    const opened = await service.open(1, request('README.md'))
+    expect(opened.ok).toBe(true)
+    if (!opened.ok || opened.value.kind !== 'file_preview') return
+    expect(await service.open(1, {
+      kind: 'child_of_handle', parentHandleId: opened.value.file.handleId,
+      rawReference: './reports', allowSystemOpen: false
+    })).toMatchObject({ ok: false, error: { code: 'reference_not_clickable' } })
+    expect(native.revealPath).not.toHaveBeenCalled()
+    await service.closeAll()
+  })
+
+  it('opens and reads supported files through an opaque handle', async () => {
+    const { root, service, native, registry } = await fixture()
+    await writeFile(join(root, 'README.md'), '# Hello')
+    const opened = await service.open(1, request('README.md'))
+    expect(opened.ok).toBe(true)
+    if (!opened.ok || opened.value.kind !== 'file_preview') return
+    expect(opened.value.file).toMatchObject({
+      displayPath: 'README.md',
+      pathPresentation: 'project_relative',
+      fileName: 'README.md',
+      kind: 'markdown'
+    })
+    expect(opened.value.file).not.toHaveProperty('canonicalPath')
+    expect(registry.rootCount).toBe(1)
+    const content = await service.readText(1, {
+      handleId: opened.value.file.handleId,
+      expectedGeneration: opened.value.file.contentGeneration
+    })
+    expect(content).toMatchObject({ ok: true, value: { text: '# Hello' } })
+    expect(await service.copyPath(1, {
+      handleId: opened.value.file.handleId,
+      format: 'absolute'
+    })).toEqual({ ok: true, value: { copied: true } })
+    expect(native.copyText).toHaveBeenCalledWith(await realpath(join(root, 'README.md')))
+    await service.release(1, { handleId: opened.value.file.handleId })
+    expect(registry.rootCount).toBe(0)
+  })
+
+  it('deduplicates the verified file across messages and locations without reusing source authority', async () => {
+    const { root, service, authority, registry } = await fixture()
+    await mkdir(join(root, 'src'))
+    await writeFile(join(root, 'src', 'app.ts'), 'const value = 1')
+    const resolveSource = vi.spyOn(authority, 'resolve')
+    const firstRequest: OpenFilePreviewRequest = {
+      kind: 'message_reference', threadId: 'camp-1', messageId: 'message-1', rawReference: 'src/app.ts:1'
+    }
+    const secondRequest: OpenFilePreviewRequest = {
+      kind: 'message_reference', threadId: 'camp-1', messageId: 'message-2', rawReference: './src/app.ts:20'
+    }
+    try {
+      const first = await service.open(1, firstRequest)
+      const second = await service.open(1, secondRequest)
+      expect(first).toMatchObject({ ok: true, value: { kind: 'file_preview' } })
+      expect(second).toMatchObject({ ok: true, value: { kind: 'file_preview' } })
+      if (!first.ok || first.value.kind !== 'file_preview' || !second.ok || second.value.kind !== 'file_preview') return
+      const firstFile = first.value.file
+      const secondFile = second.value.file
+      expect(firstFile).toMatchObject({ displayPath: 'src/app.ts', pathPresentation: 'project_relative' })
+      expect(secondFile.previewKey).toBe(firstFile.previewKey)
+      expect(secondFile.handleId).not.toBe(firstFile.handleId)
+      expect(secondFile.reopenToken).not.toBe(firstFile.reopenToken)
+      expect(secondFile.target).toMatchObject({ line: 20 })
+      expect(resolveSource).toHaveBeenNthCalledWith(1, firstRequest)
+      expect(resolveSource).toHaveBeenNthCalledWith(2, secondRequest)
+      await service.release(1, { handleId: secondFile.handleId })
+      expect(service.handleCount).toBe(1)
+      expect(registry.rootCount).toBe(1)
+      expect(await service.readText(1, { handleId: firstFile.handleId, expectedGeneration: firstFile.contentGeneration }))
+        .toMatchObject({ ok: true, value: { text: 'const value = 1' } })
+      resolveSource.mockResolvedValueOnce(null)
+      expect((await service.open(1, secondRequest)).ok).toBe(false)
+      expect(resolveSource).toHaveBeenCalledTimes(3)
+      expect(service.handleCount).toBe(1)
+    } finally {
+      await service.closeAll()
+    }
+  })
+
+  it('keeps different files, windows and Threads distinct while preserving identity after a disk update', async () => {
+    const { root, service } = await fixture()
+    await mkdir(join(root, 'first'))
+    await mkdir(join(root, 'second'))
+    await writeFile(join(root, 'first', 'app.ts'), 'first')
+    await writeFile(join(root, 'second', 'app.ts'), 'second')
+    const openKey = async (windowId: number, threadId: string, rawReference: string): Promise<string> => {
+      const opened = await service.open(windowId, { kind: 'camp_workspace', threadId, rawReference })
+      if (!opened.ok || opened.value.kind !== 'file_preview') throw new Error('Expected a preview')
+      return opened.value.file.previewKey
+    }
+    try {
+      const original = await openKey(1, 'camp-1', 'first/app.ts')
+      expect(await openKey(1, 'camp-1', 'second/app.ts')).not.toBe(original)
+      await writeFile(join(root, 'first', 'app.ts'), 'updated first file')
+      expect(await openKey(1, 'camp-1', './first/app.ts:20')).toBe(original)
+      await service.bindThread(2, 'camp-1')
+      expect(await openKey(2, 'camp-1', 'first/app.ts')).not.toBe(original)
+      await service.bindThread(1, 'camp-2')
+      expect(await openKey(1, 'camp-2', 'first/app.ts')).not.toBe(original)
+    } finally {
+      await service.closeAll()
+    }
+  })
+
+  it('silently reopens an expired file descriptor while keeping the tab watcher alive', async () => {
+    vi.useFakeTimers()
+    try {
+      const { root, service, registry } = await fixture()
+      await writeFile(join(root, 'README.md'), '# Hello')
+      const opened = await service.open(1, request('README.md'))
+      expect(opened.ok).toBe(true)
+      if (!opened.ok || opened.value.kind !== 'file_preview') return
+
+      vi.setSystemTime(Date.now() + 31 * 60 * 1_000)
+      const content = await service.readText(1, {
+        handleId: opened.value.file.handleId,
+        expectedGeneration: opened.value.file.contentGeneration
+      })
+
+      expect(content).toMatchObject({ ok: true, value: { text: '# Hello' } })
+      expect(registry.rootCount).toBe(1)
+      expect(service.handleCount).toBe(1)
+      await service.closeAll()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not read a newer file version while recovering an expired descriptor', async () => {
+    vi.useFakeTimers()
+    try {
+      const { root, service } = await fixture()
+      const file = join(root, 'notes.txt')
+      await writeFile(file, 'old')
+      const opened = await service.open(1, request('notes.txt'))
+      expect(opened.ok).toBe(true)
+      if (!opened.ok || opened.value.kind !== 'file_preview') return
+
+      await writeFile(file, 'new version')
+      vi.setSystemTime(Date.now() + 31 * 60 * 1_000)
+      const staleRead = await service.readText(1, {
+        handleId: opened.value.file.handleId,
+        expectedGeneration: opened.value.file.contentGeneration
+      })
+      expect(staleRead).toMatchObject({
+        ok: false,
+        error: { code: 'read_failed', message: '文件已有更新，请重新加载。' }
+      })
+
+      const reloaded = await service.reload(1, {
+        handleId: opened.value.file.handleId,
+        reopenToken: opened.value.file.reopenToken,
+        expectedGeneration: opened.value.file.contentGeneration
+      })
+      expect(reloaded.ok).toBe(true)
+      if (!reloaded.ok) return
+      const current = await service.readText(1, {
+        handleId: reloaded.value.handleId,
+        expectedGeneration: reloaded.value.contentGeneration
+      })
+      expect(current).toMatchObject({ ok: true, value: { text: 'new version' } })
+      await service.closeAll()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('routes an unsupported external file to the system without creating a preview handle or root grant', async () => {
+    const { service, native, openPath, registry } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-file-preview-system-'))
+    directories.push(outside)
+    const report = join(outside, 'report.pdf')
+    await writeFile(report, '%PDF-1.7')
+    const opened = await service.open(1, request(report))
+    expect(opened).toEqual({
+      ok: true,
+      value: { kind: 'opened_in_system', fileName: 'report.pdf' }
+    })
+    expect(basename(openPath.mock.calls[0]?.[0] as string)).toBe('report.pdf')
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    expect(service.handleCount).toBe(0)
+    expect(registry.rootCount).toBe(0)
+  })
+
+  it('restores only previewable files without native actions or authorization prompts', async () => {
+    const { root, service, native, openPath } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-file-preview-restore-outside-'))
+    directories.push(outside)
+    await writeFile(join(root, 'README.md'), '# Restored')
+    await writeFile(join(root, 'installer.exe'), new Uint8Array([0, 1, 2]))
+    await mkdir(join(root, 'reports'))
+    await symlink(outside, join(root, 'external-directory'))
+
+    expect(await service.restore(1, request('README.md'))).toMatchObject({
+      ok: true,
+      value: { kind: 'file_preview', file: { fileName: 'README.md' } }
+    })
+    expect(await service.restore(1, request('installer.exe'))).toMatchObject({
+      ok: false,
+      error: { code: 'reference_not_clickable' }
+    })
+    expect(await service.restore(1, request('reports'))).toMatchObject({
+      ok: false,
+      error: { code: 'reference_not_clickable' }
+    })
+    const outsideResult = await service.restore(1, request('external-directory'))
+    expect(outsideResult).toMatchObject({
+      ok: false,
+      error: { code: 'outside_authorized_root' }
+    })
+    if (!outsideResult.ok) expect(outsideResult.error.authorizationChallenge).toBeUndefined()
+
+    expect(native.confirmOpen).not.toHaveBeenCalled()
+    expect(native.revealPath).not.toHaveBeenCalled()
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    expect(openPath).not.toHaveBeenCalled()
+    expect(service.handleCount).toBe(1)
+  })
+
+  it('retains an in-flight file open across Thread switches', async () => {
+    const { root, service, authority, native } = await fixture()
+    await writeFile(join(root, 'notes.txt'), 'notes')
+    type AuthorityResult = Awaited<ReturnType<FilePreviewSourceAuthority['resolve']>>
+    let completeAuthority!: (result: AuthorityResult) => void
+    const delayedAuthority = new Promise<AuthorityResult>((resolveResult) => {
+      completeAuthority = resolveResult
+    })
+    const resolveSource = vi.spyOn(authority, 'resolve').mockReturnValueOnce(delayedAuthority)
+
+    const opening = service.open(1, request('notes.txt'))
+    await vi.waitFor(() => expect(resolveSource).toHaveBeenCalledOnce())
+    await service.bindThread(1, 'camp-2')
+    await service.bindThread(1, 'camp-1')
+    completeAuthority({
+      kind: 'file_target',
+      threadId: 'camp-1',
+      sourceKind: 'camp_workspace',
+      sourceIdentity: 'camp-1:notes.txt',
+      rootPath: root,
+      basePath: root,
+      rawReference: 'notes.txt',
+      allowChildren: true
+    })
+
+    expect(await opening).toMatchObject({ ok: true, value: { kind: 'file_preview' } })
+    expect(service.handleCount).toBe(1)
+    expect(native.revealPath).not.toHaveBeenCalled()
+    expect(native.openPath).not.toHaveBeenCalled()
+  })
+
+  it('rechecks the Thread generation after native confirmation before opening', async () => {
+    const { root, service, native, openPath } = await fixture()
+    await writeFile(join(root, 'installer.exe'), new Uint8Array([0, 1, 2]))
+    let completeConfirmation!: (confirmed: boolean) => void
+    vi.mocked(native.confirmOpen).mockReturnValueOnce(new Promise<boolean>((resolveConfirmation) => {
+      completeConfirmation = resolveConfirmation
+    }))
+
+    const opening = service.open(1, request('installer.exe'))
+    await vi.waitFor(() => expect(native.confirmOpen).toHaveBeenCalledOnce())
+    await service.bindThread(1, 'camp-2')
+    await service.bindThread(1, 'camp-1')
+    completeConfirmation(true)
+
+    expect(await opening).toMatchObject({ ok: false, error: { code: 'open_failed' } })
+    expect(openPath).not.toHaveBeenCalled()
+    expect(service.handleCount).toBe(0)
+  })
+
+  it('opens absolute, Home-relative, and file-URI references to one external file without choosing a root', async () => {
+    const { service, native, registry } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-file-preview-outside-'))
+    directories.push(outside)
+    const outsideFile = join(outside, 'notes.txt')
+    await writeFile(outsideFile, 'notes')
+    vi.mocked(homedir).mockReturnValue(outside)
+    const requests: OpenFilePreviewRequest[] = [
+      request(outsideFile),
+      { kind: 'message_reference', threadId: 'camp-1', messageId: 'message-file-uri', rawReference: pathToFileURL(outsideFile).href },
+      { kind: 'message_reference', threadId: 'camp-1', messageId: 'message-home', rawReference: '~/notes.txt' }
+    ]
+
+    for (const input of requests) {
+      const opened = await service.open(1, input)
+      expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+        displayPath: '~/notes.txt', pathPresentation: 'external', fileName: 'notes.txt', kind: 'text'
+      } } })
+      if (!opened.ok || opened.value.kind !== 'file_preview') continue
+      expect(await service.readText(1, {
+        handleId: opened.value.file.handleId,
+        expectedGeneration: opened.value.file.contentGeneration
+      })).toMatchObject({ ok: true, value: { text: 'notes' } })
+      expect(await service.copyPath(1, {
+        handleId: opened.value.file.handleId,
+        format: 'absolute'
+      })).toEqual({ ok: true, value: { copied: true } })
+      expect(native.copyText).toHaveBeenLastCalledWith(await realpath(outsideFile))
+    }
+
+    expect(service.handleCount).toBe(3)
+    expect(registry.rootCount).toBe(1)
+    expect(native.selectRoot).not.toHaveBeenCalled()
+  })
+
+  it.each(['attachment', 'run_evidence', 'run_activity_file'] as const)('opens an exact external file resolved by %s authority', async (kind) => {
+    const { root, service, authority, native } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), `rovai-file-preview-${kind}-`))
+    directories.push(outside)
+    const outsideFile = join(outside, 'notes.txt')
+    await writeFile(join(root, 'notes.txt'), 'wrong root')
+    await writeFile(outsideFile, kind)
+    vi.spyOn(authority, 'resolve').mockResolvedValue({
+      kind: 'file_target', threadId: 'camp-1', sourceKind: kind, sourceIdentity: `${kind}-source`,
+      rootPath: root, basePath: root, allowChildren: kind !== 'attachment',
+      ...(kind === 'attachment' ? { candidatePath: outsideFile } : { rawReference: outsideFile })
+    })
+    const input: OpenFilePreviewRequest = kind === 'attachment'
+      ? { kind, threadId: 'camp-1', locator: { owner: 'message', threadId: 'camp-1', messageId: 'message-1', attachmentRefId: 'attachment-1' } }
+      : kind === 'run_evidence'
+        ? { kind, threadId: 'camp-1', agentRunId: 'run-1', executionEpoch: 1, evidenceFileId: 'file-1', action: 'open_current' }
+        : { kind, threadId: 'camp-1', agentRunId: 'run-1', executionEpoch: 1, evidenceId: 'evidence-1', rawReference: outsideFile }
+
+    const opened = await service.open(1, input)
+    const expectedDisplayPath = kind === 'attachment' ? 'notes.txt' : await realpath(outsideFile)
+    const expectedPresentation = kind === 'attachment' ? 'file_name_only' : 'external'
+    expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+      displayPath: expectedDisplayPath, pathPresentation: expectedPresentation, fileName: 'notes.txt'
+    } } })
+    if (!opened.ok || opened.value.kind !== 'file_preview') return
+    expect(await service.readText(1, {
+      handleId: opened.value.file.handleId,
+      expectedGeneration: opened.value.file.contentGeneration
+    })).toMatchObject({ ok: true, value: { text: kind } })
+    if (kind === 'attachment') {
+      expect(await service.copyPath(1, {
+        handleId: opened.value.file.handleId,
+        format: 'absolute'
+      })).toMatchObject({ ok: false, error: { code: 'source_not_authorized' } })
+      expect(await service.copyPath(1, {
+        handleId: opened.value.file.handleId,
+        format: 'display'
+      })).toEqual({ ok: true, value: { copied: true } })
+      expect(native.copyText).toHaveBeenLastCalledWith('notes.txt')
+    }
+    expect(native.selectRoot).not.toHaveBeenCalled()
+  })
+
+  it('opens new and same-named Mission files from the Run execution root', async () => {
+    const { root: projectRoot, service, authority, native } = await fixture()
+    const executionRoot = await mkdtemp(join(tmpdir(), 'rovai-mission-worktree-preview-'))
+    directories.push(executionRoot)
+    await mkdir(join(projectRoot, 'src'), { recursive: true })
+    await mkdir(join(executionRoot, 'src'), { recursive: true })
+    await writeFile(join(projectRoot, 'src', 'same.txt'), 'original project')
+    await writeFile(join(executionRoot, 'src', 'same.txt'), 'mission worktree')
+    await writeFile(join(executionRoot, 'src', 'added.txt'), 'new in mission')
+    vi.spyOn(authority, 'resolve').mockImplementation(async (input) => {
+      if (input.kind !== 'run_evidence') return null
+      const rawReference = input.evidenceFileId === 'added' ? 'src/added.txt' : 'src/same.txt'
+      return {
+        kind: 'file_target', threadId: 'camp-1', sourceKind: 'run_evidence',
+        sourceIdentity: `run-evidence:run-1:1:${input.evidenceFileId}`,
+        rootPath: executionRoot, basePath: executionRoot, rawReference, allowChildren: true
+      }
+    })
+
+    for (const [evidenceFileId, expected] of [['added', 'new in mission'], ['same', 'mission worktree']] as const) {
+      const opened = await service.open(1, {
+        kind: 'run_evidence', threadId: 'camp-1', agentRunId: 'run-1', executionEpoch: 1,
+        evidenceFileId, action: 'open_current'
+      })
+      expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+        displayPath: `src/${evidenceFileId}.txt`, pathPresentation: 'project_relative'
+      } } })
+      if (!opened.ok || opened.value.kind !== 'file_preview') continue
+      expect(await service.readText(1, {
+        handleId: opened.value.file.handleId,
+        expectedGeneration: opened.value.file.contentGeneration
+      })).toMatchObject({ ok: true, value: { text: expected } })
+    }
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    expect(native.openPath).not.toHaveBeenCalled()
+  })
+
+  it('opens and restores an exact Run activity file from its execution root', async () => {
+    const { root: projectRoot, service, authority, native } = await fixture()
+    const executionRoot = await mkdtemp(join(tmpdir(), 'rovai-run-activity-preview-'))
+    directories.push(executionRoot)
+    await mkdir(join(projectRoot, 'src'), { recursive: true })
+    await mkdir(join(executionRoot, 'src'), { recursive: true })
+    await writeFile(join(projectRoot, 'src', 'generated.txt'), 'original project')
+    await writeFile(join(executionRoot, 'src', 'generated.txt'), 'mission worktree')
+    vi.spyOn(authority, 'resolve').mockImplementation(async (input) => input.kind === 'run_activity_file'
+      ? {
+          kind: 'file_target', threadId: input.threadId, sourceKind: input.kind,
+          sourceIdentity: `run-activity-file:${input.agentRunId}:${input.executionEpoch}:${input.evidenceId}`,
+          rootPath: executionRoot, basePath: executionRoot, rawReference: input.rawReference, allowChildren: true
+        }
+      : null)
+    const input = {
+      kind: 'run_activity_file' as const,
+      threadId: 'camp-1',
+      agentRunId: 'run-1',
+      executionEpoch: 1,
+      evidenceId: 'evidence-1',
+      rawReference: 'src/generated.txt'
+    }
+
+    for (const opened of [await service.open(1, input), await service.restore(1, input)]) {
+      expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+        displayPath: 'src/generated.txt', pathPresentation: 'project_relative'
+      } } })
+      if (!opened.ok || opened.value.kind !== 'file_preview') continue
+      expect(await service.readText(1, {
+        handleId: opened.value.file.handleId,
+        expectedGeneration: opened.value.file.contentGeneration
+      })).toMatchObject({ ok: true, value: { text: 'mission worktree' } })
+    }
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    expect(native.openPath).not.toHaveBeenCalled()
+  })
+
+  it('keeps root grants for an explicit external directory operation', async () => {
+    const { root, service, native } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-file-preview-grant-'))
+    directories.push(outside)
+    await symlink(outside, join(root, 'external-directory'))
+    vi.mocked(native.selectRoot).mockResolvedValue(outside)
+    const opened = await service.open(1, request('external-directory'))
+    expect(opened.ok).toBe(false)
+    if (opened.ok || !opened.error.authorizationChallenge) return
+
+    const granted = await service.chooseAuthorizedRoot(1, {
+      threadId: 'camp-1',
+      pendingOpenId: opened.error.authorizationChallenge.pendingOpenId
+    })
+    expect(granted.ok).toBe(true)
+    if (!granted.ok || !granted.value) return
+    expect(granted.value.displayName).toBe(basename(outside))
+    expect(granted.value.displayName).not.toContain(outside)
+    expect(granted.value.result.kind).toBe('opened_in_system')
+    expect(native.revealPath).toHaveBeenCalledWith(await realpath(outside))
+    await service.closeAll()
+  })
+
+  it('revalidates the file before a system action', async () => {
+    const { root, service, openPath } = await fixture()
+    const file = join(root, 'notes.txt')
+    await writeFile(file, 'notes')
+    const opened = await service.open(1, request('notes.txt'))
+    expect(opened.ok).toBe(true)
+    if (!opened.ok || opened.value.kind !== 'file_preview') return
+    await rm(file)
+
+    const system = await service.openInSystem(1, { handleId: opened.value.file.handleId })
+    expect(system.ok).toBe(false)
+    expect(openPath).not.toHaveBeenCalled()
+    await service.closeAll()
+  })
+
+  it('preserves an exact external-file capability across descriptor recovery, reload, and system actions', async () => {
+    vi.useFakeTimers()
+    try {
+      const { service, native, openPath } = await fixture()
+      const outside = await mkdtemp(join(tmpdir(), 'rovai-file-preview-reopen-outside-'))
+      directories.push(outside)
+      const path = join(outside, 'notes.txt')
+      await writeFile(path, 'first')
+      const opened = await service.open(1, request(path))
+      expect(opened).toMatchObject({ ok: true, value: { kind: 'file_preview' } })
+      if (!opened.ok || opened.value.kind !== 'file_preview') return
+
+      vi.setSystemTime(Date.now() + 31 * 60 * 1_000)
+      expect(await service.readText(1, {
+        handleId: opened.value.file.handleId,
+        expectedGeneration: opened.value.file.contentGeneration
+      })).toMatchObject({ ok: true, value: { text: 'first' } })
+      expect(await service.openInSystem(1, { handleId: opened.value.file.handleId }))
+        .toEqual({ ok: true, value: { opened: true } })
+      expect(openPath).toHaveBeenCalledWith(await realpath(path))
+
+      await writeFile(path, 'second version')
+      const reloaded = await service.reload(1, {
+        handleId: opened.value.file.handleId,
+        reopenToken: opened.value.file.reopenToken,
+        expectedGeneration: opened.value.file.contentGeneration
+      })
+      expect(reloaded).toMatchObject({ ok: true, value: {
+        displayPath: await realpath(path), pathPresentation: 'external'
+      } })
+      if (!reloaded.ok) return
+      expect(await service.readText(1, {
+        handleId: reloaded.value.handleId,
+        expectedGeneration: reloaded.value.contentGeneration
+      })).toMatchObject({ ok: true, value: { text: 'second version' } })
+      expect(await service.revealInFolder(1, { handleId: reloaded.value.handleId }))
+        .toEqual({ ok: true, value: { revealed: true } })
+      expect(native.revealPath).toHaveBeenCalledWith(await realpath(path))
+      expect(native.selectRoot).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retains handles and watchers across navigation and releases them with the preview session', async () => {
+    const { root, service, registry } = await fixture()
+    await writeFile(join(root, 'one.txt'), 'one')
+    await writeFile(join(root, 'two.txt'), 'two')
+    await service.open(1, request('one.txt'))
+    await service.open(1, request('two.txt'))
+    expect(service.handleCount).toBe(2)
+    expect(registry.rootCount).toBe(1)
+    await service.bindThread(1, 'camp-2')
+    expect(service.handleCount).toBe(2)
+    expect(registry.rootCount).toBe(1)
+    await service.updateRetention(1, { sessions: [], handles: [] })
+    expect(service.handleCount).toBe(0)
+    expect(registry.rootCount).toBe(0)
+  })
+
+  it('shows the actual managed attachment path and releases it before Thread deletion', async () => {
+    const { root, native, registry } = await fixture()
+    const file = join(root, 'payload.md')
+    await writeFile(file, 'attachment')
+    const authority = new CoreFilePreviewSourceAuthority({
+      async request<T>(): Promise<T> {
+        return {
+          attachmentId: 'attachment-1',
+          path: file,
+          displayName: 'Design Notes.md',
+          kind: 'file', mediaType: 'text/markdown', openRisk: 'normal', canShowPath: true
+        } as T
+      }
+    })
+    const service = new FilePreviewService(authority, native, registry)
+    await service.bindThread(1, 'camp-1')
+    const opened = await service.open(1, {
+      kind: 'attachment', threadId: 'camp-1',
+      locator: { owner: 'message', threadId: 'camp-1', messageId: 'message-1', attachmentRefId: 'attachment-1' }
+    })
+    expect(opened.ok && opened.value.kind === 'file_preview').toBe(true)
+    expect(opened.ok && opened.value.kind === 'file_preview'
+      ? opened.value.file
+      : { fileName: basename(file) }).toMatchObject({
+      displayPath: await realpath(file),
+      pathPresentation: 'external',
+      fileName: 'Design Notes.md'
+    })
+    if (opened.ok && opened.value.kind === 'file_preview') {
+      const file = opened.value.file
+      expect(previewPathIsVisible(file)).toBe(true)
+      expect(await service.copyPath(1, { handleId: file.handleId, format: 'absolute' })).toMatchObject({ ok: true })
+      expect(await service.copyPath(1, { handleId: file.handleId, format: 'display' })).toMatchObject({ ok: true })
+      expect(native.copyText).toHaveBeenCalledWith(await realpath(join(root, 'payload.md')))
+    }
+    await service.releaseThread('camp-1')
+    expect(service.handleCount).toBe(0)
+    expect(registry.rootCount).toBe(0)
+    await service.closeAll()
+  })
+
+  it('restores a project child independently after its parent is deleted and the Thread changes', async () => {
+    const { root, service, authority } = await fixture()
+    const docs = join(root, 'docs')
+    await mkdir(docs)
+    const parentPath = join(docs, 'README.md')
+    await writeFile(parentPath, '[设计说明](./design.md)')
+    await writeFile(join(docs, 'design.md'), '# Design')
+    const resolveSource = vi.spyOn(authority, 'resolve')
+    const parent = await service.open(1, request('docs/README.md'))
+    expect(parent).toMatchObject({ ok: true, value: { kind: 'file_preview' } })
+    if (!parent.ok || parent.value.kind !== 'file_preview') return
+
+    const child = await service.open(1, {
+      kind: 'child_of_handle',
+      parentHandleId: parent.value.file.handleId,
+      rawReference: './design.md',
+      allowSystemOpen: true
+    })
+    expect(child).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+      restoreRequest: { kind: 'camp_workspace', threadId: 'camp-1', rawReference: 'docs/design.md' }
+    } } })
+    if (!child.ok || child.value.kind !== 'file_preview' || !child.value.file.restoreRequest) {
+      throw new Error('Expected an independently restorable child')
+    }
+    expect(resolveSource).toHaveBeenCalledWith({
+      kind: 'camp_workspace', threadId: 'camp-1', rawReference: '.'
+    })
+
+    await service.release(1, { handleId: parent.value.file.handleId })
+    await rm(parentPath)
+    await service.bindThread(1, 'camp-2')
+    await service.bindThread(1, 'camp-1')
+    const restored = await service.restore(1, child.value.file.restoreRequest)
+    expect(restored).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+      displayPath: 'docs/design.md', pathPresentation: 'project_relative', fileName: 'design.md'
+    } } })
+    if (!restored.ok || restored.value.kind !== 'file_preview') return
+    expect(await service.readText(1, {
+      handleId: restored.value.file.handleId,
+      expectedGeneration: restored.value.file.contentGeneration
+    })).toMatchObject({ ok: true, value: { text: '# Design' } })
+
+    await rm(join(docs, 'design.md'))
+    await service.bindThread(1, 'camp-2')
+    await service.bindThread(1, 'camp-1')
+    expect(await service.restore(1, child.value.file.restoreRequest)).toMatchObject({
+      ok: false,
+      error: { code: 'file_not_found' }
+    })
+  })
+
+  it('gives each link in a project child chain its own workspace restore source', async () => {
+    const { root, service } = await fixture()
+    await mkdir(join(root, 'docs'))
+    await writeFile(join(root, 'A.md'), '[B](docs/B.md)')
+    await writeFile(join(root, 'docs', 'B.md'), '[C](C.md)')
+    await writeFile(join(root, 'docs', 'C.md'), '# C')
+    const parent = await service.open(1, request('A.md'))
+    if (!parent.ok || parent.value.kind !== 'file_preview') throw new Error('Expected A preview')
+    const child = await service.open(1, {
+      kind: 'child_of_handle', parentHandleId: parent.value.file.handleId,
+      rawReference: 'docs/B.md', allowSystemOpen: true
+    })
+    if (!child.ok || child.value.kind !== 'file_preview') throw new Error('Expected B preview')
+    const grandchild = await service.open(1, {
+      kind: 'child_of_handle', parentHandleId: child.value.file.handleId,
+      rawReference: 'C.md', allowSystemOpen: true
+    })
+    if (!grandchild.ok || grandchild.value.kind !== 'file_preview') throw new Error('Expected C preview')
+
+    expect(child.value.file.restoreRequest).toEqual({
+      kind: 'camp_workspace', threadId: 'camp-1', rawReference: 'docs/B.md'
+    })
+    expect(grandchild.value.file.restoreRequest).toEqual({
+      kind: 'camp_workspace', threadId: 'camp-1', rawReference: 'docs/C.md'
+    })
+  })
+
+  it('encodes a project child restore reference without changing its file identity', async () => {
+    const { root, service } = await fixture()
+    await mkdir(join(root, 'docs'))
+    await writeFile(join(root, 'docs', 'README.md'), '[Draft](./design%20%28draft%29%231.md)')
+    await writeFile(join(root, 'docs', 'design (draft)#1.md'), '# Draft')
+    const parent = await service.open(1, request('docs/README.md'))
+    if (!parent.ok || parent.value.kind !== 'file_preview') throw new Error('Expected parent preview')
+    const child = await service.open(1, {
+      kind: 'child_of_handle', parentHandleId: parent.value.file.handleId,
+      rawReference: './design%20%28draft%29%231.md', allowSystemOpen: true
+    })
+    if (!child.ok || child.value.kind !== 'file_preview' || !child.value.file.restoreRequest) {
+      throw new Error('Expected an independently restorable child')
+    }
+
+    expect(child.value.file.restoreRequest).toEqual({
+      kind: 'camp_workspace',
+      threadId: 'camp-1',
+      rawReference: 'docs/design%20%28draft%29%231.md'
+    })
+    await service.bindThread(1, 'camp-2')
+    await service.bindThread(1, 'camp-1')
+    expect(await service.restore(1, child.value.file.restoreRequest)).toMatchObject({
+      ok: true,
+      value: { kind: 'file_preview', file: { displayPath: 'docs/design (draft)#1.md' } }
+    })
+  })
+
+  it('rechecks the Thread generation after resolving a child workspace restore source', async () => {
+    const { root, service, authority } = await fixture()
+    await writeFile(join(root, 'README.md'), '[Notes](notes.md)')
+    await writeFile(join(root, 'notes.md'), 'notes')
+    const parent = await service.open(1, request('README.md'))
+    if (!parent.ok || parent.value.kind !== 'file_preview') throw new Error('Expected parent preview')
+    type AuthorityResult = Awaited<ReturnType<FilePreviewSourceAuthority['resolve']>>
+    let completeAuthority!: (result: AuthorityResult) => void
+    const delayedAuthority = new Promise<AuthorityResult>((resolveResult) => {
+      completeAuthority = resolveResult
+    })
+    const resolveSource = vi.spyOn(authority, 'resolve').mockReturnValueOnce(delayedAuthority)
+
+    const opening = service.open(1, {
+      kind: 'child_of_handle', parentHandleId: parent.value.file.handleId,
+      rawReference: 'notes.md', allowSystemOpen: true
+    })
+    await vi.waitFor(() => expect(resolveSource).toHaveBeenCalledWith({
+      kind: 'camp_workspace', threadId: 'camp-1', rawReference: '.'
+    }))
+    await service.updateRetention(1, { sessions: [], handles: [] })
+    await service.bindThread(1, 'camp-2')
+    await service.bindThread(1, 'camp-1')
+    completeAuthority({
+      kind: 'file_target', threadId: 'camp-1', sourceKind: 'camp_workspace',
+      sourceIdentity: 'thread:camp-1', rootPath: root, basePath: root,
+      rawReference: '.', allowChildren: true
+    })
+
+    expect(await opening).toMatchObject({ ok: false, error: { code: 'read_failed' } })
+    expect(service.handleCount).toBe(0)
+  })
+
+  it('opens a Markdown relative link next to an external parent without a root grant', async () => {
+    const { service, native } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-file-preview-markdown-outside-'))
+    directories.push(outside)
+    await mkdir(join(outside, 'guides'))
+    await writeFile(join(outside, 'README.md'), '[设计说明](guides/design.md)')
+    await writeFile(join(outside, 'guides', 'design.md'), '# Design')
+    const parent = await service.open(1, request(join(outside, 'README.md')))
+    expect(parent).toMatchObject({ ok: true, value: { kind: 'file_preview' } })
+    if (!parent.ok || parent.value.kind !== 'file_preview') return
+
+    const child = await service.open(1, {
+      kind: 'child_of_handle',
+      parentHandleId: parent.value.file.handleId,
+      rawReference: 'guides/design.md',
+      allowSystemOpen: true
+    })
+    expect(child).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+      displayPath: await realpath(join(outside, 'guides', 'design.md')),
+      pathPresentation: 'external', fileName: 'design.md'
+    } } })
+    if (!child.ok || child.value.kind !== 'file_preview') return
+    expect(child.value.file).not.toHaveProperty('restoreRequest')
+    expect(await service.readText(1, {
+      handleId: child.value.file.handleId,
+      expectedGeneration: child.value.file.contentGeneration
+    })).toMatchObject({ ok: true, value: { text: '# Design' } })
+    expect(native.selectRoot).not.toHaveBeenCalled()
+  })
+
+  it('derives an external Markdown tab resource scope from its own directory and releases it with the tab', async () => {
+    const { root, service, native } = await fixture()
+    const outside = await mkdtemp(join(tmpdir(), 'rovai-file-preview-html-outside-'))
+    directories.push(outside)
+    const pages = join(outside, 'pages')
+    await mkdir(join(pages, 'assets'), { recursive: true })
+    await mkdir(join(pages, 'images'), { recursive: true })
+    await writeFile(join(pages, 'index.md'), '<link rel="stylesheet" href="./assets/site.css"><a href="details.html">Details</a>')
+    await writeFile(join(pages, 'details.html'), '<h1>Details</h1>')
+    await writeFile(join(pages, 'assets', 'site.css'), 'body{background:url(../images/bg.png)}')
+    await writeFile(join(pages, 'images', 'bg.png'), new Uint8Array([0x89, 0x50, 0x4e, 0x47]))
+    await writeFile(join(root, 'not-in-html-scope.css'), 'body{color:red}')
+
+    const opened = await service.open(1, request(join(pages, 'index.md')))
+    expect(opened.ok).toBe(true)
+    if (!opened.ok || opened.value.kind !== 'file_preview') return
+    const prepared = await service.prepareHtml(1, {
+      handleId: opened.value.file.handleId,
+      expectedGeneration: opened.value.file.contentGeneration
+    })
+    expect(prepared.ok).toBe(true)
+    if (!prepared.ok) return
+    expect(prepared.value).toMatchObject({
+      html: '<link rel="stylesheet" href="./assets/site.css"><a href="details.html">Details</a>',
+      assetBasePath: ''
+    })
+    const assetUrl = `rovai-preview://asset/${prepared.value.tabToken}/assets/site.css`
+    expect(service.authorizeHtmlAsset(2, 'GET', assetUrl)).toBe(false)
+    expect(service.authorizeHtmlAsset(1, 'POST', assetUrl)).toBe(false)
+    expect(service.authorizeHtmlAsset(1, 'GET', assetUrl)).toBe(true)
+    const response = await service.serveHtmlAsset(new Request(assetUrl))
+    expect(response.status).toBe(200)
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    expect(await response.text()).toContain(
+      `rovai-preview://asset/${prepared.value.tabToken}/images/bg.png`
+    )
+    expect((await service.serveHtmlAsset(new Request(
+      `rovai-preview://asset/${prepared.value.tabToken}/not-in-html-scope.css`
+    ))).status).toBe(404)
+
+    const child = await service.open(1, {
+      kind: 'child_of_handle', parentHandleId: opened.value.file.handleId,
+      rawReference: 'details.html', allowSystemOpen: true
+    })
+    expect(child).toMatchObject({ ok: true, value: { kind: 'file_preview', file: {
+      displayPath: await realpath(join(pages, 'details.html')),
+      pathPresentation: 'external', fileName: 'details.html'
+    } } })
+    expect(native.selectRoot).not.toHaveBeenCalled()
+    await service.release(1, { handleId: opened.value.file.handleId })
+    expect(service.authorizeHtmlAsset(1, 'GET', assetUrl)).toBe(false)
+  })
+
+  it('does not let an untrusted HTML bridge open unsupported child files', async () => {
+    const { root, service, openPath } = await fixture()
+    await writeFile(join(root, 'index.html'), '<a href="report.pdf">report</a>')
+    await writeFile(join(root, 'report.pdf'), '%PDF-1.7')
+    const parent = await service.open(1, request('index.html'))
+    expect(parent.ok).toBe(true)
+    if (!parent.ok || parent.value.kind !== 'file_preview') return
+    const denied = await service.open(1, {
+      kind: 'child_of_handle',
+      parentHandleId: parent.value.file.handleId,
+      rawReference: 'report.pdf',
+      allowSystemOpen: false
+    })
+    expect(denied).toMatchObject({ ok: false, error: { code: 'reference_not_clickable' } })
+    expect(openPath).not.toHaveBeenCalled()
+  })
+
+})

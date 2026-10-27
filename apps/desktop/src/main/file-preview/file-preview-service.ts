@@ -1,0 +1,1626 @@
+import { filePreviewRetentionLimits } from '../../file-preview-retention'
+import { HtmlPreviewSite } from '../../../../../packages/html-preview/src/site'
+import { createPreviewFileSource } from '../../../../../packages/html-preview/src/file-source'
+import { createHash, randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path'
+import type { FileHandle } from 'node:fs/promises'
+import type {
+  FilePreviewRetentionState,
+  FileContentVersion,
+  FileLocationTarget,
+  FilePreviewApi,
+  FilePreviewAuthorizationChallenge,
+  FilePreviewCapability,
+  FilePreviewErrorCode,
+  FilePreviewHtmlDocument,
+  FilePreviewHtmlSite,
+  FilePreviewOperationResult,
+  FilePreviewPageContent,
+  FilePreviewPathPresentation,
+  FilePreviewRootGrantResult,
+  FilePreviewTextContent,
+  FilePreviewKind,
+  OpenFilePreviewRequest,
+  OpenFilePreviewResult,
+  ParsedFileReference,
+  RestoreFilePreviewRequest,
+  ResolvedFilePreview
+} from '@contracts'
+import { parseFileReference } from '../../file-preview-reference'
+import { filePreviewAssetUrl, parseFilePreviewAssetUrl } from '../../file-preview-asset-url'
+import {
+  canonicalizeExistingPath,
+  FilePreviewAccessError,
+  inspectPreviewPath,
+  openPreviewFile,
+  pathIsWithin,
+  referenceCandidatePath,
+  resolveFileReferencePath,
+  type OpenedPreviewFile
+} from './file-preview-access'
+import {
+  classifyFilePreview,
+  filePreviewLimits,
+  type FilePreviewClassification
+} from './file-preview-classifier'
+import {
+  RootWatchRegistry,
+  type RootWatchNotification
+} from './file-preview-watchers'
+
+const FILE_DESCRIPTOR_IDLE_MS = 30 * 60 * 1000
+const PENDING_OPEN_TTL_MS = 5 * 60 * 1000
+const MAX_HANDLES_PER_WINDOW = filePreviewRetentionLimits.handles
+const HTML_ASSET_BYTES = 8 * 1024 * 1024
+
+function canPresentProjectRelativePath(sourceKind: OpenFilePreviewRequest['kind']): boolean {
+  return sourceKind === 'message_reference'
+    || sourceKind === 'camp_workspace'
+    || sourceKind === 'run_evidence'
+    || sourceKind === 'run_activity_file'
+}
+
+export type FilePreviewAuthorityResult =
+  | {
+      kind: 'evidence_review'
+      threadId: string
+      agentRunId: string
+      executionEpoch: number
+      evidenceFileId: string
+    }
+  | {
+      kind: 'evidence_identity_unavailable'
+      threadId: string
+      agentRunId: string
+      executionEpoch: number
+      evidenceFileId: string
+    }
+  | {
+      kind: 'file_target'
+      threadId: string
+      sourceKind: 'skill_reference' | 'message_reference' | 'camp_workspace' | 'attachment' | 'run_evidence' | 'run_activity_file'
+      sourceIdentity: string
+      rootPath: string
+      basePath: string
+      rawReference?: string
+      candidatePath?: string
+      displayName?: string
+      openRisk?: 'normal' | 'confirm'
+      canShowPath?: boolean
+      allowChildren?: boolean
+    }
+
+export interface FilePreviewSourceAuthority {
+  resolve(request: Exclude<OpenFilePreviewRequest, { kind: 'child_of_handle' | 'authorized_root' }>): Promise<FilePreviewAuthorityResult | null>
+}
+
+export interface FilePreviewNativeActions {
+  previewHostOrigin?(webContentsId: number): string
+  previewProtectedRoots?(): readonly string[]
+  selectRoot(webContentsId: number): Promise<string | null>
+  confirmOpen(displayName: string): Promise<boolean>
+  openPath(path: string): Promise<string>
+  revealPath(path: string): void
+  copyText(text: string): void
+  publishExternalUpdate(notification: RootWatchNotification): void
+  publishResourcesReleased?(webContentsId: number, handleIds: string[]): void
+}
+
+interface ResolvedTarget {
+  kind: 'file_target'
+  threadId: string
+  sourceKind: OpenFilePreviewRequest['kind']
+  sourceIdentity: string
+  rootPath: string
+  basePath: string
+  rawReference?: string
+  candidatePath?: string
+  displayName?: string
+  target?: FileLocationTarget
+  openRisk: 'normal' | 'confirm'
+  canShowPath?: boolean
+  allowChildren: boolean
+  projectRoot?: string | null
+}
+
+type SupportedClassification = Omit<FilePreviewClassification, 'kind'> & { kind: FilePreviewKind }
+
+interface PreviewHandleRecord {
+  handleId: string
+  webContentsId: number
+  threadId: string
+  bindingGeneration: number
+  request: OpenFilePreviewRequest
+  sourceIdentity: string
+  file: FileHandle | null
+  reopening: Promise<FileHandle> | null
+  reopenTarget: ResolvedTarget
+  canonicalRoot: string
+  canonicalPath: string
+  projectRoot: string | null
+  displayPath: string
+  pathPresentation: FilePreviewPathPresentation
+  fileName: string
+  version: FileContentVersion
+  classification: SupportedClassification
+  previewKey: string
+  restoreRequest?: RestoreFilePreviewRequest
+  reopenToken: string
+  generation: string
+  target?: FileLocationTarget
+  capabilities: FilePreviewCapability[]
+  hasExternalUpdate: boolean
+  allowChildren: boolean
+  lastUsedAt: number
+  activeReads?: number
+  resolvedLine?: { offset: number; line: number }
+  retention?: FilePreviewRetentionState['handles'][number]
+}
+
+interface PendingOpen {
+  id: string
+  webContentsId: number
+  threadId: string
+  bindingGeneration: number
+  request: OpenFilePreviewRequest
+  target: ResolvedTarget
+  candidatePath: string
+  displayReference: string
+  expiresAt: number
+}
+
+interface RootGrant {
+  id: string
+  webContentsId: number
+  threadId: string
+  bindingGeneration: number
+  canonicalRoot: string
+  displayName: string
+}
+
+interface HtmlPreviewToken {
+  token: string
+  bridgeToken: string
+  handleId: string
+  webContentsId: number
+  threadId: string
+  generation: string
+  assetRoot: string
+  expiresAt: number
+}
+
+interface WindowThreadBinding {
+  previewSessionId?: string
+  threadId: string | null
+  generation: number
+}
+
+interface FilePreviewOpenPolicy {
+  nativeGuard?: () => void
+  nativeSideEffects: boolean
+  authorizationChallenge: boolean
+}
+
+const INTERACTIVE_OPEN_POLICY: FilePreviewOpenPolicy = {
+  nativeSideEffects: true,
+  authorizationChallenge: true
+}
+
+const RESTORE_OPEN_POLICY: FilePreviewOpenPolicy = {
+  nativeSideEffects: false,
+  authorizationChallenge: false
+}
+
+function ok<T>(value: T): FilePreviewOperationResult<T> {
+  return { ok: true, value }
+}
+
+function failed<T>(
+  code: FilePreviewErrorCode,
+  message: string,
+  retryable = false,
+  extra?: { displayReference?: string; authorizationChallenge?: FilePreviewAuthorizationChallenge }
+): FilePreviewOperationResult<T> {
+  return { ok: false, error: { code, message, retryable, ...extra } }
+}
+
+function generation(): string {
+  return randomUUID()
+}
+
+function contentVersionMatches(left: FileContentVersion, right: FileContentVersion): boolean {
+  if (left.fileId && right.fileId && left.fileId !== right.fileId) return false
+  return left.size === right.size && left.mtimeMs === right.mtimeMs
+}
+
+async function fileHandleVersion(file: FileHandle): Promise<FileContentVersion> {
+  const stat = await file.stat()
+  return {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    fileId: `${stat.dev}:${stat.ino}`
+  }
+}
+
+function safeDisplayReference(value: string): string {
+  const normalized = value.replace(/[\r\n\0]/gu, ' ').trim()
+  return Array.from(normalized).slice(0, 180).join('')
+}
+
+function workspaceRelativeReference(root: string, candidate: string): string | null {
+  if (!pathIsWithin(root, candidate)) return null
+  const path = relative(root, candidate)
+  if (!path || path.length > 4_096 || /[\0\r\n]/u.test(path)) return null
+  try {
+    const encoded = path
+      .split(sep)
+      .map((segment) => encodeURIComponent(segment).replace(/[!'()*]/gu, (character) =>
+        `%${character.charCodeAt(0).toString(16).toUpperCase()}`))
+      .join('/')
+    if (!encoded || encoded.length > 4_096) return null
+    const resolvesCandidate = (reference: string): boolean => {
+      const parsed = parseFileReference(reference)
+      return parsed?.pathKind === 'relative'
+        && parsed.query === undefined
+        && parsed.fragment === undefined
+        && parsed.target === undefined
+        && resolve(root, parsed.pathPart) === candidate
+    }
+    if (resolvesCandidate(encoded)) return encoded
+    const explicitlyRelative = `./${encoded}`
+    return explicitlyRelative.length <= 4_096
+      && resolvesCandidate(explicitlyRelative)
+      ? explicitlyRelative
+      : null
+  } catch {
+    return null
+  }
+}
+
+function strictDecode(bytes: Uint8Array): string {
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+}
+
+function htmlAssetMime(path: string): string | null {
+  const extension = extname(path).toLocaleLowerCase('en-US')
+  return new Map<string, string>([
+    ['.css', 'text/css; charset=utf-8'],
+    ['.js', 'text/javascript; charset=utf-8'],
+    ['.mjs', 'text/javascript; charset=utf-8'],
+    ['.json', 'application/json; charset=utf-8'],
+    ['.wasm', 'application/wasm'],
+    ['.png', 'image/png'],
+    ['.jpg', 'image/jpeg'],
+    ['.jpeg', 'image/jpeg'],
+    ['.gif', 'image/gif'],
+    ['.webp', 'image/webp'],
+    ['.avif', 'image/avif'],
+    ['.bmp', 'image/bmp'],
+    ['.ico', 'image/x-icon'],
+    ['.svg', 'image/svg+xml'],
+    ['.woff', 'font/woff'],
+    ['.woff2', 'font/woff2'],
+    ['.ttf', 'font/ttf'],
+    ['.otf', 'font/otf'],
+    ['.mp3', 'audio/mpeg'],
+    ['.wav', 'audio/wav'],
+    ['.ogg', 'audio/ogg'],
+    ['.mp4', 'video/mp4'],
+    ['.webm', 'video/webm']
+  ]).get(extension) ?? null
+}
+
+function rewriteAssetCss(css: string, token: string, basePath: string): string {
+  return css
+    .replace(/url\(\s*(['"]?)([^)'"\s][^)'"\n]*?)\1\s*\)/giu, (_match, quote: string, value: string) => {
+      const rewritten = filePreviewAssetUrl(value.trim(), token, basePath)
+      return `url(${quote}${rewritten ?? value.trim()}${quote})`
+    })
+    .replace(/(@import\s+)(['"])([^'"]+)\2/giu, (_match, prefix: string, quote: string, value: string) => {
+      const rewritten = filePreviewAssetUrl(value, token, basePath)
+      return `${prefix}${quote}${rewritten ?? value}${quote}`
+    })
+}
+
+export class FilePreviewService {
+  readonly #authority: FilePreviewSourceAuthority
+  readonly #native: FilePreviewNativeActions
+  readonly #handles = new Map<string, PreviewHandleRecord>()
+  readonly #windowThreads = new Map<number, WindowThreadBinding>()
+  readonly #sessionBindings = new Map<number, Map<string, WindowThreadBinding>>()
+  #nextBindingGeneration = 0
+  readonly #pending = new Map<string, PendingOpen>()
+  readonly #rootGrants = new Map<string, RootGrant>()
+  readonly #htmlSites = new Map<string, { handleId: string; webContentsId: number; site: HtmlPreviewSite }>()
+  readonly #htmlPreparations = new Map<string, symbol>()
+  readonly #htmlClosures = new Set<Promise<void>>()
+  readonly #htmlTokens = new Map<string, HtmlPreviewToken>()
+  readonly #watchers: RootWatchRegistry
+
+  constructor(
+    authority: FilePreviewSourceAuthority,
+    native: FilePreviewNativeActions,
+    watchers?: RootWatchRegistry
+  ) {
+    this.#authority = authority
+    this.#native = native
+    this.#watchers = watchers ?? new RootWatchRegistry({
+      notify: (notification) => this.#onExternalUpdate(notification)
+    })
+  }
+
+  async bindThread(webContentsId: number, threadId: string | null): Promise<void> {
+    // Navigation is presentation only. Retained sessions keep their own binding identity.
+    const sessions = this.#sessions(webContentsId)
+    if (threadId && !sessions.has(threadId)) sessions.set(threadId, { threadId, generation: ++this.#nextBindingGeneration })
+    this.#windowThreads.set(webContentsId, { threadId, generation: ++this.#nextBindingGeneration })
+  }
+
+  #sessions(webContentsId: number): Map<string, WindowThreadBinding> {
+    let sessions = this.#sessionBindings.get(webContentsId)
+    if (!sessions) { sessions = new Map(); this.#sessionBindings.set(webContentsId, sessions) }
+    return sessions
+  }
+
+  async updateRetention(webContentsId: number, state: FilePreviewRetentionState): Promise<void> {
+    const sessions = this.#sessions(webContentsId)
+    const incoming = new Map(state.sessions.map(value => [value.threadId, value]))
+    const closing: Promise<void>[] = []
+    for (const [threadId, binding] of sessions) {
+      const next = incoming.get(threadId)
+      if (!next || (binding.previewSessionId && next.previewSessionId !== binding.previewSessionId)) {
+        sessions.delete(threadId)
+        closing.push(this.#releaseThread(webContentsId, threadId, binding.generation))
+      }
+    }
+    for (const value of state.sessions) {
+      const existing = sessions.get(value.threadId)
+      if (existing) existing.previewSessionId = value.previewSessionId
+      else sessions.set(value.threadId, { ...value, generation: ++this.#nextBindingGeneration })
+    }
+    for (const hint of state.handles) {
+      const record = this.#handles.get(hint.handleId)
+      const binding = record && sessions.get(record.threadId)
+      if (record?.webContentsId === webContentsId && binding?.generation === record.bindingGeneration
+        && binding.previewSessionId === hint.previewSessionId) record.retention = { ...hint }
+    }
+    await Promise.all(closing)
+  }
+
+  async open(
+    webContentsId: number,
+    request: OpenFilePreviewRequest
+  ): Promise<FilePreviewOperationResult<OpenFilePreviewResult>> {
+    return this.#open(webContentsId, request, INTERACTIVE_OPEN_POLICY)
+  }
+
+  async restore(
+    webContentsId: number,
+    request: OpenFilePreviewRequest
+  ): Promise<FilePreviewOperationResult<OpenFilePreviewResult>> {
+    if (request.kind === 'child_of_handle' || request.kind === 'authorized_root') {
+      return failed('source_not_authorized', '这个文件访问已失效。')
+    }
+    return this.#open(webContentsId, request, RESTORE_OPEN_POLICY)
+  }
+
+  async #open(
+    webContentsId: number,
+    request: OpenFilePreviewRequest,
+    policy: FilePreviewOpenPolicy
+  ): Promise<FilePreviewOperationResult<OpenFilePreviewResult>> {
+    this.#prune()
+    const navigation = this.#windowThreads.get(webContentsId)
+    try {
+      const binding = this.#captureBinding(webContentsId, 'threadId' in request ? request.threadId : undefined)
+      const target = await this.#resolveTarget(webContentsId, request)
+      this.#requireBinding(webContentsId, binding, target && 'threadId' in target ? target.threadId : undefined)
+      if (!target) return failed('source_not_authorized', '无法确认这个文件来源。')
+      if (target.kind === 'evidence_review') return ok(target)
+      if (target.kind === 'evidence_identity_unavailable') {
+        return failed('evidence_identity_unavailable', '无法可靠定位这个历史记录对应的当前文件。')
+      }
+      return await this.#openResolved(webContentsId, request, target, binding, {
+        ...policy, nativeGuard: () => {
+          if (!navigation || navigation.threadId !== target.threadId || this.#windowThreads.get(webContentsId) !== navigation)
+            throw new FilePreviewAccessError('read_failed', '文件不属于当前显示的 Thread。')
+        }
+      })
+    } catch (error) {
+      return this.#errorResult(error)
+    }
+  }
+
+  async reopen(
+    webContentsId: number,
+    request: { threadId: string; reopenToken: string }
+  ): Promise<FilePreviewOperationResult<OpenFilePreviewResult>> {
+    this.#prune()
+    const record = [...this.#handles.values()].find((candidate) =>
+      candidate.webContentsId === webContentsId
+      && candidate.threadId === request.threadId
+      && candidate.reopenToken === request.reopenToken
+    )
+    if (!record) return failed('source_not_authorized', '这个文件访问已失效。', true)
+    try {
+      await this.#ensureFile(record)
+      return ok({ kind: 'file_preview', file: this.#publicFile(record) })
+    } catch (error) {
+      return this.#errorResult(error)
+    }
+  }
+
+  async readText(
+    webContentsId: number,
+    request: { handleId: string; expectedGeneration: string }
+  ): Promise<FilePreviewOperationResult<FilePreviewTextContent>> {
+    try {
+      const record = this.#record(webContentsId, request.handleId, request.expectedGeneration)
+      if (record.version.size > filePreviewLimits.wholeTextBytes) {
+        return failed('file_too_large', '文件较大，请使用分页阅读。')
+      }
+      const bytes = await this.#readAt(record, 0, record.version.size)
+      return ok({
+        text: strictDecode(bytes),
+        contentGeneration: record.generation,
+        contentVersion: record.version
+      })
+    } catch (error) {
+      return this.#errorResult(error, 'decode_failed')
+    }
+  }
+
+  async readPage(
+    webContentsId: number,
+    request: { handleId: string; expectedGeneration: string; offset: number; maxBytes?: number }
+  ): Promise<FilePreviewOperationResult<FilePreviewPageContent>> {
+    try {
+      const record = this.#record(webContentsId, request.handleId, request.expectedGeneration)
+      if (!Number.isSafeInteger(request.offset) || request.offset < 0 || request.offset > record.version.size) {
+        return failed('read_failed', '分页位置无效。')
+      }
+      const maximum = Math.min(
+        Math.max(1, request.maxBytes ?? filePreviewLimits.pageBytes),
+        filePreviewLimits.pageBytes
+      )
+      const bytes = await this.#readAt(record, request.offset, Math.min(maximum, record.version.size - request.offset))
+      let text: string | null = null
+      let decodedLength = bytes.byteLength
+      for (let trim = 0; trim <= Math.min(3, bytes.byteLength); trim += 1) {
+        try {
+          decodedLength = bytes.byteLength - trim
+          text = strictDecode(bytes.subarray(0, decodedLength))
+          break
+        } catch {
+          // A page may end halfway through a UTF-8 scalar; trim only that incomplete tail.
+        }
+      }
+      if (text === null) return failed('decode_failed', '这个文件不是有效的 UTF-8 文本。')
+      const startLine = record.resolvedLine?.offset === request.offset
+        ? record.resolvedLine.line : await this.#lineAtOffset(record, request.offset)
+      const endOffset = request.offset + decodedLength
+      return ok({
+        text,
+        startOffset: request.offset,
+        endOffset,
+        startLine,
+        hasPrevious: request.offset > 0,
+        hasNext: endOffset < record.version.size,
+        contentGeneration: record.generation,
+        contentVersion: record.version
+      })
+    } catch (error) {
+      return this.#errorResult(error)
+    }
+  }
+
+  async resolveLine(
+    webContentsId: number,
+    request: { handleId: string; expectedGeneration: string; line: number }
+  ): Promise<FilePreviewOperationResult<{ offset: number; line: number; contentGeneration: string }>> {
+    try {
+      const record = this.#record(webContentsId, request.handleId, request.expectedGeneration)
+      if (!Number.isSafeInteger(request.line) || request.line < 1) return failed('read_failed', '行号无效。')
+      let line = 1
+      let offset = 0
+      while (offset < record.version.size && line < request.line) {
+        const bytes = await this.#readAt(record, offset, Math.min(64 * 1024, record.version.size - offset))
+        for (let index = 0; index < bytes.byteLength && line < request.line; index += 1) {
+          if (bytes[index] === 0x0a) line += 1
+          offset += 1
+        }
+      }
+      record.resolvedLine = { offset, line }
+      return ok({ offset, line, contentGeneration: record.generation })
+    } catch (error) {
+      return this.#errorResult(error)
+    }
+  }
+
+  async readBinary(
+    webContentsId: number,
+    request: { handleId: string; expectedGeneration: string }
+  ): Promise<ReturnType<FilePreviewApi['readBinary']>> {
+    try {
+      const record = this.#record(webContentsId, request.handleId, request.expectedGeneration)
+      if (record.version.size > filePreviewLimits.binaryBytes) {
+        return failed('file_too_large', '图片超过 32 MiB，无法预览。')
+      }
+      return ok({
+        bytes: await this.#readAt(record, 0, record.version.size),
+        mime: record.classification.mime,
+        contentGeneration: record.generation,
+        contentVersion: record.version
+      })
+    } catch (error) {
+      return this.#errorResult(error)
+    }
+  }
+
+  async prepareHtmlSite(
+    webContentsId: number,
+    request: { handleId: string; expectedGeneration: string }
+  ): Promise<FilePreviewOperationResult<FilePreviewHtmlSite>> {
+    let site: HtmlPreviewSite | null = null
+    const preparation = Symbol()
+    try {
+      const record = this.#record(webContentsId, request.handleId, request.expectedGeneration)
+      if (record.version.size > filePreviewLimits.htmlDocumentBytes) return failed('file_too_large', '文件较大，请使用分页阅读。')
+      if (record.classification.mime !== 'text/html') throw new FilePreviewAccessError('read_failed', '这不是 HTML 文件。')
+      if (this.#htmlPreparations.has(record.handleId)) return failed('read_failed', '预览正在准备中。', true)
+      const sites = [...this.#htmlSites.values()].filter(site => site.webContentsId === webContentsId).length
+      const preparing = [...this.#htmlPreparations.keys()].filter(id => this.#handles.get(id)?.webContentsId === webContentsId).length
+      if (sites + preparing >= filePreviewRetentionLimits.htmlInstances) return failed('too_many_open_files', '预览资源不足，请关闭一个后台页面。', true)
+      this.#htmlPreparations.set(record.handleId, preparation)
+      const validate = async (signal: AbortSignal): Promise<void> => {
+        signal.throwIfAborted()
+        this.#record(webContentsId, request.handleId, request.expectedGeneration)
+        await this.#revalidateRecordPath(record, true)
+        this.#record(webContentsId, request.handleId, request.expectedGeneration)
+        signal.throwIfAborted()
+      }
+      const parsed = this.#parsedReference(record.reopenTarget)
+      const entryPath = '/' + relative(record.canonicalRoot, record.canonicalPath).split(sep).map(encodeURIComponent).join('/')
+        + (parsed.query ? `?${parsed.query}` : '') + (parsed.fragment ? `#${encodeURIComponent(parsed.fragment)}` : '')
+      site = await HtmlPreviewSite.create({
+        generation: record.generation,
+        idleTimeoutMs: null,
+        hostOrigin: this.#native.previewHostOrigin?.(webContentsId) ?? 'null',
+        entryPath,
+        validate,
+        openResource: createPreviewFileSource(record.canonicalRoot, record.canonicalPath, record.allowChildren, this.#native.previewProtectedRoots?.(), record.request.kind === 'attachment')
+      })
+      this.#record(webContentsId, request.handleId, request.expectedGeneration)
+      if (this.#htmlPreparations.get(record.handleId) !== preparation) throw new FilePreviewAccessError('read_failed', '预览请求已经过期。')
+      this.#closeHtmlSites(record.handleId)
+      this.#htmlSites.set(site.descriptor.previewId, { handleId: record.handleId, webContentsId, site })
+      return ok({ ...site.descriptor, contentGeneration: record.generation, contentVersion: record.version })
+    } catch (error) { await site?.close(); return this.#errorResult(error) }
+    finally { if (this.#htmlPreparations.get(request.handleId) === preparation) this.#htmlPreparations.delete(request.handleId) }
+  }
+
+  async releaseHtmlSite(webContentsId: number, request: { previewId: string }): Promise<{ released: true }> {
+    const record = this.#htmlSites.get(request.previewId)
+    if (record?.webContentsId === webContentsId) {
+      this.#htmlSites.delete(request.previewId)
+      await record.site.close()
+    }
+    return { released: true }
+  }
+
+  ownsHtmlPreviewOrigin(webContentsId: number, url: string): boolean {
+    let origin: string
+    try { origin = new URL(url).origin } catch { return false }
+    return [...this.#htmlSites.values()].some(record => record.webContentsId === webContentsId && !record.site.closed && record.site.descriptor.origin === origin)
+  }
+
+  #closeHtmlSites(handleId: string): void {
+    for (const [id, record] of this.#htmlSites) {
+      if (record.handleId !== handleId) continue
+      this.#htmlSites.delete(id)
+      const closing = record.site.close()
+      this.#htmlClosures.add(closing)
+      void closing.finally(() => this.#htmlClosures.delete(closing))
+    }
+  }
+
+  async prepareHtml(
+    webContentsId: number,
+    request: { handleId: string; expectedGeneration: string }
+  ): Promise<FilePreviewOperationResult<FilePreviewHtmlDocument>> {
+    try {
+      const record = this.#record(webContentsId, request.handleId, request.expectedGeneration)
+      // This string/token entry remains only for Markdown; HTML has one URL path.
+      if (record.classification.mime === 'text/html') return failed('read_failed', 'HTML 预览需要站点入口。')
+      const limit = filePreviewLimits.wholeTextBytes
+      if (record.version.size > limit) {
+        return failed('file_too_large', '文件较大，请使用分页阅读。')
+      }
+      const html = strictDecode(await this.#readAt(record, 0, record.version.size))
+      // Recheck after reading: closing or evicting the preview session revokes this handle.
+      const current = this.#record(webContentsId, request.handleId, request.expectedGeneration)
+      this.#revokeHtmlTokens(current.handleId)
+      const token: HtmlPreviewToken = {
+        token: randomUUID(),
+        bridgeToken: randomUUID(),
+        handleId: current.handleId,
+        webContentsId: current.webContentsId,
+        threadId: current.threadId,
+        generation: current.generation,
+        assetRoot: dirname(current.canonicalPath),
+        expiresAt: Number.POSITIVE_INFINITY
+      }
+      this.#htmlTokens.set(token.token, token)
+      return ok({
+        html,
+        tabToken: token.token,
+        bridgeToken: token.bridgeToken,
+        assetBasePath: '',
+        contentGeneration: current.generation,
+        contentVersion: current.version
+      })
+    } catch (error) {
+      return this.#errorResult(error, 'decode_failed')
+    }
+  }
+
+  authorizeHtmlAsset(webContentsId: number, method: string, url: string): boolean {
+    if (method !== 'GET') return false
+    const parsed = parseFilePreviewAssetUrl(url)
+    if (!parsed) return false
+    const token = this.#htmlTokens.get(parsed.tabToken)
+    if (!token || token.webContentsId !== webContentsId || token.expiresAt <= Date.now()) return false
+    const record = this.#handles.get(token.handleId)
+    return Boolean(
+      record
+      && record.webContentsId === webContentsId
+      && record.threadId === token.threadId
+      && record.generation === token.generation
+      && record.capabilities.includes('preview_asset')
+      && this.#sessionBindings.get(webContentsId)?.get(token.threadId)?.threadId === token.threadId
+      && this.#sessionBindings.get(webContentsId)?.get(token.threadId)?.generation === record.bindingGeneration
+    )
+  }
+
+  async serveHtmlAsset(request: Request): Promise<Response> {
+    if (request.method !== 'GET') return new Response(null, { status: 405 })
+    const parsed = parseFilePreviewAssetUrl(request.url)
+    if (!parsed) return new Response(null, { status: 404 })
+    const token = this.#htmlTokens.get(parsed.tabToken)
+    if (!token || token.expiresAt <= Date.now()) return new Response(null, { status: 403 })
+    const record = this.#handles.get(token.handleId)
+    if (
+      !record
+      || record.webContentsId !== token.webContentsId
+      || record.threadId !== token.threadId
+      || record.generation !== token.generation
+      || !record.capabilities.includes('preview_asset')
+      || this.#sessionBindings.get(record.webContentsId)?.get(record.threadId)?.threadId !== record.threadId
+      || this.#sessionBindings.get(record.webContentsId)?.get(record.threadId)?.generation !== record.bindingGeneration
+    ) return new Response(null, { status: 403 })
+
+    let opened: OpenedPreviewFile | null = null
+    try {
+      const relativePath = parsed.pathSegments.join('/')
+      const mime = htmlAssetMime(relativePath)
+      if (!mime) return new Response(null, { status: 415 })
+      opened = await openPreviewFile(token.assetRoot, resolve(token.assetRoot, ...parsed.pathSegments))
+      const limit = mime.startsWith('image/') || mime.startsWith('audio/') || mime.startsWith('video/')
+        ? filePreviewLimits.binaryBytes
+        : HTML_ASSET_BYTES
+      if (opened.version.size > limit) return new Response(null, { status: 413 })
+      const bytes = Buffer.alloc(opened.version.size)
+      const { bytesRead } = await opened.file.read(bytes, 0, bytes.byteLength, 0)
+      token.expiresAt = Number.POSITIVE_INFINITY
+      record.lastUsedAt = Date.now()
+      const headers = {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+        'Content-Type': mime,
+        'Cross-Origin-Resource-Policy': 'cross-origin',
+        'X-Content-Type-Options': 'nosniff'
+      }
+      if (mime.startsWith('text/css')) {
+        const css = strictDecode(bytes.subarray(0, bytesRead))
+        return new Response(rewriteAssetCss(css, token.token, dirname(relativePath).replace(/\\/gu, '/')), { headers })
+      }
+      return new Response(new Uint8Array(bytes.buffer, bytes.byteOffset, bytesRead), { headers })
+    } catch {
+      return new Response(null, { status: 404 })
+    } finally {
+      await opened?.file.close().catch(() => undefined)
+    }
+  }
+
+  async reload(
+    webContentsId: number,
+    request: { handleId: string; reopenToken: string; expectedGeneration: string }
+  ): Promise<FilePreviewOperationResult<ResolvedFilePreview>> {
+    const record = this.#recordOrNull(webContentsId, request.handleId)
+    if (!record || record.reopenToken !== request.reopenToken || record.generation !== request.expectedGeneration) {
+      return failed('source_not_authorized', '这个文件访问已失效。', true)
+    }
+    const binding = this.#captureBinding(webContentsId, record.threadId)
+    try {
+      const target = await this.#resolveReopenTarget(record)
+      this.#requireBinding(webContentsId, binding, record.threadId)
+      // A candidate has its own handle/generation/tokens. Preparing it never mutates the displayed version.
+      const result = await this.#openResolved(webContentsId, record.request, target, binding, RESTORE_OPEN_POLICY, record.handleId)
+      if (!result.ok) return result
+      if (result.value.kind !== 'file_preview') return failed('open_failed', '无法准备新的文件预览。')
+      return ok(result.value.file)
+    } catch (error) { return this.#errorResult(error) }
+  }
+
+  async release(webContentsId: number, request: { handleId: string }): Promise<{ released: true }> {
+    const record = this.#handles.get(request.handleId)
+    if (record?.webContentsId === webContentsId) await this.#dropHandle(record)
+    return { released: true }
+  }
+
+  async openInSystem(
+    webContentsId: number,
+    request: { handleId: string }
+  ): Promise<FilePreviewOperationResult<{ opened: true }>> {
+    const record = this.#recordOrNull(webContentsId, request.handleId)
+    if (!record) return failed('source_not_authorized', '这个文件访问已失效。')
+    const binding = this.#captureBinding(webContentsId, record.threadId)
+    const navigation = this.#windowThreads.get(webContentsId)
+    try {
+      const current = await this.#revalidateRecordPath(record)
+      this.#requireBinding(webContentsId, binding, record.threadId); this.#requireNavigation(webContentsId, navigation, record.threadId)
+      return this.#openNative(
+        current.canonicalPath,
+        record.fileName,
+        current.openRisk,
+        () => { this.#requireBinding(webContentsId, binding, record.threadId); this.#requireNavigation(webContentsId, navigation, record.threadId) }
+      )
+    } catch (error) {
+      return this.#errorResult(error, 'open_failed')
+    }
+  }
+
+  async revealInFolder(
+    webContentsId: number,
+    request: { handleId: string }
+  ): Promise<FilePreviewOperationResult<{ revealed: true }>> {
+    const record = this.#recordOrNull(webContentsId, request.handleId)
+    if (!record) return failed('source_not_authorized', '这个文件访问已失效。')
+    const binding = this.#captureBinding(webContentsId, record.threadId)
+    const navigation = this.#windowThreads.get(webContentsId)
+    try {
+      const current = await this.#revalidateRecordPath(record)
+      this.#requireBinding(webContentsId, binding, record.threadId); this.#requireNavigation(webContentsId, navigation, record.threadId)
+      this.#native.revealPath(current.canonicalPath)
+      return ok({ revealed: true })
+    } catch (error) {
+      const result = this.#errorResult<{ revealed: true }>(error, 'reveal_failed')
+      return result.ok ? failed('reveal_failed', '无法在文件夹中显示这个文件。', true) : result
+    }
+  }
+
+  async copyPath(
+    webContentsId: number,
+    request: { handleId: string; format: 'display' | 'absolute' }
+  ): Promise<FilePreviewOperationResult<{ copied: true }>> {
+    const record = this.#recordOrNull(webContentsId, request.handleId)
+    if (!record) return failed('source_not_authorized', '这个文件访问已失效。')
+    if (request.format === 'absolute' && record.pathPresentation === 'file_name_only') {
+      return failed('source_not_authorized', '无法复制这个文件的内部路径。')
+    }
+    const binding = this.#captureBinding(webContentsId, record.threadId)
+    const navigation = this.#windowThreads.get(webContentsId)
+    try {
+      let value = record.displayPath
+      if (request.format === 'absolute') {
+        const target = await this.#revalidateRecordPath(record)
+        if (!target.canShowPath) return failed('source_not_authorized', '无法复制这个文件的内部路径。')
+        value = target.canonicalPath
+      }
+      this.#requireBinding(webContentsId, binding, record.threadId); this.#requireNavigation(webContentsId, navigation, record.threadId)
+      this.#native.copyText(value)
+      return ok({ copied: true })
+    } catch (error) {
+      return this.#errorResult(error)
+    }
+  }
+
+  async chooseAuthorizedRoot(
+    webContentsId: number,
+    request: { threadId: string; pendingOpenId: string }
+  ): Promise<FilePreviewOperationResult<FilePreviewRootGrantResult | null>> {
+    this.#prune()
+    try {
+      const binding = this.#captureBinding(webContentsId, request.threadId)
+      const navigation = this.#windowThreads.get(webContentsId)
+      this.#requireNavigation(webContentsId, navigation, request.threadId)
+      const pending = this.#pending.get(request.pendingOpenId)
+      if (
+        !pending
+        || pending.webContentsId !== webContentsId
+        || pending.threadId !== request.threadId
+        || pending.bindingGeneration !== binding.generation
+      ) {
+        return failed('source_not_authorized', '这次目录授权请求已失效。')
+      }
+      const selected = await this.#native.selectRoot(webContentsId)
+      this.#requireNavigation(webContentsId, navigation, request.threadId)
+      if (!selected) return ok(null)
+      const canonicalRoot = await canonicalizeExistingPath(selected)
+      const canonicalCandidate = await canonicalizeExistingPath(pending.candidatePath)
+      this.#requireNavigation(webContentsId, navigation, request.threadId)
+      if (!pathIsWithin(canonicalRoot, canonicalCandidate)) {
+        return failed('outside_authorized_root', '所选目录不包含目标文件。')
+      }
+      const grant: RootGrant = {
+        id: randomUUID(),
+        webContentsId,
+        threadId: request.threadId,
+        bindingGeneration: binding.generation,
+        canonicalRoot,
+        displayName: basename(canonicalRoot) || '已授权目录'
+      }
+      this.#rootGrants.set(grant.id, grant)
+      this.#pending.delete(pending.id)
+      const result = await this.#openResolved(webContentsId, {
+        kind: 'authorized_root',
+        threadId: request.threadId,
+        rootGrantId: grant.id,
+        rawReference: pending.candidatePath
+      }, {
+        ...pending.target,
+        sourceKind: 'authorized_root',
+        sourceIdentity: `root-grant:${grant.id}`,
+        rootPath: canonicalRoot,
+        basePath: canonicalRoot,
+        candidatePath: canonicalCandidate
+      }, binding, INTERACTIVE_OPEN_POLICY)
+      if (!result.ok) return result
+      return ok({ rootGrantId: grant.id, displayName: grant.displayName, result: result.value })
+    } catch (error) {
+      return this.#errorResult(error)
+    }
+  }
+
+  async releaseWindow(webContentsId: number): Promise<void> {
+    this.#sessionBindings.delete(webContentsId)
+    const records = [...this.#handles.values()].filter((record) => record.webContentsId === webContentsId)
+    await Promise.all(records.map((record) => this.#dropHandle(record)))
+    this.#sessionBindings.delete(webContentsId)
+    this.#windowThreads.delete(webContentsId)
+    for (const [id, pending] of this.#pending) if (pending.webContentsId === webContentsId) this.#pending.delete(id)
+    for (const [id, grant] of this.#rootGrants) if (grant.webContentsId === webContentsId) this.#rootGrants.delete(id)
+    this.#watchers.releaseWindow(webContentsId)
+  }
+
+  async closeAll(): Promise<void> {
+    this.#sessionBindings.clear()
+    await Promise.all([...this.#handles.values()].map((record) => this.#dropHandle(record)))
+    this.#sessionBindings.clear()
+    this.#windowThreads.clear()
+    this.#pending.clear()
+    this.#rootGrants.clear()
+    this.#htmlTokens.clear()
+    this.#watchers.closeAll()
+  }
+
+  get handleCount(): number {
+    return this.#handles.size
+  }
+
+  async #resolveTarget(
+    webContentsId: number,
+    request: OpenFilePreviewRequest
+  ): Promise<FilePreviewAuthorityResult | ResolvedTarget | null> {
+    if (request.kind === 'child_of_handle') {
+      const parent = this.#recordOrNull(webContentsId, request.parentHandleId)
+      if (!parent || !parent.allowChildren) return null
+      this.#requireSession(webContentsId, parent.threadId)
+      return {
+        kind: 'file_target',
+        threadId: parent.threadId,
+        sourceKind: request.kind,
+        sourceIdentity: `child:${parent.previewKey}:${request.rawReference}`,
+        rootPath: parent.canonicalRoot,
+        basePath: dirname(parent.canonicalPath),
+        rawReference: request.rawReference,
+        openRisk: 'normal',
+        allowChildren: true,
+        projectRoot: parent.projectRoot
+      }
+    }
+    if (request.kind === 'authorized_root') {
+      this.#requireSession(webContentsId, request.threadId)
+      const grant = this.#rootGrants.get(request.rootGrantId)
+      const binding = this.#captureBinding(webContentsId, request.threadId)
+      if (
+        !grant
+        || grant.webContentsId !== webContentsId
+        || grant.threadId !== request.threadId
+        || grant.bindingGeneration !== binding.generation
+      ) return null
+      return {
+        kind: 'file_target',
+        threadId: request.threadId,
+        sourceKind: request.kind,
+        sourceIdentity: `root-grant:${grant.id}:${request.rawReference}`,
+        rootPath: grant.canonicalRoot,
+        basePath: grant.canonicalRoot,
+        rawReference: request.rawReference,
+        openRisk: 'normal',
+        allowChildren: true,
+        projectRoot: null
+      }
+    }
+    this.#requireSession(webContentsId, request.threadId)
+    return this.#authority.resolve(request)
+  }
+
+  async #openResolved(
+    webContentsId: number,
+    request: OpenFilePreviewRequest,
+    target: ResolvedTarget | Extract<FilePreviewAuthorityResult, { kind: 'file_target' }>,
+    binding: WindowThreadBinding,
+    policy: FilePreviewOpenPolicy,
+    protectedHandleId?: string
+  ): Promise<FilePreviewOperationResult<OpenFilePreviewResult>> {
+    const parsed = this.#parsedReference(target)
+    const candidatePath = await this.#candidatePath(target, parsed)
+    const fileAccessOptions = this.#fileAccessOptions(target)
+    let opened: OpenedPreviewFile
+    try {
+      // Explicit outside directories only need a native reveal, not a read grant.
+      // Relative/symlink escapes and non-message sources keep their existing gate.
+      const allowExternalDirectory = (request.kind === 'message_reference' || request.kind === 'camp_workspace')
+        && target.allowChildren !== false && parsed.pathKind !== 'relative'
+        && isAbsolute(candidatePath) && !pathIsWithin(resolve(target.rootPath), candidatePath)
+      const path = await inspectPreviewPath(target.rootPath, candidatePath, {
+        allowExternalDirectory,
+        ...fileAccessOptions
+      })
+      if (path.kind === 'directory') {
+        if (
+          target.allowChildren === false
+          || request.kind === 'run_evidence'
+          || request.kind === 'run_activity_file'
+        ) {
+          return failed('not_regular_file', '这个来源不支持打开文件夹。')
+        }
+        if (!policy.nativeSideEffects
+          || (request.kind === 'child_of_handle' && request.allowSystemOpen === false)) {
+          return failed('reference_not_clickable', '这个链接不能在预览中打开。')
+        }
+        this.#requireBinding(webContentsId, binding, target.threadId)
+        policy.nativeGuard?.()
+        // Reveal through the file manager, never launch a directory-shaped app bundle.
+        try {
+          this.#native.revealPath(path.canonicalPath)
+          return ok({ kind: 'opened_in_system', fileName: basename(path.canonicalPath) })
+        } catch {
+          return failed('open_failed', '无法在文件管理器中显示这个文件夹。', true)
+        }
+      }
+      opened = await openPreviewFile(target.rootPath, candidatePath, fileAccessOptions)
+    } catch (error) {
+      if (
+        policy.authorizationChallenge
+        && error instanceof FilePreviewAccessError
+        && error.code === 'outside_authorized_root'
+        && isAbsolute(candidatePath)
+      ) {
+        this.#requireBinding(webContentsId, binding, target.threadId)
+        policy.nativeGuard?.()
+        const challenge = this.#createAuthorizationChallenge(webContentsId, request, {
+          ...target,
+          target: parsed.target,
+          openRisk: target.openRisk ?? 'normal',
+          allowChildren: target.allowChildren ?? true
+        }, candidatePath, binding)
+        return failed('authorization_required', '这个目录需要通过显式目录操作访问。', false, {
+          displayReference: challenge.displayReference,
+          authorizationChallenge: challenge
+        })
+      }
+      throw error
+    }
+    let classification: FilePreviewClassification
+    try {
+      classification = await this.#classify(opened)
+    } catch (error) {
+      await opened.file.close().catch(() => undefined)
+      if (!(error instanceof FilePreviewAccessError) || error.code !== 'read_failed') throw error
+      opened = await openPreviewFile(target.rootPath, candidatePath, fileAccessOptions)
+      classification = await this.#classify(opened)
+    }
+    const fileName = target.displayName || opened.fileName
+    const openRisk = target.openRisk === 'confirm' ? 'confirm' : classification.openRisk
+    if (classification.kind === 'system') {
+      await opened.file.close().catch(() => undefined)
+      if (!policy.nativeSideEffects
+        || (request.kind === 'child_of_handle' && request.allowSystemOpen === false)) {
+        return failed('reference_not_clickable', '这个链接不能在预览中打开。')
+      }
+      this.#requireBinding(webContentsId, binding, target.threadId)
+      const nativeResult = await this.#openNative(
+        opened.canonicalPath,
+        fileName,
+        openRisk,
+        () => { this.#requireBinding(webContentsId, binding, target.threadId); policy.nativeGuard?.() }
+      )
+      return nativeResult.ok
+        ? ok({ kind: 'opened_in_system', fileName })
+        : nativeResult
+    }
+    const supportedClassification = classification as SupportedClassification
+    try {
+      this.#requireBinding(webContentsId, binding, target.threadId)
+    } catch (error) {
+      await opened.file.close().catch(() => undefined)
+      throw error
+    }
+    const handleId = randomUUID()
+    const previewKey = createHash('sha256')
+      .update(`${webContentsId}\0${target.threadId}\0${opened.canonicalPath}`)
+      .digest('hex')
+    const allowChildren = target.allowChildren ?? target.sourceKind !== 'attachment'
+    const capabilities: FilePreviewCapability[] = ['read', 'open_in_system']
+    if (allowChildren) capabilities.push('read_child')
+    if (allowChildren && (classification.kind === 'html' || classification.kind === 'markdown')) {
+      capabilities.push('preview_asset')
+    }
+    const pathProjection = await this.#pathProjection(target, opened)
+    const restoreRequest = await this.#independentRestoreRequest(request, target.threadId, opened.canonicalPath)
+    try {
+      this.#requireBinding(webContentsId, binding, target.threadId)
+    } catch (error) {
+      await opened.file.close().catch(() => undefined)
+      throw error
+    }
+    if (this.#windowHandleCount(webContentsId) >= MAX_HANDLES_PER_WINDOW) {
+      const candidate = [...this.#handles.values()].filter(value => value.webContentsId === webContentsId
+        && value.handleId !== protectedHandleId && value.retention?.recoverable
+        && !value.retention.visible && !value.retention.busy && !value.activeReads)
+        .sort((a, b) => a.retention!.lastUsed - b.retention!.lastUsed)[0]
+      if (candidate) {
+        // Drop removes the logical slot synchronously, before another open can allocate it.
+        void this.#dropHandle(candidate)
+        this.#native.publishResourcesReleased?.(webContentsId, [candidate.handleId])
+      }
+    }
+    if (this.#windowHandleCount(webContentsId) >= MAX_HANDLES_PER_WINDOW) {
+      await opened.file.close().catch(() => undefined)
+      return failed('too_many_open_files', '打开的文件较多，请先关闭一些标签页。')
+    }
+    const record: PreviewHandleRecord = {
+      handleId,
+      webContentsId,
+      threadId: target.threadId,
+      bindingGeneration: binding.generation,
+      request,
+      reopenTarget: {
+        ...target,
+        target: parsed.target,
+        openRisk: target.openRisk ?? 'normal',
+        allowChildren,
+        projectRoot: pathProjection.projectRoot
+      },
+      sourceIdentity: target.sourceIdentity,
+      file: opened.file,
+      reopening: null,
+      canonicalRoot: opened.canonicalRoot,
+      canonicalPath: opened.canonicalPath,
+      projectRoot: pathProjection.projectRoot,
+      displayPath: pathProjection.displayPath,
+      pathPresentation: pathProjection.pathPresentation,
+      fileName,
+      version: opened.version,
+      classification: supportedClassification,
+      previewKey,
+      restoreRequest,
+      reopenToken: randomUUID(),
+      generation: generation(),
+      target: parsed.target,
+      capabilities,
+      hasExternalUpdate: false,
+      allowChildren,
+      lastUsedAt: Date.now()
+    }
+    this.#handles.set(record.handleId, record)
+    this.#subscribe(record)
+    return ok({ kind: 'file_preview', file: this.#publicFile(record) })
+  }
+
+  async #candidatePath(
+    target: ResolvedTarget | Extract<FilePreviewAuthorityResult, { kind: 'file_target' }>,
+    parsed: ParsedFileReference
+  ): Promise<string> {
+    if (target.candidatePath) return target.candidatePath
+    return target.sourceKind === 'message_reference' || target.sourceKind === 'camp_workspace'
+      ? resolveFileReferencePath(parsed, target.rootPath, target.basePath)
+      : referenceCandidatePath(parsed, target.rootPath, target.basePath)
+  }
+
+  async #pathProjection(
+    target: ResolvedTarget | Extract<FilePreviewAuthorityResult, { kind: 'file_target' }>,
+    opened: OpenedPreviewFile
+  ): Promise<{
+      projectRoot: string | null
+      displayPath: string
+      pathPresentation: FilePreviewPathPresentation
+    }> {
+    const inheritedProjectRoot = 'projectRoot' in target ? target.projectRoot : undefined
+    let projectRoot = inheritedProjectRoot ?? null
+    if (inheritedProjectRoot === undefined && canPresentProjectRelativePath(target.sourceKind)) {
+      projectRoot = await canonicalizeExistingPath(target.rootPath).catch(() => null)
+    }
+    if (target.sourceKind === 'attachment' && target.canShowPath !== true) {
+      return {
+        projectRoot,
+        pathPresentation: 'file_name_only',
+        displayPath: target.displayName || opened.fileName
+      }
+    }
+    if (inheritedProjectRoot === undefined && target.sourceKind === 'attachment') {
+      projectRoot = await this.#canonicalWorkspaceRoot(target.threadId)
+    }
+    if (projectRoot && pathIsWithin(projectRoot, opened.canonicalPath)) {
+      return {
+        projectRoot,
+        pathPresentation: 'project_relative',
+        displayPath: relative(projectRoot, opened.canonicalPath).split(sep).join('/') || opened.fileName
+      }
+    }
+    const canonicalHome = await canonicalizeExistingPath(homedir()).catch(() => null)
+    const homeRelativePath = canonicalHome && pathIsWithin(canonicalHome, opened.canonicalPath)
+      ? relative(canonicalHome, opened.canonicalPath).split(sep).join('/')
+      : null
+    return {
+      projectRoot,
+      pathPresentation: 'external',
+      displayPath: homeRelativePath ? `~/${homeRelativePath}` : opened.canonicalPath
+    }
+  }
+
+  async #independentRestoreRequest(
+    request: OpenFilePreviewRequest,
+    threadId: string,
+    canonicalPath: string
+  ): Promise<RestoreFilePreviewRequest | undefined> {
+    if (request.kind !== 'child_of_handle') return undefined
+    const root = await this.#canonicalWorkspaceRoot(threadId)
+    const rawReference = root ? workspaceRelativeReference(root, canonicalPath) : null
+    return rawReference ? { kind: 'camp_workspace', threadId, rawReference } : undefined
+  }
+
+  async #canonicalWorkspaceRoot(threadId: string): Promise<string | null> {
+    try {
+      const workspace = await this.#authority.resolve({
+        kind: 'camp_workspace',
+        threadId,
+        rawReference: '.'
+      })
+      if (
+        !workspace
+        || workspace.kind !== 'file_target'
+        || workspace.threadId !== threadId
+        || workspace.sourceKind !== 'camp_workspace'
+        || workspace.allowChildren !== true
+      ) return null
+      return await canonicalizeExistingPath(workspace.rootPath)
+    } catch {
+      return null
+    }
+  }
+
+  #fileAccessOptions(target: { sourceKind: OpenFilePreviewRequest['kind'] }): { allowExternalFile: boolean } {
+    return { allowExternalFile: target.sourceKind !== 'authorized_root' }
+  }
+
+  #parsedReference(target: { rawReference?: string; candidatePath?: string; target?: FileLocationTarget }): ParsedFileReference {
+    const parsed = target.rawReference ? parseFileReference(target.rawReference) : null
+    if (parsed) return parsed
+    if (target.candidatePath) {
+      return {
+        raw: target.candidatePath,
+        pathPart: target.candidatePath,
+        pathKind: 'unix_absolute',
+        target: target.target
+      }
+    }
+    throw new FilePreviewAccessError('file_not_found', '文件引用无效。')
+  }
+
+  async #classify(opened: OpenedPreviewFile): Promise<FilePreviewClassification> {
+    try {
+      const length = Math.min(filePreviewLimits.sampleBytes, opened.version.size)
+      const buffer = Buffer.alloc(length)
+      const { bytesRead } = await opened.file.read(buffer, 0, length, 0)
+      const after = await fileHandleVersion(opened.file)
+      if (!contentVersionMatches(opened.version, after)) {
+        throw new FilePreviewAccessError('read_failed', '文件在打开时发生了变化。')
+      }
+      return classifyFilePreview(opened.canonicalPath, opened.version.size, buffer.subarray(0, bytesRead))
+    } catch (error) {
+      await opened.file.close().catch(() => undefined)
+      throw error
+    }
+  }
+
+  #publicFile(record: PreviewHandleRecord): ResolvedFilePreview {
+    return {
+      handleId: record.handleId,
+      reopenToken: record.reopenToken,
+      previewKey: record.previewKey,
+      ...(record.restoreRequest ? { restoreRequest: { ...record.restoreRequest } } : {}),
+      displayPath: record.displayPath,
+      pathPresentation: record.pathPresentation,
+      fileName: record.fileName,
+      size: record.version.size,
+      mime: record.classification.mime,
+      extension: record.classification.extension,
+      kind: record.classification.kind,
+      hasExternalUpdate: record.hasExternalUpdate,
+      contentVersion: record.version,
+      contentGeneration: record.generation,
+      capabilities: record.capabilities,
+      target: record.target
+    }
+  }
+
+  #subscribe(record: PreviewHandleRecord): void {
+    this.#watchers.subscribe(record.canonicalRoot, {
+      handleId: record.handleId,
+      webContentsId: record.webContentsId,
+      threadId: record.threadId,
+      bindingGeneration: record.bindingGeneration,
+      previewKey: record.previewKey,
+      canonicalFilePath: record.canonicalPath
+    })
+  }
+
+  #onExternalUpdate(notification: RootWatchNotification): void {
+    const binding = this.#sessionBindings.get(notification.webContentsId)?.get(notification.threadId)
+    if (
+      !binding
+      || binding.threadId !== notification.threadId
+      || binding.generation !== notification.bindingGeneration
+    ) return
+    const changed = new Set(notification.previewKeys)
+    for (const record of this.#handles.values()) {
+      if (
+        record.webContentsId === notification.webContentsId
+        && record.threadId === notification.threadId
+        && record.bindingGeneration === notification.bindingGeneration
+        && changed.has(record.previewKey)
+      ) record.hasExternalUpdate = true
+    }
+    this.#native.publishExternalUpdate(notification)
+  }
+
+  #record(webContentsId: number, handleId: string, expectedGeneration: string): PreviewHandleRecord {
+    const record = this.#recordOrNull(webContentsId, handleId)
+    if (!record || record.generation !== expectedGeneration) {
+      throw new FilePreviewAccessError('read_failed', '这个文件访问已失效。')
+    }
+    return record
+  }
+
+  #recordOrNull(webContentsId: number, handleId: string): PreviewHandleRecord | null {
+    this.#prune()
+    const record = this.#handles.get(handleId)
+    if (!record || record.webContentsId !== webContentsId) return null
+    const binding = this.#sessionBindings.get(webContentsId)?.get(record.threadId)
+    if (
+      !binding
+      || binding.threadId !== record.threadId
+      || record.bindingGeneration !== binding.generation
+    ) return null
+    record.lastUsedAt = Date.now()
+    return record
+  }
+
+  #captureBinding(webContentsId: number, threadId?: string): WindowThreadBinding {
+    const selectedThread = threadId ?? this.#windowThreads.get(webContentsId)?.threadId
+    const binding = selectedThread ? this.#sessionBindings.get(webContentsId)?.get(selectedThread) : undefined
+    if (!binding || !binding.threadId || (threadId !== undefined && binding.threadId !== threadId)) {
+      throw new FilePreviewAccessError('read_failed', '文件不属于当前 Thread。')
+    }
+    return binding
+  }
+
+  #requireBinding(
+    webContentsId: number,
+    expected: WindowThreadBinding,
+    threadId?: string
+  ): void {
+    const current = expected.threadId ? this.#sessionBindings.get(webContentsId)?.get(expected.threadId) : undefined
+    if (
+      current !== expected
+      || !current?.threadId
+      || (threadId !== undefined && current.threadId !== threadId)
+    ) throw new FilePreviewAccessError('read_failed', '文件不属于当前 Thread。')
+  }
+
+  #requireNavigation(webContentsId: number, expected: WindowThreadBinding | undefined, threadId: string): void {
+    if (!expected || expected.threadId !== threadId || this.#windowThreads.get(webContentsId) !== expected)
+      throw new FilePreviewAccessError('read_failed', '这次文件操作已失效。')
+  }
+
+  #requireSession(webContentsId: number, threadId: string): void {
+    this.#captureBinding(webContentsId, threadId)
+  }
+
+  async #readAt(record: PreviewHandleRecord, position: number, length: number): Promise<Uint8Array> {
+    record.activeReads = (record.activeReads ?? 0) + 1
+    try {
+    const buffer = Buffer.alloc(length)
+    const file = await this.#ensureFile(record)
+    const before = await fileHandleVersion(file)
+    if (!contentVersionMatches(record.version, before)) {
+      await this.#retireChangedFile(record, file)
+      throw new FilePreviewAccessError('read_failed', '文件已有更新，请重新加载。')
+    }
+    const { bytesRead } = await file.read(buffer, 0, length, position)
+    const after = await fileHandleVersion(file)
+    if (!contentVersionMatches(record.version, after)) {
+      await this.#retireChangedFile(record, file)
+      throw new FilePreviewAccessError('read_failed', '文件已有更新，请重新加载。')
+    }
+    record.lastUsedAt = Date.now()
+    return new Uint8Array(buffer.subarray(0, bytesRead))
+    } finally { record.activeReads!-- }
+  }
+
+  async #retireChangedFile(record: PreviewHandleRecord, file: FileHandle): Promise<void> {
+    record.hasExternalUpdate = true
+    if (record.file === file) record.file = null
+    await file.close().catch(() => undefined)
+  }
+
+  async #ensureFile(record: PreviewHandleRecord): Promise<FileHandle> {
+    if (record.file) return record.file
+    if (record.reopening) return record.reopening
+
+    const reopening = this.#reopenFile(record)
+    record.reopening = reopening
+    try {
+      return await reopening
+    } finally {
+      if (record.reopening === reopening) record.reopening = null
+    }
+  }
+
+  async #reopenFile(record: PreviewHandleRecord): Promise<FileHandle> {
+    this.#requireSession(record.webContentsId, record.threadId)
+    const target = await this.#resolveReopenTarget(record)
+    const parsed = this.#parsedReference(target)
+    const candidatePath = await this.#candidatePath(target, parsed)
+    const opened = await openPreviewFile(target.rootPath, candidatePath, this.#fileAccessOptions(target))
+    if (
+      opened.canonicalRoot !== record.canonicalRoot
+      || opened.canonicalPath !== record.canonicalPath
+    ) {
+      await opened.file.close().catch(() => undefined)
+      throw new FilePreviewAccessError('read_failed', '文件来源已发生变化，请重新打开。')
+    }
+    if (!contentVersionMatches(record.version, opened.version)) {
+      record.hasExternalUpdate = true
+      await opened.file.close().catch(() => undefined)
+      throw new FilePreviewAccessError('read_failed', '文件已有更新，请重新加载。')
+    }
+    if (this.#handles.get(record.handleId) !== record) {
+      await opened.file.close().catch(() => undefined)
+      throw new FilePreviewAccessError('read_failed', '这个文件访问已失效。')
+    }
+    record.file = opened.file
+    record.reopenTarget = target
+    record.lastUsedAt = Date.now()
+    return opened.file
+  }
+
+  async #revalidateRecordPath(record: PreviewHandleRecord, requireVersion = false): Promise<{
+    canonicalPath: string
+    openRisk: 'normal' | 'confirm'
+    canShowPath: boolean
+  }> {
+    const target = await this.#resolveReopenTarget(record)
+    const parsed = this.#parsedReference(target)
+    const candidatePath = await this.#candidatePath(target, parsed)
+    const opened = await openPreviewFile(target.rootPath, candidatePath, this.#fileAccessOptions(target))
+    try {
+      if (
+        opened.canonicalRoot !== record.canonicalRoot
+        || opened.canonicalPath !== record.canonicalPath
+      ) throw new FilePreviewAccessError('read_failed', '文件来源已发生变化，请重新打开。')
+      const classification = await this.#classify(opened)
+      if (!contentVersionMatches(record.version, opened.version)) {
+        record.hasExternalUpdate = true
+        if (requireVersion) throw new FilePreviewAccessError('read_failed', '文件已有更新，请重新加载。')
+      }
+      if (requireVersion && target.allowChildren !== record.allowChildren) throw new FilePreviewAccessError('read_failed', '文件资源范围已变化，请重新打开。')
+      return {
+        canonicalPath: opened.canonicalPath,
+        canShowPath: target.sourceKind !== 'attachment' || target.canShowPath === true,
+        openRisk: target.openRisk === 'confirm' ? 'confirm' : classification.openRisk
+      }
+    } finally {
+      await opened.file.close().catch(() => undefined)
+    }
+  }
+
+  async #resolveReopenTarget(record: PreviewHandleRecord): Promise<ResolvedTarget> {
+    if (record.request.kind === 'child_of_handle') return record.reopenTarget
+    const target = await this.#resolveTarget(record.webContentsId, record.request)
+    if (
+      !target
+      || target.kind !== 'file_target'
+      || target.threadId !== record.threadId
+      || target.sourceIdentity !== record.sourceIdentity
+    ) throw new FilePreviewAccessError('read_failed', '无法重新确认文件来源。')
+    return {
+      ...target,
+      target: record.target,
+      openRisk: target.openRisk ?? record.reopenTarget.openRisk,
+      allowChildren: target.allowChildren ?? record.allowChildren
+    }
+  }
+
+  async #lineAtOffset(record: PreviewHandleRecord, targetOffset: number): Promise<number> {
+    let line = 1
+    let offset = 0
+    while (offset < targetOffset) {
+      const bytes = await this.#readAt(record, offset, Math.min(64 * 1024, targetOffset - offset))
+      for (const byte of bytes) if (byte === 0x0a) line += 1
+      if (bytes.byteLength === 0) break
+      offset += bytes.byteLength
+    }
+    return line
+  }
+
+  async #openNative(
+    path: string,
+    displayName: string,
+    openRisk: 'normal' | 'confirm',
+    requireCurrentBinding: () => void = () => undefined
+  ): Promise<FilePreviewOperationResult<{ opened: true }>> {
+    try {
+      requireCurrentBinding()
+      if (openRisk === 'confirm' && !(await this.#native.confirmOpen(displayName))) {
+        return failed('open_failed', '已取消打开。')
+      }
+      requireCurrentBinding()
+      const error = await this.#native.openPath(path)
+      return error ? failed('open_failed', '系统默认应用无法打开这个文件。', true) : ok({ opened: true })
+    } catch {
+      return failed('open_failed', '系统默认应用无法打开这个文件。', true)
+    }
+  }
+
+  #createAuthorizationChallenge(
+    webContentsId: number,
+    request: OpenFilePreviewRequest,
+    target: ResolvedTarget,
+    candidatePath: string,
+    binding: WindowThreadBinding
+  ): FilePreviewAuthorizationChallenge & { displayReference: string } {
+    const id = randomUUID()
+    const displayReference = safeDisplayReference(target.rawReference || candidatePath)
+    const pending: PendingOpen = {
+      id,
+      webContentsId,
+      threadId: target.threadId,
+      bindingGeneration: binding.generation,
+      request,
+      target,
+      candidatePath,
+      displayReference,
+      expiresAt: Date.now() + PENDING_OPEN_TTL_MS
+    }
+    this.#pending.set(id, pending)
+    return {
+      pendingOpenId: id,
+      threadId: target.threadId,
+      displayReference,
+      expiresAt: pending.expiresAt
+    }
+  }
+
+  /** End existing file leases before an explicitly requested Thread deletion. */
+  async releaseThread(threadId: string): Promise<void> {
+    const closing: Promise<void>[] = []
+    for (const [webContentsId, sessions] of this.#sessionBindings) {
+      const binding = sessions.get(threadId)
+      if (!binding) continue
+      sessions.delete(threadId)
+      closing.push(this.#releaseThread(webContentsId, threadId, binding.generation))
+    }
+    await Promise.all(closing)
+  }
+
+  async #releaseThread(
+    webContentsId: number,
+    threadId: string,
+    bindingGeneration: number
+  ): Promise<void> {
+    const records = [...this.#handles.values()].filter((record) =>
+      record.webContentsId === webContentsId
+      && record.threadId === threadId
+      && record.bindingGeneration === bindingGeneration
+    )
+    await Promise.all(records.map((record) => this.#dropHandle(record)))
+    for (const [id, pending] of this.#pending) {
+      if (
+        pending.webContentsId === webContentsId
+        && pending.threadId === threadId
+        && pending.bindingGeneration === bindingGeneration
+      ) this.#pending.delete(id)
+    }
+    for (const [id, grant] of this.#rootGrants) {
+      if (
+        grant.webContentsId === webContentsId
+        && grant.threadId === threadId
+        && grant.bindingGeneration === bindingGeneration
+      ) this.#rootGrants.delete(id)
+    }
+    this.#watchers.releaseBinding(webContentsId, threadId, bindingGeneration)
+  }
+
+  async #dropHandle(record: PreviewHandleRecord): Promise<void> {
+    if (!this.#handles.delete(record.handleId)) return
+    this.#htmlPreparations.delete(record.handleId)
+    this.#closeHtmlSites(record.handleId)
+    this.#revokeHtmlTokens(record.handleId)
+    await Promise.all(this.#htmlClosures)
+    this.#watchers.unsubscribe(record.handleId)
+    const file = record.file
+    record.file = null
+    await file?.close().catch(() => undefined)
+  }
+
+  #revokeHtmlTokens(handleId: string): void {
+    for (const [token, value] of this.#htmlTokens) {
+      if (value.handleId === handleId) this.#htmlTokens.delete(token)
+    }
+  }
+
+  #windowHandleCount(webContentsId: number): number {
+    let count = 0
+    for (const record of this.#handles.values()) if (record.webContentsId === webContentsId) count += 1
+    return count
+  }
+
+  #prune(now = Date.now()): void {
+    for (const record of this.#handles.values()) {
+      if (record.file && !record.activeReads && now - record.lastUsedAt > FILE_DESCRIPTOR_IDLE_MS) {
+        const file = record.file
+        record.file = null
+        void file.close().catch(() => undefined)
+      }
+    }
+    for (const [id, pending] of this.#pending) if (pending.expiresAt <= now) this.#pending.delete(id)
+    for (const [token, value] of this.#htmlTokens) if (value.expiresAt <= now) this.#htmlTokens.delete(token)
+  }
+
+  #errorResult<T>(
+    error: unknown,
+    defaultCode: FilePreviewErrorCode = 'read_failed'
+  ): FilePreviewOperationResult<T> {
+    if (error instanceof FilePreviewAccessError) {
+      return failed(error.code, error.message, error.code === 'read_failed')
+    }
+    if (error && typeof error === 'object' && 'code' in error) {
+      if (error.code === 'attachment_missing') {
+        return failed('attachment_missing', '找不到这个附件。')
+      }
+      if (error.code === 'attachment_unreadable') {
+        return failed('attachment_unreadable', '无法读取这个附件。')
+      }
+      if (error.code === 'attachment_kind_changed') {
+        return failed('attachment_kind_changed', '附件类型已经变化。')
+      }
+    }
+    if (error instanceof TypeError) return failed('decode_failed', '这个文件不是有效的 UTF-8 文本。')
+    return failed(defaultCode, '无法打开文件。', true)
+  }
+}

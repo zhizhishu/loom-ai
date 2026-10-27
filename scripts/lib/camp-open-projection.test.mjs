@@ -1,0 +1,83 @@
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import test from 'node:test'
+import react from '@vitejs/plugin-react'
+import electron from 'electron'
+import { build } from 'vite'
+import { admitElectronIntegrationTest } from './electron-sandbox-capability.mjs'
+
+const root = resolve(import.meta.dirname, '../..')
+const fixtureSource = join(root, 'scripts/fixtures/camp-open-projection')
+
+test('public input history preserves drafts and sends the displayed structured preview', { timeout: 90_000 }, t => runFixture(t, '--input-history'))
+
+test('Steer uses per-recipient routes, attachment-only send and silent execution completion', { timeout: 90_000 }, t => runFixture(t, '--steer'))
+
+test('business-only CampOpen keeps cards, earlier pages and reading position across refresh', { timeout: 60_000 }, t => runFixture(t))
+test('return to latest is local to the viewport and never toggles failed Run rows', { timeout: 60_000 }, t => runFixture(t, '--return-latest'))
+test('execution text loads sparse history and complete Blob bodies in place with retry', { timeout: 60_000 }, t => runFixture(t, '--text-evidence'))
+test('execution window pages on demand, preserves the anchor and mounts details only on expansion', { timeout: 120_000 }, t => runFixture(t, '--execution-window'))
+test('block pages fill the viewport and expanded commands have independent retryable cursors', { timeout: 90_000 }, t => runFixture(t, '--block-pagination'))
+
+test('terminal Run artifacts retain their authors and layout across themes and widths', { timeout: 60_000 }, t => runFixture(t, '--run-artifacts'))
+test('public message groups follow rendered content height and preserve individual actions', { timeout: 60_000 }, t => runFixture(t, '--message-groups'))
+test('current user avatars and structured mentions open a live, keyboard-accessible profile card', { timeout: 60_000 }, t => runFixture(t, '--current-user-profile'))
+test('formal Camp entry readiness preserves cached-preview execution choices', { timeout: 60_000 }, t => runFixture(t, '--entry-preview-selection'))
+
+test('command interaction keeps disclosure anchors through async results and accessible states', { timeout: 120_000 }, t => runFixture(t, '--command-interaction'))
+
+test('public Camp draft survives projection refresh and remount without a private pending queue', { timeout: 60_000 }, t => runFixture(t, '--composer-local-draft'))
+
+test('image menus copy full image pixels, save original bytes and work in the lightbox', { timeout: 90_000 }, t => runFixture(t, '--image-context-menu'))
+
+async function runFixture(t, mode = '--camp-open') {
+  if (!admitElectronIntegrationTest(t)) return
+  const fixture = await mkdtemp(join(tmpdir(), 'rovai-camp-open-projection-test-'))
+  let child
+  let closed
+  try {
+    await build({
+      configFile: false, root: fixtureSource, base: './', logLevel: 'error', plugins: [react()],
+      resolve: { alias: { '@contracts': join(root, 'packages/contracts/src/index.ts') } },
+      build: { outDir: join(fixture, 'renderer'), minify: false }
+    })
+    const environment = { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: 'true' }
+    delete environment.ELECTRON_RUN_AS_NODE
+    process.stdout.write(`Automatic acceptance userData: ${join(fixture, 'user-data')}; no Core/SQLite/Skill Library/Runtime\n`)
+    child = spawn(electron, [
+      join(fixtureSource, 'main.cjs'), join(fixture, 'renderer/index.html'), join(fixture, 'user-data'),
+      mode,
+      ...(process.platform === 'linux'
+        || process.env.ROVAI_CAMP_OPEN_ACCEPT_NO_SANDBOX === '1'
+        ? ['--no-sandbox']
+        : [])
+    ], { env: environment, stdio: ['ignore', 'pipe', 'pipe'] })
+    closed = once(child, 'close')
+    let output = ''
+    child.stdout.on('data', chunk => { output += chunk.toString() })
+    child.stderr.on('data', chunk => { output += chunk.toString() })
+    // The window scenario traverses both viewports and captures expanded results
+    // in both themes; retain a separate bounded Electron budget for that pass.
+    const timeout = setTimeout(() => child.kill('SIGKILL'), ['--execution-window', '--command-interaction'].includes(mode) ? 75_000 : 45_000)
+    let code
+    try { [code] = await closed } finally { clearTimeout(timeout) }
+    assert.equal(code, 0, `CampOpen refresh regression failed:\n${output}`)
+    const report = JSON.parse(output.split('\n').find(line => line.startsWith('{')))
+    assert.equal(report.ok, true)
+    process.stdout.write(`${JSON.stringify(report)}\n`)
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL')
+      await closed
+    }
+    if (process.env.ROVAI_KEEP_CAMP_OPEN_FIXTURE === '1') {
+      process.stdout.write(`CampOpen fixture: ${fixture}\n`)
+    } else {
+      await rm(fixture, { recursive: true, force: true })
+    }
+  }
+}

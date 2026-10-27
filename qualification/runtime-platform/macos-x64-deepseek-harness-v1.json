@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "macos-x64-deepseek-harness-v1",
+  "capturedAt": "2026-09-17",
+  "platform": "macos-x64",
+  "baseRevision": "28afa40b09bedb1adc0937cce81e3f08585788f9",
+  "qualifiedRuntimeKinds": [
+    "deepseek-harness"
+  ],
+  "qualificationBasis": {
+    "type": "maintainer-target-host-acceptance",
+    "decision": "The maintainer confirmed that the current DeepSeek Harness qualification matrix was completed without blocking issues on macOS x64 and explicitly approved release on all four shipped platform keys.",
+    "repositoryEvidence": [
+      "docs/development/runtime-integration-checklist.md",
+      "docs/research/deepseek-harness-runtime/acp-0.1.5-parity.md",
+      "scripts/probe-dsh-runtime.mjs",
+      "scripts/smoke-acp-runtime.mjs",
+      "scripts/smoke-dsh-fleet.mjs",
+      "scripts/smoke-dsh-safety.mjs",
+      "scripts/smoke-dsh-usage.mjs",
+      "scripts/smoke-mcp-projection.mjs",
+      "scripts/smoke-skills.mjs"
+    ],
+    "rawEvidencePolicy": "Credentials, prompts, machine paths, Native Session identifiers, Run identifiers and raw target-host logs remain private and are intentionally excluded from the repository."
+  },
+  "runtimeEvidence": {
+    "runtimeVersion": "0.1.5-rc.2",
+    "minimumVersion": ">=0.1.5-rc.2",
+    "protocol": "acp-v1",
+    "package": "@deepseek-ai/dsh@0.1.5-rc.2",
+    "hostStrategy": "resident_multi_session through the shared RuntimeFleet",
+    "sessionStrategy": "exact Native Session continuation",
+    "bootstrapStrategy": "native persistent system prompt",
+    "skillStrategy": "managed .dsh/skills projection plus native discovery",
+    "mcpStrategy": "native stdio and HTTP MCP with whole-definition Rovai precedence",
+    "permissionStrategy": "native DSH sandbox and approval authority"
+  },
+  "acceptance": {
+    "status": "qualified",
+    "targetHostValidation": "maintainer-confirmed",
+    "checklist": "The maintainer confirmed completion of the current 14-axis Runtime integration matrix and required Golden Flows without a blocking issue.",
+    "releaseApproval": "approved",
+    "platformScope": "macos-x64 only",
+    "machineAndExecutionBoundary": "Installation, authentication, model availability, Session health and dispatch readiness remain independent fail-closed checks on each machine."
+  },
+  "limitations": [
+    "This artifact records the maintainer's completed target-host acceptance and release decision; this promotion commit does not claim to rerun the private macOS x64 model sessions or possess their raw logs.",
+    "The exact host OS build and executable fingerprint were not supplied to this promotion commit and are not inferred from macOS arm64, Linux x64 or Windows x64 evidence.",
+    "ACP still lacks session/load, additionalDirectories, a manual compact command, compaction lifecycle, MCP SSE/resources/prompts and client filesystem/terminal bridges.",
+    "Platform qualification does not bypass ordinary machine installation, authentication, model, version, Probe or Ready checks."
+  ]
+}

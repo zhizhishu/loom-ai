@@ -1,0 +1,43 @@
+{
+  "verifiedAt": "2026-09-12T19:36:00.700Z",
+  "simulation": false,
+  "realRuntime": true,
+  "setup": "Empty standalone Host with explicit local initialization; Runtime check, member configuration and Camp creation use the production browser UI.",
+  "checks": {
+    "browserRuntimeMemberAndCampSetup": true,
+    "browserUploadAndMarkdownRead": true,
+    "browserSend": true,
+    "browserNativeApproval": true,
+    "secondApprovalRejected": true,
+    "composerPreservedDuringExecution": true,
+    "browserArtifactRead": true,
+    "browserStopBeforeHostShutdown": true,
+    "noElectronBridgeOrRuntimeExceptions": true
+  },
+  "notVerified": [
+    "Desktop-managed Runtime execution",
+    "Second physical device/LAN",
+    "Other platforms",
+    "Headless Automation clock",
+    "Control-plane isolation"
+  ],
+  "campId": "rvcamp_01m2bhxjgzeh9rqb3r2ynnt1wa",
+  "approvalId": "93b642f2-c1e4-4553-b5db-f6b008364df1",
+  "runId": "07f841cc-3e75-42be-b63c-f6d4266f1fcd",
+  "messageId": "6b37077f-006e-43e3-a09b-963ac36f4133",
+  "attachmentId": "31f629d5-52e8-41f4-b9d4-ae4a3e0400a1",
+  "stopRunId": "f933b66e-df80-49d4-a6b2-f9bd8961a165",
+  "hostBinarySha256": "de31ad1dd45d385feb0d303ddeab5c5f3819ff2846dd8828e22c6a5a6893abcc",
+  "status": "passed",
+  "sourceReportSha256": "2acfbd3f516105505a6c9190583dc0362679279af7ca2a00eb51d17aff4f0bd6",
+  "screenshots": {
+    "web-native-approval.png": "headless-web-native-approval.png",
+    "web-runtime-artifact.png": "headless-web-runtime-artifact.png"
+  },
+  "otherScreenshotsRetainedLocally": [
+    "web-source-upload.png",
+    "web-runtime-complete.png",
+    "web-stop-active.png",
+    "web-stop-complete.png"
+  ]
+}

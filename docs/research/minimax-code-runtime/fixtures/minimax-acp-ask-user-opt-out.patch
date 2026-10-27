@@ -1,0 +1,47 @@
+diff --git a/packages/tui/src/cli/program.ts b/packages/tui/src/cli/program.ts
+index f3bbf89..aafc025 100644
+--- a/packages/tui/src/cli/program.ts
++++ b/packages/tui/src/cli/program.ts
+@@ -124,6 +124,7 @@ export function createTuiProgram(options: CreateTuiProgramOptions): Command {
+       .command('acp')
+       .description('Run MiniMax Code as an Agent Client Protocol server over stdio'),
+   )
++    .addHelpText('after', '\nMCODE_DISABLE_ASK_USER=1 hides questionnaire tools for this ACP process only.')
+     .allowExcessArguments(false)
+     .action((commandOptions: RawSystemPromptOptions, command: Command) => {
+       const runAcp = requireAcpRunner(options);
+diff --git a/packages/tui/src/cli/run-acp-command.ts b/packages/tui/src/cli/run-acp-command.ts
+index 672cea9..c3bac44 100644
+--- a/packages/tui/src/cli/run-acp-command.ts
++++ b/packages/tui/src/cli/run-acp-command.ts
+@@ -64,6 +64,9 @@ export async function runTuiAcpCommand(
+       workspaceDir: (dependencies.workspaceDir ?? (() => process.cwd()))(),
+       version,
+       surface: 'acp',
++      // ACP hosts without a questionnaire UI can hide both questionnaire tools
++      // without changing the user's config, auth, or native Session data root.
++      disableAskUser: process.env.MCODE_DISABLE_ASK_USER === '1',
+       ...(lane ? { lane } : {}),
+       ...(systemPromptOverrides ? { systemPromptOverrides } : {}),
+     });
+diff --git a/packages/tui/src/runtime/lifecycle.ts b/packages/tui/src/runtime/lifecycle.ts
+index d4483d1..058c61e 100644
+--- a/packages/tui/src/runtime/lifecycle.ts
++++ b/packages/tui/src/runtime/lifecycle.ts
+@@ -78,6 +78,8 @@ export interface CreateTuiRuntimeOptions {
+   workspaceDir: string;
+   version: string;
+   configPath?: string;
++  /** Process-only host ceiling; never persisted to user or Session config. */
++  disableAskUser?: boolean;
+   promptMode?: CreateLocalRuntimeHostOptions['promptMode'];
+   systemPromptOverrides?: CreateLocalRuntimeHostOptions['systemPromptOverrides'];
+   surface?: TuiObservabilitySurface;
+@@ -151,6 +153,7 @@ export async function createTuiRuntime(
+     const config = getSourceConfig();
+     return {
+       ...config,
++      ...(options.disableAskUser ? { askUser: { enabled: false } } : {}),
+       beta: {
+         ...config.beta,
+         browserUseTooling: browserUseToolingEnabled,

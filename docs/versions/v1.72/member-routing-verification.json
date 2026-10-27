@@ -1,0 +1,328 @@
+{
+  "kind": "member-routing-real-runtime-smoke",
+  "date": "2026-10-13",
+  "formalContextGate": {
+    "status": "not_run",
+    "reason": "Pinned Judge configuration unavailable; no semantic Gate conclusion"
+  },
+  "reports": [
+    {
+      "adapterKind": "codex-cli",
+      "startedAt": "2026-10-13T14:03:23.185Z",
+      "scalars": 10000,
+      "utf8Bytes": 39580,
+      "responsibilitiesSha256": "9182ccca01fcb5660c67424e42b715ad6d05d51134e2fc20c0e852b1be511542",
+      "status": "passed",
+      "readiness": "installed_unverified",
+      "runtimeVersion": "codex-cli 0.162.1",
+      "model": {
+        "mode": "runtime_default"
+      },
+      "warmCoreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "511533bc7e2bb581b05e4e52232e61a7cd2dea9decd3e7ca9358d72ccd7ac0f7",
+        "stderrBytes": 1433
+      },
+      "nativeIdentityEvidence": [
+        {
+          "instructionsBytes": 42214,
+          "responsibilitiesSha256": "9182ccca01fcb5660c67424e42b715ad6d05d51134e2fc20c0e852b1be511542"
+        }
+      ],
+      "runIds": [
+        "c4122e55-11a2-4fd5-8bbe-decdb65e7e00",
+        "3440f5fd-a08f-4c37-ae6f-d65916dbdced",
+        "2951010b-420f-454b-9e00-79bf4dca483e"
+      ],
+      "nativeSessionPreserved": true,
+      "coldResumeAfterCoreRestart": true,
+      "memberListFields": 4,
+      "peerGetSha256": "9182ccca01fcb5660c67424e42b715ad6d05d51134e2fc20c0e852b1be511542",
+      "identityMarkersPresent": true,
+      "manifests": [
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 1
+        },
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 0
+        },
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 0
+        }
+      ],
+      "coreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "a3827b098f96d79c2659bba6e7ff26a83f3541b2268f34191d8d257e944a6b60",
+        "stderrBytes": 1168
+      },
+      "finishedAt": "2026-10-13T14:05:32.225Z",
+      "nativeModels": [
+        "gpt-6.1-sol"
+      ],
+      "nativeSessionId": "01a13593-95d7-7570-a291-63fee66858f9",
+      "observedRuntime": [
+        {
+          "runtime_adapter_kind": "codex-cli",
+          "runtime_reported_version": "codex-cli 0.162.1",
+          "runtime_observed_model_id": "gpt-6.1-sol"
+        },
+        {
+          "runtime_adapter_kind": "codex-cli",
+          "runtime_reported_version": "codex-cli 0.162.1",
+          "runtime_observed_model_id": "gpt-6.1-sol"
+        },
+        {
+          "runtime_adapter_kind": "codex-cli",
+          "runtime_reported_version": "codex-cli 0.162.1",
+          "runtime_observed_model_id": "gpt-6.1-sol"
+        }
+      ],
+      "acceptedInputs": [
+        {
+          "agent_run_id": "c4122e55-11a2-4fd5-8bbe-decdb65e7e00",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:03:47.266430+00:00",
+          "runtime_request_digest": "e7ceb92847ec85f6fe3f70efd50b264590174f5d5a2731f7b0492d74e5b51f59"
+        },
+        {
+          "agent_run_id": "3440f5fd-a08f-4c37-ae6f-d65916dbdced",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:04:46.818253+00:00",
+          "runtime_request_digest": "35d0df04619ce55d1e217d9f26147fb5bfdb328be9445c404e606c0c1793f974"
+        },
+        {
+          "agent_run_id": "2951010b-420f-454b-9e00-79bf4dca483e",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:05:07.369176+00:00",
+          "runtime_request_digest": "daaaade1a08dad90118959b478844fd0571f3a1bd2b30c7a27a6684422d76cc7"
+        }
+      ],
+      "fixtureRoot": "/private/tmp/rovai-member-routing-cold.T4CEqH"
+    },
+    {
+      "adapterKind": "opencode-cli",
+      "startedAt": "2026-10-13T14:11:13.922Z",
+      "scalars": 10000,
+      "utf8Bytes": 39580,
+      "responsibilitiesSha256": "054b26707fd5408f7d82879515967672d3a3455b369a7559b2b6a3e8cb3020a1",
+      "status": "passed",
+      "readiness": "installed_unverified",
+      "runtimeVersion": "opencode v2.0.25",
+      "model": {
+        "mode": "runtime_default"
+      },
+      "warmCoreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "c0829feae9986831a5e5a37721618d7c7221a2303842a17f9f174dc0a33741be",
+        "stderrBytes": 600
+      },
+      "runIds": [
+        "53f81d91-e348-4ae8-a2b6-6c23d4fdf3e1",
+        "f6d27224-1c02-4f3d-8eee-e2868a043a66",
+        "79c6cac8-e266-49eb-a5fe-626bfde69be9"
+      ],
+      "nativeSessionPreserved": true,
+      "coldResumeAfterCoreRestart": true,
+      "memberListFields": 4,
+      "peerGetSha256": "054b26707fd5408f7d82879515967672d3a3455b369a7559b2b6a3e8cb3020a1",
+      "identityMarkersPresent": true,
+      "manifests": [
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 1
+        },
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 0
+        },
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 0
+        }
+      ],
+      "coreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "651c1e77ffcab22cc4198b433da86b8a08c3a1dd80dc55413526516ca37c9d9c",
+        "stderrBytes": 749
+      },
+      "finishedAt": "2026-10-13T14:12:59.557Z",
+      "nativeSessionId": "ses_eca6554daffeoATR4xvpi2fYdq",
+      "observedRuntime": [
+        {
+          "runtime_adapter_kind": "opencode-cli",
+          "runtime_reported_version": "opencode v2.0.25",
+          "runtime_observed_model_id": "sub2api/gpt-6.1-sol"
+        },
+        {
+          "runtime_adapter_kind": "opencode-cli",
+          "runtime_reported_version": "opencode v2.0.25",
+          "runtime_observed_model_id": "sub2api/gpt-6.1-sol"
+        },
+        {
+          "runtime_adapter_kind": "opencode-cli",
+          "runtime_reported_version": "opencode v2.0.25",
+          "runtime_observed_model_id": "sub2api/gpt-6.1-sol"
+        }
+      ],
+      "acceptedInputs": [
+        {
+          "agent_run_id": "53f81d91-e348-4ae8-a2b6-6c23d4fdf3e1",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:12:07.194242+00:00",
+          "runtime_request_digest": "a74dcb479f7b6c0824d575e3ca457531bd2d558a55d489a74d48b88f2d3dd0f0"
+        },
+        {
+          "agent_run_id": "f6d27224-1c02-4f3d-8eee-e2868a043a66",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:12:31.866698+00:00",
+          "runtime_request_digest": "e5976f6556f233ee6997862c85c7b5c70467670c3878f9737026b30c7e5b7a74"
+        },
+        {
+          "agent_run_id": "79c6cac8-e266-49eb-a5fe-626bfde69be9",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:12:59.301564+00:00",
+          "runtime_request_digest": "1bf9229b65aea383bd135f7e679648e788ca6357be8aff78df20c3f4c0423d1a"
+        }
+      ],
+      "fixtureRoot": "/private/tmp/rovai-member-routing-opencode.mFstDL"
+    },
+    {
+      "adapterKind": "pi",
+      "startedAt": "2026-10-13T14:14:09.304Z",
+      "scalars": 10000,
+      "utf8Bytes": 39580,
+      "responsibilitiesSha256": "ab65facaac6d1ca2e4bfeb5b5ea09a564c6c7b76872b8546c571ef7d11dfa22b",
+      "status": "passed",
+      "readiness": "installed_unverified",
+      "runtimeVersion": "1.1.0",
+      "model": {
+        "mode": "runtime_default"
+      },
+      "warmCoreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "34730a6d3416ce9f2088da1656e07c3abbc74d69a3fcdccb784a050ab7642dc8",
+        "stderrBytes": 577
+      },
+      "runIds": [
+        "de24dad6-7fad-4020-8512-35c4c842111f",
+        "a3a372dd-a935-4e77-b261-1962a7e78f8b",
+        "08787f0b-00cf-4543-8b7d-83b1a0eb81bf"
+      ],
+      "nativeSessionPreserved": true,
+      "coldResumeAfterCoreRestart": true,
+      "memberListFields": 4,
+      "peerGetSha256": "ab65facaac6d1ca2e4bfeb5b5ea09a564c6c7b76872b8546c571ef7d11dfa22b",
+      "identityMarkersPresent": true,
+      "manifests": [
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 1
+        },
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 0
+        },
+        {
+          "context_manifest_version": 34,
+          "formatter_version": 34,
+          "context_delivery_profile_version": 11,
+          "collaboration_state_included": 0
+        }
+      ],
+      "coreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "d7504403b59ddd67d58757607883458a023979114da7db4c28e8506f118029ea",
+        "stderrBytes": 749
+      },
+      "finishedAt": "2026-10-13T14:15:38.274Z",
+      "nativeSessionId": "01a1359d-388b-76a1-95b7-f146e15f8f38",
+      "observedRuntime": [
+        {
+          "runtime_adapter_kind": "pi",
+          "runtime_reported_version": "1.1.0",
+          "runtime_observed_model_id": "pi://model?provider=sub2api&id=gpt-6.1-sol"
+        },
+        {
+          "runtime_adapter_kind": "pi",
+          "runtime_reported_version": "1.1.0",
+          "runtime_observed_model_id": "pi://model?provider=sub2api&id=gpt-6.1-sol"
+        },
+        {
+          "runtime_adapter_kind": "pi",
+          "runtime_reported_version": "1.1.0",
+          "runtime_observed_model_id": "pi://model?provider=sub2api&id=gpt-6.1-sol"
+        }
+      ],
+      "acceptedInputs": [
+        {
+          "agent_run_id": "de24dad6-7fad-4020-8512-35c4c842111f",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:14:18.565915+00:00",
+          "runtime_request_digest": "fd35417de236eefb7b4f3812b662624b0f0c691433a5a6fb1ca7199b420d933d"
+        },
+        {
+          "agent_run_id": "a3a372dd-a935-4e77-b261-1962a7e78f8b",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:14:52.389733+00:00",
+          "runtime_request_digest": "a55b7a5dfc4f89072d83d378a48e00f8b1276853c78930a9c4b660cba5e5bfc5"
+        },
+        {
+          "agent_run_id": "08787f0b-00cf-4543-8b7d-83b1a0eb81bf",
+          "status": "accepted",
+          "accepted_at": "2026-10-13T14:15:11.721723+00:00",
+          "runtime_request_digest": "a67a6f6e776f790888ba183660ca0ad236ec166741b1d264c7c831c2a7b5acb7"
+        }
+      ],
+      "fixtureRoot": "/private/tmp/rovai-member-routing-pi.xZ34Ed"
+    },
+    {
+      "adapterKind": "cline-cli",
+      "startedAt": "2026-10-13T14:11:13.922Z",
+      "scalars": 10000,
+      "utf8Bytes": 39580,
+      "responsibilitiesSha256": "8fbf12eae54ce35ad278a37bb679d53e6efe702a4c354527e1b9f5610efa104c",
+      "status": "failed",
+      "error": "runtime_platform_not_qualified: {\"field\":\"runtime\",\"platformAdmission\":{\"evidenceRevision\":null,\"platform\":\"macos-arm64\",\"reasonCode\":\"runtime_platform.qualification_evidence_missing\",\"runtimeKind\":\"cline-cli\",\"status\":\"not_qualified\"},\"runtimeKind\":\"cline-cli\"}",
+      "coreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "2ce174a7e45ac1b4439b9dfd7c61689238a7201e2d09f9fd4d07347e3b3c61b1",
+        "stderrBytes": 451
+      },
+      "finishedAt": "2026-10-13T14:11:28.486Z",
+      "acceptedInputs": [],
+      "fixtureRoot": "/private/tmp/rovai-member-routing-cline.CTj3zy"
+    }
+  ],
+  "limits": [
+    "Only Codex has native transcript byte-for-byte identity verification; OpenCode and Pi combine member get hashes, first/middle/last identity markers and accepted input receipts.",
+    "No real compaction signal was triggered; long Bootstrap redelivery is covered by Core integration tests.",
+    "Cold Core startup emitted an empty fixture attachment-view integrity warning; these member identity runs still succeeded.",
+    "No Windows or Linux real Runtime run, packaging, release or daily-data upgrade was performed."
+  ]
+}

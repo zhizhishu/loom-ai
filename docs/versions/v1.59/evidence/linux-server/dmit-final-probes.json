@@ -1,0 +1,1058 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-14",
+  "scope": "DMIT resumed light probes, packaged Server OS and partial Runtime integration; then user-requested migration and cleanup",
+  "sourceCommit": "bda1ab832d48229a4b91c2530a599b32029827cc",
+  "fullRuntimeQualification": false,
+  "records": {
+    "qwen-native-result-v2.json": {
+      "runtime": "qwen",
+      "version": "0.23.3",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 12.67,
+      "toolFileVerified": true,
+      "exactNewline": true,
+      "markerInOutput": true,
+      "eventTypes": [
+        "assistant",
+        "result",
+        "stream_event",
+        "system",
+        "user"
+      ],
+      "rovaiIntegration": false
+    },
+    "install-opencode.json": {
+      "name": "install-opencode",
+      "initial": {
+        "availableKiB": 1674244,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1327448,
+      "peakTestUserRssKiB": 513928,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 13.04,
+      "final": {
+        "availableKiB": 1677000,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-qwen.json": {
+      "name": "install-qwen",
+      "initial": {
+        "availableKiB": 1636116,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1536904,
+      "peakTestUserRssKiB": 202276,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 4.52,
+      "final": {
+        "availableKiB": 1676420,
+        "swapUsedKiB": 0
+      }
+    },
+    "byok-opencode.json": {
+      "name": "byok-opencode",
+      "initial": {
+        "availableKiB": 1671120,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1066384,
+      "peakTestUserRssKiB": 715924,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 30.59,
+      "final": {
+        "availableKiB": 1673744,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-grok.json": {
+      "name": "install-grok",
+      "initial": {
+        "availableKiB": 1679500,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1635752,
+      "peakTestUserRssKiB": 117104,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 2.01,
+      "final": {
+        "availableKiB": 1663044,
+        "swapUsedKiB": 0
+      }
+    },
+    "copilot-native-result.json": {
+      "runtime": "copilot",
+      "version": "GitHub Copilot CLI 1.0.83.\nRun 'copilot update' to check for updates.",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 7.57,
+      "toolFileVerified": false,
+      "markerInOutput": true,
+      "eventTypes": [
+        "assistant.idle",
+        "assistant.message",
+        "assistant.message_delta",
+        "assistant.message_start",
+        "assistant.tool_call_delta",
+        "assistant.turn_end",
+        "assistant.turn_start",
+        "model.call_finished",
+        "model.call_start",
+        "result",
+        "session.info",
+        "session.mcp_servers_loaded",
+        "session.skills_loaded",
+        "session.tools_updated",
+        "tool.execution_complete",
+        "tool.execution_start",
+        "user.message"
+      ],
+      "rovaiIntegration": false,
+      "diagnostic": "ccess\",\"editClassifierVersion\":1,\"interactionId\":\"477f1035-8936-42a6-8876-e1c0636ce423\",\"containsBuiltInFileEditRequest\":false},\"ephemeral\":true,\"id\":\"b75e5f71-044a-4165-9974-44f5e371890c\",\"timestamp\":\"2026-09-14T11:49:21.820Z\",\"parentId\":\"649dc3de-a973-4ea5-a3b2-042aa94a8d82\"}\n{\"type\":\"assistant.message\",\"data\":{\"messageId\":\"c28daa4a-e2ef-45b2-b720-af68c6a30128\",\"model\":\"MiniMax-M3\",\"content\":\"<think>File created and verified. Now reply with the exact marker.</think>\\n\\nROVAI_LINUX_COPILOT_TOOL_OK\",\"toolRequests\":[],\"interactionId\":\"477f1035-8936-42a6-8876-e1c0636ce423\",\"turnId\":\"2\",\"rte\":false,\"apiCallId\":\"06f712404592b5c99c70380166114663\"},\"id\":\"b6c1fd80-90c1-461a-8cc4-d4c5cb75404c\",\"timestamp\":\"2026-09-14T11:49:21.821Z\",\"parentId\":\"649dc3de-a973-4ea5-a3b2-042aa94a8d82\"}\n{\"type\":\"assistant.turn_end\",\"data\":{\"turnId\":\"2\"},\"id\":\"3dfbc2b6-044b-4cd6-805e-a6794c20b2fb\",\"timestamp\":\"2026-09-14T11:49:21.823Z\",\"parentId\":\"b6c1fd80-90c1-461a-8cc4-d4c5cb75404c\"}\n{\"type\":\"assistant.idle\",\"data\":{},\"ephemeral\":true,\"id\":\"7e427db3-0338-47fb-9b9f-cff86d044f41\",\"timestamp\":\"2026-09-14T11:49:21.826Z\",\"parentId\":\"3dfbc2b6-044b-4cd6-805e-a6794c20b2fb\"}\n{\"type\":\"result\",\"timestamp\":\"2026-09-14T11:49:21.835Z\",\"sessionId\":\"ebc002f9-8cd9-425c-83f9-71b77a07c83d\",\"exitCode\":0,\"usage\":{\"premiumRequests\":0,\"totalApiDurationMs\":6129,\"sessionDurationMs\":6459,\"codeChanges\":{\"linesAdded\":1,\"linesRemoved\":0,\"filesModified\":[\"/home/rovai-test/qualification/workspace-copilot/linux-runtime-marker.txt\"]}}}\n"
+    },
+    "claude-native.json": {
+      "name": "claude-native",
+      "initial": {
+        "availableKiB": 1678984,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1553188,
+      "peakTestUserRssKiB": 245128,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 10.53,
+      "final": {
+        "availableKiB": 1673860,
+        "swapUsedKiB": 0
+      }
+    },
+    "inspect-more.json": {
+      "name": "inspect-more",
+      "initial": {
+        "availableKiB": 1657780,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1008628,
+      "peakTestUserRssKiB": 778756,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 11.03,
+      "final": {
+        "availableKiB": 1685500,
+        "swapUsedKiB": 0
+      }
+    },
+    "server-claude-1.json": {
+      "name": "server-claude-1",
+      "initial": {
+        "availableKiB": 1642612,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1544248,
+      "peakTestUserRssKiB": 502000,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 4.01,
+      "final": {
+        "availableKiB": 1632444,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-codebuddy.json": {
+      "name": "install-codebuddy",
+      "initial": {
+        "availableKiB": 1676956,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1477496,
+      "peakTestUserRssKiB": 214940,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 4.52,
+      "final": {
+        "availableKiB": 1678200,
+        "swapUsedKiB": 0
+      }
+    },
+    "codex-native.json": {
+      "name": "codex-native",
+      "initial": {
+        "availableKiB": 1685464,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1607744,
+      "peakTestUserRssKiB": 233348,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 12.54,
+      "final": {
+        "availableKiB": 1679920,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-trae.json": {
+      "name": "install-trae",
+      "initial": {
+        "availableKiB": 1680176,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1676880,
+      "peakTestUserRssKiB": 28288,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 2.51,
+      "final": {
+        "availableKiB": 1650524,
+        "swapUsedKiB": 0
+      }
+    },
+    "server-codex-1.json": {
+      "name": "server-codex-1",
+      "initial": {
+        "availableKiB": 1679764,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1578016,
+      "peakTestUserRssKiB": 235860,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 88.77,
+      "final": {
+        "availableKiB": 1678108,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-antigravity.json": {
+      "name": "install-antigravity",
+      "initial": {
+        "availableKiB": 1680428,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1648844,
+      "peakTestUserRssKiB": 105056,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 3.53,
+      "final": {
+        "availableKiB": 1686224,
+        "swapUsedKiB": 0
+      }
+    },
+    "codebuddy-native-result-v3.json": {
+      "runtime": "codebuddy",
+      "version": "2.150.0",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 2.57,
+      "toolFileVerified": false,
+      "exactNewline": false,
+      "markerInOutput": false,
+      "eventTypes": [
+        "assistant",
+        "file-history-snapshot",
+        "result",
+        "system"
+      ],
+      "rovaiIntegration": false,
+      "diagnostic": "message\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":null,\"server_tool_use\":null,\"service_tier\":null}},\"parent_tool_use_id\":null,\"_requestId\":\"01a09fca22c47710b2e1bbd3314ebe05\",\"_meta\":{\"codebuddy.ai/conversationRequestId\":\"01a09fca22c47710b2e1bbd3314ebe05\",\"codebuddy.ai/messageId\":\"01a09fca-2381-7ce7-966d-90edf150d2eb\",\"baggage\":\"codebuddy.session_id=01a09fca-20ec-7051-a91c-8c90bac7b486,codebuddy.conversation_request_id=01a09fca22c47710b2e1bbd3314ebe05\"},\"__timestamp\":\"2026-09-14T12:00:19.891Z\"}\n{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"uuid\":\"01a09fca-23b5-70a1-91ad-2418dd452222\",\"session_id\":\"01a09fca-20ec-7051-a91c-8c90bac7b486\",\"duration_ms\":96,\"duration_api_ms\":55,\"num_turns\":2,\"total_cost_usd\":0,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":null,\"server_tool_use\":null,\"service_tier\":null},\"permission_denials\":[],\"errors\":[\"Authentication required. Please use /login command to sign in to your account\"],\"modelUsage\":{\"custom:MiniMax-M3\":{\"inputTokens\":0,\"outputTokens\":0,\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":0,\"contextWindow\":0,\"maxOutputTokens\":0}},\"_meta\":{\"baggage\":\"codebuddy.session_id=01a09fca-20ec-7051-a91c-8c90bac7b486,codebuddy.conversation_request_id=01a09fca22c47710b2e1bbd3314ebe05\"},\"__timestamp\":\"2026-09-14T12:00:19.895Z\",\"_requestId\":\"01a09fca22c47710b2e1bbd3314ebe05\"}\n"
+    },
+    "opencode-native-result.json": {
+      "runtime": "opencode",
+      "version": "1.18.30",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 30.35,
+      "toolFileVerified": false,
+      "markerInOutput": true,
+      "eventTypes": [
+        "step_finish",
+        "step_start",
+        "text",
+        "tool_use"
+      ],
+      "rovaiIntegration": false,
+      "diagnostic": "\",\"timestamp\":1789386547416,\"sessionID\":\"ses_f60408053ffeIMqADvVmVmBNfr\",\"part\":{\"id\":\"prt_09fbfe082001U2oSubCtMPzmaN\",\"reason\":\"tool-calls\",\"messageID\":\"msg_09fbfbcdc001DZFzlqW8CMRtwh\",\"sessionID\":\"ses_f60408053ffeIMqADvVmVmBNfr\",\"type\":\"step-finish\",\"tokens\":{\"total\":7594,\"input\":190,\"output\":45,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":7359}},\"cost\":0}}\n{\"type\":\"step_start\",\"timestamp\":1789386549595,\"sessionID\":\"ses_f60408053ffeIMqADvVmVmBNfr\",\"part\":{\"id\":\"prt_09fbfe94f001i7trYN7ULOKB8n\",\"messageID\":\"msg_09fbfe0a2001OjTh8KyxdlouBR\",\"sessionID\":\"ses_f60408053ffeIMqADvVmVmBNfr\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"timestamp\":1789386550041,\"sessionID\":\"ses_f60408053ffeIMqADvVmVmBNfr\",\"part\":{\"id\":\"prt_09fbfe955001CMuPIPkdX8Jug2\",\"messageID\":\"msg_09fbfe0a2001OjTh8KyxdlouBR\",\"sessionID\":\"ses_f60408053ffeIMqADvVmVmBNfr\",\"type\":\"text\",\"text\":\"<think>The file has been created and read back successfully. The content is exactly \\\"ROVAI_LINUX_OPENCODE_TOOL_OK\\\" followed by a newline. Now I need to reply with thatexact marker.</think>\\n\\nROVAI_LINUX_OPENCODE_TOOL_OK\",\"time\":{\"start\":1789386549589,\"end\":1789386549997}}}\n{\"type\":\"step_finish\",\"timestamp\":1789386550042,\"sessionID\":\"ses_f60408053ffeIMqADvVmVmBNfr\",\"part\":{\"id\":\"prt_09fbfeaf4001PmLPS7MbliDQHb\",\"reason\":\"stop\",\"messageID\":\"msg_09fbfe0a2001OjTh8KyxdlouBR\",\"sessionID\":\"ses_f60408053ffeIMqADvVmVmBNfr\",\"type\":\"step-finish\",\"tokens\":{\"total\":7720,\"input\":117,\"output\":13,\"reasoning\":41,\"cache\":{\"write\":0,\"read\":7549}},\"cost\":0}}\n"
+    },
+    "install-codex.json": {
+      "name": "install-codex",
+      "initial": {
+        "availableKiB": 1667556,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1405972,
+      "peakTestUserRssKiB": 336572,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 7.03,
+      "final": {
+        "availableKiB": 1684552,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-kiro.json": {
+      "name": "install-kiro",
+      "initial": {
+        "availableKiB": 1676092,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1667196,
+      "peakTestUserRssKiB": 27908,
+      "maximumSwapUsedKiB": 0,
+      "status": "stopped",
+      "exitCode": -15,
+      "reason": "test_cgroup_memory_pressure",
+      "elapsedSeconds": 14.08,
+      "final": {
+        "availableKiB": 1671372,
+        "swapUsedKiB": 0
+      }
+    },
+    "codebuddy-native-result-v2.json": {
+      "runtime": "codebuddy",
+      "version": "2.150.0",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 4.21,
+      "toolFileVerified": false,
+      "exactNewline": false,
+      "markerInOutput": false,
+      "eventTypes": [
+        "assistant",
+        "file-history-snapshot",
+        "result",
+        "system"
+      ],
+      "rovaiIntegration": false,
+      "diagnostic": "71dc94b14e\",\"traceparent\":\"00-b177ade1065b0ed8d96714dcca9ad22b-9ae3bd07db47546b-01\",\"baggage\":\"codebuddy.session_id=01a09fc6-f718-752d-b719-115140b8ee45,codebuddy.conversation_request_id=01a09fc6f8c370319e743ff74b5a59f1\"},\"__timestamp\":\"2026-09-14T11:56:54.350Z\"}\n{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"uuid\":\"01a09fc7-00cf-7d72-a668-c115a1d6bcae\",\"session_id\":\"01a09fc6-f718-752d-b719-115140b8ee45\",\"duration_ms\":1887,\"duration_api_ms\":1657,\"num_turns\":2,\"total_cost_usd\":0,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":null,\"server_tool_use\":null,\"service_tier\":null},\"permission_denials\":[],\"errors\":[\"404 404 page not found (target: https://api.minimaxi.com) (01a09fc6f992714b9876c4440b632406/01a09fc6-f718-752d-b719-115140b8ee45)\"],\"errors_info\":[{\"status\":404,\"code\":404,\"details\":\"404 404 page not found (target: https://api.minimaxi.com) (01a09fc6f992714b9876c4440b632406/01a09fc6-f718-752d-b719-115140b8ee45)\"}],\"modelUsage\":{\"minimax-m3\":{\"inputTokens\":0,\"outputTokens\":0,\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":0,\"contextWindow\":512000,\"maxOutputTokens\":128000}},\"_meta\":{\"traceparent\":\"00-b177ade1065b0ed8d96714dcca9ad22b-9ae3bd07db47546b-01\",\"baggage\":\"codebuddy.session_id=01a09fc6-f718-752d-b719-115140b8ee45,codebuddy.conversation_request_id=01a09fc6f8c370319e743ff74b5a59f1\"},\"__timestamp\":\"2026-09-14T11:56:54.352Z\",\"_requestId\":\"01a09fc6f8c370319e743ff74b5a59f1\"}\n"
+    },
+    "install-kimi.json": {
+      "name": "install-kimi",
+      "initial": {
+        "availableKiB": 1650604,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1650604,
+      "peakTestUserRssKiB": 33148,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 2.51,
+      "final": {
+        "availableKiB": 1657952,
+        "swapUsedKiB": 0
+      }
+    },
+    "provider-protocols.json": {
+      "model": "MiniMax-M3",
+      "endpoint": "api.minimaxi.com",
+      "results": [
+        {
+          "protocol": "chat_completions",
+          "httpStatus": 200,
+          "responseType": null,
+          "model": "MiniMax-M3",
+          "hasChoices": true,
+          "hasContent": false,
+          "hasOutput": false,
+          "providerStatusCode": 0,
+          "providerStatusMessage": ""
+        },
+        {
+          "protocol": "responses",
+          "httpStatus": 200,
+          "responseType": null,
+          "model": "MiniMax-M3",
+          "hasChoices": false,
+          "hasContent": false,
+          "hasOutput": true
+        },
+        {
+          "protocol": "messages",
+          "httpStatus": 200,
+          "responseType": "message",
+          "model": "MiniMax-M3",
+          "hasChoices": false,
+          "hasContent": true,
+          "hasOutput": false,
+          "providerStatusCode": 0,
+          "providerStatusMessage": ""
+        }
+      ]
+    },
+    "claude-native-result.json": {
+      "runtime": "claude",
+      "version": "2.1.270 (Claude Code)",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 10.17,
+      "toolFileVerified": true,
+      "markerInOutput": true,
+      "eventTypes": [
+        "assistant",
+        "result",
+        "system",
+        "user"
+      ],
+      "rovaiIntegration": false
+    },
+    "server-claude-3.json": {
+      "name": "server-claude-3",
+      "initial": {
+        "availableKiB": 1658636,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1492996,
+      "peakTestUserRssKiB": 515540,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 28.59,
+      "final": {
+        "availableKiB": 1633444,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-node.json": {
+      "name": "install-node",
+      "initial": {
+        "availableKiB": 1684952,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1600592,
+      "peakTestUserRssKiB": 105028,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 5.52,
+      "final": {
+        "availableKiB": 1683316,
+        "swapUsedKiB": 0
+      }
+    },
+    "byok-v3-grok.json": {
+      "name": "byok-v3-grok",
+      "initial": {
+        "availableKiB": 1676752,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1636456,
+      "peakTestUserRssKiB": 131236,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 24.07,
+      "final": {
+        "availableKiB": 1637688,
+        "swapUsedKiB": 0
+      }
+    },
+    "codex-native-result.json": {
+      "runtime": "codex",
+      "version": "codex-cli 0.154.0",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 12.03,
+      "toolFileVerified": true,
+      "markerInOutput": true,
+      "eventTypes": [
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "rovaiIntegration": false
+    },
+    "install-claude.json": {
+      "name": "install-claude",
+      "initial": {
+        "availableKiB": 1654872,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1476888,
+      "peakTestUserRssKiB": 247632,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 5.02,
+      "final": {
+        "availableKiB": 1684328,
+        "swapUsedKiB": 0
+      }
+    },
+    "SKIP_KIRO.json": {
+      "reason": "User explicitly authorized resuming other lightweight tests while skipping Kiro",
+      "memoryLimitsUnchanged": true
+    },
+    "dmit-server-os.json": {
+      "schemaVersion": 1,
+      "gate": "server_os",
+      "runtimeQualification": false,
+      "sourceCommit": "bda1ab832d48229a4b91c2530a599b32029827cc",
+      "packageManifestSha256": "168e98f55c831df65e240b4f74fc1247000f5b33667411541a7bbce329a77865",
+      "platform": "Linux-6.1.0-49-amd64-x86_64-with-glibc2.36",
+      "libc": [
+        "glibc",
+        "2.36"
+      ],
+      "osRelease": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nVERSION_ID=\"12\"\nVERSION=\"12 (bookworm)\"\nVERSION_CODENAME=bookworm\nID=debian\nHOME_URL=\"https://www.debian.org/\"\nSUPPORT_URL=\"https://www.debian.org/support\"\nBUG_REPORT_URL=\"https://bugs.debian.org/\"\n",
+      "checks": [
+        "package_hashes",
+        "web_ui",
+        "authentication",
+        "authenticated_read_write",
+        "no_node_electron_or_rust_on_host_path",
+        "exclusive_data_root",
+        "durable_sigterm",
+        "restart",
+        "persisted_data",
+        "persisted_session",
+        "persisted_token"
+      ],
+      "status": "passed"
+    },
+    "server-gate-a.json": {
+      "name": "server-gate-a",
+      "initial": {
+        "availableKiB": 1666160,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1662812,
+      "peakTestUserRssKiB": 59976,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 5.52,
+      "final": {
+        "availableKiB": 1660808,
+        "swapUsedKiB": 0
+      }
+    },
+    "pi-native-result.json": {
+      "runtime": "pi",
+      "version": "0.85.1",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 14.42,
+      "toolFileVerified": true,
+      "markerInOutput": true,
+      "eventTypes": [
+        "agent_end",
+        "agent_settled",
+        "agent_start",
+        "message_end",
+        "message_start",
+        "message_update",
+        "session",
+        "tool_execution_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "turn_end",
+        "turn_start"
+      ],
+      "rovaiIntegration": false
+    },
+    "byok-v2-qwen.json": {
+      "name": "byok-v2-qwen",
+      "initial": {
+        "availableKiB": 1675680,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1312732,
+      "peakTestUserRssKiB": 526236,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 13.04,
+      "final": {
+        "availableKiB": 1626928,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-cursor.json": {
+      "name": "install-cursor",
+      "initial": {
+        "availableKiB": 1663208,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1619400,
+      "peakTestUserRssKiB": 35356,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 6.03,
+      "final": {
+        "availableKiB": 1678676,
+        "swapUsedKiB": 0
+      }
+    },
+    "STOP_MEMORY-kiro-skipped-with-user-approval.json": {
+      "name": "install-kiro",
+      "initial": {
+        "availableKiB": 1676092,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1667196,
+      "peakTestUserRssKiB": 27908,
+      "maximumSwapUsedKiB": 0,
+      "status": "stopped",
+      "exitCode": -15,
+      "reason": "test_cgroup_memory_pressure",
+      "elapsedSeconds": 14.08,
+      "final": {
+        "availableKiB": 1671372,
+        "swapUsedKiB": 0
+      }
+    },
+    "grok-native-result-v3.json": {
+      "runtime": "grok",
+      "version": "grok 1.0.30 (04b7ffed98c6)",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 24.02,
+      "toolFileVerified": true,
+      "exactNewline": true,
+      "markerInOutput": true,
+      "eventTypes": [
+        "available_commands",
+        "end",
+        "text",
+        "tool_call",
+        "tool_call_update",
+        "usage"
+      ],
+      "rovaiIntegration": false
+    },
+    "byok-pi.json": {
+      "name": "byok-pi",
+      "initial": {
+        "availableKiB": 1635348,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1577296,
+      "peakTestUserRssKiB": 150684,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 14.54,
+      "final": {
+        "availableKiB": 1671140,
+        "swapUsedKiB": 0
+      }
+    },
+    "codex-auth-check.json": {
+      "name": "codex-auth-check",
+      "initial": {
+        "availableKiB": 1667708,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1667708,
+      "peakTestUserRssKiB": 11708,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 0.5,
+      "final": {
+        "availableKiB": 1641444,
+        "swapUsedKiB": 0
+      }
+    },
+    "byok-copilot.json": {
+      "name": "byok-copilot",
+      "initial": {
+        "availableKiB": 1675868,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1479776,
+      "peakTestUserRssKiB": 317816,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 8.02,
+      "final": {
+        "availableKiB": 1680176,
+        "swapUsedKiB": 0
+      }
+    },
+    "qwen-native-result.json": {
+      "runtime": "qwen",
+      "version": "0.23.3",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 4.81,
+      "toolFileVerified": false,
+      "markerInOutput": false,
+      "eventTypes": [
+        "assistant",
+        "result",
+        "stream_event",
+        "system"
+      ],
+      "rovaiIntegration": false,
+      "diagnostic": "Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.\n"
+    },
+    "install-copilot.json": {
+      "name": "install-copilot",
+      "initial": {
+        "availableKiB": 1676396,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1464332,
+      "peakTestUserRssKiB": 266576,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 6.02,
+      "final": {
+        "availableKiB": 1675284,
+        "swapUsedKiB": 0
+      }
+    },
+    "install-qoder.json": {
+      "name": "install-qoder",
+      "initial": {
+        "availableKiB": 1674800,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1270612,
+      "peakTestUserRssKiB": 559732,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 9.53,
+      "final": {
+        "availableKiB": 1677496,
+        "swapUsedKiB": 0
+      }
+    },
+    "byok-v3-codebuddy.json": {
+      "name": "byok-v3-codebuddy",
+      "initial": {
+        "availableKiB": 1684332,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1410928,
+      "peakTestUserRssKiB": 329260,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 3.01,
+      "final": {
+        "availableKiB": 1676692,
+        "swapUsedKiB": 0
+      }
+    },
+    "byok-v2-codebuddy.json": {
+      "name": "byok-v2-codebuddy",
+      "initial": {
+        "availableKiB": 1681028,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1384516,
+      "peakTestUserRssKiB": 340820,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 4.51,
+      "final": {
+        "availableKiB": 1679468,
+        "swapUsedKiB": 0
+      }
+    },
+    "inspect-native.json": {
+      "name": "inspect-native",
+      "initial": {
+        "availableKiB": 1676508,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1380132,
+      "peakTestUserRssKiB": 407492,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 17.55,
+      "final": {
+        "availableKiB": 1677628,
+        "swapUsedKiB": 0
+      }
+    },
+    "byok-qwen.json": {
+      "name": "byok-qwen",
+      "initial": {
+        "availableKiB": 1679456,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1302028,
+      "peakTestUserRssKiB": 532908,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 5.02,
+      "final": {
+        "availableKiB": 1680056,
+        "swapUsedKiB": 0
+      }
+    },
+    "server-claude-2.json": {
+      "name": "server-claude-2",
+      "initial": {
+        "availableKiB": 1682692,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1498148,
+      "peakTestUserRssKiB": 376332,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 11.54,
+      "final": {
+        "availableKiB": 1685344,
+        "swapUsedKiB": 0
+      }
+    },
+    "qoder-auth-result.json": {
+      "runtime": "qoder-auth",
+      "exitCode": 1,
+      "output": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"duration_ms\":0,\"duration_api_ms\":0,\"num_turns\":1,\"result\":\"Not logged in · Please run /login\",\"stop_reason\":\"stop_sequence\",\"session_id\":\"50910443-f512-4437-96ce-7a434903e6f2\",\"total_cost_usd\":0,\"total_credits\":0,\"usage\":{\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"\",\"iterations\":[],\"speed\":\"standard\"},\"modelUsage\":{},\"permission_denials\":[],\"terminal_reason\":\"completed\",\"uuid\":\"ea384a42-be56-4322-ba27-59b75fef329b\"}\n"
+    },
+    "install-pi.json": {
+      "name": "install-pi",
+      "initial": {
+        "availableKiB": 1637632,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1369384,
+      "peakTestUserRssKiB": 395852,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 14.05,
+      "final": {
+        "availableKiB": 1620676,
+        "swapUsedKiB": 0
+      }
+    },
+    "provider.json": {
+      "name": "provider",
+      "initial": {
+        "availableKiB": 1678400,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1668152,
+      "peakTestUserRssKiB": 33504,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 5.02,
+      "final": {
+        "availableKiB": 1667960,
+        "swapUsedKiB": 0
+      }
+    },
+    "cursor-auth-result.json": {
+      "runtime": "cursor-auth",
+      "exitCode": 0,
+      "output": "Not logged in\n"
+    },
+    "server-integration-claude-code-cli-1/result.json": {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "claude-code-cli",
+      "sourceCommit": "bda1ab832d48229a4b91c2530a599b32029827cc",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-claude-code-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-claude-code-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-claude-code-cli-1/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions"
+      ],
+      "runs": [],
+      "runtimeVersion": "2.1.270 (Claude Code)",
+      "admission": null,
+      "status": "failed",
+      "error": "camps.snapshot HTTP status\n\n400 !== 200\n"
+    },
+    "server-integration-codex-cli-1/result.json": {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "codex-cli",
+      "sourceCommit": "bda1ab832d48229a4b91c2530a599b32029827cc",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-codex-cli-1/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-codex-cli-1/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-codex-cli-1/data/mcp.json",
+      "checks": [],
+      "runs": [],
+      "status": "failed",
+      "error": "Product Runtime was not resolved: {\"adapterKind\":\"codex-cli\",\"agentId\":\"agent_1\",\"resolved\":null}"
+    },
+    "server-integration-claude-code-cli-2/result.json": {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "claude-code-cli",
+      "sourceCommit": "bda1ab832d48229a4b91c2530a599b32029827cc",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-claude-code-cli-2/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-claude-code-cli-2/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-claude-code-cli-2/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions"
+      ],
+      "runs": [
+        {
+          "id": "f9acb5dd-4780-4eec-ba85-4b7ca19f5db0",
+          "status": "succeeded",
+          "conversationId": "91144980-5cce-4e9d-8296-02f47c14701b"
+        }
+      ],
+      "runtimeVersion": "2.1.270 (Claude Code)",
+      "admission": null,
+      "status": "failed",
+      "error": "Cannot read properties of undefined (reading 'some')"
+    },
+    "server-integration-claude-code-cli-3/result.json": {
+      "schemaVersion": 1,
+      "gate": "runtime_integration_probe",
+      "runtime": "claude-code-cli",
+      "sourceCommit": "bda1ab832d48229a4b91c2530a599b32029827cc",
+      "fullQualification": false,
+      "dataDir": "/home/rovai-test/qualification/server-integration-claude-code-cli-3/data",
+      "skillLibraryRoot": "/home/rovai-test/qualification/server-integration-claude-code-cli-3/data/skills",
+      "mcpConfigPath": "/home/rovai-test/qualification/server-integration-claude-code-cli-3/data/mcp.json",
+      "checks": [
+        "native_discovery_auth_model_and_permissions",
+        "http_send_native_tool_write_read_and_final_projection",
+        "warm_conversation_continuation",
+        "server_restart_persisted_auth_and_cold_conversation_continuation"
+      ],
+      "runs": [
+        {
+          "id": "408ae180-12bf-4eab-bdca-c054150ffb56",
+          "status": "succeeded",
+          "conversationId": "3fce4032-03b8-4659-9d0c-908ad2288e0e"
+        },
+        {
+          "id": "fc5dd43a-f3a4-4a42-ab92-2c69ec5e94cc",
+          "status": "succeeded",
+          "conversationId": "3fce4032-03b8-4659-9d0c-908ad2288e0e"
+        },
+        {
+          "id": "9abd7208-163a-4c13-ba57-8035d044d990",
+          "status": "succeeded",
+          "conversationId": "3fce4032-03b8-4659-9d0c-908ad2288e0e"
+        }
+      ],
+      "runtimeVersion": "2.1.270 (Claude Code)",
+      "admission": null,
+      "toolEvidence": [
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "Write",
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_result",
+          "phase": "completed",
+          "toolName": "Read",
+          "outcome": "succeeded"
+        }
+      ],
+      "status": "failed",
+      "error": "Cancellable tool must still be active"
+    }
+  },
+  "cleanup": {
+    "reason": "User moved testing to a dedicated development machine",
+    "testAccountAndHomeRemoved": true,
+    "installedRuntimesNodeServerAndTestCredentialsRemoved": true,
+    "testProcesses": 0,
+    "testSystemdUnits": 0,
+    "xray": "active",
+    "availableMiB": 1667,
+    "swapUsedMiB": 0
+  }
+}

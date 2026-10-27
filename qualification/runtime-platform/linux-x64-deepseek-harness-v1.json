@@ -1,0 +1,235 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "linux-x64-deepseek-harness-v1",
+  "capturedAt": "2026-09-17",
+  "platform": "linux-x64",
+  "hostEnvelope": {
+    "os": "Ubuntu 24.04.5 LTS",
+    "kernel": "6.8.0-41-generic",
+    "libc": "glibc 2.39",
+    "architecture": "x86_64",
+    "cpuCores": 4,
+    "memoryMiB": 7941
+  },
+  "baseRevision": "d664e3293af862f13eeb5146e077c282f8eaf5cd",
+  "qualifiedRuntimeKinds": [
+    "deepseek-harness"
+  ],
+  "runtimeEvidence": {
+    "runtimeVersion": "0.1.5-rc.2",
+    "minimumVersion": ">=0.1.5-rc.2",
+    "protocol": "acp-v1",
+    "bridgeVersion": "0.0.1",
+    "nodeVersion": "24.21.0",
+    "launch": "dsh --profile acp --patch <private-rovai-patch>",
+    "package": "@deepseek-ai/dsh@0.1.5-rc.2",
+    "packageIntegrity": "sha512-8Xc8hCQHcIWRmTCVU/xZdp6/qMsWMeAd2ObChKDEsfhUPJFXx6H0lgeb1DxUMD86HZrrVN+1bCvn1ppjZ/fOxw==",
+    "executableFingerprint": "sha256:0ff7f1d72c4e0cbe14001709c81e20a04b70464118a7f78568952988e28f2ac5",
+    "realProvider": "MiniMax-M3 through the official Anthropic-compatible endpoint and native llm-pi-ai route",
+    "credentialUse": "User-authorized acceptance only; process-local isolated child environment; no secret in argv, repository or public evidence"
+  },
+  "acceptance": {
+    "status": "qualified",
+    "platformScope": "linux-x64 only",
+    "referenceMatrix": "docs/research/deepseek-harness-runtime/acp-0.1.5-parity.md",
+    "axes": {
+      "authProviderModel": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native DSH settings/profile and grouped catalog; real MiniMax-M3 generation through the native provider route; explicit opaque catalog selection; the product accepts 0.1.5-rc.2 and higher while this artifact records the exact version tested."
+      },
+      "hostFleetLru": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Shared resident_multi_session Fleet; same-Host warm, native A/B/A, concurrent distinct Hosts and Sessions, exact switch-back, Core crash recovery, production idle eviction with exact resume, and planned shutdown process cleanup."
+      },
+      "nativeSessionContinuation": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Exact warm and Core cold resume; compacted Session restoration; no history Action or Approval replay; one invalid persisted identity produces one continuity-lost event and one replacement Session."
+      },
+      "bootstrapContext": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Official systemPrompt section and one-pass variable expansion read exact Session-bound SHA-256-verified private Bootstrap bytes at each model step; A/B/A, cold and compact retain the correct identity."
+      },
+      "compactionContinuity": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native manual, pressure, context-overflow, automatic threshold and one controlled overflow plus real automatic retry; cancelled and failed compactions do not advance generation; fresh Skill and actual MCP capability checks remain available at each checkpoint."
+      },
+      "skills": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Real native .dsh/skills discovery and invocation; managed import, update, delete, disable, restart and same-name project conflict behavior; cli-operations attention path verified."
+      },
+      "externalMcp": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Whole-definition RovaiWins projection, Host update and fencing, exact Session resume, adjacent isolation, unassign, reassign, delete and native restoration passed through real DSH/Core MCP lifecycle; deterministic model fixture produced three native effects and zero Core-synthesized approvals."
+      },
+      "toolActionCommandOutput": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Real stdout, stderr, mixed, empty, nonzero and oversized output; canonical read/add/edit/empty-edit paths; byte-exact file contents and stable call identity. Add projects +1/-0, edit +1/-1 and empty-file edit +1/-0 through the shared Diff model."
+      },
+      "narrationFinalMissingSend": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Committed ACP public/thought distinction and authoritative end_turn; real zero-send recovery publication, accepted-send suppression and tool-to-final cases."
+      },
+      "permissionApprovalWorkspace": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Frozen sandbox and approval values; real workspace-write file and Bash inside the workspace succeed, outside writes fail, read-only writes and Bash fail, and cancelled Shell produces no delayed file after 32 seconds."
+      },
+      "builtinRovaiCli": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Current contract-v25 all 22 operations, 70 evidence rows and 35 output samples through native Bash and bundled CLI; three input sources, A2A, Gather, history and attachments, initial and successor Run lease fencing, and original Session continuation."
+      },
+      "usageCacheCost": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Independent native observer and Core database agree on every available token bucket and per-Run total across warm and cold continuation, including one automatic summary; exact cold resume has no replay. Unreported cache-write, reasoning and cost remain unknown."
+      },
+      "retryQueueCancelCleanup": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Shared accepted-input, queue and lease ownership; native overflow owns its retry; cancelled and failed operations do not produce late effects; Core crash, idle eviction and planned shutdown reap observed descendants."
+      },
+      "readyVersionPlatform": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "CLI minimum >=0.1.5-rc.2 is separate from ACP bridge 0.0.1; executable fingerprint, initialize, new, exact resume and real grouped catalog are verified on GNU x86_64. This artifact does not qualify another architecture, libc family or operating-system platform key."
+      }
+    },
+    "fileOperationMatrix": {
+      "passed": true,
+      "read": "byte-exact; no Diff",
+      "add": "byte-exact; add +1/-0",
+      "edit": "byte-exact; update +1/-1",
+      "editEmpty": "byte-exact; update +1/-0"
+    },
+    "commandOutputMatrix": {
+      "passed": true,
+      "cases": [
+        "stdout",
+        "stderr",
+        "mixed",
+        "empty",
+        "nonzero-exit",
+        "large-truncated"
+      ],
+      "sameNativeSession": true,
+      "syntheticApprovalCount": 0
+    },
+    "idleEviction": {
+      "passed": true,
+      "productionTtlMinutes": 30,
+      "elapsedMs": 1853656,
+      "descendantsReaped": 1,
+      "exactResume": true,
+      "plannedShutdownReaped": 1,
+      "coreCrashDescendantsReaped": 2
+    },
+    "usageReconciliation": {
+      "passed": true,
+      "warm": {
+        "runs": 2,
+        "nativeCalls": 3,
+        "automaticSummaryCalls": 1,
+        "bucketsMatch": true,
+        "perRunAttributionMatches": true
+      },
+      "cold": {
+        "runs": 3,
+        "nativeCalls": 4,
+        "automaticSummaryCalls": 1,
+        "bucketsMatch": true,
+        "perRunAttributionMatches": true
+      },
+      "exactColdResume": true,
+      "noReplay": true
+    },
+    "resourceGuard": {
+      "execution": "serial transient systemd scopes",
+      "memoryHighGiB": 3,
+      "memoryMaxGiB": 4,
+      "memorySwapMaxGiB": 0,
+      "hostStopThresholdAvailableGiB": 2,
+      "swapObserved": false,
+      "kernelOomObserved": false,
+      "stopThresholdTriggered": false
+    },
+    "targetHostChecks": {
+      "linuxCoreBuild": "passed",
+      "nativeParityProbe": "passed",
+      "fileOperationMatrix": "passed",
+      "commandOutputMatrix": "passed",
+      "builtinCli": "passed",
+      "skills": "passed",
+      "externalMcpLifecycle": "passed",
+      "coldResume": "passed",
+      "missingSend": "passed",
+      "permissionSafety": "passed",
+      "usageReconciliation": "passed",
+      "fleetLifecycle": "passed"
+    },
+    "rerunNotes": {
+      "builtinCli": "The first final-report rerun completed both Gather deliveries and the completion Run but produced no captured-return marker, so the strict assertion failed. An unchanged rerun passed all 22 operations, the captured-return assertion, both lease fences and Native Session continuation. The earlier full acceptance run had also passed; no assertion was relaxed."
+    }
+  },
+  "privateLogSha256": {
+    "linuxCoreBuild": "500341f3a04b51cefc18c30d6b618395177f53b3607c6c8dd32d106e7806ac61",
+    "nativeParityProbe": "92e92492247cfe2467ef3ab08a89d67a5322dcc3150563be96826eed5041e738",
+    "fileOperationMatrix": "1537c224a7271a0f8509641dd4159eda493e5b188c57d6d029952d570ba53b82",
+    "commandOutputMatrix": "3393d4fb70b6376430ae2fc9363ca9381559f5452a7df3f093b62558b97f03d8",
+    "builtinCliMissingCapturedReturn": "4ad1adc02a96d85ed4a66709909d18ec5d82670287eed7e1b766aa711fef4280",
+    "builtinCli": "f78a356677f3b00da524515c9edcc9a104d3d4b144539bb6541ab29a3639d737",
+    "skills": "ac2e098f39983436a5006d8917bc68921206cafa926f9b721061ad975aea7136",
+    "externalMcpLifecycle": "5a63739933f141b10e5f3b4aa136a1fc465a84f99d17f9a14f501aaabb34f373",
+    "coldResume": "1f790cbc474539304f60d36a5f16a065ef9ed64742cc02b90245d68b94bb76eb",
+    "missingSend": "0de99084a8228cd515abee8a900584c99c277496ca23f75c41eae0dcbebac514",
+    "permissionSafety": "0023c4876b17108f4c8a10dd73bcf7e65a82106b606ca6c79ae697c3446d29f4",
+    "usageReconciliation": "b4af4073c8b60d81768f00b76fedaf797d9ca6e973c29190a94810a200d6e4b5",
+    "fleetLifecycle": "69b46886fabd67d8802c975c6f6456645324272e67314201e0c88688c55ee68c"
+  },
+  "implementationSourceSha256": {
+    "crates/rovai-core/src/dsh.rs": "aebf442652f1a20721a1f5bdd960b4afe76fa78f899bc6ea7ecd325852efabb1",
+    "crates/rovai-core/src/dsh/bootstrap.mjs": "0b7056e1edbc28f6d289449de15273e7c9fa507b9ea8c3220bcca84bba5689f0",
+    "crates/rovai-core/src/acp.rs": "9b94b10705b9834218c0498ab1626cbc63eba27d5906f514da5a973c23201f51",
+    "crates/rovai-core/src/runtime_fleet.rs": "5746d717ae66e52b2a9963665e02f80625e73be857d31a09901cb4ba9dca0f4b",
+    "crates/rovai-core/src/monitoring.rs": "97f574ba8fe19b998966ee1bca94267af7769f7d68d765b561b72b125955d12c",
+    "crates/rovai-core/src/runtime_failure.rs": "372af77cf7a6b044d345c49443451a3800fca2cccac63a8a3f1f232e39884708",
+    "scripts/probe-dsh-runtime.mjs": "f540c414fc4f23517a08a95930ac879fae0d838cb14f5195d94df06b74190864",
+    "scripts/smoke-acp-runtime.mjs": "514e96089d1b9f976549f8223084de3f05fd56e5936b9e948249603c91b79b91",
+    "scripts/smoke-builtin-cli.mjs": "3f47f334d21e00be1e377ae3549b87ebb2010ca011066adae59943c1bf25a542",
+    "scripts/smoke-dsh-fleet.mjs": "46468902f05ba27bcc0c72eb7111d858a832fef7b4eeac7eb9d9a7d4d7727ba9",
+    "scripts/smoke-dsh-safety.mjs": "b870ad050921dddb46ac7bd9d8aa756cb48231600d992406f29247560f182d92",
+    "scripts/smoke-dsh-usage.mjs": "b7552aeb796e8d6716b1a4646168db3094620f5bcf90f3d7202bae715344416f",
+    "scripts/smoke-mcp-projection.mjs": "42d1eccf5e3810092d5967a175a90473770e0c41f74864f78f0620443be8693d"
+  },
+  "limitations": [
+    "The deterministic model used by the MCP lifecycle smoke is protocol evidence and not provider-generation qualification; all other stated real-provider cases use MiniMax-M3 through native DSH.",
+    "ACP has no session/load, additionalDirectories, manual compact command, compaction lifecycle, MCP SSE/resources/prompts or client filesystem/terminal bridge.",
+    "The controlled overflow case injects one context-window error at the official stream seam and then exercises the real native summarizer and automatic retry; it does not claim natural provider-window exhaustion.",
+    "Ubuntu 24.04.5 target-host evidence qualifies the product's linux-x64 platform key only; it does not qualify Linux ARM64, musl, macOS x64 or Windows x64, and does not replace the separate Linux Server release ABI matrix.",
+    "Credentials, raw prompts, private paths, Native Session IDs, Run IDs and full tool output are excluded."
+  ],
+  "qualificationBasis": {
+    "type": "reproducible-target-host-golden-flows",
+    "decision": "All 14 Runtime integration axes are independently verified on GNU Linux x86_64. This is Adapter behavior qualification, separate from Server OS and packaged release qualification.",
+    "versionDecision": "docs/versions/v1.59/decisions.md#v1-59-d10"
+  },
+  "notQualified": [
+    {
+      "platform": "macos-x64",
+      "reason": "No DSH target-host qualification evidence"
+    },
+    {
+      "platform": "windows-x64",
+      "reason": "No DSH target-host qualification evidence"
+    }
+  ]
+}

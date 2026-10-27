@@ -1,0 +1,11427 @@
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::{
+    agent_profile::{
+        AdapterKind, AgentProfileService, FrozenAgentRuntimeConfig, MissingSendRecoveryMode,
+        PublicOutputMode,
+    },
+    camp_content::{StructuredThreadMessageSegment, canonical_content_digest},
+    collaboration::exhaust_camp_turn_execution_budget,
+    command::{
+        ActorRef, CommandEnvelope, CommandExecution, CommandHandlerResult, DomainCommand,
+        DomainCommandGateway, EntityReference, canonical_json_digest, sealed,
+    },
+    context_index::index_camp_message,
+    db::Database,
+    delivery_queue::settle_run_deliveries,
+    execution_budget::{ThreadTurnExecutionBudgetExhaustionReason, camp_turn_execution_budget_now},
+    execution_evidence::AgentRunExecutionEvidence,
+    git::GitObservation,
+    message_delivery::{
+        AgentRunDeliverySettlement, CAMP_MESSAGE_SEND_MAX_BODY_BYTES, DeliveryDispatchTrigger,
+        cancel_pending_turn_deliveries, dispatch_pending_for_recipient,
+        settle_materialized_delivery_for_agent_run,
+    },
+    network_recovery::NetworkFailureCategory,
+    planned_shutdown::{ActiveExecutionKey, RuntimeTerminalOutcome, TerminalSettlementPermit},
+    runtime_failure::RuntimeFailureView,
+};
+
+/// Reject explicit child ownership, replay and complete snapshots before an
+/// adapter strips private payload fields. Native Session/turn fencing still
+/// belongs to the transport; this helper cannot establish ownership by itself.
+pub fn is_root_output(payload: &Value) -> bool {
+    [
+        payload,
+        &payload["_meta"],
+        &payload["content"],
+        &payload["content"]["_meta"],
+        &payload["message"],
+        &payload["assistantMessageEvent"],
+        &payload["assistantMessageEvent"]["partial"],
+        &payload["payload"],
+        &payload["payload"]["_meta"],
+    ]
+    .iter()
+    .all(|value| {
+        ![
+            "agentId",
+            "sourceAgentId",
+            "subagentId",
+            "parentAgentId",
+            "parentSessionId",
+            "parent_tool_use_id",
+            "parentToolCallId",
+            "parent_tool_call_id",
+            "opencode/child-session",
+            "subAgentId",
+            "source_agent_id",
+            "replay",
+            "isReplay",
+            "historical",
+            "snapshot",
+            "isSnapshot",
+        ]
+        .iter()
+        .any(|field| {
+            value
+                .get(*field)
+                .is_some_and(|value| !value.is_null() && value != false)
+        })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionSemantics {
+    CoreEnforcedV1,
+    RuntimeManagedV2,
+}
+
+impl PermissionSemantics {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CoreEnforcedV1 => "core_enforced_v1",
+            Self::RuntimeManagedV2 => "runtime_managed_v2",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "core_enforced_v1" => Ok(Self::CoreEnforcedV1),
+            "runtime_managed_v2" => Ok(Self::RuntimeManagedV2),
+            _ => anyhow::bail!("AgentRun permission semantics are invalid"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunWorkspace {
+    pub execution_root: String,
+    pub access: String,
+    pub isolation: String,
+}
+
+/// Resolve a local input without touching the filesystem or changing symlinks.
+pub fn resolve_agent_local_path(path: &Path, execution_root: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        execution_root.join(path)
+    }
+}
+
+impl AgentRunWorkspace {
+    pub fn runtime_managed_path(execution_root: String) -> Self {
+        Self {
+            execution_root,
+            access: "write".to_string(),
+            isolation: "shared".to_string(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        Path::new(&self.execution_root)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !Path::new(&self.execution_root).is_absolute() {
+            anyhow::bail!("AgentRun executionRoot must be absolute");
+        }
+        if !matches!(self.access.as_str(), "read_only" | "write") {
+            anyhow::bail!("AgentRun workspace access must be read_only or write");
+        }
+        if !matches!(self.isolation.as_str(), "shared" | "git_worktree") {
+            anyhow::bail!("AgentRun workspace isolation must be shared or git_worktree");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimAgentRunCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub lease_owner: String,
+    pub lease_seconds: i64,
+    pub workspace: Option<AgentRunWorkspace>,
+    pub starting_git_observation: Option<GitObservation>,
+}
+
+impl sealed::Sealed for ClaimAgentRunCommand {}
+impl DomainCommand for ClaimAgentRunCommand {
+    const TYPE: &'static str = "agent_run.claim";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkAgentRunForRecoveryCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub execution_epoch: i64,
+    pub reason: String,
+}
+
+impl sealed::Sealed for MarkAgentRunForRecoveryCommand {}
+impl DomainCommand for MarkAgentRunForRecoveryCommand {
+    const TYPE: &'static str = "agent_run.runtime_recovery.request";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkAgentRunForNetworkRecoveryCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub execution_epoch: i64,
+    pub category: String,
+    pub source: String,
+    pub failure: RuntimeFailureView,
+}
+
+impl sealed::Sealed for MarkAgentRunForNetworkRecoveryCommand {}
+impl DomainCommand for MarkAgentRunForNetworkRecoveryCommand {
+    const TYPE: &'static str = "agent_run.network_recovery.wait";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArmAgentRunNetworkRecoveryCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub execution_epoch: i64,
+    pub attempt: u32,
+}
+
+impl sealed::Sealed for ArmAgentRunNetworkRecoveryCommand {}
+impl DomainCommand for ArmAgentRunNetworkRecoveryCommand {
+    const TYPE: &'static str = "agent_run.network_recovery.attempt";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteAgentRunNetworkRecoveryCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub execution_epoch: i64,
+}
+
+impl sealed::Sealed for CompleteAgentRunNetworkRecoveryCommand {}
+impl DomainCommand for CompleteAgentRunNetworkRecoveryCommand {
+    const TYPE: &'static str = "agent_run.network_recovery.complete";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveAcceptedInputRecoveryBlockerCommand {
+    #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub agent_run_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for ResolveAcceptedInputRecoveryBlockerCommand {}
+impl DomainCommand for ResolveAcceptedInputRecoveryBlockerCommand {
+    const TYPE: &'static str = "agent_run.accepted_input_recovery.resolve";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelThreadTurnCommand {
+    #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for CancelThreadTurnCommand {}
+impl DomainCommand for CancelThreadTurnCommand {
+    const TYPE: &'static str = "camp_turn.cancel";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelAgentRunCommand {
+    #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub agent_run_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for CancelAgentRunCommand {}
+impl DomainCommand for CancelAgentRunCommand {
+    const TYPE: &'static str = "agent_run.cancel";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordCancelledAgentRunEndingGitObservationCommand {
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub ending_git_observation: GitObservation,
+}
+
+impl sealed::Sealed for RecordCancelledAgentRunEndingGitObservationCommand {}
+impl DomainCommand for RecordCancelledAgentRunEndingGitObservationCommand {
+    const TYPE: &'static str = "agent_run.cancelled.ending_git_observation.record";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindNativeSessionCommand {
+    pub conversation_id: String,
+    pub agent_run_id: String,
+    pub expected_conversation_version: i64,
+    pub expected_execution_epoch: i64,
+    pub previous_adapter_installation_id: Option<String>,
+    pub previous_native_session_id: Option<String>,
+    pub previous_binding_compatibility_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_binding_id: Option<String>,
+    pub adapter_installation_id: String,
+    pub native_session_id: String,
+    pub binding_compatibility_digest: Option<String>,
+}
+
+impl sealed::Sealed for BindNativeSessionCommand {}
+impl DomainCommand for BindNativeSessionCommand {
+    const TYPE: &'static str = "conversation.native_session.bind";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartNativeSessionCommand {
+    pub conversation_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for RestartNativeSessionCommand {}
+impl DomainCommand for RestartNativeSessionCommand {
+    const TYPE: &'static str = "conversation.native_session.restart";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SucceedAgentRunCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub execution_epoch: i64,
+    pub native_turn_id: String,
+    pub final_output: String,
+    #[serde(default)]
+    pub missing_send_recovery_candidate: Option<MissingSendRecoveryCandidate>,
+    pub ending_git_observation: Option<GitObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingSendRecoveryBoundary {
+    CodexCompletedTurn,
+    ClaudeSuccessResult,
+    AntigravityPrintStdout,
+    AcpEndTurnAssistantSuffix,
+    PiAgentSettled,
+    /// Passive decoding of pre-ACP receipts; never admitted for a new result.
+    #[serde(rename = "cline_hub_run_result")]
+    RetiredClineHubRunResult,
+    ZcodeCompletedTurn,
+}
+
+impl MissingSendRecoveryBoundary {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexCompletedTurn => "codex_completed_turn",
+            Self::ClaudeSuccessResult => "claude_success_result",
+            Self::AntigravityPrintStdout => "antigravity_print_stdout",
+            Self::AcpEndTurnAssistantSuffix => "acp_end_turn_assistant_suffix",
+            Self::PiAgentSettled => "pi_agent_settled",
+            Self::RetiredClineHubRunResult => "cline_hub_run_result",
+            Self::ZcodeCompletedTurn => "zcode_completed_turn",
+        }
+    }
+
+    fn is_compatible_with(self, adapter_kind: AdapterKind, protocol: Option<&str>) -> bool {
+        match self {
+            Self::CodexCompletedTurn => matches!(adapter_kind, AdapterKind::CodexCli),
+            Self::ClaudeSuccessResult => matches!(adapter_kind, AdapterKind::ClaudeCodeCli),
+            Self::AntigravityPrintStdout => matches!(adapter_kind, AdapterKind::AntigravityApp),
+            Self::AcpEndTurnAssistantSuffix => {
+                adapter_kind.uses_acp()
+                    && adapter_kind != AdapterKind::ZcodeApp
+                    && (adapter_kind != AdapterKind::ClineCli || protocol == Some("acp-v1"))
+            }
+            Self::PiAgentSettled => matches!(adapter_kind, AdapterKind::Pi),
+            Self::RetiredClineHubRunResult => false,
+            Self::ZcodeCompletedTurn => matches!(adapter_kind, AdapterKind::ZcodeApp),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingSendRecoveryCandidate {
+    pub boundary: MissingSendRecoveryBoundary,
+    pub body: String,
+}
+
+impl MissingSendRecoveryCandidate {
+    pub fn new(boundary: MissingSendRecoveryBoundary, body: impl Into<String>) -> Self {
+        Self {
+            boundary,
+            body: body.into(),
+        }
+    }
+}
+
+impl sealed::Sealed for SucceedAgentRunCommand {}
+impl DomainCommand for SucceedAgentRunCommand {
+    const TYPE: &'static str = "agent_run.succeed";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailAgentRunCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub execution_epoch: i64,
+    pub error_code: String,
+    pub error_detail: Option<String>,
+    #[serde(default)]
+    pub failure: Option<RuntimeFailureView>,
+    pub manual_retry_allowed: bool,
+    pub ending_git_observation: Option<GitObservation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlannedShutdownAbortiveTerminal {
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub outcome: RuntimeTerminalOutcome,
+    pub error_code: String,
+    pub error_detail: Option<String>,
+    pub failure: Option<RuntimeFailureView>,
+    pub manual_retry_allowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedShutdownTerminalSettlement {
+    pub agent_run_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: String,
+    pub agent_run_status: String,
+    #[serde(rename = "threadTurnStatus", alias = "campTurnStatus")]
+    pub camp_turn_status: String,
+    pub terminal_reason_code: String,
+    pub already_settled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledShutdownFencedAgentRun {
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub execution_root: String,
+    pub has_unsettled_external_effects: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledShutdownCycleSettlement {
+    pub core_generation: String,
+    pub fenced_agent_runs: Vec<ControlledShutdownFencedAgentRun>,
+    pub already_settled: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ControlledShutdownStartupRecovery {
+    pub cycles_settled: usize,
+    pub fenced_agent_runs: Vec<ControlledShutdownFencedAgentRun>,
+}
+
+impl sealed::Sealed for FailAgentRunCommand {}
+impl DomainCommand for FailAgentRunCommand {
+    const TYPE: &'static str = "agent_run.fail";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectAgentRunDispatchCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub error_code: String,
+    pub error_detail: Option<String>,
+    #[serde(default)]
+    pub failure: Option<RuntimeFailureView>,
+    pub manual_retry_allowed: bool,
+}
+
+impl sealed::Sealed for RejectAgentRunDispatchCommand {}
+impl DomainCommand for RejectAgentRunDispatchCommand {
+    const TYPE: &'static str = "agent_run.rejectDispatch";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebindAgentRunRuntimeCommand {
+    pub agent_run_id: String,
+    pub expected_version: i64,
+    pub drift_reason: String,
+    pub effective_runtime: FrozenAgentRuntimeConfig,
+}
+
+impl sealed::Sealed for RebindAgentRunRuntimeCommand {}
+impl DomainCommand for RebindAgentRunRuntimeCommand {
+    const TYPE: &'static str = "agent_run.runtime.rebind";
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedAgentRunCandidate {
+    pub agent_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: String,
+    pub conversation_id: String,
+    pub agent_id: String,
+    pub task_id: Option<String>,
+    pub version: i64,
+    pub permission_semantics: PermissionSemantics,
+    pub project_binding_kind: String,
+    pub project_path: String,
+    pub effective_config: Value,
+    pub workspace: Option<AgentRunWorkspace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunCancellationCandidate {
+    pub agent_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: String,
+    pub project_binding_kind: String,
+    pub project_path: String,
+    pub execution_root: String,
+    pub version: i64,
+    pub execution_epoch: i64,
+    pub status: String,
+    pub wait_reason: Option<String>,
+    pub adapter_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRuntimeCleanupTarget {
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub adapter_kind: AdapterKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnExecutionBudgetExpiry {
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub deadline_at: String,
+    pub agent_runs_fenced: i64,
+}
+
+impl QueuedAgentRunCandidate {
+    pub fn execution_workspace(&self) -> AgentRunWorkspace {
+        self.workspace.clone().unwrap_or_else(|| {
+            if self.permission_semantics == PermissionSemantics::RuntimeManagedV2 {
+                return AgentRunWorkspace::runtime_managed_path(self.project_path.clone());
+            }
+            let can_write = self.effective_config["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == Some("workspace.bind"))
+                });
+            AgentRunWorkspace {
+                execution_root: self.project_path.clone(),
+                access: if can_write { "write" } else { "read_only" }.to_string(),
+                isolation: "shared".to_string(),
+            }
+        })
+    }
+
+    pub fn frozen_runtime(&self) -> Result<FrozenAgentRuntimeConfig> {
+        serde_json::from_value(
+            self.effective_config
+                .get("runtime")
+                .cloned()
+                .context("queued AgentRun has no frozen Runtime configuration")?,
+        )
+        .context("queued AgentRun frozen Runtime configuration is invalid")
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunExecution {
+    pub agent_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: String,
+    pub conversation_id: String,
+    pub conversation_version: i64,
+    pub agent_id: String,
+    pub task_id: Option<String>,
+    pub version: i64,
+    pub permission_semantics: PermissionSemantics,
+    pub project_binding_kind: String,
+    pub project_path: String,
+    pub execution_epoch: i64,
+    pub status: String,
+    pub wait_reason: Option<String>,
+    pub runtime_recovery_required: bool,
+    pub native_adapter_installation_id: Option<String>,
+    pub native_adapter_kind: Option<AdapterKind>,
+    pub native_session_id: Option<String>,
+    pub native_binding_compatibility_digest: Option<String>,
+    pub native_installation_generation: Option<i64>,
+    pub native_session_compatibility_key: Option<String>,
+    pub purpose: String,
+    pub effective_config: Value,
+    pub runtime: FrozenAgentRuntimeConfig,
+    pub workspace: AgentRunWorkspace,
+    pub runtime_compatibility_digest: Option<String>,
+}
+
+impl AgentRunExecution {
+    pub fn resumable_native_session_id(&self) -> Option<&str> {
+        (self.native_session_resume_disposition() != NativeSessionResumeDisposition::New)
+            .then_some(self.native_session_id.as_deref())
+            .flatten()
+    }
+
+    pub fn native_session_resume_disposition(&self) -> NativeSessionResumeDisposition {
+        if self.native_session_id.is_none()
+            || self.native_adapter_kind != Some(self.runtime.adapter_kind)
+        {
+            return NativeSessionResumeDisposition::New;
+        }
+        NativeSessionResumeDisposition::Compatible
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSessionResumeDisposition {
+    New,
+    Compatible,
+    Controlled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSessionResumeFailure {
+    Incompatible,
+    Ambiguous,
+}
+
+impl std::fmt::Display for NativeSessionResumeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Incompatible => "Adapter confirmed Native Session restoration is unavailable",
+            Self::Ambiguous => "Native Session restoration outcome is unknown",
+        })
+    }
+}
+
+impl std::error::Error for NativeSessionResumeFailure {}
+
+/// Resolve only the current Conversation's target, including installations that
+/// have since been removed. Configuration equality never identifies a Session.
+pub(crate) fn native_session_adapter_kind(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<Option<AdapterKind>> {
+    let (session, installation): (Option<String>, Option<String>) = connection.query_row(
+        "SELECT native_session_id, native_adapter_installation_id FROM conversation WHERE id=?1",
+        [conversation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if session.is_none() {
+        return Ok(None);
+    }
+    let installation =
+        installation.context("Native Session has no recorded CLI installation identity")?;
+    let mut query = connection.prepare(
+        "SELECT adapter_kind FROM adapter_installation WHERE id=?1
+         UNION SELECT runtime_adapter_kind FROM agent_run
+         WHERE conversation_id=?2 AND runtime_installation_id=?1 AND runtime_adapter_kind IS NOT NULL",
+    )?;
+    let kinds = query
+        .query_map(params![installation, conversation_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        kinds.len() == 1,
+        "Native Session CLI type cannot be determined from its binding and runs"
+    );
+    Ok(Some(kinds[0].parse()?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_frozen_runtime_columns(
+    runtime: &FrozenAgentRuntimeConfig,
+    adapter_kind: Option<&str>,
+    installation_id: Option<&str>,
+    installation_generation: Option<i64>,
+    search_environment_generation: Option<i64>,
+    executable_path: Option<&str>,
+    auth_scope: Option<&str>,
+    reported_version: Option<&str>,
+    executable_fingerprint: Option<&str>,
+    capabilities_json: Option<&str>,
+    model_json: Option<&str>,
+    permissions_json: Option<&str>,
+    binding_digest: Option<&str>,
+    host_digest: Option<&str>,
+    protocol_version: Option<&str>,
+    native_session_compatibility_key: Option<&str>,
+) -> Result<()> {
+    let capabilities = capabilities_json
+        .map(serde_json::from_str::<Vec<String>>)
+        .transpose()
+        .context("AgentRun frozen Runtime capabilities are invalid")?;
+    let model = model_json
+        .map(serde_json::from_str)
+        .transpose()
+        .context("AgentRun frozen model selection is invalid")?;
+    let permissions = permissions_json
+        .map(serde_json::from_str)
+        .transpose()
+        .context("AgentRun frozen permission configuration is invalid")?;
+    let consistent = adapter_kind == Some(runtime.adapter_kind.as_str())
+        && installation_id == Some(runtime.installation_id.as_str())
+        && installation_generation == Some(runtime.installation_generation)
+        && search_environment_generation == Some(runtime.search_environment_generation)
+        && executable_path == Some(runtime.executable_path.as_str())
+        && auth_scope == Some(runtime.auth_scope.as_str())
+        && reported_version == runtime.reported_version.as_deref()
+        && executable_fingerprint == Some(runtime.executable_fingerprint.as_str())
+        && capabilities.as_ref() == Some(&runtime.capabilities)
+        && model.as_ref() == Some(&runtime.model)
+        && permissions.as_ref() == Some(&runtime.permissions)
+        && binding_digest == runtime.binding_compatibility_digest.as_deref()
+        && host_digest == runtime.host_config_digest.as_deref()
+        && protocol_version == Some(runtime.protocol_version.as_str())
+        && native_session_compatibility_key == runtime.native_session_compatibility_key.as_deref();
+    if !consistent {
+        anyhow::bail!("AgentRun frozen Runtime columns disagree with effective configuration");
+    }
+    Ok(())
+}
+
+pub(crate) fn runtime_cleanup_blocked_since_connection(
+    connection: &Connection,
+    conversation_id: &str,
+    excluded_agent_run_id: Option<&str>,
+) -> Result<Option<String>> {
+    Ok(connection.query_row(
+        r#"
+        SELECT MIN(cancel_requested_at)
+        FROM agent_run
+        WHERE conversation_id = ?1
+          AND (?2 IS NULL OR id <> ?2)
+          AND cancel_requested_at IS NOT NULL
+          AND cancel_acknowledged_at IS NULL
+          AND status IN ('succeeded', 'failed', 'cancelled')
+        "#,
+        params![conversation_id, excluded_agent_run_id],
+        |row| row.get(0),
+    )?)
+}
+
+#[derive(Debug, Default)]
+pub struct ExecutionRuntimeService {
+    gateway: DomainCommandGateway,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordObservedRuntimeModelCommand {
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub model_id: String,
+}
+
+impl sealed::Sealed for RecordObservedRuntimeModelCommand {}
+impl DomainCommand for RecordObservedRuntimeModelCommand {
+    const TYPE: &'static str = "agent_run.runtime_model.observe";
+}
+
+impl ExecutionRuntimeService {
+    /// Single Chat does not participate in Runtime recovery. Process startup
+    /// settles only the interrupted reply; its Conversation remains active.
+    pub fn cancel_interrupted_single_chat_runs(
+        &self,
+        database: &mut Database,
+    ) -> Result<Vec<String>> {
+        let changes_before = database.connection().total_changes();
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let targets = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT agent_run.id, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                       COALESCE(agent_run.camp_turn_id, ''),
+                       agent_run.execution_epoch
+                FROM agent_run
+                JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                WHERE agent_run.invocation_kind = 'single_chat'
+                  AND agent_run.status IN ('queued', 'running', 'waiting')
+                ORDER BY agent_run.created_at, agent_run.id
+                "#,
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let actor = ActorRef::System {
+            component_id: "runtime-recovery-coordinator".to_string(),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut cancelled = Vec::with_capacity(targets.len());
+        for (agent_run_id, camp_id, camp_turn_id, execution_epoch) in targets {
+            settle_abortive_agent_run_in_tx(
+                &transaction,
+                &agent_run_id,
+                "core_restarted",
+                &actor,
+                &now,
+            )?;
+            recompute_camp_turn(
+                &transaction,
+                &camp_id,
+                &camp_turn_id,
+                &actor,
+                Some(execution_epoch),
+                &now,
+            )?;
+            cancelled.push(agent_run_id);
+        }
+        transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
+        Ok(cancelled)
+    }
+
+    pub fn record_observed_runtime_model(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RecordObservedRuntimeModelCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id }
+                    if component_id.starts_with("runtime-adapter:")
+            ) {
+                return Ok(rejected(
+                    "agent_run.runtime_model_adapter_required",
+                    "Runtime model observation requires a Runtime Adapter",
+                ));
+            }
+            let model_id = envelope.payload.model_id.trim();
+            if model_id.is_empty() || model_id.len() > 512 {
+                return Ok(rejected(
+                    "agent_run.runtime_model_invalid",
+                    "Observed Runtime model identifier is invalid",
+                ));
+            }
+            let target = transaction
+                .query_row(
+                    r#"
+                SELECT COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                       json_extract(agent_run.runtime_model_selection_json, '$.source'),
+                       agent_run.runtime_observed_model_id,
+                       agent_run.cancel_requested_at
+                FROM agent_run
+                LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                WHERE agent_run.id = ?1
+                  AND agent_run.execution_epoch = ?2
+                "#,
+                    params![
+                        envelope.payload.agent_run_id,
+                        envelope.payload.execution_epoch
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((camp_id, model_source, existing_model_id, cancel_requested_at)) = target
+            else {
+                return Ok(CommandHandlerResult::applied(
+                    "agent_run.runtime_model_not_recorded",
+                    json!({ "changed": false, "reason": "run_or_epoch_missing" }),
+                    None,
+                ));
+            };
+            if envelope.camp_id.as_deref() != Some(camp_id.as_str()) {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if cancel_requested_at.is_some() {
+                return Ok(CommandHandlerResult::applied(
+                    "agent_run.runtime_model_observation_fenced",
+                    json!({
+                        "agentRunId": envelope.payload.agent_run_id,
+                        "threadId": camp_id,
+                        "changed": false,
+                        "reason": "cancellation_requested",
+                    }),
+                    Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+                ));
+            }
+            if model_source.as_deref() != Some("runtime_default") || existing_model_id.is_some() {
+                return Ok(CommandHandlerResult::applied(
+                    "agent_run.runtime_model_not_recorded",
+                    json!({
+                        "agentRunId": envelope.payload.agent_run_id,
+                        "threadId": camp_id,
+                        "changed": false,
+                        "reason": if existing_model_id.is_some() {
+                            "already_observed"
+                        } else {
+                            "explicit_model"
+                        },
+                    }),
+                    Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET runtime_observed_model_id = ?3,
+                    version = version + 1,
+                    updated_at = ?4
+                WHERE id = ?1
+                  AND execution_epoch = ?2
+                  AND cancel_requested_at IS NULL
+                  AND runtime_observed_model_id IS NULL
+                  AND json_extract(runtime_model_selection_json, '$.source') = 'runtime_default'
+                "#,
+                params![
+                    envelope.payload.agent_run_id,
+                    envelope.payload.execution_epoch,
+                    model_id,
+                    now
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(CommandHandlerResult::applied(
+                    "agent_run.runtime_model_observation_fenced",
+                    json!({
+                        "agentRunId": envelope.payload.agent_run_id,
+                        "threadId": camp_id,
+                        "changed": false,
+                        "reason": "concurrent_change",
+                    }),
+                    Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.runtime_model_observed",
+                &camp_id,
+                ("agent_run", &envelope.payload.agent_run_id),
+                &envelope.actor,
+                Some(envelope.payload.execution_epoch),
+                &json!({
+                    "agentRunId": envelope.payload.agent_run_id,
+                    "executionEpoch": envelope.payload.execution_epoch,
+                    "modelId": model_id,
+                }),
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "agent_run.runtime_model_observed",
+                json!({
+                    "agentRunId": envelope.payload.agent_run_id,
+                    "threadId": camp_id,
+                    "changed": true,
+                    "modelId": model_id,
+                }),
+                Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+            ))
+        })
+    }
+
+    pub fn record_runtime_compatibility_digest(
+        &self,
+        database: &mut Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        digest: &str,
+    ) -> Result<()> {
+        if digest.trim().is_empty() {
+            anyhow::bail!("Runtime compatibility digest cannot be empty");
+        }
+        let changed = database.connection_mut().execute(
+            r#"
+            UPDATE agent_run
+            SET runtime_compatibility_digest = ?1
+            WHERE id = ?2
+              AND execution_epoch = ?3
+              AND status IN ('running', 'waiting')
+            "#,
+            params![digest, agent_run_id, execution_epoch],
+        )?;
+        if changed == 0 {
+            let current = database
+                .connection()
+                .query_row(
+                    "SELECT runtime_compatibility_digest FROM agent_run WHERE id = ?1",
+                    [agent_run_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            if current.flatten().as_deref() != Some(digest) {
+                anyhow::bail!(
+                    "AgentRun runtime compatibility digest could not be persisted for the active execution"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn prepare_native_session_resume(
+        &self,
+        database: &mut Database,
+        execution: &AgentRunExecution,
+    ) -> Result<NativeSessionResumeDisposition> {
+        // Run/epoch, input-delivery and native writer-lock fences remain the
+        // execution authority. Historical configuration attempts are audit only.
+        let _ = database;
+        Ok(execution.native_session_resume_disposition())
+    }
+
+    pub fn record_native_session_resume_failure(
+        &self,
+        database: &mut Database,
+        execution: &AgentRunExecution,
+        failure: NativeSessionResumeFailure,
+    ) -> Result<()> {
+        let status = match failure {
+            NativeSessionResumeFailure::Incompatible => "incompatible",
+            NativeSessionResumeFailure::Ambiguous => "ambiguous",
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        database.connection_mut().execute(
+            r#"
+            UPDATE native_session_resume_attempt
+            SET status = ?4, completed_at = ?5
+            WHERE conversation_id = ?1
+              AND installation_id = ?2
+              AND installation_generation = ?3
+              AND status = 'attempting'
+            "#,
+            params![
+                execution.conversation_id,
+                execution.runtime.installation_id,
+                execution.runtime.installation_generation,
+                status,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_native_session_continuity_lost(
+        &self,
+        database: &mut Database,
+        execution: &AgentRunExecution,
+        continuation: &str,
+        failure: NativeSessionResumeFailure,
+    ) -> Result<()> {
+        let changes_before = database.connection().total_changes();
+        let transaction = database.connection_mut().transaction()?;
+        append_domain_event(
+            &transaction,
+            "agent_run.native_session_continuity_lost",
+            &execution.camp_id,
+            ("agent_run", &execution.agent_run_id),
+            &ActorRef::System {
+                component_id: "runtime-adapter:session-continuation".to_string(),
+            },
+            Some(execution.execution_epoch),
+            &json!({
+                "agentRunId": execution.agent_run_id,
+                "conversationId": execution.conversation_id,
+                "executionEpoch": execution.execution_epoch,
+                "adapterKind": execution.runtime.adapter_kind,
+                "adapterInstallationId": execution.runtime.installation_id,
+                "previousNativeSessionId": execution.native_session_id,
+                "continuation": continuation,
+                "failure": match failure {
+                    NativeSessionResumeFailure::Incompatible => "incompatible",
+                    NativeSessionResumeFailure::Ambiguous => "ambiguous",
+                },
+                "fallback": "new_session",
+            }),
+        )?;
+        transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
+        Ok(())
+    }
+
+    pub fn expire_elapsed_camp_turn_execution_budgets(
+        &self,
+        database: &mut Database,
+        observed_budget_now: chrono::DateTime<chrono::Utc>,
+        audit_now: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<ThreadTurnExecutionBudgetExpiry>> {
+        if !(1..=100).contains(&limit) {
+            anyhow::bail!("ThreadTurn Execution Budget expiry limit must be between 1 and 100");
+        }
+        let budget_now = observed_budget_now.to_rfc3339();
+        let audit_now = audit_now.to_rfc3339();
+        let changes_before = database.connection().total_changes();
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidates = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT id, camp_id, execution_budget_deadline_at
+                FROM camp_turn
+                WHERE status IN ('running', 'waiting')
+                  AND execution_budget_exhausted_at IS NULL
+                  AND execution_budget_deadline_at <= ?1
+                ORDER BY execution_budget_deadline_at, id
+                LIMIT ?2
+                "#,
+            )?;
+            statement
+                .query_map(params![budget_now, limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let actor = ActorRef::System {
+            component_id: "execution-budget-deadline-monitor".to_string(),
+        };
+        let mut expired = Vec::with_capacity(candidates.len());
+        for (camp_turn_id, camp_id, deadline_at) in candidates {
+            let command_id = format!("camp-turn-execution-budget-expiry:{camp_turn_id}");
+            let exhaustion = exhaust_camp_turn_execution_budget(
+                &transaction,
+                &camp_turn_id,
+                ThreadTurnExecutionBudgetExhaustionReason::Elapsed,
+                &command_id,
+                &audit_now,
+                &actor,
+                None,
+            )?;
+            if exhaustion.newly_exhausted {
+                expired.push(ThreadTurnExecutionBudgetExpiry {
+                    camp_turn_id,
+                    camp_id,
+                    deadline_at,
+                    agent_runs_fenced: exhaustion.agent_runs_fenced,
+                });
+            }
+        }
+        transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
+        Ok(expired)
+    }
+
+    pub fn settle_forced_camp_deletion(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+        expected_version: i64,
+        command_id: &str,
+    ) -> Result<std::result::Result<Vec<Value>, CommandHandlerResult>> {
+        let changes_before = database.connection().total_changes();
+        let transaction = database.connection_mut().transaction()?;
+        let version: Option<i64> = transaction
+            .query_row("SELECT version FROM camp WHERE id = ?1", [camp_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(version) = version else {
+            return Ok(Err(rejected("camp.not_found", "Thread does not exist")));
+        };
+        if version != expected_version {
+            return Ok(Err(CommandHandlerResult::rejected(
+                "command.version_conflict",
+                json!({ "currentVersion": version }),
+            )));
+        }
+        let blockers =
+            self.settle_camp_deletion_in_transaction(&transaction, camp_id, command_id)?;
+        transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
+        Ok(Ok(blockers))
+    }
+
+    pub(crate) fn settle_camp_deletion_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        camp_id: &str,
+        command_id: &str,
+    ) -> Result<Vec<Value>> {
+        let blockers = crate::collaboration::camp_delete_blockers(transaction, camp_id)?;
+        self.apply_camp_deletion_settlement(transaction, camp_id, command_id)?;
+        Ok(blockers)
+    }
+
+    pub(crate) fn settle_camp_deletion_cutover_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        camp_id: &str,
+        command_id: &str,
+    ) -> Result<()> {
+        self.apply_camp_deletion_settlement(transaction, camp_id, command_id)
+    }
+
+    fn apply_camp_deletion_settlement(
+        &self,
+        transaction: &Transaction<'_>,
+        camp_id: &str,
+        command_id: &str,
+    ) -> Result<()> {
+        let turn_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM camp_turn WHERE camp_id = ?1 AND status IN ('running', 'waiting')",
+            )?;
+            statement
+                .query_map([camp_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let batch_run_ids = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT id
+                FROM agent_run
+                WHERE camp_id = ?1 AND camp_turn_id IS NULL
+                  AND status IN ('queued', 'running', 'waiting')
+                ORDER BY created_at, id
+                "#,
+            )?;
+            statement
+                .query_map([camp_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let actor = ActorRef::System {
+            component_id: "camp-deletion".into(),
+        };
+        for turn_id in turn_ids {
+            transaction.execute(
+                "UPDATE camp_turn SET cancel_requested_at = COALESCE(cancel_requested_at, ?2), cancel_request_command_id = COALESCE(cancel_request_command_id, ?3) WHERE id = ?1",
+                params![turn_id, now, command_id],
+            )?;
+            settle_abortive_camp_turn_in_tx(transaction, &turn_id, "camp_deleted", &actor, &now)?;
+        }
+        for run_id in batch_run_ids {
+            settle_abortive_agent_run_in_tx(transaction, &run_id, "camp_deleted", &actor, &now)?;
+        }
+        transaction.execute(
+            r#"
+            UPDATE camp_message_delivery
+            SET status = 'cancelled', failure_code = 'camp_deleted', ended_at = ?2,
+                version = version + 1, updated_at = ?2
+            WHERE camp_id = ?1 AND status = 'waiting'
+            "#,
+            params![camp_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_camp_runtime_cleanup_targets(
+        &self,
+        database: &Database,
+        camp_id: &str,
+    ) -> Result<Vec<ThreadRuntimeCleanupTarget>> {
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT target.id, target.execution_epoch, target.runtime_adapter_kind
+            FROM (
+                SELECT agent_run.id, agent_run.execution_epoch,
+                       agent_run.runtime_adapter_kind
+                FROM agent_run
+                WHERE agent_run.invocation_kind = 'batch'
+                  AND agent_run.camp_id = ?1
+                  AND (
+                      agent_run.status IN ('queued', 'running', 'waiting')
+                      OR (agent_run.cancel_requested_at IS NOT NULL
+                          AND agent_run.cancel_acknowledged_at IS NULL)
+                  )
+                UNION ALL
+                SELECT agent_run.id, agent_run.execution_epoch,
+                       agent_run.runtime_adapter_kind
+                FROM agent_run
+                JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                WHERE agent_run.invocation_kind IS NOT 'batch'
+                  AND camp_turn.camp_id = ?1
+                  AND (
+                      agent_run.status IN ('queued', 'running', 'waiting')
+                      OR (agent_run.cancel_requested_at IS NOT NULL
+                          AND agent_run.cancel_acknowledged_at IS NULL)
+                  )
+            ) AS target
+            ORDER BY target.id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([camp_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(agent_run_id, execution_epoch, adapter_kind)| {
+                Some(ThreadRuntimeCleanupTarget {
+                    agent_run_id,
+                    execution_epoch,
+                    adapter_kind: adapter_kind?.parse::<AdapterKind>().ok()?,
+                })
+            })
+            .collect())
+    }
+
+    pub fn list_cancellation_candidates(
+        &self,
+        database: &Database,
+        limit: i64,
+    ) -> Result<Vec<AgentRunCancellationCandidate>> {
+        self.list_cancellation_candidates_page(database, limit, 0)
+    }
+
+    pub(crate) fn list_cancellation_candidates_page(
+        &self,
+        database: &Database,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AgentRunCancellationCandidate>> {
+        if !(1..=100).contains(&limit) {
+            anyhow::bail!("AgentRun cancellation limit must be between 1 and 100");
+        }
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT agent_run.id, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                   COALESCE(agent_run.camp_turn_id, ''),
+                   agent_run.version, agent_run.execution_epoch, agent_run.status,
+                   agent_run.wait_reason, COALESCE(agent_run.runtime_adapter_kind, ''),
+                   camp.project_binding_kind, camp.project_path,
+                   COALESCE(
+                       json_extract(agent_run.workspace_json, '$.executionRoot'),
+                       camp.project_path
+                   )
+            FROM agent_run
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+            WHERE agent_run.cancel_requested_at IS NOT NULL
+              AND agent_run.cancel_acknowledged_at IS NULL
+              AND agent_run.status IN ('succeeded', 'failed', 'cancelled')
+            ORDER BY agent_run.updated_at, agent_run.id
+            LIMIT ?1 OFFSET ?2
+            "#,
+        )?;
+        Ok(statement
+            .query_map([limit, offset], |row| {
+                Ok(AgentRunCancellationCandidate {
+                    agent_run_id: row.get(0)?,
+                    camp_id: row.get(1)?,
+                    camp_turn_id: row.get(2)?,
+                    version: row.get(3)?,
+                    execution_epoch: row.get(4)?,
+                    status: row.get(5)?,
+                    wait_reason: row.get(6)?,
+                    adapter_kind: row.get(7)?,
+                    project_binding_kind: row.get(8)?,
+                    project_path: row.get(9)?,
+                    execution_root: row.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_dispatchable_agent_runs(
+        &self,
+        database: &Database,
+        limit: i64,
+    ) -> Result<Vec<QueuedAgentRunCandidate>> {
+        self.list_dispatchable_agent_runs_scoped(database, limit, 0, "all", None)
+    }
+
+    pub fn list_dispatchable_batch_agent_runs(
+        &self,
+        database: &Database,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<QueuedAgentRunCandidate>> {
+        self.list_dispatchable_agent_runs_scoped(database, limit, offset, "batch", None)
+    }
+
+    pub fn list_dispatchable_non_batch_agent_runs(
+        &self,
+        database: &Database,
+        limit: i64,
+    ) -> Result<Vec<QueuedAgentRunCandidate>> {
+        self.list_dispatchable_agent_runs_scoped(database, limit, 0, "non_batch", None)
+    }
+
+    pub(crate) fn list_dispatchable_non_batch_agent_runs_page(
+        &self,
+        database: &Database,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<QueuedAgentRunCandidate>> {
+        self.list_dispatchable_agent_runs_scoped(database, limit, offset, "non_batch", None)
+    }
+
+    pub fn load_dispatchable_agent_run(
+        &self,
+        database: &Database,
+        agent_run_id: &str,
+    ) -> Result<Option<QueuedAgentRunCandidate>> {
+        Ok(self
+            .list_dispatchable_agent_runs_scoped(database, 1, 0, "exact", Some(agent_run_id))?
+            .pop())
+    }
+
+    fn list_dispatchable_agent_runs_scoped(
+        &self,
+        database: &Database,
+        limit: i64,
+        offset: i64,
+        scope: &str,
+        exact_agent_run_id: Option<&str>,
+    ) -> Result<Vec<QueuedAgentRunCandidate>> {
+        if !(1..=100).contains(&limit) {
+            anyhow::bail!("AgentRun scheduler limit must be between 1 and 100");
+        }
+        if offset < 0 {
+            anyhow::bail!("AgentRun scheduler offset must not be negative");
+        }
+        let now = camp_turn_execution_budget_now().to_rfc3339();
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT agent_run.id, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                   COALESCE(agent_run.camp_turn_id, ''),
+                   agent_run.conversation_id, conversation.agent_id,
+                   agent_run.task_id, agent_run.version,
+                   agent_run.permission_semantics, camp.project_binding_kind,
+                   camp.project_path, agent_run.effective_config_json,
+                   agent_run.workspace_json
+            FROM agent_run
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+            JOIN conversation ON conversation.id = agent_run.conversation_id
+            JOIN camp_member
+              ON camp_member.camp_id = camp.id
+             AND camp_member.agent_id = conversation.agent_id
+            JOIN agent_profile ON agent_profile.id = conversation.agent_id
+            WHERE (agent_run.status = 'queued'
+                   OR (agent_run.status = 'waiting'
+                       AND agent_run.wait_reason = 'runtime_recovery'
+                       AND agent_run.runtime_recovery_required = 1))
+              AND agent_run.input_ready_at IS NOT NULL
+              AND agent_run.cancel_requested_at IS NULL
+              AND camp.deletion_operation_id IS NULL
+              AND camp_member.status = 'active'
+              AND camp_member.leave_requested_at IS NULL
+              AND agent_profile.profile_status = 'present'
+              AND (
+                  ?3 = 'all'
+                  OR (?3 = 'batch'
+                      AND agent_run.status = 'queued'
+                      AND agent_run.invocation_kind = 'batch')
+                  OR (?3 = 'non_batch' AND agent_run.invocation_kind <> 'batch')
+                  OR (?3 = 'exact' AND agent_run.id = ?4)
+              )
+              AND (
+                  agent_run.invocation_kind = 'batch'
+                  OR (
+                      camp_turn.status IN ('running', 'waiting')
+                      AND camp_turn.cancel_requested_at IS NULL
+                      AND camp_turn.execution_budget_exhausted_at IS NULL
+                      AND (camp_turn.execution_budget_deadline_at > ?1
+                           OR (camp_turn.execution_budget_deadline_at IS NULL
+                               AND camp_turn.execution_budget_schema_version = 2))
+                  )
+              )
+              AND NOT (
+                  agent_run.status = 'waiting'
+                  AND agent_run.wait_reason = 'runtime_recovery'
+                  AND EXISTS (
+                      SELECT 1 FROM runtime_input_delivery
+                      WHERE runtime_input_delivery.agent_run_id = agent_run.id
+                        AND runtime_input_delivery.status = 'accepted'
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_run AS active_run
+                  WHERE active_run.conversation_id = agent_run.conversation_id
+                    AND active_run.id <> agent_run.id
+                    AND active_run.status IN ('running', 'waiting')
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_run AS earlier_run
+                  WHERE earlier_run.conversation_id = agent_run.conversation_id
+                    AND (earlier_run.status = 'queued'
+                         OR (earlier_run.status = 'waiting'
+                             AND earlier_run.wait_reason = 'runtime_recovery'
+                             AND earlier_run.runtime_recovery_required = 1))
+                    AND earlier_run.input_ready_at IS NOT NULL
+                    AND earlier_run.cancel_requested_at IS NULL
+                    AND (earlier_run.created_at < agent_run.created_at
+                         OR (earlier_run.created_at = agent_run.created_at
+                             AND earlier_run.id < agent_run.id))
+              )
+            ORDER BY agent_run.created_at, agent_run.id
+            LIMIT ?2 OFFSET ?5
+            "#,
+        )?;
+        let rows = statement
+            .query_map(
+                params![now, limit, scope, exact_agent_run_id, offset],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    agent_run_id,
+                    camp_id,
+                    camp_turn_id,
+                    conversation_id,
+                    agent_id,
+                    task_id,
+                    version,
+                    permission_semantics,
+                    project_binding_kind,
+                    project_path,
+                    effective_config,
+                    workspace,
+                )| {
+                    Ok(QueuedAgentRunCandidate {
+                        agent_run_id,
+                        camp_id,
+                        camp_turn_id,
+                        conversation_id,
+                        agent_id,
+                        task_id,
+                        version,
+                        permission_semantics: PermissionSemantics::parse(&permission_semantics)?,
+                        project_binding_kind,
+                        project_path,
+                        effective_config: serde_json::from_str(&effective_config)
+                            .context("AgentRun effective config is invalid")?,
+                        workspace: workspace
+                            .map(|workspace| {
+                                serde_json::from_str(&workspace)
+                                    .context("AgentRun workspace is invalid")
+                            })
+                            .transpose()?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn load_agent_run_execution(
+        &self,
+        database: &Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<Option<AgentRunExecution>> {
+        let now = camp_turn_execution_budget_now().to_rfc3339();
+        let row = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT agent_run.id, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                       COALESCE(agent_run.camp_turn_id, ''),
+                       agent_run.conversation_id, conversation.version,
+                       conversation.agent_id, agent_run.task_id,
+                       agent_run.version, agent_run.permission_semantics,
+                       agent_run.execution_epoch,
+                       agent_run.status, agent_run.wait_reason,
+                       agent_run.runtime_recovery_required,
+                       conversation.native_adapter_installation_id,
+                       conversation.native_session_id,
+                       conversation.native_binding_compatibility_digest,
+                       conversation.native_installation_generation,
+                       conversation.native_session_compatibility_key,
+                       agent_run.purpose,
+                       agent_run.effective_config_json,
+                       agent_run.workspace_json,
+                       agent_run.runtime_adapter_kind,
+                       agent_run.runtime_installation_id,
+                       agent_run.runtime_executable_path,
+                       agent_run.runtime_auth_scope,
+                       agent_run.runtime_reported_version,
+                       agent_run.runtime_executable_fingerprint,
+                       agent_run.runtime_capabilities_json,
+                       agent_run.runtime_model_selection_json,
+                       agent_run.runtime_permission_config_json,
+                       agent_run.runtime_binding_compatibility_digest,
+                       agent_run.runtime_host_config_digest,
+                       agent_run.runtime_protocol_version,
+                       agent_run.runtime_installation_generation,
+                       agent_run.runtime_search_environment_generation,
+                       agent_run.runtime_native_session_compatibility_key,
+                       camp.project_binding_kind, camp.project_path,
+                       agent_run.runtime_compatibility_digest
+                FROM agent_run
+                LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+                JOIN conversation ON conversation.id = agent_run.conversation_id
+                WHERE agent_run.id = ?1
+                  AND agent_run.status IN ('running', 'waiting')
+                  AND agent_run.cancel_requested_at IS NULL
+                  AND camp.deletion_operation_id IS NULL
+                  AND agent_run.execution_epoch = ?2
+                  AND (
+                      agent_run.invocation_kind = 'batch'
+                      OR (
+                          camp_turn.status IN ('running', 'waiting')
+                          AND camp_turn.cancel_requested_at IS NULL
+                          AND camp_turn.execution_budget_exhausted_at IS NULL
+                          AND (camp_turn.execution_budget_deadline_at > ?3
+                               OR (camp_turn.execution_budget_deadline_at IS NULL
+                                   AND camp_turn.execution_budget_schema_version = 2))
+                      )
+                  )
+                "#,
+                params![agent_run_id, execution_epoch, now],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
+                        row.get::<_, Option<i64>>(16)?,
+                        row.get::<_, Option<String>>(17)?,
+                        row.get::<_, String>(18)?,
+                        row.get::<_, String>(19)?,
+                        row.get::<_, String>(20)?,
+                        row.get::<_, Option<String>>(21)?,
+                        row.get::<_, Option<String>>(22)?,
+                        row.get::<_, Option<String>>(23)?,
+                        row.get::<_, Option<String>>(24)?,
+                        row.get::<_, Option<String>>(25)?,
+                        row.get::<_, Option<String>>(26)?,
+                        row.get::<_, Option<String>>(27)?,
+                        row.get::<_, Option<String>>(28)?,
+                        row.get::<_, Option<String>>(29)?,
+                        row.get::<_, Option<String>>(30)?,
+                        row.get::<_, Option<String>>(31)?,
+                        row.get::<_, Option<String>>(32)?,
+                        row.get::<_, Option<i64>>(33)?,
+                        row.get::<_, Option<i64>>(34)?,
+                        row.get::<_, Option<String>>(35)?,
+                        row.get::<_, String>(36)?,
+                        row.get::<_, String>(37)?,
+                        row.get::<_, Option<String>>(38)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            agent_run_id,
+            camp_id,
+            camp_turn_id,
+            conversation_id,
+            conversation_version,
+            agent_id,
+            task_id,
+            version,
+            permission_semantics,
+            execution_epoch,
+            status,
+            wait_reason,
+            runtime_recovery_required,
+            native_adapter_installation_id,
+            native_session_id,
+            native_binding_compatibility_digest,
+            native_installation_generation,
+            native_session_compatibility_key,
+            purpose,
+            effective_config,
+            workspace,
+            runtime_adapter_kind,
+            runtime_installation_id,
+            runtime_executable_path,
+            runtime_auth_scope,
+            runtime_reported_version,
+            runtime_executable_fingerprint,
+            runtime_capabilities_json,
+            runtime_model_selection_json,
+            runtime_permission_config_json,
+            runtime_binding_compatibility_digest,
+            runtime_host_config_digest,
+            runtime_protocol_version,
+            runtime_installation_generation,
+            runtime_search_environment_generation,
+            runtime_native_session_compatibility_key,
+            project_binding_kind,
+            project_path,
+            runtime_compatibility_digest,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let workspace = serde_json::from_str::<AgentRunWorkspace>(&workspace)
+            .context("claimed AgentRun has no valid frozen workspace")?;
+        workspace.validate()?;
+        let effective_config: Value = serde_json::from_str(&effective_config)
+            .context("AgentRun effective config is invalid")?;
+        let runtime: FrozenAgentRuntimeConfig = serde_json::from_value(
+            effective_config
+                .get("runtime")
+                .cloned()
+                .context("AgentRun has no frozen Runtime configuration")?,
+        )
+        .context("AgentRun frozen Runtime configuration is invalid")?;
+        validate_frozen_runtime_columns(
+            &runtime,
+            runtime_adapter_kind.as_deref(),
+            runtime_installation_id.as_deref(),
+            runtime_installation_generation,
+            runtime_search_environment_generation,
+            runtime_executable_path.as_deref(),
+            runtime_auth_scope.as_deref(),
+            runtime_reported_version.as_deref(),
+            runtime_executable_fingerprint.as_deref(),
+            runtime_capabilities_json.as_deref(),
+            runtime_model_selection_json.as_deref(),
+            runtime_permission_config_json.as_deref(),
+            runtime_binding_compatibility_digest.as_deref(),
+            runtime_host_config_digest.as_deref(),
+            runtime_protocol_version.as_deref(),
+            runtime_native_session_compatibility_key.as_deref(),
+        )?;
+        let native_adapter_kind =
+            native_session_adapter_kind(database.connection(), &conversation_id)?;
+        Ok(Some(AgentRunExecution {
+            agent_run_id,
+            camp_id,
+            camp_turn_id,
+            conversation_id,
+            conversation_version,
+            agent_id,
+            task_id,
+            version,
+            permission_semantics: PermissionSemantics::parse(&permission_semantics)?,
+            project_binding_kind,
+            project_path,
+            execution_epoch,
+            status,
+            wait_reason,
+            runtime_recovery_required: runtime_recovery_required != 0,
+            native_adapter_installation_id,
+            native_adapter_kind,
+            native_session_id,
+            native_binding_compatibility_digest,
+            native_installation_generation,
+            native_session_compatibility_key,
+            purpose,
+            effective_config,
+            runtime,
+            workspace,
+            runtime_compatibility_digest,
+        }))
+    }
+
+    /// Reserve the execution-preparing boundary only after the same admission used by claim.
+    /// Filesystem preparation runs outside SQLite; claim rechecks all fences before launch.
+    pub(crate) fn begin_workspace_preparation(
+        &self,
+        database: &mut Database,
+        candidate: &QueuedAgentRunCandidate,
+    ) -> Result<bool> {
+        let tx = database
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(run) = load_claimable_run(&tx, &candidate.agent_run_id)? else {
+            return Ok(false);
+        };
+        let envelope = CommandEnvelope {
+            command_id: Uuid::new_v4().to_string(),
+            actor: ActorRef::System {
+                component_id: "agent-run-scheduler".into(),
+            },
+            camp_id: Some(candidate.camp_id.clone()),
+            expected_versions: vec![],
+            execution_epoch: None,
+            payload: ClaimAgentRunCommand {
+                agent_run_id: candidate.agent_run_id.clone(),
+                expected_version: candidate.version,
+                lease_owner: "preparing".into(),
+                lease_seconds: 120,
+                workspace: None,
+                starting_git_observation: None,
+            },
+        };
+        if claim_admission_rejection(&tx, &run, &envelope)?.is_some() {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute("UPDATE agent_run SET workspace_preparing_at=COALESCE(workspace_preparing_at,?2) WHERE id=?1",params![run.id,chrono::Utc::now().to_rfc3339()])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn claim_agent_run(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<ClaimAgentRunCommand>,
+    ) -> Result<CommandExecution> {
+        if let Some(workspace) = &envelope.payload.workspace {
+            workspace.validate()?;
+        }
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id }
+                    if component_id == "agent-run-scheduler"
+                        || component_id == "runtime-recovery-coordinator"
+            ) {
+                return Ok(rejected(
+                    "agent_run.scheduler_required",
+                    "AgentRun claim requires the scheduler or recovery coordinator",
+                ));
+            }
+            if envelope.payload.lease_owner.trim().is_empty() || envelope.payload.lease_seconds <= 0
+            {
+                return Ok(rejected(
+                    "agent_run.invalid_lease",
+                    "Execution lease is invalid",
+                ));
+            }
+            let run = load_claimable_run(transaction, &envelope.payload.agent_run_id)?;
+            let Some(run) = run else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if let Some(rejection) = claim_admission_rejection(transaction, &run, envelope)? {
+                return Ok(rejection);
+            }
+            let budget_now = camp_turn_execution_budget_now();
+            let budget_now_text = budget_now.to_rfc3339();
+            let audit_now_text = chrono::Utc::now().to_rfc3339();
+
+            let frozen_workspace = match (&run.workspace, &envelope.payload.workspace) {
+                (Some(existing), Some(requested)) => {
+                    let existing: AgentRunWorkspace = serde_json::from_value(existing.clone())
+                        .context("stored AgentRun workspace is invalid")?;
+                    if existing != *requested {
+                        return Ok(rejected(
+                            "agent_run.workspace_frozen",
+                            "AgentRun workspace cannot be changed after it is frozen",
+                        ));
+                    }
+                    Some(serde_json::to_value(existing)?)
+                }
+                (Some(existing), None) => Some(existing.clone()),
+                (None, Some(requested)) => Some(serde_json::to_value(requested)?),
+                (None, None) => None,
+            };
+            if let Some(workspace) = frozen_workspace.as_ref()
+                && !workspace_matches_camp(transaction, &run.camp_id, workspace)?
+            {
+                return Ok(rejected(
+                    "agent_run.workspace_scope_mismatch",
+                    "AgentRun workspace does not match the Thread project path",
+                ));
+            }
+            let starting_git_observation = envelope
+                .payload
+                .starting_git_observation
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+
+            let lease_expires_at = (budget_now
+                + chrono::Duration::seconds(envelope.payload.lease_seconds))
+            .to_rfc3339();
+            let next_epoch = run.execution_epoch + 1;
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET workspace_json = COALESCE(workspace_json, ?2),
+                    starting_git_observation_json =
+                        COALESCE(starting_git_observation_json, ?8),
+                    status = 'running', wait_reason = 'runtime_initializing', wait_deadline_at = NULL,
+                    runtime_recovery_required = 0,
+                    execution_epoch = ?3, execution_lease_owner = ?4,
+                    execution_lease_expires_at = ?5,
+                    started_at = COALESCE(started_at, ?6),
+                    version = version + 1, updated_at = ?6
+                WHERE id = ?1 AND version = ?7
+                  AND (status = 'queued'
+                       OR (status = 'waiting' AND wait_reason = 'runtime_recovery'
+                           AND runtime_recovery_required = 1))
+                  AND cancel_requested_at IS NULL
+                  AND (
+                      agent_run.invocation_kind = 'batch'
+                      OR EXISTS (
+                          SELECT 1 FROM camp_turn
+                          WHERE camp_turn.id = agent_run.camp_turn_id
+                            AND camp_turn.status IN ('running', 'waiting')
+                            AND camp_turn.cancel_requested_at IS NULL
+                            AND camp_turn.execution_budget_exhausted_at IS NULL
+                            AND (camp_turn.execution_budget_deadline_at > ?9
+                                 OR (camp_turn.execution_budget_deadline_at IS NULL
+                                     AND camp_turn.execution_budget_schema_version = 2))
+                      )
+                  )
+                "#,
+                params![
+                    run.id,
+                    frozen_workspace
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    next_epoch,
+                    envelope.payload.lease_owner,
+                    lease_expires_at,
+                    audit_now_text,
+                    envelope.payload.expected_version,
+                    starting_git_observation,
+                    budget_now_text,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.claim_race_lost",
+                    "AgentRun changed before its lease was acquired",
+                ));
+            }
+            // A reusable Native Session may outlive an AgentRun epoch. Clear the
+            // previous Team Tool credential before the new epoch can execute so
+            // a stale MCP process cannot be resolved as the newly claimed Run.
+            transaction.execute(
+                r#"
+                UPDATE conversation
+                SET native_binding_secret_digest = NULL,
+                    version = version + 1,
+                    updated_at = ?2
+                WHERE id = ?1
+                "#,
+                params![run.conversation_id, audit_now_text],
+            )?;
+            append_domain_event(
+                transaction,
+                "agent_run.claimed",
+                &run.camp_id,
+                ("agent_run", &run.id),
+                &envelope.actor,
+                None,
+                &json!({
+                    "conversationId": run.conversation_id,
+                    "executionEpoch": next_epoch,
+                    "leaseOwner": envelope.payload.lease_owner,
+                    "leaseExpiresAt": lease_expires_at,
+                    "workspace": frozen_workspace,
+                    "startingGitObservation": envelope.payload.starting_git_observation,
+                }),
+            )?;
+            Ok(CommandHandlerResult::accepted(
+                "agent_run.claimed",
+                json!({
+                    "agentRunId": run.id,
+                    "conversationId": run.conversation_id,
+                    "executionEpoch": next_epoch,
+                    "leaseExpiresAt": lease_expires_at,
+                    "workspace": frozen_workspace,
+                    "startingGitObservation": envelope.payload.starting_git_observation,
+                }),
+                Some(entity_ref("agent_run", &run.id)),
+            ))
+        })
+    }
+
+    pub fn mark_for_recovery(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<MarkAgentRunForRecoveryCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id } if component_id == "runtime-recovery-coordinator"
+            ) {
+                return Ok(rejected(
+                    "agent_run.recovery_coordinator_required",
+                    "Runtime recovery requires its coordinator",
+                ));
+            }
+            let camp_id = transaction
+                .query_row(
+                    r#"
+                    SELECT COALESCE(agent_run.camp_id, camp_turn.camp_id)
+                    FROM agent_run
+                    LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                    WHERE agent_run.id = ?1
+                    "#,
+                    [&envelope.payload.agent_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(camp_id) = camp_id else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(camp_id.as_str()) {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            let audit_now = chrono::Utc::now().to_rfc3339();
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'waiting',
+                    wait_reason = CASE
+                        WHEN status = 'running' THEN 'runtime_recovery'
+                        ELSE wait_reason
+                    END,
+                    runtime_recovery_required = 1,
+                    execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+                    last_error_code = 'runtime_connection_lost',
+                    version = version + 1, updated_at = ?4
+                WHERE id = ?1 AND status IN ('running', 'waiting')
+                  AND version = ?2 AND execution_epoch = ?3
+                  AND cancel_requested_at IS NULL
+                  AND NOT (
+                      status = 'waiting'
+                      AND wait_reason = 'recovery_blocked'
+                  )
+                "#,
+                params![
+                    envelope.payload.agent_run_id,
+                    envelope.payload.expected_version,
+                    envelope.payload.execution_epoch,
+                    audit_now,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.recovery_fenced",
+                    "AgentRun is stale or is not active",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.runtime_recovery_requested",
+                &camp_id,
+                ("agent_run", &envelope.payload.agent_run_id),
+                &envelope.actor,
+                None,
+                &json!({
+                    "executionEpoch": envelope.payload.execution_epoch,
+                    "reason": envelope.payload.reason,
+                }),
+            )?;
+            Ok(CommandHandlerResult::accepted(
+                "agent_run.runtime_recovery_requested",
+                json!({ "agentRunId": envelope.payload.agent_run_id }),
+                Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+            ))
+        })
+    }
+
+    pub fn mark_for_network_recovery(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<MarkAgentRunForNetworkRecoveryCommand>,
+    ) -> Result<CommandExecution> {
+        if NetworkFailureCategory::parse(&envelope.payload.category).is_none() {
+            anyhow::bail!("AgentRun network recovery category is invalid");
+        }
+        if envelope.payload.source != "acp_prompt_terminal" {
+            anyhow::bail!("AgentRun network recovery source is invalid");
+        }
+        validate_public_runtime_failure(
+            "runtime_network_interrupted",
+            Some(&envelope.payload.failure),
+        )?;
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id } if component_id == "network-recovery-coordinator"
+            ) {
+                return Ok(rejected(
+                    "agent_run.network_recovery_coordinator_required",
+                    "Network recovery requires its coordinator",
+                ));
+            }
+            let run = load_claimable_run(transaction, &envelope.payload.agent_run_id)?;
+            let Some(run) = run else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(run.camp_id.as_str()) {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if run.version != envelope.payload.expected_version
+                || run.execution_epoch != envelope.payload.execution_epoch
+            {
+                return Ok(rejected(
+                    "agent_run.network_recovery_fenced",
+                    "AgentRun network failure evidence is stale",
+                ));
+            }
+            if run.status != "running" || run.cancel_requested_at.is_some() {
+                return Ok(rejected(
+                    "agent_run.network_recovery_fenced",
+                    "AgentRun is no longer running",
+                ));
+            }
+            if !network_recovery_input_is_safe(transaction, &run.id, run.execution_epoch)? {
+                return Ok(rejected(
+                    "agent_run.network_recovery_input_unsafe",
+                    "Runtime input was accepted or its delivery outcome is unknown",
+                ));
+            }
+            if has_recovery_safety_blocker(transaction, &run.id)? {
+                return Ok(rejected(
+                    "agent_run.network_recovery_effect_unsafe",
+                    "Approval, Action or Runtime Delivery must settle before network recovery",
+                ));
+            }
+            let budget_now = camp_turn_execution_budget_now();
+            if crate::execution_budget::execution_deadline_elapsed(
+                run.execution_budget_deadline_at.as_deref(),
+                budget_now,
+            )? || !matches!(run.camp_turn_status.as_str(), "running" | "waiting")
+                || run.camp_turn_cancel_requested_at.is_some()
+                || run.execution_budget_exhausted_at.is_some()
+            {
+                return Ok(rejected(
+                    "agent_run.network_recovery_deadline_fenced",
+                    "ThreadTurn is no longer accepting network recovery",
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let failure_json = serde_json::to_string(&envelope.payload.failure)?;
+            let error_details_ref = json!({
+                "category": envelope.payload.category,
+                "source": envelope.payload.source,
+            })
+            .to_string();
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'waiting', wait_reason = 'network_recovery',
+                    wait_deadline_at = NULL, runtime_recovery_required = 1,
+                    execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+                    last_error_code = 'runtime_network_interrupted',
+                    last_error_details_ref = ?4,
+                    public_runtime_failure_json = ?5,
+                    manual_retry_allowed = 1,
+                    version = version + 1, updated_at = ?6
+                WHERE id = ?1 AND status = 'running'
+                  AND version = ?2 AND execution_epoch = ?3
+                  AND cancel_requested_at IS NULL
+                "#,
+                params![
+                    run.id,
+                    envelope.payload.expected_version,
+                    envelope.payload.execution_epoch,
+                    error_details_ref,
+                    failure_json,
+                    now,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.network_recovery_fenced",
+                    "AgentRun changed before network recovery was persisted",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.network_recovery_waiting",
+                &run.camp_id,
+                ("agent_run", &run.id),
+                &envelope.actor,
+                Some(run.execution_epoch),
+                &json!({
+                    "category": envelope.payload.category,
+                    "source": envelope.payload.source,
+                }),
+            )?;
+            let camp_turn_status = if run.camp_turn_id.is_empty() {
+                "waiting".to_string()
+            } else {
+                recompute_camp_turn(
+                    transaction,
+                    &run.camp_id,
+                    &run.camp_turn_id,
+                    &envelope.actor,
+                    Some(run.execution_epoch),
+                    &now,
+                )?
+            };
+            Ok(CommandHandlerResult::accepted(
+                "agent_run.network_recovery_waiting",
+                json!({
+                    "agentRunId": run.id,
+                    "threadTurnId": run.camp_turn_id,
+                    "threadTurnStatus": camp_turn_status,
+                    "executionEpoch": run.execution_epoch,
+                    "version": run.version + 1,
+                }),
+                Some(entity_ref("agent_run", &run.id)),
+            ))
+        })
+    }
+
+    pub fn arm_network_recovery_attempt(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<ArmAgentRunNetworkRecoveryCommand>,
+    ) -> Result<CommandExecution> {
+        if envelope.payload.attempt == 0 {
+            anyhow::bail!("AgentRun network recovery attempt must be positive");
+        }
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id } if component_id == "network-recovery-coordinator"
+            ) {
+                return Ok(rejected(
+                    "agent_run.network_recovery_coordinator_required",
+                    "Network recovery requires its coordinator",
+                ));
+            }
+            let run = load_claimable_run(transaction, &envelope.payload.agent_run_id)?;
+            let Some(run) = run else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(run.camp_id.as_str()) {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if run.version != envelope.payload.expected_version
+                || run.execution_epoch != envelope.payload.execution_epoch
+                || run.status != "waiting"
+                || !matches!(
+                    run.wait_reason.as_deref(),
+                    Some("network_recovery" | "runtime_recovery")
+                )
+                || !run.runtime_recovery_required
+            {
+                return Ok(rejected(
+                    "agent_run.network_recovery_fenced",
+                    "AgentRun changed before the recovery attempt",
+                ));
+            }
+            if run.cancel_requested_at.is_some()
+                || !matches!(run.camp_turn_status.as_str(), "running" | "waiting")
+                || run.camp_turn_cancel_requested_at.is_some()
+                || run.execution_budget_exhausted_at.is_some()
+            {
+                return Ok(rejected(
+                    "agent_run.network_recovery_stopped",
+                    "AgentRun recovery is cancelled or no longer active",
+                ));
+            }
+            let budget_now = camp_turn_execution_budget_now();
+            if crate::execution_budget::execution_deadline_elapsed(
+                run.execution_budget_deadline_at.as_deref(),
+                budget_now,
+            )? {
+                return Ok(rejected(
+                    "agent_run.network_recovery_stopped",
+                    "ThreadTurn Execution Budget deadline has elapsed",
+                ));
+            }
+            if !run.member_active
+                || !current_authorization_covers_snapshot(
+                    &run.effective_config,
+                    &run.current_default_capabilities,
+                    &run.current_capability_overrides,
+                )?
+                || !network_recovery_input_is_safe(transaction, &run.id, run.execution_epoch)?
+                || has_recovery_safety_blocker(transaction, &run.id)?
+            {
+                let now = chrono::Utc::now().to_rfc3339();
+                let updated = transaction.execute(
+                    r#"
+                    UPDATE agent_run
+                    SET wait_reason = 'network_recovery_blocked',
+                        runtime_recovery_required = 0,
+                        manual_retry_allowed = 0,
+                        version = version + 1, updated_at = ?4
+                    WHERE id = ?1 AND status = 'waiting'
+                      AND wait_reason IN ('network_recovery', 'runtime_recovery')
+                      AND runtime_recovery_required = 1
+                      AND version = ?2 AND execution_epoch = ?3
+                    "#,
+                    params![
+                        run.id,
+                        envelope.payload.expected_version,
+                        envelope.payload.execution_epoch,
+                        now,
+                    ],
+                )?;
+                if updated != 1 {
+                    return Ok(rejected(
+                        "agent_run.network_recovery_fenced",
+                        "AgentRun changed before unsafe recovery was closed",
+                    ));
+                }
+                append_domain_event(
+                    transaction,
+                    "agent_run.network_recovery_needs_attention",
+                    &run.camp_id,
+                    ("agent_run", &run.id),
+                    &envelope.actor,
+                    Some(run.execution_epoch),
+                    &json!({ "attempt": envelope.payload.attempt }),
+                )?;
+                return Ok(CommandHandlerResult::applied(
+                    "agent_run.network_recovery_needs_attention",
+                    json!({
+                        "agentRunId": run.id,
+                        "executionEpoch": run.execution_epoch,
+                        "attempt": envelope.payload.attempt,
+                        "version": run.version + 1,
+                    }),
+                    Some(entity_ref("agent_run", &run.id)),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET wait_reason = 'runtime_recovery',
+                    version = version + 1, updated_at = ?4
+                WHERE id = ?1 AND status = 'waiting'
+                  AND wait_reason IN ('network_recovery', 'runtime_recovery')
+                  AND runtime_recovery_required = 1
+                  AND version = ?2 AND execution_epoch = ?3
+                  AND cancel_requested_at IS NULL
+                "#,
+                params![
+                    run.id,
+                    envelope.payload.expected_version,
+                    envelope.payload.execution_epoch,
+                    now,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.network_recovery_fenced",
+                    "AgentRun changed before the recovery attempt was admitted",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.network_recovery_attempt_admitted",
+                &run.camp_id,
+                ("agent_run", &run.id),
+                &envelope.actor,
+                Some(run.execution_epoch),
+                &json!({ "attempt": envelope.payload.attempt }),
+            )?;
+            Ok(CommandHandlerResult::accepted(
+                "agent_run.network_recovery_attempt_admitted",
+                json!({
+                    "agentRunId": run.id,
+                    "executionEpoch": run.execution_epoch,
+                    "attempt": envelope.payload.attempt,
+                    "version": run.version + 1,
+                }),
+                Some(entity_ref("agent_run", &run.id)),
+            ))
+        })
+    }
+
+    pub fn complete_network_recovery(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CompleteAgentRunNetworkRecoveryCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id } if component_id == "network-recovery-coordinator"
+            ) {
+                return Ok(rejected(
+                    "agent_run.network_recovery_coordinator_required",
+                    "Network recovery requires its coordinator",
+                ));
+            }
+            let run = load_claimable_run(transaction, &envelope.payload.agent_run_id)?;
+            let Some(run) = run else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(run.camp_id.as_str()) {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if run.version != envelope.payload.expected_version
+                || run.execution_epoch != envelope.payload.execution_epoch
+                || run.status != "running"
+            {
+                return Ok(rejected(
+                    "agent_run.network_recovery_fenced",
+                    "AgentRun changed before recovery progress was recorded",
+                ));
+            }
+            let accepted: i64 = transaction.query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM runtime_input_delivery
+                    WHERE agent_run_id = ?1 AND execution_epoch = ?2
+                      AND status = 'accepted'
+                )
+                "#,
+                params![run.id, run.execution_epoch],
+                |row| row.get(0),
+            )?;
+            if accepted == 0 {
+                return Ok(rejected(
+                    "agent_run.network_recovery_progress_unproven",
+                    "Accepted Runtime input is required to complete network recovery",
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET last_error_code = NULL, last_error_details_ref = NULL,
+                    public_runtime_failure_json = NULL, manual_retry_allowed = 0,
+                    version = version + 1, updated_at = ?4
+                WHERE id = ?1 AND status = 'running'
+                  AND version = ?2 AND execution_epoch = ?3
+                  AND last_error_code = 'runtime_network_interrupted'
+                "#,
+                params![
+                    run.id,
+                    envelope.payload.expected_version,
+                    envelope.payload.execution_epoch,
+                    now,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.network_recovery_not_active",
+                    "AgentRun has no active network recovery cycle",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.network_recovery_progressed",
+                &run.camp_id,
+                ("agent_run", &run.id),
+                &envelope.actor,
+                Some(run.execution_epoch),
+                &json!({ "progress": "runtime_input_accepted" }),
+            )?;
+            Ok(CommandHandlerResult::accepted(
+                "agent_run.network_recovery_progressed",
+                json!({
+                    "agentRunId": run.id,
+                    "executionEpoch": run.execution_epoch,
+                    "version": run.version + 1,
+                }),
+                Some(entity_ref("agent_run", &run.id)),
+            ))
+        })
+    }
+
+    pub fn resolve_accepted_input_recovery_blocker(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<ResolveAcceptedInputRecoveryBlockerCommand>,
+    ) -> Result<CommandExecution> {
+        let execution = self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, ActorRef::User { .. }) {
+                return Ok(rejected(
+                    "agent_run.recovery_blocker_user_required",
+                    "Only the local user may close an accepted-input recovery blocker",
+                ));
+            }
+            let target = transaction
+                .query_row(
+                    r#"
+                    SELECT COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                           COALESCE(agent_run.camp_turn_id, ''),
+                           agent_run.status, agent_run.wait_reason,
+                           agent_run.version, agent_run.execution_epoch,
+                           agent_run.runtime_recovery_required,
+                           agent_run.cancel_requested_at
+                    FROM agent_run
+                    LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                    WHERE agent_run.id = ?1
+                    "#,
+                    [&envelope.payload.agent_run_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                camp_id,
+                camp_turn_id,
+                status,
+                wait_reason,
+                version,
+                execution_epoch,
+                runtime_recovery_required,
+                cancel_requested_at,
+            )) = target
+            else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.payload.camp_id != camp_id
+                || envelope.camp_id.as_deref() != Some(camp_id.as_str())
+            {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if version != envelope.payload.expected_version {
+                return Ok(rejected(
+                    "agent_run.version_conflict",
+                    "AgentRun version is stale",
+                ));
+            }
+            if status != "waiting"
+                || wait_reason.as_deref() != Some("recovery_blocked")
+                || runtime_recovery_required != 0
+            {
+                return Ok(rejected(
+                    "agent_run.recovery_blocker_fenced",
+                    "AgentRun is not an accepted-input recovery blocker",
+                ));
+            }
+            if cancel_requested_at.is_some() {
+                return Ok(rejected(
+                    "agent_run.recovery_blocker_fenced",
+                    "AgentRun is already being closed by another command",
+                ));
+            }
+            if !has_accepted_runtime_input(transaction, &envelope.payload.agent_run_id)? {
+                return Ok(rejected(
+                    "agent_run.accepted_input_missing",
+                    "Recovery blocker no longer has accepted Runtime input evidence",
+                ));
+            }
+            if has_terminal_safety_blocker(transaction, &envelope.payload.agent_run_id)? {
+                return Ok(rejected(
+                    "agent_run.terminal_safety_blocked",
+                    "Approval, Action or Runtime Delivery must settle before the blocker can close",
+                ));
+            }
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let error_details_ref = json!({
+                "reason": "core_restarted_after_runtime_input_accepted",
+                "resolution": "user_closed_unknown_outcome",
+            })
+            .to_string();
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'failed', wait_reason = NULL, wait_deadline_at = NULL,
+                    runtime_recovery_required = 0,
+                    execution_lease_owner = NULL,
+                    execution_lease_expires_at = NULL,
+                    last_error_code = 'accepted_input_outcome_unknown',
+                    last_error_details_ref = ?2,
+                    manual_retry_allowed = 0,
+                    ended_at = ?3,
+                    version = version + 1,
+                    updated_at = ?3
+                WHERE id = ?1
+                  AND status = 'waiting'
+                  AND wait_reason = 'recovery_blocked'
+                  AND runtime_recovery_required = 0
+                  AND version = ?4
+                  AND cancel_requested_at IS NULL
+                "#,
+                params![
+                    envelope.payload.agent_run_id,
+                    error_details_ref,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.recovery_blocker_fenced",
+                    "AgentRun changed before the recovery blocker was closed",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.accepted_input_outcome_unknown",
+                &camp_id,
+                ("agent_run", &envelope.payload.agent_run_id),
+                &envelope.actor,
+                Some(execution_epoch),
+                &json!({
+                    "resolutionSource": "user",
+                    "acceptedInputPreserved": true,
+                    "automaticRetryAllowed": false,
+                }),
+            )?;
+            settle_materialized_delivery_for_agent_run(
+                transaction,
+                AgentRunDeliverySettlement {
+                    agent_run_id: &envelope.payload.agent_run_id,
+                    agent_run_status: "failed",
+                    agent_run_error_code: Some("accepted_input_outcome_unknown"),
+                    terminal_resolution_source: None,
+                    terminal_reason_code: None,
+                    actor: &envelope.actor,
+                    execution_epoch: Some(execution_epoch),
+                    now: &now,
+                },
+            )?;
+            let camp_turn_status = if camp_turn_id.is_empty() {
+                settle_run_deliveries(
+                    transaction,
+                    &envelope.payload.agent_run_id,
+                    "cancelled",
+                    Some("user_requested_agent_run_stop"),
+                    &now,
+                )?;
+                None
+            } else {
+                Some(recompute_camp_turn(
+                    transaction,
+                    &camp_id,
+                    &camp_turn_id,
+                    &envelope.actor,
+                    Some(execution_epoch),
+                    &now,
+                )?)
+            };
+            Ok(CommandHandlerResult::applied(
+                "agent_run.accepted_input_outcome_unknown",
+                json!({
+                    "agentRunId": envelope.payload.agent_run_id,
+                    "threadTurnId": (!camp_turn_id.is_empty()).then_some(camp_turn_id),
+                    "threadTurnStatus": camp_turn_status,
+                    "acceptedInputPreserved": true,
+                }),
+                Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+            ))
+        })?;
+        if !execution.replayed
+            && execution.result.code == "agent_run.accepted_input_outcome_unknown"
+        {
+            pump_target_after_run_terminal(database, &envelope.payload.agent_run_id)?;
+        }
+        Ok(execution)
+    }
+
+    pub fn request_camp_turn_cancellation(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CancelThreadTurnCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, ActorRef::User { .. }) {
+                return Ok(rejected(
+                    "camp_turn.cancel_user_required",
+                    "Only a User can stop a ThreadTurn from the v0.04 workbench",
+                ));
+            }
+            let turn = transaction
+                .query_row(
+                    r#"
+                    SELECT camp_id, status, version, cancel_requested_at
+                    FROM camp_turn WHERE id = ?1
+                    "#,
+                    [&envelope.payload.camp_turn_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((camp_id, status, version, cancel_requested_at)) = turn else {
+                return Ok(rejected("camp_turn.not_found", "ThreadTurn does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(camp_id.as_str()) {
+                return Ok(rejected(
+                    "camp_turn.camp_mismatch",
+                    "ThreadTurn is outside the Thread",
+                ));
+            }
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return Ok(CommandHandlerResult::applied(
+                    "camp_turn.already_terminal",
+                    json!({
+                        "threadTurnId": envelope.payload.camp_turn_id,
+                        "threadTurnStatus": status,
+                        "status": status,
+                    }),
+                    Some(entity_ref("camp_turn", &envelope.payload.camp_turn_id)),
+                ));
+            }
+            if version != envelope.payload.expected_version {
+                return Ok(CommandHandlerResult::rejected(
+                    "command.version_conflict",
+                    json!({ "currentVersion": version }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            if cancel_requested_at.is_none() {
+                transaction.execute(
+                    "UPDATE camp_turn SET cancel_requested_at = ?2,
+                     cancel_request_command_id = ?3, version = version + 1, updated_at = ?2
+                     WHERE id = ?1",
+                    params![envelope.payload.camp_turn_id, now, envelope.command_id],
+                )?;
+                append_domain_event(
+                    transaction,
+                    "camp_turn.cancel_requested",
+                    &camp_id,
+                    ("camp_turn", &envelope.payload.camp_turn_id),
+                    &envelope.actor,
+                    None,
+                    &json!({}),
+                )?;
+            }
+            let settlement = settle_abortive_camp_turn_in_tx(
+                transaction,
+                &envelope.payload.camp_turn_id,
+                "camp_turn_cancelled",
+                &envelope.actor,
+                &now,
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "camp_turn.cancelled",
+                json!({
+                    "threadTurnId": envelope.payload.camp_turn_id,
+                    "threadTurnStatus": settlement.terminal_status,
+                    "agentRunCount": settlement.runs.len(),
+                    "runs": settlement.runs,
+                    "messageDeliveriesCancelled": settlement.message_deliveries_cancelled,
+                }),
+                Some(entity_ref("camp_turn", &envelope.payload.camp_turn_id)),
+            ))
+        })
+    }
+
+    pub fn request_agent_run_cancellation(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CancelAgentRunCommand>,
+    ) -> Result<CommandExecution> {
+        let mut settled_run_id = None;
+        let execution = self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, ActorRef::User { .. }) {
+                return Ok(rejected(
+                    "agent_run.cancel_user_required",
+                    "Only a User can stop an AgentRun",
+                ));
+            }
+            let target = transaction
+                .query_row(
+                    r#"
+                    SELECT COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                           COALESCE(agent_run.camp_turn_id, ''),
+                           agent_run.status, agent_run.wait_reason,
+                           agent_run.version, agent_run.execution_epoch,
+                           agent_run.cancel_requested_at,
+                           camp_turn.cancel_requested_at
+                    FROM agent_run
+                    LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                    WHERE agent_run.id = ?1
+                    "#,
+                    [&envelope.payload.agent_run_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                camp_id,
+                camp_turn_id,
+                status,
+                wait_reason,
+                version,
+                execution_epoch,
+                _cancel_requested_at,
+                turn_cancel_requested_at,
+            )) = target
+            else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(camp_id.as_str())
+                || envelope.payload.camp_id != camp_id
+            {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+                return Ok(CommandHandlerResult::applied(
+                    "agent_run.already_terminal",
+                    json!({
+                        "agentRunId": envelope.payload.agent_run_id,
+                        "status": status,
+                    }),
+                    Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+                ));
+            }
+            if version != envelope.payload.expected_version {
+                return Ok(CommandHandlerResult::rejected(
+                    "command.version_conflict",
+                    json!({ "currentVersion": version }),
+                ));
+            }
+            if status == "waiting" && wait_reason.as_deref() == Some("recovery_blocked") {
+                return Ok(rejected(
+                    "agent_run.recovery_blocker_requires_resolution",
+                    "Recovery-blocked AgentRuns must use their dedicated resolution action",
+                ));
+            }
+            if turn_cancel_requested_at.is_some() {
+                return Ok(rejected(
+                    "agent_run.turn_cancellation_in_progress",
+                    "The owning ThreadTurn is already stopping",
+                ));
+            }
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let settlement = settle_abortive_agent_run_in_tx(
+                transaction,
+                &envelope.payload.agent_run_id,
+                "user_requested_agent_run_stop",
+                &envelope.actor,
+                &now,
+            )?;
+            settled_run_id = Some(settlement.agent_run_id.clone());
+            let camp_turn_status = if camp_turn_id.is_empty() {
+                None
+            } else {
+                Some(recompute_camp_turn(
+                    transaction,
+                    &camp_id,
+                    &camp_turn_id,
+                    &envelope.actor,
+                    Some(execution_epoch),
+                    &now,
+                )?)
+            };
+            Ok(CommandHandlerResult::applied(
+                settlement.terminal_code,
+                json!({
+                    "agentRunId": envelope.payload.agent_run_id,
+                    "threadTurnId": (!camp_turn_id.is_empty()).then_some(camp_turn_id),
+                    "threadTurnStatus": camp_turn_status,
+                    "status": settlement.terminal_status,
+                }),
+                Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+            ))
+        })?;
+        if let Some(agent_run_id) = settled_run_id {
+            pump_target_after_run_terminal(database, &agent_run_id)?;
+        }
+        Ok(execution)
+    }
+
+    pub fn runtime_cleanup_blocked_since(
+        &self,
+        database: &Database,
+        conversation_id: &str,
+        agent_run_id: &str,
+    ) -> Result<Option<String>> {
+        runtime_cleanup_blocked_since_connection(
+            database.connection(),
+            conversation_id,
+            Some(agent_run_id),
+        )
+    }
+
+    pub fn defer_runtime_cleanup(
+        &self,
+        database: &Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<()> {
+        database.connection().execute(
+            "UPDATE agent_run SET updated_at = ?3 WHERE id = ?1 AND execution_epoch = ?2 AND cancel_acknowledged_at IS NULL",
+            params![agent_run_id, execution_epoch, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_runtime_cleanup_completed(
+        &self,
+        database: &Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<()> {
+        let changed = database.connection().execute(
+            "UPDATE agent_run SET cancel_acknowledged_at = ?3, updated_at = ?3
+             WHERE id = ?1 AND execution_epoch = ?2
+               AND status IN ('succeeded', 'failed', 'cancelled')
+               AND cancel_requested_at IS NOT NULL AND cancel_acknowledged_at IS NULL",
+            params![
+                agent_run_id,
+                execution_epoch,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        if changed > 0 {
+            database.execution_wake.runs.notify_one();
+            database.execution_wake.delivery.notify_one();
+        }
+        Ok(())
+    }
+
+    pub fn record_cancelled_agent_run_ending_git_observation(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RecordCancelledAgentRunEndingGitObservationCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id }
+                    if component_id == "agent-run-git-observer"
+            ) {
+                return Ok(rejected(
+                    "agent_run.git_observer_required",
+                    "Cancelled AgentRun Git observation requires its background observer",
+                ));
+            }
+            let target = transaction
+                .query_row(
+                    r#"
+                    SELECT COALESCE(agent_run.camp_id, camp_turn.camp_id), agent_run.status,
+                           agent_run.execution_epoch,
+                           agent_run.ending_git_observation_json,
+                           agent_run.cancel_requested_at IS NOT NULL
+                    FROM agent_run
+                    LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                    WHERE agent_run.id = ?1
+                    "#,
+                    [&envelope.payload.agent_run_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, bool>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                camp_id,
+                status,
+                execution_epoch,
+                existing_observation,
+                cancellation_requested,
+            )) = target
+            else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(camp_id.as_str()) {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if execution_epoch != envelope.payload.execution_epoch {
+                return Ok(rejected(
+                    "agent_run.git_observation_fenced",
+                    "AgentRun execution epoch changed before Git observation",
+                ));
+            }
+            if existing_observation.is_some() {
+                return Ok(CommandHandlerResult::applied(
+                    "agent_run.ending_git_observation_already_recorded",
+                    json!({ "agentRunId": envelope.payload.agent_run_id }),
+                    Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+                ));
+            }
+            if status != "cancelled" && !(status == "failed" && cancellation_requested) {
+                return Ok(rejected(
+                    "agent_run.not_cancelled",
+                    "Ending Git observation can be appended only after business cancellation",
+                ));
+            }
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let ending_git_observation =
+                serde_json::to_string(&envelope.payload.ending_git_observation)?;
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET ending_git_observation_json = ?2,
+                    version = version + 1, updated_at = ?3
+                WHERE id = ?1 AND status IN ('cancelled', 'failed')
+                  AND execution_epoch = ?4
+                  AND ending_git_observation_json IS NULL
+                "#,
+                params![
+                    envelope.payload.agent_run_id,
+                    ending_git_observation,
+                    now,
+                    envelope.payload.execution_epoch,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.git_observation_fenced",
+                    "AgentRun changed before Git observation was recorded",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.ending_git_observation_recorded",
+                &camp_id,
+                ("agent_run", &envelope.payload.agent_run_id),
+                &envelope.actor,
+                Some(envelope.payload.execution_epoch),
+                &json!({
+                    "endingGitObservation": envelope.payload.ending_git_observation,
+                }),
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "agent_run.ending_git_observation_recorded",
+                json!({ "agentRunId": envelope.payload.agent_run_id }),
+                Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
+            ))
+        })
+    }
+
+    pub fn bind_native_session(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<BindNativeSessionCommand>,
+    ) -> Result<CommandExecution> {
+        if envelope.payload.adapter_installation_id.trim().is_empty()
+            || envelope.payload.native_session_id.trim().is_empty()
+            || envelope
+                .payload
+                .binding_compatibility_digest
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!("Native Binding fields must not be empty");
+        }
+        if let Some(proposed_binding_id) = envelope.payload.proposed_binding_id.as_deref() {
+            Uuid::parse_str(proposed_binding_id)
+                .context("proposed Native Binding ID must be a UUID")?;
+        }
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id } if component_id.starts_with("runtime-adapter:")
+            ) {
+                return Ok(rejected(
+                    "runtime.adapter_required",
+                    "Native Session binding requires a Runtime Adapter",
+                ));
+            }
+            let budget_now = camp_turn_execution_budget_now().to_rfc3339();
+            let audit_now = chrono::Utc::now().to_rfc3339();
+            let row = transaction
+                .query_row(
+                    r#"
+                    SELECT conversation.camp_id,
+                           conversation.native_adapter_installation_id,
+                           conversation.native_session_id,
+                           conversation.native_binding_compatibility_digest,
+                           conversation.native_installation_generation,
+                           conversation.native_session_compatibility_key,
+                           conversation.native_binding_id,
+                           conversation.native_binding_generation,
+                           conversation.version, agent_run.execution_epoch,
+                           agent_run.status, agent_run.runtime_installation_id,
+                           agent_run.runtime_binding_compatibility_digest,
+                           agent_run.runtime_installation_generation,
+                           agent_run.runtime_native_session_compatibility_key,
+                           agent_run.runtime_adapter_kind
+                    FROM conversation
+                    JOIN agent_run ON agent_run.conversation_id = conversation.id
+                    LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                    WHERE conversation.id = ?1 AND agent_run.id = ?2
+                      AND agent_run.cancel_requested_at IS NULL
+                      AND (
+                            agent_run.camp_turn_id IS NULL
+                         OR (
+                                camp_turn.status IN ('running', 'waiting')
+                            AND camp_turn.cancel_requested_at IS NULL
+                            AND camp_turn.execution_budget_exhausted_at IS NULL
+                            AND (camp_turn.execution_budget_deadline_at > ?3
+                                 OR (camp_turn.execution_budget_deadline_at IS NULL
+                                     AND camp_turn.execution_budget_schema_version = 2))
+                         )
+                      )
+                    "#,
+                    params![
+                        envelope.payload.conversation_id,
+                        envelope.payload.agent_run_id,
+                        budget_now,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, String>(10)?,
+                            row.get::<_, Option<String>>(11)?,
+                            row.get::<_, Option<String>>(12)?,
+                            row.get::<_, Option<i64>>(13)?,
+                            row.get::<_, Option<String>>(14)?,
+                            row.get::<_, String>(15)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                camp_id,
+                current_installation,
+                current_session,
+                current_digest,
+                current_installation_generation,
+                current_session_compatibility_key,
+                current_binding_id,
+                current_binding_generation,
+                version,
+                epoch,
+                run_status,
+                frozen_installation,
+                frozen_digest,
+                frozen_installation_generation,
+                frozen_session_compatibility_key,
+                kind,
+            )) = row
+            else {
+                return Ok(rejected(
+                    "runtime.binding_not_found",
+                    "Conversation and AgentRun binding does not exist",
+                ));
+            };
+            if envelope.camp_id.as_deref() != Some(camp_id.as_str())
+                || version != envelope.payload.expected_conversation_version
+                || epoch != envelope.payload.expected_execution_epoch
+                || !matches!(run_status.as_str(), "running" | "waiting")
+            {
+                return Ok(rejected(
+                    "runtime.binding_fenced",
+                    "Conversation or AgentRun binding is stale",
+                ));
+            }
+            let identity_binding = matches!(kind.as_str(), "command-code-cli" | "hermes-cli");
+            if !identity_binding && envelope.payload.binding_compatibility_digest.is_none() {
+                return Ok(rejected("runtime.binding_configuration_mismatch", "Native Binding compatibility digest missing"));
+            }
+            if frozen_installation.as_deref()
+                != Some(envelope.payload.adapter_installation_id.as_str())
+                || (!identity_binding && frozen_digest != envelope.payload.binding_compatibility_digest)
+                || frozen_installation_generation.is_none()
+            {
+                return Ok(rejected(
+                    "runtime.binding_configuration_mismatch",
+                    "Native Binding does not match the AgentRun frozen Runtime",
+                ));
+            }
+            if current_installation != envelope.payload.previous_adapter_installation_id
+                || current_session != envelope.payload.previous_native_session_id
+                || (!identity_binding && current_digest != envelope.payload.previous_binding_compatibility_digest)
+            {
+                return Ok(rejected(
+                    "runtime.session_changed",
+                    "Native Binding changed before replacement",
+                ));
+            }
+            let frozen_installation_generation =
+                frozen_installation_generation.context("frozen Runtime has no generation")?;
+            let native_session_replaced = if current_session.as_deref()
+                .is_some_and(|old| old != envelope.payload.native_session_id)
+            {
+                native_session_adapter_kind(transaction, &envelope.payload.conversation_id)?
+                    == Some(kind.parse()?)
+            } else { false };
+            let binding_reused = current_binding_id.is_some()
+                && current_binding_generation >= 1
+                && (identity_binding || current_installation.as_deref()
+                    == Some(envelope.payload.adapter_installation_id.as_str()))
+                && current_session.as_deref() == Some(envelope.payload.native_session_id.as_str())
+                && (identity_binding || current_digest == envelope.payload.binding_compatibility_digest);
+            let binding_prepared = current_binding_id.is_some()
+                && current_binding_generation >= 1
+                && envelope.payload.proposed_binding_id.as_deref() == current_binding_id.as_deref();
+            if binding_reused
+                && envelope.payload.proposed_binding_id.is_some()
+                && envelope.payload.proposed_binding_id.as_deref()
+                    != current_binding_id.as_deref()
+            {
+                return Ok(rejected(
+                    "runtime.binding_proposal_conflict",
+                    "Proposed Native Binding ID conflicts with the reusable binding",
+                ));
+            }
+            let binding_id = if binding_reused || binding_prepared {
+                current_binding_id.context("reused Native Binding has no identity")?
+            } else {
+                envelope
+                    .payload
+                    .proposed_binding_id
+                    .clone()
+                    .unwrap_or_else(|| Uuid::new_v4().to_string())
+            };
+            let binding_generation = if binding_reused || binding_prepared {
+                current_binding_generation
+            } else {
+                current_binding_generation
+                    .checked_add(1)
+                    .context("Native Binding generation overflow")?
+                    .max(1)
+            };
+            if !binding_reused {
+                let updated = if binding_prepared {
+                    // The Team Tool credential and Binding identity were
+                    // reserved before the Adapter started its MCP process.
+                    // Completing that reservation must retain the secret,
+                    // generation, accepted public boundary and Charter state prepared
+                    // for this exact Native Session generation.
+                    transaction.execute(
+                        r#"
+                        UPDATE conversation
+                        SET native_session_id = ?2,
+                            native_adapter_installation_id = ?5,
+                            native_binding_compatibility_digest = ?6,
+                            native_installation_generation = ?9,
+                            native_session_compatibility_key = ?10,
+                            version = version + 1,
+                            updated_at = ?3
+                        WHERE id = ?1 AND version = ?4
+                          AND native_binding_id = ?7
+                          AND native_binding_generation = ?8
+                          AND native_binding_secret_digest IS NOT NULL
+                        "#,
+                        params![
+                            envelope.payload.conversation_id,
+                            envelope.payload.native_session_id,
+                            audit_now,
+                            envelope.payload.expected_conversation_version,
+                            envelope.payload.adapter_installation_id,
+                            envelope.payload.binding_compatibility_digest,
+                            binding_id,
+                            binding_generation,
+                            frozen_installation_generation,
+                            frozen_session_compatibility_key,
+                        ],
+                    )?
+                } else {
+                    transaction.execute(
+                        r#"
+                        UPDATE conversation
+                        SET native_adapter_installation_id = ?2,
+                            native_session_id = ?3,
+                            native_binding_compatibility_digest = ?4,
+                            native_installation_generation = ?12,
+                            native_session_compatibility_key = ?13,
+                            native_binding_id = ?5,
+                            native_binding_generation = ?6,
+                            native_binding_secret_digest = NULL,
+                            last_accepted_public_boundary_sequence = CASE
+                                WHEN kind = 'single_chat' THEN 0
+                                ELSE last_accepted_public_boundary_sequence
+                            END,
+                            native_charter_digest = NULL,
+                            native_collaboration_state_digest = NULL,
+                            version = version + 1, updated_at = ?7
+                        WHERE id = ?1 AND version = ?8
+                          AND native_adapter_installation_id IS ?9
+                          AND native_session_id IS ?10
+                          AND (?14 OR native_binding_compatibility_digest IS ?11)
+                        "#,
+                        params![
+                            envelope.payload.conversation_id,
+                            envelope.payload.adapter_installation_id,
+                            envelope.payload.native_session_id,
+                            envelope.payload.binding_compatibility_digest,
+                            binding_id,
+                            binding_generation,
+                            audit_now,
+                            envelope.payload.expected_conversation_version,
+                            envelope.payload.previous_adapter_installation_id,
+                            envelope.payload.previous_native_session_id,
+                            envelope.payload.previous_binding_compatibility_digest,
+                            frozen_installation_generation,
+                            frozen_session_compatibility_key,
+                            identity_binding,
+                        ],
+                    )?
+                };
+                if updated != 1 {
+                    return Ok(rejected(
+                        "runtime.binding_race_lost",
+                        "Conversation changed before Native Session binding",
+                    ));
+                }
+            } else if !identity_binding && (current_installation_generation
+                != Some(frozen_installation_generation)
+                || current_session_compatibility_key != frozen_session_compatibility_key)
+            {
+                let updated = transaction.execute(
+                    r#"
+                    UPDATE conversation
+                    SET native_installation_generation = ?2,
+                        native_session_compatibility_key = ?3,
+                        version = version + 1, updated_at = ?4
+                    WHERE id = ?1 AND version = ?5
+                      AND native_session_id = ?6
+                      AND native_binding_id = ?7
+                      AND native_binding_generation = ?8
+                    "#,
+                    params![
+                        envelope.payload.conversation_id,
+                        frozen_installation_generation,
+                        frozen_session_compatibility_key,
+                        audit_now,
+                        envelope.payload.expected_conversation_version,
+                        envelope.payload.native_session_id,
+                        binding_id,
+                        binding_generation,
+                    ],
+                )?;
+                if updated != 1 {
+                    return Ok(rejected(
+                        "runtime.binding_race_lost",
+                        "Conversation changed before compatible Native Session metadata update",
+                    ));
+                }
+            }
+            transaction.execute(
+                r#"
+                UPDATE native_session_resume_attempt
+                SET status = 'succeeded', completed_at = ?4
+                WHERE conversation_id = ?1
+                  AND installation_id = ?2
+                  AND installation_generation = ?3
+                  AND status = 'attempting'
+                "#,
+                params![
+                    envelope.payload.conversation_id,
+                    envelope.payload.adapter_installation_id,
+                    frozen_installation_generation,
+                    audit_now,
+                ],
+            )?;
+            append_domain_event(
+                transaction,
+                "conversation.native_session_bound",
+                &camp_id,
+                ("conversation", &envelope.payload.conversation_id),
+                &envelope.actor,
+                None,
+                &json!({
+                    "agentRunId": envelope.payload.agent_run_id,
+                    "executionEpoch": envelope.payload.expected_execution_epoch,
+                    "previousAdapterInstallationId": envelope.payload.previous_adapter_installation_id,
+                    "previousNativeSessionId": envelope.payload.previous_native_session_id,
+                    "previousBindingCompatibilityDigest": envelope.payload.previous_binding_compatibility_digest,
+                    "adapterInstallationId": envelope.payload.adapter_installation_id,
+                    "nativeSessionId": envelope.payload.native_session_id,
+                    "bindingCompatibilityDigest": envelope.payload.binding_compatibility_digest,
+                    "nativeBindingId": binding_id,
+                    "nativeBindingGeneration": binding_generation,
+                    "bindingReused": binding_reused,
+                    "bindingPrepared": binding_prepared,
+                    "installationGeneration": frozen_installation_generation,
+                    "nativeSessionCompatibilityKey": frozen_session_compatibility_key,
+                }),
+            )?;
+            if native_session_replaced {
+                append_domain_event(transaction, "agent_run.native_session_continuity_lost", &camp_id,
+                    ("agent_run", &envelope.payload.agent_run_id), &envelope.actor,
+                    Some(envelope.payload.expected_execution_epoch), &json!({
+                        "agentRunId": envelope.payload.agent_run_id,
+                        "conversationId": envelope.payload.conversation_id,
+                        "executionEpoch": envelope.payload.expected_execution_epoch,
+                        "continuation": "native_session_replaced",
+                        "failure": "incompatible", "fallback": "new_session",
+                    }))?;
+            }
+            Ok(CommandHandlerResult::applied(
+                "conversation.native_session_bound",
+                json!({
+                    "conversationId": envelope.payload.conversation_id,
+                    "adapterInstallationId": envelope.payload.adapter_installation_id,
+                    "nativeSessionId": envelope.payload.native_session_id,
+                    "bindingCompatibilityDigest": envelope.payload.binding_compatibility_digest,
+                    "nativeBindingId": binding_id,
+                    "nativeBindingGeneration": binding_generation,
+                    "bindingReused": binding_reused,
+                    "bindingPrepared": binding_prepared,
+                }),
+                Some(entity_ref(
+                    "conversation",
+                    &envelope.payload.conversation_id,
+                )),
+            ))
+        })
+    }
+
+    pub fn restart_native_session(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RestartNativeSessionCommand>,
+    ) -> Result<CommandExecution> {
+        if envelope.payload.conversation_id.trim().is_empty() {
+            anyhow::bail!("conversationId must not be empty");
+        }
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, ActorRef::User { .. }) {
+                return Ok(rejected(
+                    "conversation.user_required",
+                    "Only the local user may restart a Native Session",
+                ));
+            }
+            let conversation = transaction
+                .query_row(
+                    r#"
+                    SELECT camp_id, version, native_adapter_installation_id,
+                           native_session_id, native_binding_id
+                    FROM conversation WHERE id = ?1
+                    "#,
+                    [&envelope.payload.conversation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((camp_id, version, installation_id, native_session_id, binding_id)) =
+                conversation
+            else {
+                return Ok(rejected(
+                    "conversation.not_found",
+                    "Conversation does not exist",
+                ));
+            };
+            if envelope.camp_id.as_deref().is_some_and(|id| id != camp_id) {
+                return Ok(rejected(
+                    "conversation.camp_mismatch",
+                    "Conversation is outside the requested Thread",
+                ));
+            }
+            if version != envelope.payload.expected_version {
+                return Ok(rejected(
+                    "conversation.version_conflict",
+                    "Conversation changed before its Native Session was restarted",
+                ));
+            }
+            let active_run_count: i64 = transaction.query_row(
+                r#"
+                SELECT COUNT(*) FROM agent_run
+                WHERE conversation_id = ?1
+                  AND status IN ('queued', 'running', 'waiting')
+                "#,
+                [&envelope.payload.conversation_id],
+                |row| row.get(0),
+            )?;
+            if active_run_count != 0 {
+                return Ok(rejected(
+                    "conversation.active_run",
+                    "Native Session cannot be restarted while this Conversation has active work",
+                ));
+            }
+            if installation_id.is_none() && native_session_id.is_none() && binding_id.is_none() {
+                return Ok(CommandHandlerResult::applied(
+                    "conversation_native_session_already_clear",
+                    json!({
+                        "conversationId": envelope.payload.conversation_id,
+                        "nativeBindingGenerationChanged": false,
+                    }),
+                    Some(entity_ref(
+                        "conversation",
+                        &envelope.payload.conversation_id,
+                    )),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let updated = transaction.execute(
+                r#"
+                UPDATE conversation
+                SET native_adapter_installation_id = NULL,
+                    native_session_id = NULL,
+                    native_binding_compatibility_digest = NULL,
+                    native_installation_generation = NULL,
+                    native_session_compatibility_key = NULL,
+                    native_binding_id = NULL,
+                    native_binding_secret_digest = NULL,
+                    last_accepted_public_boundary_sequence = CASE
+                        WHEN kind = 'single_chat' THEN 0
+                        ELSE last_accepted_public_boundary_sequence
+                    END,
+                    native_charter_digest = NULL,
+                            native_collaboration_state_digest = NULL,
+                    version = version + 1,
+                    updated_at = ?3
+                WHERE id = ?1 AND version = ?2
+                "#,
+                params![
+                    envelope.payload.conversation_id,
+                    envelope.payload.expected_version,
+                    now,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "conversation.version_conflict",
+                    "Conversation changed before its Native Session was restarted",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "conversation.native_session_restarted",
+                &camp_id,
+                ("conversation", &envelope.payload.conversation_id),
+                &envelope.actor,
+                None,
+                &json!({
+                    "conversationId": envelope.payload.conversation_id,
+                    "previousAdapterInstallationId": installation_id,
+                    "previousNativeSessionId": native_session_id,
+                    "previousNativeBindingId": binding_id,
+                    "nativeBindingGenerationChanged": false,
+                }),
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "conversation_native_session_restarted",
+                json!({
+                    "conversationId": envelope.payload.conversation_id,
+                    "version": version + 1,
+                    "nativeBindingGenerationChanged": false,
+                }),
+                Some(entity_ref(
+                    "conversation",
+                    &envelope.payload.conversation_id,
+                )),
+            ))
+        })
+    }
+
+    pub fn has_current_run_public_send(
+        &self,
+        database: &Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<bool> {
+        has_current_run_public_send(database.connection(), agent_run_id, execution_epoch)
+    }
+
+    pub fn succeed_agent_run(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SucceedAgentRunCommand>,
+    ) -> Result<CommandExecution> {
+        self.succeed_agent_run_with_terminal_reason(database, envelope, None, false)
+    }
+
+    pub fn succeed_agent_run_during_planned_shutdown(
+        &self,
+        database: &mut Database,
+        permit: &TerminalSettlementPermit,
+        envelope: &CommandEnvelope<SucceedAgentRunCommand>,
+    ) -> Result<CommandExecution> {
+        if !permit.authorizes(
+            &envelope.payload.agent_run_id,
+            envelope.payload.execution_epoch,
+            RuntimeTerminalOutcome::Succeeded,
+        ) {
+            anyhow::bail!("planned shutdown terminal permit does not match the success target");
+        }
+        self.succeed_agent_run_with_terminal_reason(
+            database,
+            envelope,
+            Some("planned_shutdown_completed"),
+            false,
+        )
+    }
+
+    pub fn succeed_agent_run_requiring_cleanup(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SucceedAgentRunCommand>,
+        permit: Option<&TerminalSettlementPermit>,
+    ) -> Result<CommandExecution> {
+        if permit.is_some_and(|permit| {
+            !permit.authorizes(
+                &envelope.payload.agent_run_id,
+                envelope.payload.execution_epoch,
+                RuntimeTerminalOutcome::Succeeded,
+            )
+        }) {
+            anyhow::bail!("planned shutdown terminal permit does not match the success target");
+        }
+        self.succeed_agent_run_with_terminal_reason(
+            database,
+            envelope,
+            permit.map(|_| "planned_shutdown_completed"),
+            true,
+        )
+    }
+
+    fn succeed_agent_run_with_terminal_reason(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SucceedAgentRunCommand>,
+        terminal_reason_code: Option<&str>,
+        cleanup_required: bool,
+    ) -> Result<CommandExecution> {
+        if envelope.payload.native_turn_id.trim().is_empty() {
+            anyhow::bail!("nativeTurnId must not be empty");
+        }
+        let has_final_output = !envelope.payload.final_output.trim().is_empty();
+        let execution = self.gateway.execute(database, envelope, |transaction| {
+            if !is_runtime_adapter(&envelope.actor) {
+                return Ok(rejected(
+                    "runtime.adapter_required",
+                    "AgentRun completion requires a Runtime Adapter",
+                ));
+            }
+            let target = load_terminal_target(transaction, &envelope.payload.agent_run_id)?;
+            let Some(target) = target else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if let Some(rejection) = validate_terminal_target(
+                transaction,
+                envelope.camp_id.as_deref(),
+                &target,
+                envelope.payload.expected_version,
+                envelope.payload.execution_epoch,
+            )? {
+                return Ok(rejection);
+            }
+            if !has_final_output
+                && (target.invocation_kind == "single_chat"
+                    || !has_current_run_public_send(transaction, &target.agent_run_id, target.execution_epoch)?)
+            {
+                return Ok(rejected(
+                    "agent_run.missing_final_output",
+                    "Empty final output requires a committed public send from this Run and execution epoch",
+                ));
+            }
+            if target.invocation_kind == "single_chat" {
+                return persist_single_chat_success(
+                    transaction,
+                    &target,
+                    envelope,
+                    terminal_reason_code,
+                    cleanup_required,
+                );
+            }
+            let adapter_kind = target
+                .runtime_adapter_kind
+                .as_deref()
+                .and_then(|value| value.parse::<AdapterKind>().ok());
+            let public_output_mode = adapter_kind
+                .map(AdapterKind::public_output_mode)
+                .unwrap_or(PublicOutputMode::ExplicitSendOnly);
+            let publication_allowed = terminal_publication_allowed(transaction, &target)?;
+            let final_output_digest = has_final_output.then(||
+                canonical_content_digest(&[StructuredThreadMessageSegment::Text {
+                    text: envelope.payload.final_output.clone(),
+                }])).transpose()?;
+            let (ordinary_final_camp_message_id, automatic_public_output_suppressed) =
+                if public_output_mode == PublicOutputMode::AssistantFinalVisible
+                    && publication_allowed
+                    && has_final_output
+                {
+                    // A Runtime may have already made the exact final answer public through
+                    // `camp.message.send`. Suppress only that same Run + canonical body digest;
+                    // never deduplicate across Runs, recipients, time windows, or semantics.
+                    let existing_final_message_id: Option<String> = transaction
+                        .query_row(
+                            r#"
+                            SELECT id
+                            FROM camp_message
+                            WHERE source_agent_run_id = ?1
+                              AND author_type = 'agent'
+                              AND tombstoned_at IS NULL
+                              AND content_digest = ?2
+                              AND source_operation_id IS NOT NULL
+                              AND json_array_length(effective_recipient_ids_json) = 0
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM message_delivery
+                                  WHERE message_delivery.message_id = camp_message.id
+                              )
+                            ORDER BY sequence, id
+                            LIMIT 1
+                            "#,
+                            params![target.agent_run_id, final_output_digest],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(existing_final_message_id) = existing_final_message_id {
+                        (Some(existing_final_message_id), true)
+                    } else {
+                        let final_camp_message_id = persist_recipient_free_agent_publication(
+                            transaction,
+                            &target,
+                            &envelope.payload.final_output,
+                            final_output_digest.as_deref().expect("nonempty final has a digest"),
+                            &envelope.actor,
+                            envelope.payload.execution_epoch,
+                            "assistant_final_visible",
+                            Some(public_output_mode.as_str()),
+                            None,
+                        )?;
+                        (Some(final_camp_message_id), false)
+                    }
+                } else if public_output_mode == PublicOutputMode::AssistantFinalVisible {
+                    (None, true)
+                } else {
+                    (None, false)
+                };
+            let missing_send_recovery = decide_missing_send_recovery(
+                transaction,
+                &target,
+                &envelope.actor,
+                adapter_kind,
+                publication_allowed,
+                ordinary_final_camp_message_id.as_deref(),
+                envelope.payload.missing_send_recovery_candidate.as_ref(),
+            )?;
+            let final_camp_message_id =
+                ordinary_final_camp_message_id.or_else(|| missing_send_recovery.message_id.clone());
+            let ending_git_observation = envelope
+                .payload
+                .ending_git_observation
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'succeeded', wait_reason = NULL, wait_deadline_at = NULL,
+                    runtime_recovery_required = 0,
+                    execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+                    terminal_resolution_source = 'runtime_terminal',
+                    terminal_reason_code = ?7,
+                    cancel_requested_at = CASE WHEN ?8 THEN COALESCE(cancel_requested_at, ?3) ELSE cancel_requested_at END,
+                    cancel_reason_code = CASE WHEN ?8 THEN COALESCE(cancel_reason_code, 'runtime_host_release_pending') ELSE cancel_reason_code END,
+                    final_conversation_message_id = NULL,
+                    final_camp_message_id = ?2,
+                    ending_git_observation_json = ?6,
+                    ended_at = ?3, version = version + 1, updated_at = ?3
+                WHERE id = ?1 AND status = 'running'
+                  AND version = ?4 AND execution_epoch = ?5
+                "#,
+                params![
+                    target.agent_run_id,
+                    final_camp_message_id,
+                    target.now,
+                    envelope.payload.expected_version,
+                    envelope.payload.execution_epoch,
+                    ending_git_observation,
+                    terminal_reason_code,
+                    cleanup_required,
+                ],
+            )?;
+            if updated != 1 {
+                anyhow::bail!("AgentRun changed inside its completion transaction");
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.succeeded",
+                &target.camp_id,
+                ("agent_run", &target.agent_run_id),
+                &envelope.actor,
+                Some(envelope.payload.execution_epoch),
+                &json!({
+                    "nativeTurnId": envelope.payload.native_turn_id,
+                    "finalThreadMessageId": final_camp_message_id,
+                    "finalOutputDigest": final_output_digest,
+                    "publicOutputMode": public_output_mode.as_str(),
+                    "recipientFree": true,
+                    "automaticPublicOutputSuppressed": automatic_public_output_suppressed,
+                    "missingSendRecovery": missing_send_recovery,
+                    "endingGitObservation": envelope.payload.ending_git_observation,
+                    "terminalResolutionSource": "runtime_terminal",
+                    "terminalReasonCode": terminal_reason_code,
+                }),
+            )?;
+            settle_materialized_delivery_for_agent_run(
+                transaction,
+                AgentRunDeliverySettlement {
+                    agent_run_id: &target.agent_run_id,
+                    agent_run_status: "succeeded",
+                    agent_run_error_code: None,
+                    terminal_resolution_source: Some("runtime_terminal"),
+                    terminal_reason_code,
+                    actor: &envelope.actor,
+                    execution_epoch: Some(envelope.payload.execution_epoch),
+                    now: &target.now,
+                },
+            )?;
+            let camp_turn_status = if target.camp_turn_id.is_empty() {
+                settle_run_deliveries(
+                    transaction,
+                    &target.agent_run_id,
+                    "succeeded",
+                    None,
+                    &target.now,
+                )?;
+                None
+            } else {
+                Some(recompute_camp_turn(
+                    transaction,
+                    &target.camp_id,
+                    &target.camp_turn_id,
+                    &envelope.actor,
+                    Some(envelope.payload.execution_epoch),
+                    &target.now,
+                )?)
+            };
+            Ok(CommandHandlerResult::applied(
+                "agent_run.succeeded",
+                json!({
+                    "agentRunId": target.agent_run_id,
+                    "threadTurnId": (!target.camp_turn_id.is_empty())
+                        .then_some(target.camp_turn_id),
+                    "threadTurnStatus": camp_turn_status,
+                    "finalThreadMessageId": final_camp_message_id,
+                    "finalOutputDigest": final_output_digest,
+                    "publicOutputMode": public_output_mode.as_str(),
+                    "automaticPublicOutputSuppressed": automatic_public_output_suppressed,
+                    "missingSendRecovery": missing_send_recovery,
+                }),
+                Some(entity_ref("agent_run", &target.agent_run_id)),
+            ))
+        })?;
+        if !execution.replayed && execution.result.code == "agent_run.succeeded" {
+            pump_target_after_run_terminal(database, &envelope.payload.agent_run_id)?;
+        }
+        Ok(execution)
+    }
+
+    pub fn rebind_agent_run_runtime(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RebindAgentRunRuntimeCommand>,
+    ) -> Result<CommandExecution> {
+        if envelope.payload.drift_reason.trim().is_empty() {
+            anyhow::bail!("Runtime drift reason must not be empty");
+        }
+        let execution = self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id } if component_id == "agent-run-scheduler"
+            ) {
+                return Ok(rejected(
+                    "agent_run.scheduler_required",
+                    "AgentRun Runtime rebind requires the scheduler",
+                ));
+            }
+            let target = load_terminal_target(transaction, &envelope.payload.agent_run_id)?;
+            let Some(target) = target else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(target.camp_id.as_str()) {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if target.version != envelope.payload.expected_version {
+                return Ok(rejected(
+                    "agent_run.version_conflict",
+                    "AgentRun version is stale",
+                ));
+            }
+            if !matches!(target.status.as_str(), "queued" | "waiting")
+                || target.cancel_requested_at.is_some()
+            {
+                return Ok(rejected(
+                    "agent_run.runtime_rebind_fenced",
+                    "AgentRun is no longer awaiting dispatch",
+                ));
+            }
+            let (effective_config_json, runtime_rebind_count) = transaction.query_row(
+                "SELECT effective_config_json, runtime_rebind_count FROM agent_run WHERE id = ?1",
+                [&target.agent_run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            if runtime_rebind_count >= 1 {
+                return Ok(rejected(
+                    "agent_run.runtime_rebind_limit_reached",
+                    "AgentRun Runtime was already rebound once",
+                ));
+            }
+            let mut effective_config: Value = serde_json::from_str(&effective_config_json)
+                .context("AgentRun effective config is invalid")?;
+            let frozen_runtime: FrozenAgentRuntimeConfig = serde_json::from_value(
+                effective_config
+                    .get("runtime")
+                    .cloned()
+                    .context("AgentRun has no frozen Runtime configuration")?,
+            )
+            .context("AgentRun frozen Runtime configuration is invalid")?;
+            if !runtime_logical_identity_matches(
+                &frozen_runtime,
+                &envelope.payload.effective_runtime,
+            ) {
+                return Ok(rejected(
+                    "agent_run.runtime_identity_changed",
+                    "Refreshed Runtime does not match the Run's frozen logical identity",
+                ));
+            }
+            if !runtime_config_digest_is_valid(&envelope.payload.effective_runtime)? {
+                return Ok(rejected(
+                    "agent_run.runtime_rebind_invalid",
+                    "Refreshed Runtime configuration digest is invalid",
+                ));
+            }
+            if let Some(blocker) = AgentProfileService::default()
+                .runtime_dispatch_blocker_for_connection(
+                    transaction,
+                    &envelope.payload.effective_runtime,
+                )?
+            {
+                return Ok(CommandHandlerResult::rejected(
+                    blocker.code,
+                    blocker.payload,
+                ));
+            }
+
+            replace_effective_runtime(&mut effective_config, &envelope.payload.effective_runtime)?;
+            let effective_config_json = serde_json::to_string(&effective_config)?;
+            let runtime = &envelope.payload.effective_runtime;
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET effective_config_json = ?2,
+                    runtime_adapter_kind = ?3,
+                    runtime_installation_id = ?4,
+                    runtime_executable_path = ?5,
+                    runtime_auth_scope = ?6,
+                    runtime_reported_version = ?7,
+                    runtime_executable_fingerprint = ?8,
+                    runtime_capabilities_json = ?9,
+                    runtime_model_selection_json = ?10,
+                    runtime_permission_config_json = ?11,
+                    runtime_binding_compatibility_digest = ?12,
+                    runtime_host_config_digest = ?13,
+                    runtime_protocol_version = ?14,
+                    runtime_installation_generation = ?15,
+                    runtime_search_environment_generation = ?16,
+                    runtime_native_session_compatibility_key = ?17,
+                    runtime_initial_reported_version =
+                        COALESCE(runtime_initial_reported_version, ?18),
+                    runtime_initial_executable_fingerprint =
+                        COALESCE(runtime_initial_executable_fingerprint, ?19),
+                    runtime_rebind_count = runtime_rebind_count + 1,
+                    version = version + 1, updated_at = ?20
+                WHERE id = ?1 AND version = ?21
+                  AND cancel_requested_at IS NULL
+                  AND runtime_rebind_count = 0
+                  AND (
+                    status = 'queued'
+                    OR (
+                      status = 'waiting'
+                      AND wait_reason = 'runtime_recovery'
+                      AND runtime_recovery_required = 1
+                    )
+                  )
+                "#,
+                params![
+                    target.agent_run_id,
+                    effective_config_json,
+                    runtime.adapter_kind.as_str(),
+                    runtime.installation_id,
+                    runtime.executable_path,
+                    runtime.auth_scope,
+                    runtime.reported_version,
+                    runtime.executable_fingerprint,
+                    serde_json::to_string(&runtime.capabilities)?,
+                    serde_json::to_string(&runtime.model)?,
+                    serde_json::to_string(&runtime.permissions)?,
+                    runtime.binding_compatibility_digest,
+                    runtime.host_config_digest,
+                    runtime.protocol_version,
+                    runtime.installation_generation,
+                    runtime.search_environment_generation,
+                    runtime.native_session_compatibility_key,
+                    frozen_runtime.reported_version,
+                    frozen_runtime.executable_fingerprint,
+                    target.now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.runtime_rebind_fenced",
+                    "AgentRun changed before Runtime rebind was persisted",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.runtime_drift_detected",
+                &target.camp_id,
+                ("agent_run", &target.agent_run_id),
+                &envelope.actor,
+                Some(target.execution_epoch),
+                &json!({
+                    "reason": envelope.payload.drift_reason,
+                    "initialReportedVersion": frozen_runtime.reported_version,
+                    "initialExecutableFingerprint": frozen_runtime.executable_fingerprint,
+                }),
+            )?;
+            append_domain_event(
+                transaction,
+                "agent_run.runtime_rebound",
+                &target.camp_id,
+                ("agent_run", &target.agent_run_id),
+                &envelope.actor,
+                Some(target.execution_epoch),
+                &json!({
+                    "installationId": runtime.installation_id,
+                    "reportedVersion": runtime.reported_version,
+                    "executableFingerprint": runtime.executable_fingerprint,
+                    "installationGeneration": runtime.installation_generation,
+                    "runtimeRebindCount": runtime_rebind_count + 1,
+                }),
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "agent_run.runtime_rebound",
+                json!({
+                    "agentRunId": target.agent_run_id,
+                    "version": target.version + 1,
+                    "runtimeRebindCount": runtime_rebind_count + 1,
+                }),
+                Some(entity_ref("agent_run", &target.agent_run_id)),
+            ))
+        })?;
+        Ok(execution)
+    }
+
+    pub fn reject_agent_run_dispatch(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RejectAgentRunDispatchCommand>,
+    ) -> Result<CommandExecution> {
+        if envelope.payload.error_code.trim().is_empty() {
+            anyhow::bail!("AgentRun dispatch errorCode must not be empty");
+        }
+        validate_public_runtime_failure(
+            &envelope.payload.error_code,
+            envelope.payload.failure.as_ref(),
+        )?;
+        let execution = self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(
+                &envelope.actor,
+                ActorRef::System { component_id } if component_id == "agent-run-scheduler"
+            ) {
+                return Ok(rejected(
+                    "agent_run.scheduler_required",
+                    "AgentRun dispatch rejection requires the scheduler",
+                ));
+            }
+            let target = load_terminal_target(transaction, &envelope.payload.agent_run_id)?;
+            let Some(target) = target else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if envelope.camp_id.as_deref() != Some(target.camp_id.as_str()) {
+                return Ok(rejected(
+                    "agent_run.camp_mismatch",
+                    "AgentRun is outside the Thread",
+                ));
+            }
+            if target.version != envelope.payload.expected_version {
+                return Ok(rejected(
+                    "agent_run.version_conflict",
+                    "AgentRun version is stale",
+                ));
+            }
+            if !matches!(target.status.as_str(), "queued" | "waiting")
+                || target.cancel_requested_at.is_some()
+            {
+                return Ok(rejected(
+                    "agent_run.dispatch_fenced",
+                    "AgentRun is no longer awaiting dispatch",
+                ));
+            }
+            let error_details_ref = envelope
+                .payload
+                .error_detail
+                .as_ref()
+                .map(|detail| json!({ "detail": detail }).to_string());
+            let public_runtime_failure_json = envelope
+                .payload
+                .failure
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let updated = transaction.execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'failed', wait_reason = NULL, wait_deadline_at = NULL,
+                    runtime_recovery_required = 0,
+                    execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+                    last_error_code = ?2, last_error_details_ref = ?3,
+                    public_runtime_failure_json = ?7,
+                    manual_retry_allowed = ?4,
+                    ended_at = ?5, version = version + 1, updated_at = ?5
+                WHERE id = ?1 AND version = ?6
+                  AND cancel_requested_at IS NULL
+                  AND (
+                    status = 'queued'
+                    OR (
+                      status = 'waiting'
+                      AND wait_reason = 'runtime_recovery'
+                      AND runtime_recovery_required = 1
+                    )
+                  )
+                "#,
+                params![
+                    target.agent_run_id,
+                    envelope.payload.error_code,
+                    error_details_ref,
+                    i64::from(envelope.payload.manual_retry_allowed),
+                    target.now,
+                    envelope.payload.expected_version,
+                    public_runtime_failure_json,
+                ],
+            )?;
+            if updated != 1 {
+                return Ok(rejected(
+                    "agent_run.dispatch_fenced",
+                    "AgentRun changed before dispatch rejection was persisted",
+                ));
+            }
+            append_domain_event(
+                transaction,
+                "agent_run.failed",
+                &target.camp_id,
+                ("agent_run", &target.agent_run_id),
+                &envelope.actor,
+                Some(target.execution_epoch),
+                &json!({
+                    "phase": "dispatch_preflight",
+                    "errorCode": envelope.payload.error_code,
+                    "errorDetail": envelope.payload.error_detail,
+                    "failure": envelope.payload.failure,
+                    "manualRetryAllowed": envelope.payload.manual_retry_allowed,
+                }),
+            )?;
+            settle_materialized_delivery_for_agent_run(
+                transaction,
+                AgentRunDeliverySettlement {
+                    agent_run_id: &target.agent_run_id,
+                    agent_run_status: "failed",
+                    agent_run_error_code: Some(&envelope.payload.error_code),
+                    terminal_resolution_source: None,
+                    terminal_reason_code: None,
+                    actor: &envelope.actor,
+                    execution_epoch: Some(target.execution_epoch),
+                    now: &target.now,
+                },
+            )?;
+            let camp_turn_status = if target.camp_turn_id.is_empty() {
+                settle_run_deliveries(
+                    transaction,
+                    &target.agent_run_id,
+                    "failed",
+                    Some(&envelope.payload.error_code),
+                    &target.now,
+                )?;
+                None
+            } else {
+                Some(recompute_camp_turn(
+                    transaction,
+                    &target.camp_id,
+                    &target.camp_turn_id,
+                    &envelope.actor,
+                    Some(target.execution_epoch),
+                    &target.now,
+                )?)
+            };
+            Ok(CommandHandlerResult::applied(
+                "agent_run.dispatch_rejected",
+                json!({
+                    "agentRunId": target.agent_run_id,
+                    "threadTurnId": (!target.camp_turn_id.is_empty())
+                        .then_some(target.camp_turn_id),
+                    "threadTurnStatus": camp_turn_status,
+                }),
+                Some(entity_ref("agent_run", &target.agent_run_id)),
+            ))
+        })?;
+        if !execution.replayed && execution.result.code == "agent_run.dispatch_rejected" {
+            pump_target_after_run_terminal(database, &envelope.payload.agent_run_id)?;
+        }
+        Ok(execution)
+    }
+
+    pub fn fail_agent_run(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<FailAgentRunCommand>,
+    ) -> Result<CommandExecution> {
+        self.fail_agent_run_with_terminal_source(
+            database,
+            envelope,
+            Some("runtime_terminal"),
+            false,
+        )
+    }
+
+    pub fn fail_agent_run_without_runtime_terminal(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<FailAgentRunCommand>,
+    ) -> Result<CommandExecution> {
+        self.fail_agent_run_with_terminal_source(database, envelope, None, true)
+    }
+
+    /// Native failure provenance and process cleanup are independent facts.
+    /// The cleanup intent commits with the terminal under the same database
+    /// transaction used by Delivery claim; no successor Run can slip between.
+    pub fn fail_agent_run_requiring_cleanup(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<FailAgentRunCommand>,
+    ) -> Result<CommandExecution> {
+        self.fail_agent_run_with_terminal_source(database, envelope, Some("runtime_terminal"), true)
+    }
+
+    fn fail_agent_run_with_terminal_source(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<FailAgentRunCommand>,
+        terminal_resolution_source: Option<&str>,
+        cleanup_required: bool,
+    ) -> Result<CommandExecution> {
+        if envelope.payload.error_code.trim().is_empty() {
+            anyhow::bail!("AgentRun errorCode must not be empty");
+        }
+        validate_public_runtime_failure(
+            &envelope.payload.error_code,
+            envelope.payload.failure.as_ref(),
+        )?;
+        let execution = self.gateway.execute(database, envelope, |transaction| {
+            if !is_runtime_adapter(&envelope.actor) {
+                return Ok(rejected(
+                    "runtime.adapter_required",
+                    "AgentRun failure requires a Runtime Adapter",
+                ));
+            }
+            let target = load_terminal_target(transaction, &envelope.payload.agent_run_id)?;
+            let Some(target) = target else {
+                return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
+            };
+            if terminal_resolution_source.is_none()
+                && target.runtime_adapter_kind.as_deref() == Some("codex-cli")
+                && target.version == envelope.payload.expected_version
+                && target.execution_epoch == envelope.payload.execution_epoch
+                && envelope.camp_id.as_deref() == Some(target.camp_id.as_str()) {
+                let uncertain: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runtime_input_delivery WHERE agent_run_id = ?1
+                     AND (status IN ('accepted', 'delivery_unknown') OR (status = 'prepared' AND dispatch_started_at IS NOT NULL)))",
+                    [&target.agent_run_id], |row| row.get(0),
+                )?;
+                if uncertain {
+                    return fail_lost_agent_run_in_tx(transaction, &target.agent_run_id, &envelope.actor,
+                        "Codex input outcome could not be reconciled after a nonterminal failure", None);
+                }
+            }
+            if let Some(rejection) = validate_terminal_target(
+                transaction,
+                envelope.camp_id.as_deref(),
+                &target,
+                envelope.payload.expected_version,
+                envelope.payload.execution_epoch,
+            )? {
+                return Ok(rejection);
+            }
+            settle_failed_agent_run_in_tx(
+                transaction,
+                &target,
+                &envelope.actor,
+                &envelope.payload,
+                terminal_resolution_source,
+                cleanup_required,
+            )
+        })?;
+        if !execution.replayed && execution.result.code == "agent_run.failed" {
+            pump_target_after_run_terminal(database, &envelope.payload.agent_run_id)?;
+        }
+        Ok(execution)
+    }
+
+    pub fn record_controlled_shutdown_cycle(
+        &self,
+        database: &mut Database,
+        core_generation: &str,
+        protocol_version: u32,
+    ) -> Result<()> {
+        if core_generation.trim().is_empty() {
+            anyhow::bail!("controlled shutdown core generation must not be empty");
+        }
+        if !matches!(protocol_version, 2 | 3) {
+            anyhow::bail!("controlled shutdown cycle requires protocol version 2 or 3");
+        }
+        let changes_before = database.connection().total_changes();
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let requested_at = chrono::Utc::now().to_rfc3339();
+        transaction.execute(
+            r#"
+            INSERT OR IGNORE INTO planned_shutdown_cycle(
+                core_generation, protocol_version, requested_at
+            ) VALUES (?1, ?2, ?3)
+            "#,
+            params![core_generation, protocol_version, requested_at],
+        )?;
+        let persisted_protocol: i64 = transaction.query_row(
+            "SELECT protocol_version FROM planned_shutdown_cycle WHERE core_generation = ?1",
+            [core_generation],
+            |row| row.get(0),
+        )?;
+        if persisted_protocol != i64::from(protocol_version) {
+            anyhow::bail!("controlled shutdown cycle has a conflicting protocol version");
+        }
+        transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
+        Ok(())
+    }
+
+    pub fn recover_interrupted_controlled_shutdowns(
+        &self,
+        database: &mut Database,
+    ) -> Result<ControlledShutdownStartupRecovery> {
+        let generations = {
+            let mut statement = database.connection().prepare(
+                r#"
+                SELECT core_generation
+                FROM planned_shutdown_cycle
+                WHERE settled_at IS NULL
+                ORDER BY requested_at, core_generation
+                "#,
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut recovery = ControlledShutdownStartupRecovery::default();
+        for generation in generations {
+            let settlement = self.settle_controlled_shutdown_cycle(database, &generation)?;
+            if !settlement.already_settled {
+                recovery.cycles_settled += 1;
+            }
+            recovery
+                .fenced_agent_runs
+                .extend(settlement.fenced_agent_runs);
+        }
+        Ok(recovery)
+    }
+
+    pub fn count_runtime_terminal_settlements(
+        &self,
+        database: &Database,
+        keys: &[ActiveExecutionKey],
+    ) -> Result<usize> {
+        let mut count = 0;
+        for key in keys {
+            let settled: bool = database.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_run WHERE id = ?1 AND execution_epoch = ?2
+                 AND status IN ('succeeded','failed','cancelled') AND terminal_resolution_source = 'runtime_terminal')",
+                params![key.agent_run_id, key.execution_epoch], |row| row.get(0),
+            )?;
+            count += usize::from(settled);
+        }
+        Ok(count)
+    }
+
+    pub fn count_nonterminal_agent_runs(&self, database: &Database) -> Result<usize> {
+        let count: i64 = database.connection().query_row(
+            "SELECT COUNT(*) FROM agent_run WHERE status IN ('queued', 'running', 'waiting')",
+            [],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count).context("non-terminal AgentRun count is invalid")
+    }
+
+    pub fn settle_controlled_shutdown_cycle(
+        &self,
+        database: &mut Database,
+        core_generation: &str,
+    ) -> Result<ControlledShutdownCycleSettlement> {
+        self.settle_controlled_shutdown_runs(database, core_generation, true, (0, 0))
+    }
+
+    pub fn settle_controlled_shutdown_runs(
+        &self,
+        database: &mut Database,
+        core_generation: &str,
+        complete_cycle: bool,
+        prior_settlement_counts: (usize, usize),
+    ) -> Result<ControlledShutdownCycleSettlement> {
+        let changes_before = database.connection().total_changes();
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cycle = transaction
+            .query_row(
+                r#"
+                SELECT protocol_version, settled_at, requested_at
+                FROM planned_shutdown_cycle
+                WHERE core_generation = ?1
+                "#,
+                [core_generation],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("controlled shutdown cycle does not exist")?;
+        if !matches!(cycle.0, 2 | 3) {
+            anyhow::bail!("controlled shutdown cycle protocol is unsupported");
+        }
+        if cycle.1.is_some() {
+            transaction.commit()?;
+            if database.connection().total_changes() != changes_before {
+                database.execution_wake.execution_changed();
+            }
+            crate::execution_text::request_settlement(database);
+            return Ok(ControlledShutdownCycleSettlement {
+                core_generation: core_generation.to_string(),
+                fenced_agent_runs: Vec::new(),
+                already_settled: true,
+            });
+        }
+        let targets = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT agent_run.id, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                       agent_run.camp_turn_id,
+                       agent_run.execution_epoch, agent_run.cancel_requested_at,
+                       agent_run.cancel_reason_code,
+                       COALESCE(
+                           json_extract(agent_run.workspace_json, '$.executionRoot'),
+                           camp.project_path
+                       )
+                FROM agent_run
+                LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+                WHERE agent_run.status IN ('queued', 'running', 'waiting')
+                ORDER BY agent_run.created_at, agent_run.id
+                "#,
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let actor = ActorRef::System {
+            component_id: "controlled-shutdown-fence".to_string(),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let camp_turns = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM camp_turn WHERE status IN ('running', 'waiting') ORDER BY id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut effect_evidence_run_ids = BTreeSet::new();
+        for turn_id in camp_turns {
+            let settlement = settle_abortive_camp_turn_in_tx(
+                &transaction,
+                &turn_id,
+                if cycle.0 == 3 {
+                    "app_shutdown_cancel_all"
+                } else {
+                    "planned_shutdown_cancelled"
+                },
+                &actor,
+                &now,
+            )?;
+            effect_evidence_run_ids.extend(
+                settlement
+                    .runs
+                    .into_iter()
+                    .filter(|run| run.external_effect_evidence_preserved)
+                    .map(|run| run.agent_run_id),
+            );
+        }
+        for (agent_run_id, _, camp_turn_id, _, _, _, _) in &targets {
+            if camp_turn_id.is_none() {
+                let settlement = settle_abortive_agent_run_in_tx(
+                    &transaction,
+                    agent_run_id,
+                    if cycle.0 == 3 {
+                        "app_shutdown_cancel_all"
+                    } else {
+                        "planned_shutdown_cancelled"
+                    },
+                    &actor,
+                    &now,
+                )?;
+                if settlement.external_effect_evidence_preserved {
+                    effect_evidence_run_ids.insert(agent_run_id.clone());
+                }
+            }
+        }
+        let mut fenced_agent_runs = Vec::with_capacity(targets.len());
+        for (agent_run_id, _, _, execution_epoch, _, _, execution_root) in targets {
+            let has_unsettled_external_effects = effect_evidence_run_ids.contains(&agent_run_id);
+            fenced_agent_runs.push(ControlledShutdownFencedAgentRun {
+                agent_run_id,
+                execution_epoch,
+                execution_root,
+                has_unsettled_external_effects,
+            });
+        }
+        let unsettled_effect_agent_run_count = fenced_agent_runs
+            .iter()
+            .filter(|run| run.has_unsettled_external_effects)
+            .count();
+        // Pending cycles retain the existing NULL-count contract. Only the final
+        // business pass writes the summary; Main carries this invocation's earlier
+        // settled counts without introducing a second durable coordination phase.
+        if complete_cycle {
+            let updated = transaction.execute(
+                "UPDATE planned_shutdown_cycle SET settled_at = ?2,
+                    fenced_agent_run_count = ?3, unsettled_effect_agent_run_count = ?4
+                 WHERE core_generation = ?1 AND settled_at IS NULL",
+                params![
+                    core_generation,
+                    now,
+                    (prior_settlement_counts.0 + fenced_agent_runs.len()) as i64,
+                    (prior_settlement_counts.1 + unsettled_effect_agent_run_count) as i64
+                ],
+            )?;
+            if updated != 1 {
+                anyhow::bail!("controlled shutdown cycle changed before settlement");
+            }
+        }
+        transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
+        crate::execution_text::request_settlement(database);
+        Ok(ControlledShutdownCycleSettlement {
+            core_generation: core_generation.to_string(),
+            fenced_agent_runs,
+            already_settled: false,
+        })
+    }
+
+    pub fn settle_planned_shutdown_abortive_terminal(
+        &self,
+        database: &mut Database,
+        permit: &TerminalSettlementPermit,
+        terminal: &PlannedShutdownAbortiveTerminal,
+    ) -> Result<PlannedShutdownTerminalSettlement> {
+        let (agent_run_status, terminal_reason_code) =
+            planned_shutdown_abortive_terminal_facts(terminal.outcome)?;
+        if terminal.error_code.trim().is_empty() {
+            anyhow::bail!("planned shutdown terminal errorCode must not be empty");
+        }
+        validate_public_runtime_failure(&terminal.error_code, terminal.failure.as_ref())?;
+        if !permit.authorizes(
+            &terminal.agent_run_id,
+            terminal.execution_epoch,
+            terminal.outcome,
+        ) {
+            anyhow::bail!("planned shutdown terminal permit does not match the terminal target");
+        }
+
+        let changes_before = database.connection().total_changes();
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let target = load_terminal_target(&transaction, &terminal.agent_run_id)?
+            .context("planned shutdown terminal AgentRun does not exist")?;
+        if target.execution_epoch != terminal.execution_epoch {
+            anyhow::bail!("planned shutdown terminal execution epoch is stale");
+        }
+        if matches!(target.status.as_str(), "succeeded" | "failed" | "cancelled") {
+            if target.status != agent_run_status
+                || target.terminal_resolution_source.as_deref() != Some("runtime_terminal")
+                || target.terminal_reason_code.as_deref() != Some(terminal_reason_code)
+            {
+                anyhow::bail!("AgentRun already has a conflicting terminal settlement");
+            }
+            let camp_turn_status = if target.camp_turn_id.is_empty() {
+                target.status.clone()
+            } else {
+                transaction.query_row(
+                    "SELECT status FROM camp_turn WHERE id = ?1",
+                    [&target.camp_turn_id],
+                    |row| row.get::<_, String>(0),
+                )?
+            };
+            transaction.commit()?;
+            if database.connection().total_changes() != changes_before {
+                database.execution_wake.execution_changed();
+            }
+            crate::execution_text::request_settlement(database);
+            return Ok(PlannedShutdownTerminalSettlement {
+                agent_run_id: target.agent_run_id,
+                camp_turn_id: target.camp_turn_id,
+                agent_run_status: agent_run_status.to_string(),
+                camp_turn_status,
+                terminal_reason_code: terminal_reason_code.to_string(),
+                already_settled: true,
+            });
+        }
+        if !matches!(target.status.as_str(), "running" | "waiting")
+            || target.cancel_requested_at.is_some()
+        {
+            anyhow::bail!("planned shutdown terminal target is no longer active");
+        }
+        if target.final_conversation_message_id.is_some() || target.final_camp_message_id.is_some()
+        {
+            anyhow::bail!("planned shutdown abortive terminal target already has final output");
+        }
+
+        let actor = ActorRef::System {
+            component_id: "planned-shutdown-coordinator".to_string(),
+        };
+        let effect_closure = close_abortive_run_effects(
+            &transaction,
+            &terminal.agent_run_id,
+            &target.now,
+            AbortiveEffectClosureReason::planned_shutdown_runtime_terminal(),
+        )?;
+        let error_details_ref = terminal
+            .error_detail
+            .as_ref()
+            .map(|detail| json!({ "detail": detail }).to_string());
+        let public_runtime_failure_json = terminal
+            .failure
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let manual_retry_allowed =
+            terminal.outcome == RuntimeTerminalOutcome::Failed && terminal.manual_retry_allowed;
+        let updated = transaction.execute(
+            r#"
+            UPDATE agent_run
+            SET status = ?2, wait_reason = NULL, wait_deadline_at = NULL,
+                runtime_recovery_required = 0,
+                execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+                terminal_resolution_source = 'runtime_terminal',
+                terminal_reason_code = ?3,
+                cancel_requested_at = CASE WHEN runtime_adapter_kind = 'codex-cli' THEN ?7 ELSE cancel_requested_at END,
+                cancel_reason_code = CASE WHEN runtime_adapter_kind = 'codex-cli' THEN 'runtime_host_release_pending' ELSE cancel_reason_code END,
+                last_error_code = ?4, last_error_details_ref = ?5,
+                public_runtime_failure_json = ?9,
+                manual_retry_allowed = ?6,
+                ended_at = ?7, version = version + 1, updated_at = ?7
+            WHERE id = ?1 AND status IN ('running', 'waiting')
+              AND execution_epoch = ?8 AND cancel_requested_at IS NULL
+            "#,
+            params![
+                terminal.agent_run_id,
+                agent_run_status,
+                terminal_reason_code,
+                terminal.error_code,
+                error_details_ref,
+                i64::from(manual_retry_allowed),
+                target.now,
+                terminal.execution_epoch,
+                public_runtime_failure_json,
+            ],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("AgentRun changed inside planned shutdown terminal settlement");
+        }
+        append_domain_event(
+            &transaction,
+            if terminal.outcome == RuntimeTerminalOutcome::Failed {
+                "agent_run.failed"
+            } else {
+                "agent_run.cancelled"
+            },
+            &target.camp_id,
+            ("agent_run", &target.agent_run_id),
+            &actor,
+            Some(terminal.execution_epoch),
+            &json!({
+                "errorCode": terminal.error_code,
+                "errorDetail": terminal.error_detail,
+                "failure": terminal.failure,
+                "manualRetryAllowed": manual_retry_allowed,
+                "terminalResolutionSource": "runtime_terminal",
+                "terminalReasonCode": terminal_reason_code,
+                "actionsMarkedUnknown": effect_closure.actions_marked_unknown,
+                "actionsClosed": effect_closure.actions_closed,
+                "approvalsCancelled": effect_closure.approvals_cancelled,
+                "deliveriesClosed": effect_closure.deliveries_closed,
+                "preparedInputsClosed": effect_closure.prepared_inputs_closed,
+            }),
+        )?;
+        settle_materialized_delivery_for_agent_run(
+            &transaction,
+            AgentRunDeliverySettlement {
+                agent_run_id: &target.agent_run_id,
+                agent_run_status,
+                agent_run_error_code: Some(&terminal.error_code),
+                terminal_resolution_source: Some("runtime_terminal"),
+                terminal_reason_code: Some(terminal_reason_code),
+                actor: &actor,
+                execution_epoch: Some(terminal.execution_epoch),
+                now: &target.now,
+            },
+        )?;
+        let camp_turn_status = if target.camp_turn_id.is_empty() {
+            settle_run_deliveries(
+                &transaction,
+                &target.agent_run_id,
+                agent_run_status,
+                Some(&terminal.error_code),
+                &target.now,
+            )?;
+            agent_run_status.to_string()
+        } else {
+            recompute_camp_turn(
+                &transaction,
+                &target.camp_id,
+                &target.camp_turn_id,
+                &actor,
+                Some(terminal.execution_epoch),
+                &target.now,
+            )?
+        };
+        transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
+        crate::execution_text::request_settlement(database);
+        pump_target_after_run_terminal(database, &terminal.agent_run_id)?;
+        Ok(PlannedShutdownTerminalSettlement {
+            agent_run_id: target.agent_run_id,
+            camp_turn_id: target.camp_turn_id,
+            agent_run_status: agent_run_status.to_string(),
+            camp_turn_status,
+            terminal_reason_code: terminal_reason_code.to_string(),
+            already_settled: false,
+        })
+    }
+}
+
+// Both normal Runtime failures and confirmed Host loss use the same terminal
+// write, Delivery settlement and cleanup intent. Callers validate their own
+// admission facts before entering this transaction-local settlement.
+fn settle_failed_agent_run_in_tx(
+    transaction: &Transaction<'_>,
+    target: &TerminalTarget,
+    actor: &ActorRef,
+    failure: &FailAgentRunCommand,
+    terminal_resolution_source: Option<&str>,
+    cleanup_required: bool,
+) -> Result<CommandHandlerResult> {
+    let error_details_ref = failure
+        .error_detail
+        .as_ref()
+        .map(|detail| json!({ "detail": detail }).to_string());
+    let public_runtime_failure_json = failure
+        .failure
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let ending_git_observation = failure
+        .ending_git_observation
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let updated = transaction.execute(
+        r#"
+        UPDATE agent_run
+        SET status = 'failed', wait_reason = NULL, wait_deadline_at = NULL,
+            runtime_recovery_required = 0,
+            execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+            cancel_requested_at = CASE
+                WHEN ?11 THEN COALESCE(cancel_requested_at, ?5)
+                ELSE cancel_requested_at
+            END,
+            cancel_reason_code = CASE
+                WHEN ?11 THEN COALESCE(cancel_reason_code,
+                    CASE WHEN ?2 = 'accepted_input_outcome_unknown'
+                         THEN 'accepted_input_outcome_unknown'
+                         WHEN ?9 IS NULL THEN 'runtime_terminal_unconfirmed'
+                         ELSE 'runtime_terminal_host_failed' END
+                )
+                ELSE cancel_reason_code
+            END,
+            terminal_resolution_source = ?9,
+            terminal_reason_code = NULL,
+            last_error_code = ?2, last_error_details_ref = ?3,
+            public_runtime_failure_json = ?10,
+            manual_retry_allowed = ?4,
+            ending_git_observation_json = ?8,
+            ended_at = ?5, version = version + 1, updated_at = ?5
+        WHERE id = ?1 AND status IN ('running', 'waiting')
+          AND version = ?6 AND execution_epoch = ?7
+        "#,
+        params![
+            target.agent_run_id,
+            failure.error_code,
+            error_details_ref,
+            i64::from(failure.manual_retry_allowed),
+            target.now,
+            failure.expected_version,
+            failure.execution_epoch,
+            ending_git_observation,
+            terminal_resolution_source,
+            public_runtime_failure_json,
+            cleanup_required,
+        ],
+    )?;
+    if updated != 1 {
+        anyhow::bail!("AgentRun changed inside its failure transaction");
+    }
+    let native_turn_id: Option<String> = if terminal_resolution_source == Some("runtime_terminal") {
+        transaction.query_row(
+            "SELECT native_input_id FROM runtime_input_delivery WHERE agent_run_id=?1 AND execution_epoch=?2 AND input_kind='start' AND status='accepted'",
+            params![target.agent_run_id, failure.execution_epoch], |row| row.get(0),
+        ).optional()?.flatten()
+    } else {
+        None
+    };
+    append_domain_event(
+        transaction,
+        "agent_run.failed",
+        &target.camp_id,
+        ("agent_run", &target.agent_run_id),
+        actor,
+        Some(failure.execution_epoch),
+        &json!({
+            "errorCode": failure.error_code,
+            "errorDetail": failure.error_detail,
+            "failure": failure.failure,
+            "manualRetryAllowed": failure.manual_retry_allowed,
+            "endingGitObservation": failure.ending_git_observation,
+            "terminalResolutionSource": terminal_resolution_source,
+            "nativeTurnId": native_turn_id,
+        }),
+    )?;
+    settle_materialized_delivery_for_agent_run(
+        transaction,
+        AgentRunDeliverySettlement {
+            agent_run_id: &target.agent_run_id,
+            agent_run_status: "failed",
+            agent_run_error_code: Some(&failure.error_code),
+            terminal_resolution_source,
+            terminal_reason_code: None,
+            actor,
+            execution_epoch: Some(failure.execution_epoch),
+            now: &target.now,
+        },
+    )?;
+    let camp_turn_status = if target.camp_turn_id.is_empty() {
+        settle_run_deliveries(
+            transaction,
+            &target.agent_run_id,
+            "failed",
+            Some(&failure.error_code),
+            &target.now,
+        )?;
+        None
+    } else {
+        Some(recompute_camp_turn(
+            transaction,
+            &target.camp_id,
+            &target.camp_turn_id,
+            actor,
+            Some(failure.execution_epoch),
+            &target.now,
+        )?)
+    };
+    Ok(CommandHandlerResult::applied(
+        "agent_run.failed",
+        json!({
+            "agentRunId": target.agent_run_id,
+            "threadTurnId": (!target.camp_turn_id.is_empty())
+                .then_some(&target.camp_turn_id),
+            "threadTurnStatus": camp_turn_status,
+        }),
+        Some(entity_ref("agent_run", &target.agent_run_id)),
+    ))
+}
+
+/// The caller has fenced a confirmed lost execution by Run/version/epoch.
+/// Accepted or uncertain input cannot be dispatched again after that loss.
+pub(crate) fn fail_lost_agent_run_in_tx(
+    transaction: &Transaction<'_>,
+    agent_run_id: &str,
+    actor: &ActorRef,
+    reason: &str,
+    public_failure: Option<&RuntimeFailureView>,
+) -> Result<CommandHandlerResult> {
+    let target =
+        load_terminal_target(transaction, agent_run_id)?.context("lost AgentRun does not exist")?;
+    if !matches!(target.status.as_str(), "running" | "waiting")
+        || target.cancel_requested_at.is_some()
+        || target.final_conversation_message_id.is_some()
+        || target.final_camp_message_id.is_some()
+    {
+        return Ok(rejected(
+            "runtime_loss.fenced",
+            "AgentRun is no longer active",
+        ));
+    }
+    close_abortive_run_effects(
+        transaction,
+        agent_run_id,
+        &target.now,
+        AbortiveEffectClosureReason::runtime_loss(),
+    )?;
+    // Runtime loss fences this input; it does not establish that native history is gone.
+    settle_failed_agent_run_in_tx(
+        transaction,
+        &target,
+        actor,
+        &FailAgentRunCommand {
+            agent_run_id: agent_run_id.to_string(),
+            expected_version: target.version,
+            execution_epoch: target.execution_epoch,
+            error_code: "accepted_input_outcome_unknown".to_string(),
+            error_detail: Some(reason.to_string()),
+            // The transport cause explains this loss without claiming a native
+            // terminal outcome or making the accepted input replayable.
+            failure: public_failure.cloned(),
+            manual_retry_allowed: false,
+            ending_git_observation: None,
+        },
+        None,
+        true,
+    )
+}
+
+struct AbortiveEffectClosure {
+    actions_marked_unknown: usize,
+    actions_closed: usize,
+    approvals_cancelled: usize,
+    deliveries_closed: usize,
+    prepared_inputs_closed: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AbortiveEffectClosureReason<'a> {
+    action_unknown_error_code: &'a str,
+    action_not_executed_reason: &'a str,
+    approval_reason: &'a str,
+    approval_resolver_id: &'a str,
+    runtime_delivery_error: &'a str,
+    prepared_input_error: &'a str,
+    prepared_input_disposition: AbortivePreparedInputDisposition,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AbortivePreparedInputDisposition {
+    DispatchEvidence,
+}
+
+impl AbortiveEffectClosureReason<'static> {
+    const fn runtime_loss() -> Self {
+        Self {
+            action_unknown_error_code: "runtime_lost_after_dispatch",
+            action_not_executed_reason: "runtime_request_lost",
+            approval_reason: "runtime_request_lost",
+            approval_resolver_id: "runtime-recovery-coordinator",
+            runtime_delivery_error: "runtime_request_lost",
+            prepared_input_error: "runtime_request_lost",
+            prepared_input_disposition: AbortivePreparedInputDisposition::DispatchEvidence,
+        }
+    }
+
+    const fn cancellation() -> Self {
+        Self {
+            action_unknown_error_code: "agent_run_cancelled_after_dispatch",
+            action_not_executed_reason: "agent_run_cancelled",
+            approval_reason: "agent_run_cancelled",
+            approval_resolver_id: "cancellation-transaction",
+            runtime_delivery_error: "agent_run_cancelled",
+            prepared_input_error: "agent_run_cancelled",
+            prepared_input_disposition: AbortivePreparedInputDisposition::DispatchEvidence,
+        }
+    }
+
+    const fn planned_shutdown_runtime_terminal() -> Self {
+        Self {
+            action_unknown_error_code: "planned_shutdown_terminal_after_dispatch",
+            action_not_executed_reason: "planned_shutdown_runtime_terminal",
+            approval_reason: "planned_shutdown_runtime_terminal",
+            approval_resolver_id: "planned-shutdown-coordinator",
+            runtime_delivery_error: "planned_shutdown_runtime_terminal",
+            prepared_input_error: "planned_shutdown_runtime_terminal",
+            prepared_input_disposition: AbortivePreparedInputDisposition::DispatchEvidence,
+        }
+    }
+}
+
+fn close_abortive_run_effects(
+    transaction: &Transaction<'_>,
+    agent_run_id: &str,
+    now: &str,
+    reason: AbortiveEffectClosureReason<'_>,
+) -> Result<AbortiveEffectClosure> {
+    let actions_marked_unknown = transaction.execute(
+        r#"
+        UPDATE action_execution
+        SET status = 'unknown', unknown_disposition = 'active',
+            effect_disposition = 'unknown', resolution_source = 'reconciler',
+            execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+            last_error_code = ?3,
+            next_reconcile_at = ?2,
+            version = version + 1, updated_at = ?2
+        WHERE agent_run_id = ?1
+          AND status = 'executing'
+          AND dispatch_may_have_started_at IS NOT NULL
+        "#,
+        params![agent_run_id, now, reason.action_unknown_error_code],
+    )?;
+    transaction.execute(
+        r#"
+        UPDATE action_attempt
+        SET outcome = 'unknown', ended_at = COALESCE(ended_at, ?2)
+        WHERE outcome IS NULL
+          AND action_id IN (
+            SELECT id FROM action_execution
+            WHERE agent_run_id = ?1
+              AND status = 'unknown'
+              AND last_error_code = ?3
+          )
+        "#,
+        params![agent_run_id, now, reason.action_unknown_error_code],
+    )?;
+    let actions_closed = transaction.execute(
+        r#"
+        UPDATE action_execution
+        SET status = 'not_executed',
+            not_executed_reason = ?3,
+            effect_disposition = 'none', ended_at = ?2,
+            execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+            version = version + 1, updated_at = ?2
+        WHERE agent_run_id = ?1
+          AND (
+            status = 'prepared'
+            OR (
+              status = 'executing'
+              AND dispatch_may_have_started_at IS NULL
+            )
+          )
+        "#,
+        params![agent_run_id, now, reason.action_not_executed_reason],
+    )?;
+    let approvals_cancelled = transaction.execute(
+        r#"
+        UPDATE approval
+        SET status = 'cancelled',
+            decision_json = json_object('reason', ?3),
+            resolved_by_type = 'system',
+            resolved_by_id = ?4,
+            resolution_code = ?3,
+            version = version + 1,
+            resolved_at = ?2, updated_at = ?2
+        WHERE status = 'pending'
+          AND action_id IN (
+            SELECT id FROM action_execution WHERE agent_run_id = ?1
+          )
+        "#,
+        params![
+            agent_run_id,
+            now,
+            reason.approval_reason,
+            reason.approval_resolver_id,
+        ],
+    )?;
+    let deliveries_closed = transaction.execute(
+        r#"
+        UPDATE runtime_delivery_checkpoint
+        SET status = 'safely_closed', safely_closed_at = ?2,
+            lease_owner = NULL, lease_expires_at = NULL,
+            last_error = ?3,
+            version = version + 1, updated_at = ?2
+        WHERE agent_run_id = ?1
+          AND status IN ('pending', 'delivering', 'failed')
+        "#,
+        params![agent_run_id, now, reason.runtime_delivery_error],
+    )?;
+    let prepared_inputs_closed = match reason.prepared_input_disposition {
+        AbortivePreparedInputDisposition::DispatchEvidence => transaction.execute(
+            "UPDATE runtime_input_delivery
+             SET status = CASE WHEN dispatch_started_at IS NULL THEN 'not_accepted' ELSE 'delivery_unknown' END,
+                 resolved_at = CASE WHEN dispatch_started_at IS NULL THEN ?2 ELSE NULL END,
+                 last_error = ?3, updated_at = ?2
+             WHERE agent_run_id = ?1 AND status = 'prepared'",
+            params![agent_run_id, now, reason.prepared_input_error],
+        )?,
+    };
+    Ok(AbortiveEffectClosure {
+        actions_marked_unknown,
+        actions_closed,
+        approvals_cancelled,
+        deliveries_closed,
+        prepared_inputs_closed,
+    })
+}
+
+#[derive(Debug)]
+struct TerminalTarget {
+    agent_run_id: String,
+    camp_id: String,
+    camp_turn_id: String,
+    conversation_id: String,
+    conversation_kind: String,
+    conversation_ended_at: Option<String>,
+    agent_id: String,
+    runtime_adapter_kind: Option<String>,
+    status: String,
+    version: i64,
+    execution_epoch: i64,
+    cancel_requested_at: Option<String>,
+    final_conversation_message_id: Option<String>,
+    final_camp_message_id: Option<String>,
+    terminal_resolution_source: Option<String>,
+    terminal_reason_code: Option<String>,
+    invocation_kind: String,
+    response_delivery: String,
+    operation_policy: String,
+    operation_policy_version: i64,
+    destination_conversation_id: Option<String>,
+    anchor_message_id: Option<String>,
+    now: String,
+}
+
+fn persist_single_chat_success(
+    transaction: &Transaction<'_>,
+    target: &TerminalTarget,
+    envelope: &CommandEnvelope<SucceedAgentRunCommand>,
+    terminal_reason_code: Option<&str>,
+    cleanup_required: bool,
+) -> Result<CommandHandlerResult> {
+    let final_output_digest = canonical_content_digest(&[StructuredThreadMessageSegment::Text {
+        text: envelope.payload.final_output.clone(),
+    }])?;
+    let final_conversation_message_id = Uuid::new_v4().to_string();
+    let ending_git_observation = envelope
+        .payload
+        .ending_git_observation
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let conversation_updated = transaction.execute(
+        r#"
+        UPDATE conversation
+        SET last_message_sequence = last_message_sequence + 1,
+            version = version + 1, updated_at = ?2
+        WHERE id = ?1 AND kind = 'single_chat' AND ended_at IS NULL
+        "#,
+        params![target.conversation_id, target.now],
+    )?;
+    if conversation_updated != 1 {
+        return Ok(rejected(
+            "agent_run.terminal_fenced",
+            "Single Chat ended before its final output arrived",
+        ));
+    }
+    let message_sequence: i64 = transaction.query_row(
+        "SELECT last_message_sequence FROM conversation WHERE id = ?1",
+        [&target.conversation_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        r#"
+        INSERT INTO conversation_message(
+            id, conversation_id, sequence,
+            author_type, author_id, source_agent_run_id, body,
+            source_camp_message_id, source_inbox_message_id,
+            camp_turn_id, agent_run_id, source_attachments_json, created_at
+        ) VALUES (?1, ?2, ?3, 'agent', ?4, ?5, ?6, NULL, NULL, ?7, ?5, '[]', ?8)
+        "#,
+        params![
+            final_conversation_message_id,
+            target.conversation_id,
+            message_sequence,
+            target.agent_id,
+            target.agent_run_id,
+            envelope.payload.final_output,
+            target.camp_turn_id,
+            target.now,
+        ],
+    )?;
+    let updated = transaction.execute(
+        r#"
+        UPDATE agent_run
+        SET status = 'succeeded', wait_reason = NULL, wait_deadline_at = NULL,
+            runtime_recovery_required = 0,
+            execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+            terminal_resolution_source = 'runtime_terminal',
+            terminal_reason_code = ?7,
+            cancel_requested_at = CASE WHEN ?9 THEN COALESCE(cancel_requested_at, ?3) ELSE cancel_requested_at END,
+            cancel_reason_code = CASE WHEN ?9 THEN COALESCE(cancel_reason_code, 'runtime_host_release_pending') ELSE cancel_reason_code END,
+            final_conversation_message_id = ?2,
+            final_camp_message_id = NULL,
+            ending_git_observation_json = ?6,
+            ended_at = ?3, version = version + 1, updated_at = ?3
+        WHERE id = ?1 AND status = 'running'
+          AND version = ?4 AND execution_epoch = ?5
+          AND invocation_kind = 'single_chat'
+          AND response_delivery = 'conversation_message'
+          AND operation_policy = 'single_chat_v1'
+          AND operation_policy_version IN (1, 2)
+          AND destination_conversation_id = ?8
+        "#,
+        params![
+            target.agent_run_id,
+            final_conversation_message_id,
+            target.now,
+            envelope.payload.expected_version,
+            envelope.payload.execution_epoch,
+            ending_git_observation,
+            terminal_reason_code,
+            target.conversation_id,
+            cleanup_required,
+        ],
+    )?;
+    if updated != 1 {
+        anyhow::bail!("Single Chat AgentRun changed inside its completion transaction");
+    }
+    append_domain_event(
+        transaction,
+        "agent_run.succeeded",
+        &target.camp_id,
+        ("agent_run", &target.agent_run_id),
+        &envelope.actor,
+        Some(envelope.payload.execution_epoch),
+        &json!({
+            "nativeTurnId": envelope.payload.native_turn_id,
+            "conversationId": target.conversation_id,
+            "finalConversationMessageId": final_conversation_message_id,
+            "finalThreadMessageId": Value::Null,
+            "finalOutputDigest": final_output_digest,
+            "responseDelivery": "conversation_message",
+            "operationPolicy": "single_chat_v1",
+            "terminalResolutionSource": "runtime_terminal",
+            "terminalReasonCode": terminal_reason_code,
+            "endingGitObservation": envelope.payload.ending_git_observation,
+        }),
+    )?;
+    settle_materialized_delivery_for_agent_run(
+        transaction,
+        AgentRunDeliverySettlement {
+            agent_run_id: &target.agent_run_id,
+            agent_run_status: "succeeded",
+            agent_run_error_code: None,
+            terminal_resolution_source: Some("runtime_terminal"),
+            terminal_reason_code,
+            actor: &envelope.actor,
+            execution_epoch: Some(envelope.payload.execution_epoch),
+            now: &target.now,
+        },
+    )?;
+    let camp_turn_status = recompute_camp_turn(
+        transaction,
+        &target.camp_id,
+        &target.camp_turn_id,
+        &envelope.actor,
+        Some(envelope.payload.execution_epoch),
+        &target.now,
+    )?;
+    Ok(CommandHandlerResult::applied(
+        "agent_run.succeeded",
+        json!({
+            "agentRunId": target.agent_run_id,
+            "threadTurnId": target.camp_turn_id,
+            "threadTurnStatus": camp_turn_status,
+            "finalConversationMessageId": final_conversation_message_id,
+            "finalThreadMessageId": Value::Null,
+            "finalOutputDigest": final_output_digest,
+            "responseDelivery": "conversation_message",
+            "automaticPublicOutputSuppressed": true,
+            "missingSendRecovery": Value::Null,
+        }),
+        Some(entity_ref("agent_run", &target.agent_run_id)),
+    ))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MissingSendRecoveryOutcome {
+    mode: &'static str,
+    decision: &'static str,
+    accepted_send_detected: bool,
+    candidate_boundary: Option<&'static str>,
+    candidate_digest: Option<String>,
+    message_id: Option<String>,
+}
+
+/// The successful send receipt, message, Run and execution epoch must agree.
+/// A prior epoch, rejected command, recalled message or another Run cannot
+/// substitute for this turn's output. Missing-send recovery has its separate,
+/// broader suppression rule because even withdrawn sends are side effects.
+fn has_current_run_public_send(connection: &Connection, run_id: &str, epoch: i64) -> Result<bool> {
+    Ok(connection.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM camp_message AS message
+            JOIN agent_run AS run ON run.id = message.source_agent_run_id
+            JOIN conversation ON conversation.id = run.conversation_id
+            LEFT JOIN camp_turn ON camp_turn.id = run.camp_turn_id
+            JOIN event_log AS outcome ON outcome.command_id = message.source_operation_id
+            WHERE run.id = ?1 AND run.execution_epoch = ?2
+              AND run.invocation_kind <> 'single_chat'
+              AND message.author_type = 'agent' AND message.author_id = conversation.agent_id
+              AND message.camp_id = COALESCE(run.camp_id, camp_turn.camp_id) AND message.tombstoned_at IS NULL
+              AND message.recall_state NOT IN ('recallable', 'withdrawn')
+              AND outcome.event_type = 'command.result'
+              AND outcome.command_type = 'thread.message.send'
+              AND outcome.result_status = 'accepted'
+              AND outcome.result_code = 'camp_message.send_accepted'
+              AND outcome.result_entity_type = 'camp_message'
+              AND outcome.result_entity_id = message.id
+              AND outcome.camp_id = message.camp_id
+              AND outcome.actor_type = 'agent' AND outcome.actor_id = conversation.agent_id
+              AND outcome.source_agent_run_id = run.id AND outcome.execution_epoch = ?2
+              AND json_extract(outcome.result_payload_json, '$.messageId') = message.id
+        )
+        "#,
+        params![run_id, epoch],
+        |row| row.get(0),
+    )?)
+}
+
+fn decide_missing_send_recovery(
+    transaction: &Transaction<'_>,
+    target: &TerminalTarget,
+    actor: &ActorRef,
+    adapter_kind: Option<AdapterKind>,
+    publication_allowed: bool,
+    ordinary_publication_id: Option<&str>,
+    candidate: Option<&MissingSendRecoveryCandidate>,
+) -> Result<MissingSendRecoveryOutcome> {
+    let mode = adapter_kind
+        .map(AdapterKind::missing_send_recovery_mode)
+        .unwrap_or(MissingSendRecoveryMode::Disabled);
+    // TODO(public-output-kind): Introduce explicit send intent so progress or
+    // coordination messages need not satisfy the final-public-output
+    // requirement. For this release, every accepted send suppresses recovery.
+    let accepted_send_detected: bool = transaction.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM camp_message
+            WHERE source_agent_run_id = ?1
+              AND author_type = 'agent'
+              AND author_id = ?2
+              AND source_operation_id IS NOT NULL
+        )
+        "#,
+        params![target.agent_run_id, target.agent_id],
+        |row| row.get(0),
+    )?;
+    let candidate_boundary = candidate.map(|candidate| candidate.boundary.as_str());
+    let outcome = |decision, candidate_digest, message_id| MissingSendRecoveryOutcome {
+        mode: mode.as_str(),
+        decision,
+        accepted_send_detected,
+        candidate_boundary,
+        candidate_digest,
+        message_id,
+    };
+
+    if mode == MissingSendRecoveryMode::Disabled {
+        return Ok(outcome("skipped_policy_disabled", None, None));
+    }
+    if !publication_allowed {
+        return Ok(outcome("skipped_membership_fenced", None, None));
+    }
+    if accepted_send_detected {
+        return Ok(outcome("suppressed_accepted_send", None, None));
+    }
+    if ordinary_publication_id.is_some() {
+        return Ok(outcome("skipped_ordinary_publication", None, None));
+    }
+    let Some(candidate) = candidate else {
+        return Ok(outcome("skipped_no_candidate", None, None));
+    };
+    let Some(adapter_kind) = adapter_kind else {
+        return Ok(outcome("skipped_boundary_mismatch", None, None));
+    };
+    let protocol: Option<String> = transaction.query_row(
+        "SELECT runtime_protocol_version FROM agent_run WHERE id = ?1",
+        [&target.agent_run_id],
+        |row| row.get(0),
+    )?;
+    if !candidate
+        .boundary
+        .is_compatible_with(adapter_kind, protocol.as_deref())
+    {
+        return Ok(outcome("skipped_boundary_mismatch", None, None));
+    }
+    if candidate.body.trim().is_empty() {
+        return Ok(outcome("skipped_empty_candidate", None, None));
+    }
+    if candidate.body.len() > CAMP_MESSAGE_SEND_MAX_BODY_BYTES {
+        return Ok(outcome("skipped_candidate_too_large", None, None));
+    }
+    let candidate_digest = canonical_content_digest(&[StructuredThreadMessageSegment::Text {
+        text: candidate.body.clone(),
+    }])?;
+    let message_id = persist_recipient_free_agent_publication(
+        transaction,
+        target,
+        &candidate.body,
+        &candidate_digest,
+        actor,
+        target.execution_epoch,
+        "missing_send_recovery",
+        None,
+        Some(candidate.boundary.as_str()),
+    )?;
+    Ok(outcome(
+        "published",
+        Some(candidate_digest),
+        Some(message_id),
+    ))
+}
+
+fn terminal_publication_allowed(
+    transaction: &Transaction<'_>,
+    target: &TerminalTarget,
+) -> Result<bool> {
+    transaction
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM agent_run
+                JOIN conversation ON conversation.id = agent_run.conversation_id
+                JOIN camp_member
+                  ON camp_member.camp_id = ?2
+                 AND camp_member.agent_id = conversation.agent_id
+                WHERE agent_run.id = ?1
+                  AND conversation.agent_id = ?3
+                  AND camp_member.status = 'active'
+                  AND camp_member.leave_requested_at IS NULL
+                  AND camp_member.version = CAST(
+                      json_extract(agent_run.effective_config_json, '$.campMemberVersion')
+                      AS INTEGER
+                  )
+            )
+            "#,
+            params![target.agent_run_id, target.camp_id, target.agent_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_recipient_free_agent_publication(
+    transaction: &Transaction<'_>,
+    target: &TerminalTarget,
+    body: &str,
+    content_digest: &str,
+    actor: &ActorRef,
+    execution_epoch: i64,
+    publication_kind: &str,
+    public_output_mode: Option<&str>,
+    candidate_boundary: Option<&str>,
+) -> Result<String> {
+    transaction.execute(
+        r#"
+        UPDATE camp
+        SET last_message_sequence = last_message_sequence + 1,
+            version = version + 1, updated_at = ?2
+        WHERE id = ?1
+        "#,
+        params![target.camp_id, target.now],
+    )?;
+    let camp_sequence: i64 = transaction.query_row(
+        "SELECT last_message_sequence FROM camp WHERE id = ?1",
+        [&target.camp_id],
+        |row| row.get(0),
+    )?;
+    let message_id = Uuid::new_v4().to_string();
+    let addressed_agents_json = "[]";
+    let structured_content = vec![StructuredThreadMessageSegment::Text {
+        text: body.to_string(),
+    }];
+    let structured_content_json = serde_json::to_string(&structured_content)?;
+    transaction.execute(
+        r#"
+        INSERT INTO camp_message(
+            id, camp_id, sequence,
+            author_type, author_id, source_agent_run_id, body,
+            structured_content_json, content_digest,
+            address_mode, addressed_agent_ids_json,
+            reply_to_camp_message_id, camp_turn_id, agent_run_id,
+            tombstoned_at, version, created_at, updated_at,
+            effective_recipient_ids_json, recipient_set_digest,
+            recipient_presentation_json, source_operation_id,
+            origin_kind, recall_state
+        ) VALUES (
+            ?1, ?2, ?3, 'agent', ?4, ?5, ?6, ?7, ?8,
+            'default', ?9, ?10, ?11, ?5,
+            NULL, 1, ?12, ?12, '[]', NULL, '{}', NULL,
+            'agent', 'ineligible'
+        )
+        "#,
+        params![
+            message_id,
+            target.camp_id,
+            camp_sequence,
+            target.agent_id,
+            target.agent_run_id,
+            body,
+            structured_content_json,
+            content_digest,
+            addressed_agents_json,
+            target.anchor_message_id,
+            (!target.camp_turn_id.is_empty()).then_some(target.camp_turn_id.as_str()),
+            target.now,
+        ],
+    )?;
+    index_camp_message(
+        transaction,
+        &message_id,
+        &target.camp_id,
+        body,
+        addressed_agents_json,
+    )?;
+    append_domain_event(
+        transaction,
+        "camp_message.sent",
+        &target.camp_id,
+        ("camp_message", &message_id),
+        actor,
+        Some(execution_epoch),
+        &json!({
+            "sequence": camp_sequence,
+            "sourceAgentRunId": target.agent_run_id,
+            "publicationKind": publication_kind,
+            "publicOutputMode": public_output_mode,
+            "candidateBoundary": candidate_boundary,
+            "recipientFree": true,
+        }),
+    )?;
+    crate::message_changes::record(transaction, &target.camp_id, false, &[]);
+    Ok(message_id)
+}
+
+fn load_terminal_target(
+    transaction: &Transaction<'_>,
+    agent_run_id: &str,
+) -> Result<Option<TerminalTarget>> {
+    transaction
+        .query_row(
+            r#"
+            SELECT agent_run.id, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                   COALESCE(agent_run.camp_turn_id, ''),
+                   conversation.id, conversation.kind, conversation.ended_at,
+                   conversation.agent_id,
+                   agent_run.runtime_adapter_kind,
+                   agent_run.status, agent_run.version, agent_run.execution_epoch,
+                   agent_run.cancel_requested_at,
+                   agent_run.final_conversation_message_id,
+                   agent_run.final_camp_message_id,
+                   agent_run.terminal_resolution_source,
+                   agent_run.terminal_reason_code,
+                   agent_run.invocation_kind, agent_run.response_delivery,
+                   agent_run.operation_policy, agent_run.operation_policy_version,
+                   agent_run.destination_conversation_id,
+                   agent_run.anchor_message_id
+            FROM agent_run
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+            JOIN conversation ON conversation.id = agent_run.conversation_id
+            WHERE agent_run.id = ?1
+              AND camp.deletion_operation_id IS NULL
+            "#,
+            [agent_run_id],
+            |row| {
+                Ok(TerminalTarget {
+                    agent_run_id: row.get(0)?,
+                    camp_id: row.get(1)?,
+                    camp_turn_id: row.get(2)?,
+                    conversation_id: row.get(3)?,
+                    conversation_kind: row.get(4)?,
+                    conversation_ended_at: row.get(5)?,
+                    agent_id: row.get(6)?,
+                    runtime_adapter_kind: row.get(7)?,
+                    status: row.get(8)?,
+                    version: row.get(9)?,
+                    execution_epoch: row.get(10)?,
+                    cancel_requested_at: row.get(11)?,
+                    final_conversation_message_id: row.get(12)?,
+                    final_camp_message_id: row.get(13)?,
+                    terminal_resolution_source: row.get(14)?,
+                    terminal_reason_code: row.get(15)?,
+                    invocation_kind: row.get(16)?,
+                    response_delivery: row.get(17)?,
+                    operation_policy: row.get(18)?,
+                    operation_policy_version: row.get(19)?,
+                    destination_conversation_id: row.get(20)?,
+                    anchor_message_id: row.get(21)?,
+                    now: chrono::Utc::now().to_rfc3339(),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn validate_terminal_target(
+    transaction: &Transaction<'_>,
+    camp_id: Option<&str>,
+    target: &TerminalTarget,
+    expected_version: i64,
+    execution_epoch: i64,
+) -> Result<Option<CommandHandlerResult>> {
+    if camp_id != Some(target.camp_id.as_str()) {
+        return Ok(Some(rejected(
+            "agent_run.camp_mismatch",
+            "AgentRun is outside the Thread",
+        )));
+    }
+    if target.version != expected_version {
+        return Ok(Some(rejected(
+            "agent_run.version_conflict",
+            "AgentRun version is stale",
+        )));
+    }
+    if target.status != "running" || target.execution_epoch != execution_epoch {
+        return Ok(Some(rejected(
+            "agent_run.terminal_fenced",
+            "AgentRun terminal update is stale or the Run is not active",
+        )));
+    }
+    if target.cancel_requested_at.is_some() {
+        return Ok(Some(rejected(
+            "agent_run.terminal_fenced",
+            "AgentRun was stopped before its terminal output arrived",
+        )));
+    }
+    if target.final_conversation_message_id.is_some() || target.final_camp_message_id.is_some() {
+        return Ok(Some(rejected(
+            "agent_run.output_already_recorded",
+            "AgentRun already has a final output",
+        )));
+    }
+    if target.invocation_kind == "single_chat"
+        && (target.conversation_kind != "single_chat"
+            || target.conversation_ended_at.is_some()
+            || target.response_delivery != crate::single_chat::SINGLE_CHAT_RESPONSE_DELIVERY
+            || !crate::single_chat::single_chat_operation_policy_is_supported(
+                &target.operation_policy,
+                target.operation_policy_version,
+            )
+            || target.destination_conversation_id.as_deref()
+                != Some(target.conversation_id.as_str()))
+    {
+        return Ok(Some(rejected(
+            "agent_run.terminal_fenced",
+            "Single Chat output route is closed or does not match the active Conversation",
+        )));
+    }
+    if has_terminal_safety_blocker(transaction, &target.agent_run_id)? {
+        return Ok(Some(rejected(
+            "agent_run.terminal_safety_blocked",
+            "Approval, Action or Runtime Delivery must settle before the Run can become terminal",
+        )));
+    }
+    Ok(None)
+}
+
+fn has_terminal_safety_blocker(transaction: &Transaction<'_>, run_id: &str) -> Result<bool> {
+    let blockers: i64 = transaction.query_row(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM approval
+             JOIN action_execution ON action_execution.id = approval.action_id
+             WHERE action_execution.agent_run_id = ?1 AND approval.status = 'pending')
+          + (SELECT COUNT(*) FROM action_execution
+             WHERE agent_run_id = ?1
+               AND (status IN ('prepared', 'executing')
+                    OR (status = 'unknown' AND unknown_disposition = 'active'))
+               AND NOT (status IN ('executing', 'unknown') AND control_mode = 'intercepted'
+                 AND EXISTS(SELECT 1 FROM agent_run AS owner
+                   JOIN agent_run_execution_evidence AS evidence ON evidence.agent_run_id = owner.id
+                   WHERE owner.id = action_execution.agent_run_id AND owner.runtime_adapter_kind = 'zcode-app'
+                     AND owner.execution_epoch = action_execution.source_agent_run_execution_epoch
+                     AND evidence.execution_epoch = owner.execution_epoch AND evidence.event_type = 'runtime.action'
+                     AND CASE WHEN evidence.storage_version = 1 THEN json_extract(evidence.payload_preview_json, '$.zcodeBackground.toolCallId') ELSE COALESCE(json_extract(evidence.result_preview_json, '$.zcodeBackground.toolCallId'), json_extract(evidence.input_preview_json, '$.zcodeBackground.toolCallId')) END = action_execution.native_item_id
+                     AND evidence.sequence = (SELECT MAX(latest.sequence) FROM agent_run_execution_evidence AS latest
+                       WHERE latest.agent_run_id = owner.id AND latest.execution_epoch = owner.execution_epoch
+                         AND latest.event_type = 'runtime.action'
+                         AND CASE WHEN latest.storage_version = 1 THEN json_extract(latest.payload_preview_json, '$.zcodeBackground.toolCallId') ELSE COALESCE(json_extract(latest.result_preview_json, '$.zcodeBackground.toolCallId'), json_extract(latest.input_preview_json, '$.zcodeBackground.toolCallId')) END = action_execution.native_item_id)
+                     AND CASE WHEN evidence.storage_version = 1 THEN json_extract(evidence.payload_preview_json, '$.zcodeBackground.status') ELSE COALESCE(json_extract(evidence.result_preview_json, '$.zcodeBackground.status'), json_extract(evidence.input_preview_json, '$.zcodeBackground.status')) END IN ('running', 'lost'))))
+          + (SELECT COUNT(*) FROM runtime_delivery_checkpoint
+             WHERE agent_run_id = ?1 AND status IN ('pending', 'delivering', 'failed'))
+          + (SELECT COUNT(*) FROM runtime_input_delivery
+             WHERE agent_run_id = ?1 AND input_kind = 'start'
+               AND status IN ('prepared', 'delivery_unknown'))
+        "#,
+        [run_id],
+        |row| row.get(0),
+    )?;
+    Ok(blockers != 0)
+}
+
+fn is_runtime_adapter(actor: &ActorRef) -> bool {
+    matches!(
+        actor,
+        ActorRef::System { component_id } if component_id.starts_with("runtime-adapter:")
+    )
+}
+
+fn validate_public_runtime_failure(
+    error_code: &str,
+    failure: Option<&RuntimeFailureView>,
+) -> Result<()> {
+    let Some(failure) = failure else {
+        return Ok(());
+    };
+    failure.validate()?;
+    if failure.code != error_code {
+        anyhow::bail!("public Runtime failure code must match AgentRun errorCode");
+    }
+    Ok(())
+}
+
+fn planned_shutdown_abortive_terminal_facts(
+    outcome: RuntimeTerminalOutcome,
+) -> Result<(&'static str, &'static str)> {
+    match outcome {
+        RuntimeTerminalOutcome::Failed => Ok(("failed", "planned_shutdown_failed")),
+        RuntimeTerminalOutcome::Cancelled => Ok(("cancelled", "planned_shutdown_cancelled")),
+        RuntimeTerminalOutcome::Interrupted => Ok(("failed", "runtime_interrupted")),
+        RuntimeTerminalOutcome::Succeeded => {
+            anyhow::bail!("planned shutdown abortive settlement cannot record success")
+        }
+    }
+}
+
+/// Repair only obsolete manual-retry waits, after startup has settled Run and Delivery recovery.
+/// Run history and pending inputs stay unchanged; the scheduler still owns queue publication.
+pub fn settle_legacy_retry_waits(database: &mut Database) -> Result<()> {
+    let changes_before = database.connection().total_changes();
+    let transaction = database.connection_mut().transaction()?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let turns = {
+        let mut statement = transaction.prepare(
+            r#"
+            SELECT turn.camp_id, turn.id
+            FROM camp_turn AS turn
+            WHERE turn.status = 'waiting'
+              AND EXISTS (
+                  SELECT 1 FROM agent_run AS run
+                  WHERE run.camp_turn_id = turn.id
+                    AND run.completion_role = 'required' AND run.status = 'failed'
+                    AND run.manual_retry_allowed = 1 AND run.retry_declined_at IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_run AS successor
+                        WHERE successor.predecessor_agent_run_id = run.id
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_run AS run
+                  WHERE run.camp_turn_id = turn.id
+                    AND run.status IN ('queued', 'running', 'waiting')
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_delivery AS delivery
+                  WHERE delivery.camp_turn_id = turn.id
+                    AND delivery.status IN ('pending', 'running')
+              )
+            ORDER BY turn.created_at, turn.id
+            "#,
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let actor = ActorRef::System {
+        component_id: "runtime-recovery-coordinator".to_string(),
+    };
+    for (camp_id, turn_id) in turns {
+        recompute_camp_turn(&transaction, &camp_id, &turn_id, &actor, None, &now)?;
+    }
+    transaction.commit()?;
+    if database.connection().total_changes() != changes_before {
+        database.execution_wake.execution_changed();
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AbortiveRunSettlement {
+    pub agent_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: String,
+    pub conversation_id: String,
+    pub execution_epoch: i64,
+    pub terminal_status: String,
+    pub terminal_code: String,
+    pub runtime_cleanup_required: bool,
+    #[serde(skip)]
+    pub external_effect_evidence_preserved: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct AbortiveTurnSettlement {
+    pub terminal_status: String,
+    pub runs: Vec<AbortiveRunSettlement>,
+    pub message_deliveries_cancelled: usize,
+}
+
+/// Business cancellation is linearized by the caller's transaction. Runtime cleanup never
+/// replays a domain command or owns the transition to terminal. Recompute the Turn once, outside
+/// this function, after all responsibilities affected by the user's intent have been settled.
+pub(crate) fn settle_abortive_agent_run_in_tx(
+    transaction: &Transaction<'_>,
+    agent_run_id: &str,
+    reason_code: &str,
+    actor: &ActorRef,
+    now: &str,
+) -> Result<AbortiveRunSettlement> {
+    settle_interrupted_run_in_tx(transaction, agent_run_id, reason_code, actor, now, false)
+}
+
+/// A lost accepted/possibly accepted public input must fail without replay.
+/// Cleanup acknowledgement remains a separate, adapter-owned isolation fact.
+pub(crate) fn settle_lost_agent_run_in_tx(
+    transaction: &Transaction<'_>,
+    agent_run_id: &str,
+    actor: &ActorRef,
+    now: &str,
+) -> Result<AbortiveRunSettlement> {
+    settle_interrupted_run_in_tx(
+        transaction,
+        agent_run_id,
+        "accepted_input_outcome_unknown",
+        actor,
+        now,
+        true,
+    )
+}
+
+fn settle_interrupted_run_in_tx(
+    transaction: &Transaction<'_>,
+    agent_run_id: &str,
+    reason_code: &str,
+    actor: &ActorRef,
+    now: &str,
+    runtime_lost: bool,
+) -> Result<AbortiveRunSettlement> {
+    struct RunFacts {
+        camp_id: String,
+        camp_turn_id: String,
+        conversation_id: String,
+        execution_epoch: i64,
+        status: String,
+        requested_at: Option<String>,
+        previous_reason: Option<String>,
+        cleanup_ack: Option<String>,
+    }
+    let RunFacts { camp_id, camp_turn_id, conversation_id, execution_epoch, status,
+        requested_at, previous_reason, cleanup_ack } = transaction.query_row(
+        "SELECT COALESCE(run.camp_id, turn.camp_id), COALESCE(run.camp_turn_id, ''),
+                run.conversation_id, run.execution_epoch,
+                run.status, run.cancel_requested_at, run.cancel_reason_code, run.cancel_acknowledged_at
+         FROM agent_run AS run LEFT JOIN camp_turn AS turn ON turn.id = run.camp_turn_id
+         WHERE run.id = ?1",
+        [agent_run_id],
+        |row| Ok(RunFacts { camp_id: row.get(0)?, camp_turn_id: row.get(1)?, conversation_id: row.get(2)?,
+            execution_epoch: row.get(3)?, status: row.get(4)?, requested_at: row.get(5)?,
+            previous_reason: row.get(6)?, cleanup_ack: row.get(7)? }),
+    )?;
+    if matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+        let error_code: Option<String> = transaction.query_row(
+            "SELECT last_error_code FROM agent_run WHERE id = ?1",
+            [agent_run_id],
+            |row| row.get(0),
+        )?;
+        settle_materialized_delivery_for_agent_run(
+            transaction,
+            AgentRunDeliverySettlement {
+                agent_run_id,
+                agent_run_status: &status,
+                agent_run_error_code: error_code.as_deref(),
+                terminal_resolution_source: None,
+                terminal_reason_code: None,
+                actor,
+                execution_epoch: Some(execution_epoch),
+                now,
+            },
+        )?;
+        if camp_turn_id.is_empty() {
+            settle_run_deliveries(
+                transaction,
+                agent_run_id,
+                &status,
+                error_code.as_deref(),
+                now,
+            )?;
+        }
+        return Ok(AbortiveRunSettlement {
+            agent_run_id: agent_run_id.to_string(),
+            camp_id,
+            camp_turn_id,
+            conversation_id,
+            execution_epoch,
+            terminal_status: status,
+            terminal_code: "agent_run.already_terminal".into(),
+            runtime_cleanup_required: requested_at.is_some() && cleanup_ack.is_none(),
+            external_effect_evidence_preserved: false,
+        });
+    }
+    let reason_code = previous_reason.as_deref().unwrap_or(reason_code);
+    // A user cancellation committed first retains its cancellation outcome.
+    let runtime_lost = runtime_lost && requested_at.is_none();
+    let terminal_status = if runtime_lost { "failed" } else { "cancelled" };
+    let terminal_code = if runtime_lost {
+        "agent_run.failed"
+    } else {
+        "agent_run.cancelled"
+    };
+    let error_code = runtime_lost.then_some(reason_code);
+
+    let (accepted_input_preserved, action_effect_evidence, runtime_delivery_evidence): (
+        bool,
+        bool,
+        bool,
+    ) = transaction.query_row(
+        "SELECT
+               EXISTS(SELECT 1 FROM runtime_input_delivery WHERE agent_run_id = ?1
+                 AND (status IN ('accepted', 'delivery_unknown') OR (status = 'prepared' AND dispatch_started_at IS NOT NULL))),
+               EXISTS(SELECT 1 FROM action_execution WHERE agent_run_id = ?1
+                 AND ((status = 'executing' AND dispatch_may_have_started_at IS NOT NULL)
+                      OR (status = 'unknown' AND unknown_disposition = 'active'))),
+               EXISTS(SELECT 1 FROM runtime_delivery_checkpoint WHERE agent_run_id = ?1 AND status = 'delivering')",
+        [agent_run_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let external_effect_evidence_preserved =
+        accepted_input_preserved || action_effect_evidence || runtime_delivery_evidence;
+    let runtime_cleanup_required = status != "queued" || external_effect_evidence_preserved;
+    let closure = close_abortive_run_effects(
+        transaction,
+        agent_run_id,
+        now,
+        if runtime_lost {
+            AbortiveEffectClosureReason::runtime_loss()
+        } else {
+            AbortiveEffectClosureReason::cancellation()
+        },
+    )?;
+    transaction.execute(
+        "UPDATE agent_run SET status = ?2, wait_reason = NULL, wait_deadline_at = NULL,
+             runtime_recovery_required = 0, execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+             cancel_requested_at = COALESCE(cancel_requested_at, ?3), cancel_reason_code = ?4,
+             cancel_acknowledged_at = COALESCE(cancel_acknowledged_at, ?7),
+             last_error_code = ?5, last_error_details_ref = ?6, manual_retry_allowed = 0,
+             terminal_resolution_source = NULL, terminal_reason_code = NULL, public_runtime_failure_json = NULL,
+             ended_at = ?3, updated_at = ?3, version = version + 1
+         WHERE id = ?1 AND status IN ('queued', 'running', 'waiting')",
+        params![
+            agent_run_id,
+            terminal_status,
+            now,
+            reason_code,
+            error_code,
+            Option::<&str>::None,
+            (!runtime_cleanup_required).then_some(now),
+        ],
+    )?;
+    if requested_at.is_none() {
+        append_domain_event(
+            transaction,
+            "agent_run.cancel_requested",
+            &camp_id,
+            ("agent_run", agent_run_id),
+            actor,
+            Some(execution_epoch),
+            &json!({"threadTurnId": camp_turn_id, "reasonCode": reason_code}),
+        )?;
+    }
+    append_domain_event(
+        transaction,
+        terminal_code,
+        &camp_id,
+        ("agent_run", agent_run_id),
+        actor,
+        Some(execution_epoch),
+        &json!({
+            "reasonCode": reason_code, "resolutionSource": if runtime_lost { "runtime_loss" } else { "cancellation_transaction" },
+            "acceptedInputPreserved": accepted_input_preserved,
+            "externalEffectEvidencePreserved": external_effect_evidence_preserved,
+            "automaticRetryAllowed": false,
+            "actionsMarkedUnknown": closure.actions_marked_unknown, "actionsClosed": closure.actions_closed,
+            "approvalsCancelled": closure.approvals_cancelled, "deliveriesClosed": closure.deliveries_closed,
+            "preparedInputsClosed": closure.prepared_inputs_closed,
+        }),
+    )?;
+    settle_materialized_delivery_for_agent_run(
+        transaction,
+        AgentRunDeliverySettlement {
+            agent_run_id,
+            agent_run_status: terminal_status,
+            agent_run_error_code: Some(reason_code),
+            terminal_resolution_source: None,
+            terminal_reason_code: None,
+            actor,
+            execution_epoch: Some(execution_epoch),
+            now,
+        },
+    )?;
+    if camp_turn_id.is_empty() {
+        settle_run_deliveries(
+            transaction,
+            agent_run_id,
+            terminal_status,
+            Some(reason_code),
+            now,
+        )?;
+    }
+    Ok(AbortiveRunSettlement {
+        agent_run_id: agent_run_id.to_string(),
+        camp_id,
+        camp_turn_id,
+        conversation_id,
+        execution_epoch,
+        terminal_status: terminal_status.into(),
+        terminal_code: terminal_code.into(),
+        runtime_cleanup_required,
+        external_effect_evidence_preserved,
+    })
+}
+
+pub(crate) fn settle_abortive_camp_turn_in_tx(
+    transaction: &Transaction<'_>,
+    camp_turn_id: &str,
+    reason_code: &str,
+    actor: &ActorRef,
+    now: &str,
+) -> Result<AbortiveTurnSettlement> {
+    let camp_id: String = transaction.query_row(
+        "SELECT camp_id FROM camp_turn WHERE id = ?1",
+        [camp_turn_id],
+        |row| row.get(0),
+    )?;
+    let run_ids = {
+        let mut statement = transaction.prepare("SELECT id FROM agent_run WHERE camp_turn_id = ?1 AND (status IN ('queued', 'running', 'waiting') OR EXISTS(SELECT 1 FROM message_delivery WHERE target_agent_run_id = agent_run.id AND status = 'running')) ORDER BY id")?;
+        statement
+            .query_map([camp_turn_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    // Close Gather completion admission before a child settlement can make its barrier ready.
+    let message_deliveries_cancelled =
+        cancel_pending_turn_deliveries(transaction, camp_turn_id, reason_code, actor, None, now)?;
+    let mut runs = Vec::with_capacity(run_ids.len());
+    for run_id in run_ids {
+        runs.push(settle_abortive_agent_run_in_tx(
+            transaction,
+            &run_id,
+            reason_code,
+            actor,
+            now,
+        )?);
+    }
+    let terminal_status =
+        recompute_camp_turn(transaction, &camp_id, camp_turn_id, actor, None, now)?;
+    crate::channel::settle_channel_turn_after_abort_in_tx(
+        transaction,
+        camp_turn_id,
+        reason_code,
+        now,
+    )?;
+    Ok(AbortiveTurnSettlement {
+        terminal_status,
+        runs,
+        message_deliveries_cancelled,
+    })
+}
+
+/// Internal cancellation authority for scheduled Automations. The exact
+/// AutomationRun/CampTurn association is checked in the same transaction so
+/// this path cannot be used as a general-purpose replacement for the existing
+/// user stop command.
+pub(crate) fn cancel_automation_camp_turn_in_tx(
+    transaction: &Transaction<'_>,
+    automation_run_id: &str,
+    camp_turn_id: &str,
+    reason_code: &str,
+    now: &str,
+) -> Result<AbortiveTurnSettlement> {
+    if !matches!(
+        reason_code,
+        "interaction_required" | "timeout" | "interrupted"
+    ) {
+        anyhow::bail!("Automation cancellation reason is not allowed");
+    }
+    let association: bool = transaction.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM automation_run AS automation
+            JOIN camp_turn AS turn ON turn.id = automation.camp_turn_id
+            WHERE automation.id = ?1 AND automation.camp_turn_id = ?2
+              AND turn.automation_run_id = automation.id
+              AND automation.status IN ('running', 'cancelling')
+        )
+        "#,
+        params![automation_run_id, camp_turn_id],
+        |row| row.get(0),
+    )?;
+    if !association {
+        anyhow::bail!("AutomationRun does not own the requested ThreadTurn");
+    }
+    let actor = ActorRef::System {
+        component_id: "automation-cancellation".to_string(),
+    };
+    transaction.execute(
+        "UPDATE camp_turn SET cancel_requested_at = COALESCE(cancel_requested_at, ?2),
+         cancel_request_command_id = COALESCE(cancel_request_command_id, ?3),
+         version = version + CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END,
+         updated_at = ?2 WHERE id = ?1",
+        params![
+            camp_turn_id,
+            now,
+            format!("automation-cancel:{automation_run_id}:{reason_code}")
+        ],
+    )?;
+    settle_abortive_camp_turn_in_tx(transaction, camp_turn_id, reason_code, &actor, now)
+}
+
+/// Repairs only the persisted intermediate state left by the retired two-phase cancellation
+/// protocol. Startup invokes this before generic execution recovery can admit old work again.
+pub fn recover_legacy_pending_cancellations(database: &mut Database) -> Result<()> {
+    let camp_ids = {
+        let mut statement = database.connection().prepare(
+            r#"SELECT DISTINCT turn.camp_id FROM agent_run AS run
+            JOIN camp_turn AS turn ON turn.id = run.camp_turn_id
+            WHERE (run.cancel_requested_at IS NOT NULL OR turn.cancel_requested_at IS NOT NULL)
+              AND (run.status IN ('queued', 'running', 'waiting') OR turn.status IN ('running', 'waiting')
+                OR EXISTS(SELECT 1 FROM message_delivery WHERE target_agent_run_id = run.id AND status = 'running')
+                OR EXISTS(SELECT 1 FROM channel_turn_request WHERE camp_turn_id = turn.id AND status = 'admitted'))
+            ORDER BY turn.camp_id"#,
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if camp_ids.is_empty() {
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let changes_before = database.connection().total_changes();
+    let transaction = database.connection_mut().transaction()?;
+    let mut settled_run_ids = Vec::new();
+    for camp_id in camp_ids {
+        settled_run_ids.extend(settle_pending_camp_cancellations_in_tx(
+            &transaction,
+            &camp_id,
+            &now,
+        )?);
+    }
+    transaction.commit()?;
+    if database.connection().total_changes() != changes_before {
+        database.execution_wake.execution_changed();
+    }
+    settled_run_ids.sort();
+    settled_run_ids.dedup();
+    pump_targets_after_runs_terminal(database, &settled_run_ids)?;
+    Ok(())
+}
+
+pub struct ExecutionTextMaintenance {
+    pub attempted: bool,
+    pub finalized: Vec<AgentRunExecutionEvidence>,
+    pub error: Option<anyhow::Error>,
+}
+
+pub fn maintain_execution_text(database: &mut Database) -> ExecutionTextMaintenance {
+    let outcome = crate::execution_text::maintain_settled(database);
+    ExecutionTextMaintenance {
+        attempted: outcome.attempted,
+        finalized: outcome.finalized,
+        error: outcome.error,
+    }
+}
+
+pub(crate) fn settle_pending_camp_cancellations_in_tx(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    now: &str,
+) -> Result<Vec<String>> {
+    let targets = {
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT turn.id, turn.cancel_requested_at, turn.execution_budget_exhausted_at
+             FROM camp_turn AS turn JOIN agent_run AS run ON run.camp_turn_id = turn.id
+             WHERE turn.camp_id = ?1 AND (run.cancel_requested_at IS NOT NULL OR turn.cancel_requested_at IS NOT NULL)
+               AND (run.status IN ('queued','running','waiting') OR turn.status IN ('running','waiting')
+                OR EXISTS(SELECT 1 FROM message_delivery WHERE target_agent_run_id = run.id AND status = 'running')
+                OR EXISTS(SELECT 1 FROM channel_turn_request WHERE camp_turn_id = turn.id AND status = 'admitted'))")?;
+        statement
+            .query_map([camp_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let actor = ActorRef::System {
+        component_id: "camp-cancellation-recovery".into(),
+    };
+    let mut settled_run_ids = Vec::new();
+    for (turn_id, turn_cancelled, exhausted) in targets {
+        if turn_cancelled.is_some() || exhausted.is_some() {
+            settle_abortive_camp_turn_in_tx(
+                transaction,
+                &turn_id,
+                if exhausted.is_some() {
+                    "execution_budget_exhausted"
+                } else {
+                    "camp_turn_cancelled"
+                },
+                &actor,
+                now,
+            )?;
+        } else {
+            let run_ids = {
+                let mut statement = transaction.prepare("SELECT id FROM agent_run WHERE camp_turn_id = ?1 AND cancel_requested_at IS NOT NULL")?;
+                statement
+                    .query_map([&turn_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in run_ids {
+                settle_abortive_agent_run_in_tx(
+                    transaction,
+                    &id,
+                    "user_requested_agent_run_stop",
+                    &actor,
+                    now,
+                )?;
+                settled_run_ids.push(id);
+            }
+            recompute_camp_turn(transaction, camp_id, &turn_id, &actor, None, now)?;
+        }
+    }
+    settled_run_ids.sort();
+    settled_run_ids.dedup();
+    Ok(settled_run_ids)
+}
+
+pub(crate) fn recompute_camp_turn(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    camp_turn_id: &str,
+    actor: &ActorRef,
+    execution_epoch: Option<i64>,
+    now: &str,
+) -> Result<String> {
+    let (current_status, current_aggregate_reason, cancel_requested_at, budget_exhausted_at): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = transaction.query_row(
+        "SELECT status, aggregate_reason_code, cancel_requested_at, execution_budget_exhausted_at FROM camp_turn WHERE id = ?1 AND camp_id = ?2",
+        params![camp_turn_id, camp_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT agent_run.completion_role, agent_run.status
+        FROM agent_run
+        WHERE agent_run.camp_turn_id = ?1
+          AND NOT EXISTS (
+              SELECT 1 FROM agent_run AS successor
+              WHERE successor.predecessor_agent_run_id = agent_run.id
+          )
+        "#,
+    )?;
+    let runs = statement
+        .query_map([camp_turn_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if runs.is_empty() {
+        anyhow::bail!("ThreadTurn has no current AgentRun responsibilities");
+    }
+
+    let has_nonterminal = runs
+        .iter()
+        .any(|(_, status)| matches!(status.as_str(), "queued" | "running" | "waiting"));
+    let delivery_states = {
+        let mut statement = transaction.prepare(
+            r#"
+            SELECT delivery.status, delivery.completion_role
+            FROM message_delivery AS delivery
+            WHERE delivery.camp_turn_id = ?1
+            ORDER BY delivery.created_at, delivery.id
+            "#,
+        )?;
+        statement
+            .query_map([camp_turn_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let has_nonterminal_delivery = delivery_states
+        .iter()
+        .any(|(status, _)| matches!(status.as_str(), "pending" | "running"));
+    let has_failed_delivery = delivery_states.iter().any(|(status, completion_role)| {
+        matches!(
+            status.as_str(),
+            "failed" | "cancelled" | "interrupted_before_dispatch"
+        ) && completion_role.as_deref() == Some("required")
+    });
+    let (next_status, next_aggregate_reason) = if budget_exhausted_at.is_some() {
+        if has_nonterminal || has_nonterminal_delivery {
+            ("waiting", None)
+        } else {
+            ("failed", None)
+        }
+    } else if cancel_requested_at.is_some() {
+        if has_nonterminal || has_nonterminal_delivery {
+            ("waiting", None)
+        } else {
+            ("cancelled", None)
+        }
+    } else if has_nonterminal || has_nonterminal_delivery {
+        if runs.iter().any(|(_, status)| status == "waiting") {
+            ("waiting", None)
+        } else {
+            ("running", None)
+        }
+    } else if runs
+        .iter()
+        .any(|(role, status)| role == "required" && status == "cancelled")
+    {
+        ("failed", Some("required_run_incomplete"))
+    } else if has_failed_delivery
+        || runs
+            .iter()
+            .any(|(role, status)| role == "required" && status == "failed")
+    {
+        ("failed", None)
+    } else {
+        ("completed", None)
+    };
+
+    if current_status != next_status || current_aggregate_reason.as_deref() != next_aggregate_reason
+    {
+        let ended_at = matches!(next_status, "completed" | "failed" | "cancelled").then_some(now);
+        transaction.execute(
+            r#"
+            UPDATE camp_turn
+            SET status = ?2, aggregate_reason_code = ?3,
+                ended_at = ?4, version = version + 1, updated_at = ?5
+            WHERE id = ?1
+            "#,
+            params![
+                camp_turn_id,
+                next_status,
+                next_aggregate_reason,
+                ended_at,
+                now,
+            ],
+        )?;
+        append_domain_event(
+            transaction,
+            "camp_turn.status_changed",
+            camp_id,
+            ("camp_turn", camp_turn_id),
+            actor,
+            execution_epoch,
+            &json!({
+                "previousStatus": current_status,
+                "status": next_status,
+                "previousAggregateReasonCode": current_aggregate_reason,
+                "aggregateReasonCode": next_aggregate_reason,
+            }),
+        )?;
+    }
+    if matches!(next_status, "completed" | "failed" | "cancelled")
+        && cancel_requested_at.is_none()
+        && budget_exhausted_at.is_none()
+    {
+        crate::channel::settle_terminal_request_for_turn_in_tx(transaction, camp_turn_id, now)?;
+    }
+    Ok(next_status.to_string())
+}
+
+pub(crate) fn pump_targets_after_runs_terminal(
+    database: &mut Database,
+    agent_run_ids: &[String],
+) -> Result<()> {
+    let unique_run_ids = agent_run_ids.iter().collect::<BTreeSet<_>>();
+    for agent_run_id in unique_run_ids {
+        pump_target_after_run_terminal(database, agent_run_id)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn pump_target_after_run_terminal(
+    database: &mut Database,
+    agent_run_id: &str,
+) -> Result<()> {
+    let target = database
+        .connection()
+        .query_row(
+            r#"
+            SELECT COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                   conversation.agent_id, agent_run.invocation_kind
+            FROM agent_run
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            JOIN conversation ON conversation.id = agent_run.conversation_id
+            WHERE agent_run.id = ?1
+            "#,
+            [agent_run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((camp_id, recipient_agent_id, invocation_kind)) = target else {
+        return Ok(());
+    };
+    if invocation_kind == "batch" {
+        return Ok(());
+    }
+    let _ = dispatch_pending_for_recipient(
+        database,
+        &camp_id,
+        &recipient_agent_id,
+        DeliveryDispatchTrigger::TargetRunEnded,
+        true,
+    )?;
+    Ok(())
+}
+
+fn claim_admission_rejection(
+    transaction: &Transaction<'_>,
+    run: &ClaimableRun,
+    envelope: &CommandEnvelope<ClaimAgentRunCommand>,
+) -> Result<Option<CommandHandlerResult>> {
+    if envelope.camp_id.as_deref() != Some(run.camp_id.as_str()) {
+        return Ok(Some(rejected(
+            "agent_run.camp_mismatch",
+            "AgentRun is outside the Thread",
+        )));
+    }
+    if run.version != envelope.payload.expected_version {
+        return Ok(Some(rejected(
+            "agent_run.version_conflict",
+            "AgentRun version is stale",
+        )));
+    }
+    if !run.camp_turn_id.is_empty() {
+        if run.execution_budget_exhausted_at.is_some() {
+            return Ok(Some(rejected(
+                "agent_run.execution_budget_exhausted",
+                "ThreadTurn Execution Budget is already exhausted",
+            )));
+        }
+        if !matches!(run.camp_turn_status.as_str(), "running" | "waiting")
+            || run.camp_turn_cancel_requested_at.is_some()
+        {
+            return Ok(Some(rejected(
+                "agent_run.turn_fenced",
+                "ThreadTurn is no longer accepting AgentRun execution",
+            )));
+        }
+        let budget_now = camp_turn_execution_budget_now();
+        let audit_now_text = chrono::Utc::now().to_rfc3339();
+        if crate::execution_budget::execution_deadline_elapsed(
+            run.execution_budget_deadline_at.as_deref(),
+            budget_now,
+        )? {
+            let exhaustion = exhaust_camp_turn_execution_budget(
+                transaction,
+                &run.camp_turn_id,
+                ThreadTurnExecutionBudgetExhaustionReason::Elapsed,
+                &envelope.command_id,
+                &audit_now_text,
+                &envelope.actor,
+                None,
+            )?;
+            return Ok(Some(CommandHandlerResult::rejected(
+                "agent_run.execution_budget_exhausted",
+                json!({
+                    "message": "ThreadTurn Execution Budget deadline has elapsed",
+                    "reason": "elapsed",
+                    "threadTurnId": run.camp_turn_id,
+                    "deadlineAt": run.execution_budget_deadline_at,
+                    "agentRunsFenced": exhaustion.agent_runs_fenced,
+                }),
+            )));
+        }
+    }
+    let valid_state = run.status == "queued"
+        || (run.status == "waiting"
+            && run.wait_reason.as_deref() == Some("runtime_recovery")
+            && run.runtime_recovery_required);
+    if !valid_state || run.input_ready_at.is_none() || run.cancel_requested_at.is_some() {
+        return Ok(Some(rejected(
+            "agent_run.not_claimable",
+            "AgentRun is not ready for execution",
+        )));
+    }
+    if run.status == "waiting"
+        && run.wait_reason.as_deref() == Some("runtime_recovery")
+        && has_accepted_runtime_input(transaction, &run.id)?
+    {
+        return Ok(Some(rejected(
+            "agent_run.accepted_input_requires_reconciliation",
+            "An accepted Runtime input cannot be resent or assumed complete after restart",
+        )));
+    }
+    if !run.member_active {
+        return Ok(Some(rejected(
+            "agent_run.member_unavailable",
+            "Agent is no longer an executable current Thread member",
+        )));
+    }
+    if !current_authorization_covers_snapshot(
+        &run.effective_config,
+        &run.current_default_capabilities,
+        &run.current_capability_overrides,
+    )? {
+        return Ok(Some(rejected(
+            "agent_run.authorization_revoked",
+            "Current Thread authorization no longer covers the frozen AgentRun",
+        )));
+    }
+    if run.status == "waiting" && has_recovery_safety_blocker(transaction, &run.id)? {
+        return Ok(Some(rejected(
+            "agent_run.recovery_blocked",
+            "Approval, Action or Runtime Delivery must settle before recovery",
+        )));
+    }
+    let other_active: i64 = transaction.query_row(
+        r#"
+                SELECT COUNT(*) FROM agent_run
+                WHERE conversation_id = ?1 AND id <> ?2
+                  AND status IN ('running', 'waiting')
+                "#,
+        params![run.conversation_id, run.id],
+        |row| row.get(0),
+    )?;
+    if other_active != 0 {
+        return Ok(Some(rejected(
+            "agent_run.conversation_busy",
+            "Conversation already has an active AgentRun",
+        )));
+    }
+
+    Ok(None)
+}
+
+#[derive(Debug)]
+struct ClaimableRun {
+    id: String,
+    camp_id: String,
+    camp_turn_id: String,
+    conversation_id: String,
+    input_ready_at: Option<String>,
+    effective_config: Value,
+    workspace: Option<Value>,
+    status: String,
+    wait_reason: Option<String>,
+    runtime_recovery_required: bool,
+    execution_epoch: i64,
+    cancel_requested_at: Option<String>,
+    camp_turn_status: String,
+    camp_turn_cancel_requested_at: Option<String>,
+    execution_budget_exhausted_at: Option<String>,
+    execution_budget_deadline_at: Option<String>,
+    version: i64,
+    member_active: bool,
+    current_default_capabilities: Value,
+    current_capability_overrides: Value,
+}
+
+fn load_claimable_run(transaction: &Transaction<'_>, run_id: &str) -> Result<Option<ClaimableRun>> {
+    transaction
+        .query_row(
+            r#"
+            SELECT agent_run.id, COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                   COALESCE(agent_run.camp_turn_id, ''),
+                   agent_run.conversation_id,
+                   agent_run.task_id,
+                   agent_run.input_ready_at,
+                   agent_run.effective_config_json, agent_run.workspace_json,
+                   agent_run.status, agent_run.wait_reason,
+                   agent_run.runtime_recovery_required,
+                   agent_run.execution_epoch, agent_run.cancel_requested_at,
+                   agent_run.version, COALESCE(camp_turn.status, 'running'),
+                   camp_turn.cancel_requested_at,
+                   camp_turn.execution_budget_exhausted_at,
+                   CASE
+                     WHEN agent_run.camp_turn_id IS NULL THEN NULL
+                     WHEN camp_turn.execution_budget_schema_version = 2 THEN camp_turn.execution_budget_deadline_at
+                     ELSE COALESCE(camp_turn.execution_budget_deadline_at, 'invalid')
+                   END,
+                   CASE WHEN camp_member.status = 'active'
+                             AND camp_member.leave_requested_at IS NULL
+                             AND agent_profile.profile_status = 'present'
+                        THEN 1 ELSE 0 END,
+                   agent_profile.default_capabilities_json,
+                   camp_member.capability_overrides_json
+            FROM agent_run
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+            JOIN conversation ON conversation.id = agent_run.conversation_id
+            JOIN agent_profile ON agent_profile.id = conversation.agent_id
+            JOIN camp_member
+              ON camp_member.camp_id = camp.id
+             AND camp_member.agent_id = conversation.agent_id
+            WHERE agent_run.id = ?1
+              AND camp.deletion_operation_id IS NULL
+            "#,
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, i64>(18)?,
+                    row.get::<_, String>(19)?,
+                    row.get::<_, String>(20)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |(
+                id,
+                camp_id,
+                camp_turn_id,
+                conversation_id,
+                _task_id,
+                input_ready_at,
+                effective_config,
+                workspace,
+                status,
+                wait_reason,
+                runtime_recovery_required,
+                execution_epoch,
+                cancel_requested_at,
+                version,
+                camp_turn_status,
+                camp_turn_cancel_requested_at,
+                execution_budget_exhausted_at,
+                execution_budget_deadline_at,
+                member_active,
+                current_default_capabilities,
+                current_capability_overrides,
+            )| {
+                Ok(ClaimableRun {
+                    id,
+                    camp_id,
+                    camp_turn_id,
+                    conversation_id,
+                    input_ready_at,
+                    effective_config: serde_json::from_str(&effective_config)
+                        .context("AgentRun effective config is invalid")?,
+                    workspace: workspace
+                        .map(|value| {
+                            serde_json::from_str(&value).context("AgentRun workspace is invalid")
+                        })
+                        .transpose()?,
+                    status,
+                    wait_reason,
+                    runtime_recovery_required: runtime_recovery_required != 0,
+                    execution_epoch,
+                    cancel_requested_at,
+                    camp_turn_status,
+                    camp_turn_cancel_requested_at,
+                    execution_budget_exhausted_at,
+                    execution_budget_deadline_at,
+                    version,
+                    member_active: member_active != 0,
+                    current_default_capabilities: serde_json::from_str(
+                        &current_default_capabilities,
+                    )
+                    .context("AgentProfile capabilities are invalid")?,
+                    current_capability_overrides: serde_json::from_str(
+                        &current_capability_overrides,
+                    )
+                    .context("ThreadMember capability overrides are invalid")?,
+                })
+            },
+        )
+        .transpose()
+}
+
+pub(crate) fn current_authorization_covers_snapshot(
+    effective_config: &Value,
+    current_defaults: &Value,
+    overrides: &Value,
+) -> Result<bool> {
+    let mut current = current_defaults
+        .as_array()
+        .context("current default capabilities must be an array")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .context("capability must be a string")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if let Some(overrides) = overrides.as_object() {
+        for (capability, effect) in overrides {
+            match effect.as_str() {
+                Some("allow") => {
+                    current.insert(capability.clone());
+                }
+                Some("deny") => {
+                    current.remove(capability);
+                }
+                _ => anyhow::bail!("invalid ThreadMember capability override"),
+            }
+        }
+    }
+    let frozen = effective_config["capabilities"]
+        .as_array()
+        .context("frozen AgentRun capabilities must be an array")?;
+    Ok(frozen
+        .iter()
+        .filter_map(Value::as_str)
+        .all(|capability| current.contains(capability)))
+}
+
+fn has_accepted_runtime_input(transaction: &Transaction<'_>, run_id: &str) -> Result<bool> {
+    let accepted: i64 = transaction.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM runtime_input_delivery
+            WHERE agent_run_id = ?1 AND status = 'accepted'
+        )
+        "#,
+        [run_id],
+        |row| row.get(0),
+    )?;
+    Ok(accepted != 0)
+}
+
+fn network_recovery_input_is_safe(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    execution_epoch: i64,
+) -> Result<bool> {
+    let delivery = transaction
+        .query_row(
+            r#"
+            SELECT status, dispatch_started_at
+            FROM runtime_input_delivery
+            WHERE agent_run_id = ?1 AND execution_epoch = ?2 AND input_kind='start'
+            "#,
+            params![run_id, execution_epoch],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    Ok(match delivery {
+        None => true,
+        Some((status, _)) if status == "not_accepted" => true,
+        Some((status, dispatch_started_at))
+            if status == "prepared" && dispatch_started_at.is_none() =>
+        {
+            true
+        }
+        Some(_) => false,
+    })
+}
+
+fn has_recovery_safety_blocker(transaction: &Transaction<'_>, run_id: &str) -> Result<bool> {
+    let blockers: i64 = transaction.query_row(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM approval
+             JOIN action_execution ON action_execution.id = approval.action_id
+             WHERE action_execution.agent_run_id = ?1 AND approval.status = 'pending')
+          + (SELECT COUNT(*) FROM action_execution
+             WHERE agent_run_id = ?1 AND status IN ('executing', 'unknown'))
+          + (SELECT COUNT(*) FROM runtime_delivery_checkpoint
+             WHERE agent_run_id = ?1 AND status IN ('pending', 'delivering', 'failed'))
+          + (SELECT COUNT(*) FROM runtime_input_delivery
+             WHERE agent_run_id = ?1 AND status = 'delivery_unknown')
+        "#,
+        [run_id],
+        |row| row.get(0),
+    )?;
+    Ok(blockers != 0)
+}
+
+fn workspace_matches_camp(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    workspace: &Value,
+) -> Result<bool> {
+    let project_path = transaction.query_row(
+        "SELECT project_path FROM camp WHERE id = ?1",
+        [camp_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    let pending:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM mission_workspace w JOIN mission m ON m.id=w.mission_id WHERE m.camp_id=?1 AND w.state<>'ready')",[camp_id],|r|r.get(0))?;
+    if pending {
+        return Ok(false);
+    }
+    let mission_directory = crate::mission_workspace::execution_directory(transaction, camp_id)?;
+    Ok(workspace["executionRoot"].as_str()
+        == Some(
+            mission_directory
+                .as_deref()
+                .unwrap_or(project_path.as_str()),
+        ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeHostKey {
+    pub adapter_kind: String,
+    pub protocol_version: String,
+    pub auth_scope: String,
+    pub process_config_digest: String,
+}
+
+impl RuntimeHostKey {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(
+            self.adapter_kind.as_str(),
+            "codex-cli" | "opencode-cli" | "copilot-cli" | "claude-code-cli" | "antigravity-app"
+        ) || self.protocol_version.trim().is_empty()
+            || self.auth_scope.trim().is_empty()
+            || self.process_config_digest.trim().is_empty()
+        {
+            anyhow::bail!("RuntimeHostKey is incomplete or unsupported");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHostDescriptor {
+    pub host_instance_id: String,
+    pub key: RuntimeHostKey,
+    pub fenced: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeHostManager {
+    hosts: HashMap<RuntimeHostKey, RuntimeHostDescriptor>,
+}
+
+impl RuntimeHostManager {
+    pub fn acquire(&mut self, key: RuntimeHostKey) -> Result<RuntimeHostDescriptor> {
+        key.validate()?;
+        if let Some(host) = self.hosts.get(&key)
+            && !host.fenced
+        {
+            return Ok(host.clone());
+        }
+        let host = RuntimeHostDescriptor {
+            host_instance_id: Uuid::new_v4().to_string(),
+            key: key.clone(),
+            fenced: false,
+        };
+        self.hosts.insert(key, host.clone());
+        Ok(host)
+    }
+
+    pub fn fence(&mut self, host_instance_id: &str) -> bool {
+        let Some(host) = self
+            .hosts
+            .values_mut()
+            .find(|host| host.host_instance_id == host_instance_id)
+        else {
+            return false;
+        };
+        host.fenced = true;
+        true
+    }
+
+    pub fn is_current(&self, host_instance_id: &str) -> bool {
+        self.hosts
+            .values()
+            .any(|host| host.host_instance_id == host_instance_id && !host.fenced)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeThreadBinding {
+    pub host_instance_id: String,
+    pub conversation_id: String,
+    pub native_thread_id: String,
+    pub active_agent_run_id: Option<String>,
+    pub execution_epoch: Option<i64>,
+    pub native_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeEventRoute {
+    pub conversation_id: String,
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub native_turn_id: String,
+}
+
+#[derive(Debug, Default)]
+pub struct NativeThreadBindingRegistry {
+    by_thread: HashMap<String, NativeThreadBinding>,
+    by_conversation: HashMap<String, String>,
+}
+
+impl NativeThreadBindingRegistry {
+    pub fn bind(&mut self, binding: NativeThreadBinding) -> Result<()> {
+        if binding.host_instance_id.trim().is_empty()
+            || binding.conversation_id.trim().is_empty()
+            || binding.native_thread_id.trim().is_empty()
+        {
+            anyhow::bail!("Native Thread binding identifiers must not be empty");
+        }
+        if let Some(existing_thread) = self.by_conversation.get(&binding.conversation_id)
+            && existing_thread != &binding.native_thread_id
+        {
+            anyhow::bail!("Conversation is already bound to another Native Thread");
+        }
+        if let Some(existing) = self.by_thread.get(&binding.native_thread_id)
+            && existing.conversation_id != binding.conversation_id
+        {
+            anyhow::bail!("Native Thread is already bound to another Conversation");
+        }
+        self.by_conversation.insert(
+            binding.conversation_id.clone(),
+            binding.native_thread_id.clone(),
+        );
+        self.by_thread
+            .insert(binding.native_thread_id.clone(), binding);
+        Ok(())
+    }
+
+    pub fn activate(
+        &mut self,
+        host_instance_id: &str,
+        native_thread_id: &str,
+        agent_run_id: String,
+        execution_epoch: i64,
+        native_turn_id: String,
+    ) -> Result<()> {
+        let binding = self
+            .by_thread
+            .get_mut(native_thread_id)
+            .context("Native Thread is not registered")?;
+        if binding.host_instance_id != host_instance_id {
+            anyhow::bail!("Runtime Host instance is fenced");
+        }
+        if binding.active_agent_run_id.is_some() {
+            anyhow::bail!("Native Thread already has an active AgentRun");
+        }
+        binding.active_agent_run_id = Some(agent_run_id);
+        binding.execution_epoch = Some(execution_epoch);
+        binding.native_turn_id = Some(native_turn_id);
+        Ok(())
+    }
+
+    pub fn route(
+        &self,
+        host_instance_id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<RuntimeEventRoute> {
+        let binding = self
+            .by_thread
+            .get(native_thread_id)
+            .context("Runtime event has no Native Thread binding")?;
+        if binding.host_instance_id != host_instance_id
+            || binding.native_turn_id.as_deref() != Some(native_turn_id)
+            || binding.active_agent_run_id.as_deref() != Some(agent_run_id)
+            || binding.execution_epoch != Some(execution_epoch)
+        {
+            anyhow::bail!("Runtime event failed host/thread/turn/run/epoch fencing");
+        }
+        Ok(RuntimeEventRoute {
+            conversation_id: binding.conversation_id.clone(),
+            agent_run_id: agent_run_id.to_string(),
+            execution_epoch,
+            native_turn_id: native_turn_id.to_string(),
+        })
+    }
+
+    pub fn fence_host(&mut self, host_instance_id: &str) -> usize {
+        let removed = self
+            .by_thread
+            .iter()
+            .filter(|(_, binding)| binding.host_instance_id == host_instance_id)
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect::<Vec<_>>();
+        for thread_id in &removed {
+            if let Some(binding) = self.by_thread.remove(thread_id) {
+                self.by_conversation.remove(&binding.conversation_id);
+            }
+        }
+        removed.len()
+    }
+}
+
+fn append_domain_event(
+    transaction: &Transaction<'_>,
+    event_type: &str,
+    camp_id: &str,
+    entity: (&str, &str),
+    actor: &ActorRef,
+    execution_epoch: Option<i64>,
+    payload: &Value,
+) -> Result<()> {
+    let (actor_type, actor_id, source_agent_run_id) = match actor {
+        ActorRef::User { user_id } => ("user", user_id.as_str(), None),
+        ActorRef::Agent {
+            agent_id,
+            source_agent_run_id,
+        } => (
+            "agent",
+            agent_id.as_str(),
+            Some(source_agent_run_id.as_str()),
+        ),
+        ActorRef::System { component_id } => ("system", component_id.as_str(), None),
+    };
+    transaction.execute(
+        r#"
+        INSERT INTO event_log(
+            event_id, task_id, turn_id, sequence, event_type, native_method,
+            payload_json, camp_id, entity_type, entity_id,
+            actor_type, actor_id, source_agent_run_id, execution_epoch, created_at
+        ) VALUES (?1, NULL, NULL, NULL, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+        params![
+            Uuid::new_v4().to_string(),
+            event_type,
+            serde_json::to_string(payload)?,
+            camp_id,
+            entity.0,
+            entity.1,
+            actor_type,
+            actor_id,
+            source_agent_run_id,
+            execution_epoch,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn runtime_logical_identity_matches(
+    frozen: &FrozenAgentRuntimeConfig,
+    effective: &FrozenAgentRuntimeConfig,
+) -> bool {
+    if frozen.adapter_kind != effective.adapter_kind
+        || frozen.installation_id != effective.installation_id
+        || frozen.auth_scope != effective.auth_scope
+        || frozen.permissions != effective.permissions
+        || frozen.model.source != effective.model.source
+        || frozen.camp_fast != effective.camp_fast
+        || (frozen.camp_fast.is_some()
+            && frozen.adapter_kind == AdapterKind::CodexCli
+            && frozen.model.options.get("serviceTier")
+                != effective.model.options.get("serviceTier"))
+    {
+        return false;
+    }
+    frozen.model.source == "runtime_default"
+        || (frozen.model.model_id == effective.model.model_id
+            && frozen.model.options == effective.model.options)
+}
+
+fn runtime_config_digest_is_valid(runtime: &FrozenAgentRuntimeConfig) -> Result<bool> {
+    let mut unsigned = runtime.clone();
+    let expected = unsigned.config_digest.clone();
+    unsigned.config_digest.clear();
+    Ok(canonical_json_digest(&serde_json::to_value(unsigned)?)? == expected)
+}
+
+fn replace_effective_runtime(
+    effective_config: &mut Value,
+    runtime: &FrozenAgentRuntimeConfig,
+) -> Result<()> {
+    let config = effective_config
+        .as_object_mut()
+        .context("AgentRun effective config must be an object")?;
+    config.insert("runtime".to_string(), serde_json::to_value(runtime)?);
+    config.insert(
+        "runtimeAdapter".to_string(),
+        serde_json::to_value(runtime.adapter_kind)?,
+    );
+    config.insert(
+        "provider".to_string(),
+        serde_json::to_value(runtime.adapter_kind)?,
+    );
+    config.insert(
+        "model".to_string(),
+        Value::String(runtime.model.model_id.clone()),
+    );
+    config.remove("configDigest");
+    let digest = canonical_json_digest(effective_config)?;
+    effective_config
+        .as_object_mut()
+        .expect("effective config was validated as an object")
+        .insert("configDigest".to_string(), Value::String(digest));
+    Ok(())
+}
+
+fn rejected(code: &str, message: &str) -> CommandHandlerResult {
+    CommandHandlerResult::rejected(code, json!({ "message": message }))
+}
+
+fn entity_ref(entity_type: &str, entity_id: &str) -> EntityReference {
+    EntityReference {
+        entity_type: entity_type.to_string(),
+        entity_id: entity_id.to_string(),
+    }
+}
+
+#[cfg(all(test, feature = "extended-tests"))]
+mod tests {
+    use super::*;
+    use crate::test_support::insert_test_runtime_input;
+    use crate::{
+        agent_profile::{
+            AdapterKind, AdapterPermissionConfig, FrozenAgentRuntimeConfig, ResolvedModelSelection,
+        },
+        collaboration::{
+            AddThreadMemberCommand, CollaborationService, CreateThreadCommand, ExecutionRequest,
+            ProjectBindingKind, TestThreadMessageAddress, TestThreadMessageCommand,
+        },
+        command::CommandResultStatus,
+        planned_shutdown::{
+            ActiveExecutionKey, PlannedShutdownCoordinator, RuntimeRouteBinding,
+            RuntimeTerminalAdmission, RuntimeTerminalObservation,
+        },
+        read_model::ReadModelService,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn recovery_boundaries_are_closed_over_the_product_adapter_catalog() {
+        for adapter_kind in AdapterKind::ALL {
+            let expected = if adapter_kind == AdapterKind::ZcodeApp {
+                MissingSendRecoveryBoundary::ZcodeCompletedTurn
+            } else if adapter_kind.uses_acp() {
+                MissingSendRecoveryBoundary::AcpEndTurnAssistantSuffix
+            } else {
+                match adapter_kind {
+                    AdapterKind::CodexCli => MissingSendRecoveryBoundary::CodexCompletedTurn,
+                    AdapterKind::ClaudeCodeCli => MissingSendRecoveryBoundary::ClaudeSuccessResult,
+                    AdapterKind::AntigravityApp => {
+                        MissingSendRecoveryBoundary::AntigravityPrintStdout
+                    }
+                    AdapterKind::Pi => MissingSendRecoveryBoundary::PiAgentSettled,
+                    _ => unreachable!("non-ACP Adapter must have a dedicated boundary"),
+                }
+            };
+            for boundary in [
+                MissingSendRecoveryBoundary::CodexCompletedTurn,
+                MissingSendRecoveryBoundary::ClaudeSuccessResult,
+                MissingSendRecoveryBoundary::AntigravityPrintStdout,
+                MissingSendRecoveryBoundary::AcpEndTurnAssistantSuffix,
+                MissingSendRecoveryBoundary::PiAgentSettled,
+                MissingSendRecoveryBoundary::RetiredClineHubRunResult,
+                MissingSendRecoveryBoundary::ZcodeCompletedTurn,
+            ] {
+                assert_eq!(
+                    boundary.is_compatible_with(adapter_kind, Some("acp-v1")),
+                    boundary == expected,
+                    "{} must accept only its frozen recovery boundary",
+                    adapter_kind.as_str(),
+                );
+            }
+        }
+        for (protocol, acp, hub) in [
+            (None, false, false),
+            (Some("unknown"), false, false),
+            (Some("acp-v1"), true, false),
+            (Some("cline-hub-v1"), false, false),
+        ] {
+            assert_eq!(
+                MissingSendRecoveryBoundary::AcpEndTurnAssistantSuffix
+                    .is_compatible_with(AdapterKind::ClineCli, protocol),
+                acp
+            );
+            assert_eq!(
+                MissingSendRecoveryBoundary::RetiredClineHubRunResult
+                    .is_compatible_with(AdapterKind::ClineCli, protocol),
+                hub
+            );
+        }
+    }
+
+    #[test]
+    fn startup_cancellation_recovery_settles_all_legacy_candidates_once() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let service = CollaborationService::default();
+        let mut camps = Vec::new();
+        for index in 0..2 {
+            let mut create = CreateThreadCommand::for_test_with_members(
+                database
+                    .directory()
+                    .join(format!("startup-recovery-{index}"))
+                    .to_string_lossy()
+                    .into_owned(),
+                &["agent_1", "agent_2"],
+                "agent_1",
+            );
+            create.project_binding_kind = ProjectBindingKind::Directory;
+            let created = service
+                .create_camp(
+                    &mut database,
+                    &user_envelope(&format!("recovery-create-{index}"), None, create),
+                )
+                .unwrap();
+            let camp_id = created.result.payload["threadId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let sent = service
+                .send_test_camp_message(
+                    &mut database,
+                    &user_envelope(
+                        &format!("recovery-send-{index}"),
+                        Some(&camp_id),
+                        TestThreadMessageCommand {
+                            camp_id: camp_id.clone(),
+                            draft_revision: None,
+                            body: "recover persisted cancellation".into(),
+                            prepared_attachment_ids: Vec::new(),
+                            address: TestThreadMessageAddress::Explicit {
+                                agent_ids: vec!["agent_1".into(), "agent_2".into()],
+                            },
+                            reply_to_camp_message_id: None,
+                            execution: Some(ExecutionRequest {
+                                task_id: None,
+                                purpose: "startup cancellation recovery".into(),
+                                completion_role: "required".into(),
+                                budget: None,
+                            }),
+                        },
+                    ),
+                )
+                .unwrap();
+            let run_ids = sent.result.payload["agentRunIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            let trigger_id: String = database
+                .connection()
+                .query_row(
+                    "SELECT anchor_message_id FROM agent_run WHERE id=?1",
+                    [&run_ids[0]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let turn_id = format!("legacy-recovery-turn-{index}");
+            database.connection().execute(
+                "INSERT INTO camp_turn(id,camp_id,trigger_type,trigger_id,status,created_at,updated_at) VALUES(?1,?2,'camp_message',?3,'waiting','2026-08-31T00:00:00Z','2026-08-31T00:00:00Z')",
+                params![turn_id, camp_id, trigger_id],
+            ).unwrap();
+            database.connection().execute(
+                "UPDATE camp_turn SET execution_budget_schema_version=?2, execution_budget_accepted_at='2026-08-31T00:00:00Z', execution_budget_deadline_at='2026-09-01T00:00:00Z', execution_budget_elapsed_seconds=?3, execution_budget_max_agent_run_responsibilities=?4, execution_budget_max_accepted_a2a=?5, execution_budget_root_agent_run_responsibilities=?6, agent_run_responsibilities_allocated=0, accepted_a2a_allocated=0 WHERE id=?1",
+                params![
+                    turn_id,
+                    crate::execution_budget::CAMP_TURN_EXECUTION_BUDGET_SCHEMA_VERSION,
+                    crate::execution_budget::LEGACY_EXECUTION_ELAPSED_SECONDS,
+                    crate::execution_budget::PRODUCT_MAX_AGENT_RUN_RESPONSIBILITIES,
+                    crate::execution_budget::PRODUCT_MAX_ACCEPTED_A2A,
+                    run_ids.len() as i64,
+                ],
+            ).unwrap();
+            for run_id in &run_ids {
+                database.connection().execute(
+                    "UPDATE agent_run SET status='waiting', wait_reason='runtime_delivery', invocation_kind='direct', camp_id=NULL, anchor_message_id=NULL, current_public_tail_sequence=NULL, camp_turn_id=?2, trigger_camp_message_id=?3 WHERE id=?1",
+                    params![run_id, turn_id, trigger_id],
+                ).unwrap();
+            }
+            database.connection().execute(
+                "UPDATE agent_run SET cancel_requested_at='2026-08-31T00:00:00Z', cancel_reason_code='user_requested_agent_run_stop' WHERE id=?1",
+                [&run_ids[0]],
+            ).unwrap();
+            camps.push((camp_id, run_ids));
+        }
+
+        recover_legacy_pending_cancellations(&mut database).unwrap();
+        for (_, run_ids) in &camps {
+            let statuses = run_ids
+                .iter()
+                .map(|run_id| {
+                    database
+                        .connection()
+                        .query_row(
+                            "SELECT status FROM agent_run WHERE id=?1",
+                            [run_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(statuses, vec!["cancelled", "waiting"]);
+        }
+        let cancelled_events: i64 = database.connection().query_row(
+            "SELECT COUNT(*) FROM event_log WHERE event_type='agent_run.cancelled' AND entity_id IN (?1, ?2)",
+            params![camps[0].1[0], camps[1].1[0]],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(cancelled_events, 2);
+
+        let changes = database.connection().total_changes();
+        recover_legacy_pending_cancellations(&mut database).unwrap();
+        assert_eq!(database.connection().total_changes(), changes);
+    }
+
+    fn host_key(scope: &str) -> RuntimeHostKey {
+        RuntimeHostKey {
+            adapter_kind: "codex-cli".to_string(),
+            protocol_version: "0.1".to_string(),
+            auth_scope: scope.to_string(),
+            process_config_digest: "digest-v1".to_string(),
+        }
+    }
+
+    fn resume_execution(
+        previous_key: Option<&str>,
+        current_key: Option<&str>,
+        previous_generation: i64,
+        current_generation: i64,
+    ) -> AgentRunExecution {
+        AgentRunExecution {
+            agent_run_id: "run-resume".to_string(),
+            camp_id: "rvcamp_01h47kvsy5fk1shh6w1g60eecf".to_string(),
+            camp_turn_id: "turn-resume".to_string(),
+            conversation_id: "conversation-resume".to_string(),
+            conversation_version: 1,
+            agent_id: "agent_1".to_string(),
+            task_id: None,
+            version: 1,
+            permission_semantics: PermissionSemantics::RuntimeManagedV2,
+            project_binding_kind: "directory".to_string(),
+            project_path: "/tmp".to_string(),
+            execution_epoch: 1,
+            status: "running".to_string(),
+            wait_reason: None,
+            runtime_recovery_required: false,
+            native_adapter_installation_id: Some("adapter-test-codex".to_string()),
+            native_adapter_kind: Some(AdapterKind::CodexCli),
+            native_session_id: Some("session-existing".to_string()),
+            native_binding_compatibility_digest: Some("binding-stable".to_string()),
+            native_installation_generation: Some(previous_generation),
+            native_session_compatibility_key: previous_key.map(str::to_string),
+            purpose: "resume safely".to_string(),
+            effective_config: json!({}),
+            runtime: FrozenAgentRuntimeConfig {
+                environment: None,
+                custom_api: None,
+                camp_fast: None,
+                adapter_kind: AdapterKind::CodexCli,
+                installation_id: "adapter-test-codex".to_string(),
+                installation_generation: current_generation,
+                search_environment_generation: 1,
+                executable_path: "/tmp/codex".to_string(),
+                auth_scope: "test-user".to_string(),
+                reported_version: Some("1.2.3".to_string()),
+                executable_fingerprint: "sha256:test".to_string(),
+                capabilities: Vec::new(),
+                protocol_version: "codex-app-server-v2".to_string(),
+                model: ResolvedModelSelection {
+                    dsh_source: None,
+                    source: "runtime_default".to_string(),
+                    model_id: "gpt-test".to_string(),
+                    options: json!({}),
+                },
+                permissions: AdapterPermissionConfig {
+                    adapter_kind: AdapterKind::CodexCli,
+                    schema_version: 1,
+                    values: json!({}),
+                },
+                native_session_compatibility_key: current_key.map(str::to_string),
+                binding_compatibility_digest: Some("binding-stable".to_string()),
+                host_config_digest: Some("host-current".to_string()),
+                config_digest: "config-current".to_string(),
+            },
+            workspace: AgentRunWorkspace::runtime_managed_path("/tmp".to_string()),
+            runtime_compatibility_digest: None,
+        }
+    }
+
+    #[test]
+    fn resume_uses_cli_type_and_current_target_instead_of_configuration() {
+        for adapter in [AdapterKind::CodexCli, AdapterKind::HermesCli] {
+            for (old_key, new_key) in [
+                (None, None),
+                (None, Some("new")),
+                (Some("old"), None),
+                (Some("old"), Some("new")),
+            ] {
+                let mut execution = resume_execution(old_key, new_key, 1, 9);
+                execution.native_adapter_kind = Some(adapter);
+                execution.runtime.adapter_kind = adapter;
+                execution.runtime.installation_id = "reinstalled-cli".into();
+                execution.runtime.executable_path = "/new/location/selected-cli".into();
+                execution.runtime.reported_version = Some("0.23.0".into());
+                execution.runtime.binding_compatibility_digest =
+                    Some("different-context-and-permissions".into());
+                execution.runtime.executable_fingerprint = "new-binary".into();
+                assert_eq!(
+                    execution.resumable_native_session_id(),
+                    Some("session-existing")
+                );
+                execution.runtime.adapter_kind = AdapterKind::ClaudeCodeCli;
+                assert_eq!(execution.resumable_native_session_id(), None);
+                execution.runtime.adapter_kind = adapter;
+                execution.native_session_id = None;
+                assert_eq!(execution.resumable_native_session_id(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_rebind_allows_default_version_drift_but_not_logical_identity_changes() {
+        let frozen = resume_execution(None, None, 1, 1).runtime;
+        let mut upgraded = frozen.clone();
+        upgraded.installation_generation = 2;
+        upgraded.reported_version = Some("2.0.0".to_string());
+        upgraded.executable_fingerprint = "sha256:runtime-v2".to_string();
+        upgraded.model.model_id = "gpt-next-default".to_string();
+        assert!(runtime_logical_identity_matches(&frozen, &upgraded));
+
+        // Rebinding only refreshes Runtime fields, including for old Runs that
+        // must never acquire the new snapshot layout during recovery.
+        for mut config in [json!({}), json!({"mcpSnapshotLayout": "run_v1"})] {
+            let layout = config.get("mcpSnapshotLayout").cloned();
+            replace_effective_runtime(&mut config, &upgraded).unwrap();
+            assert_eq!(config.get("mcpSnapshotLayout").cloned(), layout);
+            let digest = config
+                .as_object_mut()
+                .unwrap()
+                .remove("configDigest")
+                .unwrap();
+            assert_eq!(digest, canonical_json_digest(&config).unwrap());
+        }
+
+        let mut different_installation = upgraded.clone();
+        different_installation.installation_id = "adapter-other".to_string();
+        assert!(!runtime_logical_identity_matches(
+            &frozen,
+            &different_installation
+        ));
+
+        let mut different_policy = upgraded;
+        different_policy.permissions.values = json!({"approvalPolicy": "different"});
+        assert!(!runtime_logical_identity_matches(
+            &frozen,
+            &different_policy
+        ));
+    }
+
+    #[test]
+    fn historical_resume_attempts_do_not_disqualify_a_fresh_run() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database();
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO camp(
+                    id, title, project_binding_kind, project_path,
+                    last_message_sequence, version, created_at, updated_at
+                ) VALUES (
+                    'camp-resume', 'Resume', 'directory', '/tmp',
+                    0, 1, ?1, ?1
+                )
+                "#,
+                [&now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO conversation(
+                    id, camp_id, agent_id,
+                    native_adapter_installation_id, native_session_id,
+                    native_binding_compatibility_digest,
+                    native_installation_generation,
+                    native_session_compatibility_key,
+                    version, created_at, updated_at
+                ) VALUES (
+                    'conversation-resume', 'camp-resume', 'agent_1',
+                    'adapter-test-codex', 'session-existing',
+                    'binding-stable', 1, NULL, 1, ?1, ?1
+                )
+                "#,
+                [&now],
+            )
+            .unwrap();
+        let service = ExecutionRuntimeService::default();
+        let generation_three = resume_execution(None, None, 1, 3);
+        for status in ["attempting", "ambiguous", "incompatible", "succeeded"] {
+            database.connection().execute(
+                "INSERT OR REPLACE INTO native_session_resume_attempt(conversation_id, installation_id, installation_generation, status, attempted_at) VALUES('conversation-resume','adapter-test-codex',3,?1,?2)",
+                params![status, now],
+            ).unwrap();
+            assert_eq!(
+                service
+                    .prepare_native_session_resume(&mut database, &generation_three)
+                    .unwrap(),
+                NativeSessionResumeDisposition::Compatible
+            );
+            let recorded: String = database.connection().query_row("SELECT status FROM native_session_resume_attempt WHERE conversation_id='conversation-resume'", [], |r| r.get(0)).unwrap();
+            assert_eq!(recorded, status, "legacy audit is not an execution lock");
+        }
+        service
+            .record_native_session_continuity_lost(
+                &mut database,
+                &generation_three,
+                "acp_history_restore",
+                NativeSessionResumeFailure::Incompatible,
+            )
+            .unwrap();
+        let continuity_event: String = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT payload_json FROM event_log
+                WHERE event_type = 'agent_run.native_session_continuity_lost'
+                  AND entity_id = 'run-resume'
+                  AND execution_epoch = 1
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let continuity_event: Value = serde_json::from_str(&continuity_event).unwrap();
+        assert_eq!(continuity_event["continuation"], "acp_history_restore");
+        assert_eq!(continuity_event["failure"], "incompatible");
+        assert_eq!(continuity_event["fallback"], "new_session");
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn host_manager_reuses_only_the_same_unfenced_key() {
+        let mut manager = RuntimeHostManager::default();
+        let first = manager.acquire(host_key("local_user")).unwrap();
+        let reused = manager.acquire(host_key("local_user")).unwrap();
+        let other = manager.acquire(host_key("other-user")).unwrap();
+
+        assert_eq!(first.host_instance_id, reused.host_instance_id);
+        assert_ne!(first.host_instance_id, other.host_instance_id);
+        assert!(manager.fence(&first.host_instance_id));
+        assert!(!manager.is_current(&first.host_instance_id));
+        let replacement = manager.acquire(host_key("local_user")).unwrap();
+        assert_ne!(first.host_instance_id, replacement.host_instance_id);
+    }
+
+    #[test]
+    fn event_routing_fences_host_thread_turn_run_and_epoch() {
+        let mut registry = NativeThreadBindingRegistry::default();
+        registry
+            .bind(NativeThreadBinding {
+                host_instance_id: "host-1".to_string(),
+                conversation_id: "conversation-a".to_string(),
+                native_thread_id: "thread-a".to_string(),
+                active_agent_run_id: None,
+                execution_epoch: None,
+                native_turn_id: None,
+            })
+            .unwrap();
+        registry
+            .bind(NativeThreadBinding {
+                host_instance_id: "host-1".to_string(),
+                conversation_id: "conversation-b".to_string(),
+                native_thread_id: "thread-b".to_string(),
+                active_agent_run_id: None,
+                execution_epoch: None,
+                native_turn_id: None,
+            })
+            .unwrap();
+        registry
+            .activate(
+                "host-1",
+                "thread-a",
+                "run-a".to_string(),
+                3,
+                "turn-a".to_string(),
+            )
+            .unwrap();
+        registry
+            .activate(
+                "host-1",
+                "thread-b",
+                "run-b".to_string(),
+                7,
+                "turn-b".to_string(),
+            )
+            .unwrap();
+
+        let route = registry
+            .route("host-1", "thread-b", "turn-b", "run-b", 7)
+            .unwrap();
+        assert_eq!(route.conversation_id, "conversation-b");
+        assert!(
+            registry
+                .route("host-old", "thread-b", "turn-b", "run-b", 7)
+                .is_err()
+        );
+        assert!(
+            registry
+                .route("host-1", "thread-a", "turn-b", "run-b", 7)
+                .is_err()
+        );
+        assert!(
+            registry
+                .route("host-1", "thread-b", "turn-b", "run-b", 6)
+                .is_err()
+        );
+        assert_eq!(registry.fence_host("host-1"), 2);
+        assert!(
+            registry
+                .route("host-1", "thread-b", "turn-b", "run-b", 7)
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn manual_native_session_restart_keeps_conversation_identity_and_generation() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database();
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO camp(
+                    id, title, project_binding_kind, project_path,
+                    last_message_sequence, version, created_at, updated_at
+                ) VALUES (
+                    'restart-camp', 'Restart', 'directory', ?1,
+                    0, 1, ?2, ?2
+                )
+                "#,
+                params![directory.to_string_lossy().as_ref(), now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO conversation(
+                    id, camp_id, agent_id,
+                    native_adapter_installation_id, native_session_id,
+                    native_binding_compatibility_digest, native_binding_id,
+                    native_binding_generation, native_binding_secret_digest,
+                    last_accepted_public_boundary_sequence,
+                    native_charter_digest, native_collaboration_state_digest,
+                    version, created_at, updated_at
+                ) VALUES (
+                    'restart-conversation', 'restart-camp', 'agent_1',
+                    'adapter-test-codex', 'session-old', 'digest-old', ?1,
+                    7, 'secret-old', 12, 'charter-old', 'members-old',
+                    1, ?2, ?2
+                )
+                "#,
+                params![Uuid::new_v4().to_string(), now],
+            )
+            .unwrap();
+
+        let envelope = user_envelope(
+            "restart-native-session",
+            Some("restart-camp"),
+            RestartNativeSessionCommand {
+                conversation_id: "restart-conversation".to_string(),
+                expected_version: 1,
+            },
+        );
+        let execution = ExecutionRuntimeService::default()
+            .restart_native_session(&mut database, &envelope)
+            .unwrap();
+        assert_eq!(execution.result.status, CommandResultStatus::Applied);
+        let replay = ExecutionRuntimeService::default()
+            .restart_native_session(&mut database, &envelope)
+            .unwrap();
+        assert!(replay.replayed);
+        type RestartedConversationState = (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let state: RestartedConversationState = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT camp_id, agent_id, version,
+                       native_binding_generation,
+                       last_accepted_public_boundary_sequence,
+                       native_adapter_installation_id, native_session_id,
+                       native_binding_id
+                FROM conversation WHERE id = 'restart-conversation'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(state.0, "restart-camp");
+        assert_eq!(state.1, "agent_1");
+        assert_eq!(state.2, 2);
+        assert_eq!(state.3, 7);
+        assert_eq!(state.4, 12);
+        assert!(state.5.is_none() && state.6.is_none() && state.7.is_none());
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn user_envelope<P>(command_id: &str, camp_id: Option<&str>, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::User {
+                user_id: "local_user".to_string(),
+            },
+            camp_id: camp_id.map(str::to_string),
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    fn scheduler_envelope<P>(command_id: &str, camp_id: &str, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::System {
+                component_id: "agent-run-scheduler".to_string(),
+            },
+            camp_id: Some(camp_id.to_string()),
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    fn claimed_run_for_planned_shutdown(
+        completion_role: &str,
+    ) -> (PathBuf, Database, String, String, String, i64) {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let collaboration = CollaborationService::default();
+        let camp = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "planned-shutdown-create",
+                    None,
+                    CreateThreadCommand::for_test_with_members(
+                        workspace.to_string_lossy().to_string(),
+                        &["agent_2"],
+                        "agent_2",
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        collaboration
+            .add_camp_member(
+                &mut database,
+                &user_envelope(
+                    "planned-shutdown-member",
+                    Some(&camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let sent = collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "planned-shutdown-send",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: "执行关闭语义测试".to_string(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Default,
+                        reply_to_camp_message_id: None,
+                        execution: Some(ExecutionRequest {
+                            task_id: None,
+                            purpose: "验证 planned shutdown".to_string(),
+                            completion_role: completion_role.to_string(),
+                            budget: None,
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+        let camp_turn_id = String::new();
+        let agent_run_id = sent.result.payload["agentRunIds"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let claim = ExecutionRuntimeService::default()
+            .claim_agent_run(
+                &mut database,
+                &scheduler_envelope(
+                    "planned-shutdown-claim",
+                    &camp_id,
+                    ClaimAgentRunCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: 1,
+                        lease_owner: "planned-shutdown-test-host".to_string(),
+                        lease_seconds: 60,
+                        workspace: Some(AgentRunWorkspace {
+                            execution_root: workspace.to_string_lossy().to_string(),
+                            access: "write".to_string(),
+                            isolation: "shared".to_string(),
+                        }),
+                        starting_git_observation: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let execution_epoch = claim.result.payload["executionEpoch"].as_i64().unwrap();
+        (
+            directory,
+            database,
+            camp_id,
+            camp_turn_id,
+            agent_run_id,
+            execution_epoch,
+        )
+    }
+
+    fn mark_claimed_run_waiting(database: &Database, agent_run_id: &str, wait_reason: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let updated = database
+            .connection()
+            .execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'waiting', wait_reason = ?2,
+                    wait_deadline_at = '2099-01-01T00:00:00Z',
+                    version = version + 1, updated_at = ?3
+                WHERE id = ?1 AND status = 'running'
+                "#,
+                params![agent_run_id, wait_reason, now],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+    }
+
+    #[test]
+    fn observed_runtime_model_is_default_only_epoch_fenced_and_write_once() {
+        let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        let runtime = ExecutionRuntimeService::default();
+        let initial_version: i64 = database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET runtime_model_selection_json = ?2 WHERE id = ?1",
+                params![agent_run_id, json!({"source": "explicit"}).to_string()],
+            )
+            .unwrap();
+        let fixed = runtime
+            .record_observed_runtime_model(
+                &mut database,
+                &adapter_envelope(
+                    "runtime-model-fixed",
+                    &camp_id,
+                    RecordObservedRuntimeModelCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        execution_epoch,
+                        model_id: "fixed-model-must-not-project".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(fixed.result.payload["changed"], false);
+
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET runtime_model_selection_json = ?2 WHERE id = ?1",
+                params![
+                    agent_run_id,
+                    json!({"source": "runtime_default"}).to_string()
+                ],
+            )
+            .unwrap();
+        let wrong_epoch = runtime
+            .record_observed_runtime_model(
+                &mut database,
+                &adapter_envelope(
+                    "runtime-model-wrong-epoch",
+                    &camp_id,
+                    RecordObservedRuntimeModelCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        execution_epoch: execution_epoch + 1,
+                        model_id: "wrong-epoch".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(wrong_epoch.result.payload["changed"], false);
+        let first = runtime
+            .record_observed_runtime_model(
+                &mut database,
+                &adapter_envelope(
+                    "runtime-model-first",
+                    &camp_id,
+                    RecordObservedRuntimeModelCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        execution_epoch,
+                        model_id: "  gpt-5.6  ".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(first.result.payload["changed"], true);
+        let replay = runtime
+            .record_observed_runtime_model(
+                &mut database,
+                &adapter_envelope(
+                    "runtime-model-first",
+                    &camp_id,
+                    RecordObservedRuntimeModelCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        execution_epoch,
+                        model_id: "  gpt-5.6  ".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        let later = runtime
+            .record_observed_runtime_model(
+                &mut database,
+                &adapter_envelope(
+                    "runtime-model-later",
+                    &camp_id,
+                    RecordObservedRuntimeModelCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        execution_epoch,
+                        model_id: "later-model-must-not-overwrite".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(later.result.payload["changed"], false);
+
+        let state: (Option<String>, i64, i64) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT runtime_observed_model_id, version,
+                       (SELECT COUNT(*) FROM event_log
+                        WHERE event_type = 'agent_run.runtime_model_observed'
+                          AND entity_id = ?1)
+                FROM agent_run WHERE id = ?1
+                "#,
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0.as_deref(), Some("gpt-5.6"));
+        assert_eq!(state.1, initial_version + 1);
+        assert_eq!(state.2, 1);
+
+        let snapshot = ReadModelService
+            .camp_snapshot(&mut database, &camp_id)
+            .unwrap();
+        let run = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == agent_run_id)
+            .unwrap();
+        assert_eq!(
+            run.runtime_model
+                .as_ref()
+                .and_then(|model| model.model_id.as_deref()),
+            Some("gpt-5.6")
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn observed_runtime_model_respects_run_cancellation_fence() {
+        let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        let runtime = ExecutionRuntimeService::default();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET runtime_model_selection_json = ?2 WHERE id = ?1",
+                params![
+                    agent_run_id,
+                    json!({"source": "runtime_default"}).to_string()
+                ],
+            )
+            .unwrap();
+        let version: i64 = database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        runtime
+            .request_agent_run_cancellation(
+                &mut database,
+                &user_envelope(
+                    "cancel-before-model-observation",
+                    Some(&camp_id),
+                    CancelAgentRunCommand {
+                        camp_id: camp_id.clone(),
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: version,
+                    },
+                ),
+            )
+            .unwrap();
+
+        let observation = runtime
+            .record_observed_runtime_model(
+                &mut database,
+                &adapter_envelope(
+                    "runtime-model-after-cancel",
+                    &camp_id,
+                    RecordObservedRuntimeModelCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        execution_epoch,
+                        model_id: "must-not-persist".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(observation.result.payload["changed"], false);
+        assert_eq!(
+            observation.result.code,
+            "agent_run.runtime_model_observation_fenced"
+        );
+        let state: (Option<String>, i64) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT runtime_observed_model_id,
+                       (SELECT COUNT(*) FROM event_log
+                        WHERE event_type = 'agent_run.runtime_model_observed'
+                          AND entity_id = ?1)
+                FROM agent_run WHERE id = ?1
+                "#,
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (None, 0));
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // Owns the live Host-loss transaction, which startup and transport-retry
+    // tests do not exercise. Reuse the existing claimed Run/input fixture.
+    #[test]
+    fn runtime_loss_settles_uncertain_input_and_fences_old_or_terminal_executions() {
+        for (input_status, waiting, dispatched, launch_failure, pi_failure) in [
+            ("accepted", false, false, false, false),
+            ("accepted", true, false, false, false),
+            ("delivery_unknown", true, false, false, false),
+            ("prepared", false, true, false, false),
+            ("not_accepted", false, false, false, false),
+            ("delivery_unknown", false, true, true, false),
+            ("accepted", false, false, false, true),
+            ("delivery_unknown", false, false, false, true),
+        ] {
+            let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+                claimed_run_for_planned_shutdown("required");
+            insert_test_runtime_input(&database, &agent_run_id, execution_epoch, input_status);
+            if dispatched {
+                database.connection().execute(
+                    "UPDATE runtime_input_delivery SET dispatch_started_at = prepared_at WHERE agent_run_id = ?1",
+                    [&agent_run_id],
+                ).unwrap();
+            }
+            if waiting {
+                database.connection().execute(
+                    "UPDATE agent_run SET status = 'waiting', wait_reason = 'delivery_unknown', runtime_recovery_required = 1 WHERE id = ?1",
+                    [&agent_run_id],
+                ).unwrap();
+            }
+            let version: i64 = database
+                .connection()
+                .query_row(
+                    "SELECT version FROM agent_run WHERE id = ?1",
+                    [&agent_run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let public_failure = pi_failure.then(|| {
+                database
+                    .connection()
+                    .execute(
+                        "UPDATE agent_run SET runtime_adapter_kind = 'pi' WHERE id = ?1",
+                        [&agent_run_id],
+                    )
+                    .unwrap();
+                crate::pi::PiTransportFailure::FrameTooLarge {
+                    limit_bytes: 64 * 1024 * 1024,
+                    observed_bytes: 64 * 1024 * 1024 + 1,
+                }
+                .public_failure()
+            });
+            let envelope = |epoch, version| CommandEnvelope {
+                command_id: Uuid::new_v4().to_string(),
+                actor: ActorRef::System {
+                    component_id: "runtime-recovery-coordinator".to_string(),
+                },
+                camp_id: Some(camp_id.clone()),
+                expected_versions: Vec::new(),
+                execution_epoch: None,
+                payload: crate::action::ReconcileRuntimeLossCommand {
+                    failure: public_failure.clone(),
+                    agent_run_id: agent_run_id.clone(),
+                    expected_version: version,
+                    execution_epoch: epoch,
+                    reason: public_failure
+                        .as_ref()
+                        .map_or("codex_host_exited", |failure| failure.code.as_str())
+                        .to_string(),
+                },
+            };
+            let service = crate::action::ActionSafetyService::default();
+            assert_eq!(
+                service
+                    .reconcile_runtime_loss(&mut database, &envelope(execution_epoch - 1, version))
+                    .unwrap()
+                    .result
+                    .code,
+                "runtime_loss.fenced"
+            );
+            database.connection().execute("UPDATE conversation SET native_session_id = 'old-native' WHERE id = (SELECT conversation_id FROM agent_run WHERE id = ?1)", [&agent_run_id]).unwrap();
+            let result = if launch_failure {
+                ExecutionRuntimeService::default().fail_agent_run_without_runtime_terminal(
+                    &mut database,
+                    &adapter_envelope(
+                        "launch-unknown",
+                        &camp_id,
+                        FailAgentRunCommand {
+                            agent_run_id: agent_run_id.clone(),
+                            expected_version: version,
+                            execution_epoch,
+                            error_code: "runtime_launch_failed".into(),
+                            error_detail: None,
+                            failure: None,
+                            manual_retry_allowed: true,
+                            ending_git_observation: None,
+                        },
+                    ),
+                )
+            } else {
+                service.reconcile_runtime_loss(&mut database, &envelope(execution_epoch, version))
+            }
+            .unwrap();
+            let stored: Option<String> = database
+                .connection()
+                .query_row(
+                    "SELECT public_runtime_failure_json FROM agent_run WHERE id = ?1",
+                    [&agent_run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored.map(|value| serde_json::from_str::<RuntimeFailureView>(&value).unwrap()),
+                public_failure
+            );
+            if input_status == "not_accepted" {
+                assert_eq!(result.result.code, "agent_run.runtime_loss_reconciled");
+                assert!(
+                    ExecutionRuntimeService::default()
+                        .load_dispatchable_agent_run(&database, &agent_run_id)
+                        .unwrap()
+                        .is_some()
+                );
+            } else {
+                assert_eq!(result.result.code, "agent_run.failed");
+                let binding: Option<String> = database.connection().query_row("SELECT native_session_id FROM conversation WHERE id = (SELECT conversation_id FROM agent_run WHERE id = ?1)", [&agent_run_id], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    binding.as_deref(),
+                    Some("old-native"),
+                    "unknown outcome keeps the same CLI Session available for an explicit continuation"
+                );
+                let state = database
+                    .connection()
+                    .query_row(
+                        "SELECT status, wait_reason, runtime_recovery_required, last_error_code,
+                            cancel_requested_at IS NOT NULL, cancel_acknowledged_at IS NULL,
+                            execution_epoch, execution_lease_owner, manual_retry_allowed
+                     FROM agent_run WHERE id = ?1",
+                        [&agent_run_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, bool>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, bool>(4)?,
+                                row.get::<_, bool>(5)?,
+                                row.get::<_, i64>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                                row.get::<_, bool>(8)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    state,
+                    (
+                        "failed".into(),
+                        None,
+                        false,
+                        "accepted_input_outcome_unknown".into(),
+                        true,
+                        true,
+                        execution_epoch,
+                        None,
+                        false
+                    )
+                );
+                let preserved: String = database
+                    .connection()
+                    .query_row(
+                        "SELECT status FROM runtime_input_delivery WHERE agent_run_id = ?1",
+                        [&agent_run_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    preserved,
+                    if dispatched {
+                        "delivery_unknown"
+                    } else {
+                        input_status
+                    }
+                );
+                assert!(
+                    ExecutionRuntimeService::default()
+                        .load_dispatchable_agent_run(&database, &agent_run_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    service
+                        .reconcile_runtime_loss(
+                            &mut database,
+                            &envelope(execution_epoch, version + 1)
+                        )
+                        .unwrap()
+                        .result
+                        .code,
+                    "runtime_loss.fenced"
+                );
+                assert_eq!(
+                    ExecutionRuntimeService::default()
+                        .list_cancellation_candidates(&database, 100)
+                        .unwrap()
+                        .iter()
+                        .filter(|run| run.agent_run_id == agent_run_id)
+                        .count(),
+                    1
+                );
+            }
+            drop(database);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn network_recovery_waits_reclaims_and_clears_only_after_input_acceptance() {
+        let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        insert_test_runtime_input(&database, &agent_run_id, execution_epoch, "not_accepted");
+        let service = ExecutionRuntimeService::default();
+        let version: i64 = database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let failure = RuntimeFailureView::new(
+            AdapterKind::CodexCli,
+            crate::runtime_failure::RuntimeFailureOrigin::Runtime,
+            crate::runtime_failure::RuntimeFailurePhase::Execution,
+            "runtime_network_interrupted",
+            "网络连接中断",
+            Some("connection reset by peer".to_string()),
+            true,
+        );
+        let waiting = service
+            .mark_for_network_recovery(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-wait".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: MarkAgentRunForNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: version,
+                        execution_epoch,
+                        category: "connection_reset".to_string(),
+                        source: "acp_prompt_terminal".to_string(),
+                        failure,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(waiting.result.code, "agent_run.network_recovery_waiting");
+        let waiting_version = waiting.result.payload["version"].as_i64().unwrap();
+        let waiting_state: (String, Option<String>, i64, Option<String>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, wait_reason, runtime_recovery_required,
+                       public_runtime_failure_json
+                FROM agent_run WHERE id = ?1
+                "#,
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(waiting_state.0, "waiting");
+        assert_eq!(waiting_state.1.as_deref(), Some("network_recovery"));
+        assert_eq!(waiting_state.2, 1);
+        assert!(waiting_state.3.is_some());
+
+        let armed = service
+            .arm_network_recovery_attempt(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-arm".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: ArmAgentRunNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: waiting_version,
+                        execution_epoch,
+                        attempt: 1,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            armed.result.code,
+            "agent_run.network_recovery_attempt_admitted"
+        );
+        let armed = service
+            .arm_network_recovery_attempt(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-readmit-deferred-claim".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: ArmAgentRunNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: armed.result.payload["version"].as_i64().unwrap(),
+                        execution_epoch,
+                        attempt: 1,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            armed.result.code,
+            "agent_run.network_recovery_attempt_admitted"
+        );
+        let reclaimed = service
+            .claim_agent_run(
+                &mut database,
+                &scheduler_envelope(
+                    "network-recovery-reclaim",
+                    &camp_id,
+                    ClaimAgentRunCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: armed.result.payload["version"].as_i64().unwrap(),
+                        lease_owner: "network-recovery-test-host".to_string(),
+                        lease_seconds: 60,
+                        workspace: None,
+                        starting_git_observation: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(reclaimed.result.status, CommandResultStatus::Accepted);
+        let recovered_epoch = reclaimed.result.payload["executionEpoch"].as_i64().unwrap();
+        assert_eq!(recovered_epoch, execution_epoch + 1);
+        insert_test_runtime_input(&database, &agent_run_id, recovered_epoch, "accepted");
+        let recovered = service
+            .load_agent_run_execution(&database, &agent_run_id, recovered_epoch)
+            .unwrap()
+            .unwrap();
+        let completed = service
+            .complete_network_recovery(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-complete".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: CompleteAgentRunNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: recovered.version,
+                        execution_epoch: recovered_epoch,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            completed.result.code,
+            "agent_run.network_recovery_progressed"
+        );
+        let cleared: (Option<String>, Option<String>, i64) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT last_error_code, public_runtime_failure_json, manual_retry_allowed
+                FROM agent_run WHERE id = ?1
+                "#,
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cleared, (None, None, 0));
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn network_recovery_never_replays_an_accepted_input() {
+        let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        insert_test_runtime_input(&database, &agent_run_id, execution_epoch, "accepted");
+        let version: i64 = database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blocked = ExecutionRuntimeService::default()
+            .mark_for_network_recovery(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-accepted-blocked".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: MarkAgentRunForNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: version,
+                        execution_epoch,
+                        category: "connection_failed".to_string(),
+                        source: "acp_prompt_terminal".to_string(),
+                        failure: RuntimeFailureView::new(
+                            AdapterKind::CodexCli,
+                            crate::runtime_failure::RuntimeFailureOrigin::Runtime,
+                            crate::runtime_failure::RuntimeFailurePhase::Execution,
+                            "runtime_network_interrupted",
+                            "网络连接中断",
+                            None,
+                            false,
+                        ),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(blocked.result.status, CommandResultStatus::Rejected);
+        assert_eq!(
+            blocked.result.code,
+            "agent_run.network_recovery_input_unsafe"
+        );
+        let state: (String, Option<String>, i64) = database
+            .connection()
+            .query_row(
+                "SELECT status, wait_reason, version FROM agent_run WHERE id = ?1",
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "running".to_string(),
+                Some("runtime_initializing".to_string()),
+                version
+            )
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn network_recovery_rechecks_safety_and_keeps_attention_state_across_restart() {
+        let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        insert_test_runtime_input(&database, &agent_run_id, execution_epoch, "not_accepted");
+        let service = ExecutionRuntimeService::default();
+        let version: i64 = database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let waiting = service
+            .mark_for_network_recovery(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-safety-wait".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: MarkAgentRunForNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: version,
+                        execution_epoch,
+                        category: "connection_failed".to_string(),
+                        source: "acp_prompt_terminal".to_string(),
+                        failure: RuntimeFailureView::new(
+                            AdapterKind::CodexCli,
+                            crate::runtime_failure::RuntimeFailureOrigin::Runtime,
+                            crate::runtime_failure::RuntimeFailurePhase::Execution,
+                            "runtime_network_interrupted",
+                            "网络连接中断",
+                            None,
+                            true,
+                        ),
+                    },
+                },
+            )
+            .unwrap();
+        let waiting_version = waiting.result.payload["version"].as_i64().unwrap();
+
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE agent_profile
+                SET profile_status = 'away'
+                WHERE id = (
+                    SELECT conversation.agent_id
+                    FROM agent_run
+                    JOIN conversation ON conversation.id = agent_run.conversation_id
+                    WHERE agent_run.id = ?1
+                )
+                "#,
+                [&agent_run_id],
+            )
+            .unwrap();
+        let blocked = service
+            .arm_network_recovery_attempt(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-safety-recheck".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: ArmAgentRunNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: waiting_version,
+                        execution_epoch,
+                        attempt: 1,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            blocked.result.code,
+            "agent_run.network_recovery_needs_attention"
+        );
+        assert_eq!(blocked.result.status, CommandResultStatus::Applied);
+
+        database.prepare_v2_recovery().unwrap();
+        let state: (String, Option<String>, i64) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, wait_reason, runtime_recovery_required
+                FROM agent_run WHERE id = ?1
+                "#,
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "waiting".to_string(),
+                Some("network_recovery_blocked".to_string()),
+                0,
+            )
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn core_restart_hands_live_network_wait_to_existing_startup_recovery() {
+        let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        insert_test_runtime_input(&database, &agent_run_id, execution_epoch, "not_accepted");
+        let version: i64 = database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let waiting = ExecutionRuntimeService::default()
+            .mark_for_network_recovery(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-before-restart".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: MarkAgentRunForNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: version,
+                        execution_epoch,
+                        category: "dns_temporary_failure".to_string(),
+                        source: "acp_prompt_terminal".to_string(),
+                        failure: RuntimeFailureView::new(
+                            AdapterKind::CodexCli,
+                            crate::runtime_failure::RuntimeFailureOrigin::Runtime,
+                            crate::runtime_failure::RuntimeFailurePhase::Execution,
+                            "runtime_network_interrupted",
+                            "网络连接中断",
+                            None,
+                            true,
+                        ),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(waiting.result.status, CommandResultStatus::Accepted);
+
+        database.prepare_v2_recovery().unwrap();
+        let state: (String, Option<String>, i64, Option<String>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, wait_reason, runtime_recovery_required, last_error_code
+                FROM agent_run WHERE id = ?1
+                "#,
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "waiting");
+        assert_eq!(state.1.as_deref(), Some("runtime_recovery"));
+        assert_eq!(state.2, 1);
+        assert_eq!(
+            state.3.as_deref(),
+            Some("core_restarted_during_network_recovery")
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    async fn planned_terminal_permit(
+        agent_run_id: &str,
+        execution_epoch: i64,
+        outcome: RuntimeTerminalOutcome,
+    ) -> TerminalSettlementPermit {
+        let coordinator = PlannedShutdownCoordinator::new("planned-shutdown-test-generation");
+        let mut launch = coordinator.enter_launch().await.unwrap();
+        let key = ActiveExecutionKey::new(agent_run_id, execution_epoch);
+        assert!(
+            coordinator
+                .register_active(&launch, key.clone(), AdapterKind::CodexCli)
+                .await
+        );
+        let binding = RuntimeRouteBinding {
+            route_identity: "planned-shutdown-test-route".to_string(),
+            adapter_turn_correlation: "planned-shutdown-test-turn".to_string(),
+            provider_turn_id: Some("planned-shutdown-test-turn".to_string()),
+        };
+        assert!(
+            coordinator
+                .complete_handoff(&mut launch, &key, binding.clone())
+                .await
+        );
+        coordinator.close_launch_admission();
+        assert!(
+            coordinator
+                .finish_launch_closure_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+        );
+        assert!(coordinator.mark_planned_stop_requested(&key).await);
+        match coordinator
+            .admit_terminal(RuntimeTerminalObservation {
+                key,
+                binding,
+                outcome,
+                fingerprint: format!("planned-shutdown-test:{}", outcome.as_str()),
+            })
+            .await
+            .unwrap()
+        {
+            RuntimeTerminalAdmission::Planned(permit) => permit,
+            RuntimeTerminalAdmission::Ordinary { .. } => {
+                panic!("terminal remained ordinary after launch closure")
+            }
+        }
+    }
+
+    // Distinct regression owner: preserving an old reference must not restore
+    // its credential, overwrite a replacement, or reinterpret dispatched input.
+    #[test]
+    fn failed_session_replacement_retains_reference_without_reviving_old_binding() {
+        let (directory, mut database, _, _, run_id, epoch) =
+            claimed_run_for_planned_shutdown("required");
+        let service = ExecutionRuntimeService::default();
+        let tools = crate::team_tool::TeamToolService::default();
+        let binding = tools
+            .prepare_binding_credential(&mut database, &run_id, epoch, false)
+            .unwrap();
+        database.connection().execute("UPDATE conversation SET native_session_id='recoverable-old-session' WHERE id=(SELECT conversation_id FROM agent_run WHERE id=?1)", [&run_id]).unwrap();
+        let execution = service
+            .load_agent_run_execution(&database, &run_id, epoch)
+            .unwrap()
+            .unwrap();
+        let replacement = tools
+            .prepare_binding_credential(&mut database, &run_id, epoch, true)
+            .unwrap();
+        assert_ne!(replacement.native_binding_id, binding.native_binding_id);
+        assert_ne!(replacement.binding_credential, binding.binding_credential);
+        assert!(
+            replacement.native_session_id.is_none(),
+            "the replacement launch creates a fresh native session"
+        );
+        assert_eq!(
+            replacement.previous_native_session_id.as_deref(),
+            Some("recoverable-old-session")
+        );
+        let retained = |db: &Database| -> String {
+            db.connection()
+                .query_row(
+                    "SELECT native_session_id FROM conversation WHERE id=?1",
+                    [&execution.conversation_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            retained(&database),
+            "recoverable-old-session",
+            "failed activation needs no compensating write"
+        );
+        let notices: i64 = database.connection().query_row("SELECT count(*) FROM event_log WHERE event_type='agent_run.native_session_continuity_lost'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            notices, 0,
+            "preparation cannot claim a successful replacement"
+        );
+        assert!(
+            tools
+                .prepare_binding_credential(&mut database, &run_id, epoch + 1, true)
+                .is_err()
+        );
+        database.connection().execute_batch("CREATE TEMP TRIGGER reject_replacement_notice BEFORE INSERT ON event_log WHEN NEW.event_type='agent_run.native_session_continuity_lost' BEGIN SELECT RAISE(ABORT,'notice write rejected'); END;").unwrap();
+        let bound = service.bind_native_session(
+            &mut database,
+            &adapter_envelope(
+                "replace-with-notice",
+                &execution.camp_id,
+                BindNativeSessionCommand {
+                    conversation_id: execution.conversation_id.clone(),
+                    agent_run_id: run_id.clone(),
+                    expected_conversation_version: replacement.conversation_version,
+                    expected_execution_epoch: epoch,
+                    previous_adapter_installation_id: replacement
+                        .previous_adapter_installation_id
+                        .clone(),
+                    previous_native_session_id: replacement.previous_native_session_id.clone(),
+                    previous_binding_compatibility_digest: replacement
+                        .previous_binding_compatibility_digest
+                        .clone(),
+                    proposed_binding_id: Some(replacement.native_binding_id.clone()),
+                    adapter_installation_id: replacement.adapter_installation_id.clone(),
+                    native_session_id: "replacement-session".into(),
+                    binding_compatibility_digest: replacement.binding_compatibility_digest.clone(),
+                },
+            ),
+        );
+        assert!(
+            bound.is_err(),
+            "the successful-replacement notice belongs to the binding transaction"
+        );
+        assert_eq!(retained(&database), "recoverable-old-session");
+        database
+            .connection()
+            .execute_batch("DROP TRIGGER reject_replacement_notice")
+            .unwrap();
+        insert_test_runtime_input(&database, &run_id, epoch, "delivery_unknown");
+        assert!(
+            tools
+                .prepare_binding_credential(&mut database, &run_id, epoch, true)
+                .is_err()
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status='cancelled',ended_at=datetime('now') WHERE id=?1",
+                [&run_id],
+            )
+            .unwrap();
+        assert!(
+            tools
+                .prepare_binding_credential(&mut database, &run_id, epoch, true)
+                .is_err()
+        );
+        assert_eq!(retained(&database), "recoverable-old-session");
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_terminal_provenance_is_not_fabricated_for_core_launch_failures() {
+        for (runtime_terminal_observed, cleanup_required) in
+            [(false, true), (true, false), (true, true)]
+        {
+            let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+                claimed_run_for_planned_shutdown("required");
+            let execution = ExecutionRuntimeService::default()
+                .load_agent_run_execution(&database, &agent_run_id, execution_epoch)
+                .unwrap()
+                .unwrap();
+            let envelope = adapter_envelope(
+                if runtime_terminal_observed {
+                    "observed-runtime-terminal"
+                } else {
+                    "core-launch-failure"
+                },
+                &camp_id,
+                FailAgentRunCommand {
+                    agent_run_id: agent_run_id.clone(),
+                    expected_version: execution.version,
+                    execution_epoch,
+                    error_code: "runtime_launch_failed".to_string(),
+                    error_detail: None,
+                    failure: None,
+                    manual_retry_allowed: false,
+                    ending_git_observation: None,
+                },
+            );
+            let service = ExecutionRuntimeService::default();
+            let terminal = if runtime_terminal_observed && cleanup_required {
+                service.fail_agent_run_requiring_cleanup(&mut database, &envelope)
+            } else if runtime_terminal_observed {
+                service.fail_agent_run(&mut database, &envelope)
+            } else {
+                service.fail_agent_run_without_runtime_terminal(&mut database, &envelope)
+            }
+            .unwrap();
+            assert_ne!(terminal.result.status, CommandResultStatus::Rejected);
+
+            let state: (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = database
+                .connection()
+                .query_row(
+                    r#"
+                    SELECT terminal_resolution_source, cancel_requested_at,
+                           cancel_reason_code, cancel_acknowledged_at
+                    FROM agent_run WHERE id = ?1
+                    "#,
+                    [&agent_run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state.0.as_deref(),
+                runtime_terminal_observed.then_some("runtime_terminal")
+            );
+            if !cleanup_required {
+                assert!(state.1.is_none());
+                assert!(state.2.is_none());
+            } else {
+                assert!(state.1.is_some());
+                assert_eq!(
+                    state.2.as_deref(),
+                    Some(if runtime_terminal_observed {
+                        "runtime_terminal_host_failed"
+                    } else {
+                        "runtime_terminal_unconfirmed"
+                    })
+                );
+            }
+            assert!(state.3.is_none());
+            assert_eq!(
+                service
+                    .count_runtime_terminal_settlements(
+                        &database,
+                        &[ActiveExecutionKey::new(&agent_run_id, execution_epoch)]
+                    )
+                    .unwrap(),
+                usize::from(runtime_terminal_observed)
+            );
+            drop(database);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn controlled_shutdown_fence_terminalizes_accepted_input_without_erasing_uncertainty() {
+        struct ControlledShutdownState {
+            run_status: String,
+            wait_reason: Option<String>,
+            cancel_requested_at: Option<String>,
+            cancel_reason_code: Option<String>,
+            cancel_acknowledged_at: Option<String>,
+            terminal_resolution_source: Option<String>,
+            terminal_reason_code: Option<String>,
+            last_error_code: Option<String>,
+            input_delivery_status: String,
+        }
+
+        let (directory, mut database, camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        insert_test_runtime_input(&database, &agent_run_id, execution_epoch, "accepted");
+        let service = ExecutionRuntimeService::default();
+        service
+            .record_controlled_shutdown_cycle(&mut database, "generation-accepted", 3)
+            .unwrap();
+        let settlement = service
+            .settle_controlled_shutdown_runs(&mut database, "generation-accepted", false, (0, 0))
+            .unwrap();
+        assert!(!settlement.already_settled);
+        assert_eq!(settlement.fenced_agent_runs.len(), 1);
+        assert!(settlement.fenced_agent_runs[0].has_unsettled_external_effects);
+
+        let state: ControlledShutdownState = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT agent_run.status, agent_run.wait_reason,
+                       agent_run.cancel_requested_at,
+                       agent_run.cancel_reason_code,
+                       agent_run.cancel_acknowledged_at,
+                       agent_run.terminal_resolution_source,
+                       agent_run.terminal_reason_code,
+                       agent_run.last_error_code,
+                       runtime_input_delivery.status
+                FROM agent_run
+                JOIN runtime_input_delivery
+                  ON runtime_input_delivery.agent_run_id = agent_run.id
+                WHERE agent_run.id = ?1
+                "#,
+                [&agent_run_id],
+                |row| {
+                    Ok(ControlledShutdownState {
+                        run_status: row.get(0)?,
+                        wait_reason: row.get(1)?,
+                        cancel_requested_at: row.get(2)?,
+                        cancel_reason_code: row.get(3)?,
+                        cancel_acknowledged_at: row.get(4)?,
+                        terminal_resolution_source: row.get(5)?,
+                        terminal_reason_code: row.get(6)?,
+                        last_error_code: row.get(7)?,
+                        input_delivery_status: row.get(8)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(state.run_status, "cancelled");
+        assert!(state.cancel_requested_at.is_some());
+        assert_eq!(
+            state.cancel_reason_code.as_deref(),
+            Some("app_shutdown_cancel_all")
+        );
+        assert!(state.cancel_acknowledged_at.is_none());
+        assert!(
+            state.wait_reason.is_none()
+                && state.terminal_resolution_source.is_none()
+                && state.terminal_reason_code.is_none()
+        );
+        assert!(state.last_error_code.is_none());
+        assert_eq!(state.input_delivery_status, "accepted");
+        assert_eq!(database.connection().query_row(
+            "SELECT interruption_kind FROM notification_occurrence WHERE agent_run_id=?1 AND semantic='run_stopped'",
+            [&agent_run_id], |r| r.get::<_,String>(0)).unwrap(), "app_shutdown");
+        assert_eq!(
+            service
+                .count_runtime_terminal_settlements(
+                    &database,
+                    &[ActiveExecutionKey::new(&agent_run_id, execution_epoch)]
+                )
+                .unwrap(),
+            0
+        );
+
+        let snapshot = ReadModelService
+            .camp_snapshot(&mut database, &camp_id)
+            .unwrap();
+        let run = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == agent_run_id)
+            .unwrap();
+        assert_eq!(run.status, "cancelled");
+        assert!(!run.has_unsettled_external_effects);
+        let pending: (bool, bool) = database.connection().query_row(
+            "SELECT settled_at IS NULL, fenced_agent_run_count IS NULL FROM planned_shutdown_cycle WHERE core_generation = 'generation-accepted'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(pending, (true, true));
+        let finished = service
+            .settle_controlled_shutdown_runs(
+                &mut database,
+                "generation-accepted",
+                true,
+                (settlement.fenced_agent_runs.len(), 1),
+            )
+            .unwrap();
+        assert!(finished.fenced_agent_runs.is_empty());
+        let counts: (i64, i64) = database.connection().query_row(
+            "SELECT fenced_agent_run_count, unsettled_effect_agent_run_count FROM planned_shutdown_cycle WHERE core_generation = 'generation-accepted' AND settled_at IS NOT NULL",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(counts, (1, 1));
+        let replay = service
+            .settle_controlled_shutdown_cycle(&mut database, "generation-accepted")
+            .unwrap();
+        assert!(replay.already_settled);
+        assert!(replay.fenced_agent_runs.is_empty());
+        let observed = service
+            .record_cancelled_agent_run_ending_git_observation(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "shutdown-ending-git".into(),
+                    actor: ActorRef::System {
+                        component_id: "agent-run-git-observer".into(),
+                    },
+                    camp_id: Some(camp_id),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: RecordCancelledAgentRunEndingGitObservationCommand {
+                        agent_run_id,
+                        execution_epoch,
+                        ending_git_observation: test_git_observation(
+                            crate::git::GitCapabilityState::GitValid,
+                            None,
+                        ),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(observed.result.status, CommandResultStatus::Applied);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_recovery_terminalizes_an_accepted_unknown_input_without_a_waiting_blocker() {
+        for (input_status, startup) in [
+            ("accepted", true),
+            ("delivery_unknown", true),
+            ("prepared", false),
+        ] {
+            let (directory, mut database, camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+                claimed_run_for_planned_shutdown("required");
+            insert_test_runtime_input(&database, &agent_run_id, execution_epoch, input_status);
+            if input_status == "prepared" {
+                database.connection().execute("UPDATE runtime_input_delivery SET dispatch_started_at = prepared_at WHERE agent_run_id = ?1", [&agent_run_id]).unwrap();
+            }
+            database
+                .connection()
+                .execute(
+                    r#"
+                UPDATE conversation
+                SET last_accepted_public_boundary_sequence = 12
+                WHERE id = (
+                    SELECT conversation_id FROM agent_run WHERE id = ?1
+                )
+                "#,
+                    [&agent_run_id],
+                )
+                .unwrap();
+            if startup {
+                let recovery = database.prepare_v2_recovery().unwrap();
+                assert_eq!(recovery.accepted_input_recovery_blockers_created, 1);
+            } else {
+                let version = database
+                    .connection()
+                    .query_row(
+                        "SELECT version FROM agent_run WHERE id = ?1",
+                        [&agent_run_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let recovery = crate::action::ActionSafetyService::default()
+                    .reconcile_runtime_loss(
+                        &mut database,
+                        &CommandEnvelope {
+                            command_id: "runtime-loss-owner".into(),
+                            actor: ActorRef::System {
+                                component_id: "runtime-recovery-coordinator".into(),
+                            },
+                            camp_id: Some(camp_id.clone()),
+                            expected_versions: vec![],
+                            execution_epoch: None,
+                            payload: crate::action::ReconcileRuntimeLossCommand {
+                                failure: None,
+                                agent_run_id: agent_run_id.clone(),
+                                expected_version: version,
+                                execution_epoch,
+                                reason: "fixture-native-exit".into(),
+                            },
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(recovery.result.code, "agent_run.failed");
+            }
+            // Recovery is idempotent and cannot requeue the unknown input.
+            assert_eq!(
+                database
+                    .prepare_v2_recovery()
+                    .unwrap()
+                    .accepted_input_recovery_blockers_created,
+                0
+            );
+            let state: (
+                String,
+                Option<String>,
+                i64,
+                Option<String>,
+                Option<String>,
+                String,
+                i64,
+            ) = database
+                .connection()
+                .query_row(
+                    r#"
+                SELECT agent_run.status, agent_run.wait_reason,
+                       agent_run.runtime_recovery_required,
+                       agent_run.last_error_code, agent_run.cancel_requested_at,
+                       camp_message_delivery.status,
+                       conversation.last_accepted_public_boundary_sequence
+                FROM agent_run
+                JOIN camp_message_delivery
+                  ON camp_message_delivery.claimed_agent_run_id = agent_run.id
+                JOIN conversation ON conversation.id = agent_run.conversation_id
+                WHERE agent_run.id = ?1
+                "#,
+                    [&agent_run_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(state.0, "failed");
+            assert!(state.1.is_none());
+            assert_eq!(state.2, 0);
+            assert_eq!(state.3.as_deref(), Some("accepted_input_outcome_unknown"));
+            assert!(
+                state.4.is_some(),
+                "cleanup remains explicitly unacknowledged"
+            );
+            assert_eq!(state.5, "failed");
+            assert_eq!(state.6, 12);
+            assert_eq!(database.connection().query_row(
+                "SELECT interruption_kind FROM notification_occurrence WHERE agent_run_id=?1 AND semantic='turn_failed'",
+                [&agent_run_id], |r| r.get::<_,String>(0)).unwrap(), "execution_lost");
+
+            // Cleanup uses cancellation bookkeeping, but runtime loss must remain
+            // a failure in the public view rather than a legacy user cancellation.
+            let snapshot = ReadModelService
+                .camp_snapshot(&mut database, &camp_id)
+                .unwrap();
+            let projected = snapshot
+                .agent_runs
+                .iter()
+                .find(|run| run.id == agent_run_id)
+                .unwrap();
+            assert_eq!(projected.status, "failed");
+            assert!(projected.wait_reason.is_none());
+            assert!(projected.cancel_acknowledged_at.is_none());
+            assert!(!projected.has_unsettled_external_effects);
+
+            drop(database);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn controlled_shutdown_startup_recovery_cancels_run_and_preserves_dispatch_evidence() {
+        struct StartupRecoveryState {
+            run_status: String,
+            last_error_code: Option<String>,
+            input_delivery_status: String,
+            input_resolved_at: Option<String>,
+            cancel_requested_at: Option<String>,
+            cancel_reason_code: Option<String>,
+            cancel_acknowledged_at: Option<String>,
+        }
+
+        let (directory, mut database, _camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        insert_test_runtime_input(&database, &agent_run_id, execution_epoch, "prepared");
+        database.connection().execute("UPDATE runtime_input_delivery SET dispatch_started_at = prepared_at WHERE agent_run_id = ?1", [&agent_run_id]).unwrap();
+        let service = ExecutionRuntimeService::default();
+        service
+            .record_controlled_shutdown_cycle(&mut database, "generation-interrupted", 3)
+            .unwrap();
+
+        let recovery = service
+            .recover_interrupted_controlled_shutdowns(&mut database)
+            .unwrap();
+        assert_eq!(recovery.cycles_settled, 1);
+        assert_eq!(recovery.fenced_agent_runs.len(), 1);
+        assert!(recovery.fenced_agent_runs[0].has_unsettled_external_effects);
+        let state: StartupRecoveryState = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT agent_run.status, agent_run.last_error_code,
+                       runtime_input_delivery.status,
+                       runtime_input_delivery.resolved_at,
+                       agent_run.cancel_requested_at,
+                       agent_run.cancel_reason_code,
+                       agent_run.cancel_acknowledged_at
+                FROM agent_run
+                JOIN runtime_input_delivery
+                  ON runtime_input_delivery.agent_run_id = agent_run.id
+                WHERE agent_run.id = ?1
+                "#,
+                [&agent_run_id],
+                |row| {
+                    Ok(StartupRecoveryState {
+                        run_status: row.get(0)?,
+                        last_error_code: row.get(1)?,
+                        input_delivery_status: row.get(2)?,
+                        input_resolved_at: row.get(3)?,
+                        cancel_requested_at: row.get(4)?,
+                        cancel_reason_code: row.get(5)?,
+                        cancel_acknowledged_at: row.get(6)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(state.run_status, "cancelled");
+        assert!(state.last_error_code.is_none());
+        assert_eq!(state.input_delivery_status, "delivery_unknown");
+        assert!(state.input_resolved_at.is_none());
+        assert!(state.cancel_requested_at.is_some());
+        assert_eq!(
+            state.cancel_reason_code.as_deref(),
+            Some("app_shutdown_cancel_all")
+        );
+        assert!(state.cancel_acknowledged_at.is_none());
+
+        let replay = service
+            .recover_interrupted_controlled_shutdowns(&mut database)
+            .unwrap();
+        assert_eq!(replay.cycles_settled, 0);
+        assert!(replay.fenced_agent_runs.is_empty());
+        assert_eq!(database.connection().query_row(
+            "SELECT count(*) FROM notification_occurrence WHERE agent_run_id=?1 AND interruption_kind='app_shutdown'",
+            [&agent_run_id], |r| r.get::<_,i64>(0)).unwrap(), 1, "startup replay must keep the first admission");
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn planned_shutdown_abortive_terminal_outcomes_are_wait_reason_independent() {
+        for wait_reason in ["approval", "action_execution", "runtime_delivery"] {
+            for (outcome, expected) in [
+                (
+                    RuntimeTerminalOutcome::Failed,
+                    ("failed", "planned_shutdown_failed"),
+                ),
+                (
+                    RuntimeTerminalOutcome::Cancelled,
+                    ("cancelled", "planned_shutdown_cancelled"),
+                ),
+                (
+                    RuntimeTerminalOutcome::Interrupted,
+                    ("failed", "runtime_interrupted"),
+                ),
+            ] {
+                assert_eq!(
+                    planned_shutdown_abortive_terminal_facts(outcome).unwrap(),
+                    expected,
+                    "wait reason {wait_reason} must not change terminal facts"
+                );
+            }
+        }
+        assert!(
+            planned_shutdown_abortive_terminal_facts(RuntimeTerminalOutcome::Succeeded).is_err()
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    async fn planned_shutdown_failed_clears_live_waiting_state() {
+        struct WaitingTerminalState {
+            run_status: String,
+            wait_reason: Option<String>,
+            wait_deadline_at: Option<String>,
+            runtime_recovery_required: i64,
+            execution_lease_owner: Option<String>,
+            execution_lease_expires_at: Option<String>,
+            terminal_resolution_source: Option<String>,
+            terminal_reason_code: Option<String>,
+            delivery_status: String,
+        }
+
+        for wait_reason in ["approval"] {
+            for outcome in [RuntimeTerminalOutcome::Failed] {
+                let (
+                    directory,
+                    mut database,
+                    _camp_id,
+                    _camp_turn_id,
+                    agent_run_id,
+                    execution_epoch,
+                ) = claimed_run_for_planned_shutdown("required");
+                mark_claimed_run_waiting(&database, &agent_run_id, wait_reason);
+                let permit = planned_terminal_permit(&agent_run_id, execution_epoch, outcome).await;
+                let (expected_run_status, expected_terminal_reason) =
+                    planned_shutdown_abortive_terminal_facts(outcome).unwrap();
+                let settlement = ExecutionRuntimeService::default()
+                    .settle_planned_shutdown_abortive_terminal(
+                        &mut database,
+                        &permit,
+                        &PlannedShutdownAbortiveTerminal {
+                            agent_run_id: agent_run_id.clone(),
+                            execution_epoch,
+                            outcome,
+                            error_code: format!("runtime_{expected_run_status}"),
+                            error_detail: Some(format!(
+                                "Runtime returned {expected_run_status} while waiting for {wait_reason}"
+                            )),
+                            failure: None,
+                            manual_retry_allowed: false,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(settlement.agent_run_status, expected_run_status);
+                assert_eq!(settlement.camp_turn_status, "failed");
+
+                let state = database
+                    .connection()
+                    .query_row(
+                        r#"
+                        SELECT agent_run.status,
+                               agent_run.wait_reason,
+                               agent_run.wait_deadline_at,
+                               agent_run.runtime_recovery_required,
+                               agent_run.execution_lease_owner,
+                               agent_run.execution_lease_expires_at,
+                               agent_run.terminal_resolution_source,
+                               agent_run.terminal_reason_code,
+                               camp_message_delivery.status
+                        FROM agent_run
+                        JOIN camp_message_delivery
+                          ON camp_message_delivery.claimed_agent_run_id = agent_run.id
+                        WHERE agent_run.id = ?1
+                        "#,
+                        params![agent_run_id],
+                        |row| {
+                            Ok(WaitingTerminalState {
+                                run_status: row.get(0)?,
+                                wait_reason: row.get(1)?,
+                                wait_deadline_at: row.get(2)?,
+                                runtime_recovery_required: row.get(3)?,
+                                execution_lease_owner: row.get(4)?,
+                                execution_lease_expires_at: row.get(5)?,
+                                terminal_resolution_source: row.get(6)?,
+                                terminal_reason_code: row.get(7)?,
+                                delivery_status: row.get(8)?,
+                            })
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(state.run_status, expected_run_status);
+                assert!(state.wait_reason.is_none());
+                assert!(state.wait_deadline_at.is_none());
+                assert_eq!(state.runtime_recovery_required, 0);
+                assert!(state.execution_lease_owner.is_none());
+                assert!(state.execution_lease_expires_at.is_none());
+                assert_eq!(
+                    state.terminal_resolution_source.as_deref(),
+                    Some("runtime_terminal")
+                );
+                assert_eq!(
+                    state.terminal_reason_code.as_deref(),
+                    Some(expected_terminal_reason)
+                );
+                assert_eq!(state.delivery_status, "failed");
+
+                drop(database);
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_cancelled_is_run_local_and_settles_its_delivery() {
+        let (directory, mut database, _camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        let permit = planned_terminal_permit(
+            &agent_run_id,
+            execution_epoch,
+            RuntimeTerminalOutcome::Cancelled,
+        )
+        .await;
+        let settlement = ExecutionRuntimeService::default()
+            .settle_planned_shutdown_abortive_terminal(
+                &mut database,
+                &permit,
+                &PlannedShutdownAbortiveTerminal {
+                    agent_run_id: agent_run_id.clone(),
+                    execution_epoch,
+                    outcome: RuntimeTerminalOutcome::Cancelled,
+                    error_code: "runtime_cancelled".to_string(),
+                    error_detail: Some("Runtime confirmed cancellation".to_string()),
+                    failure: None,
+                    manual_retry_allowed: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(settlement.agent_run_status, "cancelled");
+        assert_eq!(settlement.camp_turn_status, "cancelled");
+        let state: (String, Option<String>, Option<String>, String) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT agent_run.status,
+                       agent_run.terminal_resolution_source,
+                       agent_run.terminal_reason_code,
+                       camp_message_delivery.status
+                FROM agent_run
+                JOIN camp_message_delivery
+                  ON camp_message_delivery.claimed_agent_run_id = agent_run.id
+                WHERE agent_run.id = ?1
+                "#,
+                params![agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "cancelled");
+        assert_eq!(state.1.as_deref(), Some("runtime_terminal"));
+        assert_eq!(state.2.as_deref(), Some("planned_shutdown_cancelled"));
+        assert_eq!(state.3, "cancelled");
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT interruption_kind FROM notification_occurrence WHERE agent_run_id=?1",
+                    [&agent_run_id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "app_shutdown"
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "slow-tests")]
+    async fn planned_shutdown_optional_cancelled_still_settles_its_delivery() {
+        let (directory, mut database, _camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("optional");
+        let permit = planned_terminal_permit(
+            &agent_run_id,
+            execution_epoch,
+            RuntimeTerminalOutcome::Cancelled,
+        )
+        .await;
+        let settlement = ExecutionRuntimeService::default()
+            .settle_planned_shutdown_abortive_terminal(
+                &mut database,
+                &permit,
+                &PlannedShutdownAbortiveTerminal {
+                    agent_run_id: agent_run_id.clone(),
+                    execution_epoch,
+                    outcome: RuntimeTerminalOutcome::Cancelled,
+                    error_code: "runtime_cancelled".to_string(),
+                    error_detail: None,
+                    failure: None,
+                    manual_retry_allowed: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(settlement.camp_turn_status, "cancelled");
+        let delivery_status: String = database
+            .connection()
+            .query_row(
+                "SELECT status FROM camp_message_delivery WHERE claimed_agent_run_id = ?1",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivery_status, "cancelled");
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "slow-tests")]
+    async fn planned_shutdown_optional_failed_still_settles_its_delivery() {
+        let (directory, mut database, _camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("optional");
+        let permit = planned_terminal_permit(
+            &agent_run_id,
+            execution_epoch,
+            RuntimeTerminalOutcome::Failed,
+        )
+        .await;
+        let settlement = ExecutionRuntimeService::default()
+            .settle_planned_shutdown_abortive_terminal(
+                &mut database,
+                &permit,
+                &PlannedShutdownAbortiveTerminal {
+                    agent_run_id: agent_run_id.clone(),
+                    execution_epoch,
+                    outcome: RuntimeTerminalOutcome::Failed,
+                    error_code: "provider_terminal_failure".to_string(),
+                    error_detail: None,
+                    failure: None,
+                    manual_retry_allowed: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(settlement.agent_run_status, "failed");
+        assert_eq!(settlement.camp_turn_status, "failed");
+        let delivery_status: String = database
+            .connection()
+            .query_row(
+                "SELECT status FROM camp_message_delivery WHERE claimed_agent_run_id = ?1",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivery_status, "failed");
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "slow-tests")]
+    async fn planned_shutdown_failed_uses_abortive_terminal_source_without_camp_cancellation() {
+        let (directory, mut database, _camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        let permit = planned_terminal_permit(
+            &agent_run_id,
+            execution_epoch,
+            RuntimeTerminalOutcome::Failed,
+        )
+        .await;
+        let settlement = ExecutionRuntimeService::default()
+            .settle_planned_shutdown_abortive_terminal(
+                &mut database,
+                &permit,
+                &PlannedShutdownAbortiveTerminal {
+                    agent_run_id: agent_run_id.clone(),
+                    execution_epoch,
+                    outcome: RuntimeTerminalOutcome::Failed,
+                    error_code: "provider_terminal_failure".to_string(),
+                    error_detail: Some("Provider returned a terminal failure".to_string()),
+                    failure: None,
+                    manual_retry_allowed: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(settlement.agent_run_status, "failed");
+        assert_eq!(settlement.camp_turn_status, "failed");
+        let state: (String, Option<String>, Option<String>, String) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT agent_run.status,
+                       agent_run.terminal_resolution_source,
+                       agent_run.terminal_reason_code,
+                       camp_message_delivery.status
+                FROM agent_run
+                JOIN camp_message_delivery
+                  ON camp_message_delivery.claimed_agent_run_id = agent_run.id
+                WHERE agent_run.id = ?1
+                "#,
+                params![agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "failed");
+        assert_eq!(state.1.as_deref(), Some("runtime_terminal"));
+        assert_eq!(state.2.as_deref(), Some("planned_shutdown_failed"));
+        assert_eq!(state.3, "failed");
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_abortive_terminal_atomically_closes_run_local_effects() {
+        let (directory, mut database, camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO action_execution(
+                    id, agent_run_id, action_kind, action_schema_version,
+                    action_digest, digest_algorithm, canonicalization_version,
+                    canonical_input_json, input_completeness, action_summary,
+                    execution_authority, control_mode,
+                    source_agent_run_execution_epoch,
+                    policy_decision, policy_version, matched_policy_rule_ids_json,
+                    status, resolution_evidence_refs_json, created_at, updated_at
+                ) VALUES (
+                    'planned-action', ?1, 'test.action', '1',
+                    'sha256:planned-action', 'sha256', 'canonical-json-v1',
+                    '{}', 'complete', 'Planned shutdown test action',
+                    'core', 'mediated', ?2,
+                    'ask', 'test-policy-v1', '[]',
+                    'prepared', '[]', ?3, ?3
+                )
+                "#,
+                params![agent_run_id, execution_epoch, now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO approval(
+                    id, action_id, action_kind, action_digest,
+                    digest_algorithm, canonicalization_version, action_summary,
+                    requested_for_user_id, request_policy_version,
+                    status, requested_at, updated_at, native_options_json
+                ) VALUES (
+                    'planned-approval', 'planned-action', 'test.action',
+                    'sha256:planned-action', 'sha256', 'canonical-json-v1',
+                    'Planned shutdown test action', 'local-user', 'test-policy-v1',
+                    'pending', ?1, ?1, '[]'
+                )
+                "#,
+                [&now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO runtime_delivery_checkpoint(
+                    id, agent_run_id, action_id, delivery_kind,
+                    payload_digest, payload_json, target_execution_epoch,
+                    status, available_at, created_at, updated_at
+                ) VALUES (
+                    'planned-delivery', ?1, 'planned-action', 'authorization_resolution',
+                    'sha256:planned-delivery', '{}', ?2,
+                    'pending', ?3, ?3, ?3
+                )
+                "#,
+                params![agent_run_id, execution_epoch, now],
+            )
+            .unwrap();
+
+        // The existing terminal-safety owner also covers ZCode's narrow
+        // background exception. Roll back this branch before shutdown checks.
+        {
+            let tx = database.connection_mut().transaction().unwrap();
+            tx.execute("DELETE FROM approval WHERE id = 'planned-approval'", [])
+                .unwrap();
+            tx.execute(
+                "DELETE FROM runtime_delivery_checkpoint WHERE id = 'planned-delivery'",
+                [],
+            )
+            .unwrap();
+            tx.execute("UPDATE action_execution SET control_mode = 'intercepted', native_item_id = 'background-tool', status = 'unknown', unknown_disposition = 'active' WHERE id = 'planned-action'", []).unwrap();
+            tx.execute(
+                "UPDATE agent_run SET runtime_adapter_kind = 'zcode-app' WHERE id = ?1",
+                [&agent_run_id],
+            )
+            .unwrap();
+            assert!(has_terminal_safety_blocker(&tx, &agent_run_id).unwrap());
+            tx.execute(r#"INSERT INTO agent_run_execution_evidence(id, agent_run_id, execution_epoch, sequence, event_type, kind, phase, payload_preview_json, content_byte_count, is_truncated, occurred_at)
+                VALUES ('background-proof', ?1, ?2, 100000, 'runtime.action', 'command', 'updated', '{"zcodeBackground":{"toolCallId":"background-tool","status":"running"}}', 0, 0, ?3)"#, params![agent_run_id, execution_epoch, now]).unwrap();
+            assert!(!has_terminal_safety_blocker(&tx, &agent_run_id).unwrap());
+            tx.execute(
+                "UPDATE agent_run SET runtime_adapter_kind = 'codex' WHERE id = ?1",
+                [&agent_run_id],
+            )
+            .unwrap();
+            assert!(has_terminal_safety_blocker(&tx, &agent_run_id).unwrap());
+            tx.execute(
+                "UPDATE agent_run SET runtime_adapter_kind = 'zcode-app' WHERE id = ?1",
+                [&agent_run_id],
+            )
+            .unwrap();
+            tx.execute("UPDATE action_execution SET status = 'prepared', unknown_disposition = NULL WHERE id = 'planned-action'", []).unwrap();
+            assert!(has_terminal_safety_blocker(&tx, &agent_run_id).unwrap());
+            tx.execute("UPDATE action_execution SET status = 'unknown', unknown_disposition = 'active' WHERE id = 'planned-action'", []).unwrap();
+            tx.execute(r#"INSERT INTO agent_run_execution_evidence(id, agent_run_id, execution_epoch, sequence, event_type, kind, phase, payload_preview_json, content_byte_count, is_truncated, occurred_at)
+                VALUES ('background-ended', ?1, ?2, 100001, 'runtime.action', 'command', 'failed', '{"zcodeBackground":{"toolCallId":"background-tool","status":"failed"}}', 0, 0, ?3)"#, params![agent_run_id, execution_epoch, now]).unwrap();
+            assert!(
+                has_terminal_safety_blocker(&tx, &agent_run_id).unwrap(),
+                "a historical running event cannot bypass an unsettled final Action result"
+            );
+        }
+
+        let execution = ExecutionRuntimeService::default()
+            .load_agent_run_execution(&database, &agent_run_id, execution_epoch)
+            .unwrap()
+            .unwrap();
+        let ordinary_failure = ExecutionRuntimeService::default()
+            .fail_agent_run(
+                &mut database,
+                &adapter_envelope(
+                    "ordinary-failure-with-effects",
+                    &camp_id,
+                    FailAgentRunCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: execution.version,
+                        execution_epoch,
+                        error_code: "provider_terminal_failure".to_string(),
+                        error_detail: None,
+                        failure: None,
+                        manual_retry_allowed: false,
+                        ending_git_observation: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            ordinary_failure.result.status,
+            CommandResultStatus::Rejected
+        );
+        assert_eq!(
+            ordinary_failure.result.code,
+            "agent_run.terminal_safety_blocked"
+        );
+
+        mark_claimed_run_waiting(&database, &agent_run_id, "approval");
+        let permit = planned_terminal_permit(
+            &agent_run_id,
+            execution_epoch,
+            RuntimeTerminalOutcome::Failed,
+        )
+        .await;
+        ExecutionRuntimeService::default()
+            .settle_planned_shutdown_abortive_terminal(
+                &mut database,
+                &permit,
+                &PlannedShutdownAbortiveTerminal {
+                    agent_run_id: agent_run_id.clone(),
+                    execution_epoch,
+                    outcome: RuntimeTerminalOutcome::Failed,
+                    error_code: "provider_terminal_failure".to_string(),
+                    error_detail: None,
+                    failure: None,
+                    manual_retry_allowed: false,
+                },
+            )
+            .unwrap();
+
+        let action: (String, Option<String>, Option<String>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, not_executed_reason, effect_disposition
+                FROM action_execution WHERE id = 'planned-action'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(action.0, "not_executed");
+        assert_eq!(
+            action.1.as_deref(),
+            Some("planned_shutdown_runtime_terminal")
+        );
+        assert_eq!(action.2.as_deref(), Some("none"));
+        let approval: (String, Option<String>, Option<String>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, resolved_by_id, resolution_code
+                FROM approval WHERE id = 'planned-approval'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(approval.0, "cancelled");
+        assert_eq!(approval.1.as_deref(), Some("planned-shutdown-coordinator"));
+        assert_eq!(
+            approval.2.as_deref(),
+            Some("planned_shutdown_runtime_terminal")
+        );
+        let delivery: (String, Option<String>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, last_error
+                FROM runtime_delivery_checkpoint WHERE id = 'planned-delivery'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delivery.0, "safely_closed");
+        assert_eq!(
+            delivery.1.as_deref(),
+            Some("planned_shutdown_runtime_terminal")
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "slow-tests")]
+    async fn planned_shutdown_success_keeps_ordinary_invariants_and_records_terminal_reason() {
+        let (directory, mut database, camp_id, _camp_turn_id, agent_run_id, execution_epoch) =
+            claimed_run_for_planned_shutdown("required");
+        let permit = planned_terminal_permit(
+            &agent_run_id,
+            execution_epoch,
+            RuntimeTerminalOutcome::Succeeded,
+        )
+        .await;
+        let execution = ExecutionRuntimeService::default()
+            .load_agent_run_execution(&database, &agent_run_id, execution_epoch)
+            .unwrap()
+            .unwrap();
+        let succeeded = ExecutionRuntimeService::default()
+            .succeed_agent_run_during_planned_shutdown(
+                &mut database,
+                &permit,
+                &adapter_envelope(
+                    "planned-shutdown-success",
+                    &camp_id,
+                    SucceedAgentRunCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: execution.version,
+                        execution_epoch,
+                        native_turn_id: "planned-shutdown-test-turn".to_string(),
+                        final_output: "可靠成功终态".to_string(),
+                        missing_send_recovery_candidate: None,
+                        ending_git_observation: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(succeeded.result.status, CommandResultStatus::Applied);
+        let terminal: (String, Option<String>, Option<String>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, terminal_resolution_source, terminal_reason_code
+                FROM agent_run WHERE id = ?1
+                "#,
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(terminal.0, "succeeded");
+        assert_eq!(terminal.1.as_deref(), Some("runtime_terminal"));
+        assert_eq!(terminal.2.as_deref(), Some("planned_shutdown_completed"));
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn adapter_envelope<P>(command_id: &str, camp_id: &str, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::System {
+                component_id: "runtime-adapter:codex".to_string(),
+            },
+            camp_id: Some(camp_id.to_string()),
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    fn test_git_observation(
+        state: crate::git::GitCapabilityState,
+        head_commit: Option<&str>,
+    ) -> GitObservation {
+        GitObservation {
+            state,
+            repository_root: None,
+            git_common_dir: None,
+            object_format: None,
+            head_commit: head_commit.map(str::to_string),
+            branch: None,
+            dirty: (state == crate::git::GitCapabilityState::GitValid).then_some(false),
+            observed_at: "2026-07-30T00:00:00Z".to_string(),
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn scheduler_serializes_one_conversation_and_increments_recovery_epoch() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let collaboration = CollaborationService::default();
+        let camp = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "runtime-create-camp",
+                    None,
+                    CreateThreadCommand::for_test_with_members(
+                        workspace.to_string_lossy().to_string(),
+                        &["agent_2"],
+                        "agent_2",
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        collaboration
+            .add_camp_member(
+                &mut database,
+                &user_envelope(
+                    "runtime-add-member",
+                    Some(&camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let mut first_run_id = None;
+        let mut later_delivery_id = None;
+        for index in 0..2 {
+            let turn = collaboration
+                .send_test_camp_message(
+                    &mut database,
+                    &user_envelope(
+                        &format!("runtime-turn-{index}"),
+                        Some(&camp_id),
+                        TestThreadMessageCommand {
+                            camp_id: camp_id.clone(),
+                            draft_revision: None,
+                            body: format!("执行职责 {index}"),
+                            prepared_attachment_ids: Vec::new(),
+                            address: TestThreadMessageAddress::Default,
+                            reply_to_camp_message_id: None,
+                            execution: Some(ExecutionRequest {
+                                task_id: None,
+                                purpose: format!("职责 {index}"),
+                                completion_role: "required".to_string(),
+                                budget: None,
+                            }),
+                        },
+                    ),
+                )
+                .unwrap();
+            let agent_run_ids = turn.result.payload["agentRunIds"].as_array().unwrap();
+            if index == 0 {
+                assert_eq!(agent_run_ids.len(), 1);
+                first_run_id = Some(agent_run_ids[0].as_str().unwrap().to_string());
+            } else {
+                assert!(agent_run_ids.is_empty());
+                later_delivery_id = Some(
+                    turn.result.payload["deliveryIds"][0]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+        }
+        let first_run_id = first_run_id.unwrap();
+        let later_delivery_id = later_delivery_id.unwrap();
+        let runtime = ExecutionRuntimeService::default();
+        let claim = runtime
+            .claim_agent_run(
+                &mut database,
+                &scheduler_envelope(
+                    "claim-first-run",
+                    &camp_id,
+                    ClaimAgentRunCommand {
+                        agent_run_id: first_run_id.clone(),
+                        expected_version: 1,
+                        lease_owner: "runtime-host-1".to_string(),
+                        lease_seconds: 60,
+                        workspace: Some(AgentRunWorkspace {
+                            execution_root: workspace.to_string_lossy().to_string(),
+                            access: "write".to_string(),
+                            isolation: "shared".to_string(),
+                        }),
+                        starting_git_observation: Some(test_git_observation(
+                            crate::git::GitCapabilityState::NotGit,
+                            None,
+                        )),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(claim.result.status, CommandResultStatus::Accepted);
+        assert_eq!(claim.result.payload["executionEpoch"], 1);
+        let execution = runtime
+            .load_agent_run_execution(&database, &first_run_id, 1)
+            .unwrap()
+            .expect("claimed AgentRun should materialize");
+        assert_eq!(execution.runtime.installation_id, "adapter-test-codex");
+        assert_eq!(execution.runtime.model.source, "runtime_default");
+        assert_eq!(
+            execution.runtime.model.model_id,
+            "codex-cli://runtime-default"
+        );
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO native_session_resume_attempt(
+                    conversation_id, installation_id,
+                    installation_generation, status,
+                    attempted_at, completed_at
+                ) VALUES (?1, ?2, ?3, 'attempting', ?4, NULL)
+                "#,
+                params![
+                    execution.conversation_id,
+                    execution.runtime.installation_id,
+                    execution.runtime.installation_generation,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        let bound = runtime
+            .bind_native_session(
+                &mut database,
+                &adapter_envelope(
+                    "bind-first-session",
+                    &camp_id,
+                    BindNativeSessionCommand {
+                        conversation_id: execution.conversation_id.clone(),
+                        agent_run_id: execution.agent_run_id.clone(),
+                        expected_conversation_version: execution.conversation_version,
+                        expected_execution_epoch: execution.execution_epoch,
+                        previous_adapter_installation_id: None,
+                        previous_native_session_id: None,
+                        previous_binding_compatibility_digest: None,
+                        proposed_binding_id: None,
+                        adapter_installation_id: execution.runtime.installation_id.clone(),
+                        native_session_id: "thread-first".to_string(),
+                        binding_compatibility_digest: execution
+                            .runtime
+                            .binding_compatibility_digest
+                            .clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(bound.result.status, CommandResultStatus::Applied);
+        let binding: (Option<String>, Option<String>, Option<String>) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT native_adapter_installation_id, native_session_id,
+                       native_binding_compatibility_digest
+                FROM conversation WHERE id = ?1
+                "#,
+                [&execution.conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(binding.0.as_deref(), Some("adapter-test-codex"));
+        assert_eq!(binding.1.as_deref(), Some("thread-first"));
+        assert_eq!(
+            binding.2.as_deref(),
+            execution.runtime.binding_compatibility_digest.as_deref()
+        );
+        let resume_status: String = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status
+                FROM native_session_resume_attempt
+                WHERE conversation_id = ?1
+                  AND installation_id = ?2
+                  AND installation_generation = ?3
+                "#,
+                params![
+                    execution.conversation_id,
+                    execution.runtime.installation_id,
+                    execution.runtime.installation_generation,
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resume_status, "succeeded");
+
+        let later_delivery_state: (String, Option<String>) = database
+            .connection()
+            .query_row(
+                "SELECT status, claimed_agent_run_id FROM camp_message_delivery WHERE id = ?1",
+                [&later_delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(later_delivery_state, ("waiting".to_string(), None));
+
+        let marked = runtime
+            .mark_for_recovery(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "mark-recovery".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: MarkAgentRunForRecoveryCommand {
+                        agent_run_id: first_run_id.clone(),
+                        expected_version: 2,
+                        execution_epoch: 1,
+                        reason: "host_lost".to_string(),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(marked.result.status, CommandResultStatus::Accepted);
+        let reclaimed = runtime
+            .claim_agent_run(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "reclaim-first-run".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: ClaimAgentRunCommand {
+                        agent_run_id: first_run_id.clone(),
+                        expected_version: 3,
+                        lease_owner: "runtime-host-2".to_string(),
+                        lease_seconds: 60,
+                        workspace: None,
+                        starting_git_observation: Some(test_git_observation(
+                            crate::git::GitCapabilityState::GitValid,
+                            Some("1111111111111111111111111111111111111111"),
+                        )),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(reclaimed.result.status, CommandResultStatus::Accepted);
+        assert_eq!(reclaimed.result.payload["executionEpoch"], 2);
+        let starting_observation_json: String = database
+            .connection()
+            .query_row(
+                "SELECT starting_git_observation_json FROM agent_run WHERE id = ?1",
+                [&first_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let starting_observation: GitObservation =
+            serde_json::from_str(&starting_observation_json).unwrap();
+        assert_eq!(
+            starting_observation.state,
+            crate::git::GitCapabilityState::NotGit,
+            "recovery must preserve the original run-start observation"
+        );
+
+        let stale_recovery = runtime
+            .mark_for_recovery(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "stale-recovery".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: MarkAgentRunForRecoveryCommand {
+                        agent_run_id: first_run_id,
+                        expected_version: 4,
+                        execution_epoch: 1,
+                        reason: "late_host_callback".to_string(),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(stale_recovery.result.status, CommandResultStatus::Rejected);
+        assert_eq!(stale_recovery.result.code, "agent_run.recovery_fenced");
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn scheduler_can_reject_a_queued_run_without_starting_it_or_removing_its_message() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database_fast();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let collaboration = CollaborationService::default();
+        let camp = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "dispatch-reject-create",
+                    None,
+                    CreateThreadCommand::for_test_with_members(
+                        workspace.to_string_lossy().to_string(),
+                        &["agent_2"],
+                        "agent_2",
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        collaboration
+            .add_camp_member(
+                &mut database,
+                &user_envelope(
+                    "dispatch-reject-member",
+                    Some(&camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let sent = collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "dispatch-reject-send",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: "消息必须保留".to_string(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Default,
+                        reply_to_camp_message_id: None,
+                        execution: Some(ExecutionRequest {
+                            task_id: None,
+                            purpose: "验证调度失败".to_string(),
+                            completion_role: "required".to_string(),
+                            budget: None,
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+        let run_id = sent.result.payload["agentRunIds"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let public_failure = crate::runtime_failure::RuntimeFailureView::new(
+            AdapterKind::ClaudeCodeCli,
+            crate::runtime_failure::RuntimeFailureOrigin::Environment,
+            crate::runtime_failure::RuntimeFailurePhase::Execution,
+            "workspace_unavailable",
+            "Claude Code 的执行目录不可用",
+            Some("请选择一个可访问的项目目录".to_string()),
+            true,
+        );
+        let runtime = ExecutionRuntimeService::default();
+        let rejected = runtime
+            .reject_agent_run_dispatch(
+                &mut database,
+                &scheduler_envelope(
+                    "dispatch-reject-run",
+                    &camp_id,
+                    RejectAgentRunDispatchCommand {
+                        agent_run_id: run_id.clone(),
+                        expected_version: 1,
+                        error_code: "workspace_unavailable".to_string(),
+                        error_detail: Some("workspace safety check failed".to_string()),
+                        failure: Some(public_failure.clone()),
+                        manual_retry_allowed: true,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(rejected.result.status, CommandResultStatus::Applied);
+        let state: (String, String, Option<String>, Option<String>, String) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT agent_run.status, camp_message_delivery.status,
+                       agent_run.started_at, agent_run.starting_git_observation_json,
+                       agent_run.last_error_code
+                FROM agent_run
+                JOIN camp_message_delivery
+                  ON camp_message_delivery.claimed_agent_run_id = agent_run.id
+                WHERE agent_run.id = ?1
+                "#,
+                [&run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(state.0, "failed");
+        assert_eq!(state.1, "failed");
+        assert!(state.2.is_none());
+        assert!(state.3.is_none());
+        assert_eq!(state.4, "workspace_unavailable");
+        let snapshot = ReadModelService
+            .camp_snapshot(&mut database, &camp_id)
+            .unwrap();
+        let run = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .unwrap();
+        assert_eq!(run.failure.as_ref(), Some(&public_failure));
+        let message_count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM camp_message", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_count, 1);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn scheduler_rebinds_one_compatible_runtime_drift_and_preserves_initial_audit() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database_fast();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let collaboration = CollaborationService::default();
+        let camp = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "runtime-rebind-create",
+                    None,
+                    CreateThreadCommand::for_test_with_members(
+                        workspace.to_string_lossy().to_string(),
+                        &["agent_2"],
+                        "agent_2",
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        collaboration
+            .add_camp_member(
+                &mut database,
+                &user_envelope(
+                    "runtime-rebind-member",
+                    Some(&camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let fast_target = crate::camp_fast::target(&database, &camp_id, "agent_2")
+            .unwrap()
+            .unwrap();
+        let preference = |command_id: &str, enabled| {
+            user_envelope(
+                command_id,
+                Some(&camp_id),
+                crate::camp_fast::SetThreadMemberFastCommand {
+                    camp_id: camp_id.clone(),
+                    agent_id: "agent_2".into(),
+                    expected_runtime_binding_revision: fast_target.runtime_binding_revision.clone(),
+                    fast_override: Some(enabled),
+                },
+            )
+        };
+        crate::camp_fast::set_preference(&mut database, &preference("freeze-fast", true)).unwrap();
+        let sent = collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "runtime-rebind-send",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: "允许可信 Runtime 原地升级".to_string(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Default,
+                        reply_to_camp_message_id: None,
+                        execution: Some(ExecutionRequest {
+                            task_id: None,
+                            purpose: "验证 Runtime rebind".to_string(),
+                            completion_role: "required".to_string(),
+                            budget: None,
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+        let run_id = sent.result.payload["agentRunIds"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let candidate = ExecutionRuntimeService::default()
+            .list_dispatchable_agent_runs(&database, 16)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.agent_run_id == run_id)
+            .unwrap();
+        let frozen = candidate.frozen_runtime().unwrap();
+        assert_eq!(frozen.camp_fast.as_ref().unwrap().fast_override, Some(true));
+        assert!(runtime_config_digest_is_valid(&frozen).unwrap());
+        crate::camp_fast::set_preference(&mut database, &preference("later-standard", false))
+            .unwrap();
+        let mut effective = frozen.clone();
+        effective.installation_generation += 1;
+        effective.reported_version = Some("2.0.0".to_string());
+        effective.executable_fingerprint = "sha256:runtime-v2".to_string();
+        effective.host_config_digest = Some("sha256:host-v2".to_string());
+        effective.config_digest.clear();
+        effective.config_digest =
+            canonical_json_digest(&serde_json::to_value(&effective).unwrap()).unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE adapter_installation SET generation = ?2 WHERE id = ?1",
+                params![effective.installation_id, effective.installation_generation],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE adapter_capability_snapshot
+                SET reported_version = ?2, executable_fingerprint = ?3,
+                    probe_status = 'ready', authentication_status = 'authenticated',
+                    stale_at = NULL, last_error = NULL
+                WHERE installation_id = ?1
+                "#,
+                params![
+                    effective.installation_id,
+                    effective.reported_version,
+                    effective.executable_fingerprint,
+                ],
+            )
+            .unwrap();
+
+        // Both model modes preserve the admitted choice, even after the UI chose Standard.
+        for explicit in [false, true] {
+            let mut admitted = frozen.clone();
+            if explicit {
+                admitted.model.source = "explicit".into();
+                admitted.model.model_id = "gpt-test".into();
+                admitted.model.options["reasoning_effort"] = json!("high");
+            }
+            admitted.refresh_config_digest().unwrap();
+            let resolved = AgentProfileService::default()
+                .resolve_rebound_runtime(&database, &admitted)
+                .unwrap()
+                .unwrap();
+            assert!(runtime_logical_identity_matches(&admitted, &resolved));
+            assert!(runtime_config_digest_is_valid(&resolved).unwrap());
+            assert_eq!(resolved.camp_fast, admitted.camp_fast);
+            assert_eq!(resolved.model.options["serviceTier"], "priority");
+            let mut lost_intent = resolved.clone();
+            lost_intent.camp_fast = None;
+            assert!(!runtime_logical_identity_matches(&admitted, &lost_intent));
+        }
+        let effective = AgentProfileService::default()
+            .resolve_rebound_runtime(&database, &frozen)
+            .unwrap()
+            .unwrap();
+        let service = ExecutionRuntimeService::default();
+        let rebound = service
+            .rebind_agent_run_runtime(
+                &mut database,
+                &scheduler_envelope(
+                    "runtime-rebind-once",
+                    &camp_id,
+                    RebindAgentRunRuntimeCommand {
+                        agent_run_id: run_id.clone(),
+                        expected_version: 1,
+                        drift_reason: "runtime_executable_fingerprint_changed".to_string(),
+                        effective_runtime: effective.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(rebound.result.status, CommandResultStatus::Applied);
+        assert_eq!(rebound.result.code, "agent_run.runtime_rebound");
+        assert_eq!(rebound.result.payload["version"], 2);
+
+        let state: (
+            String,
+            i64,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            i64,
+            String,
+        ) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, version,
+                       runtime_initial_reported_version,
+                       runtime_initial_executable_fingerprint,
+                       runtime_reported_version, runtime_executable_fingerprint,
+                       runtime_rebind_count, effective_config_json
+                FROM agent_run WHERE id = ?1
+                "#,
+                [&run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(state.0, "queued");
+        assert_eq!(state.1, 2);
+        assert_eq!(state.2.as_deref(), frozen.reported_version.as_deref());
+        assert_eq!(state.3, frozen.executable_fingerprint);
+        assert_eq!(state.4.as_deref(), effective.reported_version.as_deref());
+        assert_eq!(state.5, effective.executable_fingerprint);
+        assert_eq!(state.6, 1);
+        let effective_config: Value = serde_json::from_str(&state.7).unwrap();
+        assert_eq!(effective_config["mcpSnapshotLayout"], "run_v1");
+        assert_eq!(
+            effective_config["runtime"]["executableFingerprint"],
+            effective.executable_fingerprint
+        );
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    r#"
+                    SELECT COUNT(*) FROM event_log
+                    WHERE entity_id = ?1 AND event_type IN (
+                        'agent_run.runtime_drift_detected', 'agent_run.runtime_rebound'
+                    )
+                    "#,
+                    [&run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+
+        let second = service
+            .rebind_agent_run_runtime(
+                &mut database,
+                &scheduler_envelope(
+                    "runtime-rebind-twice",
+                    &camp_id,
+                    RebindAgentRunRuntimeCommand {
+                        agent_run_id: run_id,
+                        expected_version: 2,
+                        drift_reason: "second_drift".to_string(),
+                        effective_runtime: effective,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(second.result.status, CommandResultStatus::Rejected);
+        assert_eq!(second.result.code, "agent_run.runtime_rebind_limit_reached");
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn user_agent_run_cancellation_is_run_local_and_stably_idempotent() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database_fast();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let collaboration = CollaborationService::default();
+        let camp = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "run-cancel-create-camp",
+                    None,
+                    CreateThreadCommand::for_test_with_members(
+                        workspace.to_string_lossy().to_string(),
+                        &["agent_2", "agent_1"],
+                        "agent_2",
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for agent_id in ["agent_2", "agent_1"] {
+            collaboration
+                .add_camp_member(
+                    &mut database,
+                    &user_envelope(
+                        &format!("run-cancel-add-{agent_id}"),
+                        Some(&camp_id),
+                        AddThreadMemberCommand {
+                            camp_id: camp_id.clone(),
+                            agent_id: agent_id.to_string(),
+                            expected_membership_generation: 1,
+                            capability_overrides: json!({}),
+                            source: None,
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        let sent = collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "run-cancel-send",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: "并行处理两项职责".to_string(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Explicit {
+                            agent_ids: vec!["agent_2".to_string(), "agent_1".to_string()],
+                        },
+                        reply_to_camp_message_id: None,
+                        execution: Some(ExecutionRequest {
+                            task_id: None,
+                            purpose: "验证仅停止目标运行".to_string(),
+                            completion_role: "required".to_string(),
+                            budget: None,
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+        let run_ids = sent.result.payload["agentRunIds"].as_array().unwrap();
+        assert_eq!(run_ids.len(), 2);
+        let target_run_id = run_ids[0].as_str().unwrap().to_string();
+        let sibling_run_id = run_ids[1].as_str().unwrap().to_string();
+        let runtime = ExecutionRuntimeService::default();
+        let claimed = runtime
+            .claim_agent_run(
+                &mut database,
+                &scheduler_envelope(
+                    "run-cancel-claim-target",
+                    &camp_id,
+                    ClaimAgentRunCommand {
+                        agent_run_id: target_run_id.clone(),
+                        expected_version: 1,
+                        lease_owner: "run-cancel-test-host".to_string(),
+                        lease_seconds: 60,
+                        workspace: Some(AgentRunWorkspace {
+                            execution_root: workspace.to_string_lossy().to_string(),
+                            access: "write".to_string(),
+                            isolation: "shared".to_string(),
+                        }),
+                        starting_git_observation: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_ne!(claimed.result.status, CommandResultStatus::Rejected);
+        let (target_version, target_execution_epoch): (i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT version, execution_epoch FROM agent_run WHERE id = ?1",
+                [&target_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        insert_test_runtime_input(
+            &database,
+            &target_run_id,
+            target_execution_epoch,
+            "prepared",
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE runtime_input_delivery SET dispatch_started_at = prepared_at WHERE agent_run_id = ?1",
+                [&target_run_id],
+            )
+            .unwrap();
+        let camp_messages_before: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message WHERE camp_id = ?1",
+                [&camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let system_attempt = runtime
+            .request_agent_run_cancellation(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "run-cancel-system-attempt".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "test-system".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: CancelAgentRunCommand {
+                        camp_id: camp_id.clone(),
+                        agent_run_id: target_run_id.clone(),
+                        expected_version: target_version,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(system_attempt.result.code, "agent_run.cancel_user_required");
+
+        let requested = runtime
+            .request_agent_run_cancellation(
+                &mut database,
+                &user_envelope(
+                    "run-cancel-request",
+                    Some(&camp_id),
+                    CancelAgentRunCommand {
+                        camp_id: camp_id.clone(),
+                        agent_run_id: target_run_id.clone(),
+                        expected_version: target_version,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(requested.result.status, CommandResultStatus::Applied);
+        assert_eq!(requested.result.code, "agent_run.cancelled");
+        assert_eq!(requested.result.payload["status"], "cancelled");
+        let repeated_with_stale_version = runtime
+            .request_agent_run_cancellation(
+                &mut database,
+                &user_envelope(
+                    "run-cancel-repeat",
+                    Some(&camp_id),
+                    CancelAgentRunCommand {
+                        camp_id: camp_id.clone(),
+                        agent_run_id: target_run_id.clone(),
+                        expected_version: target_version,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            repeated_with_stale_version.result.code,
+            "agent_run.already_terminal"
+        );
+        assert_eq!(database.connection().query_row(
+            "SELECT count(*) FROM notification_occurrence WHERE agent_run_id=?1 AND interruption_kind='user_stop'",
+            [&target_run_id], |r| r.get::<_,i64>(0)).unwrap(), 0, "manual cancel and repeat do not admit exit attention");
+
+        let run_state: (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT
+                    target.status,
+                    target.last_error_code,
+                    input.status,
+                    target.cancel_reason_code,
+                    sibling.cancel_requested_at,
+                    sibling.cancel_reason_code
+                FROM agent_run AS target
+                JOIN runtime_input_delivery AS input ON input.agent_run_id = target.id
+                JOIN agent_run AS sibling ON sibling.id = ?2
+                WHERE target.id = ?1
+                "#,
+                params![target_run_id, sibling_run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(run_state.0, "cancelled");
+        assert!(run_state.1.is_none());
+        assert_eq!(run_state.2, "delivery_unknown");
+        assert_eq!(
+            run_state.3.as_deref(),
+            Some("user_requested_agent_run_stop")
+        );
+        assert!(run_state.4.is_none() && run_state.5.is_none());
+        let snapshot = ReadModelService
+            .camp_snapshot(&mut database, &camp_id)
+            .unwrap();
+        let projected_target = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == target_run_id)
+            .unwrap();
+        assert!(projected_target.cancel_requested_at.is_some());
+        assert_eq!(
+            projected_target.cancel_reason_code.as_deref(),
+            Some("user_requested_agent_run_stop")
+        );
+        assert!(projected_target.cancel_acknowledged_at.is_none());
+        assert_eq!(projected_target.status, "cancelled");
+        assert!(!projected_target.has_unsettled_external_effects);
+        let sibling_cancel_requested: Option<String> = database
+            .connection()
+            .query_row(
+                "SELECT cancel_requested_at FROM agent_run WHERE id = ?1",
+                [&sibling_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sibling_cancel_requested.is_none());
+        let public_state: (i64, i64) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM camp_message WHERE camp_id = ?1),
+                    (SELECT COUNT(*) FROM event_log
+                     WHERE event_type = 'agent_run.cancel_requested'
+                       AND entity_id = ?2)
+                "#,
+                params![camp_id, target_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(public_state, (camp_messages_before, 1));
+        let candidates = runtime.list_cancellation_candidates(&database, 10).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].agent_run_id, target_run_id);
+
+        // #153 wrote this exact terminal shape for cancellations. Preserve its raw
+        // evidence, but normalize the public projection to the corrected contract.
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'failed', last_error_code = 'accepted_input_outcome_unknown' WHERE id = ?1",
+                [&target_run_id],
+            )
+            .unwrap();
+        let legacy_snapshot = ReadModelService
+            .camp_snapshot(&mut database, &camp_id)
+            .unwrap();
+        let legacy_target = legacy_snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == target_run_id)
+            .unwrap();
+        assert_eq!(legacy_target.status, "cancelled");
+        assert!(!legacy_target.has_unsettled_external_effects);
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn away_members_keep_responsibility_but_wait_for_presence_before_dispatch() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database_fast();
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let collaboration = CollaborationService::default();
+        let camp = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "fanout-runtime-create-camp",
+                    None,
+                    CreateThreadCommand::for_test_with_members(
+                        workspace.to_string_lossy().to_string(),
+                        &["agent_2", "agent_1"],
+                        "agent_2",
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for agent_id in ["agent_2", "agent_1"] {
+            collaboration
+                .add_camp_member(
+                    &mut database,
+                    &user_envelope(
+                        &format!("fanout-runtime-add-{agent_id}"),
+                        Some(&camp_id),
+                        AddThreadMemberCommand {
+                            camp_id: camp_id.clone(),
+                            agent_id: agent_id.to_string(),
+                            expected_membership_generation: 1,
+                            capability_overrides: json!({}),
+                            source: None,
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        let queued = collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "fanout-runtime-message",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: "请独立分析并公开各自结论。".to_string(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Explicit {
+                            agent_ids: vec!["agent_2".to_string(), "agent_1".to_string()],
+                        },
+                        reply_to_camp_message_id: None,
+                        execution: Some(ExecutionRequest {
+                            task_id: None,
+                            purpose: "独立分析".to_string(),
+                            completion_role: "required".to_string(),
+                            budget: None,
+                        }),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            queued.result.payload["agentRunIds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status = 'away' WHERE id IN ('agent_2', 'agent_1')",
+                [],
+            )
+            .unwrap();
+        // Public output mode is frozen on AgentRun, not re-read from a later
+        // Profile edit while the Runtime is completing the Run.
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET selected_runtime_adapter_kind = 'opencode-cli' WHERE id = 'agent_2'",
+                [],
+            )
+            .unwrap();
+        let runtime = ExecutionRuntimeService::default();
+        assert!(
+            runtime
+                .list_dispatchable_agent_runs(&database, 10)
+                .unwrap()
+                .is_empty(),
+            "accepted responsibility remains queued while Presence is away"
+        );
+        let queued_count: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_run WHERE camp_id = ?1 AND status = 'queued'",
+                [&camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued_count, 2);
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status = 'present' WHERE id IN ('agent_2', 'agent_1')",
+                [],
+            )
+            .unwrap();
+        let candidates = runtime.list_dispatchable_agent_runs(&database, 10).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|candidate| candidate.agent_id == "agent_2")
+                .unwrap()
+                .execution_workspace()
+                .access,
+            "write"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|candidate| candidate.agent_id == "agent_1")
+                .unwrap()
+                .execution_workspace()
+                .access,
+            "write"
+        );
+        assert!(candidates.iter().all(
+            |candidate| candidate.permission_semantics == PermissionSemantics::RuntimeManagedV2
+        ));
+
+        let mut executions = Vec::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let claim = runtime
+                .claim_agent_run(
+                    &mut database,
+                    &scheduler_envelope(
+                        &format!("fanout-claim-{index}"),
+                        &camp_id,
+                        ClaimAgentRunCommand {
+                            agent_run_id: candidate.agent_run_id.clone(),
+                            expected_version: candidate.version,
+                            lease_owner: format!("runtime-host-{index}"),
+                            lease_seconds: 60,
+                            workspace: Some(candidate.execution_workspace()),
+                            starting_git_observation: None,
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(claim.result.status, CommandResultStatus::Accepted);
+            let execution = runtime
+                .load_agent_run_execution(&database, &candidate.agent_run_id, 1)
+                .unwrap()
+                .unwrap();
+            executions.push(execution);
+        }
+
+        for (index, execution) in executions.iter().enumerate() {
+            let completed = runtime
+                .succeed_agent_run(
+                    &mut database,
+                    &adapter_envelope(
+                        &format!("fanout-complete-{index}"),
+                        &camp_id,
+                        SucceedAgentRunCommand {
+                            agent_run_id: execution.agent_run_id.clone(),
+                            expected_version: execution.version,
+                            execution_epoch: execution.execution_epoch,
+                            native_turn_id: format!("native-turn-{index}"),
+                            final_output: format!("Agent {index} 的公开结论"),
+                            missing_send_recovery_candidate: None,
+                            ending_git_observation: Some(test_git_observation(
+                                crate::git::GitCapabilityState::NotGit,
+                                None,
+                            )),
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(completed.result.status, CommandResultStatus::Applied);
+            assert!(completed.result.payload["threadTurnStatus"].is_null());
+        }
+
+        let settled_deliveries: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message_delivery WHERE camp_id = ?1 AND status = 'settled'",
+                [&camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled_deliveries, 2);
+        let automatic_final_outputs: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_run WHERE final_camp_message_id IS NOT NULL AND final_conversation_message_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(automatic_final_outputs, 0);
+        let ending_observations: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_run WHERE ending_git_observation_json IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ending_observations, 2);
+        let public_agent_messages: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(public_agent_messages, 0);
+        let recipient_free_defaults: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id IS NOT NULL AND address_mode = 'default' AND addressed_agent_ids_json = '[]'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recipient_free_defaults, 0);
+
+        let replay = runtime
+            .succeed_agent_run(
+                &mut database,
+                &adapter_envelope(
+                    "fanout-complete-1",
+                    &camp_id,
+                    SucceedAgentRunCommand {
+                        agent_run_id: executions[1].agent_run_id.clone(),
+                        expected_version: executions[1].version,
+                        execution_epoch: executions[1].execution_epoch,
+                        native_turn_id: "native-turn-1".to_string(),
+                        final_output: "Agent 1 的公开结论".to_string(),
+                        missing_send_recovery_candidate: None,
+                        ending_git_observation: Some(test_git_observation(
+                            crate::git::GitCapabilityState::NotGit,
+                            None,
+                        )),
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM camp_message", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "slow-tests")]
+    mod slow_tests {
+        #[test]
+        fn manual_native_session_restart_keeps_conversation_identity_and_generation() {
+            super::manual_native_session_restart_keeps_conversation_identity_and_generation();
+        }
+        #[tokio::test]
+        async fn planned_shutdown_failed_clears_live_waiting_state() {
+            super::planned_shutdown_failed_clears_live_waiting_state().await;
+        }
+        #[tokio::test]
+        async fn planned_shutdown_optional_cancelled_still_settles_its_delivery() {
+            super::planned_shutdown_optional_cancelled_still_settles_its_delivery().await;
+        }
+        #[tokio::test]
+        async fn planned_shutdown_optional_failed_still_settles_its_delivery() {
+            super::planned_shutdown_optional_failed_still_settles_its_delivery().await;
+        }
+        #[tokio::test]
+        async fn planned_shutdown_failed_uses_abortive_terminal_source_without_camp_cancellation() {
+            super::planned_shutdown_failed_uses_abortive_terminal_source_without_camp_cancellation(
+            )
+            .await;
+        }
+        #[tokio::test]
+        async fn planned_shutdown_success_keeps_ordinary_invariants_and_records_terminal_reason() {
+            super::planned_shutdown_success_keeps_ordinary_invariants_and_records_terminal_reason()
+                .await;
+        }
+        #[test]
+        fn scheduler_can_reject_a_queued_run_without_starting_it_or_removing_its_message() {
+            super::scheduler_can_reject_a_queued_run_without_starting_it_or_removing_its_message();
+        }
+        #[test]
+        fn away_members_keep_responsibility_but_wait_for_presence_before_dispatch() {
+            super::away_members_keep_responsibility_but_wait_for_presence_before_dispatch();
+        }
+    }
+}

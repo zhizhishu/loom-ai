@@ -1,0 +1,775 @@
+import * as childProcess from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:child_process')>()
+}))
+
+vi.mock('electron', () => ({
+  app: {
+    isPackaged: false,
+    getPath: () => process.env.ROVAI_CORE_TEST_USER_DATA ?? tmpdir(),
+    getAppPath: () => process.cwd()
+  }
+}))
+
+import {
+  CoreClient,
+  RovaiRequestError,
+  coreProcessHomeDirectory,
+  coreStartupRetryDelay,
+  coreLaunchArguments,
+  desktopSkillLibraryRoot,
+  runtimeThreadFilesRoot,
+  sidecarExecutableName,
+  sidecarTargetKey
+} from './core-client'
+import type { SupervisorSnapshot } from '@contracts'
+
+const temporaryRoots: string[] = []
+const originalPlatform = process.platform
+
+function useSupportedPosixHost(): void {
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'darwin' })
+}
+
+function nextSnapshot(
+  client: CoreClient,
+  predicate: (snapshot: SupervisorSnapshot) => boolean,
+  timeoutMs = 3_000
+): Promise<SupervisorSnapshot> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe()
+      reject(new Error('Timed out waiting for Supervisor snapshot'))
+    }, timeoutMs)
+    const unsubscribe = client.onSnapshot((snapshot) => {
+      if (!predicate(snapshot)) return
+      clearTimeout(timer)
+      unsubscribe()
+      resolve(snapshot)
+    })
+  })
+}
+
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+  Object.defineProperty(process, 'platform', { configurable: true, value: originalPlatform })
+  delete process.env.ROVAI_CORE_BIN
+  delete process.env.ROVAI_CORE_TEST_USER_DATA
+  for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
+
+describe('CoreClient planned shutdown', () => {
+  it('dispatches only channel operations without blocking Core replies and fences late callbacks after stop', async () => {
+    useSupportedPosixHost()
+    const root = mkdtempSync(join(tmpdir(), 'rovai-channel-wire-')); temporaryRoots.push(root)
+    process.env.ROVAI_CORE_BIN = process.execPath
+    const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => true), killed: false })
+    vi.spyOn(childProcess, 'spawn').mockReturnValue(child as unknown as childProcess.ChildProcess)
+    const frames: Array<{ id: number; method: string; params: unknown }> = []
+    child.stdin.on('data', bytes => {
+      const frame = JSON.parse(String(bytes)); frames.push(frame)
+      child.stdout.write(`${JSON.stringify({ id: frame.id, result: { name: 'same Core' } })}\n`)
+    })
+    const client = new CoreClient(root)
+    let release!: () => void
+    const handler = vi.fn(async (request: { operation: string }) => {
+      await expect(client.request('app.info')).resolves.toEqual({ name: 'same Core' })
+      if (request.operation === 'retry') await new Promise<void>(resolve => { release = resolve })
+      return { error: 'channel_operation_failed' as const }
+    })
+    client.setChannelHandler(handler)
+    try {
+      client.start()
+      child.stdout.write(`${JSON.stringify({ kind: 'core_startup', schemaVersion: 1, status: 'ready', authorityState: { kind: 'current' } })}\n`)
+      const notify = (id: string, request: unknown) => child.stdout.write(`${JSON.stringify({ method: 'host.channels.request', params: { requestId: id, request } })}\n`)
+      notify('1', { operation: 'connect' })
+      notify('2', { operation: 'get', cookie: 'forbidden' })
+      notify('3', { operation: 'get' })
+      await vi.waitFor(() => expect(frames.some(frame => frame.method === 'host.channels.reply')).toBe(true))
+      expect(handler).toHaveBeenCalledTimes(1)
+      notify('4', { operation: 'retry', kind: 'feishu', agentId: 'original' })
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      client.stop(); release()
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(frames.filter(frame => frame.method === 'host.channels.reply')).toHaveLength(1)
+    } finally {
+      client.stop(); child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy()
+    }
+  })
+
+  it('admits only bounded transient authority retries, independently of the crash budget', () => {
+    const busy = { status: 'blocked' as const, authorityState: { kind: 'blocked' as const, reason: { kind: 'busy', stage: 'open' } } }
+    expect([0, 1, 2, 3].map(attempt => coreStartupRetryDelay(busy, attempt))).toEqual([250, 750, 1500, null])
+    expect(coreStartupRetryDelay({ status: 'failed', error: { code: 'authority_migration_schema_failed', message: 'SQLITE_BUSY', retryable: true, details: { stage: 'database_migration' } } }, 0)).toBe(250)
+    expect(coreStartupRetryDelay({ status: 'failed', error: { code: 'authority_recovery_failed', message: 'Requires explicit recovery', retryable: true, details: { stage: 'authority_recovery' } } }, 0)).toBeNull()
+    for (const kind of ['unknown_data_contract', 'ambiguous_authority_candidates', 'unsupported_authority_artifact', 'identity_changed', 'corrupt_or_unreadable']) {
+      expect(coreStartupRetryDelay({ ...busy, authorityState: { kind: 'blocked', reason: { kind } } }, 0)).toBeNull()
+    }
+    for (const code of ['authority_contract_changed', 'authority_migration_schema_failed']) {
+      expect(coreStartupRetryDelay({ status: 'blocked', error: { code, message: 'deterministic refusal', retryable: false, details: {} } }, 0)).toBeNull()
+    }
+  })
+
+  it.runIf(process.platform !== 'win32').each([
+    { status: 'blocked', authorityState: { kind: 'blocked', reason: { kind: 'busy', stage: 'open' } } },
+    { status: 'failed', authorityState: { kind: 'unknown' }, error: { code: 'authority_io_transient', message: 'Interrupted', retryable: true, details: { stage: 'database_admission' } } }
+  ])('exhausts startup retries without consuming crash restarts or opening authority (%j)', async refusal => {
+    useSupportedPosixHost()
+    const root = mkdtempSync(join(tmpdir(), 'rovai-core-startup-retry-'))
+    temporaryRoots.push(root)
+    const fakeCore = join(root, 'fake-core.sh')
+    writeFileSync(fakeCore, `#!/bin/sh
+printf '%s\\n' "$*" >> '${join(root, 'launches.txt')}'
+printf '%s\\n' '${JSON.stringify({ kind: 'core_startup', schemaVersion: 1, ...refusal })}'
+`)
+    chmodSync(fakeCore, 0o700)
+    process.env.ROVAI_CORE_BIN = fakeCore
+    const client = new CoreClient(root)
+    const snapshots: SupervisorSnapshot[] = []
+    client.onSnapshot(snapshot => snapshots.push(snapshot))
+    try {
+      const blocked = nextSnapshot(client, snapshot => snapshot.fullCoreState === 'blocked', 6_000)
+      client.start()
+      expect(await blocked).toMatchObject({ generation: 4, restartAttempt: 0, capabilities: { authoritativeWorkspace: false, coreRequests: false } })
+      expect(snapshots.every(snapshot => snapshot.restartAttempt === 0 && !snapshot.capabilities.authoritativeWorkspace)).toBe(true)
+      expect(snapshots.filter(snapshot => snapshot.fullCoreState === 'blocked')).toHaveLength(1)
+      expect(readFileSync(join(root, 'launches.txt'), 'utf8').trim().split('\n').map(args => args.includes('--require-existing-authority'))).toEqual([false, true, true, true])
+      // Explicit retry gets a fresh startup budget, even before refusal exit.
+      const restarting = nextSnapshot(client, snapshot => snapshot.generation === 5 && snapshot.fullCoreState === 'starting')
+      client.retryFullCore()
+      await restarting
+    } finally { client.stop() }
+  // Real child I/O plus all three backoffs can exceed Vitest's default 5s
+  // under parallel builds. Keep the outer deadline beyond both owned waits,
+  // so timeout cleanup completes before the next case changes the fake binary.
+  }, 15_000)
+  it.runIf(process.platform !== 'win32').each([
+    ['admitted', true], ['migration_required', true], ['confirmed_absent', false]
+  ] as const)('retains the %s assessment across a later preparation failure', (kind, requiresExisting) => {
+    useSupportedPosixHost()
+    const root = mkdtempSync(join(tmpdir(), 'rovai-core-preparation-fence-'))
+    temporaryRoots.push(root)
+    process.env.ROVAI_CORE_BIN = process.execPath
+    const children: Array<ReturnType<typeof fakeChild>> = []
+    function fakeChild() {
+      return Object.assign(new EventEmitter(), {
+        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+        kill: vi.fn(() => true), killed: false
+      })
+    }
+    const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation(() => {
+      const child = fakeChild()
+      children.push(child)
+      return child as unknown as childProcess.ChildProcess
+    })
+    const client = new CoreClient(root)
+    try {
+      client.start()
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const child = children[attempt]
+        // Exit can precede the final stdout data. Force that ordering instead of relying
+        // on how quickly a shell fixture happens to drain on macOS versus Linux.
+        child.emit('exit', 0, null)
+        child.stdout.write(`${JSON.stringify({ kind: 'core_startup', schemaVersion: 1, status: 'phase',
+          phase: 'preparing_runtime_storage', authorityState: { kind } })}\n`)
+        child.stdout.write(`${JSON.stringify({ kind: 'core_startup', schemaVersion: 1, status: 'failed',
+          phase: 'preparing_runtime_storage', authorityState: { kind }, error: {
+            code: 'runtime_camp_files_root_admission_failed', message: 'fixture refusal', retryable: false,
+            details: { stage: 'runtime_storage' }
+          } })}\n`)
+        expect(client.getSnapshot()).toMatchObject({ generation: attempt + 1, fullCoreState: 'blocked',
+          restartAttempt: 0, authorityState: { kind }, lastError: { code: 'runtime_camp_files_root_admission_failed' } })
+        if (attempt === 0) client.retryFullCore()
+        child.stdout.end()
+        child.stderr.end()
+        child.emit('close', 0, null)
+      }
+      expect(spawn.mock.calls.map(([, args]) => Array.isArray(args) && args.includes('--require-existing-authority')))
+        .toEqual([false, requiresExisting])
+    } finally {
+      client.stop()
+      for (const child of children) { child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy() }
+    }
+  })
+
+  it('keeps an unadmitted Windows root blocked without inventing a Core path or consuming a generation', async () => {
+    const client = new CoreClient(null)
+    client.blockStartup({
+      code: 'windows_data_root_preparation_failed', message: 'private ACL unavailable', retryable: true, details: {}
+    }, 'preparing_windows_data_root')
+    client.start()
+    client.retryFullCore()
+    expect(client.getSnapshot()).toMatchObject({
+      generation: 0, restartAttempt: 0, runtimeMode: 'bootstrap_only', fullCoreState: 'blocked',
+      startupPhase: 'preparing_windows_data_root',
+      capabilities: { authoritativeWorkspace: false, coreRequests: false, fullCoreRetry: true },
+      lastError: { code: 'windows_data_root_preparation_failed' }
+    })
+    await expect(client.request('members.list')).rejects.toMatchObject({ kind: 'full_core_unavailable' })
+    await client.shutdown()
+  })
+
+  it('uses one closed target key and the native executable suffix', () => {
+    expect(sidecarTargetKey('darwin', 'arm64')).toBe('macos-arm64')
+    expect(sidecarTargetKey('darwin', 'x64')).toBe('macos-x64')
+    expect(sidecarTargetKey('win32', 'x64')).toBe('windows-x64')
+    expect(() => sidecarTargetKey('win32', 'arm64')).toThrow('Unsupported Rovai sidecar host')
+    expect(sidecarExecutableName('rovai-core', 'darwin')).toBe('rovai-core')
+    expect(sidecarExecutableName('rovai-core', 'win32')).toBe('rovai-core.exe')
+  })
+
+  it('passes an isolated Skill Library root to Core', () => {
+    expect(coreLaunchArguments('/isolated/data', '/isolated/views', '/isolated/skills', [], '/isolated/mcp.json'))
+      .toContain('--mcp-config-path')
+    expect(coreLaunchArguments('/isolated/data', '/isolated/views', '/isolated/skills', [], '/isolated/mcp.json'))
+      .toContain('/isolated/mcp.json')
+    expect(coreProcessHomeDirectory('/Users/system', '/tmp/isolated-home', 'darwin')).toBe(
+      '/tmp/isolated-home'
+    )
+    expect(coreProcessHomeDirectory('/Users/system', '', 'darwin')).toBe('/Users/system')
+    expect(coreProcessHomeDirectory('C:\\Users\\system', 'C:\\Temp\\home', 'win32')).toBe(
+      'C:\\Users\\system'
+    )
+    expect(desktopSkillLibraryRoot('/tmp/rovai-accept/user-data', true)).toBe(
+      join('/tmp/rovai-accept/user-data', 'managed-skill-library')
+    )
+    expect(desktopSkillLibraryRoot('/daily/user-data', false, 'darwin')).toBeNull()
+    expect(desktopSkillLibraryRoot('C:\\Rovai AI\\Core', false, 'win32')).toBe(
+      'C:\\Rovai AI\\Core\\managed-skill-library'
+    )
+    expect(coreLaunchArguments(
+      '/tmp/rovai-accept/user-data',
+      '/tmp/rovai-accept/runtime-files',
+      '/tmp/rovai-accept/user-data/managed-skill-library',
+      ['/tmp/removed-project']
+    )).toEqual([
+      '--data-dir',
+      '/tmp/rovai-accept/user-data',
+      '--runtime-camp-files-root',
+      '/tmp/rovai-accept/runtime-files',
+      '--skill-library-root',
+      '/tmp/rovai-accept/user-data/managed-skill-library',
+      '--removed-skill-project-root',
+      '/tmp/removed-project'
+    ])
+    expect(coreLaunchArguments('/daily/user-data', '/daily/runtime-files', null, [])).toEqual([
+      '--data-dir',
+      '/daily/user-data',
+      '--runtime-camp-files-root',
+      '/daily/runtime-files',
+      '--use-default-skill-library'
+    ])
+    expect(runtimeThreadFilesRoot(
+      'C:\\Rovai AI\\Core',
+      'C:\\Users\\test',
+      'win32'
+    )).toBe('C:\\Rovai AI\\Core\\runtime-files')
+    const macRoot = runtimeThreadFilesRoot(
+      '/tmp/rovai-accept/user-data',
+      '/tmp/rovai-home',
+      'darwin'
+    )
+    expect(macRoot).toMatch(
+      /^\/tmp\/rovai-home\/\.rovai\/instances\/v1-[0-9a-f]{64}\/runtime-files$/
+    )
+  })
+
+  it.runIf(process.platform !== 'win32')(
+    'reuses one Promise, keeps shutdown Main-only, and waits for the child exit',
+    async () => {
+      useSupportedPosixHost()
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-client-shutdown-'))
+      temporaryRoots.push(root)
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"core.shutdown"'*)
+      printf '%s\\n' '{"id":1,"result":{"protocolVersion":3,"status":"completed","deadlineExpired":true,"activeExecutionsObserved":1,"stopRequestsIssued":1,"terminalExecutionsSettled":0,"cancelledAgentRunsSettled":1,"unsettledEffectAgentRuns":1,"controlledShutdownCyclePersisted":true,"unresolvedExecutions":0}}'
+      sleep 0.05
+      exit 0
+      ;;
+  esac
+done
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+
+      const events: unknown[] = []
+      const client = new CoreClient()
+      client.onEvent((event) => events.push(event))
+      client.start()
+
+      const first = client.shutdown()
+      const second = client.shutdown()
+      expect(second).toBe(first)
+      await expect(first).resolves.toEqual({
+        report: {
+          protocolVersion: 3,
+          status: 'completed',
+          deadlineExpired: true,
+          activeExecutionsObserved: 1,
+          stopRequestsIssued: 1,
+          terminalExecutionsSettled: 0,
+          cancelledAgentRunsSettled: 1,
+          unsettledEffectAgentRuns: 1,
+          controlledShutdownCyclePersisted: true,
+          unresolvedExecutions: 0
+        },
+        forcedSignal: null
+      })
+      expect(events).toContainEqual({
+        method: 'runtime.state',
+        params: { status: 'shutting_down' }
+      })
+      expect(events).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          method: 'runtime.state',
+          params: expect.objectContaining({ status: 'restarting' })
+        })
+      ]))
+      await expect(client.request('health.check')).rejects.toThrow('shutting down')
+    }
+  )
+
+  it.runIf(process.platform !== 'win32')(
+    'uses SIGTERM only after the Core deadline and outer grace expire',
+    async () => {
+      useSupportedPosixHost()
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-client-sigterm-'))
+      temporaryRoots.push(root)
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"core.shutdown"'*)
+      while IFS= read -r ignored; do :; done
+      ;;
+  esac
+done
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+
+      const client = new CoreClient()
+      client.start()
+      const shutdown = client.shutdown()
+
+      await vi.advanceTimersByTimeAsync(12_999)
+      let settled = false
+      void shutdown.finally(() => {
+        settled = true
+      })
+      expect(settled).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      await expect(shutdown).resolves.toEqual({ report: null, forcedSignal: 'SIGTERM' })
+    }
+  )
+
+  it.runIf(process.platform !== 'win32')(
+    'escalates to SIGKILL when the child ignores SIGTERM',
+    async () => {
+      useSupportedPosixHost()
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-client-sigkill-'))
+      temporaryRoots.push(root)
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"core.shutdown"'*)
+      trap '' TERM
+      printf '%s\n' '{"kind":"core_startup","schemaVersion":1,"status":"ready","authorityState":{"kind":"current"}}'
+      while IFS= read -r ignored; do :; done
+      ;;
+  esac
+done
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+
+      const client = new CoreClient()
+      const armed = new Promise<void>((resolve) => {
+        client.onEvent((event) => {
+          if (event.method === 'runtime.state'
+            && JSON.stringify(event.params).includes('"status":"ready"')) resolve()
+        })
+      })
+      client.start()
+      const shutdown = client.shutdown()
+
+      await armed
+      await vi.advanceTimersByTimeAsync(13_000)
+      await vi.advanceTimersByTimeAsync(2_000)
+      await expect(shutdown).resolves.toEqual({ report: null, forcedSignal: 'SIGKILL' })
+    }
+  )
+})
+
+describe('CoreClient Supervisor protocol', () => {
+  it.runIf(process.platform !== 'win32')(
+    'caches the recovery boundary before readiness and orders suspend/resume controls',
+    async () => {
+      useSupportedPosixHost()
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-automation-resume-'))
+      temporaryRoots.push(root)
+      const launchPath = join(root, 'launch.txt')
+      const requestPath = join(root, 'requests.jsonl')
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+printf '%s\n' "$*" > '${launchPath}'
+printf '%s\n' '{"kind":"core_startup","schemaVersion":1,"status":"ready","authorityState":{"kind":"current"}}'
+IFS= read -r request || exit 1
+printf '%s\n' "$request" >> '${requestPath}'
+printf '%s\n' '{"id":1,"result":{}}'
+IFS= read -r request || exit 1
+printf '%s\n' "$request" >> '${requestPath}'
+printf '%s\n' '{"id":2,"result":{}}'
+IFS= read -r request || exit 1
+printf '%s\n' "$request" >> '${requestPath}'
+printf '%s\n' '{"id":3,"result":{}}'
+while IFS= read -r request; do :; done
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+
+      const client = new CoreClient(
+        root,
+        undefined,
+        '2026-09-05T08:00:00.000Z'
+      )
+      try {
+        await client.notifyAutomationSystemResumed('2026-09-05T09:00:00.000Z')
+        const ready = nextSnapshot(client, (snapshot) => snapshot.fullCoreState === 'ready')
+        client.start()
+        await ready
+        const launch = readFileSync(launchPath, 'utf8')
+        expect(launch).toContain('--automation-scheduler-epoch 1')
+        expect(launch).toContain('--automation-recovery-boundary 2026-09-05T09:00:00.000Z')
+
+        await client.notifyAutomationSystemSuspending()
+        await client.notifyAutomationSystemResumed('2026-09-05T10:00:00.000Z')
+        const requests = readFileSync(requestPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+        expect(requests).toMatchObject([{
+          method: 'automations.schedulerControl',
+          params: {
+            epoch: 2,
+            recoveryBoundary: '2026-09-05T09:00:00.000Z',
+            paused: true
+          }
+        }, {
+          method: 'automations.schedulerControl',
+          params: {
+            epoch: 3,
+            recoveryBoundary: '2026-09-05T10:00:00.000Z',
+            paused: false
+          }
+        }])
+      } finally {
+        client.stop()
+      }
+    }
+  )
+
+  it.runIf(process.platform !== 'win32')(
+    'reuses the Desktop-owned recovery boundary when Core restarts',
+    async () => {
+      useSupportedPosixHost()
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-automation-restart-'))
+      temporaryRoots.push(root)
+      const launchPath = join(root, 'launches.txt')
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+printf '%s\n' "$*" >> '${launchPath}'
+printf '%s\n' '{"kind":"core_startup","schemaVersion":1,"status":"ready","authorityState":{"kind":"current"}}'
+sleep 0.1
+exit 1
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+
+      const client = new CoreClient(root, undefined, '2026-09-05T08:00:00.000Z')
+      try {
+        const restarted = nextSnapshot(
+          client,
+          (snapshot) => snapshot.generation === 2 && snapshot.fullCoreState === 'ready',
+          5_000
+        )
+        client.start()
+        await restarted
+        const launches = readFileSync(launchPath, 'utf8').trim().split('\n')
+        expect(launches).toHaveLength(2)
+        expect(launches.every((launch) => (
+          launch.includes('--automation-scheduler-epoch 0')
+          && launch.includes('--automation-recovery-boundary 2026-09-05T08:00:00.000Z')
+        ))).toBe(true)
+      } finally {
+        client.stop()
+      }
+    }
+  )
+
+  it.runIf(process.platform !== 'win32')(
+    'restarts a bootstrapping Core with a resume boundary that arrived before readiness',
+    async () => {
+      useSupportedPosixHost()
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-automation-bootstrap-resume-'))
+      temporaryRoots.push(root)
+      process.env.ROVAI_CORE_BIN = process.execPath
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+      const children: Array<ReturnType<typeof fakeChild>> = []
+      function fakeChild() {
+        return Object.assign(new EventEmitter(), {
+          stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+          kill: vi.fn(() => true), killed: false
+        })
+      }
+      const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation(() => {
+        const child = fakeChild()
+        children.push(child)
+        return child as unknown as childProcess.ChildProcess
+      })
+
+      const client = new CoreClient(root, undefined, '2026-09-05T08:00:00.000Z')
+      try {
+        const restarted = nextSnapshot(
+          client,
+          (snapshot) => snapshot.generation === 2 && snapshot.fullCoreState === 'ready',
+          5_000
+        )
+        client.start()
+        await client.notifyAutomationSystemResumed('2026-09-05T09:00:00.000Z')
+        expect(children[0].kill).toHaveBeenCalledWith('SIGTERM')
+        children[0].stdout.end()
+        children[0].stderr.end()
+        children[0].emit('close', null, 'SIGTERM')
+        expect(children).toHaveLength(2)
+        children[1].stdout.write(`${JSON.stringify({
+          kind: 'core_startup',
+          schemaVersion: 1,
+          status: 'ready',
+          authorityState: { kind: 'current' }
+        })}\n`)
+        await restarted
+        const launches = spawn.mock.calls.map(([, args]) => args as string[])
+        expect(launches[0]).toEqual(expect.arrayContaining([
+          '--automation-scheduler-epoch', '0',
+          '--automation-recovery-boundary', '2026-09-05T08:00:00.000Z'
+        ]))
+        expect(launches[1]).toEqual(expect.arrayContaining([
+          '--automation-scheduler-epoch', '1',
+          '--automation-recovery-boundary', '2026-09-05T09:00:00.000Z'
+        ]))
+      } finally {
+        client.stop()
+        for (const child of children) {
+          child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy()
+        }
+      }
+    },
+    10_000
+  )
+
+  it('adds the Automation scheduler snapshot only when supplied', () => {
+    expect(coreLaunchArguments(
+      '/daily/user-data',
+      '/daily/runtime-files',
+      null,
+      [],
+      null,
+      {
+        epoch: 7,
+        recoveryBoundary: '2026-09-05T10:00:00.000Z',
+        paused: true
+      }
+    )).toEqual([
+      '--data-dir', '/daily/user-data',
+      '--runtime-camp-files-root', '/daily/runtime-files',
+      '--use-default-skill-library',
+      '--automation-scheduler-epoch', '7',
+      '--automation-recovery-boundary', '2026-09-05T10:00:00.000Z',
+      '--automation-scheduler-paused'
+    ])
+    expect(coreLaunchArguments(
+      '/daily/user-data',
+      '/daily/runtime-files',
+      null,
+      []
+    )).toEqual([
+      '--data-dir', '/daily/user-data',
+      '--runtime-camp-files-root', '/daily/runtime-files',
+      '--use-default-skill-library'
+    ])
+  })
+
+  it.runIf(process.platform !== 'win32')(
+    'publishes complete monotonic snapshots and enables authority only after ready',
+    async () => {
+      useSupportedPosixHost()
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-client-supervisor-'))
+      temporaryRoots.push(root)
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+printf '%s\n' '{"kind":"core_startup","schemaVersion":1,"status":"phase","phase":"assessing_authority","authorityState":{"kind":"assessing"}}'
+printf '%s\n' '{"kind":"core_startup","schemaVersion":1,"status":"ready","authorityState":{"kind":"current","origin":"existing"}}'
+while IFS= read -r request; do :; done
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+
+      const client = new CoreClient()
+      const snapshots: SupervisorSnapshot[] = []
+      client.onSnapshot((snapshot) => snapshots.push(snapshot))
+      const ready = nextSnapshot(client, (snapshot) => snapshot.fullCoreState === 'ready')
+      client.start()
+
+      await expect(ready).resolves.toMatchObject({
+        generation: 1,
+        runtimeMode: 'full_core',
+        authorityState: { kind: 'current', origin: 'existing' },
+        capabilities: { authoritativeWorkspace: true, coreRequests: true }
+      })
+      expect(snapshots.some((snapshot) => (
+        snapshot.fullCoreState === 'starting'
+        && snapshot.capabilities.authoritativeWorkspace === false
+      ))).toBe(true)
+      expect(snapshots.map((snapshot) => snapshot.revision)).toEqual(
+        [...snapshots.map((snapshot) => snapshot.revision)].sort((left, right) => left - right)
+      )
+      expect(new Set(snapshots.map((snapshot) => snapshot.revision)).size).toBe(snapshots.length)
+      client.stop()
+    }
+  )
+
+  it.runIf(process.platform !== 'win32')(
+    'preserves domain rejection details across the Core boundary',
+    async () => {
+      useSupportedPosixHost()
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-client-domain-error-'))
+      temporaryRoots.push(root)
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+printf '%s\n' '{"kind":"core_startup","schemaVersion":1,"status":"ready","authorityState":{"kind":"current"}}'
+while IFS= read -r request; do
+  printf '%s\n' '{"id":1,"error":{"kind":"domain_rejection","code":"camp_not_open","message":"Thread must be opened first","retryable":false,"details":{"threadId":"camp-1"}}}'
+done
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+
+      const client = new CoreClient()
+      const ready = nextSnapshot(client, (snapshot) => snapshot.fullCoreState === 'ready')
+      client.start()
+      await ready
+
+      const failure = await client.request('health.check').catch((error: unknown) => error)
+      expect(failure).toBeInstanceOf(RovaiRequestError)
+      expect(failure).toMatchObject({
+        kind: 'domain_rejection',
+        code: 'camp_not_open',
+        retryable: false,
+        generation: 1,
+        details: { threadId: 'camp-1' }
+      })
+      client.stop()
+    }
+  )
+
+  it.runIf(process.platform !== 'win32')(
+    'keeps authority ready with optional subsystem failures and clears them when Core stops',
+    async () => {
+      useSupportedPosixHost()
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-subsystems-'))
+      temporaryRoots.push(root)
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+printf '%s\\n' '{"kind":"core_startup","schemaVersion":1,"status":"ready","subsystems":[{"id":"skills","state":"initializing","error":null}]}'
+while IFS= read -r request; do
+  printf '%s\\n' '{"method":"runtime.subsystemsChanged","params":[{"id":"skills","state":"degraded","error":{"code":"subsystem_initialization_failed","message":"staging unavailable","retryable":true,"details":{"subsystem":"skills"}}}]}'
+  printf '%s\\n' '{"id":1,"result":[]}'
+done
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+      const client = new CoreClient()
+      try {
+        const ready = nextSnapshot(client, (snapshot) => snapshot.fullCoreState === 'ready')
+        client.start()
+        expect(await ready).toMatchObject({ coreSubsystems: [{ id: 'skills', state: 'initializing' }] })
+        const degraded = nextSnapshot(client, (snapshot) => snapshot.coreSubsystems?.[0]?.state === 'degraded')
+        await client.request('members.list')
+        expect(await degraded).toMatchObject({
+          fullCoreState: 'ready',
+          restartAttempt: 0,
+          capabilities: { authoritativeWorkspace: true, coreRequests: true },
+          coreSubsystems: [{ id: 'skills', state: 'degraded', error: { retryable: true } }]
+        })
+      } finally { client.stop() }
+      expect(client.getSnapshot().coreSubsystems).toEqual([])
+    }
+  )
+
+  it.runIf(process.platform !== 'win32')(
+    'does not spend the crash budget on deterministic authority refusal',
+    async () => {
+      useSupportedPosixHost()
+      const root = mkdtempSync(join(tmpdir(), 'rovai-core-client-blocked-'))
+      temporaryRoots.push(root)
+      const fakeCore = join(root, 'fake-core.sh')
+      writeFileSync(fakeCore, `#!/bin/sh
+printf '%s\n' '{"kind":"core_startup","schemaVersion":1,"status":"blocked","phase":"lease","authorityState":{"kind":"owned_by_active_core","dataDir":"/tmp/authority","owner":{"pid":42}}}'
+sleep 0.2
+`)
+      chmodSync(fakeCore, 0o700)
+      process.env.ROVAI_CORE_BIN = fakeCore
+      process.env.ROVAI_CORE_TEST_USER_DATA = root
+
+      const client = new CoreClient()
+      const blocked = nextSnapshot(client, (snapshot) => snapshot.fullCoreState === 'blocked')
+      client.start()
+      await blocked
+      const retried = nextSnapshot(
+        client,
+        (snapshot) => snapshot.generation === 2 && snapshot.fullCoreState === 'blocked'
+      )
+      client.retryFullCore()
+      await retried
+
+      expect(client.getSnapshot()).toMatchObject({
+        generation: 2,
+        fullCoreState: 'blocked',
+        restartAttempt: 0,
+        capabilities: { authoritativeWorkspace: false, coreRequests: false },
+        authorityState: { kind: 'owned_by_active_core' }
+      })
+      await expect(client.request('health.check')).rejects.toMatchObject({
+        kind: 'full_core_unavailable',
+        code: 'full_core_unavailable',
+        generation: 2
+      })
+      client.stop()
+    }
+  )
+})

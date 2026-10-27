@@ -1,0 +1,221 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-10-14",
+  "changeId": "member-avatar-read",
+  "revision": 3,
+  "confirmationMessageId": "049bd6bf-0b3a-486a-8d71-fe11f35372e1",
+  "source": {
+    "reviewBaseline": "c648fca7d9f6307a4f256cc7f2594ccbb9a6df39",
+    "baselineRecordedCommit": "24268b06795dce5428dd7d902cedf04a5991f934",
+    "baselineProductionMatchesReviewBaseline": true,
+    "mismatches": [],
+    "baselineSourceDigest": "12aadb3a427313df34f473d1dbc5813ed305478072df39d3129d8bae01752e51",
+    "candidateSourceDigest": "1501be8082ed90df5fb19fc3f4a3f97677b375aa255d862d3d92a59854339b9b",
+    "candidateChangedProductionFiles": [
+      "crates/rovai-core/src/builtin_tool_cli_output.rs",
+      "crates/rovai-core/src/builtin_tool_evidence_projection.rs",
+      "crates/rovai-core/src/builtin_tool_runtime.rs",
+      "crates/rovai-core/src/builtin_tool_transport.rs",
+      "crates/rovai-core/src/member_avatar.rs",
+      "crates/rovai-core/src/member_tool.rs",
+      "crates/rovai-core/src/team_tool.rs",
+      "crates/rovai-core/src/team_tool_catalog.rs",
+      "crates/rovai-core/tests/fixtures/builtin-tool-agent-output-v13.json",
+      "skills/cli-operations/SKILL.md"
+    ],
+    "baselineCoreDigest": "7022f3c93d6e0a4865c153964262209d836823a28c38b8cdcf3bd9a2952d5b26",
+    "candidateCoreDigest": "8ea738bef54387c4cdcc61e24cf3eadc451e657db86eef2851be5d8ea9766696"
+  },
+  "deterministicChecks": {
+    "workspace": {
+      "passed": 471,
+      "failed": 0,
+      "ignored": 1
+    },
+    "avatarOwner": {
+      "passed": 14,
+      "failed": 0
+    },
+    "cliTransportLeaseEvidenceOwners": {
+      "passed": 29,
+      "failed": 0
+    },
+    "memberReadWriteOwner": {
+      "passed": 1,
+      "failed": 0
+    },
+    "skillValidation": "passed",
+    "skillTestsPassed": 3,
+    "docsTestsPassed": 10,
+    "docsValidation": "passed"
+  },
+  "realModelDiagnostics": {
+    "runtime": "Claude Code 2.1.287",
+    "provider": "local sub2api",
+    "observedModel": "gpt-6.1-sol",
+    "attemptsPerScenario": 1,
+    "turnDeadlineSeconds": 240,
+    "assessment": "targeted observations passed; not full generic Gate",
+    "arms": {
+      "baseline": {
+        "cases": 6,
+        "runs": 8,
+        "observedModelReceipts": 8,
+        "scenarios": [
+          {
+            "caseId": "identity",
+            "runIds": [
+              "b9f278b7-f0f7-48e3-ab42-2cb7a9e90259"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "default-avatar",
+            "runIds": [
+              "216a810f-34e2-4fb4-a43f-3a61cd8f87ea"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "view-avatar",
+            "runIds": [
+              "9a9a9f73-fb90-4739-9105-755901a5de37"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "unavailable",
+            "runIds": [
+              "06c71816-914e-4aeb-b871-b7f615250083"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "legacy-avatar",
+            "runIds": [
+              "99db7920-fe18-42fc-89e5-864399c59890"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "supplied-wide",
+            "runIds": [
+              "caa61ce4-dc95-4852-aab7-caf87086f4d5",
+              "2f570ced-6328-4a39-a2e1-dd0150b8a66d",
+              "46263cc5-9d63-4ad6-889b-b3d7f59bd82e"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          }
+        ]
+      },
+      "candidate": {
+        "cases": 6,
+        "runs": 8,
+        "observedModelReceipts": 8,
+        "scenarios": [
+          {
+            "caseId": "identity",
+            "runIds": [
+              "8db64be0-be43-4690-8bfd-2709f5439c63"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "default-avatar",
+            "runIds": [
+              "30a04afb-46ac-421a-a826-22d3bde1b0aa"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "view-avatar",
+            "runIds": [
+              "e3e226e6-2407-4fa5-ade1-b098be6699c0"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "unavailable",
+            "runIds": [
+              "be942f8f-b44f-4a9c-89d0-313c5824ddb3"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "legacy-avatar",
+            "runIds": [
+              "36c9a3b9-b79e-4262-85ca-6ba8e5e1ab42"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          },
+          {
+            "caseId": "supplied-wide",
+            "runIds": [
+              "431dc2a4-d446-4e82-b51b-61ff074b7eee",
+              "9ab9d931-7cad-44c1-8f1c-af6608609704",
+              "c47a42ab-a119-4d78-b3d4-e80456c41b7a"
+            ],
+            "runStatus": "succeeded",
+            "evidenceCoverage": "complete",
+            "seededProfilesUnchanged": true
+          }
+        ]
+      }
+    }
+  },
+  "genericGate": {
+    "status": "degraded",
+    "attempt": 1,
+    "cases": 12,
+    "plannedSlots": 24,
+    "executedSlots": 0,
+    "baselineContract": {
+      "passed": 22,
+      "failed": 3
+    },
+    "candidateContract": {
+      "passed": 22,
+      "failed": 3
+    },
+    "newRegression": false,
+    "failedTests": [
+      "current_migration_state_admission_matrix",
+      "current_schema_contains_required_contract_objects",
+      "v172_preserves_historical_context_rows_and_gates_new_writes"
+    ],
+    "judge": "not_run"
+  },
+  "limitations": [
+    "One candidate native Skill lookup failed and recovered via the injected file path.",
+    "The candidate default-avatar case performed extra directory scans; no token, tool-count or latency improvement claimed.",
+    "Real animated GIF and channel publication are outside the targeted model scenarios.",
+    "Extended member_environment retirement test also fails on the frozen pre-change binary."
+  ],
+  "evidenceBundle": {
+    "filename": "MemberAvatarRead-ClaudeCode-sub2api-20261014.zip",
+    "sha256": "0e3a07a551e2f44cb5d0347f1606a75a7b0f842c51147065a7eb543f825a785c",
+    "threadId": "rvcamp_01m4wgy7y3ew18y6xej1081mgm"
+  }
+}

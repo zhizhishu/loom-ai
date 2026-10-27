@@ -1,0 +1,299 @@
+---
+document_type: version-decisions
+version: v1.39
+lifecycle: historical
+last_updated: 2026-09-04
+---
+
+# v1.39 决定
+
+<a id="v1-39-d01"></a>
+## V1.39-D01：Pi 使用独立 JSONL Host，Catalog identity 与平台资格分离
+
+### 背景
+
+Pi 0.84.4 提供 LF-delimited JSONL RPC 和官方 extension API，而不是 ACP。旧分支已远离当前 Fleet、取消和数据
+合同；其他 Runtime 的平台 evidence 也不能证明 Pi。
+
+### 决定
+
+从当前 main 重新实现 `pi-jsonl-rpc-v1` 与独立 `runtime.pi` optional subsystem，不复用 ACP init/storage，也不
+合并旧分支。Pi 可以进入编译时 Product Runtime closed set。最初决定在取得各平台 immutable qualification artifact
+前全部 NotQualified；该平台开放部分已由 [V1.39-D06](#v1-39-d06) 取代，独立 transport 与证据不可继承边界仍有效。
+
+### 后果与被拒绝方案
+
+Core 缺少 Pi 时继续启动，只有 `runtime.pi` degraded。拒绝把 Pi 包装成 ACP或继承通用/Kimi/Grok platform
+evidence；两者都会伪造 protocol/capability 或开放未经验证的产品路径。
+
+<a id="v1-39-d02"></a>
+## V1.39-D02：Pi 采用串行多 Session Resident Host，完整 locator 永远私有
+
+### 背景
+
+Pi 的一个 RPC 进程可以 `new_session` 和 `switch_session(exact path)`；把 Session、Bootstrap、managed Skills 或 MCP 放入
+进程 key 会失去安全复用，使用 recent/partial ID 又会破坏 exact continuation。完整 session file 同时是用户原生
+历史 locator，不应出现在公开诊断。
+
+### 决定
+
+Pi Host 策略为 `resident_multi_session`，同一 Host 一次只绑定一个 Run；并发使用独立 Host。Pi 在统一 Fleet 中用
+canonical workspace + process digest 作为复用 identity，因此同 workspace、process-compatible 的不同 Camp/成员可
+串行领取同一 Host；Fleet 另存当前独占 lease 的 Camp/member invalidation scope，并在每次领取时更新，Camp 删除或成员
+移除仍会停止当前属于该 scope 的 Host。其他 Runtime 的 Camp/member-scoped identity 不变。Pi process digest 只包含
+workspace、executable/fingerprint、protocol、managed extension、固定 managed permission boundary 与 process
+compatibility。每次恢复实际调用
+`switch_session(exact canonical file)`，再用 `get_state` 核对完整 session ID、file 和 cwd；失败停止 Host、记录
+continuity lost，并最多创建一个 replacement。完整 locator 只在 Core 私有状态，公开面最多给不可逆 digest。
+
+### 后果与被拒绝方案
+
+Bootstrap/managed Skills/model 可以逐 Session 刷新，不要求重启进程；MCP 由 D09 明确不参与 Pi Runtime。只有真正 quiescent Host 进入 LRU。workspace
+Resident 使用独立 quota bucket，仍受 Fleet global quota、TTL 与 LRU 约束。拒绝把 Pi 永久绑定单 Session、模糊扫描
+最近历史、丢失当前 Camp/member invalidation scope 或把 locator 放进 Activity/read model；这些方案分别浪费可验证的
+上游能力，或破坏删除、身份和隐私边界。
+
+<a id="v1-39-d03"></a>
+## V1.39-D03：Bootstrap 使用 managed system prompt 与不可变原子 receipt（完整 attestation 已由 D10 取代）
+
+### 背景
+
+启动参数固定 Bootstrap 会阻止同 Host 多 Session 复用；普通 first payload 会降低 Charter/Identity/Memory 的
+指令层级。仅收到 Pi prompt response 也不能证明 extension 实际使用了当前 frozen Bootstrap、Skills、MCP 和 binding。
+
+### 决定
+
+采用已确认的[模型上下文 revision 1](model-context-change-pi-managed-system-prompt.md)：官方
+`before_agent_start` 把完整 Bootstrap 追加到 Pi base system prompt。extension 在 provider request 前提交 closed、
+nonce-bound receipt；Core 逐字段验证并在同一 SQLite 事务写入不可变 receipt、接受 Runtime Input Delivery。
+Pi compaction 固定为 `native_system_prompt_preserved`，不加入 redelivery requirement/observer lease。D10 保留
+Bootstrap 注入和 receipt/acceptance 原子性，但把完整环境 attestation 收窄为最小 V2 receipt，并明确后加载的 Pi
+extension 仍可修改最终 provider payload。
+
+### 后果与被拒绝方案
+
+每轮能证明 Rovai hook 在自己的执行位置追加 exact high-authority bytes；不再证明后续 native extension 没有改写。
+没有 receipt 就不接受输入。拒绝 `--append-system-prompt`
+进程级固定、普通用户消息注入或只信 prompt ACK；它们分别阻止多 Session、降低权限层或缺少实际投递证据。
+
+<a id="v1-39-d04"></a>
+## V1.39-D04：Pi Skills/MCP 动态兼容追加，mutation 由 Core 管理（MCP 由 D09、其余完整治理由 D10 取代）
+
+### 背景
+
+Pi 没有内建 MCP，但官方 extension 可以动态注册 Tool、选择 active tools，并在 tool call 前阻塞。把“没有内建
+MCP”解释为上游 Unsupported 会忽略正式扩展面；把 Server secret 写入 Pi 全局配置又会跨 Run 泄漏。
+
+### 决定
+
+Skill Library 继续以 `.pi/skills` 为 Rovai-owned target，每个 Session 重新 discovery 并把 exact catalog 写入
+receipt。External MCP 使用 `AdditivePerRun / RovaiWins / CoreManaged`：Core 持有 stdio/Streamable HTTP、secret、
+cancel 与进程树，extension 只暴露当前 Run 的 proxy tools；所有 mutation 与 bash/write/edit 共用 Durable Approval、
+epoch/binding fence 和 effect evidence。未知 mutation/bridge failure fail closed。
+
+### 后果与被拒绝方案
+
+Host 无需因 Skill/MCP 更新重启，相邻 Session 又不会继承前一 Run exposure。拒绝标记 MCP Unsupported、写用户 Pi
+配置或信任任意第三方 extension；前者错误收窄能力，后两者扩大秘密与代码执行边界。
+
+<a id="v1-39-d05"></a>
+## V1.39-D05：消息文件链接先证明存在，视觉类型不接管打开分类
+
+### 背景
+
+会话过去只凭 Markdown 语法和一组分散扩展名，把部分整体 inline-code 投影成可点击文件引用。于是 `config.toml`
+这类真实短文件名无法链接，新增的音视频、Notebook、数据库等类型可能有图标却进不了识别；反过来，不存在的路径也
+可能先显示为文件入口。会话链接与 Preview Tab 又分别维护扩展名到图标的映射，同一文件会因入口不同而显示不同类型。
+
+一种方案是把扩展名、图标和 `preview/system` 打开策略都放进同一注册表。但现有 Main classifier 还结合大小、MIME、
+内容与平台能力，静态扩展名表不能代替它；这样做会让 Renderer 的视觉决定静默改变安全和打开行为。
+
+### 决定
+
+完整 inline-code 先作为语法候选，通过 typed Preload 请求让 Core 复核 exact CampMessage 来源，再由 Main 按同一来源
+工作目录执行路径解析、`realpath + stat`。只有最终落到现存普通文件的候选才显示图标并成为链接；不存在、目录或失败项
+继续显示普通 inline-code。响应只返回消息中原始引用，不返回 canonical path 或任何文件能力，点击时重新执行完整打开校验。
+
+建立唯一共享资源类型定义，只回答“是否为已知类型”和“显示哪个 `ResourceVisualKind`”。会话链接和普通文件 Tab
+共用这份定义。Preview、系统应用或失败仍由 Main 既有 classifier 决定；存在性探测不调用 classifier，不支持预览的文件
+不创建 Tab、handle 或 watcher。当前字段与边界由 [File Preview v4](../../contracts/file-preview-v4.md)、
+[File Preview Architecture](../../architecture/file-preview.md)和[Camp 文件预览区](../../ui/components/file-preview.md)拥有。
+
+### 后果与替代方案
+
+- 短文件名不再靠同消息中的另一条长路径猜目录；它只按消息来源工作目录的 exact relative path 判断，绝对路径直接解析。
+- 探测与点击使用同一 Core 来源映射，但探测时文件仍可能在点击前变化，因此点击重验不可省略。
+- 拒绝“已知扩展名即链接”：它无法证明目标存在，会制造虚假可操作状态。
+- 拒绝让资源注册表包含 `openStrategy`：它会复制并削弱 Main classifier 的大小、MIME、内容和平台判断。
+- 拒绝让 Renderer 直接检查磁盘：它会越过 Preload/Main/Core 的来源权威并暴露宿主路径能力。
+
+<a id="v1-39-d06"></a>
+## V1.39-D06：Pi 三平台以可运行 Preview 开放，不伪造 Qualified 证据
+
+### 背景
+
+Pi 的 Adapter、无 Prompt Machine Ready、managed receipt、Skills/MCP、Action、Usage、Session 与本机 macOS arm64
+行为 smoke 已可供主动测试，但完整 compaction、workspace/read-only、failure/retry、idle eviction、packaged lifecycle
+以及 macOS x64/Windows x64 证据仍未闭合。既有三态 Platform Admission 只能在“完全阻断”和“宣称 qualified”之间
+选择，无法诚实表达用户明确要求的实验性开放。
+
+### 决定
+
+Runtime Platform Admission 增加 `preview`：它允许 discovery、检查、Installation、Onboarding/Member 选择、Diagnostics
+与 AgentRun，但必须保留阻止正式资格化的 reason，且 `evidenceRevision = null`。Pi 的 macOS arm64、macOS x64、
+Windows x64 三行均改为 `preview / runtime_platform.qualification_evidence_missing`；Renderer 显示“实验性开放”，
+真实 machine availability 与所有 Runtime/Dispatch blocker 继续独立生效。release 不再依赖 debug-only Pi qualification
+override。Cursor 和其他 Runtime 的 admission 不变。
+
+### 后果与被拒绝方案
+
+- 用户可以在三个 shipped platform 主动选择和验证 Pi，但产品不得称其为 First-Class 或 qualified。
+- 后续每个平台仍须生成独立 immutable qualification artifact，才能把该精确行升级为 `qualified`。
+- 拒绝直接把 Pi 三行写成 `qualified`：这会伪造尚不存在的跨平台 Golden Flow 证据。
+- 拒绝只在 Renderer 解禁下拉框：Core discovery、Installation 与 Dispatch 仍会阻断，形成不可执行的假入口。
+- 拒绝继续使用 release 环境变量 override：隐藏开关不能成为可审计的产品准入合同。
+
+<a id="v1-39-d07"></a>
+## V1.39-D07：Runtime portable child command 与 Pi 外部 MCP 逐 Server 降级（已由 D09 取代）
+
+### 背景
+
+用户 MCP 配置通常使用 `npx`、`node`、`python`、`uvx`、`bunx` 等可移植命令名。Pi 的 Core-managed bridge 将这些
+结构化命令交给 Managed Process 时，旧 absolute-only capture 会在 Runtime PATH 查找前拒绝；任一已请求 Server 的
+启动或握手失败又会中止 Pi Native Session activation，使一个可选外部能力阻断整个 AgentRun。
+
+### 决定
+
+Managed Process 接受 absolute、bare command 与 cwd-relative application。每次 capture 先冻结当轮 Runtime cwd/env：
+Unix bare command 以原值交给 OS 并只使用该 PATH，relative path 只相对该 cwd，argv 始终保持独立字段，不引入 Shell。
+Windows 为保持 atomic Job 与 entrypoint safety，只在本次 launch 内按 `.exe → .cmd → .bat` 解析并验证。解析出的设备路径
+不回写用户配置、不跨 Run/恢复缓存；下一次启动按新的 Runtime 环境重新查找。绝对路径与 Windows 已有
+native/command-shim identity、原子 Job 和受控 argv serializer 行为不变。
+
+Pi bridge 将用户分配的外部 MCP 视为逐 Server optional。command resolution、process start、initialize、`tools/list`
+或 Tool catalog validation 失败时，只保存 server identity 与稳定非敏感 code/reason，将该 Server 从本轮 active catalog
+排除并继续创建 Pi Session。投影缺失/重复 identity 等 Core 状态损坏仍阻断；已暴露 Tool 的调用期 bridge、Approval、
+epoch/binding 或 mutation safety 失败仍 fail closed。原始 `PreparedMcpProjection` 与用户 `mcp.json` 均不被改写。
+
+### 后果与被拒绝方案
+
+- 同一份 `command = "npx"` 配置可以随 macOS GUI Runtime PATH、nvm/fnm/volta 或另一台机器的安装位置变化而工作；
+  恢复时找不到它只让该 Server unavailable。
+- Managed Process 继续拥有 stdio、PID、process group/Job、cancel、tree termination 与 reap；portable command 不等于
+  放弃单次 launch 的 executable/entrypoint 检查。
+- 当前 Pi bridge 只承载用户外部 MCP，因此不新增未被其他调用方消费的 `McpRequirement` schema；未来若引入 Runtime
+  必需内部 Server，必须另行建立 required 类型与准入合同。
+- 拒绝硬编码 Homebrew/Node 路径、把解析结果写回配置、用 `which` 修改配置、把 command+args 拼为 Shell 字符串，或因
+  单个 optional Server 失败清空全部 MCP/终止 AgentRun。
+
+<a id="v1-39-d08"></a>
+## V1.39-D08：派生子进程在最终请求上下文解析，Pi MCP 使用有界并发激活（Pi MCP 部分已由 D09 取代）
+
+### 背景
+
+portable command 的逐 launch 语义落地后，ACP Client Terminal 仍先使用 Host 模板 cwd/PATH 解析 application，随后
+才应用 `terminal/create` 自身的 cwd/env。这使请求级 PATH 覆盖、相对 command 和 Windows `.cmd/.bat` shim 进入错误
+上下文或 EXE-only 派生路径。Pi bridge 又按 projection 顺序串行完成每个 optional Server 的 initialize 与
+`tools/list`；多个无响应 Server 会把相同 timeout 线性累加到 Session 启动。
+
+### 决定
+
+Managed Process 提供单一 `derive_runtime_one_shot_command`：调用方提交原始 application、结构化 argv、最终 cwd 与
+环境覆盖；模块先验证 cwd/argv，形成最终环境，再处理 application 和平台 entrypoint。Unix bare command 保持到 OS
+launch，相对路径以最终 cwd 锚定；Windows 使用最终 cwd/PATH 解析后重新 capture `NativeExecutable | CommandShim`。
+ACP Terminal 删除外部“先解析、后派生”组合，Runtime 主进程 capture 不变。
+
+Pi 在启动任何 Server 前完成 projection 缺失与重复 identity 的结构预检；随后并发激活全部 Ready Server。每个 Server
+独占 60 秒总 activation deadline，覆盖 transport open、initialize、initialized notification、`tools/list` 与 catalog
+validation。协议失败或 timeout 必须显式 shutdown/reap；stdio reader 不长期强持有 client，取消 future 仍允许
+Managed Process Drop 收口。结果按原 projection index 排序后合并，跨 Server collision 只降级当前 optional Server。
+
+### 后果与被拒绝方案
+
+- ACP request 的 PATH/cwd override 现在同时决定 executable 与实际执行上下文；command/args 仍不经过 Shell，Windows
+  Job、shim/interpreter identity 和 argv serializer 不变。
+- Pi MCP 总 activation 延迟由最慢 Server 的单份 deadline 加有界 cleanup 决定，不再是 Server 数量乘 timeout；并发完成
+  顺序不会改变 active Tool、receipt/digest 或冲突赢家。
+- 拒绝在 ACP Bridge 外继续暴露分离的 resolve/derive API，因为调用顺序无法由类型保证；拒绝无界并发等待、取消 future
+  后不清理 client、或按完成顺序合并，因为它们分别破坏启动上界、进程所有权和确定性。
+
+<a id="v1-39-d09"></a>
+## V1.39-D09：删除 Pi Core-managed MCP bridge，Assignment 保留但运行时静默忽略
+
+### 背景
+
+Pi 上游没有原生 MCP 投影面。D04、D07 与 D08 曾通过 managed extension 动态 Tool、Core-owned MCP client 和
+Managed Process Server 生命周期补齐该能力，但这条桥接同时引入投影读取、Server activation、catalog/receipt、
+Approval envelope、call forwarding、cancel/reap 与恢复兼容性等额外状态，显著放大 Pi Adapter 的复杂度。
+
+### 决定
+
+Pi 的 External MCP capability 改为项目既有 `Unsupported`。Pi dispatch 在 MCP projection 之前分流，不读取成员
+Assignment 或全局 MCP 配置，不依赖 `mcp` subsystem，不启动 Server，也不向 managed extension 投递 MCP Tool。
+Pi AgentRun request、Host binding、receipt、Runtime state、compatibility/reuse/resume 全部删除 MCP 字段与判断；旧
+ContextManifest 或诊断里的 MCP 字段作为历史数据保留并在无 MCP materialization 时忽略，不迁移、不重放。
+
+managed extension 升级为 `rovai-pi-host-v4`，active tools 只含既有 Pi native catalog；bash/write/edit 的 Core-managed
+Approval、Bootstrap、Skills、receipt 原子提交、exact resume、Fleet/LRU 与 platform preview 不变。MCP Library、成员
+Assignment、设置 UI 和其他 Runtime projection 完全不变，不为 Pi 增加提示或自动取消分配。
+
+其中 v4 固定 Active Tools、完整 Skill/Tool receipt 与完整治理语义已由 D10 取代；本决定对 External MCP Unsupported、
+Assignment 静默保留和 bridge clean removal 的结论继续有效。
+
+普通 Managed Process capture 恢复 absolute application 边界，删除只为 Pi MCP portable Server command 存在的
+bare/cwd-relative 行为。D08 中 ACP Client Terminal 的 `derive_runtime_one_shot_command` 保留，因为它独立需要在最终
+request cwd/environment 中解析命令及 Windows shim。
+
+### 后果与被拒绝方案
+
+- Pi 启动与恢复不再受 `npx`、Server initialize、`tools/list`、transport 或 schema 故障影响；MCP 配置变化也不重建
+  Host、不失效 Session、不改变 LRU。
+- 使用 Pi 的成员仍可保存 Playwright、GitHub 等 Assignment；切换到支持 MCP 的 Runtime 后原分配继续生效。
+- 删除 Pi 专用 MCP 模块、测试、日志与文档宣称；历史真实 smoke 只证明被撤销实现，不再代表当前能力。
+- Runtime compatibility register 因当前 Pi 能力结论变化生成新的完整文件 digest；这不改变任何 Adapter 的平台
+  Admission status，也不为 Pi 生成 qualification artifact。
+- 拒绝保留空 bridge、空 projection 或 warning 路径；这些残留仍会让 Pi 依赖 MCP 状态并维持无意义的协议表面。
+
+<a id="v1-39-d10"></a>
+## V1.39-D10：Pi 拥有原生能力，Rovai 只保留薄接入与部分治理
+
+### 背景
+
+v4 Host 通过关闭 Extensions、Skills、Context files、Prompt templates 与 Built-in tools，再由 Rovai 固定完整 Tool/Skill
+catalog，获得了较强 attestation，却把 Pi 变成需要 Rovai 重建的空壳。它阻断用户原生扩展与新增能力，也把任意额外
+资源误判为不兼容。恢复原生 Extension 后，Pi 的 hook 顺序又决定 Rovai 无法证明自己之后的 handler 没有继续改写
+system prompt、context 或 Tool input，因此继续声称完整 sandbox/全覆盖审批是不真实的。
+
+### 决定
+
+采用已二次确认的[模型上下文 revision 3](model-context-change-pi-managed-system-prompt.md)，并以
+[Runtime Launch and Verification v33](../../contracts/runtime-launch-and-verification-v33.md)为字段级合同。正式 Host 使用
+`pi --mode rpc --no-themes --extension <rovai-pi-host-v5>`，恢复 Pi 原生 Built-in tools、Extensions、Skills、Context
+files、Prompt templates 与用户 Settings；自动 Extension 使 pre-input RPC 启动失败时只允许一次 `--no-extensions`
+降级。Machine Ready 仍是 managed-only、隔离 Session 且零模型调用。
+
+v5 extension 不再调用 `setActiveTools`，只负责 Run/Session binding、Bootstrap、最小输入确认、Session 状态和
+`bash/edit/write` 部分审批。Core 只证明三个 governed Tool 可观察、Rovai 分配 Skill 是 catalog 子集；额外原生
+Tool/Skill/Extension/template 均允许。permission 改为 `partial_managed`，明确不是完整 sandbox 或未知 mutation
+fail-closed。Bash 继续使用 Pi 当前 project trust 下实际解析的 shell path/args/transport，不伪造 argv。
+
+binding/receipt 升为 closed V2，删除 Session file digest、完整 Tool/Skill/system-prompt attestation；receipt 与 Input
+accepted 仍原子提交，父 Delivery cascade 与不可变保护并存。Core 在 dispatch 前保存 slash prompt/skill 展开、实际
+Runtime payload 和图片 bytes/order/MIME/digest 的私有证据；正式 Prompt 支持 Pi 原生 images。stderr、startup prelude
+和可恢复 malformed stdout 进入脱敏诊断；只有不可恢复 framing/response/身份冲突才 poison Host。
+
+恢复保持 exact-first，但 locator 或历史不可用不再使 AgentRun 永久不可运行：记录 continuity lost 后最多创建一个新
+Session，以相同 Bootstrap 和可恢复 Rovai context 继续。Runtime 创建 gate 按 `(agent_run_id, execution_epoch)`
+singleflight，不跨 IO 持有全局锁。External MCP 继续遵循 D09：Rovai 不投影，但 Pi 自身 Extension 能力不受禁止。
+
+### 后果与被拒绝方案
+
+- 用户 Pi 原生能力和版本新增 Tool 可直接工作；Rovai 不再维护第二套完整 Pi Runtime。
+- Rovai 只声明 hook-position Bootstrap、最小 receipt 与三个已知 Tool 的 best-effort durable Approval；后续 extension
+  改写及未知 Tool 的副作用属于明确接受的安全降级。
+- Prompt template/Skill slash command 由 Core 在 Formatter 22 的 current human input 上显式展开，避免 RPC wrapper
+  使原生命令入口失效；Extension command 不绕过 receipt 直接执行。
+- Migration 136 将 Data Contract v1.45/schema86 升到 v1.46/schema87，Writer 只写 V2，并把历史 Pi `managed`
+  permission 规范化为 `partial_managed`。平台继续 Preview/NotQualified，不生成资格证据。
+- 拒绝继续关闭全部原生环境、拒绝恢复未知 Tool 全阻止、拒绝把后加载 extension 当作已 attested，也拒绝重新引入 Pi
+  MCP bridge；这些选择会分别损失原生兼容性、形成虚假的安全承诺或重新扩大已删除的协议表面。

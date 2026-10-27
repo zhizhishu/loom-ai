@@ -1,0 +1,96 @@
+{
+  "scope": "isolated feasibility prototype; not production qualification",
+  "date": "2026-10-24",
+  "platform": "macOS arm64",
+  "rovaiBase": "269d73b862bc7cf1a7a42f5a398ec7a203cbba8a",
+  "hermesBase": "4d04303818b61bf3aa09278af48356315515965b",
+  "hermesVersion": "0.22.4",
+  "issue": "https://github.com/NousResearch/hermes-agent/issues/142671",
+  "referencePr": "https://github.com/NousResearch/hermes-agent/pull/142008",
+  "referencePrHead": "a826108edf7a6d9686b53df7a1cb1278047dcb16",
+  "referencePrMerged": false,
+  "runs": [
+    {
+      "label": "A0",
+      "run": "470b48cc-ee96-4f5d-b5fa-4989c7574a71",
+      "agentId": "agent_2",
+      "thread": "rvcamp_01m5q8abpaf4gbhmr82qt2zb90",
+      "nativeSessionId": "local-2d02c56a11791440068de0faf599605bfdbfaf3dd09071169778290d4461bb8e",
+      "messageId": "6bcbc0ff-c929-4dc9-be11-fac2ee2462d1",
+      "version": "rovai 0.4.16 contract-v43 ipc-v3",
+      "startedAt": "2026-10-24T15:26:24.571876+00:00",
+      "endedAt": "2026-10-24T15:26:27.333665+00:00"
+    },
+    {
+      "label": "B0",
+      "run": "654bdd23-ef35-4d4a-b3f1-098c8562f945",
+      "agentId": "agent_3",
+      "thread": "rvcamp_01m5q8abpgegg8ahrxv7rwnmx9",
+      "nativeSessionId": "local-1755d2c42c0b12d7ce7ea8e9f2a24af3b187d97e3eb7343280c4c5ef3e09a14f",
+      "messageId": "75af47f0-03d0-4b84-8197-c710df9690d6",
+      "version": "rovai 0.4.16 contract-v43 ipc-v3",
+      "startedAt": "2026-10-24T15:26:24.563650+00:00",
+      "endedAt": "2026-10-24T15:26:27.365061+00:00"
+    },
+    {
+      "label": "B1",
+      "run": "c6b22d46-3912-4820-8dfe-add37a37411a",
+      "agentId": "agent_3",
+      "thread": "rvcamp_01m5q8abpgegg8ahrxv7rwnmx9",
+      "nativeSessionId": "local-1755d2c42c0b12d7ce7ea8e9f2a24af3b187d97e3eb7343280c4c5ef3e09a14f",
+      "messageId": "836d9667-67e8-48f0-8f21-c4ea31d6ac4b",
+      "version": "rovai 0.4.16 contract-v43 ipc-v3",
+      "startedAt": "2026-10-24T15:26:27.660716+00:00",
+      "endedAt": "2026-10-24T15:26:31.218764+00:00"
+    },
+    {
+      "label": "A1",
+      "run": "5bcd8915-cfb0-4544-b508-b79d0a92b1f2",
+      "agentId": "agent_2",
+      "thread": "rvcamp_01m5q8abpaf4gbhmr82qt2zb90",
+      "nativeSessionId": "local-2d02c56a11791440068de0faf599605bfdbfaf3dd09071169778290d4461bb8e",
+      "messageId": "47449234-959e-4bc1-b494-4930cd505bba",
+      "version": "rovai 0.4.16 contract-v43 ipc-v3",
+      "startedAt": "2026-10-24T15:26:27.653066+00:00",
+      "endedAt": "2026-10-24T15:26:31.288842+00:00"
+    }
+  ],
+  "checks": {
+    "twoMembersConcurrent": true,
+    "fourRunsSucceeded": true,
+    "fourExactPublicSendAttributions": true,
+    "sameSessionsResumed": true,
+    "runContextPathsChanged": true,
+    "oldInheritedContextRejected": true,
+    "oldCredentialCopyRejected": true,
+    "stalePublicSendCount": 0,
+    "configUnchanged": true,
+    "dotenvUnchanged": true,
+    "gatewaySurvivedCoreShutdown": true,
+    "ownedFixtureGatewaysStopped": true,
+    "runContextPathsAbsentFromModelRequests": true
+  },
+  "nativeTests": {
+    "passed": 30,
+    "failed": 0,
+    "files": [
+      "tests/gateway/test_session_client_env.py",
+      "tests/acp_adapter/test_gateway_submit_retry.py",
+      "tests/tools/test_local_env_session_leak.py",
+      "tests/tui_gateway/contracts/test_generated.py"
+    ]
+  },
+  "notQualified": [
+    "unmodified Hermes release",
+    "full R2 migration",
+    "warm process reuse",
+    "remote terminal backends",
+    "managed worker and subagent matrix",
+    "MCP changes",
+    "paid model",
+    "other operating systems",
+    "fresh Gateway auto-start identity inheritance",
+    "execute_code-specific path"
+  ],
+  "successfulProbeExecutions": 2
+}

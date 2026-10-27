@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "a5f25ba00e8866dbbf4d13d3733a610399eacbe8",
+  "packageManifestSha256": "b8bb92f16c3dbe7c87ac9dc0a238dc45858265f7b9cf99e4b7afe9e5c9a5a652",
+  "scope": "initial_public_https_deployment",
+  "passed": [
+    "public_https_certificate_and_ui",
+    "administrator_login",
+    "anonymous_api_rejected",
+    "systemd_restart",
+    "persisted_administrator_token",
+    "persisted_browser_session",
+    "mobile_viewport_390x844_login_and_member_configuration"
+  ],
+  "execution": {
+    "status": "blocked",
+    "runId": "7935340c-e618-44c5-9526-51a2ab4411fd",
+    "observedStatus": "queued",
+    "finalStatus": "cancelled_by_acceptance",
+    "cause": "skills_subsystem_degraded",
+    "diagnostic": "materialized bundled Skill analyze-agent-codebase does not match its embedded definition",
+    "declaredMode": "0644",
+    "materializedMode": "0600",
+    "serviceUmask": "0077",
+    "modelCalled": false
+  },
+  "memory": {
+    "minimumAvailableKiB": 7219456,
+    "maximumSwapUsedKiB": 0,
+    "servicePeakObservedBytes": 897798144,
+    "serviceLimitBytes": 4294967296,
+    "maxEvents": 0,
+    "oomEvents": 0
+  },
+  "physicalPhoneVerified": false
+}

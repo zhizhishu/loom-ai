@@ -1,0 +1,5014 @@
+use crate::draft_client::DraftClient;
+use crate::message_quote::{
+    MessageQuoteSnapshot, QuoteStorage, copy_quotes, load_quotes, store_quotes,
+};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use anyhow::{Context, Result};
+use rusqlite::{OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::{
+    agent_profile::resolve_frozen_runtime,
+    camp_attachment::MAX_PREPARED_ATTACHMENTS,
+    collaboration::{append_domain_event, build_effective_config},
+    command::{
+        ActorRef, CommandEnvelope, CommandExecution, CommandHandlerResult, DomainCommand,
+        DomainCommandGateway, EntityReference, canonical_json_digest, sealed,
+    },
+    db::Database,
+    execution_budget::freeze_camp_turn_execution_budget,
+    local_attachment_source::{
+        LocalAttachmentAvailability, LocalAttachmentHistoryView, LocalAttachmentSourceRef,
+        LocalAttachmentSourceView, parse_source_attachments, serialize_source_attachments,
+        validate_source_attachments,
+    },
+    read_model::{AgentRunExecutionEvidenceView, public_execution_evidence_for_agent_run},
+    runtime::{recompute_camp_turn, settle_abortive_agent_run_in_tx},
+    skill::bundled_skill_source_identity,
+    skill_projection::PreparedSkillExposure,
+};
+
+pub const SINGLE_CHAT_OPERATION_POLICY: &str = "single_chat_v1";
+pub const SINGLE_CHAT_OPERATION_POLICY_VERSION: i64 = 2;
+pub const SINGLE_CHAT_RESPONSE_DELIVERY: &str = "conversation_message";
+pub const SINGLE_CHAT_HISTORY_TOOL_NAME: &str = "single_chat.history";
+
+const SINGLE_CHAT_HISTORY_DEFAULT_LIMIT: usize = 20;
+const SINGLE_CHAT_HISTORY_MAX_LIMIT: usize = 50;
+const SINGLE_CHAT_FILTERED_BUNDLED_SKILL_SOURCE_IDENTITIES: [&str; 2] = [
+    "rovai://bundled/cli-operations",
+    "rovai://bundled/memory-stewardship",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenSingleChatCommand {
+    #[serde(
+        default,
+        skip_deserializing,
+        skip_serializing_if = "DraftClient::is_desktop"
+    )]
+    pub draft_client: DraftClient,
+    #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub agent_id: String,
+}
+
+impl sealed::Sealed for OpenSingleChatCommand {}
+impl DomainCommand for OpenSingleChatCommand {
+    const TYPE: &'static str = "single_chat.open";
+    fn draft_client(&self) -> Option<&DraftClient> {
+        Some(&self.draft_client)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendSingleChatMessageCommand {
+    #[serde(
+        default,
+        skip_deserializing,
+        skip_serializing_if = "DraftClient::is_desktop"
+    )]
+    pub draft_client: DraftClient,
+    #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub conversation_id: String,
+    pub body: String,
+    pub draft_revision: i64,
+}
+
+impl sealed::Sealed for SendSingleChatMessageCommand {}
+impl DomainCommand for SendSingleChatMessageCommand {
+    const TYPE: &'static str = "single_chat.send";
+    fn draft_client(&self) -> Option<&DraftClient> {
+        Some(&self.draft_client)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndSingleChatCommand {
+    #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub conversation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SingleChatHistoryInput {
+    pub before_sequence: Option<i64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatHistoryMessage {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub quotes: Vec<Value>,
+    pub sequence: i64,
+    pub role: String,
+    pub body: String,
+    pub attachments: Vec<LocalAttachmentHistoryView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatHistoryOutput {
+    pub schema_version: i64,
+    pub messages: Vec<SingleChatHistoryMessage>,
+    pub has_more: bool,
+    pub next_before_sequence: Option<i64>,
+}
+
+impl sealed::Sealed for EndSingleChatCommand {}
+impl DomainCommand for EndSingleChatCommand {
+    const TYPE: &'static str = "single_chat.end";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatConversationView {
+    pub id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub agent_id: String,
+    pub version: i64,
+    pub status: String,
+    pub last_message_sequence: i64,
+    pub last_accepted_public_boundary_sequence: i64,
+    pub active_agent_run_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatMessageView {
+    pub quotes: Vec<MessageQuoteSnapshot>,
+    pub id: String,
+    pub sequence: i64,
+    pub author_type: String,
+    pub author_id: String,
+    pub body: String,
+    pub attachments: Vec<LocalAttachmentSourceView>,
+    pub agent_run_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatRunView {
+    pub id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: String,
+    pub trigger_conversation_message_id: String,
+    pub status: String,
+    pub version: i64,
+    pub execution_epoch: i64,
+    pub cancel_requested_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub final_conversation_message_id: Option<String>,
+    pub execution_evidence_count: i64,
+    pub execution_evidence_change_sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatSnapshot {
+    pub conversation: SingleChatConversationView,
+    pub approvals: Vec<crate::read_model::ApprovalView>,
+    pub messages: Vec<SingleChatMessageView>,
+    pub draft: SingleChatComposerDraftView,
+    pub pending_inputs: SingleChatPendingInputsView,
+    pub agent_runs: Vec<SingleChatRunView>,
+    pub execution_evidence: Vec<AgentRunExecutionEvidenceView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatComposerDraftView {
+    pub quotes: Vec<MessageQuoteSnapshot>,
+    pub revision: i64,
+    pub attachments: Vec<LocalAttachmentSourceView>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatPendingInputView {
+    pub quotes: Vec<MessageQuoteSnapshot>,
+    pub id: String,
+    pub conversation_id: String,
+    pub enqueue_sequence: i64,
+    pub revision: i64,
+    pub state: String,
+    pub body: String,
+    pub last_attempt_error_code: Option<String>,
+    pub attachments: Vec<LocalAttachmentSourceView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatPendingInputEditSessionView {
+    pub working_quotes: Vec<MessageQuoteSnapshot>,
+    pub pending_input_id: String,
+    pub edit_token: String,
+    pub base_pending_revision: i64,
+    pub recovery_required: bool,
+    pub working_body: String,
+    pub working_attachments: Vec<LocalAttachmentSourceView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleChatPendingInputsView {
+    pub execution_active: bool,
+    pub items: Vec<SingleChatPendingInputView>,
+    pub edit_session: Option<SingleChatPendingInputEditSessionView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditSingleChatPendingInputCommand {
+    #[serde(
+        default,
+        skip_deserializing,
+        skip_serializing_if = "DraftClient::is_desktop"
+    )]
+    pub draft_client: DraftClient,
+    #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub conversation_id: String,
+    pub pending_input_id: String,
+    pub expected_revision: i64,
+    pub edit_token: Option<String>,
+    pub action: SingleChatPendingInputEditAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SingleChatPendingInputEditAction {
+    ReturnToComposer {
+        #[serde(rename = "expectedDraftRevision")]
+        expected_draft_revision: i64,
+    },
+    Begin,
+    Takeover,
+    Save {
+        body: String,
+    },
+    RemoveAttachment {
+        #[serde(rename = "attachmentRefId")]
+        attachment_ref_id: String,
+    },
+    ReorderAttachments {
+        #[serde(rename = "attachmentRefIds")]
+        attachment_ref_ids: Vec<String>,
+    },
+    Quote {
+        action: crate::message_quote::QuoteAction,
+    },
+    Cancel,
+    Delete,
+}
+
+impl sealed::Sealed for EditSingleChatPendingInputCommand {}
+impl DomainCommand for EditSingleChatPendingInputCommand {
+    const TYPE: &'static str = "single_chat.pending_input.edit";
+    fn draft_client(&self) -> Option<&DraftClient> {
+        Some(&self.draft_client)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublishSingleChatPendingInput {
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub conversation_id: String,
+    pub pending_input_id: String,
+    pub expected_revision: i64,
+    pub user_id: String,
+}
+
+impl sealed::Sealed for PublishSingleChatPendingInput {}
+impl DomainCommand for PublishSingleChatPendingInput {
+    const TYPE: &'static str = "single_chat.pending_input.publish";
+}
+
+#[derive(Debug, Default)]
+pub struct SingleChatService {
+    client: DraftClient,
+    gateway: DomainCommandGateway,
+}
+
+impl SingleChatService {
+    pub fn for_client(client: DraftClient) -> Self {
+        Self {
+            client,
+            ..Self::default()
+        }
+    }
+
+    pub fn history_input_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "beforeSequence": {"type": "integer", "minimum": 1},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": SINGLE_CHAT_HISTORY_MAX_LIMIT
+                }
+            }
+        })
+    }
+
+    pub fn history_output_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "schemaVersion", "messages", "hasMore", "nextBeforeSequence"
+            ],
+            "properties": {
+                "schemaVersion": {"const": 2},
+                "messages": {
+                    "type": "array",
+                    "maxItems": SINGLE_CHAT_HISTORY_MAX_LIMIT,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["sequence", "role", "body", "attachments"],
+                        "properties": {
+                            "sequence": {"type": "integer", "minimum": 1},
+                            "role": {"type": "string", "enum": ["user", "assistant"]},
+                            "body": {"type": "string"},
+                            "quotes": crate::message_quote::model_quotes_schema("current_messages"),
+                            "attachments": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": [
+                                        "attachmentId", "name", "kind", "fileCount",
+                                        "mediaType", "byteSize"
+                                    ],
+                                    "properties": {
+                                        "attachmentId": {"type": "string", "minLength": 1},
+                                        "name": {"type": "string"},
+                                        "kind": {
+                                            "type": "string",
+                                            "enum": ["file", "directory"]
+                                        },
+                                        "fileCount": {"type": "integer", "minimum": 0},
+                                        "mediaType": {"type": "string"},
+                                        "byteSize": {"type": "integer", "minimum": 0}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "hasMore": {"type": "boolean"},
+                "nextBeforeSequence": {"type": ["integer", "null"], "minimum": 1}
+            }
+        })
+    }
+
+    pub fn history(
+        &self,
+        database: &Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        input: &SingleChatHistoryInput,
+    ) -> Result<SingleChatHistoryOutput> {
+        let limit = input.limit.unwrap_or(SINGLE_CHAT_HISTORY_DEFAULT_LIMIT);
+        if limit == 0 || limit > SINGLE_CHAT_HISTORY_MAX_LIMIT {
+            anyhow::bail!("Single Chat history limit is invalid");
+        }
+        if input.before_sequence.is_some_and(|sequence| sequence < 1) {
+            anyhow::bail!("Single Chat history beforeSequence is invalid");
+        }
+        let (conversation_id, current_input_sequence) =
+            load_single_chat_history_target(database, agent_run_id, execution_epoch)?
+                .ok_or_else(|| anyhow::anyhow!("Single Chat history target is unavailable"))?;
+        let before_sequence = input
+            .before_sequence
+            .unwrap_or(current_input_sequence)
+            .min(current_input_sequence);
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT sequence, author_type, body, source_attachments_json, quotes_json
+            FROM conversation_message
+            WHERE conversation_id = ?1
+              AND sequence < ?2
+              AND author_type IN ('user', 'agent')
+            ORDER BY sequence DESC, id DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let mut rows = statement
+            .query_map(
+                params![conversation_id, before_sequence, (limit + 1) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let mut messages = rows
+            .into_iter()
+            .map(
+                |(sequence, author_type, body, attachments_json, quotes_json)| {
+                    Ok(SingleChatHistoryMessage {
+                        quotes: crate::message_quote::model_quotes(
+                            &crate::message_quote::parse_quotes(&quotes_json)?,
+                        ),
+                        sequence,
+                        role: if author_type == "user" {
+                            "user".to_string()
+                        } else {
+                            "assistant".to_string()
+                        },
+                        body,
+                        attachments: history_attachment_views(&attachments_json)?,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        messages.reverse();
+        let next_before_sequence = has_more.then(|| {
+            messages
+                .first()
+                .expect("a paginated Single Chat history page is non-empty")
+                .sequence
+        });
+        Ok(SingleChatHistoryOutput {
+            schema_version: 2,
+            messages,
+            has_more,
+            next_before_sequence,
+        })
+    }
+
+    pub fn open(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<OpenSingleChatCommand>,
+    ) -> Result<CommandExecution> {
+        let client = &envelope.payload.draft_client;
+        self.gateway.execute(database, envelope, |transaction| {
+            let ActorRef::User { .. } = &envelope.actor else {
+                return Ok(rejected(
+                    "single_chat.local_user_required",
+                    "Single Chat v1 is available only to the local user",
+                ));
+            };
+            if envelope.camp_id.as_deref() != Some(envelope.payload.camp_id.as_str()) {
+                return Ok(rejected(
+                    "single_chat.camp_mismatch",
+                    "Single Chat command is outside the Thread",
+                ));
+            }
+            if !active_member(
+                transaction,
+                &envelope.payload.camp_id,
+                &envelope.payload.agent_id,
+            )? {
+                return Ok(rejected(
+                    "single_chat.member_unavailable",
+                    "Single Chat target is not an active Thread member",
+                ));
+            }
+            let active = transaction
+                .query_row(
+                    r#"
+                    SELECT id, version
+                    FROM conversation
+                    WHERE camp_id = ?1 AND agent_id = ?2
+                      AND kind = 'single_chat' AND ended_at IS NULL
+                    "#,
+                    params![envelope.payload.camp_id, envelope.payload.agent_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            if let Some((conversation_id, version)) = active {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO single_chat_composer_draft(
+                        conversation_id, revision, source_attachments_json, updated_at, client_id
+                     ) VALUES (?1, 0, '[]', ?2, ?3)",
+                    params![
+                        conversation_id,
+                        chrono::Utc::now().to_rfc3339(),
+                        client.id()
+                    ],
+                )?;
+                return Ok(CommandHandlerResult::applied(
+                    "single_chat.opened",
+                    json!({
+                        "conversationId": conversation_id,
+                        "conversationVersion": version,
+                        "created": false,
+                    }),
+                    Some(entity_ref("conversation", &conversation_id)),
+                ));
+            }
+
+            let conversation_id = Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                INSERT INTO conversation(
+                    id, camp_id, agent_id, kind,
+                    summary_through_message_sequence, last_message_sequence,
+                    last_accepted_public_boundary_sequence, last_input_sequence,
+                    native_binding_generation, version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, 'single_chat', 0, 0, 0, 0, 0, 1, ?4, ?4)
+                "#,
+                params![
+                    conversation_id,
+                    envelope.payload.camp_id,
+                    envelope.payload.agent_id,
+                    now
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO single_chat_composer_draft(
+                    conversation_id, revision, source_attachments_json, updated_at, client_id
+                 ) VALUES (?1, 0, '[]', ?2, ?3)",
+                params![conversation_id, now, client.id()],
+            )?;
+            append_domain_event(
+                transaction,
+                "single_chat.opened",
+                Some(&envelope.payload.camp_id),
+                Some(("conversation", &conversation_id)),
+                &envelope.actor,
+                None,
+                &json!({
+                    "agentId": envelope.payload.agent_id,
+                    "conversationVersion": 1,
+                }),
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "single_chat.opened",
+                json!({
+                    "conversationId": conversation_id,
+                    "conversationVersion": 1,
+                    "created": true,
+                }),
+                Some(entity_ref("conversation", &conversation_id)),
+            ))
+        })
+    }
+
+    pub fn send(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SendSingleChatMessageCommand>,
+    ) -> Result<CommandExecution> {
+        if envelope.payload.body.chars().count() > 100_000 {
+            anyhow::bail!("Single Chat body exceeds the 100000-character limit");
+        }
+        if envelope.payload.draft_revision < 0 {
+            anyhow::bail!("Single Chat Draft revision is invalid");
+        }
+        let client = &envelope.payload.draft_client;
+        self.gateway.execute(database, envelope, |transaction| {
+            let ActorRef::User { user_id } = &envelope.actor else {
+                return Ok(rejected(
+                    "single_chat.local_user_required",
+                    "Single Chat v1 is available only to the local user",
+                ));
+            };
+            let Some(target) = load_active_target(transaction, &envelope.payload.conversation_id)?
+            else {
+                return Ok(rejected(
+                    "single_chat.not_active",
+                    "Single Chat does not exist or has ended",
+                ));
+            };
+            if envelope.camp_id.as_deref() != Some(target.camp_id.as_str())
+                || envelope.payload.camp_id != target.camp_id
+            {
+                return Ok(rejected(
+                    "single_chat.camp_mismatch",
+                    "Single Chat command is outside the Thread",
+                ));
+            }
+            if !active_member(transaction, &target.camp_id, &target.agent_id)? {
+                return Ok(rejected(
+                    "single_chat.member_unavailable",
+                    "Single Chat target is not an active Thread member",
+                ));
+            }
+            let (draft_revision, source_attachments) =
+                load_single_chat_draft_refs(transaction, &target.conversation_id, client)?;
+            if draft_revision != envelope.payload.draft_revision {
+                return Ok(CommandHandlerResult::rejected(
+                    "single_chat.draft_changed",
+                    json!({ "currentDraftRevision": draft_revision }),
+                ));
+            }
+            let body = envelope.payload.body.trim();
+            let quotes = load_quotes(
+                transaction,
+                QuoteStorage::ClientPrivateDraft(client),
+                &target.conversation_id,
+            )?;
+            anyhow::ensure!(
+                quotes.is_empty() || !body.is_empty(),
+                "quote.question_required"
+            );
+            if body.is_empty() && source_attachments.is_empty() {
+                return Ok(rejected(
+                    "single_chat.empty_message",
+                    "Single Chat input must contain text or an attachment",
+                ));
+            }
+            if source_attachments.len() > MAX_PREPARED_ATTACHMENTS {
+                anyhow::bail!("Single Chat Source Attachment count exceeds the shared limit");
+            }
+            if let Err(error) = validate_source_attachments(&source_attachments) {
+                return Ok(CommandHandlerResult::rejected(
+                    error.code().as_str(),
+                    json!({ "message": error.to_string() }),
+                ));
+            }
+
+            if single_chat_has_active_run(transaction, &target.conversation_id)?
+                || single_chat_has_pending_queue(transaction, &target.conversation_id)?
+            {
+                let pending_input_id = enqueue_single_chat_input(
+                    transaction,
+                    &target.conversation_id,
+                    body,
+                    &source_attachments,
+                    user_id,
+                    client,
+                )?;
+                store_quotes(
+                    transaction,
+                    QuoteStorage::PrivatePending,
+                    &pending_input_id,
+                    &quotes,
+                )?;
+                consume_single_chat_draft(
+                    transaction,
+                    &target.conversation_id,
+                    draft_revision,
+                    client,
+                )?;
+                append_domain_event(
+                    transaction,
+                    "single_chat.pending_input_queued",
+                    Some(&target.camp_id),
+                    Some(("single_chat_pending_input", &pending_input_id)),
+                    &envelope.actor,
+                    None,
+                    &json!({
+                        "conversationId": target.conversation_id,
+                        "attachmentCount": source_attachments.len(),
+                    }),
+                )?;
+                return Ok(CommandHandlerResult::accepted(
+                    "single_chat.pending_input_queued",
+                    json!({
+                        "conversationId": target.conversation_id,
+                        "conversationVersion": target.version,
+                        "draftRevision": draft_revision + 1,
+                        "pendingInputId": pending_input_id,
+                    }),
+                    Some(entity_ref("single_chat_pending_input", &pending_input_id)),
+                ));
+            }
+
+            let runtime = match resolve_frozen_runtime(
+                transaction,
+                &target.conversation_id,
+                &target.agent_id,
+            )? {
+                Ok(runtime) => runtime,
+                Err(blocker) => {
+                    return Ok(CommandHandlerResult::rejected(
+                        "single_chat.runtime_not_ready",
+                        json!({
+                            "agentId": target.agent_id,
+                            "conversationId": target.conversation_id,
+                            "blockerCode": blocker.code,
+                            "detail": blocker.payload,
+                        }),
+                    ));
+                }
+            };
+            let admitted = admit_single_chat_message(
+                transaction,
+                &target,
+                user_id,
+                body,
+                &source_attachments,
+                &quotes,
+                &runtime,
+                &envelope.command_id,
+                Some((draft_revision, client)),
+                &envelope.actor,
+            )?;
+            Ok(CommandHandlerResult::accepted(
+                "single_chat.reply_queued",
+                json!({
+                    "conversationId": target.conversation_id,
+                    "conversationVersion": admitted.conversation_version,
+                    "draftRevision": draft_revision + 1,
+                    "conversationMessageId": admitted.conversation_message_id,
+                    "threadTurnId": admitted.camp_turn_id,
+                    "agentRunId": admitted.agent_run_id,
+                }),
+                Some(entity_ref("agent_run", &admitted.agent_run_id)),
+            ))
+        })
+    }
+
+    pub fn end(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<EndSingleChatCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            let ActorRef::User { .. } = &envelope.actor else {
+                return Ok(rejected(
+                    "single_chat.local_user_required",
+                    "Single Chat v1 is available only to the local user",
+                ));
+            };
+            let target = load_end_target(transaction, &envelope.payload.conversation_id)?;
+            let Some(target) = target else {
+                return Ok(rejected(
+                    "single_chat.not_active",
+                    "Single Chat does not exist or has ended",
+                ));
+            };
+            if target.kind != "single_chat" {
+                return Ok(rejected(
+                    "single_chat.not_active",
+                    "Single Chat does not exist or has ended",
+                ));
+            }
+            if envelope.camp_id.as_deref() != Some(target.camp_id.as_str())
+                || envelope.payload.camp_id != target.camp_id
+            {
+                return Ok(rejected(
+                    "single_chat.camp_mismatch",
+                    "Single Chat command is outside the Thread",
+                ));
+            }
+            if target.ended_at.is_some() {
+                return Ok(CommandHandlerResult::applied(
+                    "single_chat.ended",
+                    json!({
+                        "conversationId": target.conversation_id,
+                        "conversationVersion": target.version,
+                        "cancelledAgentRunId": null,
+                    }),
+                    Some(entity_ref("conversation", &target.conversation_id)),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let updated = transaction.execute(
+                r#"
+                UPDATE conversation
+                SET ended_at = ?2, ended_reason = 'user_ended',
+                    ended_binding_generation = native_binding_generation,
+                    version = version + 1, updated_at = ?2
+                WHERE id = ?1 AND kind = 'single_chat' AND ended_at IS NULL
+                "#,
+                params![target.conversation_id, now],
+            )?;
+            anyhow::ensure!(updated == 1, "Single Chat end update did not match its active target");
+            let active_run = transaction
+                .query_row(
+                    "SELECT id, camp_turn_id, execution_epoch FROM agent_run WHERE conversation_id = ?1 AND invocation_kind = 'single_chat' AND status IN ('queued', 'running', 'waiting') ORDER BY created_at, id LIMIT 1",
+                    [&target.conversation_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+                )
+                .optional()?;
+            let mut cancelled_agent_run_id = None;
+            if let Some((agent_run_id, camp_turn_id, execution_epoch)) = active_run {
+                settle_abortive_agent_run_in_tx(
+                    transaction,
+                    &agent_run_id,
+                    "single_chat_ended",
+                    &envelope.actor,
+                    &now,
+                )?;
+                recompute_camp_turn(
+                    transaction,
+                    &target.camp_id,
+                    &camp_turn_id,
+                    &envelope.actor,
+                    Some(execution_epoch),
+                    &now,
+                )?;
+                cancelled_agent_run_id = Some(agent_run_id);
+            }
+            transaction.execute(
+                "DELETE FROM single_chat_composer_draft WHERE conversation_id = ?1",
+                [&target.conversation_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM single_chat_pending_input_edit_session
+                 WHERE conversation_id = ?1",
+                [&target.conversation_id],
+            )?;
+            transaction.execute(
+                "UPDATE single_chat_pending_input
+                 SET state = 'cancelled', revision = revision + 1, updated_at = ?2
+                 WHERE conversation_id = ?1 AND state IN ('queued', 'needs_repair')",
+                params![target.conversation_id, now],
+            )?;
+            append_domain_event(
+                transaction,
+                "single_chat.ended",
+                Some(&target.camp_id),
+                Some(("conversation", &target.conversation_id)),
+                &envelope.actor,
+                None,
+                &json!({
+                    "agentId": target.agent_id,
+                    "conversationVersion": target.version + 1,
+                    "cancelledAgentRunId": cancelled_agent_run_id,
+                    "bindingGeneration": target.native_binding_generation,
+                }),
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "single_chat.ended",
+                json!({
+                    "conversationId": target.conversation_id,
+                    "conversationVersion": target.version + 1,
+                    "cancelledAgentRunId": cancelled_agent_run_id,
+                }),
+                Some(entity_ref("conversation", &target.conversation_id)),
+            ))
+        })
+    }
+
+    pub fn list_active(
+        &self,
+        database: &Database,
+        camp_id: &str,
+    ) -> Result<Vec<SingleChatConversationView>> {
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT conversation.id, conversation.camp_id, conversation.agent_id,
+                   conversation.version, conversation.last_message_sequence,
+                   conversation.last_accepted_public_boundary_sequence,
+                   conversation.created_at, conversation.updated_at, conversation.ended_at,
+                   (SELECT id FROM agent_run
+                    WHERE agent_run.conversation_id = conversation.id
+                      AND agent_run.invocation_kind = 'single_chat'
+                      AND agent_run.status IN ('queued', 'running', 'waiting')
+                    ORDER BY agent_run.created_at, agent_run.id LIMIT 1)
+            FROM conversation
+            WHERE conversation.camp_id = ?1
+              AND conversation.kind = 'single_chat'
+              AND conversation.ended_at IS NULL
+            ORDER BY conversation.updated_at DESC, conversation.id DESC
+            "#,
+        )?;
+        Ok(statement
+            .query_map([camp_id], conversation_view_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn add_source_attachment(
+        &self,
+        database: &mut Database,
+        conversation_id: &str,
+        expected_draft_revision: i64,
+        source_ref: LocalAttachmentSourceRef,
+    ) -> Result<SingleChatSnapshot> {
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        self.commit_source_attachment_in_transaction(
+            &transaction,
+            conversation_id,
+            expected_draft_revision,
+            source_ref,
+        )?;
+        transaction.commit()?;
+        self.snapshot(database, conversation_id)?
+            .context("Single Chat disappeared after its Draft attachment was added")
+    }
+
+    pub(crate) fn commit_source_attachment_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        conversation_id: &str,
+        expected_draft_revision: i64,
+        source_ref: LocalAttachmentSourceRef,
+    ) -> Result<()> {
+        validate_source_attachments(std::slice::from_ref(&source_ref))
+            .map_err(anyhow::Error::new)?;
+        anyhow::ensure!(
+            load_active_target(transaction, conversation_id)?.is_some(),
+            "single_chat.not_active"
+        );
+        let (revision, mut refs) =
+            load_single_chat_draft_refs(transaction, conversation_id, &self.client)?;
+        anyhow::ensure!(
+            revision == expected_draft_revision,
+            "single_chat.draft_changed"
+        );
+        anyhow::ensure!(
+            refs.len() < MAX_PREPARED_ATTACHMENTS,
+            "attachment_count_exceeded"
+        );
+        refs.push(source_ref);
+        store_single_chat_draft_refs(
+            transaction,
+            conversation_id,
+            expected_draft_revision,
+            &refs,
+            &self.client,
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_source_attachment(
+        &self,
+        database: &mut Database,
+        conversation_id: &str,
+        expected_draft_revision: i64,
+        attachment_ref_id: &str,
+    ) -> Result<SingleChatSnapshot> {
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        anyhow::ensure!(
+            load_active_target(&transaction, conversation_id)?.is_some(),
+            "single_chat.not_active"
+        );
+        let (revision, mut refs) =
+            load_single_chat_draft_refs(&transaction, conversation_id, &self.client)?;
+        anyhow::ensure!(
+            revision == expected_draft_revision,
+            "single_chat.draft_changed"
+        );
+        let previous_len = refs.len();
+        refs.retain(|source_ref| source_ref.id != attachment_ref_id);
+        anyhow::ensure!(refs.len() != previous_len, "attachment_not_found");
+        store_single_chat_draft_refs(
+            &transaction,
+            conversation_id,
+            expected_draft_revision,
+            &refs,
+            &self.client,
+        )?;
+        transaction.commit()?;
+        self.snapshot(database, conversation_id)?
+            .context("Single Chat disappeared after its Draft attachment was removed")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_pending_source_attachment(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+        conversation_id: &str,
+        pending_input_id: &str,
+        expected_revision: i64,
+        edit_token: &str,
+        source_ref: LocalAttachmentSourceRef,
+    ) -> Result<SingleChatSnapshot> {
+        validate_source_attachments(std::slice::from_ref(&source_ref))
+            .map_err(anyhow::Error::new)?;
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        self.commit_pending_source_attachment_in_transaction(
+            &transaction,
+            camp_id,
+            conversation_id,
+            pending_input_id,
+            expected_revision,
+            edit_token,
+            source_ref,
+        )?;
+        transaction.commit()?;
+        self.snapshot(database, conversation_id)?
+            .context("Single Chat disappeared after its pending attachment was added")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_pending_source_attachment_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        camp_id: &str,
+        conversation_id: &str,
+        pending_input_id: &str,
+        expected_revision: i64,
+        edit_token: &str,
+        source_ref: LocalAttachmentSourceRef,
+    ) -> Result<()> {
+        let target =
+            load_active_target(transaction, conversation_id)?.context("single_chat.not_active")?;
+        anyhow::ensure!(target.camp_id == camp_id, "single_chat.camp_mismatch");
+        let pending_revision = transaction
+            .query_row(
+                "SELECT revision FROM single_chat_pending_input
+                 WHERE conversation_id = ?1 AND id = ?2
+                   AND state IN ('queued', 'needs_repair')",
+                params![conversation_id, pending_input_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            pending_revision == Some(expected_revision),
+            "single_chat.pending_input_changed"
+        );
+        let working_json = transaction
+            .query_row(
+                "SELECT working_source_attachments_json
+                 FROM single_chat_pending_input_edit_session
+                 WHERE conversation_id = ?1 AND pending_input_id = ?2
+                   AND edit_token = ?3 AND base_pending_revision = ?4
+                   AND recovery_required = 0 AND client_id = ?5",
+                params![
+                    conversation_id,
+                    pending_input_id,
+                    edit_token,
+                    expected_revision,
+                    self.client.id()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .context("single_chat.pending_input_edit_fenced")?;
+        let mut refs = parse_source_attachments(&working_json)?;
+        anyhow::ensure!(
+            refs.len() < MAX_PREPARED_ATTACHMENTS,
+            "attachment_count_exceeded"
+        );
+        refs.push(source_ref);
+        transaction.execute(
+            "UPDATE single_chat_pending_input_edit_session
+             SET working_source_attachments_json = ?4
+             WHERE conversation_id = ?1 AND pending_input_id = ?2 AND edit_token = ?3",
+            params![
+                conversation_id,
+                pending_input_id,
+                edit_token,
+                serialize_source_attachments(&refs)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn edit_pending_input(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<EditSingleChatPendingInputCommand>,
+    ) -> Result<CommandExecution> {
+        let client = &envelope.payload.draft_client;
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, ActorRef::User { .. }) {
+                return Ok(rejected(
+                    "single_chat.local_user_required",
+                    "Only the local user can edit Single Chat pending inputs",
+                ));
+            }
+            let command = &envelope.payload;
+            let Some(target) = load_active_target(transaction, &command.conversation_id)? else {
+                return Ok(rejected(
+                    "single_chat.not_active",
+                    "Single Chat does not exist or has ended",
+                ));
+            };
+            if envelope.camp_id.as_deref() != Some(target.camp_id.as_str())
+                || command.camp_id != target.camp_id
+            {
+                return Ok(rejected(
+                    "single_chat.camp_mismatch",
+                    "Single Chat command is outside the Thread",
+                ));
+            }
+            let current = transaction
+                .query_row(
+                    "SELECT revision, state, body, source_attachments_json
+                     FROM single_chat_pending_input
+                     WHERE conversation_id = ?1 AND id = ?2",
+                    params![command.conversation_id, command.pending_input_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((revision, state, body, source_attachments_json)) = current else {
+                return Ok(rejected(
+                    "single_chat.pending_input_not_found",
+                    "Pending input no longer exists",
+                ));
+            };
+            if revision != command.expected_revision
+                || !matches!(state.as_str(), "queued" | "needs_repair")
+            {
+                return Ok(rejected(
+                    "single_chat.pending_input_changed",
+                    "Pending input changed or was already sent",
+                ));
+            }
+            let session = load_pending_edit_session(transaction, &command.conversation_id)?;
+            let owns_session = session.as_ref().is_some_and(|session| {
+                session.pending_input_id == command.pending_input_id
+                    && session.base_pending_revision == revision
+                    && Some(session.edit_token.as_str()) == command.edit_token.as_deref()
+                    && session.client_id == client.id()
+            });
+
+            match &command.action {
+                SingleChatPendingInputEditAction::ReturnToComposer { expected_draft_revision } => {
+                    if session.as_ref().is_some_and(|session| session.pending_input_id == command.pending_input_id) && !owns_session {
+                        return Ok(rejected("single_chat.pending_input_edit_fenced", "The pending input edit session changed"));
+                    }
+                    let (draft_revision, _) = load_single_chat_draft_refs(transaction, &command.conversation_id, client)?;
+                    if draft_revision != *expected_draft_revision {
+                        return Ok(rejected("single_chat.draft_changed", "The Composer Draft changed; reload it first"));
+                    }
+                    store_single_chat_draft_refs(transaction, &command.conversation_id, draft_revision,
+                        &parse_source_attachments(&source_attachments_json)?, client)?;
+                    copy_quotes(transaction, QuoteStorage::PrivatePending, &command.pending_input_id,
+                        QuoteStorage::ClientPrivateDraft(client), &command.conversation_id)?;
+                    transaction.execute("UPDATE single_chat_composer_draft SET quote_trash_json = '[]' WHERE conversation_id = ?1 AND client_id = ?2", params![command.conversation_id, client.id()])?;
+                    transaction.execute(
+                        "UPDATE single_chat_pending_input SET state = 'cancelled', revision = revision + 1, updated_at = ?2 WHERE id = ?1",
+                        params![command.pending_input_id, chrono::Utc::now().to_rfc3339()],
+                    )?;
+                    transaction.execute("DELETE FROM single_chat_pending_input_edit_session WHERE conversation_id = ?1 AND pending_input_id = ?2",
+                        params![command.conversation_id, command.pending_input_id])?;
+                    return Ok(CommandHandlerResult::applied("single_chat.pending_input_returned_to_composer",
+                        json!({"pendingInputId": command.pending_input_id, "body": body,
+                            "draft": SingleChatComposerDraftView {
+                                revision: draft_revision + 1,
+                                attachments: source_attachment_views(&source_attachments_json)?,
+                                quotes: load_quotes(transaction, QuoteStorage::ClientPrivateDraft(client), &command.conversation_id)?,
+                                updated_at: Some(transaction.query_row("SELECT updated_at FROM single_chat_composer_draft WHERE conversation_id = ?1 AND client_id = ?2",
+                                    params![command.conversation_id, client.id()], |row| row.get::<_, String>(0))?),
+                            }}), None));
+                }
+                SingleChatPendingInputEditAction::Begin
+                | SingleChatPendingInputEditAction::Takeover => {
+                    if matches!(command.action, SingleChatPendingInputEditAction::Begin)
+                        && session.is_some()
+                    {
+                        return Ok(rejected(
+                            "single_chat.pending_input_edit_open",
+                            "Finish the existing pending input edit first",
+                        ));
+                    }
+                    if matches!(command.action, SingleChatPendingInputEditAction::Takeover)
+                        && !owns_session
+                    {
+                        return Ok(rejected(
+                            "single_chat.pending_input_edit_fenced",
+                            "The pending input edit session changed",
+                        ));
+                    }
+                    let edit_token = Uuid::new_v4().to_string();
+                    transaction.execute(
+                        r#"
+                        INSERT INTO single_chat_pending_input_edit_session(
+                            conversation_id, pending_input_id, edit_token,
+                            base_pending_revision, recovery_required, working_body,
+                            working_source_attachments_json, client_id
+                        ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)
+                        ON CONFLICT(conversation_id) DO UPDATE SET
+                            pending_input_id = excluded.pending_input_id,
+                            edit_token = excluded.edit_token,
+                            base_pending_revision = excluded.base_pending_revision,
+                            recovery_required = 0,
+                            working_body = excluded.working_body,
+                            working_source_attachments_json =
+                                excluded.working_source_attachments_json,
+                            client_id = excluded.client_id
+                        "#,
+                        params![
+                            command.conversation_id,
+                            command.pending_input_id,
+                            edit_token,
+                            revision,
+                            body,
+                            source_attachments_json,
+                            client.id(),
+                        ],
+                    )?;
+                    copy_quotes(transaction, QuoteStorage::PrivatePending, &command.pending_input_id, QuoteStorage::PrivateEdit, &command.conversation_id)?;
+                    transaction.execute("UPDATE single_chat_pending_input_edit_session SET quote_trash_json='[]' WHERE conversation_id=?1", [&command.conversation_id])?;
+                    return Ok(CommandHandlerResult::applied(
+                        "single_chat.pending_input_edit_started",
+                        json!({ "editToken": edit_token }),
+                        None,
+                    ));
+                }
+                SingleChatPendingInputEditAction::Save { body } => {
+                    if !owns_session
+                        || session
+                            .as_ref()
+                            .is_some_and(|session| session.recovery_required)
+                    {
+                        return Ok(rejected(
+                            "single_chat.pending_input_edit_fenced",
+                            "Reopen the pending input before saving",
+                        ));
+                    }
+                    if body.chars().count() > 100_000 {
+                        anyhow::bail!("Single Chat body exceeds the 100000-character limit");
+                    }
+                    let working_json = session
+                        .as_ref()
+                        .expect("owned pending edit session")
+                        .working_source_attachments_json
+                        .clone();
+                    let refs = parse_source_attachments(&working_json)?;
+                    let working_quotes = load_quotes(transaction, QuoteStorage::PrivateEdit, &command.conversation_id)?;
+                    anyhow::ensure!(working_quotes.is_empty() || !body.trim().is_empty(), "quote.question_required");
+                    if body.trim().is_empty() && refs.is_empty() {
+                        return Ok(rejected(
+                            "single_chat.empty_message",
+                            "Pending input must contain text or an attachment",
+                        ));
+                    }
+                    transaction.execute(
+                        "UPDATE single_chat_pending_input
+                         SET body = ?3, source_attachments_json = ?4,
+                             revision = revision + 1, state = 'queued',
+                             last_attempt_error_code = NULL, updated_at = ?5
+                         WHERE conversation_id = ?1 AND id = ?2",
+                        params![
+                            command.conversation_id,
+                            command.pending_input_id,
+                            body.trim(),
+                            working_json,
+                            chrono::Utc::now().to_rfc3339(),
+                        ],
+                    )?;
+                    store_quotes(transaction, QuoteStorage::PrivatePending, &command.pending_input_id, &working_quotes)?;
+                }
+                SingleChatPendingInputEditAction::Quote { action } => {
+                    if !owns_session || session.as_ref().is_some_and(|session| session.recovery_required) {
+                        return Ok(rejected("single_chat.pending_input_edit_fenced", "Reopen the pending input before editing quotes"));
+                    }
+                    crate::message_quote::mutate_quotes(transaction, QuoteStorage::PrivateEdit, &command.conversation_id,
+                        &command.camp_id, Some(&command.conversation_id), action)?;
+                    return Ok(CommandHandlerResult::applied("single_chat.pending_input_quotes_updated", json!({"pendingInputId":command.pending_input_id}), None));
+                }
+                SingleChatPendingInputEditAction::RemoveAttachment { attachment_ref_id } => {
+                    let Some(session) = session
+                        .as_ref()
+                        .filter(|session| owns_session && !session.recovery_required)
+                    else {
+                        return Ok(rejected(
+                            "single_chat.pending_input_edit_fenced",
+                            "Reopen the pending input before editing attachments",
+                        ));
+                    };
+                    let mut refs =
+                        parse_source_attachments(&session.working_source_attachments_json)?;
+                    let previous_len = refs.len();
+                    refs.retain(|source_ref| source_ref.id != *attachment_ref_id);
+                    if refs.len() == previous_len {
+                        return Ok(rejected(
+                            "attachment_not_found",
+                            "Source Attachment no longer exists in this edit",
+                        ));
+                    }
+                    store_pending_edit_refs(
+                        transaction,
+                        &command.conversation_id,
+                        &command.pending_input_id,
+                        command.edit_token.as_deref().unwrap_or_default(),
+                        &refs,
+                    )?;
+                    return Ok(CommandHandlerResult::applied(
+                        "single_chat.pending_input_attachment_removed",
+                        json!({ "pendingInputId": command.pending_input_id }),
+                        None,
+                    ));
+                }
+                SingleChatPendingInputEditAction::ReorderAttachments { attachment_ref_ids } => {
+                    let Some(session) = session
+                        .as_ref()
+                        .filter(|session| owns_session && !session.recovery_required)
+                    else {
+                        return Ok(rejected(
+                            "single_chat.pending_input_edit_fenced",
+                            "Reopen the pending input before editing attachments",
+                        ));
+                    };
+                    let refs = parse_source_attachments(&session.working_source_attachments_json)?;
+                    let by_id = refs
+                        .into_iter()
+                        .map(|source_ref| (source_ref.id.clone(), source_ref))
+                        .collect::<HashMap<_, _>>();
+                    if attachment_ref_ids.len() != by_id.len()
+                        || attachment_ref_ids.iter().collect::<HashSet<_>>().len() != by_id.len()
+                        || attachment_ref_ids.iter().any(|id| !by_id.contains_key(id))
+                    {
+                        return Ok(rejected(
+                            "attachment_order_changed",
+                            "Source Attachment order no longer matches this edit",
+                        ));
+                    }
+                    let reordered = attachment_ref_ids
+                        .iter()
+                        .map(|id| {
+                            by_id
+                                .get(id)
+                                .expect("validated Source Attachment identity")
+                                .clone()
+                        })
+                        .collect::<Vec<_>>();
+                    store_pending_edit_refs(
+                        transaction,
+                        &command.conversation_id,
+                        &command.pending_input_id,
+                        command.edit_token.as_deref().unwrap_or_default(),
+                        &reordered,
+                    )?;
+                    return Ok(CommandHandlerResult::applied(
+                        "single_chat.pending_input_attachments_reordered",
+                        json!({ "pendingInputId": command.pending_input_id }),
+                        None,
+                    ));
+                }
+                SingleChatPendingInputEditAction::Cancel => {
+                    if !owns_session {
+                        return Ok(rejected(
+                            "single_chat.pending_input_edit_fenced",
+                            "The pending input edit session changed",
+                        ));
+                    }
+                }
+                SingleChatPendingInputEditAction::Delete => {
+                    if session
+                        .as_ref()
+                        .is_some_and(|session| session.pending_input_id == command.pending_input_id)
+                        && !owns_session
+                    {
+                        return Ok(rejected(
+                            "single_chat.pending_input_edit_fenced",
+                            "The pending input edit session changed",
+                        ));
+                    }
+                    transaction.execute(
+                        "UPDATE single_chat_pending_input
+                         SET state = 'cancelled', revision = revision + 1, updated_at = ?3
+                         WHERE conversation_id = ?1 AND id = ?2",
+                        params![
+                            command.conversation_id,
+                            command.pending_input_id,
+                            chrono::Utc::now().to_rfc3339(),
+                        ],
+                    )?;
+                }
+            }
+            transaction.execute(
+                "DELETE FROM single_chat_pending_input_edit_session
+                 WHERE conversation_id = ?1 AND pending_input_id = ?2",
+                params![command.conversation_id, command.pending_input_id],
+            )?;
+            append_domain_event(
+                transaction,
+                "single_chat.pending_input_updated",
+                Some(&target.camp_id),
+                Some(("single_chat_pending_input", &command.pending_input_id)),
+                &envelope.actor,
+                None,
+                &json!({ "conversationId": command.conversation_id }),
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "single_chat.pending_input_updated",
+                json!({ "pendingInputId": command.pending_input_id }),
+                None,
+            ))
+        })
+    }
+
+    pub fn publish_pending_input(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<PublishSingleChatPendingInput>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            let ActorRef::User { user_id } = &envelope.actor else {
+                anyhow::bail!("Single Chat pending input must publish as its original user");
+            };
+            let command = &envelope.payload;
+            anyhow::ensure!(
+                command.user_id == *user_id,
+                "single_chat.pending_user_changed"
+            );
+            let target = load_active_target(transaction, &command.conversation_id)?
+                .context("Single Chat pending input target is no longer active")?;
+            anyhow::ensure!(
+                target.camp_id == command.camp_id,
+                "single_chat.camp_mismatch"
+            );
+            let pending = load_pending_input(
+                transaction,
+                &command.conversation_id,
+                &command.pending_input_id,
+            )?
+            .context("Single Chat pending input no longer exists")?;
+            anyhow::ensure!(
+                pending.user_id == *user_id,
+                "single_chat.pending_user_changed"
+            );
+            let head = transaction
+                .query_row(
+                    "SELECT id FROM single_chat_pending_input
+                     WHERE conversation_id = ?1 AND state IN ('queued', 'needs_repair')
+                     ORDER BY enqueue_sequence, id LIMIT 1",
+                    [&command.conversation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let edit_open: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM single_chat_pending_input_edit_session
+                    WHERE pending_input_id = ?1
+                )",
+                [&command.pending_input_id],
+                |row| row.get(0),
+            )?;
+            if pending.revision != command.expected_revision
+                || pending.state != "queued"
+                || head.as_deref() != Some(command.pending_input_id.as_str())
+                || edit_open
+                || single_chat_has_active_run(transaction, &command.conversation_id)?
+            {
+                return Ok(rejected(
+                    "single_chat.pending_input_not_ready",
+                    "Single Chat queue head is not ready to send",
+                ));
+            }
+            validate_source_attachments(&pending.source_attachments).map_err(anyhow::Error::new)?;
+            let runtime =
+                resolve_frozen_runtime(transaction, &target.conversation_id, &target.agent_id)?
+                    .map_err(|blocker| {
+                        anyhow::anyhow!(
+                            "single_chat.runtime_not_ready: {}: {}",
+                            blocker.code,
+                            blocker.payload
+                        )
+                    })?;
+            let admitted = admit_single_chat_message(
+                transaction,
+                &target,
+                user_id,
+                &pending.body,
+                &pending.source_attachments,
+                &load_quotes(
+                    transaction,
+                    QuoteStorage::PrivatePending,
+                    &command.pending_input_id,
+                )?,
+                &runtime,
+                &envelope.command_id,
+                None,
+                &envelope.actor,
+            )?;
+            transaction.execute(
+                r#"
+                UPDATE single_chat_pending_input
+                SET state = 'published', published_conversation_message_id = ?3,
+                    published_camp_turn_id = ?4, published_agent_run_id = ?5,
+                    published_at = ?6, updated_at = ?6,
+                    last_attempt_error_code = NULL
+                WHERE conversation_id = ?1 AND id = ?2
+                "#,
+                params![
+                    command.conversation_id,
+                    command.pending_input_id,
+                    admitted.conversation_message_id,
+                    admitted.camp_turn_id,
+                    admitted.agent_run_id,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+            Ok(CommandHandlerResult::accepted(
+                "single_chat.pending_input_published",
+                json!({
+                    "conversationId": command.conversation_id,
+                    "conversationVersion": admitted.conversation_version,
+                    "pendingInputId": command.pending_input_id,
+                    "conversationMessageId": admitted.conversation_message_id,
+                    "threadTurnId": admitted.camp_turn_id,
+                    "agentRunId": admitted.agent_run_id,
+                }),
+                Some(entity_ref("agent_run", &admitted.agent_run_id)),
+            ))
+        })
+    }
+
+    pub fn snapshot(
+        &self,
+        database: &Database,
+        conversation_id: &str,
+    ) -> Result<Option<SingleChatSnapshot>> {
+        let conversation = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT conversation.id, conversation.camp_id, conversation.agent_id,
+                       conversation.version, conversation.last_message_sequence,
+                       conversation.last_accepted_public_boundary_sequence,
+                       conversation.created_at, conversation.updated_at, conversation.ended_at,
+                       (SELECT id FROM agent_run
+                        WHERE agent_run.conversation_id = conversation.id
+                          AND agent_run.invocation_kind = 'single_chat'
+                          AND agent_run.status IN ('queued', 'running', 'waiting')
+                        ORDER BY agent_run.created_at, agent_run.id LIMIT 1)
+                FROM conversation
+                WHERE conversation.id = ?1 AND conversation.kind = 'single_chat'
+                "#,
+                [conversation_id],
+                conversation_view_from_row,
+            )
+            .optional()?;
+        let Some(conversation) = conversation else {
+            return Ok(None);
+        };
+        let messages = {
+            let mut statement = database.connection().prepare(
+                r#"
+                SELECT id, sequence, author_type, author_id, body,
+                       source_attachments_json, agent_run_id, created_at
+                FROM conversation_message
+                WHERE conversation_id = ?1
+                ORDER BY sequence, id
+                "#,
+            )?;
+            let rows = statement
+                .query_map([conversation_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .map(
+                    |(
+                        id,
+                        sequence,
+                        author_type,
+                        author_id,
+                        body,
+                        source_attachments_json,
+                        agent_run_id,
+                        created_at,
+                    )| {
+                        Ok(SingleChatMessageView {
+                            quotes: load_quotes(
+                                database.connection(),
+                                QuoteStorage::PrivateMessage,
+                                &id,
+                            )?,
+                            id,
+                            sequence,
+                            author_type,
+                            author_id,
+                            body,
+                            attachments: source_attachment_views(&source_attachments_json)?,
+                            agent_run_id,
+                            created_at,
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?
+        };
+        let draft = load_single_chat_draft(database, conversation_id, &self.client)?;
+        let pending_inputs =
+            read_single_chat_pending_inputs(database, conversation_id, &self.client)?;
+        let agent_runs = {
+            let mut statement = database.connection().prepare(
+                r#"
+                SELECT agent_run.id, agent_run.trigger_conversation_message_id,
+                       agent_run.status, agent_run.version, agent_run.execution_epoch,
+                       agent_run.cancel_requested_at, agent_run.last_error_code,
+                       agent_run.created_at, agent_run.started_at, agent_run.ended_at,
+                       agent_run.final_conversation_message_id,
+                       (SELECT COUNT(*) FROM agent_run_execution_evidence AS evidence
+                        WHERE evidence.agent_run_id = agent_run.id),
+                       agent_run.execution_evidence_change_sequence,
+                       agent_run.camp_turn_id
+                FROM agent_run
+                WHERE agent_run.conversation_id = ?1
+                  AND agent_run.invocation_kind = 'single_chat'
+                ORDER BY agent_run.created_at, agent_run.id
+                "#,
+            )?;
+            statement
+                .query_map([conversation_id], |row| {
+                    Ok(SingleChatRunView {
+                        id: row.get(0)?,
+                        camp_turn_id: row.get(13)?,
+                        trigger_conversation_message_id: row.get(1)?,
+                        status: row.get(2)?,
+                        version: row.get(3)?,
+                        execution_epoch: row.get(4)?,
+                        cancel_requested_at: row.get(5)?,
+                        last_error_code: row.get(6)?,
+                        created_at: row.get(7)?,
+                        started_at: row.get(8)?,
+                        ended_at: row.get(9)?,
+                        final_conversation_message_id: row.get(10)?,
+                        execution_evidence_count: row.get(11)?,
+                        execution_evidence_change_sequence: row.get(12)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut execution_evidence = Vec::new();
+        for run in &agent_runs {
+            execution_evidence.extend(public_execution_evidence_for_agent_run(
+                database.connection(),
+                &run.id,
+            )?);
+        }
+        crate::execution_text::overlay(database, &mut execution_evidence)?;
+        Ok(Some(SingleChatSnapshot {
+            approvals: crate::read_model::load_conversation_approvals(
+                database.connection(),
+                &conversation.camp_id,
+                Some(conversation_id),
+                true,
+                None,
+            )?,
+            conversation,
+            messages,
+            draft,
+            pending_inputs,
+            agent_runs,
+            execution_evidence,
+        }))
+    }
+}
+
+pub fn filter_single_chat_skill_exposure(
+    database: &Database,
+    mut exposure: PreparedSkillExposure,
+) -> Result<PreparedSkillExposure> {
+    let mut statement = database.connection().prepare(
+        r#"
+        SELECT skill.id, revision.name
+        FROM skill
+        JOIN skill_revision AS revision ON revision.id = skill.current_revision_id
+        WHERE skill.origin = 'official'
+          AND revision.source_type = 'bundled'
+          AND json_extract(revision.source_metadata_json, '$.bundled') = 1
+        "#,
+    )?;
+    let filtered_skill_ids = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| match row {
+            Ok((skill_id, canonical_name))
+                if bundled_skill_source_identity(&canonical_name).is_some_and(|identity| {
+                    SINGLE_CHAT_FILTERED_BUNDLED_SKILL_SOURCE_IDENTITIES
+                        .contains(&identity.as_str())
+                }) =>
+            {
+                Some(Ok(skill_id))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    exposure
+        .snapshot
+        .skills
+        .retain(|entry| !filtered_skill_ids.contains(&entry.skill_id));
+    exposure.digest = canonical_json_digest(&serde_json::to_value(&exposure.snapshot)?)?;
+    Ok(exposure)
+}
+
+#[derive(Debug)]
+struct ActiveTarget {
+    conversation_id: String,
+    camp_id: String,
+    agent_id: String,
+    version: i64,
+    last_message_sequence: i64,
+    current_public_boundary_sequence: i64,
+}
+
+#[derive(Debug)]
+struct EndTarget {
+    conversation_id: String,
+    camp_id: String,
+    agent_id: String,
+    version: i64,
+    native_binding_generation: i64,
+    kind: String,
+    ended_at: Option<String>,
+}
+
+fn source_attachment_views(value: &str) -> Result<Vec<LocalAttachmentSourceView>> {
+    Ok(parse_source_attachments(value)?
+        .iter()
+        .map(|source_ref| source_ref.view(LocalAttachmentAvailability::Unknown))
+        .collect())
+}
+
+fn history_attachment_views(value: &str) -> Result<Vec<LocalAttachmentHistoryView>> {
+    Ok(parse_source_attachments(value)?
+        .iter()
+        .map(LocalAttachmentSourceRef::history_view)
+        .collect())
+}
+
+fn load_single_chat_draft_refs(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    client: &DraftClient,
+) -> Result<(i64, Vec<LocalAttachmentSourceRef>)> {
+    let stored = connection
+        .query_row(
+            "SELECT revision, source_attachments_json
+             FROM single_chat_composer_draft WHERE conversation_id = ?1 AND client_id = ?2",
+            params![conversation_id, client.id()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match stored {
+        Some((revision, value)) => Ok((revision, parse_source_attachments(&value)?)),
+        None => Ok((0, Vec::new())),
+    }
+}
+
+fn load_single_chat_draft(
+    database: &Database,
+    conversation_id: &str,
+    client: &DraftClient,
+) -> Result<SingleChatComposerDraftView> {
+    let stored = database
+        .connection()
+        .query_row(
+            "SELECT revision, source_attachments_json, updated_at
+             FROM single_chat_composer_draft WHERE conversation_id = ?1 AND client_id = ?2",
+            params![conversation_id, client.id()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    match stored {
+        Some((revision, value, updated_at)) => Ok(SingleChatComposerDraftView {
+            quotes: load_quotes(
+                database.connection(),
+                QuoteStorage::ClientPrivateDraft(client),
+                conversation_id,
+            )?,
+            revision,
+            attachments: source_attachment_views(&value)?,
+            updated_at: Some(updated_at),
+        }),
+        None => Ok(SingleChatComposerDraftView {
+            quotes: Vec::new(),
+            revision: 0,
+            attachments: Vec::new(),
+            updated_at: None,
+        }),
+    }
+}
+
+fn store_single_chat_draft_refs(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+    expected_revision: i64,
+    refs: &[LocalAttachmentSourceRef],
+    client: &DraftClient,
+) -> Result<()> {
+    let serialized = serialize_source_attachments(refs)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    if expected_revision == 0 {
+        let updated = transaction.execute(
+            "UPDATE single_chat_composer_draft
+             SET source_attachments_json = ?2, revision = 1, updated_at = ?3
+             WHERE conversation_id = ?1 AND revision = 0 AND client_id = ?4",
+            params![conversation_id, serialized, now, client.id()],
+        )?;
+        if updated == 0 {
+            transaction.execute(
+                "INSERT INTO single_chat_composer_draft(
+                    conversation_id, revision, source_attachments_json, updated_at, client_id
+                 ) VALUES (?1, 1, ?2, ?3, ?4)",
+                params![conversation_id, serialized, now, client.id()],
+            )?;
+        }
+        return Ok(());
+    }
+    let updated = transaction.execute(
+        "UPDATE single_chat_composer_draft
+         SET source_attachments_json = ?3, revision = revision + 1, updated_at = ?4
+         WHERE conversation_id = ?1 AND revision = ?2 AND client_id = ?5",
+        params![
+            conversation_id,
+            expected_revision,
+            serialized,
+            now,
+            client.id()
+        ],
+    )?;
+    anyhow::ensure!(updated == 1, "single_chat.draft_changed");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct StoredSingleChatPendingInput {
+    revision: i64,
+    state: String,
+    body: String,
+    user_id: String,
+    source_attachments: Vec<LocalAttachmentSourceRef>,
+}
+
+fn load_pending_input(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+    pending_input_id: &str,
+) -> Result<Option<StoredSingleChatPendingInput>> {
+    let stored = connection
+        .query_row(
+            "SELECT revision, state, body, user_id, source_attachments_json
+             FROM single_chat_pending_input
+             WHERE conversation_id = ?1 AND id = ?2",
+            params![conversation_id, pending_input_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored
+        .map(
+            |(revision, state, body, user_id, source_attachments_json)| {
+                Ok(StoredSingleChatPendingInput {
+                    revision,
+                    state,
+                    body,
+                    user_id,
+                    source_attachments: parse_source_attachments(&source_attachments_json)?,
+                })
+            },
+        )
+        .transpose()
+}
+
+#[derive(Debug)]
+struct StoredSingleChatPendingEditSession {
+    client_id: String,
+    pending_input_id: String,
+    edit_token: String,
+    base_pending_revision: i64,
+    recovery_required: bool,
+    working_source_attachments_json: String,
+}
+
+fn load_pending_edit_session(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<Option<StoredSingleChatPendingEditSession>> {
+    Ok(connection
+        .query_row(
+            "SELECT pending_input_id, edit_token, base_pending_revision,
+                    recovery_required, working_source_attachments_json, client_id
+             FROM single_chat_pending_input_edit_session
+             WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| {
+                Ok(StoredSingleChatPendingEditSession {
+                    client_id: row.get(5)?,
+                    pending_input_id: row.get(0)?,
+                    edit_token: row.get(1)?,
+                    base_pending_revision: row.get(2)?,
+                    recovery_required: row.get(3)?,
+                    working_source_attachments_json: row.get(4)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn store_pending_edit_refs(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+    pending_input_id: &str,
+    edit_token: &str,
+    refs: &[LocalAttachmentSourceRef],
+) -> Result<()> {
+    let updated = transaction.execute(
+        "UPDATE single_chat_pending_input_edit_session
+         SET working_source_attachments_json = ?4
+         WHERE conversation_id = ?1 AND pending_input_id = ?2 AND edit_token = ?3",
+        params![
+            conversation_id,
+            pending_input_id,
+            edit_token,
+            serialize_source_attachments(refs)?,
+        ],
+    )?;
+    anyhow::ensure!(updated == 1, "single_chat.pending_input_edit_fenced");
+    Ok(())
+}
+
+pub fn recover_pending_edit_sessions(database: &Database) -> Result<()> {
+    database.connection().execute(
+        "UPDATE single_chat_pending_input_edit_session SET recovery_required = 1",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn ready_pending_inputs(database: &Database) -> Result<Vec<PublishSingleChatPendingInput>> {
+    let mut statement = database.connection().prepare(
+        r#"
+        SELECT input.conversation_id, conversation.camp_id,
+               input.id, input.revision, input.user_id
+        FROM single_chat_pending_input AS input
+        JOIN conversation ON conversation.id = input.conversation_id
+        WHERE input.state = 'queued'
+          AND conversation.kind = 'single_chat'
+          AND conversation.ended_at IS NULL
+          AND NOT EXISTS(
+              SELECT 1 FROM single_chat_pending_input AS older
+              WHERE older.conversation_id = input.conversation_id
+                AND older.state IN ('queued', 'needs_repair')
+                AND older.enqueue_sequence < input.enqueue_sequence
+          )
+          AND NOT EXISTS(
+              SELECT 1 FROM single_chat_pending_input_edit_session
+              WHERE pending_input_id = input.id
+          )
+        ORDER BY input.created_at, input.id
+        "#,
+    )?;
+    let candidates = statement
+        .query_map([], |row| {
+            Ok(PublishSingleChatPendingInput {
+                conversation_id: row.get(0)?,
+                camp_id: row.get(1)?,
+                pending_input_id: row.get(2)?,
+                expected_revision: row.get(3)?,
+                user_id: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            match single_chat_has_active_run(database.connection(), &candidate.conversation_id) {
+                Ok(false) => Some(Ok(candidate)),
+                Ok(true) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+pub fn record_pending_publish_failure(
+    database: &Database,
+    command: &PublishSingleChatPendingInput,
+    code: &str,
+) -> Result<()> {
+    database.connection().execute(
+        "UPDATE single_chat_pending_input
+         SET state = 'needs_repair', last_attempt_error_code = ?4, updated_at = ?5
+         WHERE conversation_id = ?1 AND id = ?2 AND revision = ?3 AND state = 'queued'",
+        params![
+            command.conversation_id,
+            command.pending_input_id,
+            command.expected_revision,
+            code,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn read_single_chat_pending_inputs(
+    database: &Database,
+    conversation_id: &str,
+    client: &DraftClient,
+) -> Result<SingleChatPendingInputsView> {
+    let mut statement = database.connection().prepare(
+        r#"
+        SELECT id, enqueue_sequence, revision, state, body,
+               source_attachments_json, last_attempt_error_code
+        FROM single_chat_pending_input
+        WHERE conversation_id = ?1 AND state IN ('queued', 'needs_repair')
+        ORDER BY enqueue_sequence, id
+        "#,
+    )?;
+    let rows = statement
+        .query_map([conversation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let items = rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                enqueue_sequence,
+                revision,
+                state,
+                body,
+                source_attachments_json,
+                last_attempt_error_code,
+            )| {
+                Ok(SingleChatPendingInputView {
+                    quotes: load_quotes(database.connection(), QuoteStorage::PrivatePending, &id)?,
+                    id,
+                    conversation_id: conversation_id.to_string(),
+                    enqueue_sequence,
+                    revision,
+                    state,
+                    body,
+                    last_attempt_error_code,
+                    attachments: source_attachment_views(&source_attachments_json)?,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let edit_session = database
+        .connection()
+        .query_row(
+            r#"
+            SELECT pending_input_id, edit_token, base_pending_revision,
+                   recovery_required, working_body,
+                   working_source_attachments_json
+            FROM single_chat_pending_input_edit_session
+            WHERE conversation_id = ?1 AND client_id = ?2
+            "#,
+            params![conversation_id, client.id()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |(
+                pending_input_id,
+                edit_token,
+                base_pending_revision,
+                recovery_required,
+                working_body,
+                working_source_attachments_json,
+            )| {
+                Ok::<SingleChatPendingInputEditSessionView, anyhow::Error>(
+                    SingleChatPendingInputEditSessionView {
+                        working_quotes: load_quotes(
+                            database.connection(),
+                            QuoteStorage::PrivateEdit,
+                            conversation_id,
+                        )?,
+                        pending_input_id,
+                        edit_token,
+                        base_pending_revision,
+                        recovery_required,
+                        working_body,
+                        working_attachments: source_attachment_views(
+                            &working_source_attachments_json,
+                        )?,
+                    },
+                )
+            },
+        )
+        .transpose()?;
+    Ok(SingleChatPendingInputsView {
+        execution_active: single_chat_has_active_run(database.connection(), conversation_id)?,
+        items,
+        edit_session,
+    })
+}
+
+fn consume_single_chat_draft(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+    expected_revision: i64,
+    client: &DraftClient,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    if expected_revision == 0 {
+        let updated = transaction.execute(
+            "UPDATE single_chat_composer_draft
+             SET source_attachments_json = '[]', quotes_json='[]', quote_trash_json='[]', revision = 1, updated_at = ?2
+             WHERE conversation_id = ?1 AND revision = 0 AND client_id = ?3",
+            params![conversation_id, now, client.id()],
+        )?;
+        if updated == 0 {
+            transaction.execute(
+                "INSERT INTO single_chat_composer_draft(
+                    conversation_id, revision, source_attachments_json, updated_at, client_id
+                 ) VALUES (?1, 1, '[]', ?2, ?3)",
+                params![conversation_id, now, client.id()],
+            )?;
+        }
+        return Ok(());
+    }
+    let updated = transaction.execute(
+        "UPDATE single_chat_composer_draft
+         SET source_attachments_json = '[]', quotes_json='[]', quote_trash_json='[]', revision = revision + 1, updated_at = ?3
+         WHERE conversation_id = ?1 AND revision = ?2 AND client_id = ?4",
+        params![conversation_id, expected_revision, now, client.id()],
+    )?;
+    anyhow::ensure!(updated == 1, "single_chat.draft_changed");
+    Ok(())
+}
+
+fn single_chat_has_active_run(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM agent_run
+            WHERE conversation_id = ?1
+              AND invocation_kind = 'single_chat'
+              AND status IN ('queued', 'running', 'waiting')
+        )",
+        [conversation_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn single_chat_has_pending_queue(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM single_chat_pending_input
+            WHERE conversation_id = ?1 AND state IN ('queued', 'needs_repair')
+        )",
+        [conversation_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn enqueue_single_chat_input(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+    body: &str,
+    source_attachments: &[LocalAttachmentSourceRef],
+    user_id: &str,
+    client: &DraftClient,
+) -> Result<String> {
+    let pending_input_id = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    transaction.execute(
+        r#"
+        INSERT INTO single_chat_pending_input(
+            id, conversation_id, enqueue_sequence, revision, state, body,
+            source_attachments_json, user_id, created_at, updated_at, client_id
+        ) VALUES (
+            ?1, ?2,
+            (SELECT COALESCE(MAX(enqueue_sequence), 0) + 1
+             FROM single_chat_pending_input WHERE conversation_id = ?2),
+            1, 'queued', ?3, ?4, ?5, ?6, ?6, ?7
+        )
+        "#,
+        params![
+            pending_input_id,
+            conversation_id,
+            body,
+            serialize_source_attachments(source_attachments)?,
+            user_id,
+            now,
+            client.id(),
+        ],
+    )?;
+    Ok(pending_input_id)
+}
+
+#[derive(Debug)]
+struct AdmittedSingleChatMessage {
+    conversation_version: i64,
+    conversation_message_id: String,
+    camp_turn_id: String,
+    agent_run_id: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_single_chat_message(
+    transaction: &Transaction<'_>,
+    target: &ActiveTarget,
+    user_id: &str,
+    body: &str,
+    source_attachments: &[LocalAttachmentSourceRef],
+    quotes: &[MessageQuoteSnapshot],
+    runtime: &crate::agent_profile::FrozenAgentRuntimeConfig,
+    command_id: &str,
+    draft_revision: Option<(i64, &DraftClient)>,
+    actor: &ActorRef,
+) -> Result<AdmittedSingleChatMessage> {
+    anyhow::ensure!(
+        quotes.is_empty() || !body.trim().is_empty(),
+        "quote.question_required"
+    );
+    let accepted_at = chrono::Utc::now();
+    let now = accepted_at.to_rfc3339();
+    let budget = freeze_camp_turn_execution_budget(None, accepted_at, 1)?;
+    let conversation_message_id = Uuid::new_v4().to_string();
+    let camp_turn_id = Uuid::new_v4().to_string();
+    let agent_run_id = Uuid::new_v4().to_string();
+    let source_attachments_json = serialize_source_attachments(source_attachments)?;
+
+    if let Some((draft_revision, client)) = draft_revision {
+        consume_single_chat_draft(transaction, &target.conversation_id, draft_revision, client)?;
+    }
+    let updated = transaction.execute(
+        r#"
+        UPDATE conversation
+        SET last_message_sequence = last_message_sequence + 1,
+            version = version + 1,
+            updated_at = ?3
+        WHERE id = ?1 AND version = ?2
+          AND kind = 'single_chat' AND ended_at IS NULL
+        "#,
+        params![target.conversation_id, target.version, now],
+    )?;
+    anyhow::ensure!(updated == 1, "single_chat.version_conflict");
+    let conversation_sequence = target.last_message_sequence + 1;
+    let effective_config = build_effective_config(
+        transaction,
+        &target.conversation_id,
+        &target.agent_id,
+        runtime,
+    )?;
+    transaction.execute(
+        r#"
+        INSERT INTO camp_turn(
+            id, camp_id, trigger_type, trigger_id, kind, status,
+            execution_budget_schema_version,
+            execution_budget_accepted_at, execution_budget_deadline_at,
+            execution_budget_elapsed_seconds,
+            execution_budget_max_agent_run_responsibilities,
+            execution_budget_max_accepted_a2a,
+            execution_budget_root_agent_run_responsibilities,
+            version, created_at, updated_at
+        ) VALUES (
+            ?1, ?2, 'conversation_message', ?3, 'single_chat', 'running',
+            ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?5, ?5
+        )
+        "#,
+        params![
+            camp_turn_id,
+            target.camp_id,
+            conversation_message_id,
+            budget.schema_version,
+            now,
+            budget.deadline_at,
+            budget.elapsed_seconds,
+            budget.max_agent_run_responsibilities,
+            budget.max_accepted_a2a,
+            budget.root_agent_run_responsibilities,
+        ],
+    )?;
+    transaction.execute(
+        r#"
+        INSERT INTO agent_run(
+            id, camp_turn_id, conversation_id,
+            trigger_conversation_message_id, input_ready_at,
+            initial_camp_context_through_sequence,
+            initial_conversation_context_through_sequence,
+            responsibility_key, responsibility_generation,
+            start_reason, purpose, completion_role,
+            effective_config_json, workspace_json, permission_semantics,
+            runtime_adapter_kind, runtime_installation_id,
+            runtime_executable_path, runtime_auth_scope,
+            runtime_reported_version, runtime_executable_fingerprint,
+            runtime_initial_reported_version,
+            runtime_initial_executable_fingerprint,
+            runtime_capabilities_json, runtime_model_selection_json,
+            runtime_permission_config_json,
+            runtime_binding_compatibility_digest,
+            runtime_host_config_digest, runtime_protocol_version,
+            runtime_installation_generation,
+            runtime_search_environment_generation,
+            runtime_native_session_compatibility_key,
+            invocation_kind, response_delivery, operation_policy,
+            operation_policy_version, destination_conversation_id,
+            status, idempotency_key, version,
+            created_at, updated_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, 0, 'initial', ?9, 'required',
+            ?10, NULL, 'runtime_managed_v2',
+            ?11, ?12, ?13, ?14, ?15, ?16, ?15, ?16,
+            ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+            'single_chat', 'conversation_message', 'single_chat_v1', 2, ?3,
+            'queued', ?26, 1, ?5, ?5
+        )
+        "#,
+        params![
+            agent_run_id,
+            camp_turn_id,
+            target.conversation_id,
+            conversation_message_id,
+            now,
+            target.current_public_boundary_sequence,
+            conversation_sequence,
+            format!("single_chat/{}", target.agent_id),
+            "Respond to the user's Single Chat message",
+            serde_json::to_string(&effective_config)?,
+            runtime.adapter_kind.as_str(),
+            runtime.installation_id,
+            runtime.executable_path,
+            runtime.auth_scope,
+            runtime.reported_version,
+            runtime.executable_fingerprint,
+            serde_json::to_string(&runtime.capabilities)?,
+            serde_json::to_string(&runtime.model)?,
+            serde_json::to_string(&runtime.permissions)?,
+            runtime.binding_compatibility_digest,
+            runtime.host_config_digest,
+            runtime.protocol_version,
+            runtime.installation_generation,
+            runtime.search_environment_generation,
+            runtime.native_session_compatibility_key,
+            command_id,
+        ],
+    )?;
+    transaction.execute(
+        r#"
+        INSERT INTO conversation_message(
+            id, conversation_id, sequence,
+            author_type, author_id, source_agent_run_id, body,
+            source_camp_message_id, source_inbox_message_id,
+            camp_turn_id, agent_run_id, source_attachments_json, created_at
+        ) VALUES (
+            ?1, ?2, ?3, 'user', ?4, NULL, ?5,
+            NULL, NULL, ?6, ?7, ?8, ?9
+        )
+        "#,
+        params![
+            conversation_message_id,
+            target.conversation_id,
+            conversation_sequence,
+            user_id,
+            body,
+            camp_turn_id,
+            agent_run_id,
+            source_attachments_json,
+            now,
+        ],
+    )?;
+    store_quotes(
+        transaction,
+        QuoteStorage::PrivateMessage,
+        &conversation_message_id,
+        quotes,
+    )?;
+    append_domain_event(
+        transaction,
+        "single_chat.message_sent",
+        Some(&target.camp_id),
+        Some(("conversation_message", &conversation_message_id)),
+        actor,
+        None,
+        &json!({
+            "conversationId": target.conversation_id,
+            "conversationVersion": target.version + 1,
+            "threadTurnId": camp_turn_id,
+            "agentRunId": agent_run_id,
+            "publicBoundary": target.current_public_boundary_sequence,
+            "attachmentCount": source_attachments.len(),
+        }),
+    )?;
+    append_domain_event(
+        transaction,
+        "agent_run.queued",
+        Some(&target.camp_id),
+        Some(("agent_run", &agent_run_id)),
+        actor,
+        None,
+        &json!({
+            "threadTurnId": camp_turn_id,
+            "conversationId": target.conversation_id,
+            "invocationKind": "single_chat",
+            "responseDelivery": SINGLE_CHAT_RESPONSE_DELIVERY,
+            "operationPolicy": SINGLE_CHAT_OPERATION_POLICY,
+            "operationPolicyVersion": SINGLE_CHAT_OPERATION_POLICY_VERSION,
+        }),
+    )?;
+    Ok(AdmittedSingleChatMessage {
+        conversation_version: target.version + 1,
+        conversation_message_id,
+        camp_turn_id,
+        agent_run_id,
+    })
+}
+
+fn load_active_target(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+) -> Result<Option<ActiveTarget>> {
+    Ok(transaction
+        .query_row(
+            r#"
+            SELECT conversation.id, conversation.camp_id, conversation.agent_id,
+                   conversation.version, conversation.last_message_sequence,
+                   camp.last_message_sequence
+            FROM conversation
+            JOIN camp ON camp.id = conversation.camp_id
+            WHERE conversation.id = ?1
+              AND conversation.kind = 'single_chat'
+              AND conversation.ended_at IS NULL
+              AND camp.activation_state = 'active'
+            "#,
+            [conversation_id],
+            |row| {
+                Ok(ActiveTarget {
+                    conversation_id: row.get(0)?,
+                    camp_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    version: row.get(3)?,
+                    last_message_sequence: row.get(4)?,
+                    current_public_boundary_sequence: row.get(5)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn load_end_target(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+) -> Result<Option<EndTarget>> {
+    Ok(transaction
+        .query_row(
+            r#"
+            SELECT conversation.id, conversation.camp_id, conversation.agent_id,
+                   conversation.version, conversation.native_binding_generation,
+                   conversation.kind, conversation.ended_at
+            FROM conversation
+            WHERE conversation.id = ?1
+            "#,
+            [conversation_id],
+            |row| {
+                Ok(EndTarget {
+                    conversation_id: row.get(0)?,
+                    camp_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    version: row.get(3)?,
+                    native_binding_generation: row.get(4)?,
+                    kind: row.get(5)?,
+                    ended_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn active_member(transaction: &Transaction<'_>, camp_id: &str, agent_id: &str) -> Result<bool> {
+    Ok(transaction.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM camp_member
+            JOIN camp ON camp.id = camp_member.camp_id
+            JOIN agent_profile ON agent_profile.id = camp_member.agent_id
+            WHERE camp_member.camp_id = ?1
+              AND camp_member.agent_id = ?2
+              AND camp_member.status = 'active'
+              AND camp_member.leave_requested_at IS NULL
+              AND agent_profile.profile_status = 'present'
+              AND camp.activation_state = 'active'
+        )
+        "#,
+        params![camp_id, agent_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn conversation_view_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SingleChatConversationView> {
+    let ended_at = row.get::<_, Option<String>>(8)?;
+    Ok(SingleChatConversationView {
+        id: row.get(0)?,
+        camp_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        version: row.get(3)?,
+        status: if ended_at.is_some() {
+            "ended".to_string()
+        } else {
+            "active".to_string()
+        },
+        last_message_sequence: row.get(4)?,
+        last_accepted_public_boundary_sequence: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        ended_at,
+        active_agent_run_id: row.get(9)?,
+    })
+}
+
+fn rejected(code: &str, message: &str) -> CommandHandlerResult {
+    CommandHandlerResult::rejected(code, json!({ "message": message }))
+}
+
+fn entity_ref(entity_type: &str, entity_id: &str) -> EntityReference {
+    EntityReference {
+        entity_type: entity_type.to_string(),
+        entity_id: entity_id.to_string(),
+    }
+}
+
+pub fn single_chat_run_policy(
+    database: &Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+) -> Result<Option<(String, String, String, i64)>> {
+    Ok(database
+        .connection()
+        .query_row(
+            r#"
+            SELECT camp_turn.camp_id, agent_run.response_delivery,
+                   agent_run.operation_policy, agent_run.operation_policy_version
+            FROM agent_run
+            JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            WHERE agent_run.id = ?1 AND agent_run.execution_epoch = ?2
+              AND agent_run.invocation_kind = 'single_chat'
+            "#,
+            params![agent_run_id, execution_epoch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?)
+}
+
+pub fn authorize_builtin_operation(
+    database: &Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+    operation: &str,
+    input: &Value,
+) -> Result<Option<CommandHandlerResult>> {
+    let Some((camp_id, response_delivery, operation_policy, policy_version)) =
+        single_chat_run_policy(database, agent_run_id, execution_epoch)?
+    else {
+        if operation == SINGLE_CHAT_HISTORY_TOOL_NAME {
+            return Ok(Some(CommandHandlerResult::rejected(
+                "single_chat.history_unavailable",
+                json!({
+                    "message": "Current Single Chat history is unavailable.",
+                    "operation": operation,
+                }),
+            )));
+        }
+        return Ok(None);
+    };
+    if response_delivery != SINGLE_CHAT_RESPONSE_DELIVERY
+        || !single_chat_operation_policy_is_supported(&operation_policy, policy_version)
+    {
+        anyhow::bail!("Single Chat AgentRun has an invalid frozen operation policy");
+    }
+    let allowed = single_chat_operation_is_allowed(policy_version, operation);
+    if !allowed {
+        return Ok(Some(CommandHandlerResult::rejected(
+            "single_chat.operation_denied",
+            json!({
+                "message": "This Rovai operation is unavailable in Single Chat.",
+                "operation": operation,
+                "operationPolicy": SINGLE_CHAT_OPERATION_POLICY,
+            }),
+        )));
+    }
+    if matches!(operation, "thread.search" | "thread.read") {
+        let requested_camp_id = input
+            .get("threadId")
+            .or_else(|| input.get("camp_id"))
+            .and_then(Value::as_str);
+        if requested_camp_id.is_some_and(|requested| requested != camp_id) {
+            return Ok(Some(CommandHandlerResult::rejected(
+                "single_chat.cross_camp_denied",
+                json!({
+                    "message": "Single Chat can only read the current Thread.",
+                    "operation": operation,
+                    "threadId": requested_camp_id,
+                }),
+            )));
+        }
+    }
+    if operation == SINGLE_CHAT_HISTORY_TOOL_NAME
+        && load_single_chat_history_target(database, agent_run_id, execution_epoch)?.is_none()
+    {
+        return Ok(Some(CommandHandlerResult::rejected(
+            "single_chat.history_unavailable",
+            json!({
+                "message": "Current Single Chat history is unavailable.",
+                "operation": operation,
+            }),
+        )));
+    }
+    Ok(None)
+}
+
+fn load_single_chat_history_target(
+    database: &Database,
+    agent_run_id: &str,
+    execution_epoch: i64,
+) -> Result<Option<(String, i64)>> {
+    Ok(database
+        .connection()
+        .query_row(
+            r#"
+            SELECT conversation.id, current_input.sequence
+            FROM agent_run
+            JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            JOIN conversation
+              ON conversation.id = agent_run.destination_conversation_id
+             AND conversation.id = agent_run.conversation_id
+             AND conversation.camp_id = camp_turn.camp_id
+            JOIN conversation_message AS current_input
+              ON current_input.id = agent_run.trigger_conversation_message_id
+             AND current_input.conversation_id = conversation.id
+            WHERE agent_run.id = ?1
+              AND agent_run.execution_epoch = ?2
+              AND agent_run.invocation_kind = 'single_chat'
+              AND agent_run.response_delivery = 'conversation_message'
+              AND agent_run.operation_policy = 'single_chat_v1'
+              AND agent_run.operation_policy_version IN (1, 2)
+              AND agent_run.status = 'running'
+              AND agent_run.cancel_requested_at IS NULL
+              AND camp_turn.kind = 'single_chat'
+              AND camp_turn.status IN ('running', 'waiting')
+              AND camp_turn.cancel_requested_at IS NULL
+              AND conversation.kind = 'single_chat'
+              AND conversation.ended_at IS NULL
+              AND current_input.author_type = 'user'
+              AND current_input.sequence = agent_run.initial_conversation_context_through_sequence
+            "#,
+            params![agent_run_id, execution_epoch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+pub fn single_chat_operation_policy_is_supported(policy: &str, version: i64) -> bool {
+    policy == SINGLE_CHAT_OPERATION_POLICY
+        && matches!(version, 1..=SINGLE_CHAT_OPERATION_POLICY_VERSION)
+}
+
+fn single_chat_operation_is_allowed(policy_version: i64, operation: &str) -> bool {
+    matches!(
+        operation,
+        "thread.search" | "thread.read" | SINGLE_CHAT_HISTORY_TOOL_NAME
+    ) || (policy_version >= 2 && matches!(operation, "mission.list" | "mission.get"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        collaboration::{CollaborationService, CreateThreadCommand},
+        command::{CommandResultStatus, canonical_json_digest},
+        local_attachment_source::{
+            LocalAttachmentFailure, LocalAttachmentOwnerLocator, load_agent_run_source_attachments,
+            load_source_attachment, observe_source_attachment, resolve_source_attachments_for_run,
+        },
+        runtime::{ExecutionRuntimeService, SucceedAgentRunCommand},
+        skill_projection::{SkillExposureEntry, SkillExposureSnapshot},
+    };
+
+    fn user_envelope<P>(command_id: &str, camp_id: Option<&str>, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::User {
+                user_id: "local-user".to_string(),
+            },
+            camp_id: camp_id.map(str::to_string),
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    fn fixture() -> (crate::test_support::OwnedTestDatabase, String) {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let workspace = database.directory().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let created = CollaborationService::default()
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "single-chat-create-camp",
+                    None,
+                    CreateThreadCommand::for_test(workspace.to_string_lossy().to_string()),
+                ),
+            )
+            .unwrap();
+        assert_eq!(created.result.status, CommandResultStatus::Applied);
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (database, camp_id)
+    }
+
+    fn open(
+        service: &SingleChatService,
+        database: &mut Database,
+        camp_id: &str,
+        command_id: &str,
+    ) -> (String, i64) {
+        let opened = service
+            .open(
+                database,
+                &user_envelope(
+                    command_id,
+                    Some(camp_id),
+                    OpenSingleChatCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.to_string(),
+                        agent_id: "agent_1".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(opened.result.status, CommandResultStatus::Applied);
+        (
+            opened.result.payload["conversationId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            opened.result.payload["conversationVersion"]
+                .as_i64()
+                .unwrap(),
+        )
+    }
+
+    fn send(
+        service: &SingleChatService,
+        database: &mut Database,
+        camp_id: &str,
+        conversation_id: &str,
+        command_id: &str,
+    ) -> CommandExecution {
+        let draft_revision = database
+            .connection()
+            .query_row(
+                "SELECT revision FROM single_chat_composer_draft WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        while take_run_wake(database) {}
+        let result = service
+            .send(
+                database,
+                &user_envelope(
+                    command_id,
+                    Some(camp_id),
+                    SendSingleChatMessageCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.to_string(),
+                        conversation_id: conversation_id.to_string(),
+                        body: "请检查这一处设计".to_string(),
+                        draft_revision,
+                    },
+                ),
+            )
+            .unwrap();
+        if result.result.status != CommandResultStatus::Rejected {
+            assert!(
+                take_run_wake(database),
+                "committed Single Chat sends must wake the run driver"
+            );
+        }
+        result
+    }
+
+    fn take_run_wake(database: &Database) -> bool {
+        std::future::Future::poll(
+            std::pin::pin!(database.execution_wake.runs.notified()).as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_ready()
+    }
+
+    fn assert_default_run_has_no_time_limit(database: &mut Database, run_id: &str) {
+        let (schema, elapsed, deadline, accepted_at, status):
+            (i64, Option<i64>, Option<String>, String, String) = database.connection().query_row(
+                "SELECT turn.execution_budget_schema_version, turn.execution_budget_elapsed_seconds,
+                        turn.execution_budget_deadline_at, turn.execution_budget_accepted_at, run.status
+                 FROM camp_turn AS turn JOIN agent_run AS run ON run.camp_turn_id = turn.id
+                 WHERE run.id = ?1",
+                [run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).unwrap();
+        assert_eq!((schema, elapsed, deadline), (2, None, None));
+        let after_two_days = chrono::DateTime::parse_from_rfc3339(&accepted_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::days(2);
+        assert!(
+            ExecutionRuntimeService::default()
+                .expire_elapsed_camp_turn_execution_budgets(
+                    database,
+                    after_two_days,
+                    after_two_days,
+                    100
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let after: (String, Option<String>) = database
+            .connection()
+            .query_row(
+                "SELECT status, cancel_requested_at FROM agent_run WHERE id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after,
+            (status, None),
+            "passing 24 hours must not end the Run"
+        );
+    }
+
+    #[test]
+    fn send_uses_current_state_and_end_uses_exact_identity_without_fencing_a_successor() {
+        let (mut database, camp_id) = fixture();
+        let service = SingleChatService::default();
+        let (conversation_id, _) =
+            open(&service, &mut database, &camp_id, "single-chat-open-first");
+        let first = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-first",
+        );
+        assert_eq!(first.result.status, CommandResultStatus::Accepted);
+        let first_run_id = first.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_default_run_has_no_time_limit(&mut database, &first_run_id);
+        let route_rewrite = database.connection().execute(
+            r#"
+            UPDATE agent_run
+            SET invocation_kind = 'a2a',
+                response_delivery = 'camp_message',
+                operation_policy = 'camp_member_v1',
+                destination_conversation_id = NULL
+            WHERE id = ?1
+            "#,
+            [&first_run_id],
+        );
+        assert!(
+            route_rewrite
+                .unwrap_err()
+                .to_string()
+                .contains("agent_run output route is immutable"),
+            "a Single Chat Run cannot be rewritten into an ordinary public route"
+        );
+        // Runtime input acknowledgement can advance the Conversation version while the
+        // Renderer still holds the Snapshot used to prepare this queued input.
+        database
+            .connection()
+            .execute(
+                "UPDATE conversation SET version = version + 1 WHERE id = ?1",
+                [&conversation_id],
+            )
+            .unwrap();
+        let busy = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-busy",
+        );
+        assert_eq!(busy.result.status, CommandResultStatus::Accepted);
+        assert_eq!(busy.result.code, "single_chat.pending_input_queued");
+        let pending_input_id = busy.result.payload["pendingInputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let user_messages: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_message WHERE conversation_id = ?1 AND author_type = 'user'",
+                [&conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            user_messages, 1,
+            "a queued send must not append user input before publication"
+        );
+        let queued_snapshot = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued_snapshot.pending_inputs.items.len(), 1);
+        let editing = service
+            .edit_pending_input(
+                &mut database,
+                &user_envelope(
+                    "single-chat-begin-pending-before-end",
+                    Some(&camp_id),
+                    EditSingleChatPendingInputCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        pending_input_id,
+                        expected_revision: 1,
+                        edit_token: None,
+                        action: SingleChatPendingInputEditAction::Begin,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(editing.result.status, CommandResultStatus::Applied);
+
+        let missing = service
+            .end(
+                &mut database,
+                &user_envelope(
+                    "single-chat-end-missing",
+                    Some(&camp_id),
+                    EndSingleChatCommand {
+                        camp_id: camp_id.clone(),
+                        conversation_id: "missing-single-chat-conversation".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(missing.result.status, CommandResultStatus::Rejected);
+        assert_eq!(missing.result.code, "single_chat.not_active");
+
+        let camp_mismatch = service
+            .end(
+                &mut database,
+                &user_envelope(
+                    "single-chat-end-camp-mismatch",
+                    None,
+                    EndSingleChatCommand {
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(camp_mismatch.result.status, CommandResultStatus::Rejected);
+        assert_eq!(camp_mismatch.result.code, "single_chat.camp_mismatch");
+
+        let ordinary_conversation_id = "ordinary-conversation-end-target";
+        let ordinary_created_at = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO conversation(
+                    id, camp_id, agent_id, kind,
+                    summary_through_message_sequence, last_message_sequence,
+                    last_accepted_public_boundary_sequence, last_input_sequence,
+                    native_binding_generation, version, created_at, updated_at
+                ) VALUES (?1, ?2, 'agent_1', 'camp_member', 0, 0, 0, 0, 0, 1, ?3, ?3)
+                "#,
+                params![ordinary_conversation_id, camp_id, ordinary_created_at],
+            )
+            .unwrap();
+        let wrong_kind = service
+            .end(
+                &mut database,
+                &user_envelope(
+                    "single-chat-end-wrong-kind",
+                    Some(&camp_id),
+                    EndSingleChatCommand {
+                        camp_id: camp_id.clone(),
+                        conversation_id: ordinary_conversation_id.to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(wrong_kind.result.status, CommandResultStatus::Rejected);
+        assert_eq!(wrong_kind.result.code, "single_chat.not_active");
+
+        let ended = service
+            .end(
+                &mut database,
+                &user_envelope(
+                    "single-chat-end-first",
+                    Some(&camp_id),
+                    EndSingleChatCommand {
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(ended.result.status, CommandResultStatus::Applied);
+        let old_status: String = database
+            .connection()
+            .query_row(
+                "SELECT status FROM agent_run WHERE id = ?1",
+                [&first_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_status, "cancelled");
+        let cleanup_counts: (i64, i64, i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM single_chat_composer_draft
+                     WHERE conversation_id = ?1),
+                    (SELECT COUNT(*) FROM single_chat_pending_input_edit_session
+                     WHERE conversation_id = ?1),
+                    (SELECT COUNT(*) FROM single_chat_pending_input
+                     WHERE conversation_id = ?1 AND state IN ('queued', 'needs_repair')),
+                    (SELECT COUNT(*) FROM single_chat_pending_input
+                     WHERE conversation_id = ?1 AND state = 'cancelled')",
+                [&conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cleanup_counts, (0, 0, 0, 1));
+        let ended_version: i64 = database
+            .connection()
+            .query_row(
+                "SELECT version FROM conversation WHERE id = ?1",
+                [&conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ended_events: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM event_log
+                 WHERE event_type = 'single_chat.ended'
+                   AND entity_type = 'conversation' AND entity_id = ?1",
+                [&conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended_events, 1);
+
+        let ended_again = service
+            .end(
+                &mut database,
+                &user_envelope(
+                    "single-chat-end-first-again",
+                    Some(&camp_id),
+                    EndSingleChatCommand {
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(ended_again.result.status, CommandResultStatus::Applied);
+        assert_eq!(
+            ended_again.result.payload["conversationVersion"],
+            ended_version
+        );
+        assert!(ended_again.result.payload["cancelledAgentRunId"].is_null());
+        let unchanged_end_state: (i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT conversation.version,
+                        (SELECT COUNT(*) FROM event_log
+                         WHERE event_type = 'single_chat.ended'
+                           AND entity_type = 'conversation' AND entity_id = ?1)
+                 FROM conversation WHERE conversation.id = ?1",
+                [&conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unchanged_end_state, (ended_version, ended_events));
+
+        let (successor_id, _) = open(
+            &service,
+            &mut database,
+            &camp_id,
+            "single-chat-open-successor",
+        );
+        assert_ne!(successor_id, conversation_id);
+        let successor = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &successor_id,
+            "single-chat-send-successor",
+        );
+        assert_eq!(successor.result.status, CommandResultStatus::Accepted);
+    }
+
+    #[test]
+    fn successful_final_is_private_and_a_cancelled_run_cannot_append_late_output() {
+        let (mut database, camp_id) = fixture();
+        let service = SingleChatService::default();
+        let runtime = ExecutionRuntimeService::default();
+        let (conversation_id, _) = open(
+            &service,
+            &mut database,
+            &camp_id,
+            "single-chat-open-terminal",
+        );
+        let sent = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-terminal",
+        );
+        let run_id = sent.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT operation_policy_version FROM agent_run WHERE id=?1",
+                    [&run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            SINGLE_CHAT_OPERATION_POLICY_VERSION
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1, started_at = updated_at WHERE id = ?1",
+                [&run_id],
+            )
+            .unwrap();
+        assert_default_run_has_no_time_limit(&mut database, &run_id);
+        // This existing private/public boundary owner also covers approvals and their counts.
+        database
+            .connection()
+            .execute(
+                r#"INSERT INTO action_execution (
+                id, agent_run_id, action_kind, action_schema_version, action_digest,
+                digest_algorithm, canonicalization_version, canonical_input_json,
+                input_completeness, action_summary, execution_authority, control_mode,
+                source_agent_run_execution_epoch, native_request_method,
+                native_request_id_json, native_request_digest,
+                policy_decision, policy_version, status, created_at, updated_at
+            ) VALUES ('private-action', ?1, 'test.action', '1', 'sha256:private-action',
+                'sha256', 'canonical-json-v1', '{}', 'complete', '单聊审批',
+                'runtime', 'intercepted', 1, 'runtime.permission', '{"id":"private-request"}',
+                'sha256:private-request', 'ask', '1', 'prepared', datetime('now'), datetime('now'))"#,
+                [&run_id],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute_batch(
+                r#"
+            INSERT INTO approval (
+                id, action_id, action_kind, action_digest, digest_algorithm,
+                canonicalization_version, action_summary, requested_for_user_id,
+                request_policy_version, request_json, reason, status, requested_at, updated_at, native_options_json
+            ) VALUES ('private-approval', 'private-action', 'test.action', 'sha256:private-action',
+                'sha256', 'canonical-json-v1', '单聊审批', 'local_user', '1', '{}', '确认操作',
+                'pending', datetime('now'), datetime('now'),
+                '[{"optionId":"deny","kind":"deny","label":"拒绝","consequence":"拒绝","nativeResponseDigest":"digest"}]');
+        "#,
+            )
+            .unwrap();
+        // Opening either read surface must not replay audit history for Run presentation.
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        database
+            .connection()
+            .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::Read {
+                    table_name: "event_log",
+                    ..
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))
+            .unwrap();
+        let private_pending = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(private_pending.approvals.len(), 1);
+        assert_eq!(private_pending.approvals[0].id, "private-approval");
+        let public = crate::read_model::ReadModelService
+            .camp_open_projection(&mut database, &camp_id)
+            .unwrap();
+        assert!(public.approvals.is_empty());
+        assert_eq!(public.coverage.approvals.total_count, 0);
+        database
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        let pending_changes = crate::notification::NotificationEpisodeService::default()
+            .changes_since(&mut database, "local_user", 0, 100)
+            .unwrap();
+        let private_signal = pending_changes
+            .changes
+            .iter()
+            .filter_map(|change| change.heads_up_signal.as_ref())
+            .find(|signal| signal.action.approval_id.as_deref() == Some("private-approval"))
+            .unwrap();
+        assert_eq!(
+            private_signal
+                .action
+                .single_chat
+                .as_ref()
+                .unwrap()
+                .conversation_id,
+            conversation_id
+        );
+        assert_eq!(
+            private_signal
+                .action
+                .single_chat
+                .as_ref()
+                .unwrap()
+                .agent_run_id,
+            run_id
+        );
+        database
+            .connection()
+            .execute_batch(
+                "UPDATE approval SET status = 'approved', resolved_at = datetime('now'),
+             updated_at = datetime('now'), version = version + 1 WHERE id = 'private-approval';
+             UPDATE action_execution SET status = 'succeeded', updated_at = datetime('now'), ended_at = datetime('now')
+             WHERE id = 'private-action';",
+            )
+            .unwrap();
+        let completed = runtime
+            .succeed_agent_run(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "single-chat-terminal-success".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-adapter:test".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: SucceedAgentRunCommand {
+                        agent_run_id: run_id.clone(),
+                        expected_version: 1,
+                        execution_epoch: 1,
+                        native_turn_id: "native-turn-private".to_string(),
+                        final_output: "这是只写入单聊的最终回答。".to_string(),
+                        missing_send_recovery_candidate: None,
+                        ending_git_observation: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            completed.result.status,
+            CommandResultStatus::Applied,
+            "{:?}",
+            completed.result
+        );
+        assert!(completed.result.payload["finalThreadMessageId"].is_null());
+        let public_messages: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id = ?1",
+                [&run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(public_messages, 0);
+        let private_messages: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_message WHERE conversation_id = ?1 AND author_type = 'agent' AND source_agent_run_id = ?2",
+                params![conversation_id, run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(private_messages, 1);
+
+        let notifications = crate::notification::NotificationEpisodeService::default();
+        let changes = notifications
+            .changes_since(&mut database, "local_user", 0, 100)
+            .unwrap();
+        let signal = changes
+            .changes
+            .iter()
+            .filter_map(|change| change.heads_up_signal.as_ref())
+            .find(|signal| {
+                signal.semantic == crate::notification::NotificationSemantic::SingleChatReply
+            })
+            .unwrap();
+        let source = signal.action.single_chat.as_ref().unwrap();
+        assert_eq!(source.conversation_id, conversation_id);
+        assert_eq!(source.agent_run_id, run_id);
+        assert_eq!(source.agent_id, "agent_1");
+        assert_eq!(
+            signal.action.kind,
+            crate::notification::NotificationActionKind::OpenSingleChat
+        );
+        assert!(signal.action.available);
+        let occurrence_id = signal.action.acknowledgement_id.clone().unwrap();
+        let through = changes.next_change_sequence;
+        let turn_id = signal.action.camp_turn_id.clone().unwrap();
+        let private_snapshot = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(private_snapshot.agent_runs[0].camp_turn_id, turn_id);
+        // A public next turn does not satisfy a private result, even in the same Thread.
+        database.connection().execute(
+            r#"INSERT INTO camp_turn(id, camp_id, trigger_type, trigger_id, status, version, created_at, updated_at)
+               VALUES('public-next-turn', ?1, 'system_event', 'next', 'running', 1, '2099-01-01', '2099-01-01')"#, [&camp_id]).unwrap();
+        database.connection().execute(
+            r#"INSERT INTO camp_message(id, camp_id, sequence, author_type, author_id, body,
+               structured_content_json, content_digest, address_mode, addressed_agent_ids_json, camp_turn_id, version, created_at, updated_at)
+               VALUES('public-next-message', ?1, 999, 'user', 'local_user', 'next',
+               '[{"kind":"text","text":"next"}]', 'next', 'default', '[]', 'public-next-turn', 1, '2099-01-01', '2099-01-01')"#, [&camp_id]).unwrap();
+        let satisfied: bool = database.connection().query_row(
+            "SELECT satisfied_at IS NOT NULL FROM notification_occurrence_disposition WHERE occurrence_id = ?1",
+            [&occurrence_id], |row| row.get(0)).unwrap();
+        assert!(!satisfied);
+
+        let (cancel_conversation_id, _) = {
+            service
+                .end(
+                    &mut database,
+                    &user_envelope(
+                        "single-chat-end-completed",
+                        Some(&camp_id),
+                        EndSingleChatCommand {
+                            camp_id: camp_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                        },
+                    ),
+                )
+                .unwrap();
+            open(&service, &mut database, &camp_id, "single-chat-open-cancel")
+        };
+        let invalidated = notifications
+            .changes_since(&mut database, "local_user", through, 100)
+            .unwrap();
+        assert!(invalidated.changes.iter().any(|change| {
+            change
+                .heads_up_invalidation
+                .as_ref()
+                .is_some_and(|invalidation| {
+                    invalidation.acknowledgement_id.as_deref() == Some(&occurrence_id)
+                })
+        }));
+        assert!(
+            notifications
+                .changes_since(&mut database, "local_user", 0, 100)
+                .unwrap()
+                .changes
+                .iter()
+                .filter_map(|change| change.heads_up_signal.as_ref())
+                .all(|signal| signal
+                    .action
+                    .single_chat
+                    .as_ref()
+                    .is_none_or(|source| source.conversation_id != conversation_id))
+        );
+        assert_ne!(cancel_conversation_id, conversation_id);
+        let cancelled_send = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &cancel_conversation_id,
+            "single-chat-send-cancel",
+        );
+        let cancelled_run_id = cancelled_send.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1, started_at = updated_at WHERE id = ?1",
+                [&cancelled_run_id],
+            )
+            .unwrap();
+        let stopped = runtime
+            .request_agent_run_cancellation(
+                &mut database,
+                &user_envelope(
+                    "single-chat-explicit-stop",
+                    Some(&camp_id),
+                    crate::runtime::CancelAgentRunCommand {
+                        camp_id: camp_id.clone(),
+                        agent_run_id: cancelled_run_id.clone(),
+                        expected_version: 1,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(stopped.result.status, CommandResultStatus::Applied);
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM notification_occurrence WHERE agent_run_id=?1",
+                    [&cancelled_run_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "manual stop does not create an exit reminder"
+        );
+        let shutdown_send = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &cancel_conversation_id,
+            "single-chat-exit-reminder",
+        );
+        let shutdown_run = shutdown_send.result.payload["agentRunId"].as_str().unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status='cancelled',cancel_requested_at=datetime('now'),
+            cancel_reason_code='app_shutdown_cancel_all',ended_at=datetime('now') WHERE id=?1",
+                [shutdown_run],
+            )
+            .unwrap();
+        let stop_id: String = database.connection().query_row(
+            "SELECT id FROM notification_occurrence WHERE agent_run_id=?1 AND interruption_kind='app_shutdown'",
+            [shutdown_run], |r|r.get(0)).unwrap();
+        assert!(
+            notifications
+                .thread_interruptions(&mut database, "local_user", &[camp_id.clone()])
+                .unwrap()
+                .threads[0]
+                .has_unread_interruption
+        );
+        // Keep the original owner: ending C1 also cancels a still-running reply
+        // and fences its late output, independently of the preceding user stop.
+        let cancelled_send = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &cancel_conversation_id,
+            "single-chat-send-cancel-on-end",
+        );
+        let cancelled_run_id = cancelled_send.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        database.connection().execute(
+            "UPDATE agent_run SET status='running',execution_epoch=1,started_at=updated_at WHERE id=?1",
+            [&cancelled_run_id],
+        ).unwrap();
+        service
+            .end(
+                &mut database,
+                &user_envelope(
+                    "single-chat-end-cancel",
+                    Some(&camp_id),
+                    EndSingleChatCommand {
+                        camp_id: camp_id.clone(),
+                        conversation_id: cancel_conversation_id.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(
+            !notifications
+                .thread_interruptions(&mut database, "local_user", &[camp_id.clone()])
+                .unwrap()
+                .threads[0]
+                .has_unread_interruption
+        );
+        assert!(database.connection().query_row(
+            "SELECT acknowledged_at IS NULL FROM notification_occurrence_disposition WHERE occurrence_id=?1",
+            [&stop_id], |r| r.get::<_, bool>(0)).unwrap());
+        let late = runtime
+            .succeed_agent_run(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "single-chat-terminal-late".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-adapter:test".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: SucceedAgentRunCommand {
+                        agent_run_id: cancelled_run_id,
+                        expected_version: 2,
+                        execution_epoch: 1,
+                        native_turn_id: "native-turn-late".to_string(),
+                        final_output: "这条迟到回答不得出现。".to_string(),
+                        missing_send_recovery_candidate: None,
+                        ending_git_observation: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(late.result.status, CommandResultStatus::Rejected);
+        assert_eq!(late.result.code, "agent_run.terminal_fenced");
+        let leaked: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_message WHERE body = '这条迟到回答不得出现。'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0);
+        let (failed_conversation, _) = open(
+            &service,
+            &mut database,
+            &camp_id,
+            "single-chat-open-failure",
+        );
+        let failed_send = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &failed_conversation,
+            "single-chat-send-failure",
+        );
+        let failed_run = failed_send.result.payload["agentRunId"].as_str().unwrap();
+        database.connection().execute("UPDATE agent_run SET status='failed',last_error_code='accepted_input_outcome_unknown',ended_at=datetime('now'),updated_at=datetime('now') WHERE id=?1",[failed_run]).unwrap();
+        let changes = notifications
+            .changes_since(&mut database, "local_user", through, 100)
+            .unwrap();
+        let failure = changes
+            .changes
+            .iter()
+            .filter_map(|c| c.heads_up_signal.as_ref())
+            .find(|s| s.semantic == crate::notification::NotificationSemantic::TurnFailed)
+            .unwrap();
+        assert_eq!(
+            failure.action.single_chat.as_ref().unwrap().agent_run_id,
+            failed_run
+        );
+        assert_eq!(
+            failure.action.single_chat.as_ref().unwrap().conversation_id,
+            failed_conversation
+        );
+        let failure_id = failure.action.acknowledgement_id.clone().unwrap();
+        assert!(
+            notifications
+                .thread_interruptions(&mut database, "local_user", &[camp_id.clone()])
+                .unwrap()
+                .threads[0]
+                .has_unread_interruption
+        );
+        service
+            .end(
+                &mut database,
+                &user_envelope(
+                    "single-chat-close-failure",
+                    Some(&camp_id),
+                    EndSingleChatCommand {
+                        camp_id: camp_id.clone(),
+                        conversation_id: failed_conversation,
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(database.connection().query_row("SELECT resolved_at IS NOT NULL AND acknowledged_at IS NULL FROM notification_occurrence_disposition WHERE occurrence_id=?1",[&failure_id],|r|r.get::<_,bool>(0)).unwrap());
+        assert!(
+            !notifications
+                .thread_interruptions(&mut database, "local_user", &[camp_id.clone()])
+                .unwrap()
+                .threads[0]
+                .has_unread_interruption
+        );
+        open(
+            &service,
+            &mut database,
+            &camp_id,
+            "single-chat-next-after-interruption",
+        );
+        assert!(
+            !notifications
+                .thread_interruptions(&mut database, "local_user", &[camp_id.clone()])
+                .unwrap()
+                .threads[0]
+                .has_unread_interruption
+        );
+        assert_eq!(
+            database
+                .connection()
+                .query_row("SELECT count(*) FROM notification_round", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "private work never admits a public round"
+        );
+    }
+
+    #[test]
+    fn built_in_policy_is_closed_and_runtime_loss_cancels_only_the_reply() {
+        assert!(!single_chat_operation_is_allowed(1, "mission.list"));
+        assert!(!single_chat_operation_is_allowed(1, "mission.get"));
+        assert!(single_chat_operation_is_allowed(2, "mission.list"));
+        assert!(single_chat_operation_is_allowed(2, "mission.get"));
+        let (mut database, camp_id) = fixture();
+        let service = SingleChatService::default();
+        let (conversation_id, _) =
+            open(&service, &mut database, &camp_id, "single-chat-open-policy");
+        let sent = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-policy",
+        );
+        let run_id = sent.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1, started_at = updated_at WHERE id = ?1",
+                [&run_id],
+            )
+            .unwrap();
+        assert!(
+            authorize_builtin_operation(
+                &database,
+                &run_id,
+                1,
+                "thread.read",
+                &json!({"threadId": camp_id}),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            authorize_builtin_operation(
+                &database,
+                &run_id,
+                1,
+                SINGLE_CHAT_HISTORY_TOOL_NAME,
+                &json!({}),
+            )
+            .unwrap()
+            .is_none()
+        );
+        for mission_operation in ["mission.list", "mission.get"] {
+            assert!(
+                authorize_builtin_operation(&database, &run_id, 1, mission_operation, &json!({}),)
+                    .unwrap()
+                    .is_none(),
+                "{mission_operation} must remain read-only and available in Single Chat"
+            );
+        }
+        for denied_operation in [
+            "thread.runs",
+            "thread.message.send",
+            "team.gather",
+            "team.get_task",
+            "team.list_tasks",
+            "memory.view",
+            "memory.search",
+            "memory.read",
+            "memory.write",
+        ] {
+            let denial =
+                authorize_builtin_operation(&database, &run_id, 1, denied_operation, &json!({}))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(denial.code, "single_chat.operation_denied");
+        }
+        let cross_camp = authorize_builtin_operation(
+            &database,
+            &run_id,
+            1,
+            "thread.search",
+            &json!({"threadId": "rvcamp_01h47kvsy5fk1shh6w1g60eecf"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cross_camp.code, "single_chat.cross_camp_denied");
+
+        let cancelled = ExecutionRuntimeService::default()
+            .cancel_interrupted_single_chat_runs(&mut database)
+            .unwrap();
+        assert_eq!(cancelled, vec![run_id.clone()]);
+        let unavailable = authorize_builtin_operation(
+            &database,
+            &run_id,
+            1,
+            SINGLE_CHAT_HISTORY_TOOL_NAME,
+            &json!({}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(unavailable.code, "single_chat.history_unavailable");
+        let snapshot = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.conversation.status, "active");
+        assert_eq!(snapshot.agent_runs[0].status, "cancelled");
+        let next = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-after-restart",
+        );
+        assert_eq!(next.result.status, CommandResultStatus::Accepted);
+        // Live transport loss keeps the same private reply cancellation policy,
+        // while its safe cause remains in the Run record.
+        let next_run_id = next.result.payload["agentRunId"].as_str().unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1,
+             runtime_adapter_kind = 'pi', started_at = updated_at WHERE id = ?1",
+                [next_run_id],
+            )
+            .unwrap();
+        let version = database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [next_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let failure = crate::pi::PiTransportFailure::ProtocolViolation.public_failure();
+        let result = crate::action::ActionSafetyService::default()
+            .reconcile_runtime_loss(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "single-chat-pi-transport-loss".into(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-recovery-coordinator".into(),
+                    },
+                    camp_id: Some(camp_id),
+                    expected_versions: vec![],
+                    execution_epoch: None,
+                    payload: crate::action::ReconcileRuntimeLossCommand {
+                        agent_run_id: next_run_id.into(),
+                        expected_version: version,
+                        execution_epoch: 1,
+                        reason: failure.code.clone(),
+                        failure: Some(failure.clone()),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(result.result.code, "agent_run.cancelled");
+        let snapshot = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.conversation.status, "active");
+        let run = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == next_run_id)
+            .unwrap();
+        assert_eq!(run.status, "cancelled");
+        let stored: String = database
+            .connection()
+            .query_row(
+                "SELECT public_runtime_failure_json FROM agent_run WHERE id = ?1",
+                [next_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::runtime_failure::RuntimeFailureView>(&stored).unwrap(),
+            failure
+        );
+    }
+
+    #[test]
+    fn source_attachments_are_consumed_by_one_message_and_keep_their_path_for_its_run() {
+        let (mut database, camp_id) = fixture();
+        let service = SingleChatService::default();
+        let (conversation_id, _) = open(
+            &service,
+            &mut database,
+            &camp_id,
+            "single-chat-open-attachment",
+        );
+        let source = database.directory().join("private-input.md");
+        std::fs::write(&source, b"private single chat attachment").unwrap();
+        let source_ref =
+            observe_source_attachment(&source, "private-input.md", Some("text/markdown")).unwrap();
+        service
+            .add_source_attachment(&mut database, &conversation_id, 0, source_ref)
+            .unwrap();
+        let staged = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.draft.attachments.len(), 1);
+        let attachment_id = staged.draft.attachments[0].id.clone();
+
+        let sent = service
+            .send(
+                &mut database,
+                &user_envelope(
+                    "single-chat-send-attachment",
+                    Some(&camp_id),
+                    SendSingleChatMessageCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        body: String::new(),
+                        draft_revision: 1,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        let run_id = sent.result.payload["agentRunId"].as_str().unwrap();
+        let snapshot = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.draft.attachments.is_empty());
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].body, "");
+        assert_eq!(snapshot.messages[0].attachments.len(), 1);
+        assert_eq!(snapshot.messages[0].attachments[0].id, attachment_id);
+        assert!(
+            database
+                .connection()
+                .execute(
+                    "UPDATE conversation_message SET source_attachments_json = '[]' WHERE id = ?1",
+                    [&snapshot.messages[0].id],
+                )
+                .is_err(),
+            "a sent message must retain its frozen Source Refs"
+        );
+
+        let refs = load_agent_run_source_attachments(&database, run_id, 0).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].source_path, source.to_string_lossy());
+        let resolved = resolve_source_attachments_for_run(&refs).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0], source.to_string_lossy());
+        assert_eq!(
+            std::fs::read(&resolved[0]).unwrap(),
+            b"private single chat attachment"
+        );
+
+        let message_id = snapshot.messages[0].id.clone();
+        let exact = load_source_attachment(
+            &database,
+            &LocalAttachmentOwnerLocator::SingleChatMessage {
+                camp_id: camp_id.clone(),
+                conversation_id: conversation_id.clone(),
+                conversation_message_id: message_id.clone(),
+                attachment_ref_id: attachment_id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            exact.as_ref().map(|source_ref| &source_ref.id),
+            Some(&attachment_id)
+        );
+        assert!(
+            load_source_attachment(
+                &database,
+                &LocalAttachmentOwnerLocator::SingleChatMessage {
+                    camp_id: camp_id.clone(),
+                    conversation_id: Uuid::new_v4().to_string(),
+                    conversation_message_id: message_id,
+                    attachment_ref_id: attachment_id,
+                },
+            )
+            .unwrap()
+            .is_none(),
+            "a message attachment cannot be guessed through another Conversation identity"
+        );
+        // Same Owner, distinct verified editors: draft/resource reads, receipt
+        // replay and pending withdrawal must preserve the other editors' work.
+        let client_a = DraftClient::verified_web(&"a".repeat(64)).unwrap();
+        let client_b = DraftClient::verified_web(&"b".repeat(64)).unwrap();
+        let browser_a = SingleChatService::for_client(client_a.clone());
+        let browser_b = SingleChatService::for_client(client_b.clone());
+        let source_a = observe_source_attachment(&source, "A.md", Some("text/markdown")).unwrap();
+        let source_b = observe_source_attachment(&source, "B.md", Some("text/markdown")).unwrap();
+        let ref_a = source_a.id.clone();
+        let ref_b = source_b.id.clone();
+        browser_a
+            .add_source_attachment(&mut database, &conversation_id, 0, source_a)
+            .unwrap();
+        let locator = LocalAttachmentOwnerLocator::SingleChatComposer {
+            camp_id: camp_id.clone(),
+            conversation_id: conversation_id.clone(),
+            attachment_ref_id: ref_a.clone(),
+        };
+        assert!(
+            crate::local_attachment_source::load_source_attachment_for_client(
+                &database, &locator, &client_a
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            crate::local_attachment_source::load_source_attachment_for_client(
+                &database, &locator, &client_b
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            load_source_attachment(&database, &locator)
+                .unwrap()
+                .is_none()
+        );
+        browser_b
+            .add_source_attachment(&mut database, &conversation_id, 0, source_b)
+            .unwrap();
+        let mut send_a = user_envelope(
+            "web-private-send",
+            Some(&camp_id),
+            SendSingleChatMessageCommand {
+                draft_client: client_a.clone(),
+                camp_id: camp_id.clone(),
+                conversation_id: conversation_id.clone(),
+                body: "A pending message".into(),
+                draft_revision: 1,
+            },
+        );
+        let queued = browser_a.send(&mut database, &send_a).unwrap();
+        assert_eq!(queued.result.code, "single_chat.pending_input_queued");
+        assert!(browser_a.send(&mut database, &send_a).unwrap().replayed);
+        send_a.payload.draft_client = client_b.clone();
+        assert!(
+            browser_b.send(&mut database, &send_a).is_err(),
+            "a different editor must not reuse the receipt"
+        );
+        assert_eq!(
+            browser_b
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .draft
+                .attachments[0]
+                .id,
+            ref_b
+        );
+        assert!(
+            browser_a
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .draft
+                .attachments
+                .is_empty()
+        );
+        let pending_id = queued.result.payload["pendingInputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut edit = user_envelope(
+            "web-private-edit",
+            Some(&camp_id),
+            EditSingleChatPendingInputCommand {
+                draft_client: client_a.clone(),
+                camp_id: camp_id.clone(),
+                conversation_id: conversation_id.clone(),
+                pending_input_id: pending_id,
+                expected_revision: 1,
+                edit_token: None,
+                action: SingleChatPendingInputEditAction::Begin,
+            },
+        );
+        assert_ne!(
+            browser_a
+                .edit_pending_input(&mut database, &edit)
+                .unwrap()
+                .result
+                .status,
+            CommandResultStatus::Rejected
+        );
+        let snapshot_a = browser_a
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        let token = snapshot_a
+            .pending_inputs
+            .edit_session
+            .as_ref()
+            .unwrap()
+            .edit_token
+            .clone();
+        assert!(
+            browser_b
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .pending_inputs
+                .edit_session
+                .is_none()
+        );
+        edit.command_id = "web-private-forged-edit".into();
+        edit.payload.draft_client = client_b.clone();
+        edit.payload.edit_token = Some(token.clone());
+        edit.payload.action = SingleChatPendingInputEditAction::Delete;
+        assert_eq!(
+            browser_b
+                .edit_pending_input(&mut database, &edit)
+                .unwrap()
+                .result
+                .code,
+            "single_chat.pending_input_edit_fenced"
+        );
+        edit.command_id = "web-private-return".into();
+        edit.payload.draft_client = client_a;
+        edit.payload.action = SingleChatPendingInputEditAction::ReturnToComposer {
+            expected_draft_revision: snapshot_a.draft.revision,
+        };
+        assert_eq!(
+            browser_a
+                .edit_pending_input(&mut database, &edit)
+                .unwrap()
+                .result
+                .code,
+            "single_chat.pending_input_returned_to_composer"
+        );
+        assert_eq!(
+            browser_a
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .draft
+                .attachments[0]
+                .id,
+            ref_a
+        );
+        assert_eq!(
+            browser_b
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .draft
+                .attachments[0]
+                .id,
+            ref_b
+        );
+        assert!(
+            service
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .draft
+                .attachments
+                .is_empty()
+        );
+    }
+
+    // Private Draft refs and Pending FIFO share a transaction, independently of Thread Draft.
+    #[test]
+    fn returning_pending_input_restores_private_draft_and_releases_the_next_input() {
+        let (mut database, camp_id) = fixture();
+        let service = SingleChatService::default();
+        let (conversation_id, _) = open(&service, &mut database, &camp_id, "return-open");
+        send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "return-active",
+        );
+        let source = database.directory().join("queued-return.txt");
+        std::fs::write(&source, "source survives").unwrap();
+        let source_ref = observe_source_attachment(&source, "queued-return.txt", None).unwrap();
+        let attachment_id = source_ref.id.clone();
+        service
+            .add_source_attachment(&mut database, &conversation_id, 1, source_ref)
+            .unwrap();
+        send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "return-queued",
+        );
+        send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "return-next",
+        );
+        let snapshot = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        let item = &snapshot.pending_inputs.items[0];
+        let next = &snapshot.pending_inputs.items[1];
+        let mut command = user_envelope(
+            "return-stale-draft",
+            Some(&camp_id),
+            EditSingleChatPendingInputCommand {
+                draft_client: Default::default(),
+                camp_id: camp_id.clone(),
+                conversation_id: conversation_id.clone(),
+                pending_input_id: item.id.clone(),
+                expected_revision: item.revision,
+                edit_token: None,
+                action: SingleChatPendingInputEditAction::ReturnToComposer {
+                    expected_draft_revision: snapshot.draft.revision - 1,
+                },
+            },
+        );
+        assert_eq!(
+            service
+                .edit_pending_input(&mut database, &command)
+                .unwrap()
+                .result
+                .code,
+            "single_chat.draft_changed"
+        );
+        assert_eq!(
+            service
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .pending_inputs
+                .items
+                .len(),
+            2
+        );
+        command.command_id = "return-success".into();
+        command.payload.action = SingleChatPendingInputEditAction::ReturnToComposer {
+            expected_draft_revision: snapshot.draft.revision,
+        };
+        let returned = service.edit_pending_input(&mut database, &command).unwrap();
+        assert_eq!(
+            returned.result.code,
+            "single_chat.pending_input_returned_to_composer"
+        );
+        assert_eq!(returned.result.payload["body"], item.body);
+        assert_eq!(
+            returned.result.payload["draft"]["revision"],
+            snapshot.draft.revision + 1
+        );
+        assert!(
+            !returned
+                .result
+                .payload
+                .to_string()
+                .contains(source.to_str().unwrap())
+        );
+        let after = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.draft.attachments[0].id, attachment_id);
+        assert_eq!(after.pending_inputs.items.len(), 1);
+        assert_eq!(after.pending_inputs.items[0].id, next.id);
+        assert!(after.pending_inputs.edit_session.is_none());
+        assert!(source.exists());
+        database.connection().execute("UPDATE agent_run SET status = 'succeeded', ended_at = updated_at WHERE conversation_id = ?1", [&conversation_id]).unwrap();
+        assert_eq!(
+            ready_pending_inputs(&database).unwrap()[0].pending_input_id,
+            next.id
+        );
+        let requeued = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "return-resubmitted",
+        );
+        assert_eq!(requeued.result.code, "single_chat.pending_input_queued");
+        let after_send = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_send.pending_inputs.items[0].id, next.id);
+        assert_ne!(after_send.pending_inputs.items[1].id, item.id);
+        assert_eq!(
+            after_send.pending_inputs.items[1].attachments[0].id,
+            attachment_id
+        );
+        assert!(
+            service
+                .edit_pending_input(&mut database, &command)
+                .unwrap()
+                .replayed
+        );
+        assert!(
+            service
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .draft
+                .attachments
+                .is_empty()
+        );
+        let publish = ready_pending_inputs(&database).unwrap().remove(0);
+        service
+            .publish_pending_input(
+                &mut database,
+                &user_envelope("return-publish-next", Some(&camp_id), publish),
+            )
+            .unwrap();
+        command.command_id = "return-after-published".into();
+        command.payload.pending_input_id = next.id.clone();
+        command.payload.expected_revision = next.revision;
+        command.payload.action = SingleChatPendingInputEditAction::ReturnToComposer {
+            expected_draft_revision: after_send.draft.revision,
+        };
+        assert_eq!(
+            service
+                .edit_pending_input(&mut database, &command)
+                .unwrap()
+                .result
+                .code,
+            "single_chat.pending_input_changed"
+        );
+        assert_eq!(
+            service
+                .snapshot(&database, &conversation_id)
+                .unwrap()
+                .unwrap()
+                .draft
+                .revision,
+            after_send.draft.revision
+        );
+    }
+
+    #[test]
+    fn pending_input_preserves_source_refs_and_publishes_after_the_active_run() {
+        let (mut database, camp_id) = fixture();
+        let service = SingleChatService::default();
+        let runtime = ExecutionRuntimeService::default();
+        let (conversation_id, _) = open(
+            &service,
+            &mut database,
+            &camp_id,
+            "single-chat-open-pending-attachment",
+        );
+        let first = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-pending-first",
+        );
+        let first_run_id = first.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source = database.directory().join("queued-input.md");
+        std::fs::write(&source, b"queued source ref").unwrap();
+        let source_ref =
+            observe_source_attachment(&source, "queued-input.md", Some("text/markdown")).unwrap();
+        let attachment_id = source_ref.id.clone();
+        service
+            .add_source_attachment(&mut database, &conversation_id, 1, source_ref)
+            .unwrap();
+        crate::message_quote::mutate_draft(
+            &mut database,
+            &user_envelope(
+                "private-quote-add",
+                Some(&camp_id),
+                crate::message_quote::MutateQuoteDraftCommand {
+                    draft_client: Default::default(),
+                    camp_id: camp_id.clone(),
+                    conversation_id: Some(conversation_id.clone()),
+                    expected_revision: 2,
+                    action: crate::message_quote::QuoteAction::Add {
+                        selection: crate::message_quote::QuoteSelection {
+                            current_user_display_name: None,
+                            message_id: first.result.payload["conversationMessageId"]
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                            body_at_selection: "请检查这一处设计".into(),
+                            start_scalar: 3,
+                            end_scalar: 8,
+                            text: "这一处设计".into(),
+                        },
+                    },
+                },
+            ),
+        )
+        .unwrap();
+        let captured = load_quotes(
+            database.connection(),
+            QuoteStorage::PrivateDraft,
+            &conversation_id,
+        )
+        .unwrap();
+        let queued = service
+            .send(
+                &mut database,
+                &user_envelope(
+                    "single-chat-send-pending-attachment",
+                    Some(&camp_id),
+                    SendSingleChatMessageCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        body: "读取排队附件".to_string(),
+                        draft_revision: 3,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(queued.result.code, "single_chat.pending_input_queued");
+        let pending_input_id = queued.result.payload["pendingInputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            load_quotes(
+                database.connection(),
+                QuoteStorage::PrivatePending,
+                &pending_input_id
+            )
+            .unwrap(),
+            captured
+        );
+        assert!(
+            load_quotes(
+                database.connection(),
+                QuoteStorage::PrivateDraft,
+                &conversation_id
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let queued_locator = LocalAttachmentOwnerLocator::SingleChatPending {
+            camp_id: camp_id.clone(),
+            conversation_id: conversation_id.clone(),
+            pending_input_id: pending_input_id.clone(),
+            attachment_ref_id: attachment_id.clone(),
+        };
+        assert!(
+            load_source_attachment(&database, &queued_locator)
+                .unwrap()
+                .is_some()
+        );
+
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1,
+                 started_at = updated_at WHERE id = ?1",
+                [&first_run_id],
+            )
+            .unwrap();
+        while take_run_wake(&database) {}
+        runtime
+            .succeed_agent_run(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "single-chat-pending-first-final".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-adapter:test".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: SucceedAgentRunCommand {
+                        agent_run_id: first_run_id,
+                        expected_version: 1,
+                        execution_epoch: 1,
+                        native_turn_id: "single-chat-pending-first-turn".to_string(),
+                        final_output: "第一轮完成".to_string(),
+                        missing_send_recovery_candidate: None,
+                        ending_git_observation: None,
+                    },
+                },
+            )
+            .unwrap();
+
+        assert!(
+            take_run_wake(&database),
+            "terminal commit must wake FIFO publication"
+        );
+        let ready = ready_pending_inputs(&database).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].pending_input_id, pending_input_id);
+        let published = service
+            .publish_pending_input(
+                &mut database,
+                &user_envelope(
+                    "single-chat-publish-pending-attachment",
+                    Some(&camp_id),
+                    ready[0].clone(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(published.result.status, CommandResultStatus::Accepted);
+        assert!(
+            take_run_wake(&database),
+            "publishing the head must wake dispatch"
+        );
+        let queued_run_id = published.result.payload["agentRunId"].as_str().unwrap();
+        assert_default_run_has_no_time_limit(&mut database, queued_run_id);
+        let queued_refs = load_agent_run_source_attachments(&database, queued_run_id, 0).unwrap();
+        assert_eq!(queued_refs.len(), 1);
+        assert_eq!(queued_refs[0].id, attachment_id);
+        let snapshot = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.messages.len(), 3);
+        assert_eq!(snapshot.messages[2].body, "读取排队附件");
+        assert_eq!(snapshot.messages[2].quotes, captured);
+        assert_eq!(snapshot.messages[2].attachments.len(), 1);
+        assert!(snapshot.pending_inputs.items.is_empty());
+        let public_messages: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id = ?1",
+                [queued_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(public_messages, 0);
+
+        // A previously frozen finite budget still expires through the same service.
+        // This fixture owns a real Run, so also verify that expiry fences it once.
+        let accepted_at = chrono::Utc::now();
+        let finite = freeze_camp_turn_execution_budget(
+            Some(&crate::execution_budget::ThreadTurnExecutionBudgetRequest {
+                elapsed_seconds: Some(172_800),
+                max_agent_run_responsibilities: 32,
+                max_accepted_a2a: 16,
+            }),
+            accepted_at,
+            1,
+        )
+        .unwrap();
+        database.connection().execute(
+            "UPDATE camp_turn SET execution_budget_schema_version=?1,
+             execution_budget_deadline_at=?2,execution_budget_elapsed_seconds=?3,execution_budget_accepted_at=?4
+             WHERE id=(SELECT camp_turn_id FROM agent_run WHERE id=?5)",
+            params![finite.schema_version, finite.deadline_at, finite.elapsed_seconds, finite.accepted_at, queued_run_id],
+        ).unwrap();
+        let one_day = accepted_at + chrono::Duration::days(1);
+        assert!(
+            runtime
+                .expire_elapsed_camp_turn_execution_budgets(&mut database, one_day, one_day, 100)
+                .unwrap()
+                .is_empty()
+        );
+        let two_days = accepted_at + chrono::Duration::days(2);
+        let expired = runtime
+            .expire_elapsed_camp_turn_execution_budgets(&mut database, two_days, two_days, 100)
+            .unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].agent_runs_fenced, 1);
+        assert!(
+            runtime
+                .expire_elapsed_camp_turn_execution_budgets(&mut database, two_days, two_days, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unavailable_queue_head_needs_repair_and_blocks_later_single_chat_inputs() {
+        let (mut database, camp_id) = fixture();
+        let service = SingleChatService::default();
+        let runtime = ExecutionRuntimeService::default();
+        let (conversation_id, _) = open(
+            &service,
+            &mut database,
+            &camp_id,
+            "single-chat-open-pending-repair",
+        );
+        let first = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-repair-first",
+        );
+        let first_run_id = first.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source = database.directory().join("queued-missing.md");
+        std::fs::write(&source, b"remove before publish").unwrap();
+        let source_ref =
+            observe_source_attachment(&source, "queued-missing.md", Some("text/markdown")).unwrap();
+        let attachment_id = source_ref.id.clone();
+        service
+            .add_source_attachment(&mut database, &conversation_id, 1, source_ref)
+            .unwrap();
+        let head = service
+            .send(
+                &mut database,
+                &user_envelope(
+                    "single-chat-send-repair-head",
+                    Some(&camp_id),
+                    SendSingleChatMessageCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        body: "附件坏了仍可修复".to_string(),
+                        draft_revision: 2,
+                    },
+                ),
+            )
+            .unwrap();
+        let head_id = head.result.payload["pendingInputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let later = service
+            .send(
+                &mut database,
+                &user_envelope(
+                    "single-chat-send-repair-later",
+                    Some(&camp_id),
+                    SendSingleChatMessageCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        body: "后续排队消息".to_string(),
+                        draft_revision: 3,
+                    },
+                ),
+            )
+            .unwrap();
+        let later_id = later.result.payload["pendingInputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::remove_file(&source).unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1,
+                 started_at = updated_at WHERE id = ?1",
+                [&first_run_id],
+            )
+            .unwrap();
+        runtime
+            .succeed_agent_run(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "single-chat-repair-first-final".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-adapter:test".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: SucceedAgentRunCommand {
+                        agent_run_id: first_run_id,
+                        expected_version: 1,
+                        execution_epoch: 1,
+                        native_turn_id: "single-chat-repair-first-turn".to_string(),
+                        final_output: "第一轮完成".to_string(),
+                        missing_send_recovery_candidate: None,
+                        ending_git_observation: None,
+                    },
+                },
+            )
+            .unwrap();
+
+        let candidate = ready_pending_inputs(&database).unwrap().remove(0);
+        assert_eq!(candidate.pending_input_id, head_id);
+        let failure = service
+            .publish_pending_input(
+                &mut database,
+                &user_envelope(
+                    "single-chat-publish-missing-head",
+                    Some(&camp_id),
+                    candidate.clone(),
+                ),
+            )
+            .unwrap_err();
+        let failure_code = failure
+            .downcast_ref::<LocalAttachmentFailure>()
+            .expect("missing Source Attachment failure")
+            .code()
+            .as_str();
+        assert_eq!(failure_code, "attachment_missing");
+        record_pending_publish_failure(&database, &candidate, failure_code).unwrap();
+        assert!(ready_pending_inputs(&database).unwrap().is_empty());
+        let snapshot = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.pending_inputs.items[0].id, head_id);
+        assert_eq!(snapshot.pending_inputs.items[0].state, "needs_repair");
+        assert_eq!(snapshot.pending_inputs.items[1].id, later_id);
+        assert_eq!(snapshot.pending_inputs.items[1].state, "queued");
+
+        let begin = service
+            .edit_pending_input(
+                &mut database,
+                &user_envelope(
+                    "single-chat-begin-repair",
+                    Some(&camp_id),
+                    EditSingleChatPendingInputCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        pending_input_id: head_id.clone(),
+                        expected_revision: 1,
+                        edit_token: None,
+                        action: SingleChatPendingInputEditAction::Begin,
+                    },
+                ),
+            )
+            .unwrap();
+        let edit_token = begin.result.payload["editToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        service
+            .edit_pending_input(
+                &mut database,
+                &user_envelope(
+                    "single-chat-remove-repair-attachment",
+                    Some(&camp_id),
+                    EditSingleChatPendingInputCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        pending_input_id: head_id.clone(),
+                        expected_revision: 1,
+                        edit_token: Some(edit_token.clone()),
+                        action: SingleChatPendingInputEditAction::RemoveAttachment {
+                            attachment_ref_id: attachment_id,
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        service
+            .edit_pending_input(
+                &mut database,
+                &user_envelope(
+                    "single-chat-save-repair",
+                    Some(&camp_id),
+                    EditSingleChatPendingInputCommand {
+                        draft_client: Default::default(),
+                        camp_id: camp_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        pending_input_id: head_id.clone(),
+                        expected_revision: 1,
+                        edit_token: Some(edit_token),
+                        action: SingleChatPendingInputEditAction::Save {
+                            body: "附件已移除，继续发送".to_string(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        let ready = ready_pending_inputs(&database).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].pending_input_id, head_id);
+        assert_eq!(ready[0].expected_revision, 2);
+    }
+
+    #[test]
+    fn history_reads_only_messages_before_current_input_with_exclusive_pagination() {
+        let (mut database, camp_id) = fixture();
+        let service = SingleChatService::default();
+        let runtime = ExecutionRuntimeService::default();
+        let (conversation_id, _) = open(
+            &service,
+            &mut database,
+            &camp_id,
+            "single-chat-open-history",
+        );
+        let source = database.directory().join("history-input.md");
+        std::fs::write(&source, b"history attachment").unwrap();
+        let source_ref =
+            observe_source_attachment(&source, "history-input.md", Some("text/markdown")).unwrap();
+        let attachment_id = source_ref.id.clone();
+        service
+            .add_source_attachment(&mut database, &conversation_id, 0, source_ref)
+            .unwrap();
+        let first = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-history-first",
+        );
+        let first_run_id = first.result.payload["agentRunId"].as_str().unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1, started_at = updated_at WHERE id = ?1",
+                [first_run_id],
+            )
+            .unwrap();
+        let completed = runtime
+            .succeed_agent_run(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "single-chat-history-first-final".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-adapter:test".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: SucceedAgentRunCommand {
+                        agent_run_id: first_run_id.to_string(),
+                        expected_version: 1,
+                        execution_epoch: 1,
+                        native_turn_id: "single-chat-history-first-turn".to_string(),
+                        final_output: "第一轮回答".to_string(),
+                        missing_send_recovery_candidate: None,
+                        ending_git_observation: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(completed.result.status, CommandResultStatus::Applied);
+        let second = send(
+            &service,
+            &mut database,
+            &camp_id,
+            &conversation_id,
+            "single-chat-send-history-current",
+        );
+        let current_run_id = second.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1, started_at = updated_at WHERE id = ?1",
+                [&current_run_id],
+            )
+            .unwrap();
+
+        let state_before: (i64, i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT version, last_accepted_public_boundary_sequence, last_message_sequence FROM conversation WHERE id = ?1",
+                [&conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let newest = service
+            .history(
+                &database,
+                &current_run_id,
+                1,
+                &SingleChatHistoryInput {
+                    before_sequence: Some(999),
+                    limit: Some(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            newest,
+            SingleChatHistoryOutput {
+                schema_version: 2,
+                messages: vec![SingleChatHistoryMessage {
+                    quotes: Vec::new(),
+                    sequence: 2,
+                    role: "assistant".to_string(),
+                    body: "第一轮回答".to_string(),
+                    attachments: Vec::new(),
+                }],
+                has_more: true,
+                next_before_sequence: Some(2),
+            }
+        );
+        let older = service
+            .history(
+                &database,
+                &current_run_id,
+                1,
+                &SingleChatHistoryInput {
+                    before_sequence: newest.next_before_sequence,
+                    limit: Some(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(older.messages.len(), 1);
+        assert_eq!(older.messages[0].sequence, 1);
+        assert_eq!(older.messages[0].role, "user");
+        assert_eq!(
+            older.messages[0].attachments,
+            vec![LocalAttachmentHistoryView {
+                attachment_id,
+                name: "history-input.md".to_string(),
+                kind: "file".to_string(),
+                file_count: 1,
+                media_type: "text/markdown".to_string(),
+                byte_size: 18,
+            }]
+        );
+        assert!(!older.has_more);
+        assert_eq!(older.next_before_sequence, None);
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT version, last_accepted_public_boundary_sequence, last_message_sequence FROM conversation WHERE id = ?1",
+                    [&conversation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap(),
+            state_before,
+            "history must not mutate the Conversation or its public watermark"
+        );
+    }
+
+    #[test]
+    fn single_chat_skill_filter_uses_official_bundled_source_identity() {
+        let (database, _) = fixture();
+        let insert_skill = |database: &Database,
+                            skill_id: &str,
+                            revision_id: &str,
+                            skill_name: &str,
+                            revision_name: &str,
+                            origin: &str,
+                            source_type: &str,
+                            bundled: bool| {
+            database
+                .connection()
+                .execute(
+                    "INSERT INTO skill(id, name, origin, enabled, lifecycle_status, current_revision_id, version, created_at, updated_at) VALUES (?1, ?2, ?3, 1, 'active', NULL, 1, '2026-09-04', '2026-09-04')",
+                    params![skill_id, skill_name, origin],
+                )
+                .unwrap();
+            database
+                .connection()
+                .execute(
+                    "INSERT INTO skill_revision(id, skill_id, revision, name, description, source_type, source_metadata_json, content_digest, risk_summary_json, file_count, total_bytes, installed_at) VALUES (?1, ?2, 1, ?3, 'test', ?4, ?5, ?6, '{\"executableFileCount\":0,\"scriptFileCount\":0,\"binaryCandidateCount\":0,\"declaredTools\":[]}', 1, 1, '2026-09-04')",
+                    params![
+                        revision_id,
+                        skill_id,
+                        revision_name,
+                        source_type,
+                        serde_json::to_string(&json!({"bundled": bundled})).unwrap(),
+                        format!("sha256:{skill_id}"),
+                    ],
+                )
+                .unwrap();
+            database
+                .connection()
+                .execute(
+                    "UPDATE skill SET current_revision_id = ?2 WHERE id = ?1",
+                    params![skill_id, revision_id],
+                )
+                .unwrap();
+        };
+        insert_skill(
+            &database,
+            "skill-cli",
+            "revision-cli",
+            "cli-operations",
+            "cli-operations",
+            "official",
+            "bundled",
+            true,
+        );
+        insert_skill(
+            &database,
+            "skill-memory",
+            "revision-memory",
+            "memory-stewardship",
+            "memory-stewardship",
+            "official",
+            "bundled",
+            true,
+        );
+        insert_skill(
+            &database,
+            "skill-retained",
+            "revision-retained",
+            "analyze-agent-codebase",
+            "analyze-agent-codebase",
+            "official",
+            "bundled",
+            true,
+        );
+        insert_skill(
+            &database,
+            "skill-lookalike",
+            "revision-lookalike",
+            "imported-cli-lookalike",
+            "cli-operations",
+            "imported",
+            "local_folder",
+            false,
+        );
+        let entry = |skill_id: &str, name: &str, revision_id: &str| SkillExposureEntry {
+            skill_id: skill_id.to_string(),
+            name: name.to_string(),
+            revision_id: revision_id.to_string(),
+            content_digest: format!("sha256:{skill_id}"),
+            group_key: "codex".to_string(),
+            delivered_via_group_key: Some("codex".to_string()),
+            status: "ready".to_string(),
+            entry_path: Some(format!("/workspace/.codex/skills/{name}")),
+            reason_code: None,
+            conflict_statuses: Vec::new(),
+        };
+        let snapshot = SkillExposureSnapshot {
+            schema_version: 2,
+            skills: vec![
+                entry("skill-cli", "exposure-label-cli", "revision-cli"),
+                entry("skill-memory", "exposure-label-memory", "revision-memory"),
+                entry(
+                    "skill-retained",
+                    "analyze-agent-codebase",
+                    "revision-retained",
+                ),
+                entry("skill-lookalike", "cli-operations", "revision-lookalike"),
+            ],
+        };
+        let exposure = PreparedSkillExposure {
+            digest: canonical_json_digest(&serde_json::to_value(&snapshot).unwrap()).unwrap(),
+            snapshot,
+        };
+        let filtered = filter_single_chat_skill_exposure(&database, exposure).unwrap();
+        assert_eq!(
+            filtered
+                .snapshot
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["analyze-agent-codebase", "cli-operations"]
+        );
+        assert_eq!(
+            filtered.digest,
+            canonical_json_digest(&serde_json::to_value(&filtered.snapshot).unwrap()).unwrap()
+        );
+    }
+}

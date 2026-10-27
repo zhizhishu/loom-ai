@@ -1,0 +1,10 @@
+{
+  "realServer": true,
+  "actualUpdateInstall": false,
+  "runtime": false,
+  "checks": [
+    "server-hides-channels",
+    "server-only-native-update-entry",
+    "real-version"
+  ]
+}

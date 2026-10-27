@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="224" viewBox="0 0 560 224" role="img" aria-labelledby="title desc">
+  <title id="title">One Claude Code installation, two provider connections</title>
+  <desc id="desc">Teammate A and teammate B share a local Claude Code installation, each using their own environment variables to connect to Provider A and Provider B.</desc>
+  <rect x=".5" y=".5" width="559" height="223" rx="10" fill="#fff" stroke="#dfe3e6"/>
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" text-anchor="middle">
+    <text x="280" y="45" fill="#171b20" font-size="24" font-weight="600">Claude Code</text>
+    <path d="M280 63v29M140 110V92h280v18" fill="none" stroke="#afbdc7"/>
+    <g fill="#171b20" font-size="24" font-weight="550"><text x="140" y="144">Teammate A</text><text x="420" y="144">Teammate B</text></g>
+    <path d="M140 161v15m-4-4 4 4 4-4m276-11v15m-4-4 4 4 4-4" fill="none" stroke="#526f88" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <g fill="#526f88" font-size="22"><text x="140" y="206">Provider A</text><text x="420" y="206">Provider B</text></g>
+  </g>
+</svg>

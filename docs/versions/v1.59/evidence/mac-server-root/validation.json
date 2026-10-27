@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-13T07:23:46.996189+00:00",
+  "scope": "native Server installation and data-root acceptance",
+  "sourceCommit": "e1e73ca2f0f780d5c40caa3bd441231356db1057",
+  "target": "macos-arm64",
+  "version": "0.2.4",
+  "profile": "release",
+  "sourceDirty": false,
+  "qualification": "development-preview",
+  "archiveSha256": "54a7f060c91c4412a6d8c40ab3dc3616769ffbbeea6482a4165550f98b69feed",
+  "manifestSha256": "a116ca8523740f794b7665d0ca560d2f2f8fbbc615b556cd3b1e7fad1966b88a",
+  "hostSha256": "8ad420c52ba30c18a29dec650dba9644341aa91e8aa988a743d78ebf9e855212",
+  "uiEntrySha256": "edb94dad4a1c691453df1daf6eb6548989b49ef3f8f4763646396e756dd8dc37",
+  "checks": [
+    {
+      "command": "ROVAI_SERVER_BIN=<package>/rovai-server ROVAI_HOST_BIN=<package>/rovai-host ROVAI_WEB_UI=<package>/web-ui ROVAI_SERVER_RELEASE_DIR=<release-assets> node --test scripts/lib/server-entry.test.mjs",
+      "exitCode": 0,
+      "passed": 2,
+      "skipped": 0,
+      "assertions": [
+        "verified archive installation outside repository",
+        "runtime PATH excludes Node/pnpm",
+        "default and custom whole-root derivation",
+        "HTTP MCP mutation and Skill import",
+        "data and token retained after restart",
+        "second owner rejected",
+        "lost authority not reinitialized",
+        "legacy preview and Desktop resource roots rejected without modification",
+        "symlink ancestor rejected before directory preparation",
+        "parallel Desktop pipe Host retains MCP and Skill state during Server writes",
+        "Desktop Web opens the existing Desktop Host without creating standalone default data"
+      ]
+    },
+    {
+      "command": "node --test scripts/lib/server-install.test.mjs",
+      "exitCode": 0,
+      "passed": 1,
+      "skipped": 0,
+      "assertions": [
+        "repeat install and PATH deduplication",
+        "complete checksum before switch",
+        "replacement package preserves data",
+        "wrong target and symlink members rejected"
+      ]
+    },
+    {
+      "command": "ROVAI_HOST_BIN=<package>/rovai-host ROVAI_WEB_UI=<package>/web-ui node --test scripts/lib/host-lifecycle.test.mjs scripts/lib/host-web.test.mjs",
+      "exitCode": 0,
+      "passed": 4,
+      "skipped": 0
+    }
+  ],
+  "isolation": {
+    "channel": "automatic_acceptance",
+    "temporaryDataRoots": true,
+    "modelsCalled": false,
+    "dailyAppModified": false,
+    "tokensIncluded": false
+  },
+  "notEstablished": [
+    "official Release availability",
+    "Windows console shutdown",
+    "other platforms from this macOS result",
+    "clean-machine native dependency baseline",
+    "all Agent runtimes",
+    "signing and notarization",
+    "WebUI/CLI convenience updater"
+  ],
+  "buildChecks": {
+    "serverAndDesktopConcurrentBuildExitCodes": [
+      0,
+      0
+    ],
+    "webUiStaging": "separate temporary directory",
+    "sharedOutputRaceBeforeFix": "installer rejected the incomplete archive; no installed program switched"
+  }
+}

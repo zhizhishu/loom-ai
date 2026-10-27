@@ -1,0 +1,48 @@
+---
+document_type: postmortem-index
+authority: incident-history
+last_updated: 2026-10-10
+---
+
+# 事故复盘
+
+本目录保存重大故障与险情的无责复盘。复盘记录发布时能够取得的最佳证据，区分触发条件
+与系统性根因，并分配可测量的纠正措施。
+
+从 2026-08-26 起，本目录的复盘正文统一使用中文；代码符号、协议字段、外部产品名与无法准确
+翻译的技术标识保留原文。既有英文复盘已回译为中文。翻译不得改变事故事实、状态、数值、
+链接或纠正措施结论。
+
+## 受理队员的小结
+
+每份复盘的实际受理队员都必须在文档标题后、其他说明与 `## 摘要` 前留下自己的小结。
+受理队员是负责调查并交付本次复盘的队员；有多位队员共同受理时，每人各写一段。仅执行
+翻译、链接修复或排版维护的队员不因此新增小结。
+
+```md
+> **<队员名>的小结：** <用该队员自己的语气写 2–4 句>
+```
+
+小结应先说明直接结论、系统性根因，以及最重要的修复方向或适用边界，再用该队员稳定的
+表达风格帮助读者记住事故。风格可以有性格，但其中的事实必须能由正文证据支持，不得弱化
+不确定性、归咎个人，或改变正文中的证据、状态和当前架构说明。
+
+完成标准：标题后为每位实际受理队员提供一段署名与语气相符的小结，且小结中的事实均可由
+正文证据支持。
+
+复盘是历史证据。架构要求应写入当前 Architecture/Contract 及相应决定理由；当前交付
+状态属于当前版本文档；实现主张必须由代码与可复现验证支持。复盘不能替代这些当前权威。
+
+| 事故日期 | 事故 | 状态 |
+|---|---|---|
+| 2026-08-05 | [Codex MCP 配置冲突与 AgentRun 启动失败](2026-08-05-codex-mcp-configuration-collision.md) | 已关闭；继续跟踪后续措施 |
+| 2026-08-25 | [已回滚的 Camp 清理写入意图阻断 AgentRun 准入](2026-08-25-rolled-back-camp-cleanup-writer-intent.md) | 已关闭；继续跟踪后续措施 |
+| 2026-08-25 | [Codex 命令输出增量放大阻断 Camp 打开与恢复](2026-08-25-codex-command-output-delta-camp-open-amplification.md) | 已关闭；继续跟踪后续措施 |
+| 2026-08-26 | [Windows Codex Runtime 发现与验收隔离缺口](2026-08-26-windows-codex-runtime-discovery-and-acceptance-isolation.md) | 已关闭；继续跟踪后续措施 |
+| 2026-08-26 | [Gather 完成投递缺少公开因果展示，导致 A2A 调度误判](2026-08-26-gather-completion-causal-handoff-not-visible.md) | 事实调查已关闭；展示改进待跟踪 |
+| 2026-08-26 | [Camp Composer 行尾换行破坏中文输入法首字符组合](2026-08-26-composer-ime-trailing-newline-caret-host.md) | 已关闭；继续跟踪自动化覆盖 |
+| 2026-08-27 | [Camp 附件发布等待活跃 AgentRun，阻断带附件 A2A](2026-08-27-camp-attachment-publication-blocked-a2a.md) | 主链修复已实现；完整隔离与合并门禁仍在收口 |
+| 2026-08-27 | [Camp Composer 剪切事务未托管导致原生输入快照串接](2026-08-27-composer-cut-stale-dom-duplicate-input.md) | 主路径修复已合入；CI 门禁、属性名对齐与补充场景覆盖待跟踪 |
+| 2026-08-31 | [渠道轮询回调永久写库导致磁盘持续占用，升级路径放大为整库复制](2026-08-31-channel-poll-receipt-storage-growth.md) | 主链修复在 channel 分支完成；历史数据治理与合入 main 待跟踪 |
+| 2026-10-09 | [Windows Claude Code 回复完成后，后继 Run 长期排队](2026-10-09-windows-claude-queue-cleanup-stall.md) | 已确认缺陷已修复并纳入 v0.4.7；补充平台与模型覆盖待跟踪 |
+| 2026-10-09—10 | [DSH 模型配置不可见、思考档位错配与加载结果被覆盖](2026-10-09-dsh-model-configuration-and-reasoning.md) | 已确认缺陷已修复并纳入 v0.4.7；安装版 Windows 交互与独立来源重选问题继续跟踪 |

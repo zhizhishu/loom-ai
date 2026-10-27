@@ -1,0 +1,294 @@
+{
+  "recordedAtUtc": "2026-10-16T11:27:17.144428+00:00",
+  "baseCommit": "3979e32ec4834ce5fc02cd72309bbd7b5cd800c6",
+  "branch": "rovai/minimax-code-acp",
+  "platform": "macos_arm64",
+  "runtime": {
+    "package": "@minimax-ai/code",
+    "version": "0.6.12",
+    "packageManifestSha256": "4a3ae2ec80d972b50eb942d9873d4c1c7899cf3dfe0d926a03bc356d03308cfe",
+    "acpBundleSha256": "ee812da54ecd1021855bb004b31e0192b5a384c88dc2e62f92c34f7ed9a52efc"
+  },
+  "coreBinarySha256": "6f5c4fc5fdba6dbb656f828f272d6283b9e539b16532e01c54710e7779696978",
+  "productAdmission": {
+    "macos_arm64": "preview",
+    "otherPlatforms": "not_qualified",
+    "reason": "qualification_evidence_missing",
+    "evidenceRevision": null,
+    "firstClass": false
+  },
+  "controlledAcceptance": {
+    "kind": "real-installed-cli-with-scripted-loopback-model-provider",
+    "scope": "production Core, real mcode, native tools and MCP; not real-model qualification",
+    "status": "passed",
+    "caseCount": 23,
+    "cases": [
+      {
+        "name": "A",
+        "status": "passed"
+      },
+      {
+        "name": "B",
+        "status": "passed"
+      },
+      {
+        "name": "warm Host reuse",
+        "status": "passed"
+      },
+      {
+        "name": "C",
+        "status": "passed"
+      },
+      {
+        "name": "cold exact native binding resume",
+        "status": "passed"
+      },
+      {
+        "name": "journal input/output/cache observed on active exact Session",
+        "status": "passed"
+      },
+      {
+        "name": "live Steer stays in original Run",
+        "status": "passed"
+      },
+      {
+        "name": "Steer image path + native read reaches provider as image",
+        "status": "passed"
+      },
+      {
+        "name": "assigned MCP actual call after cold resume and Steer retirement",
+        "status": "passed"
+      },
+      {
+        "name": "NO_MCP",
+        "status": "passed"
+      },
+      {
+        "name": "MCP removal fences stale tools while preserving Session",
+        "status": "passed"
+      },
+      {
+        "name": "command output STDOUT",
+        "status": "passed"
+      },
+      {
+        "name": "command output STDERR",
+        "status": "passed"
+      },
+      {
+        "name": "command output EMPTY",
+        "status": "passed"
+      },
+      {
+        "name": "command output NONZERO",
+        "status": "passed"
+      },
+      {
+        "name": "command output LARGE",
+        "status": "passed"
+      },
+      {
+        "name": "native permission ALLOW",
+        "approvals": 1,
+        "status": "passed"
+      },
+      {
+        "name": "native permission DENY",
+        "approvals": 1,
+        "status": "passed"
+      },
+      {
+        "name": "cancel held native command and reap its process",
+        "status": "passed"
+      },
+      {
+        "name": "structured command stdout + stderr",
+        "status": "passed"
+      },
+      {
+        "name": "MISSING_SESSION",
+        "status": "passed"
+      },
+      {
+        "name": "exact missing native Session creates replacement before dispatch",
+        "status": "passed"
+      },
+      {
+        "name": "zero-send recovery and accepted-send suppression",
+        "status": "passed"
+      }
+    ],
+    "runStatusCounts": {
+      "cancelled": 1,
+      "succeeded": 14
+    },
+    "bootstrap": {
+      "mainModelRequests": 31,
+      "exactlyOneSystemCharter": true,
+      "dynamicContextInUser": true
+    },
+    "steer": {
+      "sameRun": true,
+      "textReachedSubsequentRequest": true,
+      "authorizedImagePathAndImageBlockReachedProvider": true,
+      "visualUnderstanding": "not tested"
+    },
+    "usage": {
+      "fields": "uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens",
+      "scope": "exact root native Session, asynchronous per-Prompt baseline and poll",
+      "runsWithNumericObservation": 5,
+      "runsWithoutNumericObservation": 10,
+      "observedValues": [
+        {
+          "uncached_input_tokens": 100,
+          "cache_read_tokens": 20,
+          "cache_write_tokens": 0,
+          "output_tokens": 5
+        },
+        {
+          "uncached_input_tokens": 200,
+          "cache_read_tokens": 40,
+          "cache_write_tokens": 0,
+          "output_tokens": 10
+        }
+      ],
+      "limitation": "Short Runs and final tail can be absent; not complete billed totals. No inferred Run cost."
+    },
+    "coreExitCode": 0,
+    "privateRawReportSha256": "006ff692518164bf755994ccb0d367b361170fae73fc3a0ee9cf61358e1c58f5"
+  },
+  "realAccount": {
+    "status": "blocked",
+    "stage": "session/new",
+    "nativeCode": -32000,
+    "error": "Authentication required: Run mcode login and try again.",
+    "modelGenerationCompleted": false,
+    "nativeUserConfigurationChanged": false
+  },
+  "automatedChecks": [
+    {
+      "command": "cargo test -p rovai-core --lib",
+      "status": "passed",
+      "passed": 427,
+      "ignored": 1,
+      "scope": "broad regression before final MiniMax output/pairing refinement; targeted owners rerun after refinement"
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests native_",
+      "status": "passed",
+      "passed": 64,
+      "ignored": 1
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests runtime_catalog_migrations_preserve_rows_and_roll_back_with_their_receipts",
+      "status": "passed",
+      "passed": 1
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests migration_sources_converge_without_reinterpreting_migration_199",
+      "status": "passed",
+      "passed": 1
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests acp_rpc_error_keeps_only_allowlisted_bounded_fields",
+      "status": "passed",
+      "passed": 1
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests acp_bypass_modes_auto_allow_protocol_permission_requests",
+      "status": "passed",
+      "passed": 1
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests active_input_receipts_preserve_the_original_prompt_and_fence_late_sources",
+      "status": "passed",
+      "passed": 1
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests paired_tools_accept_permission_only_denial_without_crossing_session_or_prompt",
+      "status": "passed",
+      "passed": 1
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests acp_command_output_uses_standard_content_and_allowlisted_raw_fallbacks",
+      "status": "passed",
+      "passed": 1
+    },
+    {
+      "command": "cargo check -p rovai-core --all-targets --features extended-tests",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build -p rovai-core --bins",
+      "status": "passed"
+    },
+    {
+      "command": "pnpm exec vitest run apps/desktop/src/renderer/src/MemberRuntimeParameters.test.ts apps/desktop/src/renderer/src/runtime-model-presentation.test.ts",
+      "status": "passed",
+      "passed": 37
+    },
+    {
+      "command": "pnpm typecheck",
+      "status": "passed"
+    },
+    {
+      "command": "pnpm docs:test",
+      "status": "passed",
+      "passed": 10
+    },
+    {
+      "command": "pnpm docs:check",
+      "status": "passed"
+    },
+    {
+      "command": "DOCS_BASE_REF=3979e32ec4834ce5fc02cd72309bbd7b5cd800c6 pnpm docs:check:ci",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "failedAttemptsAndFixes": [
+    {
+      "issue": "Native new/resume rejects additionalDirectories",
+      "resolution": "Omit unsupported extension only for MiniMax"
+    },
+    {
+      "issue": "Some advertised model variants reject config selection",
+      "resolution": "Keep native catalog/default; skip failed per-model option probes and verify explicit selection ACK"
+    },
+    {
+      "issue": "Permission ID differs from tool ID; subsequent input is JSON string and sparse updates omit name",
+      "resolution": "Unique full-proposal match within exact Session/Prompt, retained alias; ambiguity fails closed"
+    },
+    {
+      "issue": "Terminal command content and exit status were omitted by generic field reader",
+      "resolution": "Read allowlisted rawOutput.content and details.execution.exitCode; all six output cases passed"
+    },
+    {
+      "issue": "Image-capability flag missing from test Provider",
+      "resolution": "Configure native support-image; actual image block reaches model provider"
+    },
+    {
+      "issue": "Existing execution-storage fixture stopped at schema 154 after new migration",
+      "resolution": "Append migration 205 in existing upgrade helpers; broad regression passed afterward"
+    }
+  ],
+  "remainingQualification": [
+    "real-account model generation and real-model image/Steer behavior",
+    "manual/threshold/overflow compaction, cancellation and post-compaction cold resume",
+    "managed/native Skill invocation, updates, deletion and cross-Session isolation",
+    "full bundled CLI operation set",
+    "credential/Provider refresh and complete workspace, MCP concurrency and collision matrix",
+    "complete crash, protocol-error, timeout, retry, late-event and LRU cleanup matrix",
+    "complete Usage tail/retry/compaction attribution evidence",
+    "macOS x64, Windows and Linux qualification"
+  ],
+  "cleanup": {
+    "ownedCoreProcessesRemaining": 0,
+    "copiedNativeCredentialsRemoved": true,
+    "ephemeralRuntimeFileRootsRemoved": 11,
+    "privateFixtureReportsRetained": true
+  }
+}

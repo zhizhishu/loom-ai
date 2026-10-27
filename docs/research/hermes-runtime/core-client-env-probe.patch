@@ -1,0 +1,99 @@
+diff --git a/crates/rovai-core/src/acp.rs b/crates/rovai-core/src/acp.rs
+index 7a7a06012..e00280218 100644
+--- a/crates/rovai-core/src/acp.rs
++++ b/crates/rovai-core/src/acp.rs
+@@ -4365 +4365,4 @@ impl AcpHost {
+-        let params = json!({"sessionId": session_id, "prompt": [{"type":"text", "text":text}]});
++        let mut params = json!({"sessionId": session_id, "prompt": [{"type":"text", "text":text}]});
++        if self.adapter_kind == AdapterKind::HermesCli {
++            params["_meta"] = json!({"hermes.clientEnv": ["PATH", "ROVAI_CLI_CONTEXT", "ROVAI_AGENT_CLI", "ROVAI_RUN_TMP"]});
++        }
+@@ -5216,14 +5218,0 @@ impl AcpRuntime {
+-        if self.host.adapter_kind == AdapterKind::HermesCli && prebound_session {
+-            // Restore first. MCP revocation is an idle-only preparation; a native
+-            // blocker must not discard or replace the successfully restored Session.
+-            let state = self
+-                .host
+-                .hermes_control(
+-                    "prepare_session",
+-                    json!({"sessionId":session_id,"mcpServers":mcp_servers}),
+-                )
+-                .await?;
+-            if let Some(result) = self.session_result.write().await.as_mut() {
+-                result["_meta"]["rovaiHermesState"] = state;
+-            }
+-        }
+diff --git a/crates/rovai-core/src/hermes.rs b/crates/rovai-core/src/hermes.rs
+index 206797960..c1fe30c41 100644
+--- a/crates/rovai-core/src/hermes.rs
++++ b/crates/rovai-core/src/hermes.rs
+@@ -53,65 +53,4 @@ pub async fn configure_command(command: &mut Command, root: &Path, storage: &Pat
+-    let native = command.as_std();
+-    let launcher = native.get_program().to_owned();
+-    ensure!(
+-        native.get_args().next().is_none(),
+-        "Hermes entry must be configured before arguments"
+-    );
+-    let environment: Vec<_> = native
+-        .get_envs()
+-        .map(|(k, v)| (k.to_owned(), v.map(ToOwned::to_owned)))
+-        .collect();
+-    let cwd = native.get_current_dir().map(ToOwned::to_owned);
+-    let mut resolver = Command::new(native.get_program());
+-    resolver
+-        .arg("--print-runtime-command")
+-        .stdin(Stdio::null())
+-        .kill_on_drop(true);
+-    for (key, value) in &environment {
+-        if let Some(value) = value {
+-            resolver.env(key, value);
+-        } else {
+-            resolver.env_remove(key);
+-        }
+-    }
+-    resolver.env("HERMES_DISABLE_LAZY_INSTALLS", "1");
+-    if let Some(cwd) = &cwd {
+-        resolver.current_dir(cwd);
+-    }
+-    let output = crate::runtime_probe_process::run_bounded_command(
+-        &mut resolver,
+-        crate::runtime_probe_process::ProbeCommandLimits::new(Duration::from_secs(30)),
+-    )
+-    .await
+-    .context("Hermes launcher resolution failed")?;
+-    ensure!(
+-        output.status.success() && !output.stdout.truncated,
+-        "Hermes launcher resolution failed"
+-    );
+-    let argv: Vec<String> = serde_json::from_slice(&output.stdout.bytes)
+-        .context("Hermes launcher response is invalid")?;
+-    let root = crate::platform::private_storage::prepare_private_directory(root)?;
+-    let script = root.join("host.py");
+-    fs::write(&script, HOST)?;
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::PermissionsExt;
+-        fs::set_permissions(&script, fs::Permissions::from_mode(0o600))?;
+-    }
+-    let argv = managed_argv(argv, &script)?;
+-    let mut managed = Command::new(&argv[0]);
+-    managed.args(&argv[1..]);
+-    for (key, value) in environment {
+-        if let Some(value) = value {
+-            managed.env(key, value);
+-        } else {
+-            managed.env_remove(key);
+-        }
+-    }
+-    if let Some(cwd) = cwd {
+-        managed.current_dir(cwd);
+-    }
+-    let storage = crate::platform::private_storage::prepare_private_directory(storage)?;
+-    managed.env("ROVAI_HERMES_LAUNCHER", launcher);
+-    managed.env("HERMES_DISABLE_LAZY_INSTALLS", "1");
+-    managed.env("ROVAI_HERMES_STORAGE", storage);
+-    *command = managed;
++    let _ = (root, storage);
++    command.args(["--profile", "default", "acp"]);
++    command.env_remove("ROVAI_HERMES_STORAGE");
++    command.env_remove("ROVAI_HERMES_COMPACTION_HOOK");

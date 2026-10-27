@@ -1,0 +1,51 @@
+---
+document_type: interface-contract
+contract: camp-composer-draft
+version: 13
+status: accepted
+authority: camp-composer-draft-client-ownership
+last_updated: 2026-09-12
+---
+
+# Camp Composer Draft v13
+
+v13 inherits [v12](camp-composer-draft-v12.md)'s document, exact-revision mutation, send, navigation and Desktop close
+contracts. It adds Host-verified editing clients, without synchronization, merging or collaborative editing.
+
+Core Draft identity is `(campId, clientId)`. Legacy Desktop uses the reserved `desktop` scope and retains its existing
+wire/consumption semantics. Web receives a stable `draftId` derived from Camp and verified editor; an HTTP parameter
+cannot select another client. [Host Web v2](host-web-v2.md) owns fresh authentication and editor-proof recovery.
+
+The scope applies to reads, content/reply/continuation/quote mutations, source binding/removal, pending admission and
+send consumption. Command digests include a non-Desktop editor identity; historical Desktop digests are unchanged.
+Successful send/queue/discard clears only the Web client's content and advances its revision. Empty metadata remains,
+including at expiry, so an old revision cannot become valid again after clear/recreate. Desktop A and Web B/C neither
+consume nor overwrite one another's Drafts. Accepted source files keep Attachment v9's OS-controlled lifetime.
+
+Migration 153 accepts the exact v1.58/projection-102/receipt-152 source, preserves existing Desktop rows and Prepared
+references, creates composite ownership keys, and records v1.59/projection-103 atomically. Receipt failure rolls back
+DDL/data; partial or lookalike schemas are not current. Old binaries cannot admit the new marker.
+
+The earlier task-branch v1.59/projection-100/receipt-150 client schema is admitted only with its exact
+composite keys and editor proof schema. One transaction renumbers its receipt to 153, applies upstream
+DingTalk nullable-name and Runtime startup and model-catalog migrations 150/151/152, and seals the new marker. Editor proofs,
+Draft IDs and content survive; failure rolls back schema, receipt and marker together.
+
+Within one page, reconnect and same-Owner reauthentication preserve the mounted editor and outstanding command IDs.
+They update authentication generations and reauthorize reads, not Draft identity. A different Host/Owner/editor scope
+cannot consume late results from the old scope. Renderer interaction/selection/history remain local.
+
+Conversation-scoped private-chat Drafts must receive equivalent ownership before network private-chat writes are
+admitted. Their current lack of Web admission is an implementation gap, not a permanent platform restriction.
+
+## Pending withdrawal
+
+[Pending Camp Input v4](pending-camp-input-v4.md) adds an explicit overwrite from canonical Pending content into the
+caller’s Host-verified ordinary Draft. Other clients’ Drafts are not read, replaced or consumed.
+
+Draft Mutation Coordinator serializes `return_pending_input` after prior Draft mutations and uses the latest
+Draft revision. Only a successful Core withdrawal and authoritative Draft read replace the editor. The ordinary
+Draft identity, autosave and attachment/quote/reply UI own all subsequent editing; there is no Pending edit identity,
+separate local navigation snapshot or save/cancel mode. A failed/unknown post-commit read requires reload before
+local typing or sending can resume. Exact pending and Draft revision fences, replay and legacy session compatibility
+are owned by Pending v4.

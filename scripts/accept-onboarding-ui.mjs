@@ -1,0 +1,766 @@
+import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { spawn, spawnSync } from 'node:child_process'
+import { assertUserDataIsIsolated } from './lib/dev-desktop.mjs'
+
+const root = resolve(import.meta.dirname, '..')
+const appPath = resolve(process.argv[2] ?? join(root, 'dist', 'mac-arm64', 'Rovai AI.app'))
+const fixtureRoot = resolve(process.env.ROVAI_ONBOARDING_ACCEPT_FIXTURE_ROOT
+  ?? await mkdtemp(join(tmpdir(), 'rovai-onboarding-ui-accept-')))
+const dataDir = assertUserDataIsIsolated(join(fixtureRoot, 'user-data'))
+const electronUserDataDir = process.platform === 'win32'
+  ? join(dataDir, 'Electron', 'User Data')
+  : dataDir
+const coreDataDir = process.platform === 'win32'
+  ? join(dataDir, 'Core')
+  : dataDir
+const outputDir = resolve(process.env.ROVAI_ONBOARDING_ACCEPT_OUTPUT_DIR
+  ?? join(fixtureRoot, 'captures'))
+const firstPort = Number(process.env.ROVAI_ONBOARDING_ACCEPT_DEBUG_PORT ?? 9489)
+const width = 1040
+const height = 700
+const selectedRole = 'qilu'
+const initialLanguage = process.env.ROVAI_ONBOARDING_ACCEPT_INTERFACE_LANGUAGE ?? 'zh-CN'
+assert(['zh-CN', 'en'].includes(initialLanguage), 'Unsupported onboarding interface language')
+const englishCopy = JSON.parse(await readFile(join(root, 'apps/desktop/src/renderer/src/locales/en.json'), 'utf8'))
+const initialCopy = (text) => initialLanguage === 'en' ? englishCopy[text] ?? text : text
+const expectedStarter = initialCopy('我想创建一个新的队员，请用 member-studio 帮我开始。')
+
+class ExpectedWindowsPlatformAdmissionBlock extends Error {}
+
+if (process.platform !== 'win32') await mkdir(dataDir, { recursive: true })
+await mkdir(outputDir, { recursive: true })
+
+let running = null
+const captures = {}
+const report = {
+  schemaVersion: 1,
+  appPath,
+  fixtureRoot,
+  dataDir,
+  outputDir,
+  viewport: { width, height },
+  selectedRole,
+  initialLanguage,
+  runtime: null,
+  onboarding: null,
+  camp: null,
+  draft: null,
+  captures
+}
+
+try {
+  running = await launchApp(firstPort)
+  await waitForSelector(running.cdp, '.onboarding-welcome', 45_000)
+  await setTheme(running.cdp, 'day')
+  const welcome = await surfaceState(running.cdp, '.onboarding-welcome')
+  assert(welcome.visible && welcome.primaryVisible && welcome.primaryEnabled,
+    `Welcome primary action is not visible: ${JSON.stringify(welcome)}`)
+  assert(!welcome.hasSkip && !welcome.hasStepNavigation && !welcome.horizontalOverflow,
+    `Welcome exposes a skip/progress control or overflows: ${JSON.stringify(welcome)}`)
+  await assertProgress(running.cdp, 1)
+  captures.welcomeDay = join(outputDir, '01-welcome-day-1040x700.png')
+  await capture(running.cdp, captures.welcomeDay)
+
+  await clickSelector(running.cdp, '.onboarding-language input[value="en"]')
+  await waitForExpression(running.cdp,
+    `document.documentElement.lang === 'en' && document.querySelector('#onboarding-welcome-title')?.textContent === 'Welcome to Rovai'`)
+  const englishWelcome = await surfaceState(running.cdp, '.onboarding-welcome')
+  assert(englishWelcome.visible && englishWelcome.primaryVisible && !englishWelcome.horizontalOverflow,
+    `English welcome is clipped or overflows: ${JSON.stringify(englishWelcome)}`)
+  captures.welcomeEnglishDay = join(outputDir, '01-welcome-english-day-1040x700.png')
+  await capture(running.cdp, captures.welcomeEnglishDay)
+  await setTheme(running.cdp, 'night')
+  captures.welcomeEnglishNight = join(outputDir, '02-welcome-english-night-1040x700.png')
+  await capture(running.cdp, captures.welcomeEnglishNight)
+  await clickSelector(running.cdp, '.onboarding-language input[value="zh-CN"]')
+  await waitForExpression(running.cdp,
+    `document.documentElement.lang === 'zh-CN' && document.querySelector('#onboarding-welcome-title')?.textContent === '欢迎来到 Rovai'`)
+
+  captures.welcomeNight = join(outputDir, '02-welcome-night-1040x700.png')
+  await capture(running.cdp, captures.welcomeNight)
+  await setTheme(running.cdp, 'day')
+  if (initialLanguage === 'en') {
+    await clickSelector(running.cdp, '.onboarding-language input[value="en"]')
+    await waitForExpression(running.cdp, `document.documentElement.lang === 'en'`)
+  }
+
+  await clickByText(running.cdp, '.onboarding-welcome button', initialCopy('选择队员'))
+  await waitForSelector(running.cdp, '.onboarding-member-layout', 5_000)
+  const memberPage = await evaluate(running.cdp, `(() => ({
+    rows: document.querySelectorAll('.onboarding-member-row').length,
+    portraits: document.querySelectorAll('.onboarding-selected-portrait').length,
+    hasSkip: ['跳过', 'Skip'].some((text) => document.body.textContent?.includes(text)),
+    hasStepNavigation: Boolean(document.querySelector('.onboarding-step, .onboarding-progress button, .onboarding-progress a')),
+    horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth,
+    viewport: [window.innerWidth, window.innerHeight]
+  }))()`)
+  assert(memberPage.rows === 4 && memberPage.portraits === 1,
+    `Member page is not one portrait plus four text rows: ${JSON.stringify(memberPage)}`)
+  assert(!memberPage.hasSkip && !memberPage.hasStepNavigation && !memberPage.horizontalOverflow,
+    `Member page exposes skip/progress or overflows: ${JSON.stringify(memberPage)}`)
+  await assertProgress(running.cdp, 2)
+  assert(memberPage.viewport[0] === width && memberPage.viewport[1] === height,
+    `Member page viewport is not ${width}x${height}: ${JSON.stringify(memberPage.viewport)}`)
+  captures.memberDay = join(outputDir, '03-member-day-1040x700.png')
+  await capture(running.cdp, captures.memberDay)
+
+  await evaluate(running.cdp, `document.querySelector('.onboarding-member-row[aria-checked="true"]').focus()`)
+  await running.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'End', code: 'End', windowsVirtualKeyCode: 35 })
+  await running.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'End', code: 'End', windowsVirtualKeyCode: 35 })
+  await waitForExpression(running.cdp, `(() => {
+    const row = document.querySelector('.onboarding-member-row[data-member-role="qilu"]')
+    return row?.getAttribute('aria-checked') === 'true' && row?.getAttribute('aria-disabled') !== 'true'
+      && document.activeElement === row
+  })()`)
+  await setTheme(running.cdp, 'night')
+  captures.memberNight = join(outputDir, '03-member-night-1040x700.png')
+  await capture(running.cdp, captures.memberNight)
+  await setTheme(running.cdp, 'day')
+
+  await clickSelector(running.cdp, `.onboarding-member-row[data-member-role="${selectedRole}"]`)
+  await waitForExpression(running.cdp,
+    `document.querySelector('.onboarding-member-row[data-member-role="${selectedRole}"]')?.getAttribute('aria-checked') === 'true'`)
+  await closeApp(running)
+  running = null
+
+  running = await launchApp(firstPort + 1)
+  await waitForSelector(running.cdp, '.onboarding-member-layout', 45_000)
+  const resumedMember = await evaluate(running.cdp, `({
+    selected: document.querySelector('.onboarding-member-row[aria-checked="true"]')?.dataset.memberRole,
+    welcomeAbsent: !document.querySelector('.onboarding-welcome')
+  })`)
+  assert(resumedMember.selected === selectedRole && resumedMember.welcomeAbsent,
+    `Restart did not resume the unfinished member page: ${JSON.stringify(resumedMember)}`)
+  await clickByText(running.cdp, '.onboarding-member-footer button', initialCopy('下一步'))
+  await waitForSelector(running.cdp, '.onboarding-runtime-track', 5_000)
+  await assertProgress(running.cdp, 3)
+  captures.runtimeScan = join(outputDir, '04-runtime-scan-day-1040x700.png')
+  await capture(running.cdp, captures.runtimeScan)
+  await waitForSelector(running.cdp, '.onboarding-runtime-list, .onboarding-runtime-empty', 120_000)
+  const runtimeAvailability = await evaluate(running.cdp, `
+    [...document.querySelectorAll('.onboarding-runtime-row')].map((row) => ({
+      label: row.querySelector('strong')?.textContent?.trim(),
+      status: row.querySelector('.onboarding-runtime-state')?.textContent?.trim(),
+      className: row.querySelector('.onboarding-runtime-state')?.className,
+      disabled: row.disabled
+    }))`)
+  captures.runtimeReadyDay = join(outputDir, '05-runtime-ready-day-1040x700.png')
+  await capture(running.cdp, captures.runtimeReadyDay)
+  await setTheme(running.cdp, 'night')
+  captures.runtimeReadyNight = join(outputDir, '05-runtime-ready-night-1040x700.png')
+  await capture(running.cdp, captures.runtimeReadyNight)
+  await setTheme(running.cdp, 'day')
+  const usableRuntime = runtimeAvailability.some((runtime) => (
+    runtime.className?.includes('status-available')
+    || runtime.className?.includes('status-installed_unverified')
+  ))
+  if (!usableRuntime
+      && process.env.ROVAI_ONBOARDING_ALLOW_PLATFORM_BLOCKED === '1'
+      && runtimeAvailability.length > 0
+      && runtimeAvailability.every((runtime) => (
+        runtime.disabled && runtime.className?.includes('status-not_qualified')
+      ))) {
+    report.runtime = {
+      platformBlocked: true,
+      reason: 'runtime_platform_not_qualified',
+      availability: runtimeAvailability
+    }
+    throw new ExpectedWindowsPlatformAdmissionBlock(
+      'Windows Runtime platform admission correctly blocked onboarding continuation'
+    )
+  }
+  assert(usableRuntime,
+    `No usable Runtime was available for packaged acceptance: ${JSON.stringify(runtimeAvailability)}`)
+  if (runtimeAvailability.some((runtime) => !runtime.disabled)) {
+    await evaluate(running.cdp, `document.querySelector('.onboarding-runtime-row:not(:disabled)').focus()`)
+    await running.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Home', code: 'Home', windowsVirtualKeyCode: 36 })
+    await running.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Home', code: 'Home', windowsVirtualKeyCode: 36 })
+    await waitForExpression(running.cdp, `(() => {
+      const row = document.querySelector('.onboarding-runtime-row:not(:disabled)')
+      return row?.getAttribute('aria-checked') === 'true' && row?.getAttribute('aria-disabled') !== 'true'
+        && document.activeElement === row
+    })()`)
+  }
+  const runtimeChoice = await evaluate(running.cdp, `(() => {
+    const rows = [...document.querySelectorAll('.onboarding-runtime-row')]
+    const available = rows.filter((row) => row.querySelector('.status-available'))
+    const unverified = rows.filter((row) => row.querySelector('.status-installed_unverified'))
+    const candidates = available.length > 0 ? available : unverified
+    const row = candidates.find((candidate) => candidate.textContent?.includes('Codex CLI')) ?? candidates[0]
+    if (!row || row.disabled) return null
+    const result = {
+      label: row.querySelector('strong')?.textContent?.trim(),
+      status: row.querySelector('.onboarding-runtime-state')?.textContent?.trim()
+    }
+    row.click()
+    return result
+  })()`)
+  assert(runtimeChoice,
+    `No usable Runtime was available for packaged acceptance: ${JSON.stringify(runtimeAvailability)}`)
+  report.runtime = { ...runtimeChoice, availability: runtimeAvailability }
+  await waitForExpression(running.cdp,
+    `document.querySelector('.onboarding-runtime-footer .onboarding-primary')?.disabled === false`,
+    10_000)
+  const runtimeSnapshot = await onboardingGet(running.cdp)
+  assert(runtimeSnapshot.status === 'in_progress'
+    && runtimeSnapshot.step === 'runtime'
+    && runtimeSnapshot.selectedMemberRole === selectedRole
+    && runtimeSnapshot.runtimeSelection,
+  `Runtime choice was not durably saved: ${JSON.stringify(runtimeSnapshot)}`)
+  await closeApp(running)
+  running = null
+
+  running = await launchApp(firstPort + 2)
+  await waitForSelector(running.cdp, '.onboarding-runtime-track', 45_000)
+  await waitForSelector(running.cdp, '.onboarding-runtime-list', 120_000)
+  await waitForExpression(running.cdp,
+    `document.querySelector('.onboarding-runtime-row[aria-checked="true"]')
+      && document.querySelector('.onboarding-runtime-footer .onboarding-primary')?.disabled === false`,
+    15_000)
+  const resumedRuntime = await onboardingGet(running.cdp)
+  assert(resumedRuntime.status === 'in_progress'
+    && resumedRuntime.step === 'runtime'
+    && resumedRuntime.runtimeSelection?.adapterKind === runtimeSnapshot.runtimeSelection.adapterKind,
+  `Restart did not resume the unfinished Runtime page: ${JSON.stringify(resumedRuntime)}`)
+  await clickByText(running.cdp, '.onboarding-runtime-footer button', initialCopy('开始对话'))
+  await waitForExpression(running.cdp,
+    `Boolean(document.querySelector('.camp-timeline:not([hidden]) .first-run-camp-welcome'))`,
+    60_000)
+
+  const completed = await onboardingGet(running.cdp)
+  assert(completed.status === 'completed'
+    && completed.origin === 'onboarding'
+    && completed.selectedMemberRole === selectedRole
+    && completed.quickChatThreadId
+    && completed.memberAgentId,
+  `Page three did not complete onboarding: ${JSON.stringify(completed)}`)
+  report.onboarding = completed
+  const member = await request(running.cdp, 'members.get', { agentId: completed.memberAgentId })
+  const expectedPreset = await readInitialPreset(selectedRole)
+  for (const field of ['displayName', 'teamRole', 'professionalResponsibilities', 'personalityTraits', 'workingPrinciples', 'growthTopic']) {
+    assert(JSON.stringify(member[field]) === JSON.stringify(expectedPreset[field]),
+      `Saved member ${field} does not match the ${initialLanguage} preset: ${JSON.stringify(member[field])}`)
+  }
+  report.member = { agentId: member.agentId, displayName: member.displayName, presetLanguage: initialLanguage }
+  const initialMembers = await request(running.cdp, 'members.list')
+  assert(initialMembers.length === 4, `Expected four initial members, received ${initialMembers.length}`)
+  const initialPresets = await Promise.all(['luoke', 'muwa', 'mianzhi', 'qilu'].map(readInitialPreset))
+  report.initialMembers = []
+  for (const preset of initialPresets) {
+    const profile = initialMembers.find((candidate) => candidate.avatarRef === preset.avatarRef)
+    assert(profile, `Missing initial member with avatar ${preset.avatarRef}`)
+    for (const field of ['displayName', 'teamRole', 'professionalResponsibilities', 'personalityTraits', 'workingPrinciples', 'growthTopic']) {
+      assert(JSON.stringify(profile[field]) === JSON.stringify(preset[field]),
+        `Initial member ${profile.agentId} ${field} does not match the ${initialLanguage} preset: ${JSON.stringify(profile[field])}`)
+    }
+    const runtimeConfigured = profile.runtimeConfiguration !== null
+    assert(runtimeConfigured === (profile.agentId === completed.memberAgentId),
+      `Unexpected Runtime configuration on initial member ${profile.agentId}`)
+    report.initialMembers.push({
+      agentId: profile.agentId,
+      displayName: profile.displayName,
+      presetLanguage: initialLanguage,
+      runtimeConfigured
+    })
+  }
+  const beforeProjection = await request(running.cdp, 'camps.open', {
+    traceId: randomUUID(),
+    threadId: completed.quickChatThreadId
+  })
+  const campState = await evaluate(running.cdp, `(() => ({
+    title: document.querySelector('#first-run-camp-title')?.textContent?.trim(),
+    keys: [...document.querySelectorAll('.first-run-starter-key')].map((node) => node.textContent?.trim()),
+    actions: [...document.querySelectorAll('.first-run-starter-action')].map((node) => node.textContent?.trim()),
+    starters: document.querySelectorAll('.first-run-starters button').length,
+    composer: document.querySelector('#camp-message')?.textContent ?? '',
+    timelineOverflow: (() => {
+      const timeline = document.querySelector('.camp-timeline')
+      return Boolean(timeline && timeline.scrollWidth > timeline.clientWidth + 1)
+    })(),
+    horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth
+  }))()`)
+  assert(beforeProjection.thread.title === '初次集结'
+    && beforeProjection.thread.activationState === 'active'
+    && beforeProjection.members.length === 1
+    && beforeProjection.members[0].agentId === completed.memberAgentId
+    && beforeProjection.thread.defaultLeadAgentId === completed.memberAgentId,
+  `The created Quick Chat Camp is not exact: ${JSON.stringify(beforeProjection)}`)
+  assert(beforeProjection.messages.length === 0 && beforeProjection.agentRuns.length === 0,
+    `Initial Camp unexpectedly contains work: ${JSON.stringify({ messages: beforeProjection.messages.length, runs: beforeProjection.agentRuns.length })}`)
+  assert(campState.title?.startsWith(initialLanguage === 'en' ? "Hi, I'm" : '你好，我是')
+    && campState.keys.length === 0
+    && campState.actions.length === 0
+    && campState.starters === 3
+    && campState.composer === ''
+    && !campState.timelineOverflow
+    && !campState.horizontalOverflow,
+  `First-run Camp surface is incomplete: ${JSON.stringify(campState)}`)
+  const firstRunLayout = await evaluate(running.cdp, `(() => {
+    const welcome = document.querySelector('.first-run-camp-welcome').getBoundingClientRect()
+    const track = document.querySelector('.camp-timeline .timeline-track').getBoundingClientRect()
+    const cards = [...document.querySelectorAll('.first-run-starters button')].map(el => el.getBoundingClientRect())
+    return {
+      width: welcome.width,
+      centerOffset: Math.abs((welcome.top + welcome.bottom) / 2 - (track.top + track.bottom) / 2),
+      cardRows: new Set(cards.map(card => Math.round(card.top))).size
+    }
+  })()`)
+  assert(Math.abs(firstRunLayout.width - 680) < 1 && firstRunLayout.centerOffset < 2 && firstRunLayout.cardRows === 1,
+    `First-run welcome does not match the approved layout: ${JSON.stringify(firstRunLayout)}`)
+  report.firstRunLayout = firstRunLayout
+  report.thread = {
+    id: beforeProjection.thread.id,
+    title: beforeProjection.thread.title,
+    activationState: beforeProjection.thread.activationState,
+    memberCount: beforeProjection.members.length,
+    defaultLeadAgentId: beforeProjection.thread.defaultLeadAgentId
+  }
+
+  await setTheme(running.cdp, 'day')
+  captures.campDay = join(outputDir, '06-first-run-camp-day-1040x700.png')
+  await capture(running.cdp, captures.campDay)
+  await setTheme(running.cdp, 'night')
+  captures.campNight = join(outputDir, '07-first-run-camp-night-1040x700.png')
+  await capture(running.cdp, captures.campNight)
+  await setTheme(running.cdp, 'day')
+
+  const additionalStarters = [
+    '我想创建一个定时任务，让你定期帮我处理一件事。请先问我想做什么、多久执行一次、在什么时间执行，再根据我的回答帮我创建。',
+    '帮我做一个能直接预览的小工具网页，比如番茄钟或倒计时。先问我想做哪一种、需要什么功能，再用一个独立 HTML 文件做出第一版。'
+  ].map(initialCopy)
+  await waitForExpression(running.cdp,
+    `Boolean(document.querySelector('.first-run-starters button:not(:disabled)'))`, 10_000)
+  for (const [index, prompt] of additionalStarters.entries()) {
+    await clickSelector(running.cdp, `.first-run-starters button:nth-child(${index + 2})`)
+    await waitForExpression(running.cdp,
+      `document.querySelector('#camp-message')?.textContent === ${JSON.stringify(prompt)}
+        && document.activeElement === document.querySelector('#camp-message')`, 5_000)
+    await waitForExpression(running.cdp,
+      `JSON.parse(window.localStorage.getItem('rovai.camp-composer-draft.v1:' + ${JSON.stringify(completed.quickChatThreadId)}) || 'null')?.body === ${JSON.stringify(prompt)}`,
+      10_000)
+  }
+  await clickSelector(running.cdp, '.first-run-starters button')
+  await waitForExpression(running.cdp,
+    `document.querySelector('#camp-message')?.textContent === ${JSON.stringify(expectedStarter)}
+      && document.activeElement === document.querySelector('#camp-message')`,
+    5_000)
+  await waitForExpression(running.cdp,
+    `JSON.parse(window.localStorage.getItem('rovai.camp-composer-draft.v1:' + ${JSON.stringify(completed.quickChatThreadId)}) || 'null')?.body === ${JSON.stringify(expectedStarter)}`,
+    10_000)
+  const afterProjection = await request(running.cdp, 'camps.open', {
+    traceId: randomUUID(),
+    threadId: completed.quickChatThreadId
+  })
+  const draftInteraction = await evaluate(running.cdp, `(() => {
+    const editor = document.querySelector('#camp-message')
+    const selection = window.getSelection()
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null
+    const prefix = document.createRange()
+    if (editor && range) {
+      prefix.selectNodeContents(editor)
+      prefix.setEnd(range.endContainer, range.endOffset)
+    }
+    return {
+      text: editor?.textContent,
+      focused: document.activeElement === editor,
+      collapsed: selection?.isCollapsed ?? false,
+      caretAtEnd: Boolean(editor && range
+        && prefix.toString().length === (editor.textContent?.length ?? 0)),
+      notice: document.querySelector('.first-run-draft-notice')?.textContent?.trim()
+    }
+  })()`)
+  assert(afterProjection.messages.length === beforeProjection.messages.length
+    && afterProjection.agentRuns.length === beforeProjection.agentRuns.length,
+  `Choosing a starter created a message or AgentRun: ${JSON.stringify({ before: [beforeProjection.messages.length, beforeProjection.agentRuns.length], after: [afterProjection.messages.length, afterProjection.agentRuns.length] })}`)
+  assert(draftInteraction.text === expectedStarter
+    && draftInteraction.focused
+    && draftInteraction.collapsed
+    && draftInteraction.caretAtEnd
+    && draftInteraction.notice === initialCopy('内容已填入，可编辑后发送。'),
+  `Starter did not only fill/focus the Composer: ${JSON.stringify(draftInteraction)}`)
+  report.draft = draftInteraction
+  captures.campDraftDay = join(outputDir, '08-first-run-camp-draft-day-1040x700.png')
+  await capture(running.cdp, captures.campDraftDay)
+  await closeApp(running)
+  running = null
+
+  running = await launchApp(firstPort + 3)
+  await waitForExpression(running.cdp,
+    `Boolean(document.querySelector('.camp-timeline:not([hidden]) .first-run-camp-welcome'))`,
+    45_000)
+  await waitForExpression(running.cdp,
+    `document.querySelector('#camp-message')?.textContent === ${JSON.stringify(expectedStarter)}`,
+    10_000)
+  const restarted = await onboardingGet(running.cdp)
+  const restartedProjection = await request(running.cdp, 'camps.open', {
+    traceId: randomUUID(),
+    threadId: completed.quickChatThreadId
+  })
+  assert(restarted.status === 'completed'
+    && restarted.quickChatThreadId === completed.quickChatThreadId
+    && restartedProjection.messages.length === 0
+    && restartedProjection.agentRuns.length === 0,
+  `Completed onboarding/Camp did not survive restart: ${JSON.stringify({ restarted, messages: restartedProjection.messages.length, runs: restartedProjection.agentRuns.length })}`)
+  captures.campRestarted = join(outputDir, '09-first-run-camp-restarted-1040x700.png')
+  await capture(running.cdp, captures.campRestarted)
+
+  await clickSelector(running.cdp, '.sidebar-settings-main')
+  await waitForSelector(running.cdp, '.general-settings', 10_000)
+  await waitForExpression(running.cdp,
+    `Boolean(document.querySelector('.general-language-options input[value="en"]:not(:disabled)'))`, 10_000)
+  await clickSelector(running.cdp, '.general-language-options input[value="en"]')
+  await waitForExpression(running.cdp,
+    `document.documentElement.lang === 'en'
+      && document.querySelector('#general-language-heading')?.textContent === 'Interface language'`, 10_000)
+  const englishSettings = await surfaceState(running.cdp, '.general-settings')
+  assert(englishSettings.visible && !englishSettings.horizontalOverflow,
+    `English General Settings is clipped or overflows: ${JSON.stringify(englishSettings)}`)
+  captures.settingsEnglishDay = join(outputDir, '10-settings-english-day-1040x700.png')
+  await capture(running.cdp, captures.settingsEnglishDay)
+  await setTheme(running.cdp, 'night')
+  captures.settingsEnglishNight = join(outputDir, '11-settings-english-night-1040x700.png')
+  await capture(running.cdp, captures.settingsEnglishNight)
+  await setTheme(running.cdp, 'day')
+  await clickSelector(running.cdp, '.settings-sidebar-back')
+  await waitForExpression(running.cdp,
+    `Boolean(document.querySelector('.camp-timeline:not([hidden]) .first-run-camp-welcome'))
+      && document.querySelector('#camp-message')?.textContent === ${JSON.stringify(expectedStarter)}`, 10_000)
+  assert(await evaluate(running.cdp, `document.documentElement.scrollWidth <= window.innerWidth`),
+    'English Camp overflows horizontally')
+  captures.campEnglishDay = join(outputDir, '12-first-run-camp-english-day-1040x700.png')
+  await capture(running.cdp, captures.campEnglishDay)
+  const savedLanguage = await evaluate(running.cdp,
+    `window.rovai.generalPreferences.get().then((preferences) => preferences.interfaceLanguage)`, true)
+  assert(savedLanguage === 'en', `English language was not persisted: ${savedLanguage}`)
+  report.language = { saved: savedLanguage, routeAndDraftPreserved: true }
+  await closeApp(running)
+  running = null
+
+  running = await launchApp(firstPort + 4)
+  await waitForExpression(running.cdp,
+    `document.documentElement.lang === 'en'
+      && document.querySelector('#camp-message')?.textContent === ${JSON.stringify(expectedStarter)}`, 45_000)
+  captures.campEnglishRestarted = join(outputDir, '13-first-run-camp-english-restarted-1040x700.png')
+  await capture(running.cdp, captures.campEnglishRestarted)
+  await closeApp(running)
+  running = null
+
+  const persistedOnboarding = JSON.parse(await readFile(join(electronUserDataDir, 'onboarding.json'), 'utf8'))
+  assert(persistedOnboarding.status === 'completed'
+    && persistedOnboarding.quickChatThreadId === completed.quickChatThreadId,
+  `Private onboarding file is not completed: ${JSON.stringify(persistedOnboarding)}`)
+  const reportPath = join(outputDir, 'report.json')
+  await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`)
+  process.stdout.write(`${JSON.stringify({ ok: true, reportPath, ...report }, null, 2)}\n`)
+} catch (error) {
+  if (error instanceof ExpectedWindowsPlatformAdmissionBlock) {
+    const reportPath = join(outputDir, 'report.json')
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`)
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      expectedPlatformBlock: true,
+      reportPath,
+      ...report
+    }, null, 2)}\n`)
+  } else {
+  process.stderr.write(`${JSON.stringify({
+    ok: false,
+    error: error instanceof Error ? error.stack ?? error.message : String(error),
+    fixtureRoot,
+    outputDir,
+    stderr: running?.stderr ?? []
+  }, null, 2)}\n`)
+  process.exitCode = 1
+  }
+} finally {
+  if (running) await closeApp(running).catch(() => undefined)
+}
+
+async function launchApp(port) {
+  const stderr = []
+  const executable = process.platform === 'win32'
+    ? appPath
+    : join(appPath, 'Contents', 'MacOS', 'Rovai AI')
+  if (process.platform === 'win32' && !existsSync(dataDir)) {
+    const preparer = join(dirname(executable), 'resources', 'bin', 'rovai-core.exe')
+    const prepared = spawnSync(preparer, ['--prepare-windows-data-root', dataDir], {
+      cwd: root,
+      encoding: 'utf8'
+    })
+    if (prepared.error) throw prepared.error
+    if (prepared.status !== 0) {
+      throw new Error(`Windows acceptance data-root preparation failed: ${prepared.stderr}`)
+    }
+  }
+  const child = spawn(executable, [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${dataDir}`
+  ], {
+    cwd: root,
+    env: { ...process.env, ROVAI_ALLOW_ISOLATED_INSTANCE: '1' },
+    stdio: ['ignore', 'ignore', 'pipe']
+  })
+  child.stderr.on('data', (chunk) => stderr.push(String(chunk)))
+  let cdp = null
+  try {
+    const target = await waitForTarget(port, stderr)
+    cdp = await connectCdp(target.webSocketDebuggerUrl)
+    await cdp.send('Page.enable')
+    await cdp.send('Page.bringToFront')
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width,
+      height,
+      deviceScaleFactor: 1,
+      mobile: false
+    })
+    await waitForExpression(cdp,
+      `Boolean(window.rovai && document.querySelector('.app-shell'))`, 45_000)
+    return { cdp, port, stderr, child }
+  } catch (error) {
+    cdp?.close()
+    await terminateChild(child)
+    throw error
+  }
+}
+
+async function readInitialPreset(role) {
+  const directory = join(root, 'apps/desktop/src/renderer/src/assets/characters', role)
+  const base = JSON.parse(await readFile(join(directory, 'preset.json'), 'utf8'))
+  if (initialLanguage !== 'en') return base
+  const english = JSON.parse(await readFile(join(directory, 'preset.en.json'), 'utf8'))
+  return { ...base, ...english }
+}
+
+async function closeApp(app) {
+  try {
+    await Promise.race([app.cdp.send('Browser.close'), wait(1_000)])
+  } catch {
+    // The isolated App may already have exited.
+  }
+  app.cdp.close()
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < 5_000) {
+    try {
+      await fetch(`http://127.0.0.1:${app.port}/json`)
+    } catch {
+      await terminateChild(app.child)
+      await waitForCoreProcessExit()
+      return
+    }
+    await wait(100)
+  }
+  await terminateChild(app.child)
+  await waitForCoreProcessExit()
+}
+
+async function waitForCoreProcessExit(timeoutMs = 15_000) {
+  const lockPath = join(coreDataDir, '.rovai-core-instance.lock')
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const owner = JSON.parse(await readFile(lockPath, 'utf8'))
+      if (!Number.isSafeInteger(owner.processId) || !processIsAlive(owner.processId)) return
+    } catch {
+      return
+    }
+    await wait(100)
+  }
+  throw new Error(`Isolated rovai-core did not exit for ${dataDir}`)
+}
+
+function processIsAlive(processId) {
+  try {
+    process.kill(processId, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
+async function terminateChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return
+  child.kill('SIGTERM')
+  await Promise.race([
+    new Promise((resolveExit) => child.once('exit', resolveExit)),
+    wait(5_000)
+  ])
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+}
+
+async function onboardingGet(cdp) {
+  return evaluate(cdp, 'window.rovai.onboarding.get()', true)
+}
+
+async function request(cdp, method, params = {}) {
+  return evaluate(cdp,
+    `window.rovai.request(${JSON.stringify(method)}, ${JSON.stringify(params)})`, true)
+}
+
+async function setTheme(cdp, theme) {
+  const current = await evaluate(cdp, 'document.documentElement.dataset.theme')
+  if (current !== theme) {
+    const hasOnboardingToggle = await evaluate(cdp,
+      `Boolean(document.querySelector('.onboarding-theme-toggle'))`)
+    if (hasOnboardingToggle) {
+      await clickSelector(cdp, '.onboarding-theme-toggle')
+    } else {
+      await evaluate(cdp,
+        `window.rovai.appearance.setPreference(${JSON.stringify(theme)})`, true)
+    }
+  }
+  await waitForExpression(cdp,
+    `document.documentElement.dataset.theme === ${JSON.stringify(theme)}`, 5_000)
+}
+
+async function assertProgress(cdp, step) {
+  const progress = await evaluate(cdp, `(() => {
+    const element = document.querySelector('.onboarding-progress')
+    return {
+      text: element?.textContent?.trim(),
+      label: element?.getAttribute('aria-label'),
+      tag: element?.tagName,
+      language: document.documentElement.lang
+    }
+  })()`)
+  const expectedLabel = progress.language === 'en' ? `Step ${step} of 3` : `第 ${step} 步，共 3 步`
+  assert(progress.text === `${step} / 3` && progress.label === expectedLabel && progress.tag === 'SPAN',
+    `Onboarding progress must be read-only and describe the current step: ${JSON.stringify(progress)}`)
+}
+
+async function surfaceState(cdp, selector) {
+  return evaluate(cdp, `(() => {
+    const surface = document.querySelector(${JSON.stringify(selector)})
+    const primary = surface?.querySelector('.onboarding-primary')
+    const rect = primary?.getBoundingClientRect()
+    return {
+      visible: Boolean(surface),
+      primaryVisible: Boolean(rect && rect.top >= 0 && rect.bottom <= window.innerHeight),
+      primaryEnabled: Boolean(primary && !primary.disabled),
+      hasSkip: ['跳过', 'Skip'].some((text) => document.body.textContent?.includes(text)),
+      hasStepNavigation: Boolean(document.querySelector('.onboarding-step, .onboarding-progress button, .onboarding-progress a')),
+      horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth
+    }
+  })()`)
+}
+
+async function clickSelector(cdp, selector) {
+  const clicked = await evaluate(cdp, `(() => {
+    const element = document.querySelector(${JSON.stringify(selector)})
+    if (!element || element.disabled) return false
+    element.click()
+    return true
+  })()`)
+  if (!clicked) throw new Error(`Could not click selector: ${selector}`)
+}
+
+async function clickByText(cdp, selector, text) {
+  const clicked = await evaluate(cdp, `(() => {
+    const element = [...document.querySelectorAll(${JSON.stringify(selector)})]
+      .find((candidate) => candidate.textContent?.includes(${JSON.stringify(text)}))
+    if (!element || element.disabled) return false
+    element.click()
+    return true
+  })()`)
+  if (!clicked) throw new Error(`Could not click ${selector} containing ${text}`)
+}
+
+async function capture(cdp, path) {
+  await waitForExpression(cdp, `!document.querySelector('.page-zoom-indicator')`, 5_000)
+  const result = await cdp.send('Page.captureScreenshot', {
+    format: 'png',
+    captureBeyondViewport: false,
+    fromSurface: true
+  })
+  await writeFile(path, Buffer.from(result.result.data, 'base64'))
+}
+
+async function evaluate(cdp, expression, awaitPromise = false) {
+  const response = await cdp.send('Runtime.evaluate', {
+    expression,
+    awaitPromise,
+    returnByValue: true
+  })
+  if (response.result?.exceptionDetails) {
+    throw new Error(response.result.exceptionDetails.exception?.description
+      ?? response.result.exceptionDetails.text)
+  }
+  return response.result?.result?.value
+}
+
+async function waitForSelector(cdp, selector, timeoutMs) {
+  await waitForExpression(cdp,
+    `Boolean(document.querySelector(${JSON.stringify(selector)}))`, timeoutMs)
+}
+
+async function waitForExpression(cdp, expression, timeoutMs = 5_000) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      if (await evaluate(cdp, expression, true)) return
+    } catch {
+      // The Renderer may be moving between surfaces.
+    }
+    await wait(100)
+  }
+  throw new Error(`Expression did not become true within ${timeoutMs}ms: ${expression}`)
+}
+
+async function waitForTarget(debugPort, stderr) {
+  const timeoutMs = process.platform === 'win32' ? 45_000 : 15_000
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const targets = await fetch(`http://127.0.0.1:${debugPort}/json`)
+        .then((response) => response.json())
+      const target = targets.find((candidate) => candidate.type === 'page')
+      if (target) return target
+    } catch {
+      // Electron is still starting.
+    }
+    await wait(150)
+  }
+  throw new Error(`Electron DevTools target did not appear. ${stderr.join('')}`)
+}
+
+async function connectCdp(url) {
+  const socket = new WebSocket(url)
+  const pending = new Map()
+  let nextId = 1
+  await new Promise((resolveOpen, rejectOpen) => {
+    socket.addEventListener('open', resolveOpen, { once: true })
+    socket.addEventListener('error', rejectOpen, { once: true })
+  })
+  socket.addEventListener('message', (event) => {
+    const message = JSON.parse(String(event.data))
+    if (!message.id) return
+    const request = pending.get(message.id)
+    if (!request) return
+    pending.delete(message.id)
+    if (message.error) request.reject(new Error(message.error.message))
+    else request.resolve(message)
+  })
+  return {
+    send(method, params = {}) {
+      return new Promise((resolveSend, rejectSend) => {
+        const id = nextId++
+        pending.set(id, { resolve: resolveSend, reject: rejectSend })
+        socket.send(JSON.stringify({ id, method, params }))
+      })
+    },
+    close() {
+      socket.close()
+    }
+  }
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message)
+}
+
+function wait(milliseconds) {
+  return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds))
+}

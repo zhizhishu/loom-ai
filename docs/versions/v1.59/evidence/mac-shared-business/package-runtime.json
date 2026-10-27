@@ -1,0 +1,48 @@
+{
+  "verifiedAt": "2026-09-12T20:05:12.199Z",
+  "simulation": false,
+  "realRuntime": true,
+  "setup": "Empty standalone Host; Runtime check, member configuration and Camp creation use the production browser UI.",
+  "entry": "headless",
+  "checks": {
+    "browserRuntimeMemberAndCampSetup": true,
+    "browserUploadAndMarkdownRead": true,
+    "browserSend": true,
+    "browserNativeApproval": true,
+    "secondApprovalRejected": true,
+    "composerPreservedDuringExecution": true,
+    "browserArtifactRead": true,
+    "browserStopBeforeHostShutdown": true,
+    "noElectronBridgeOrRuntimeExceptions": true
+  },
+  "notVerified": [
+    "Second physical device/LAN",
+    "Other platforms",
+    "Physical sleep/wake"
+  ],
+  "campId": "rvcamp_01m2bkk9msfyhrjcvafvcq2n4x",
+  "approvalId": "8da1c70e-c591-4494-a4c0-c915a33421fd",
+  "runId": "7a0f6983-482e-45cf-9e36-787350a052c3",
+  "messageId": "170fdab2-26b9-4ad3-ac96-f9459213f261",
+  "attachmentId": "c783680c-dd71-4a0e-95d8-4d994f6c7997",
+  "stopRunId": "aea380f2-9b66-4e0a-b111-14144424352e",
+  "hostBinarySha256": "301fe10dd32478cec0a81fe9122a3a9fd3e99327f255b74d593c4642ab554abb",
+  "status": "passed",
+  "shutdown": {
+    "code": 0,
+    "signal": null
+  },
+  "sourceReportSha256": "dbd8da390013fc030c3ba2a58329644e11e8e3dd1d9e88a531186f65c80b58b4",
+  "screenshotsRetainedLocally": [
+    "web-source-upload.png",
+    "web-native-approval.png",
+    "web-runtime-complete.png",
+    "web-runtime-artifact.png",
+    "web-stop-active.png",
+    "web-stop-complete.png"
+  ],
+  "packageLocation": "Relocated product from package-upgrade acceptance, outside the repository",
+  "finalPackageManifestSha256": "f9defae5255cb0d067c7cb08e3fe84abe557459a582dcf481d8c4a03eb3c18a4",
+  "finalPackageSourceCommit": "69e1bb836d39bb6489d9804ab2e1f4f2c11e6e6d",
+  "executableAndWebHashesMatchFinalPackage": true
+}

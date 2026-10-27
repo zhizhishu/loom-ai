@@ -1,0 +1,20 @@
+{
+  "status": "passed",
+  "sourceCommit": "8e1e704e9645b78757ae821b4e5aac1a4650bce7",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "desktopPackagedApp": true,
+  "desktopListen": "0.0.0.0:8766",
+  "serverBinary": "target/debug/rovai-server",
+  "serverDefault": "127.0.0.1:8767",
+  "webSettingsWithoutControls": true,
+  "webSettingsWidth": 270,
+  "webSettingsRefresh": true,
+  "browserBackToSettings": true,
+  "ordinaryWebControlsRetained": true,
+  "concurrentHttp": true,
+  "serverControlledStop": true,
+  "desktopCoreRetained": true,
+  "realRuntime": false,
+  "installationRecord": "installation.json"
+}

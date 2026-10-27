@@ -1,0 +1,203 @@
+---
+document_type: architecture
+architecture: desktop-navigation-refresh
+authority: desktop-navigation-invalidation-and-refresh-boundaries
+status: accepted
+last_updated: 2026-10-19
+---
+
+# Desktop Navigation Refresh 架构
+
+本架构规定侧栏的单会话、单分组、完整快照读取与刷新边界。Core 拥有状态、排序、计数；Main-owned
+Navigation Preferences 拥有客户端目录清单、移除记录、项目顺序和显示名称。字段见 [Navigation Read v1](../contracts/navigation-read-v1.md)。
+
+## Component authority
+
+| Component | Responsibility |
+| --- | --- |
+| Core Navigation Read Model | 从 camp 摘要与现有业务表读取；目标行按 ID、分组按索引前缀；同一事务取得窗口与总数 |
+| Core mutation boundary | 事件序号确定后，同事务维护所属 Camp 的活动/完成摘要；提交后发带 scope 的失效提示 |
+| Electron Main | 原样转发，不组装业务状态；schema 6 私有原子 JSON 保存目录、一次性完成标记与其他导航偏好 |
+| Renderer window reader + refresh coordinator | 一处合并行/组/完整范围，串行执行、trailing、退避与窗口旧响应保护 |
+| Foreground safety refresh | 保留前台约 20 秒与聚焦完整性兜底，从摘要取完整快照；隐藏时停止 |
+| Overview loader | 首次建立完整导航与其他页面基础；普通 Camp 切换不调用 Overview |
+
+`navigation.snapshot`、`navigation.camps`、`navigation.groupCamps` 和 `navigation.findCamp` 是纯读取，
+进入 Core 已有的有界独立读取队列，避免被无关的顺序命令阻塞。实际 SQLite 操作仍通过同一数据库锁串行化。
+`navigation.campViewed` 会更新已读水位，继续走顺序命令队列；`camps.enter` 需要修复 Lead 时也回到该队列。
+
+## Post-commit invalidation flow
+
+```text
+业务事务提交（业务事实 + camp 摘要）
+  -> navigation.invalidated { scope, campId?, groupKeys? }
+  -> 唯一协调器合并范围
+  -> Core 返回目标行 / 相关组完整窗口 / 摘要完整快照
+  -> Renderer 应用权威读取结果
+```
+
+通知不携带可直接拼装的标题、marker 或排序。状态变化读行；人类消息发布、创建、删除、激活等成员/排序
+变化读组。删除在物理移除前取得原组，通知带回该组；不新增删除补齐表。普通 `camps.enter` 只读时不失效，
+确需 Lead reconciliation 时才更新对应行。已读确认返回同事务权威行；无变化不写、不通知。
+
+事件与摘要依赖同一个 SQLite 事务。先提交后通知，不因提交后的文件清理失败丢掉失效提示。
+未知范围、漏通知或失去可信基础时允许恢复完整快照，但所有正常读取都禁止聚合历史事件。
+使命自己的变化使用 `missions.invalidated`，已知使命 Camp 的 Run 变化更新使命列表；普通 Camp 事件不带起
+使命读取。技能目录在用户首次使用选择器时加载，不随 Camp 切换预扫描。
+
+## Coordinator semantics
+
+复用现有 80ms debounce、单在途、requested/completed generation、共享 drain Promise、trailing 与
+1/2/5/10 秒退避。window reader 仅额外保留待更新 ID/组的集合和完整刷新标志；不保存变化日志或回放历史。
+完整范围覆盖局部；同组多事件去重。读取失败保留范围，恢复后重试；隐藏时保留意图，不启动后台重试。
+已读回执、窗口范围变化和 dispose 保护迟到响应；查询返回不承诺浏览器已经 paint。
+
+普通 A → B：正式提交 B 内容，绘制后验证 B 行；有新完成内容且不越过已展示水位时确认已读并应用权威行。
+不重新读取 A/其他分组、不重排侧栏、不读使命或技能目录。后台 C 完成仍独立更新 C。
+
+## Visible Camp windows
+
+### Camp ordering
+
+Navigation 的 `lastActivityAt` / `lastActivityGlobalSequence` 只由已发布的用户 CampMessage 推进：
+`author_type = user` 或 `external_principal`（包括飞书、钉钉等渠道用户），通过统一公共消息 publication seam
+读取。队员消息（含 A2A）、系统消息、工具活动以及 AgentRun/CampTurn 状态均不推进排序。
+没有已发布用户消息时使用 Camp 的 `created_at` 和 sequence 0；Renderer-local 输入、未发送附件、查看和重命名
+不改变这个初始排序时间。时间降序、global sequence 降序、Camp ID 升序的确定性比较规则保持不变。
+
+`latestCompletionGlobalSequence` 沿用 wire 名称但读取非撤回 Agent 消息的首次发布水位，`unread_completed` 表示新回复；
+loading 继续独立读取 Run 事实。Run 终态本身不产生新回复小点，查看水位保持单调；
+状态刷新不能借用用户消息排序水位，否则后台完成提示会丢失。Core Project 聚合使用组内最近用户消息字段，
+Sidecar 已保存的 Project 顺序仍按下文的本机偏好规则保持稳定。
+
+### Snapshot prefixes
+
+默认每组 5 条，查看更多增加 10；Core 在 SQL 中限定目标组和 LIMIT，返回该组完整前 N 条与准确总数。
+不先加载所有 NavigationCampItem 再在内存分组截断。完整快照跨组的查询只取得目录/计数元数据。
+置顶会话按 ID 批量取得，不遍历分页。完整恢复同时核对窗口外的置顶项；普通切换只读目标 ID。
+
+展示窗口按未置顶会话计数。Renderer 以“展示数量 + 本机置顶会话 ID 数量”读取有界原始前缀，
+先排除置顶再截取展示数量；Core 总数与原始行保持原义。该前缀足以补满展示窗口，或证明剩余行均已展示／置顶，
+无需逐页扫描或把本机置顶写入 Core。完整读取首次发现项目 key 时，补全读取数量后重读同一范围，
+只提交最后一次事务的快照与水位。置顶集合变化只失效相关组，并使在途旧集合响应失效；
+收起、展开失败恢复和后续状态刷新继续由同一个 window reader 管理。
+
+行变化只替换该行，不能从缺失行猜测组成员或总数；组变化整体替换对应窗口，包含第六条补位、窗口外新活动
+进入前五条。多组窗口各自记住请求数量，不能把新前五条与旧尾部拼接。收起立即生效；展开必须重新取得完整
+窗口。旧范围返回/失败不覆盖较新范围，失败保留上次成功数量。
+
+## Storage migration
+
+Migration 177 接受经核验的 v1.72/schema 126，升级到 schema 127，新增持久化表为 0。
+
+| 对象 | 迁移 |
+| --- | --- |
+| camp.navigation_activity_sequence | INTEGER NOT NULL DEFAULT 0，非负 |
+| camp.navigation_activity_at | TEXT NULL，无活动回退 camp.created_at |
+| camp.navigation_completion_sequence | INTEGER NOT NULL DEFAULT 0，非负 |
+| camp_view_state | 复用，不新增已读存储 |
+| camp_navigation_window_idx | 分组表达式、活动时间 DESC、序号 DESC、ID，排除删除中的 Camp |
+| agent_run_navigation_active_idx | queued/running/waiting 的 camp_id |
+| agent_run_navigation_legacy_active_idx | camp_id 为空的活跃 Run 的 camp_turn_id |
+| camp_navigation_event_insert / sequence | 处理消息首次发布的显式序号插入和自动序号分配，只维护目标 Camp；和事件一起回滚 |
+| camp_navigation_reply_tombstone | Agent 消息撤回状态变化时重算该 Camp 的最新可见回复水位 |
+
+迁移事务内按消息首次 publication 规则进行一次回填；既有 camp_view_state、消息/事件字节和排序规则保留。
+新数据在写入时更新三项摘要；正常一行、一组及完整快照不访问 event_log。不引入持久化组状态、删除记录、
+保留期或通用增量同步；不另造数据库调度层，先移除无关刷新与昂贵读取。
+
+## Sidecar Project order synchronization
+
+目录清单与一次性旧项目补齐复用现有 Navigation Preferences；字段和失败语义见
+[Navigation Read v1](../contracts/navigation-read-v1.md#client-directory-preferences)。Core 只读取会话事实，
+不建目录登记表，不在业务事务自动补登，不增加登记服务、轮询或恢复队列。
+
+Renderer 在启动成功取得完整导航后只尝试一次旧目录补齐，同时保留启动恢复前的旧选中空目录。
+完成标记与目录一起原子提交；失败继续展示可靠旧分组，只提示一次，下一次启动再尝试。成功后内存标记直接关闭整个
+旧补齐分支，不随刷新、切换或会话活动做集合扫描和同步。真正的目录选择／移除继续调用统一偏好写入口。
+
+`projectOrder` 保留原相对顺序，登记新路径时追加，主动移除时清理；消息、Run 或会话归零不改变
+目录登记与顺序。合法旧 schema 的 `null` 顺序在一次补齐时按已有目录和完整 Core 分组顺序建立。
+已登记空目录和普通目录使用同一展示投影，别名仍由 `projectNames` 覆盖。
+Desktop 在实际修改时复用 Main 串行队列、最新偏好读取和原子写入；Web 复用既有 IndexedDB store 的
+短互斥事务来保护原 localStorage JSON，不把目录保存到数据库。普通会话路径只判断已加载的内存偏好。
+
+## Local Project display names
+
+`projectNames: Record<string, string>` 使用既有 canonical `directory:<projectPath>` key 保存本机显示名称。
+合法 schema 2/3 在内存升级时补空映射，不因升级产生损坏提示，也不在读取时重写旧文件。schema 1 继续沿用
+已有恢复规则。后续成功写入输出 schema 6；名称与置顶、移除、恢复、顺序共用 Main 串行队列和原子文件写入。
+写入失败保留旧快照；返回完整快照只发生在成功保存后。
+
+Main-owned `navigationPreferences.setProjectName(targetKey, name)` 接受字符串或 `null`；字符串去除首尾空白、
+合并连续空白，非空且最多 80 个 Unicode scalar；`null` 删除覆盖、恢复目录名。名称可重复，同名不同路径独立保存。
+移除项目、会话刷新或无 Camp 的空目录均不删除名称；重新选择相同目录后恢复该名称。
+
+Renderer 在 Core 原始 Navigation Snapshot 之外建立名称展示投影，并在加入已登记空目录后应用覆盖。
+侧栏/置顶、顶部、搜索、新建对话和定时任务项目选择共用该投影；Workspace inspection 返回的目录名称不会覆盖
+已保存的显示名称。重命名不调用 Core mutation、Workspace inspection 或 Runtime；不修改项目路径、Camp ID、
+消息、队员、记忆、Native Session、执行状态、活动时间或排序。渠道项目目录仍由既有 Core 投影拥有，本机别名不进入
+模型上下文或渠道配置。所有导航偏好写入保持其他字段，并发布成功后的完整快照。
+
+## Local Thread unread intent
+
+schema 5 增加 `threadReadStates: Record<ThreadId, { manualUnread: boolean, readThroughGlobalSequence: number }>`。
+合法 schema 2/3/4 在内存补空映射，读取不重写文件，也不产生损坏提示。该映射只保存展示意图，不进入 Core 或模型上下文。
+`navigationPreferences.setThreadReadState(threadId, state | null)` 校验稳定 ID 与非负安全整数；写入与其他导航偏好共用
+Main 串行事务和私有原子文件，保留单调的本机 read-through。失败保留旧状态，成功后广播
+`rovai:navigation-preferences-changed` 完整快照到所有窗口。Renderer 通过 generation 防止旧 Overview 或回复覆盖新意图。
+Web 使用当前主机作用域的 browser presentation storage，读取旧结构并监听跨标签页 storage 变更；失败不发布新状态。
+
+Renderer 独立计算运行与未读：Run 的 loading 与 `latestCompletionGlobalSequence > max(lastSeenGlobalSequence, localReadThrough)`
+分别显示，manualUnread 可以强制保留蓝点。显式标记已读把本机 read-through 推进到当前已知回复水位，后续回复不被遮蔽。
+显式打开只有在完整投影成功展示后才清除手动提醒；取消离开、失败、缓存预览、自动恢复与聚焦均不清除。
+真实查看仍由既有 `navigation.campViewed` 确认，手动操作不伪造查看或回退 Core 水位。
+
+用户停止 Run 不写入 `manualUnread`，停止回执与终态刷新也不新增未读提醒。蓝点组合回复水位、
+显式标记未读及通知模块的退出提醒；已有本机提醒沿用显式打开／标记已读的清除规则。
+退出提醒由通知事件和既有恢复刷新驱动，普通快照/command 进度不能触发重读；
+正式 Thread 展示后按观察边界确认，见[退出提醒](notification-episodes.md#app-退出中断提醒)。
+
+Desktop 的 `revealProjectDirectory` 由 Main 验证绝对目录仍存在，然后调用系统文件管理器定位目录本身；
+此能力不暴露给远程 Web。复制项目路径沿用 Renderer 的剪贴板能力，失败反馈保持可恢复。
+
+## Failure and lifecycle boundaries
+
+一次读取失败时，当前共享 Promise reject，completed generation 不前进，失效意图保留。后台重试使用
+`1s -> 2s -> 5s -> 10s` 上限退避；普通事件和安全轮询只合并 generation，不绕过在途退避。窗口 focus 或用户
+显式重试可以取消等待并立即尝试；一次成功的 quiet-point drain 重置退避。
+
+App 隐藏时取消 debounce、周期 timer 和后台 retry timer，但保留 requested generation；已经在途的读取可以完成，
+隐藏后新增的 trailing generation 等到重新可见。重新可见会恢复保留意图，重新聚焦立即刷新。20 秒刷新只修复
+极少数丢失事件，不承担正常终态收敛，也不依赖 Overview 的全局 `ready | error` 状态。
+
+Navigation 拥有独立 loading/ready/error 状态。Members、Runtime Installation、Memory Review 或 Navigation
+preference 失败可以报告自己的错误，但不能停止 Navigation retry、事件刷新或安全轮询。Core restart 后的
+`runtime.state = ready` 通过同一协调器立即恢复。
+
+## Acceptance
+
+- 多个 Camp 同时终态只形成一个在途刷新批次与必要的 trailing read；
+- Migration 前后 table 名称集合完全相同；正常导航读取在禁止访问 event_log 时仍成功；
+- 普通切换的请求记录中没有全侧栏、其他组、使命列表或技能扫描；
+- 后台 Camp 终态无需打开该 Camp 或重载 Renderer 即可清除侧栏 spinner；
+- trailing 失败 reject 当前调用者且自动按上限退避恢复，不形成热循环或 unhandled rejection；
+- App 隐藏时不做周期 Navigation Snapshot，focus 后立即收敛；
+- 即使失效事件丢失，前台 20 秒安全刷新仍能纠正；
+- 用户消息导致 Camp 移出前五条后不会恢复旧 spinner；第六条在未展示时变化，展开后立即显示最新状态；
+- 桌面和渠道用户消息推进 Camp 顺序；队员消息、A2A、终态和草稿编辑不重排，完成未读仍正常出现与清除；
+- 已展开窗口的状态/已读/标题按行更新；删除和排序按组整体替换；收起再展开不复用旧业务对象；
+- 多组并发展开、旧范围响应晚到、收起与展开交错、展开失败重试都保持最后确认的展示范围；
+- Overview 附属模块失败不禁用侧栏刷新；
+- Core 通知只在权威 mutation 已提交后发生。
+- schema 2 第一次进入时冻结旧显示顺序，合法升级不产生偏好损坏提示；
+- 老 Project 的消息活动不改顺序，新 Project 追加，只有本机主动移除的 Project 清理；
+- Sidecar Project 稳定顺序不改变 Project 内 Camp 最近活动、时间、marker 或未读更新。
+- 改名后刷新与重启保留，独立路径互不覆盖，保存失败可重试；目录和 Camp/Runtime 身份不变。
+
+## References
+
+- [Core Snapshot 与 API 边界](foundational-invariants.md#core-read-side)
+- [产品与导航不变量](foundational-invariants.md#product-navigation)
+- [Camp Open Read Path](camp-open-read-path.md)
+- [App Shell 与统一侧栏](../ui/components/app-shell-navigation.md)

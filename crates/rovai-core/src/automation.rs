@@ -1,0 +1,4400 @@
+use std::{collections::BTreeSet, path::Path, str::FromStr};
+
+use anyhow::{Context, Result};
+use chrono::{
+    DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, NaiveTime,
+    SecondsFormat, TimeZone, Utc,
+};
+use croner::{
+    Cron,
+    parser::{CronParser, Seconds, Year},
+};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::{
+    automation_naming::AutomationThreadNaming,
+    channel::ClaimedChannelDelivery,
+    collaboration::{CollaborationService, ProjectBindingKind, ScheduledAutomationAdmissionInput},
+    command::{
+        ActorRef, CommandEnvelope, CommandExecution, CommandHandlerResult, DomainCommand,
+        DomainCommandGateway, EntityReference, sealed,
+    },
+    current_user::CURRENT_USER_ID,
+    db::Database,
+    runtime::{
+        cancel_automation_camp_turn_in_tx, pump_targets_after_runs_terminal,
+        settle_abortive_agent_run_in_tx,
+    },
+};
+
+pub const AUTOMATION_RUNTIME_TIMEOUT_SECONDS: i64 = 60 * 60;
+pub const AUTOMATION_LIST_TOOL_NAME: &str = "automation.list";
+pub const AUTOMATION_GET_TOOL_NAME: &str = "automation.get";
+pub const AUTOMATION_CREATE_TOOL_NAME: &str = "automation.create";
+pub const AUTOMATION_RUN_TOOL_NAME: &str = "automation.run";
+pub const AUTOMATION_CLOSE_TOOL_NAME: &str = "automation.close";
+pub const AUTOMATION_UPDATE_TOOL_NAME: &str = "automation.update";
+pub const AUTOMATION_DELETE_TOOL_NAME: &str = "automation.delete";
+const MAX_PROMPT_SCALARS: usize = 100_000;
+const MAX_NAME_SCALARS: usize = 80;
+const MAX_LIST_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationNotifyChannel {
+    Feishu,
+    Lark,
+    Dingtalk,
+}
+
+impl AutomationNotifyChannel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu",
+            Self::Lark => "lark",
+            Self::Dingtalk => "dingtalk",
+        }
+    }
+}
+
+impl FromStr for AutomationNotifyChannel {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "feishu" => Ok(Self::Feishu),
+            "lark" => Ok(Self::Lark),
+            "dingtalk" => Ok(Self::Dingtalk),
+            _ => anyhow::bail!("unsupported Automation notification channel: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationWeekday {
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+impl AutomationWeekday {
+    const fn number_from_monday(self) -> u32 {
+        match self {
+            Self::Monday => 1,
+            Self::Tuesday => 2,
+            Self::Wednesday => 3,
+            Self::Thursday => 4,
+            Self::Friday => 5,
+            Self::Saturday => 6,
+            Self::Sunday => 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AutomationSchedule {
+    Daily {
+        at: String,
+    },
+    Weekdays {
+        at: String,
+    },
+    Weekly {
+        weekday: AutomationWeekday,
+        at: String,
+    },
+    Once {
+        date: String,
+        at: String,
+    },
+    Cron {
+        expression: String,
+    },
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AutomationProjectRef {
+    QuickChat,
+    Directory { path: String },
+}
+
+impl AutomationProjectRef {
+    pub fn binding_kind(&self) -> ProjectBindingKind {
+        match self {
+            Self::QuickChat => ProjectBindingKind::QuickChat,
+            Self::Directory { .. } => ProjectBindingKind::Directory,
+        }
+    }
+
+    fn execution_path(&self, quick_chat_path: &Path) -> String {
+        match self {
+            Self::QuickChat => quick_chat_path.to_string_lossy().into_owned(),
+            Self::Directory { path } => path.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateAutomationCommand {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub prompt: String,
+    pub member_id: String,
+    pub project_ref: AutomationProjectRef,
+    pub schedule: AutomationSchedule,
+    #[serde(default)]
+    pub notify_channels: Vec<AutomationNotifyChannel>,
+    // Keep pre-naming command digests stable across an upgrade and replay.
+    #[serde(default, skip_serializing_if = "AutomationThreadNaming::is_default")]
+    pub thread_naming: AutomationThreadNaming,
+}
+
+impl sealed::Sealed for CreateAutomationCommand {}
+impl DomainCommand for CreateAutomationCommand {
+    const TYPE: &'static str = "automation.create";
+}
+
+// Owner Host configuration; deliberately absent from the Agent CLI catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigureAutomationTimeLimitCommand {
+    pub automation_id: String,
+    pub expected_version: i64,
+    #[serde(deserialize_with = "crate::execution_budget::deserialize_required_time_limit")]
+    pub timeout_seconds: Option<i64>,
+}
+impl sealed::Sealed for ConfigureAutomationTimeLimitCommand {}
+impl DomainCommand for ConfigureAutomationTimeLimitCommand {
+    const TYPE: &'static str = "automation.configure_time_limit";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateAutomationCommand {
+    pub automation_id: String,
+    pub expected_version: i64,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub member_id: Option<String>,
+    #[serde(default)]
+    pub project_ref: Option<AutomationProjectRef>,
+    #[serde(default)]
+    pub schedule: Option<AutomationSchedule>,
+    #[serde(default)]
+    pub notify_channels: Option<Vec<AutomationNotifyChannel>>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_naming: Option<AutomationThreadNaming>,
+}
+
+impl sealed::Sealed for UpdateAutomationCommand {}
+impl DomainCommand for UpdateAutomationCommand {
+    const TYPE: &'static str = "automation.update";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CloseAutomationCommand {
+    pub automation_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for CloseAutomationCommand {}
+impl DomainCommand for CloseAutomationCommand {
+    const TYPE: &'static str = "automation.close";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteAutomationCommand {
+    pub automation_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for DeleteAutomationCommand {}
+impl DomainCommand for DeleteAutomationCommand {
+    const TYPE: &'static str = "automation.delete";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunAutomationCommand {
+    pub automation_id: String,
+}
+
+impl sealed::Sealed for RunAutomationCommand {}
+impl DomainCommand for RunAutomationCommand {
+    const TYPE: &'static str = "automation.run";
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationListQuery {
+    #[serde(default)]
+    pub status: AutomationStatusFilter,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub project: Option<AutomationProjectRef>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+}
+
+fn default_list_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationStatusFilter {
+    #[default]
+    All,
+    Enabled,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationRunSummary {
+    pub run_id: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub scheduled_for: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: Option<String>,
+    pub result_message_id: Option<String>,
+    pub notification_status: String,
+    pub created_at: String,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationView {
+    pub automation_id: String,
+    pub version: i64,
+    pub name: String,
+    pub prompt: String,
+    pub enabled: bool,
+    pub member_id: String,
+    pub project_ref: AutomationProjectRef,
+    pub schedule: AutomationSchedule,
+    pub thread_naming: AutomationThreadNaming,
+    pub notify_channels: Vec<AutomationNotifyChannel>,
+    pub next_run_at: Option<String>,
+    pub last_run: Option<AutomationRunSummary>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationRunListQuery {
+    pub automation_id: String,
+    pub cursor: Option<String>,
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationRunListPage {
+    pub runs: Vec<AutomationRunSummary>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationListPage {
+    pub automations: Vec<AutomationView>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationListToolInput {
+    #[serde(default)]
+    pub status: AutomationStatusFilter,
+    pub query: Option<String>,
+    pub project: Option<String>,
+    pub cursor: Option<String>,
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationGetToolInput {
+    pub automation_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationCreateToolInput {
+    pub name: Option<String>,
+    pub prompt: String,
+    pub member: Option<String>,
+    pub project: Option<String>,
+    pub repeat: String,
+    pub at: Option<String>,
+    pub weekday: Option<AutomationWeekday>,
+    pub date: Option<String>,
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub notify: Vec<AutomationNotifyChannel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationUpdateToolInput {
+    pub automation_id: String,
+    pub expected_version: i64,
+    pub name: Option<String>,
+    pub prompt: Option<String>,
+    pub member: Option<String>,
+    pub project: Option<String>,
+    pub repeat: Option<String>,
+    pub at: Option<String>,
+    pub weekday: Option<AutomationWeekday>,
+    pub date: Option<String>,
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub notify: Vec<AutomationNotifyChannel>,
+    #[serde(default)]
+    pub clear_notify: bool,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationVersionedToolInput {
+    pub automation_id: String,
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationRunToolInput {
+    pub automation_id: String,
+}
+
+pub fn schedule_from_tool_fields(
+    repeat: &str,
+    at: Option<&str>,
+    weekday: Option<AutomationWeekday>,
+    date: Option<&str>,
+    cron: Option<&str>,
+) -> Result<AutomationSchedule> {
+    let schedule = match repeat {
+        "daily" => AutomationSchedule::Daily {
+            at: at.context("daily schedule requires --at")?.to_string(),
+        },
+        "weekdays" => AutomationSchedule::Weekdays {
+            at: at.context("weekdays schedule requires --at")?.to_string(),
+        },
+        "weekly" => AutomationSchedule::Weekly {
+            weekday: weekday.context("weekly schedule requires --weekday")?,
+            at: at.context("weekly schedule requires --at")?.to_string(),
+        },
+        "once" => AutomationSchedule::Once {
+            date: date.context("once schedule requires --date")?.to_string(),
+            at: at.context("once schedule requires --at")?.to_string(),
+        },
+        "cron" => AutomationSchedule::Cron {
+            expression: cron.context("cron schedule requires --cron")?.to_string(),
+        },
+        "manual" => AutomationSchedule::Manual,
+        _ => anyhow::bail!("unsupported Automation repeat value: {repeat}"),
+    };
+    validate_schedule(&schedule)?;
+    let unused = match repeat {
+        "daily" | "weekdays" => weekday.is_some() || date.is_some() || cron.is_some(),
+        "weekly" => date.is_some() || cron.is_some(),
+        "once" => weekday.is_some() || cron.is_some(),
+        "cron" => at.is_some() || weekday.is_some() || date.is_some(),
+        "manual" => at.is_some() || weekday.is_some() || date.is_some() || cron.is_some(),
+        _ => false,
+    };
+    if unused {
+        anyhow::bail!("schedule fields do not match the selected repeat value");
+    }
+    Ok(schedule)
+}
+
+pub fn resolve_tool_automation_id(
+    database: &Database,
+    camp_id: &str,
+    requested: &str,
+) -> Result<String> {
+    if requested != "current" {
+        return Ok(requested.to_string());
+    }
+    database
+        .connection()
+        .query_row(
+            "SELECT automation_id FROM automation_run WHERE camp_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            [camp_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context("The current conversation was not created by an Automation")
+}
+
+pub fn resolve_tool_member(
+    database: &Database,
+    current_agent_id: &str,
+    requested: Option<&str>,
+) -> Result<String> {
+    let Some(requested) = requested.filter(|value| *value != "current") else {
+        return Ok(current_agent_id.to_string());
+    };
+    let mut statement = database.connection().prepare(
+        r#"
+        SELECT id
+        FROM agent_profile
+        WHERE profile_status = 'present' AND (id = ?1 OR display_name = ?1)
+        ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, id
+        LIMIT 2
+        "#,
+    )?;
+    let matches = statement
+        .query_map([requested], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match matches.as_slice() {
+        [member_id] => Ok(member_id.clone()),
+        [] => anyhow::bail!("The selected member does not exist or is no longer present"),
+        _ => anyhow::bail!("The member name is ambiguous; use the stable member ID"),
+    }
+}
+
+pub fn resolve_tool_project(
+    database: &Database,
+    camp_id: &str,
+    requested: &str,
+) -> Result<AutomationProjectRef> {
+    if requested == "quick-chat" {
+        return Ok(AutomationProjectRef::QuickChat);
+    }
+    if requested != "current" {
+        if !Path::new(requested).is_absolute() {
+            anyhow::bail!("Automation project must be current, quick-chat, or an absolute path");
+        }
+        return Ok(AutomationProjectRef::Directory {
+            path: requested.to_string(),
+        });
+    }
+    let binding = database
+        .connection()
+        .query_row(
+            "SELECT project_binding_kind, project_path FROM camp WHERE id = ?1",
+            [camp_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .context("Current Thread project is unavailable")?;
+    match binding.0.as_str() {
+        "quick_chat" => Ok(AutomationProjectRef::QuickChat),
+        "directory" => Ok(AutomationProjectRef::Directory { path: binding.1 }),
+        _ => anyhow::bail!("Current Thread has no supported project binding"),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AutomationRecord {
+    id: String,
+    version: i64,
+    name: String,
+    prompt: String,
+    enabled: bool,
+    member_id: String,
+    project_ref: AutomationProjectRef,
+    schedule: AutomationSchedule,
+    thread_naming: AutomationThreadNaming,
+    notify_channels: Vec<AutomationNotifyChannel>,
+    next_run_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+    runtime_timeout_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationDispatch {
+    pub automation_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+}
+
+#[derive(Debug, Default)]
+pub struct AutomationService {
+    gateway: DomainCommandGateway,
+}
+
+impl AutomationService {
+    /// The next reminder is a hint only; claim/settlement re-read authoritative rows.
+    pub(crate) fn next_wake_at(
+        &self,
+        database: &Database,
+        notifications_observed_through: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let mut statement = database.connection().prepare(
+            "SELECT next_run_at FROM automation WHERE enabled = 1 AND next_run_at IS NOT NULL
+             UNION ALL SELECT timeout_at FROM automation_run
+               WHERE status IN ('running', 'cancelling') AND timeout_at IS NOT NULL
+             UNION ALL SELECT available_at FROM automation_notification_delivery
+               WHERE status = 'pending' AND available_at > ?1",
+        )?;
+        let rows = statement.query_map([timestamp(notifications_observed_through)], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut next = None;
+        for row in rows {
+            let at = parse_timestamp(&row?)?;
+            next = Some(next.map_or(at, |previous: DateTime<Utc>| previous.min(at)));
+        }
+        Ok(next)
+    }
+
+    pub fn create(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CreateAutomationCommand>,
+    ) -> Result<CommandExecution> {
+        let command = envelope.payload.clone();
+        let automation_id = new_id("rvat");
+        self.gateway.execute(database, envelope, |transaction| {
+            if !management_actor(&envelope.actor) {
+                return Ok(rejected(
+                    "automation.actor_forbidden",
+                    "Automation management requires the local user or an attested AgentRun",
+                ));
+            }
+            let prompt = normalize_prompt(&command.prompt)?;
+            let name = normalized_or_derived_name(command.name.as_deref(), &prompt)?;
+            validate_member(transaction, &command.member_id)?;
+            let project_ref = normalize_project_ref(&command.project_ref)?;
+            let notify_channels = normalize_channels(&command.notify_channels);
+            validate_schedule(&command.schedule)?;
+            let now = Utc::now();
+            let next_run_at = next_occurrence_after(&command.schedule, now)?;
+            if matches!(command.schedule, AutomationSchedule::Once { .. }) && next_run_at.is_none()
+            {
+                return Ok(rejected(
+                    "automation.schedule_in_past",
+                    "A one-time Automation must be scheduled in the future",
+                ));
+            }
+            let now_text = timestamp(now);
+            transaction.execute(
+                r#"
+                INSERT INTO automation(
+                    id, version, name, prompt, enabled, member_id,
+                    project_ref_json, schedule_json, notify_channels_json,
+                    next_run_at, created_at, updated_at, thread_naming_json
+                ) VALUES (?1, 1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
+                "#,
+                params![
+                    automation_id,
+                    name,
+                    prompt,
+                    command.member_id,
+                    serde_json::to_string(&project_ref)?,
+                    serde_json::to_string(&command.schedule)?,
+                    serde_json::to_string(&notify_channels)?,
+                    next_run_at.map(timestamp),
+                    now_text,
+                    serde_json::to_string(&command.thread_naming)?,
+                ],
+            )?;
+            let view = load_automation_view(transaction, &automation_id)?
+                .context("created Automation is unavailable")?;
+            Ok(CommandHandlerResult::applied(
+                "automation.created",
+                serde_json::to_value(view)?,
+                Some(entity("automation", &automation_id)),
+            ))
+        })
+    }
+
+    pub fn configure_time_limit(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<ConfigureAutomationTimeLimitCommand>,
+    ) -> Result<CommandExecution> {
+        let command = &envelope.payload;
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, ActorRef::User { .. }) {
+                return Ok(rejected("automation.actor_forbidden", "Time-limit configuration requires the local user"));
+            }
+            let Some(current) = load_automation_record(transaction, &command.automation_id)? else {
+                return Ok(rejected("automation.not_found", "Automation does not exist"));
+            };
+            if current.version != command.expected_version {
+                return Ok(CommandHandlerResult::rejected("command.version_conflict", json!({"currentVersion": current.version})));
+            }
+            if command.timeout_seconds.is_some_and(|seconds| !(60..=86_400).contains(&seconds)) {
+                return Ok(rejected("automation.time_limit_invalid", "Use 60–86400 seconds or explicit null"));
+            }
+            if automation_has_active_run(transaction, &current.id)? {
+                return Ok(rejected("automation.active_run", "Wait for the active occurrence before changing its time limit"));
+            }
+            if current.runtime_timeout_seconds != command.timeout_seconds {
+                transaction.execute("UPDATE automation SET runtime_timeout_seconds=?2, version=version+1, updated_at=?3 WHERE id=?1",
+                    params![command.automation_id, command.timeout_seconds, timestamp(Utc::now())])?;
+            }
+            let version: i64 = transaction.query_row("SELECT version FROM automation WHERE id=?1", [&command.automation_id], |row| row.get(0))?;
+            Ok(CommandHandlerResult::applied("automation.time_limit_configured", json!({"automationId":command.automation_id, "automationVersion":version, "timeoutSeconds":command.timeout_seconds}), Some(entity("automation", &command.automation_id))))
+        })
+    }
+
+    pub fn update(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<UpdateAutomationCommand>,
+    ) -> Result<CommandExecution> {
+        let command = envelope.payload.clone();
+        self.gateway.execute(database, envelope, |transaction| {
+            if !management_actor(&envelope.actor) {
+                return Ok(rejected(
+                    "automation.actor_forbidden",
+                    "Automation management requires the local user or an attested AgentRun",
+                ));
+            }
+            let Some(current) = load_automation_record(transaction, &command.automation_id)? else {
+                return Ok(rejected(
+                    "automation.not_found",
+                    "Automation does not exist",
+                ));
+            };
+            if current.version != command.expected_version {
+                return Ok(CommandHandlerResult::rejected(
+                    "command.version_conflict",
+                    json!({ "currentVersion": current.version }),
+                ));
+            }
+            let prompt = match command.prompt.as_deref() {
+                Some(value) => normalize_prompt(value)?,
+                None => current.prompt.clone(),
+            };
+            let name = match command.name.as_deref() {
+                Some(value) => normalized_or_derived_name(Some(value), &prompt)?,
+                None => current.name.clone(),
+            };
+            let member_id = command
+                .member_id
+                .clone()
+                .unwrap_or(current.member_id.clone());
+            validate_member(transaction, &member_id)?;
+            let project_ref = match command.project_ref.as_ref() {
+                Some(project_ref) => normalize_project_ref(project_ref)?,
+                None => current.project_ref.clone(),
+            };
+            let schedule = command.schedule.clone().unwrap_or(current.schedule.clone());
+            validate_schedule(&schedule)?;
+            let notify_channels = command
+                .notify_channels
+                .as_ref()
+                .map(|channels| normalize_channels(channels))
+                .unwrap_or(current.notify_channels.clone());
+            let thread_naming = command
+                .thread_naming
+                .clone()
+                .unwrap_or(current.thread_naming.clone());
+            let enabled = command.enabled.unwrap_or(current.enabled);
+            let now = Utc::now();
+            let schedule_changed = schedule != current.schedule;
+            let reopened = !current.enabled && enabled;
+            let next_run_at = if !enabled {
+                None
+            } else if schedule_changed || reopened {
+                next_occurrence_after(&schedule, now)?
+            } else {
+                current
+                    .next_run_at
+                    .as_deref()
+                    .map(parse_timestamp)
+                    .transpose()?
+            };
+            if enabled
+                && matches!(schedule, AutomationSchedule::Once { .. })
+                && next_run_at.is_none()
+            {
+                return Ok(rejected(
+                    "automation.schedule_in_past",
+                    "A one-time Automation must be scheduled in the future",
+                ));
+            }
+            let now_text = timestamp(now);
+            transaction.execute(
+                r#"
+                UPDATE automation
+                SET version = version + 1, name = ?2, prompt = ?3, enabled = ?4,
+                    member_id = ?5, project_ref_json = ?6, schedule_json = ?7,
+                    notify_channels_json = ?8, next_run_at = ?9, updated_at = ?10, thread_naming_json = ?11
+                WHERE id = ?1
+                "#,
+                params![
+                    command.automation_id,
+                    name,
+                    prompt,
+                    enabled,
+                    member_id,
+                    serde_json::to_string(&project_ref)?,
+                    serde_json::to_string(&schedule)?,
+                    serde_json::to_string(&notify_channels)?,
+                    next_run_at.map(timestamp),
+                    now_text,
+                    serde_json::to_string(&thread_naming)?,
+                ],
+            )?;
+            let view = load_automation_view(transaction, &command.automation_id)?
+                .context("updated Automation is unavailable")?;
+            Ok(CommandHandlerResult::applied(
+                "automation.updated",
+                serde_json::to_value(view)?,
+                Some(entity("automation", &command.automation_id)),
+            ))
+        })
+    }
+
+    pub fn close(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CloseAutomationCommand>,
+    ) -> Result<CommandExecution> {
+        let command = envelope.payload.clone();
+        self.gateway.execute(database, envelope, |transaction| {
+            if !management_actor(&envelope.actor) {
+                return Ok(rejected(
+                    "automation.actor_forbidden",
+                    "Automation management requires the local user or an attested AgentRun",
+                ));
+            }
+            let Some(current) = load_automation_record(transaction, &command.automation_id)? else {
+                return Ok(rejected(
+                    "automation.not_found",
+                    "Automation does not exist",
+                ));
+            };
+            if current.version != command.expected_version {
+                return Ok(CommandHandlerResult::rejected(
+                    "command.version_conflict",
+                    json!({ "currentVersion": current.version }),
+                ));
+            }
+            let now = timestamp(Utc::now());
+            transaction.execute(
+                "UPDATE automation SET enabled = 0, next_run_at = NULL, version = version + 1, updated_at = ?2 WHERE id = ?1",
+                params![command.automation_id, now],
+            )?;
+            let view = load_automation_view(transaction, &command.automation_id)?
+                .context("closed Automation is unavailable")?;
+            Ok(CommandHandlerResult::applied(
+                "automation.closed",
+                serde_json::to_value(view)?,
+                Some(entity("automation", &command.automation_id)),
+            ))
+        })
+    }
+
+    pub fn delete(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<DeleteAutomationCommand>,
+    ) -> Result<CommandExecution> {
+        let command = envelope.payload.clone();
+        self.gateway.execute(database, envelope, |transaction| {
+            if !management_actor(&envelope.actor) {
+                return Ok(rejected(
+                    "automation.actor_forbidden",
+                    "Automation management requires the local user or an attested AgentRun",
+                ));
+            }
+            let Some(current) = load_automation_record(transaction, &command.automation_id)? else {
+                return Ok(rejected(
+                    "automation.not_found",
+                    "Automation does not exist",
+                ));
+            };
+            if current.version != command.expected_version {
+                return Ok(CommandHandlerResult::rejected(
+                    "command.version_conflict",
+                    json!({ "currentVersion": current.version }),
+                ));
+            }
+            transaction.execute(
+                "DELETE FROM automation WHERE id = ?1",
+                [&command.automation_id],
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "automation.deleted",
+                json!({ "automationId": command.automation_id, "deleted": true }),
+                Some(entity("automation", &command.automation_id)),
+            ))
+        })
+    }
+
+    pub fn run_now(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RunAutomationCommand>,
+        user_id: &str,
+        quick_chat_path: &Path,
+    ) -> Result<CommandExecution> {
+        let command = envelope.payload.clone();
+        self.gateway.execute(database, envelope, |transaction| {
+            if !management_actor(&envelope.actor) {
+                return Ok(rejected(
+                    "automation.actor_forbidden",
+                    "Automation execution requires the local user or an attested AgentRun",
+                ));
+            }
+            let Some(record) = load_automation_record(transaction, &command.automation_id)? else {
+                return Ok(rejected(
+                    "automation.not_found",
+                    "Automation does not exist",
+                ));
+            };
+            let scheduled_for = Utc::now();
+            let occurrence = claim_occurrence_in_tx(
+                transaction,
+                &record,
+                scheduled_for,
+                "manual",
+                false,
+                user_id,
+                quick_chat_path,
+            )?;
+            Ok(CommandHandlerResult::accepted(
+                "automation.run_requested",
+                occurrence.payload(),
+                Some(entity("automation_run", &occurrence.run_id)),
+            ))
+        })
+    }
+
+    pub fn get(&self, database: &Database, automation_id: &str) -> Result<Option<AutomationView>> {
+        load_automation_view(database.connection(), automation_id)
+    }
+
+    pub fn list_runs(
+        &self,
+        database: &Database,
+        query: &AutomationRunListQuery,
+    ) -> Result<AutomationRunListPage> {
+        if query.limit == 0 || query.limit > MAX_LIST_LIMIT {
+            anyhow::bail!("Automation history limit must be between 1 and {MAX_LIST_LIMIT}");
+        }
+        if load_automation_record(database.connection(), &query.automation_id)?.is_none() {
+            anyhow::bail!("Automation does not exist");
+        }
+        let cursor = query.cursor.as_deref().map(decode_cursor).transpose()?;
+        let mut runs = load_automation_runs(
+            database.connection(),
+            &query.automation_id,
+            cursor,
+            query.limit + 1,
+        )?;
+        let truncated = runs.len() > query.limit;
+        runs.truncate(query.limit);
+        let next_cursor = if truncated {
+            runs.last()
+                .map(|run| encode_cursor(&run.created_at, &run.run_id))
+        } else {
+            None
+        };
+        Ok(AutomationRunListPage {
+            runs,
+            next_cursor,
+            truncated,
+        })
+    }
+
+    pub fn current_for_camp(
+        &self,
+        database: &Database,
+        camp_id: &str,
+    ) -> Result<Option<AutomationView>> {
+        let automation_id = database.connection().query_row(
+            "SELECT automation_id FROM automation_run WHERE camp_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            [camp_id],
+            |row| row.get::<_, String>(0),
+        ).optional()?;
+        match automation_id {
+            Some(id) => load_automation_view(database.connection(), &id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list(
+        &self,
+        database: &Database,
+        query: &AutomationListQuery,
+    ) -> Result<AutomationListPage> {
+        if query.limit == 0 || query.limit > MAX_LIST_LIMIT {
+            anyhow::bail!("Automation list limit must be between 1 and {MAX_LIST_LIMIT}");
+        }
+        let cursor = query.cursor.as_deref().map(decode_cursor).transpose()?;
+        let normalized_query = query
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let project_json = query
+            .project
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let enabled_filter = match query.status {
+            AutomationStatusFilter::All => None,
+            AutomationStatusFilter::Enabled => Some(true),
+            AutomationStatusFilter::Closed => Some(false),
+        };
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT id
+            FROM automation
+            WHERE (?1 IS NULL OR enabled = ?1)
+              AND (?2 IS NULL OR name LIKE '%' || ?2 || '%' OR prompt LIKE '%' || ?2 || '%')
+              AND (?3 IS NULL OR project_ref_json = ?3)
+              AND (?4 IS NULL OR updated_at < ?4 OR (updated_at = ?4 AND id < ?5))
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?6
+            "#,
+        )?;
+        let mut ids = statement
+            .query_map(
+                params![
+                    enabled_filter,
+                    normalized_query,
+                    project_json,
+                    cursor.as_ref().map(|value| value.0.as_str()),
+                    cursor.as_ref().map(|value| value.1.as_str()),
+                    i64::try_from(query.limit + 1)?,
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let truncated = ids.len() > query.limit;
+        ids.truncate(query.limit);
+        let mut automations = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(view) = load_automation_view(database.connection(), &id)? {
+                automations.push(view);
+            }
+        }
+        let next_cursor = truncated
+            .then(|| {
+                automations
+                    .last()
+                    .map(|view| encode_cursor(&view.updated_at, &view.automation_id))
+            })
+            .flatten();
+        Ok(AutomationListPage {
+            automations,
+            next_cursor,
+            truncated,
+        })
+    }
+
+    pub fn claim_due(
+        &self,
+        database: &mut Database,
+        now: DateTime<Utc>,
+        recovery_boundary: DateTime<Utc>,
+        quick_chat_path: &Path,
+    ) -> Result<Vec<AutomationDispatch>> {
+        let ids = {
+            let mut statement = database.connection().prepare(
+                "SELECT id FROM automation WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1 ORDER BY next_run_at, id LIMIT 16",
+            )?;
+            statement
+                .query_map([timestamp(now)], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut dispatches = Vec::new();
+        for automation_id in ids {
+            let transaction = database
+                .connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let Some(record) = load_automation_record(&transaction, &automation_id)? else {
+                transaction.commit()?;
+                continue;
+            };
+            if !record.enabled {
+                transaction.commit()?;
+                continue;
+            }
+            let Some(stored_due) = record
+                .next_run_at
+                .as_deref()
+                .map(parse_timestamp)
+                .transpose()?
+            else {
+                transaction.commit()?;
+                continue;
+            };
+            if stored_due > now {
+                transaction.commit()?;
+                continue;
+            }
+            let missed = stored_due < recovery_boundary;
+            let consumed_at = if missed {
+                latest_occurrence_at_or_before(&record.schedule, now)?.unwrap_or(stored_due)
+            } else {
+                stored_due
+            };
+            let next =
+                next_occurrence_after(&record.schedule, if missed { now } else { consumed_at })?;
+            advance_definition_in_tx(&transaction, &record, next, &timestamp(now))?;
+            if missed {
+                insert_skipped_occurrence_in_tx(
+                    &transaction,
+                    &record,
+                    consumed_at,
+                    "missed",
+                    "scheduled",
+                )?;
+            } else if automation_has_active_run(&transaction, &record.id)? {
+                insert_skipped_occurrence_in_tx(
+                    &transaction,
+                    &record,
+                    consumed_at,
+                    "overlap",
+                    "scheduled",
+                )?;
+            } else {
+                let occurrence = claim_occurrence_in_tx(
+                    &transaction,
+                    &record,
+                    consumed_at,
+                    "scheduled",
+                    true,
+                    CURRENT_USER_ID,
+                    quick_chat_path,
+                )?;
+                if let Some(camp_id) = occurrence.camp_id {
+                    dispatches.push(AutomationDispatch {
+                        automation_run_id: occurrence.run_id,
+                        camp_id,
+                    });
+                }
+            }
+            transaction.commit()?;
+            database.execution_wake.delivery.notify_one();
+        }
+        Ok(dispatches)
+    }
+
+    pub fn settle_runs(&self, database: &mut Database, now: DateTime<Utc>) -> Result<bool> {
+        let run_ids = {
+            let mut statement = database.connection().prepare(
+                "SELECT id FROM automation_run WHERE status IN ('running', 'cancelling') ORDER BY created_at, id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut changed = false;
+        for run_id in run_ids {
+            changed |= settle_one_run(database, &run_id, now)?;
+        }
+        Ok(changed)
+    }
+
+    pub fn has_ready_notification(&self, database: &Database, now: DateTime<Utc>) -> Result<bool> {
+        database
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM automation_notification_delivery
+                    WHERE status = 'pending' AND available_at <= ?1
+                )",
+                [timestamp(now)],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Closes a claimed occurrence that could not finish its local, pre-Runtime
+    /// preparation. The exact AutomationRun/CampTurn association remains the
+    /// cancellation authority, so this cannot stop an unrelated conversation.
+    pub fn interrupt_before_runtime(
+        &self,
+        database: &mut Database,
+        automation_run_id: &str,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(state) = load_run_state(&transaction, automation_run_id)? else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        if !matches!(state.status.as_str(), "running" | "cancelling") {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let mut cancelled_agent_runs = Vec::new();
+        if let Some(camp_turn_id) = state.camp_turn_id.as_deref() {
+            let settlement = cancel_automation_camp_turn_in_tx(
+                &transaction,
+                &state.id,
+                camp_turn_id,
+                "interrupted",
+                &timestamp(now),
+            )?;
+            cancelled_agent_runs.extend(settlement.runs.into_iter().map(|run| run.agent_run_id));
+        } else if let Some(delivery_id) = state.trigger_delivery_id.as_deref() {
+            let claimed_run_id: Option<String> = transaction
+                .query_row(
+                    "SELECT claimed_agent_run_id FROM camp_message_delivery WHERE id = ?1",
+                    [delivery_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some(agent_run_id) = claimed_run_id {
+                let actor = ActorRef::System {
+                    component_id: "automation-occurrence".to_string(),
+                };
+                settle_abortive_agent_run_in_tx(
+                    &transaction,
+                    &agent_run_id,
+                    "interrupted",
+                    &actor,
+                    &timestamp(now),
+                )?;
+                cancelled_agent_runs.push(agent_run_id);
+            } else {
+                transaction.execute(
+                    r#"
+                    UPDATE camp_message_delivery
+                    SET status = 'cancelled', failure_code = 'automation_interrupted',
+                        ended_at = ?2, version = version + 1, updated_at = ?2
+                    WHERE id = ?1 AND status = 'waiting'
+                    "#,
+                    params![delivery_id, timestamp(now)],
+                )?;
+            }
+        }
+        let _ = finalize_run_in_tx(
+            &transaction,
+            &state,
+            "failed",
+            Some("interrupted"),
+            None,
+            now,
+        )?;
+        transaction.commit()?;
+        database.execution_wake.execution_changed();
+        pump_targets_after_runs_terminal(database, &cancelled_agent_runs)?;
+        Ok(())
+    }
+
+    pub fn recover_interrupted(&self, database: &mut Database) -> Result<()> {
+        let run_ids = {
+            let mut statement = database.connection().prepare(
+                "SELECT id FROM automation_run WHERE status IN ('running', 'cancelling') ORDER BY created_at, id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for run_id in run_ids {
+            let now = Utc::now();
+            let transaction = database
+                .connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state = load_run_state(&transaction, &run_id)?;
+            let Some(state) = state else {
+                transaction.commit()?;
+                continue;
+            };
+            let mut cancelled_agent_runs = Vec::new();
+            match state.camp_turn_id.as_deref() {
+                None if state.trigger_delivery_id.is_some() => {
+                    transaction.commit()?;
+                    let _ = settle_one_run(database, &run_id, now)?;
+                    continue;
+                }
+                None => {
+                    let _ = finalize_run_in_tx(
+                        &transaction,
+                        &state,
+                        "failed",
+                        Some("interrupted"),
+                        None,
+                        now,
+                    )?;
+                }
+                Some(turn_id) => {
+                    let turn_status = transaction
+                        .query_row(
+                            "SELECT status FROM camp_turn WHERE id = ?1",
+                            [turn_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    match turn_status.as_deref() {
+                        Some("completed" | "failed" | "cancelled") => {
+                            let _ = settle_terminal_turn_in_tx(&transaction, &state, now)?;
+                        }
+                        Some(_) => {
+                            let settlement = cancel_automation_camp_turn_in_tx(
+                                &transaction,
+                                &state.id,
+                                turn_id,
+                                "interrupted",
+                                &timestamp(now),
+                            )?;
+                            cancelled_agent_runs
+                                .extend(settlement.runs.into_iter().map(|run| run.agent_run_id));
+                            let _ = finalize_run_in_tx(
+                                &transaction,
+                                &state,
+                                "failed",
+                                Some("interrupted"),
+                                None,
+                                now,
+                            )?;
+                        }
+                        None => {
+                            let _ = finalize_run_in_tx(
+                                &transaction,
+                                &state,
+                                "failed",
+                                Some("interrupted"),
+                                None,
+                                now,
+                            )?;
+                        }
+                    }
+                }
+            }
+            transaction.commit()?;
+            pump_targets_after_runs_terminal(database, &cancelled_agent_runs)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ClaimedOccurrence {
+    run_id: String,
+    status: &'static str,
+    reason: Option<String>,
+    camp_id: Option<String>,
+}
+
+impl ClaimedOccurrence {
+    fn payload(&self) -> Value {
+        json!({
+            "status": self.status,
+            "runId": self.run_id,
+            "threadId": self.camp_id,
+            "reason": self.reason,
+        })
+    }
+}
+
+fn claim_occurrence_in_tx(
+    transaction: &Transaction<'_>,
+    record: &AutomationRecord,
+    scheduled_for: DateTime<Utc>,
+    trigger_kind: &str,
+    scheduled: bool,
+    _user_id: &str,
+    quick_chat_path: &Path,
+) -> Result<ClaimedOccurrence> {
+    if automation_has_active_run(transaction, &record.id)? {
+        let run_id = insert_skipped_occurrence_in_tx(
+            transaction,
+            record,
+            scheduled_for,
+            "overlap",
+            trigger_kind,
+        )?;
+        return Ok(ClaimedOccurrence {
+            run_id,
+            status: "skipped",
+            reason: Some("overlap".to_string()),
+            camp_id: None,
+        });
+    }
+    let run_id = new_id("rvar");
+    let now = Utc::now();
+    let now_text = timestamp(now);
+    transaction.execute(
+        r#"
+        INSERT INTO automation_run(
+            id, automation_id, automation_version, trigger_kind, scheduled_for,
+            status, reason, prompt, member_id, project_ref_json,
+            notify_channels_json, timeout_at, camp_id, camp_turn_id,
+            root_agent_run_id, result_message_id, created_at, started_at,
+            ended_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', NULL, ?6, ?7, ?8, ?9,
+                  ?10, NULL, NULL, NULL, NULL, ?11, ?11, NULL, ?11)
+        "#,
+        params![
+            run_id,
+            record.id,
+            record.version,
+            trigger_kind,
+            occurrence_timestamp(scheduled_for, trigger_kind),
+            record.prompt,
+            record.member_id,
+            serde_json::to_string(&record.project_ref)?,
+            serde_json::to_string(&record.notify_channels)?,
+            record
+                .runtime_timeout_seconds
+                .map(|seconds| timestamp(now + Duration::seconds(seconds))),
+            now_text,
+        ],
+    )?;
+    let admission = CollaborationService::default().admit_scheduled_automation(
+        transaction,
+        ScheduledAutomationAdmissionInput {
+            automation_run_id: run_id.clone(),
+            automation_name: record.thread_naming.title(
+                &record.name,
+                (if scheduled { scheduled_for } else { now })
+                    .with_timezone(&Local)
+                    .fixed_offset(),
+            ),
+            prompt: record.prompt.clone(),
+            member_id: record.member_id.clone(),
+            project_binding_kind: record.project_ref.binding_kind(),
+            project_path: record.project_ref.execution_path(quick_chat_path),
+            now: now_text.clone(),
+        },
+    )?;
+    match admission {
+        Ok(admission) => {
+            transaction.execute(
+                "UPDATE automation_run
+                 SET camp_id = ?2, trigger_message_id = ?3,
+                     trigger_delivery_id = ?4, updated_at = ?5
+                 WHERE id = ?1",
+                params![
+                    run_id,
+                    admission.camp_id,
+                    admission.camp_message_id,
+                    admission.delivery_id,
+                    now_text
+                ],
+            )?;
+            Ok(ClaimedOccurrence {
+                run_id,
+                status: "started",
+                reason: None,
+                camp_id: Some(admission.camp_id),
+            })
+        }
+        Err(rejection) => {
+            let reason = if rejection.code == "agent_run.runtime_not_ready" {
+                "runtime_not_ready"
+            } else {
+                "dispatch_rejected"
+            };
+            let state = load_run_state(transaction, &run_id)?
+                .context("claimed AutomationRun is unavailable")?;
+            finalize_run_in_tx(transaction, &state, "failed", Some(reason), None, now)?;
+            Ok(ClaimedOccurrence {
+                run_id,
+                status: "failed",
+                reason: Some(reason.to_string()),
+                camp_id: None,
+            })
+        }
+    }
+}
+
+fn insert_skipped_occurrence_in_tx(
+    transaction: &Transaction<'_>,
+    record: &AutomationRecord,
+    scheduled_for: DateTime<Utc>,
+    reason: &str,
+    trigger_kind: &str,
+) -> Result<String> {
+    let run_id = new_id("rvar");
+    let now = timestamp(Utc::now());
+    let scheduled_for = occurrence_timestamp(scheduled_for, trigger_kind);
+    transaction.execute(
+        r#"
+        INSERT OR IGNORE INTO automation_run(
+            id, automation_id, automation_version, trigger_kind, scheduled_for,
+            status, reason, prompt, member_id, project_ref_json,
+            notify_channels_json, timeout_at, camp_id, camp_turn_id,
+            root_agent_run_id, result_message_id, created_at, started_at,
+            ended_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, 'skipped', ?6, ?7, ?8, ?9, ?10,
+                  NULL, NULL, NULL, NULL, NULL, ?11, NULL, ?11, ?11)
+        "#,
+        params![
+            run_id,
+            record.id,
+            record.version,
+            trigger_kind,
+            scheduled_for,
+            reason,
+            record.prompt,
+            record.member_id,
+            serde_json::to_string(&record.project_ref)?,
+            serde_json::to_string(&record.notify_channels)?,
+            now,
+        ],
+    )?;
+    Ok(transaction.query_row(
+        "SELECT id FROM automation_run WHERE automation_id = ?1 AND scheduled_for = ?2",
+        params![record.id, scheduled_for],
+        |row| row.get(0),
+    )?)
+}
+
+fn advance_definition_in_tx(
+    transaction: &Transaction<'_>,
+    record: &AutomationRecord,
+    next: Option<DateTime<Utc>>,
+    now: &str,
+) -> Result<()> {
+    let consume_once = matches!(record.schedule, AutomationSchedule::Once { .. });
+    transaction.execute(
+        "UPDATE automation SET enabled = CASE WHEN ?2 THEN 0 ELSE enabled END, next_run_at = ?3, updated_at = ?4 WHERE id = ?1",
+        params![record.id, consume_once, next.map(timestamp), now],
+    )?;
+    Ok(())
+}
+
+fn automation_has_active_run(transaction: &Transaction<'_>, automation_id: &str) -> Result<bool> {
+    transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automation_run WHERE automation_id = ?1 AND status IN ('running', 'cancelling'))",
+        [automation_id],
+        |row| row.get(0),
+    ).map_err(Into::into)
+}
+
+#[derive(Debug)]
+struct RunState {
+    id: String,
+    status: String,
+    member_id: String,
+    notify_channels: Vec<AutomationNotifyChannel>,
+    camp_turn_id: Option<String>,
+    root_agent_run_id: Option<String>,
+    trigger_delivery_id: Option<String>,
+    timeout_at: Option<DateTime<Utc>>,
+}
+
+fn load_run_state(transaction: &Transaction<'_>, run_id: &str) -> Result<Option<RunState>> {
+    transaction
+        .query_row(
+            "SELECT id, status, member_id, notify_channels_json, camp_turn_id,
+                root_agent_run_id, trigger_delivery_id, timeout_at
+         FROM automation_run WHERE id = ?1",
+            [run_id],
+            |row| {
+                let channels: String = row.get(3)?;
+                let timeout: Option<String> = row.get(7)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    channels,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    timeout,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |(
+                id,
+                status,
+                member_id,
+                channels,
+                camp_turn_id,
+                root_agent_run_id,
+                trigger_delivery_id,
+                timeout,
+            )| {
+                Ok(RunState {
+                    id,
+                    status,
+                    member_id,
+                    notify_channels: serde_json::from_str(&channels)?,
+                    camp_turn_id,
+                    root_agent_run_id,
+                    trigger_delivery_id,
+                    timeout_at: timeout.as_deref().map(parse_timestamp).transpose()?,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn settle_one_run(database: &mut Database, run_id: &str, now: DateTime<Utc>) -> Result<bool> {
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(state) = load_run_state(&transaction, run_id)? else {
+        transaction.commit()?;
+        return Ok(false);
+    };
+    if !matches!(state.status.as_str(), "running" | "cancelling") {
+        transaction.commit()?;
+        return Ok(false);
+    }
+    let Some(turn_id) = state.camp_turn_id.as_deref() else {
+        let settlement = settle_delivery_occurrence_in_tx(&transaction, &state, now)?;
+        transaction.commit()?;
+        if settlement.changed {
+            database.execution_wake.execution_changed();
+        }
+        if let Some(agent_run_id) = settlement.cancelled_agent_run_id {
+            pump_targets_after_runs_terminal(database, &[agent_run_id])?;
+        }
+        return Ok(settlement.changed);
+    };
+    let turn_status = transaction
+        .query_row(
+            "SELECT status FROM camp_turn WHERE id = ?1",
+            [turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(turn_status) = turn_status else {
+        let changed = finalize_run_in_tx(
+            &transaction,
+            &state,
+            "failed",
+            Some("interrupted"),
+            None,
+            now,
+        )?;
+        transaction.commit()?;
+        if changed {
+            database.execution_wake.execution_changed();
+        }
+        return Ok(changed);
+    };
+    if matches!(turn_status.as_str(), "completed" | "failed" | "cancelled") {
+        let changed = settle_terminal_turn_in_tx(&transaction, &state, now)?;
+        transaction.commit()?;
+        if changed {
+            database.execution_wake.execution_changed();
+        }
+        return Ok(changed);
+    }
+    let interaction_required = if state.root_agent_run_id.is_some() {
+        transaction.query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM agent_run AS run
+                WHERE run.camp_turn_id = ?1
+                  AND (
+                    (run.status = 'waiting' AND run.wait_reason IN ('approval', 'user_input'))
+                    OR EXISTS(
+                        SELECT 1
+                        FROM action_execution AS action
+                        JOIN approval ON approval.action_id = action.id
+                        WHERE action.agent_run_id = run.id AND approval.status = 'pending'
+                    )
+                  )
+            )
+            "#,
+            [turn_id],
+            |row| row.get::<_, bool>(0),
+        )?
+    } else {
+        false
+    };
+    let timeout = state.timeout_at.is_some_and(|deadline| now >= deadline);
+    let reason = if interaction_required {
+        Some("interaction_required")
+    } else if timeout {
+        Some("timeout")
+    } else {
+        None
+    };
+    let Some(reason) = reason else {
+        transaction.commit()?;
+        return Ok(false);
+    };
+    transaction.execute(
+        "UPDATE automation_run SET status = 'cancelling', reason = ?2, updated_at = ?3 WHERE id = ?1 AND status = 'running'",
+        params![state.id, reason, timestamp(now)],
+    )?;
+    let settlement = cancel_automation_camp_turn_in_tx(
+        &transaction,
+        &state.id,
+        turn_id,
+        reason,
+        &timestamp(now),
+    )?;
+    let changed = finalize_run_in_tx(&transaction, &state, "failed", Some(reason), None, now)?;
+    let run_ids = settlement
+        .runs
+        .into_iter()
+        .map(|run| run.agent_run_id)
+        .collect::<Vec<_>>();
+    transaction.commit()?;
+    if changed {
+        database.execution_wake.execution_changed();
+    }
+    pump_targets_after_runs_terminal(database, &run_ids)?;
+    Ok(changed)
+}
+
+struct DeliveryOccurrenceSettlement {
+    changed: bool,
+    cancelled_agent_run_id: Option<String>,
+}
+
+fn settle_delivery_occurrence_in_tx(
+    transaction: &Transaction<'_>,
+    state: &RunState,
+    now: DateTime<Utc>,
+) -> Result<DeliveryOccurrenceSettlement> {
+    let delivery_id = state
+        .trigger_delivery_id
+        .as_deref()
+        .context("Automation occurrence has neither a Delivery nor a ThreadTurn")?;
+    let (delivery_status, claimed_agent_run_id, delivery_failure): (
+        String,
+        Option<String>,
+        Option<String>,
+    ) = transaction.query_row(
+        r#"
+        SELECT status, claimed_agent_run_id, failure_code
+        FROM camp_message_delivery WHERE id = ?1
+        "#,
+        [delivery_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let timed_out = state.timeout_at.is_some_and(|deadline| now >= deadline);
+    if delivery_status == "waiting" {
+        if !timed_out {
+            return Ok(DeliveryOccurrenceSettlement {
+                changed: false,
+                cancelled_agent_run_id: None,
+            });
+        }
+        let now_text = timestamp(now);
+        transaction.execute(
+            r#"
+            UPDATE camp_message_delivery
+            SET status = 'cancelled', failure_code = 'automation_timeout',
+                ended_at = ?2, version = version + 1, updated_at = ?2
+            WHERE id = ?1 AND status = 'waiting'
+            "#,
+            params![delivery_id, now_text],
+        )?;
+        return Ok(DeliveryOccurrenceSettlement {
+            changed: finalize_run_in_tx(transaction, state, "failed", Some("timeout"), None, now)?,
+            cancelled_agent_run_id: None,
+        });
+    }
+
+    if delivery_status == "settled" {
+        let run_id = claimed_agent_run_id
+            .as_deref()
+            .context("settled Automation Delivery has no AgentRun")?;
+        let result_message_id = automation_result_message(transaction, run_id)?;
+        let (status, reason) = if result_message_id.is_some() {
+            ("completed", None)
+        } else {
+            ("failed", Some("no_result"))
+        };
+        return Ok(DeliveryOccurrenceSettlement {
+            changed: finalize_run_in_tx(
+                transaction,
+                state,
+                status,
+                reason,
+                result_message_id.as_deref(),
+                now,
+            )?,
+            cancelled_agent_run_id: None,
+        });
+    }
+    if matches!(delivery_status.as_str(), "failed" | "cancelled") {
+        return Ok(DeliveryOccurrenceSettlement {
+            changed: finalize_run_in_tx(
+                transaction,
+                state,
+                "failed",
+                Some(
+                    delivery_failure
+                        .as_deref()
+                        .filter(|reason| *reason == "automation_timeout")
+                        .map_or("execution_failed", |_| "timeout"),
+                ),
+                None,
+                now,
+            )?,
+            cancelled_agent_run_id: None,
+        });
+    }
+
+    let run_id = claimed_agent_run_id
+        .as_deref()
+        .context("claimed Automation Delivery has no AgentRun")?;
+    let run = transaction.query_row(
+        "SELECT status, wait_reason, last_error_code FROM agent_run WHERE id = ?1",
+        [run_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    if matches!(run.0.as_str(), "succeeded" | "failed" | "cancelled") {
+        crate::delivery_queue::settle_run_deliveries(
+            transaction,
+            run_id,
+            &run.0,
+            run.2.as_deref(),
+            &timestamp(now),
+        )?;
+        if run.0 == "succeeded" {
+            let result_message_id = automation_result_message(transaction, run_id)?;
+            let (status, reason) = if result_message_id.is_some() {
+                ("completed", None)
+            } else {
+                ("failed", Some("no_result"))
+            };
+            return Ok(DeliveryOccurrenceSettlement {
+                changed: finalize_run_in_tx(
+                    transaction,
+                    state,
+                    status,
+                    reason,
+                    result_message_id.as_deref(),
+                    now,
+                )?,
+                cancelled_agent_run_id: None,
+            });
+        }
+        return Ok(DeliveryOccurrenceSettlement {
+            changed: finalize_run_in_tx(
+                transaction,
+                state,
+                "failed",
+                Some("execution_failed"),
+                None,
+                now,
+            )?,
+            cancelled_agent_run_id: None,
+        });
+    }
+
+    let interaction_required = run.0 == "waiting"
+        && matches!(run.1.as_deref(), Some("approval" | "user_input"))
+        || transaction.query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM action_execution AS action
+                JOIN approval ON approval.action_id = action.id
+                WHERE action.agent_run_id = ?1 AND approval.status = 'pending'
+            )
+            "#,
+            [run_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+    let reason = if interaction_required {
+        Some("interaction_required")
+    } else if timed_out {
+        Some("timeout")
+    } else {
+        None
+    };
+    let Some(reason) = reason else {
+        return Ok(DeliveryOccurrenceSettlement {
+            changed: false,
+            cancelled_agent_run_id: None,
+        });
+    };
+    let actor = ActorRef::System {
+        component_id: "automation-occurrence".to_string(),
+    };
+    settle_abortive_agent_run_in_tx(transaction, run_id, reason, &actor, &timestamp(now))?;
+    Ok(DeliveryOccurrenceSettlement {
+        changed: finalize_run_in_tx(transaction, state, "failed", Some(reason), None, now)?,
+        cancelled_agent_run_id: Some(run_id.to_string()),
+    })
+}
+
+fn automation_result_message(
+    transaction: &Transaction<'_>,
+    agent_run_id: &str,
+) -> Result<Option<String>> {
+    let final_message_id = transaction
+        .query_row(
+            r#"
+            SELECT message.id
+            FROM agent_run AS run
+            JOIN camp_message AS message ON message.id = run.final_camp_message_id
+            WHERE run.id = ?1 AND message.source_agent_run_id = run.id
+              AND message.author_type = 'agent' AND message.tombstoned_at IS NULL
+              AND json_array_length(message.effective_recipient_ids_json) = 0
+            "#,
+            [agent_run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if final_message_id.is_some() {
+        return Ok(final_message_id);
+    }
+    transaction
+        .query_row(
+            r#"
+            SELECT id FROM camp_message
+            WHERE source_agent_run_id = ?1 AND author_type = 'agent'
+              AND tombstoned_at IS NULL
+              AND json_array_length(effective_recipient_ids_json) = 0
+            ORDER BY sequence DESC, id DESC LIMIT 1
+            "#,
+            [agent_run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn settle_terminal_turn_in_tx(
+    transaction: &Transaction<'_>,
+    state: &RunState,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let turn_id = state
+        .camp_turn_id
+        .as_deref()
+        .context("AutomationRun has no ThreadTurn")?;
+    let turn_status: String = transaction.query_row(
+        "SELECT status FROM camp_turn WHERE id = ?1",
+        [turn_id],
+        |row| row.get(0),
+    )?;
+    if turn_status != "completed" {
+        return finalize_run_in_tx(
+            transaction,
+            state,
+            "failed",
+            Some("execution_failed"),
+            None,
+            now,
+        );
+    }
+    let Some(root_run_id) = state.root_agent_run_id.as_deref() else {
+        return finalize_run_in_tx(transaction, state, "failed", Some("no_result"), None, now);
+    };
+    let final_message_id = transaction
+        .query_row(
+            r#"
+        SELECT message.id
+        FROM agent_run AS run
+        JOIN camp_message AS message ON message.id = run.final_camp_message_id
+        WHERE run.id = ?1 AND message.source_agent_run_id = run.id
+          AND message.author_type = 'agent' AND message.tombstoned_at IS NULL
+          AND json_array_length(message.effective_recipient_ids_json) = 0
+        "#,
+            [root_run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let final_message_id = match final_message_id {
+        Some(message_id) => Some(message_id),
+        None => transaction
+            .query_row(
+                r#"
+            SELECT id FROM camp_message
+            WHERE source_agent_run_id = ?1 AND author_type = 'agent'
+              AND tombstoned_at IS NULL
+              AND json_array_length(effective_recipient_ids_json) = 0
+            ORDER BY sequence DESC, id DESC LIMIT 1
+            "#,
+                [root_run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    match final_message_id {
+        Some(message_id) => finalize_run_in_tx(
+            transaction,
+            state,
+            "completed",
+            None,
+            Some(&message_id),
+            now,
+        ),
+        None => finalize_run_in_tx(transaction, state, "failed", Some("no_result"), None, now),
+    }
+}
+
+fn finalize_run_in_tx(
+    transaction: &Transaction<'_>,
+    state: &RunState,
+    status: &str,
+    reason: Option<&str>,
+    result_message_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if !matches!(status, "completed" | "failed") {
+        anyhow::bail!("AutomationRun terminal status is invalid");
+    }
+    let now_text = timestamp(now);
+    let changed = transaction.execute(
+        r#"
+        UPDATE automation_run
+        SET status = ?2, reason = ?3, result_message_id = ?4,
+            ended_at = ?5, updated_at = ?5
+        WHERE id = ?1 AND status IN ('running', 'cancelling')
+        "#,
+        params![state.id, status, reason, result_message_id, now_text],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    let body = if let Some(message_id) = result_message_id {
+        let body = transaction.query_row(
+            "SELECT body FROM camp_message WHERE id = ?1",
+            [message_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        if body.trim().is_empty() {
+            "Rovai 定时任务已完成，结果文件已发布到运行对话。".to_string()
+        } else {
+            body
+        }
+    } else {
+        failure_notification_body(reason.unwrap_or("execution_failed"))
+    };
+    for channel in &state.notify_channels {
+        transaction.execute(
+            r#"
+            INSERT OR IGNORE INTO automation_notification_delivery(
+                id, automation_run_id, provider, member_id, payload_json,
+                status, attempt_count, available_at, lease_owner,
+                lease_expires_at, external_delivery_message_id, failure_code,
+                created_at, updated_at, ended_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, NULL, NULL, NULL, NULL, ?6, ?6, NULL)
+            "#,
+            params![
+                new_id("rvand"),
+                state.id,
+                channel.as_str(),
+                state.member_id,
+                serde_json::to_string(&json!({ "body": body }))?,
+                now_text,
+            ],
+        )?;
+    }
+    Ok(true)
+}
+
+fn failure_notification_body(reason: &str) -> String {
+    let detail = match reason {
+        "interaction_required" => "运行需要用户输入或权限审批，已停止",
+        "timeout" => "运行超出后台时限，已停止",
+        "interrupted" => "应用退出中断了运行",
+        "no_result" => "运行结束但没有产生公共结果",
+        "runtime_not_ready" => "所选队员的 Runtime 当前不可用",
+        _ => "运行失败",
+    };
+    format!("Rovai 定时任务失败：{detail}。")
+}
+
+pub(crate) fn claim_notification_deliveries(
+    transaction: &Transaction<'_>,
+    provider: &str,
+    worker_id: &str,
+    limit: usize,
+    now: &DateTime<Utc>,
+) -> Result<Vec<ClaimedChannelDelivery>> {
+    if limit == 0 || !matches!(provider, "feishu" | "lark" | "dingtalk") {
+        return Ok(Vec::new());
+    }
+    let now_text = timestamp(*now);
+    transaction.execute(
+        r#"
+        UPDATE automation_notification_delivery
+        SET status = CASE WHEN attempt_count >= 3 THEN 'failed' ELSE 'pending' END,
+            lease_owner = NULL, lease_expires_at = NULL,
+            failure_code = COALESCE(failure_code, 'lease_expired'),
+            available_at = ?1,
+            ended_at = CASE WHEN attempt_count >= 3 THEN ?1 ELSE NULL END,
+            updated_at = ?1
+        WHERE provider = ?2 AND status = 'attempting' AND lease_expires_at <= ?1
+        "#,
+        params![now_text, provider],
+    )?;
+    let ids = {
+        let mut statement = transaction.prepare(
+            "SELECT id FROM automation_notification_delivery WHERE provider = ?1 AND status = 'pending' AND available_at <= ?2 ORDER BY available_at, created_at, id LIMIT ?3",
+        )?;
+        statement
+            .query_map(params![provider, now_text, i64::try_from(limit)?], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let lease_expires_at = timestamp(*now + Duration::seconds(30));
+    let mut claims = Vec::new();
+    for delivery_id in ids {
+        let (member_id, payload_json, attempt_count): (String, String, i64) = transaction.query_row(
+            "SELECT member_id, payload_json, attempt_count FROM automation_notification_delivery WHERE id = ?1",
+            [&delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let Some(target) = notification_target(transaction, provider, &member_id)? else {
+            transaction.execute(
+                "UPDATE automation_notification_delivery SET status = 'failed', failure_code = 'target_bot_not_connected', ended_at = ?2, updated_at = ?2 WHERE id = ?1 AND status = 'pending'",
+                params![delivery_id, now_text],
+            )?;
+            continue;
+        };
+        let changed = transaction.execute(
+            "UPDATE automation_notification_delivery SET status = 'attempting', attempt_count = attempt_count + 1, lease_owner = ?2, lease_expires_at = ?3, updated_at = ?4 WHERE id = ?1 AND status = 'pending'",
+            params![delivery_id, worker_id, lease_expires_at, now_text],
+        )?;
+        if changed == 0 {
+            continue;
+        }
+        let stored: Value = serde_json::from_str(&payload_json)?;
+        let body = stored
+            .get("body")
+            .and_then(Value::as_str)
+            .context("Automation notification has no body")?;
+        let payload = if matches!(provider, "feishu" | "lark") {
+            json!({
+                "kind": "agent_output",
+                "presentationVersion": 1,
+                "agentId": member_id,
+                "body": body,
+                "mentionPrincipal": false,
+                "memberRecipients": [],
+                "reply": null,
+                "deliveryScope": "automation_owner",
+            })
+        } else {
+            json!({
+                "kind": "agent_output",
+                "presentationVersion": 2,
+                "agentId": member_id,
+                "body": body,
+                "mentionPrincipal": false,
+                "reply": null,
+                "deliveryScope": "automation_owner",
+            })
+        };
+        claims.push(ClaimedChannelDelivery {
+            delivery_id,
+            provider: provider.to_string(),
+            request_id: None,
+            delivery_kind: "agent_output".to_string(),
+            target_app_id: target.app_id,
+            credential_ref: target.credential_ref,
+            chat_id: target.owner_external_id.clone(),
+            topic_key: String::new(),
+            conversation_kind: "p2p".to_string(),
+            payload,
+            attempt_count: attempt_count + 1,
+            update_message_id: None,
+            recall_message_id: None,
+            recipient_open_id: Some(target.owner_external_id),
+        });
+    }
+    Ok(claims)
+}
+
+pub(crate) fn notification_provider(
+    transaction: &Transaction<'_>,
+    delivery_id: &str,
+) -> Result<Option<String>> {
+    transaction
+        .query_row(
+            "SELECT provider FROM automation_notification_delivery WHERE id = ?1",
+            [delivery_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub(crate) fn settle_notification_delivery_in_tx(
+    transaction: &Transaction<'_>,
+    delivery_id: &str,
+    worker_id: &str,
+    outcome: &str,
+    external_delivery_message_id: Option<&str>,
+    failure_code: Option<&str>,
+    retryable: bool,
+) -> Result<CommandHandlerResult> {
+    let state = transaction.query_row(
+        "SELECT status, lease_owner, attempt_count FROM automation_notification_delivery WHERE id = ?1",
+        [delivery_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?)),
+    ).optional()?;
+    let Some((status, lease_owner, attempt_count)) = state else {
+        return Ok(rejected(
+            "channel.delivery.not_found",
+            "Channel delivery does not exist",
+        ));
+    };
+    if matches!(status.as_str(), "sent" | "failed") {
+        return Ok(CommandHandlerResult::applied(
+            "channel.delivery.already_terminal",
+            json!({ "deliveryId": delivery_id, "status": status }),
+            None,
+        ));
+    }
+    if status != "attempting" || lease_owner.as_deref() != Some(worker_id) {
+        return Ok(rejected(
+            "channel.delivery.lease_mismatch",
+            "Delivery is not owned by this Host worker",
+        ));
+    }
+    let now = Utc::now();
+    let now_text = timestamp(now);
+    if outcome == "failed" && retryable && attempt_count < 3 {
+        let available_at =
+            timestamp(now + Duration::seconds(2_i64.pow(u32::try_from(attempt_count.min(5))?)));
+        transaction.execute(
+            "UPDATE automation_notification_delivery SET status = 'pending', available_at = ?2, lease_owner = NULL, lease_expires_at = NULL, failure_code = ?3, updated_at = ?4 WHERE id = ?1",
+            params![delivery_id, available_at, failure_code, now_text],
+        )?;
+        return Ok(CommandHandlerResult::applied(
+            "channel.delivery.retry_scheduled",
+            json!({ "deliveryId": delivery_id, "status": "pending", "availableAt": available_at }),
+            None,
+        ));
+    }
+    transaction.execute(
+        "UPDATE automation_notification_delivery SET status = ?2, external_delivery_message_id = ?3, failure_code = ?4, lease_owner = NULL, lease_expires_at = NULL, ended_at = ?5, updated_at = ?5 WHERE id = ?1",
+        params![delivery_id, outcome, external_delivery_message_id, failure_code, now_text],
+    )?;
+    Ok(CommandHandlerResult::applied(
+        "channel.delivery.settled",
+        json!({ "deliveryId": delivery_id, "status": outcome }),
+        None,
+    ))
+}
+
+pub(crate) fn has_notification_work(transaction: &Transaction<'_>, provider: &str) -> Result<bool> {
+    transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automation_notification_delivery WHERE provider = ?1 AND status IN ('pending', 'attempting'))",
+        [provider],
+        |row| row.get(0),
+    ).map_err(Into::into)
+}
+
+struct NotificationTarget {
+    app_id: String,
+    credential_ref: String,
+    owner_external_id: String,
+}
+
+fn notification_target(
+    transaction: &Transaction<'_>,
+    provider: &str,
+    member_id: &str,
+) -> Result<Option<NotificationTarget>> {
+    let sql = if let Some(spec) = crate::channel::ChannelProviderSpec::for_provider(provider) {
+        format!(
+            r#"
+        SELECT bot.app_id, bot.credential_ref, identity.external_id
+        FROM {member_bot} AS bot
+        JOIN {owner_identity} AS owner ON owner.account_id = bot.account_id
+        JOIN {owner_app_identity} AS app
+          ON app.account_id = bot.account_id AND app.app_id = bot.app_id
+        JOIN external_principal_app_identity AS identity
+          ON identity.principal_id = owner.canonical_owner_principal_id
+         AND identity.provider = '{provider}' AND identity.app_id = bot.app_id
+         AND identity.identity_kind = 'open_id'
+        WHERE bot.agent_id = ?1 AND bot.status = 'published'
+        "#,
+            member_bot = spec.member_bot,
+            owner_identity = spec.owner_identity,
+            owner_app_identity = spec.owner_app_identity,
+            provider = spec.provider
+        )
+    } else {
+        r#"
+        SELECT bot.app_key, bot.credential_ref, identity.external_id
+        FROM dingtalk_member_bot AS bot
+        JOIN dingtalk_owner_identity AS owner ON owner.account_id = bot.account_id
+        JOIN dingtalk_owner_app_identity AS app
+          ON app.account_id = bot.account_id AND app.app_key = bot.app_key
+        JOIN external_principal_app_identity AS identity
+          ON identity.principal_id = owner.canonical_owner_principal_id
+         AND identity.provider = 'dingtalk' AND identity.app_id = bot.app_key
+         AND identity.identity_kind = 'user_id'
+        WHERE bot.agent_id = ?1 AND bot.status = 'published'
+        "#
+        .to_string()
+    };
+    transaction
+        .query_row(&sql, [member_id], |row| {
+            Ok(NotificationTarget {
+                app_id: row.get(0)?,
+                credential_ref: row.get(1)?,
+                owner_external_id: row.get(2)?,
+            })
+        })
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_automation_record(
+    connection: &rusqlite::Connection,
+    automation_id: &str,
+) -> Result<Option<AutomationRecord>> {
+    connection.query_row(
+        "SELECT id, version, name, prompt, enabled, member_id, project_ref_json, schedule_json, notify_channels_json, next_run_at, created_at, updated_at, runtime_timeout_seconds, thread_naming_json FROM automation WHERE id = ?1",
+        [automation_id],
+        |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, bool>(4)?, row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
+            row.get::<_, Option<String>>(9)?, row.get::<_, String>(10)?, row.get::<_, String>(11)?, row.get::<_, Option<i64>>(12)?, row.get::<_, String>(13)?,
+        )),
+    ).optional()?.map(|row| Ok(AutomationRecord {
+        id: row.0,
+        version: row.1,
+        name: row.2,
+        prompt: row.3,
+        enabled: row.4,
+        member_id: row.5,
+        project_ref: serde_json::from_str(&row.6)?,
+        schedule: serde_json::from_str(&row.7)?,
+        notify_channels: serde_json::from_str(&row.8)?,
+        next_run_at: row.9,
+        created_at: row.10,
+        updated_at: row.11,
+        runtime_timeout_seconds: row.12,
+        thread_naming: serde_json::from_str(&row.13)?,
+    })).transpose()
+}
+
+fn load_automation_runs(
+    connection: &rusqlite::Connection,
+    automation_id: &str,
+    cursor: Option<(String, String)>,
+    limit: usize,
+) -> Result<Vec<AutomationRunSummary>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT run.id, run.status, run.reason, run.scheduled_for, run.camp_id,
+               run.result_message_id, run.created_at, run.ended_at,
+               CASE
+                 WHEN COUNT(delivery.id) = 0 THEN 'none'
+                 WHEN SUM(CASE WHEN delivery.status = 'failed' THEN 1 ELSE 0 END) > 0
+                      AND SUM(CASE WHEN delivery.status = 'sent' THEN 1 ELSE 0 END) > 0 THEN 'partial'
+                 WHEN SUM(CASE WHEN delivery.status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'failed'
+                 WHEN SUM(CASE WHEN delivery.status IN ('pending','attempting') THEN 1 ELSE 0 END) > 0 THEN 'pending'
+                 ELSE 'sent'
+               END
+        FROM automation_run AS run
+        LEFT JOIN automation_notification_delivery AS delivery ON delivery.automation_run_id = run.id
+        WHERE run.automation_id = ?1
+          AND (?2 IS NULL OR run.created_at < ?2 OR (run.created_at = ?2 AND run.id < ?3))
+        GROUP BY run.id
+        ORDER BY run.created_at DESC, run.id DESC LIMIT ?4
+        "#,
+    )?;
+    let rows = statement.query_map(
+        params![
+            automation_id,
+            cursor.as_ref().map(|value| value.0.as_str()),
+            cursor.as_ref().map(|value| value.1.as_str()),
+            i64::try_from(limit)?
+        ],
+        |row| {
+            Ok(AutomationRunSummary {
+                run_id: row.get(0)?,
+                status: row.get(1)?,
+                reason: row.get(2)?,
+                scheduled_for: row.get(3)?,
+                camp_id: row.get(4)?,
+                result_message_id: row.get(5)?,
+                created_at: row.get(6)?,
+                ended_at: row.get(7)?,
+                notification_status: row.get(8)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn load_automation_view(
+    connection: &rusqlite::Connection,
+    automation_id: &str,
+) -> Result<Option<AutomationView>> {
+    let Some(record) = load_automation_record(connection, automation_id)? else {
+        return Ok(None);
+    };
+    let last_run = load_automation_runs(connection, automation_id, None, 1)?
+        .into_iter()
+        .next();
+    Ok(Some(AutomationView {
+        automation_id: record.id,
+        version: record.version,
+        name: record.name,
+        prompt: record.prompt,
+        enabled: record.enabled,
+        member_id: record.member_id,
+        project_ref: record.project_ref,
+        schedule: record.schedule,
+        thread_naming: record.thread_naming,
+        notify_channels: record.notify_channels,
+        next_run_at: record.next_run_at,
+        last_run,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }))
+}
+
+fn management_actor(actor: &ActorRef) -> bool {
+    matches!(actor, ActorRef::User { .. } | ActorRef::Agent { .. })
+}
+
+fn validate_member(transaction: &Transaction<'_>, member_id: &str) -> Result<()> {
+    let present = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_profile WHERE id = ?1 AND profile_status = 'present')",
+        [member_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !present {
+        anyhow::bail!("selected Automation member is unavailable");
+    }
+    Ok(())
+}
+
+fn normalize_project_ref(project_ref: &AutomationProjectRef) -> Result<AutomationProjectRef> {
+    if let AutomationProjectRef::Directory { path } = project_ref {
+        let project_path = Path::new(path);
+        if path.trim().is_empty() || !project_path.is_absolute() {
+            anyhow::bail!("Automation project directory must be an absolute path");
+        }
+        if !project_path.is_dir() {
+            anyhow::bail!("Automation project directory is unavailable");
+        }
+        return Ok(AutomationProjectRef::Directory {
+            path: project_path
+                .canonicalize()
+                .context("Automation project directory could not be resolved")?
+                .to_string_lossy()
+                .into_owned(),
+        });
+    }
+    Ok(AutomationProjectRef::QuickChat)
+}
+
+fn normalize_prompt(value: &str) -> Result<String> {
+    let prompt = value.trim().to_string();
+    let count = prompt.chars().count();
+    if count == 0 {
+        anyhow::bail!("Automation prompt must not be empty");
+    }
+    if count > MAX_PROMPT_SCALARS {
+        anyhow::bail!("Automation prompt is too long");
+    }
+    Ok(prompt)
+}
+
+fn normalized_or_derived_name(name: Option<&str>, prompt: &str) -> Result<String> {
+    let normalized = name
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let name = if normalized.is_empty() {
+        derive_name(prompt)
+    } else {
+        normalized
+    };
+    if name.chars().count() > MAX_NAME_SCALARS {
+        anyhow::bail!("Automation name is too long");
+    }
+    Ok(name)
+}
+
+pub fn derive_name(prompt: &str) -> String {
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let prefix = chars.by_ref().take(20).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn normalize_channels(channels: &[AutomationNotifyChannel]) -> Vec<AutomationNotifyChannel> {
+    channels
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn validate_schedule(schedule: &AutomationSchedule) -> Result<()> {
+    match schedule {
+        AutomationSchedule::Daily { at }
+        | AutomationSchedule::Weekdays { at }
+        | AutomationSchedule::Weekly { at, .. } => {
+            parse_time(at)?;
+        }
+        AutomationSchedule::Once { date, at } => {
+            parse_date(date)?;
+            parse_time(at)?;
+        }
+        AutomationSchedule::Cron { expression } => {
+            parse_cron_expression(expression)?;
+        }
+        AutomationSchedule::Manual => {}
+    }
+    Ok(())
+}
+
+pub fn next_occurrence_after(
+    schedule: &AutomationSchedule,
+    after: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
+    validate_schedule(schedule)?;
+    match schedule {
+        AutomationSchedule::Manual => Ok(None),
+        AutomationSchedule::Once { date, at } => {
+            let candidate = local_datetime(parse_date(date)?, parse_time(at)?)?;
+            Ok(candidate.filter(|candidate| *candidate > after))
+        }
+        AutomationSchedule::Daily { at } => next_matching_day(after, parse_time(at)?, |_| true),
+        AutomationSchedule::Weekdays { at } => next_matching_day(after, parse_time(at)?, |date| {
+            date.weekday().number_from_monday() <= 5
+        }),
+        AutomationSchedule::Weekly { weekday, at } => {
+            let expected = weekday.number_from_monday();
+            next_matching_day(after, parse_time(at)?, |date| {
+                date.weekday().number_from_monday() == expected
+            })
+        }
+        AutomationSchedule::Cron { expression } => {
+            let cron = parse_cron_expression(expression)?;
+            let next = cron
+                .find_next_occurrence(&after.with_timezone(&Local), false)
+                .context("Cron expression has no future occurrence")?;
+            Ok(Some(next.with_timezone(&Utc)))
+        }
+    }
+}
+
+fn latest_occurrence_at_or_before(
+    schedule: &AutomationSchedule,
+    at: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
+    match schedule {
+        AutomationSchedule::Manual => Ok(None),
+        AutomationSchedule::Once { date, at: time } => {
+            let candidate = local_datetime(parse_date(date)?, parse_time(time)?)?;
+            Ok(candidate.filter(|candidate| *candidate <= at))
+        }
+        AutomationSchedule::Cron { expression } => {
+            let cron = parse_cron_expression(expression)?;
+            let latest = cron
+                .find_previous_occurrence(&at.with_timezone(&Local), true)
+                .context("Cron expression has no previous occurrence")?;
+            Ok(Some(latest.with_timezone(&Utc)))
+        }
+        _ => {
+            let mut cursor = at - Duration::days(8);
+            let mut latest = None;
+            while let Some(next) = next_occurrence_after(schedule, cursor)? {
+                if next > at {
+                    break;
+                }
+                latest = Some(next);
+                cursor = next;
+            }
+            Ok(latest)
+        }
+    }
+}
+
+fn next_matching_day(
+    after: DateTime<Utc>,
+    time: NaiveTime,
+    predicate: impl Fn(NaiveDate) -> bool,
+) -> Result<Option<DateTime<Utc>>> {
+    let local_after = after.with_timezone(&Local);
+    let mut date = local_after.date_naive();
+    for _ in 0..370 {
+        if predicate(date)
+            && let Some(candidate) = local_datetime(date, time)?
+            && candidate > after
+        {
+            return Ok(Some(candidate));
+        }
+        date = date
+            .succ_opt()
+            .context("Automation schedule date overflow")?;
+    }
+    anyhow::bail!("Automation schedule has no occurrence in the supported horizon")
+}
+
+fn local_datetime(date: NaiveDate, time: NaiveTime) -> Result<Option<DateTime<Utc>>> {
+    let mut naive = NaiveDateTime::new(date, time);
+    for _ in 0..=180 {
+        match Local.from_local_datetime(&naive) {
+            LocalResult::Single(value) => return Ok(Some(value.with_timezone(&Utc))),
+            LocalResult::Ambiguous(first, second) => {
+                return Ok(Some(first.min(second).with_timezone(&Utc)));
+            }
+            LocalResult::None => naive += Duration::minutes(1),
+        }
+    }
+    Ok(None)
+}
+
+fn parse_cron_expression(expression: &str) -> Result<Cron> {
+    let fields = expression.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 5 {
+        anyhow::bail!("Cron expression must contain exactly five fields");
+    }
+    let normalized = fields
+        .into_iter()
+        .map(|field| {
+            if field
+                .strip_prefix("*/")
+                .and_then(|step| step.parse::<u32>().ok())
+                == Some(1)
+            {
+                "*"
+            } else {
+                field
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    CronParser::builder()
+        .seconds(Seconds::Disallowed)
+        .year(Year::Disallowed)
+        .build()
+        .parse(&normalized)
+        .context("Cron expression is invalid")
+}
+
+fn parse_time(value: &str) -> Result<NaiveTime> {
+    NaiveTime::parse_from_str(value, "%H:%M").context("Automation time must use HH:MM")
+}
+
+fn parse_date(value: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").context("Automation date must use YYYY-MM-DD")
+}
+
+fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
+}
+
+fn timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn occurrence_timestamp(value: DateTime<Utc>, trigger_kind: &str) -> String {
+    if trigger_kind == "manual" {
+        value.to_rfc3339_opts(SecondsFormat::Nanos, true)
+    } else {
+        timestamp(value)
+    }
+}
+
+fn new_id(prefix: &str) -> String {
+    format!("{prefix}_{}", Uuid::new_v4().simple())
+}
+
+fn entity(entity_type: &str, entity_id: &str) -> EntityReference {
+    EntityReference {
+        entity_type: entity_type.to_string(),
+        entity_id: entity_id.to_string(),
+    }
+}
+
+fn rejected(code: &str, message: &str) -> CommandHandlerResult {
+    CommandHandlerResult::rejected(code, json!({ "message": message }))
+}
+
+fn encode_cursor(updated_at: &str, id: &str) -> String {
+    format!("{updated_at}\n{id}")
+}
+
+fn decode_cursor(value: &str) -> Result<(String, String)> {
+    let (updated_at, id) = value
+        .split_once('\n')
+        .context("Automation cursor is invalid")?;
+    parse_timestamp(updated_at)?;
+    if id.trim().is_empty() {
+        anyhow::bail!("Automation cursor is invalid");
+    }
+    Ok((updated_at.to_string(), id.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn user_command<P>(command_id: &str, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::User {
+                user_id: CURRENT_USER_ID.to_string(),
+            },
+            camp_id: None,
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    fn test_database() -> (Database, PathBuf, PathBuf) {
+        let (database, directory) = crate::test_support::seeded_runtime_database_fast();
+        let quick_chat_path = directory.join("quick-chat");
+        std::fs::create_dir_all(&quick_chat_path).expect("Quick Chat directory should exist");
+        (database, directory, quick_chat_path)
+    }
+
+    fn remove_test_database(database: Database, directory: PathBuf) {
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("test database should be removable");
+    }
+
+    fn publish_automatic_result(
+        database: &mut Database,
+        automation_run_id: &str,
+        body: &str,
+    ) -> String {
+        crate::delivery_queue::claim_waiting_delivery_batches(database, 100).unwrap();
+        let transaction = database.connection_mut().transaction().unwrap();
+        let (camp_id, root_agent_run_id, member_id): (String, String, String) = transaction
+            .query_row(
+                r#"
+                SELECT occurrence.camp_id, delivery.claimed_agent_run_id, occurrence.member_id
+                FROM automation_run AS occurrence
+                JOIN camp_message_delivery AS delivery
+                  ON delivery.id = occurrence.trigger_delivery_id
+                WHERE occurrence.id = ?1 AND delivery.status = 'claimed'
+                "#,
+                [automation_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let now = timestamp(Utc::now());
+        let result_command_id = format!("{automation_run_id}:test-result");
+        let sent = crate::message_delivery::persist_queued_agent_message(
+            &transaction,
+            &crate::message_delivery::SendQueuedAgentMessage {
+                command_id: &result_command_id,
+                camp_id: &camp_id,
+                source_agent_run_id: &root_agent_run_id,
+                author_agent_id: &member_id,
+                execution_epoch: 0,
+                body,
+                explicit_recipients: &[],
+                agent_addressing_mode: crate::message_delivery::AgentAddressingMode::PublicOnly,
+                mention_user: false,
+                task_id: None,
+                source_files: &[],
+            },
+        )
+        .unwrap();
+        let message_id = sent.payload["messageId"].as_str().unwrap().to_string();
+        transaction
+            .execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'succeeded', wait_reason = NULL,
+                    terminal_resolution_source = 'runtime_terminal',
+                    final_camp_message_id = ?2,
+                    started_at = COALESCE(started_at, ?3), ended_at = ?3,
+                    version = version + 1, updated_at = ?3
+                WHERE id = ?1
+                "#,
+                params![root_agent_run_id, message_id, now],
+            )
+            .unwrap();
+        crate::delivery_queue::settle_run_deliveries(
+            &transaction,
+            &root_agent_run_id,
+            "succeeded",
+            None,
+            &now,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        message_id
+    }
+
+    // Owns the persisted configuration/occurrence/expiry/recovery seam. Both
+    // policies share one isolated database; no Runtime or wall-clock wait.
+    #[test]
+    fn owner_time_limit_is_frozen_per_occurrence_and_unbounded_runs_still_recover() {
+        let (mut database, directory, quick_chat_path) = test_database();
+        let service = AutomationService::default();
+        for (label, limit) in [("bounded", Some(60)), ("unbounded", None)] {
+            let (id, _) = create_manual_automation(
+                &service,
+                &mut database,
+                &format!("create-{label}"),
+                "Evaluate the retained evidence.",
+            );
+            let command = user_command(
+                &format!("limit-{label}"),
+                ConfigureAutomationTimeLimitCommand {
+                    automation_id: id.clone(),
+                    expected_version: 1,
+                    timeout_seconds: limit,
+                },
+            );
+            let configured = service
+                .configure_time_limit(&mut database, &command)
+                .unwrap();
+            assert_eq!(configured.result.code, "automation.time_limit_configured");
+            assert!(
+                service
+                    .configure_time_limit(&mut database, &command)
+                    .unwrap()
+                    .replayed
+            );
+            let run = service
+                .run_now(
+                    &mut database,
+                    &user_command(
+                        &format!("run-{label}"),
+                        RunAutomationCommand {
+                            automation_id: id.clone(),
+                        },
+                    ),
+                    CURRENT_USER_ID,
+                    &quick_chat_path,
+                )
+                .unwrap();
+            let run_id = run.result.payload["runId"].as_str().unwrap();
+            let timeout: Option<String> = database
+                .connection()
+                .query_row(
+                    "SELECT timeout_at FROM automation_run WHERE id=?1",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(timeout.is_none(), limit.is_none());
+            let active_change = service
+                .configure_time_limit(
+                    &mut database,
+                    &user_command(
+                        &format!("active-{label}"),
+                        ConfigureAutomationTimeLimitCommand {
+                            automation_id: id.clone(),
+                            expected_version: 2,
+                            timeout_seconds: Some(120),
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(active_change.result.code, "automation.active_run");
+            let future = Utc::now() + Duration::days(7);
+            assert_eq!(
+                settle_one_run(&mut database, run_id, future).unwrap(),
+                limit.is_some()
+            );
+            if limit.is_none() {
+                service
+                    .interrupt_before_runtime(&mut database, run_id)
+                    .unwrap();
+            }
+            let reason: String = database
+                .connection()
+                .query_row(
+                    "SELECT reason FROM automation_run WHERE id=?1",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                reason,
+                if limit.is_none() {
+                    "interrupted"
+                } else {
+                    "timeout"
+                }
+            );
+        }
+        remove_test_database(database, directory);
+    }
+
+    fn create_manual_automation(
+        service: &AutomationService,
+        database: &mut Database,
+        command_id: &str,
+        prompt: &str,
+    ) -> (String, CommandEnvelope<CreateAutomationCommand>) {
+        let envelope = user_command(
+            command_id,
+            CreateAutomationCommand {
+                thread_naming: Default::default(),
+                name: None,
+                prompt: prompt.to_string(),
+                member_id: "agent_1".to_string(),
+                project_ref: AutomationProjectRef::QuickChat,
+                schedule: AutomationSchedule::Manual,
+                notify_channels: vec![
+                    AutomationNotifyChannel::Dingtalk,
+                    AutomationNotifyChannel::Feishu,
+                    AutomationNotifyChannel::Dingtalk,
+                ],
+            },
+        );
+        let execution = service
+            .create(database, &envelope)
+            .expect("Automation should be created");
+        assert!(!execution.replayed);
+        let automation_id = execution.result.payload["automationId"]
+            .as_str()
+            .expect("Automation ID should be returned")
+            .to_string();
+        (automation_id, envelope)
+    }
+
+    #[test]
+    fn derived_name_collapses_whitespace_and_limits_unicode_scalars() {
+        assert_eq!(derive_name("  alpha\n beta   gamma  "), "alpha beta gamma");
+        assert_eq!(
+            derive_name("一二三四五六七八九十一二三四五六七八九十一"),
+            "一二三四五六七八九十一二三四五六七八九十…"
+        );
+        // One pure owner covers all checkbox/position combinations and fixed formats.
+        use crate::automation_naming::AutomationDatePosition as P;
+        let at = DateTime::parse_from_rfc3339("2026-10-26T15:04:09+08:00").unwrap();
+        for (date, time, stamp) in [
+            (true, true, "2026-10-26 15:04"),
+            (true, false, "2026-10-26"),
+            (false, true, "15:04"),
+            (false, false, ""),
+        ] {
+            for position in [P::Prefix, P::Suffix] {
+                let naming = AutomationThreadNaming {
+                    include_date: date,
+                    include_time: time,
+                    position,
+                    ..Default::default()
+                };
+                let expected = if stamp.is_empty() {
+                    "周报".to_string()
+                } else if position == P::Prefix {
+                    format!("{stamp} · 周报")
+                } else {
+                    format!("周报 · {stamp}")
+                };
+                assert_eq!(naming.title("周报", at), expected);
+            }
+        }
+        for (input, expected) in [
+            ("2026-01-01T00:01:00+08:00", "周报 · 2026-01-01 00:01"),
+            ("2026-01-01T12:01:00+08:00", "周报 · 2026-01-01 12:01"),
+        ] {
+            assert_eq!(
+                AutomationThreadNaming::default()
+                    .title("周报", DateTime::parse_from_rfc3339(input).unwrap()),
+                expected
+            );
+        }
+        let long_name = "🌸".repeat(80);
+        assert_eq!(
+            AutomationThreadNaming::default().title(&long_name, at),
+            format!("{long_name} · 2026-10-26 15:04")
+        );
+        let legacy_create: CreateAutomationCommand = serde_json::from_value(json!({
+            "prompt":"Run", "memberId":"member", "projectRef":{"kind":"quick_chat"}, "schedule":{"kind":"manual"}
+        })).unwrap();
+        assert_eq!(
+            legacy_create.thread_naming,
+            AutomationThreadNaming::default()
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy_create).unwrap(),
+            json!({
+                "name":null, "prompt":"Run", "memberId":"member", "projectRef":{"kind":"quick_chat"},
+                "schedule":{"kind":"manual"}, "notifyChannels":[]
+            }),
+            "old create command canonical payload survives the upgrade"
+        );
+        let legacy_update = json!({"automationId":"kept", "expectedVersion":1, "name":null,
+            "prompt":null, "memberId":null, "projectRef":null, "schedule":null, "notifyChannels":null, "enabled":null});
+        let parsed: UpdateAutomationCommand =
+            serde_json::from_value(legacy_update.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap(),
+            legacy_update,
+            "old update command digest is unchanged"
+        );
+        let value = serde_json::to_value(AutomationThreadNaming::default()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<AutomationThreadNaming>(value.clone()).unwrap(),
+            AutomationThreadNaming::default()
+        );
+        for (key, bad) in [
+            ("dateFormat", json!("unix")),
+            ("dateFormat", json!("slash")),
+            ("dateFormat", json!("short")),
+            ("dateFormat", json!("chinese")),
+            ("timeFormat", json!("12")),
+            ("timeFormat", json!("seconds")),
+            ("includeTime", json!("yes")),
+            ("extra", json!(true)),
+        ] {
+            let mut invalid = value.clone();
+            invalid[key] = bad;
+            assert!(serde_json::from_value::<AutomationThreadNaming>(invalid).is_err());
+        }
+        // Desktop configuration must not change Agent CLI result shapes.
+        for shape in [
+            json!({"threadNaming": value, "name": "kept"}),
+            json!({"automations":[{"threadNaming": value,"name":"kept"}],"nextCursor":null}),
+            json!({"payload":{"threadNaming":value,"name":"kept"},"status":"applied"}),
+        ] {
+            let stripped = crate::automation_naming::without_desktop_settings(shape).to_string();
+            assert!(!stripped.contains("threadNaming"));
+            assert!(stripped.contains("kept"));
+        }
+    }
+
+    #[test]
+    fn manual_run_atomically_freezes_snapshot_and_replays_without_a_second_camp() {
+        let service = AutomationService::default();
+        let (mut database, directory, quick_chat_path) = test_database();
+        let original_prompt = "  Review the latest customer feedback and summarize it.  ";
+        let (automation_id, create_envelope) = create_manual_automation(
+            &service,
+            &mut database,
+            "automation-create-1",
+            original_prompt,
+        );
+
+        let replayed_create = service
+            .create(&mut database, &create_envelope)
+            .expect("create replay should succeed");
+        assert!(replayed_create.replayed);
+        assert_eq!(
+            replayed_create.result.payload["automationId"],
+            automation_id
+        );
+
+        let run_envelope = user_command(
+            "automation-run-1",
+            RunAutomationCommand {
+                automation_id: automation_id.clone(),
+            },
+        );
+        let first = service
+            .run_now(
+                &mut database,
+                &run_envelope,
+                CURRENT_USER_ID,
+                &quick_chat_path,
+            )
+            .expect("manual Automation should start");
+        assert_eq!(first.result.payload["status"], "started");
+        let automation_run_id = first.result.payload["runId"]
+            .as_str()
+            .expect("AutomationRun ID should be returned")
+            .to_string();
+        let camp_id = first.result.payload["threadId"]
+            .as_str()
+            .expect("Camp ID should be returned")
+            .to_string();
+
+        let replayed_run = service
+            .run_now(
+                &mut database,
+                &run_envelope,
+                CURRENT_USER_ID,
+                &quick_chat_path,
+            )
+            .expect("run replay should succeed");
+        assert!(replayed_run.replayed);
+        assert_eq!(replayed_run.result.payload, first.result.payload);
+
+        let (frozen_title, created_at): (String, String) = database.connection().query_row(
+            "SELECT camp.title, run.created_at FROM automation_run run JOIN camp ON camp.id=run.camp_id WHERE run.id=?1", [&automation_run_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(
+            frozen_title,
+            format!(
+                "{} · {}",
+                derive_name(original_prompt),
+                parse_timestamp(&created_at)
+                    .unwrap()
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M")
+            )
+        );
+        assert_eq!(
+            replayed_create.result.payload["threadNaming"],
+            serde_json::to_value(AutomationThreadNaming::default()).unwrap()
+        );
+
+        let normalized_prompt = original_prompt.trim();
+        let snapshot: (i64, String, String, String, String, String, bool, bool) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT run.automation_version, run.prompt, run.project_ref_json,
+                       camp.project_path, message.body, delivery.status,
+                       run.camp_turn_id IS NULL, run.root_agent_run_id IS NULL
+                FROM automation_run AS run
+                JOIN camp ON camp.id = run.camp_id
+                JOIN camp_message AS message ON message.id = run.trigger_message_id
+                JOIN camp_message_delivery AS delivery ON delivery.id = run.trigger_delivery_id
+                WHERE run.id = ?1
+                "#,
+                [&automation_run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("atomic dispatch graph should exist");
+        assert_eq!(snapshot.0, 1);
+        assert_eq!(snapshot.1, normalized_prompt);
+        assert_eq!(snapshot.2, r#"{"kind":"quick_chat"}"#);
+        assert_eq!(snapshot.3, quick_chat_path.to_string_lossy());
+        assert_eq!(snapshot.4, normalized_prompt);
+        assert_eq!(snapshot.5, "waiting");
+        assert!(snapshot.6);
+        assert!(snapshot.7);
+
+        let claimed = crate::delivery_queue::claim_waiting_delivery_batches(&mut database, 100)
+            .expect("Scheduler should claim the Automation Delivery");
+        assert_eq!(claimed.len(), 1);
+        let frozen: (String, String, String) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT run.purpose, input.message_id, occurrence.trigger_message_id
+                FROM automation_run AS occurrence
+                JOIN camp_message_delivery AS delivery
+                  ON delivery.id = occurrence.trigger_delivery_id
+                JOIN agent_run AS run ON run.id = delivery.claimed_agent_run_id
+                JOIN agent_run_input AS input ON input.agent_run_id = run.id
+                WHERE occurrence.id = ?1
+                "#,
+                [&automation_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(frozen.0, "Handle the claimed Camp message batch");
+        assert_eq!(frozen.1, frozen.2);
+
+        let original_name = service
+            .get(&database, &automation_id)
+            .expect("Automation should load")
+            .expect("Automation should exist")
+            .name;
+        let updated = service
+            .update(
+                &mut database,
+                &user_command(
+                    "automation-update-1",
+                    UpdateAutomationCommand {
+                        thread_naming: Some(AutomationThreadNaming {
+                            include_date: false,
+                            include_time: false,
+                            ..Default::default()
+                        }),
+                        automation_id: automation_id.clone(),
+                        expected_version: 1,
+                        name: None,
+                        prompt: Some("Use the revised instruction for future runs.".to_string()),
+                        member_id: None,
+                        project_ref: None,
+                        schedule: None,
+                        notify_channels: None,
+                        enabled: None,
+                    },
+                ),
+            )
+            .expect("Automation should update");
+        assert_eq!(updated.result.payload["name"], original_name);
+        assert_eq!(updated.result.payload["version"], 2);
+
+        let overlapping = service
+            .run_now(
+                &mut database,
+                &user_command(
+                    "automation-run-overlap",
+                    RunAutomationCommand {
+                        automation_id: automation_id.clone(),
+                    },
+                ),
+                CURRENT_USER_ID,
+                &quick_chat_path,
+            )
+            .expect("overlapping occurrence should be recorded");
+        assert_eq!(overlapping.result.payload["status"], "skipped");
+        assert_eq!(overlapping.result.payload["reason"], "overlap");
+        assert!(overlapping.result.payload["threadId"].is_null());
+        let counts: (i64, i64) = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT camp_id) FROM automation_run WHERE automation_id = ?1",
+                [&automation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (2, 1));
+
+        service
+            .interrupt_before_runtime(&mut database, &automation_run_id)
+            .expect("explicit interruption should settle the claimed run");
+        let recovered: (String, String, String) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT run.status, run.reason, delivery.status
+                FROM automation_run AS run
+                JOIN camp_message_delivery AS delivery
+                  ON delivery.id = run.trigger_delivery_id
+                WHERE run.id = ?1
+                "#,
+                [&automation_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered,
+            ("failed".into(), "interrupted".into(), "cancelled".into())
+        );
+        assert!(
+            database
+                .connection()
+                .execute(
+                    "UPDATE automation_run SET status = 'completed' WHERE id = ?1",
+                    [&automation_run_id],
+                )
+                .is_err()
+        );
+
+        let next = service
+            .run_now(
+                &mut database,
+                &user_command(
+                    "automation-run-2",
+                    RunAutomationCommand {
+                        automation_id: automation_id.clone(),
+                    },
+                ),
+                CURRENT_USER_ID,
+                &quick_chat_path,
+            )
+            .expect("a new run should start after terminal recovery");
+        assert_eq!(next.result.payload["status"], "started");
+        let next_run_id = next.result.payload["runId"].as_str().unwrap();
+        let next_snapshot: (i64, String) = database
+            .connection()
+            .query_row(
+                "SELECT automation_version, prompt FROM automation_run WHERE id = ?1",
+                [next_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            next_snapshot,
+            (2, "Use the revised instruction for future runs.".into())
+        );
+        assert_ne!(next.result.payload["threadId"], camp_id);
+        let next_title: String = database
+            .connection()
+            .query_row(
+                "SELECT title FROM camp WHERE id=?1",
+                [next.result.payload["threadId"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next_title, original_name);
+        let old_title: String = database
+            .connection()
+            .query_row("SELECT title FROM camp WHERE id=?1", [&camp_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            old_title, frozen_title,
+            "naming changes do not rewrite history"
+        );
+        assert_eq!(updated.result.payload["threadNaming"]["includeDate"], false);
+        service
+            .interrupt_before_runtime(&mut database, next_run_id)
+            .expect("test run should settle");
+
+        let history = service
+            .list_runs(
+                &database,
+                &AutomationRunListQuery {
+                    automation_id: automation_id.clone(),
+                    cursor: None,
+                    limit: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(history.runs.len(), 1);
+        assert!(history.truncated);
+        let older = service
+            .list_runs(
+                &database,
+                &AutomationRunListQuery {
+                    automation_id: automation_id.clone(),
+                    cursor: history.next_cursor,
+                    limit: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(older.runs.len(), 2);
+        assert!(!older.truncated);
+        assert!(older.next_cursor.is_none());
+        // Runs admitted in the same second use ID as the documented ordering tie-breaker.
+        // Check the complete paginated result instead of assuming wall-clock advancement.
+        let all = history.runs.iter().chain(&older.runs).collect::<Vec<_>>();
+        assert!(
+            all.windows(2)
+                .all(|pair| (&pair[0].created_at, &pair[0].run_id)
+                    > (&pair[1].created_at, &pair[1].run_id))
+        );
+        assert!(all.iter().any(|run| run.run_id == next_run_id
+            && run.status == "failed"
+            && run.reason.as_deref() == Some("interrupted")));
+        assert!(all.iter().any(|run| run.run_id == automation_run_id
+            && run.camp_id.as_deref() == Some(camp_id.as_str())));
+        assert!(all.iter().any(|run| run.status == "skipped"
+            && run.reason.as_deref() == Some("overlap")
+            && run.camp_id.is_none()));
+        assert!(
+            service
+                .list_runs(
+                    &database,
+                    &AutomationRunListQuery {
+                        automation_id: automation_id.clone(),
+                        cursor: Some("invalid".into()),
+                        limit: 20,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .list_runs(
+                    &database,
+                    &AutomationRunListQuery {
+                        automation_id: "missing-automation".into(),
+                        cursor: None,
+                        limit: 20,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .list_runs(
+                    &database,
+                    &AutomationRunListQuery {
+                        automation_id,
+                        cursor: None,
+                        limit: 0,
+                    }
+                )
+                .is_err()
+        );
+
+        remove_test_database(database, directory);
+    }
+
+    // Owns Automation's FK/history boundary through the deletion service and
+    // cleanup journal. Extend the original failed/manual regression with the
+    // completed/daily case; both use isolated SQLite because rollback, CASCADE
+    // and accepted receipt survival cross persisted owners. No Runtime starts.
+    #[cfg(feature = "extended-tests")]
+    #[test]
+    fn deleting_automation_threads_retries_to_completion_without_changing_schedule() {
+        use crate::{
+            camp_attachment::ThreadAttachmentStore,
+            camp_attachment_view::ThreadAttachmentViewStore,
+            camp_deletion::{RetryThreadDeletionCommand, ThreadDeletionService},
+            collaboration::{DeleteThreadCommand, MissionWorkspaceDisposition},
+            command::CommandResultStatus,
+        };
+
+        let count = |database: &Database, sql: &str, id: &str| {
+            database
+                .connection()
+                .query_row(sql, [id], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        for completed_daily in [false, true] {
+            let service = AutomationService::default();
+            let deletion = ThreadDeletionService::default();
+            let (mut database, directory, quick_chat_path) = test_database();
+            let created = service
+                .create(
+                    &mut database,
+                    &user_command(
+                        "automation-delete-create",
+                        CreateAutomationCommand {
+                            thread_naming: Default::default(),
+                            name: None,
+                            prompt: "Summarize today's papers.".to_string(),
+                            member_id: "agent_1".to_string(),
+                            project_ref: AutomationProjectRef::QuickChat,
+                            schedule: if completed_daily {
+                                AutomationSchedule::Daily { at: "09:00".into() }
+                            } else {
+                                AutomationSchedule::Manual
+                            },
+                            notify_channels: vec![
+                                AutomationNotifyChannel::Feishu,
+                                AutomationNotifyChannel::Lark,
+                                AutomationNotifyChannel::Dingtalk,
+                            ],
+                        },
+                    ),
+                )
+                .unwrap();
+            let automation_id = created.result.payload["automationId"].as_str().unwrap();
+            let run_manual = |database: &mut Database, command_id: &str| {
+                let started = service
+                    .run_now(
+                        database,
+                        &user_command(
+                            command_id,
+                            RunAutomationCommand {
+                                automation_id: automation_id.to_string(),
+                            },
+                        ),
+                        CURRENT_USER_ID,
+                        &quick_chat_path,
+                    )
+                    .unwrap();
+                assert_eq!(started.result.payload["status"], "started");
+                AutomationDispatch {
+                    automation_run_id: started.result.payload["runId"].as_str().unwrap().into(),
+                    camp_id: started.result.payload["threadId"].as_str().unwrap().into(),
+                }
+            };
+            let target = if completed_daily {
+                // Control the persisted deadline and tick explicitly; no sleep
+                // or dependency on the local time at which this test starts.
+                let due = Utc::now() - Duration::seconds(1);
+                database
+                    .connection()
+                    .execute(
+                        "UPDATE automation SET next_run_at=?2 WHERE id=?1",
+                        params![automation_id, timestamp(due)],
+                    )
+                    .unwrap();
+                let mut due_runs = service
+                    .claim_due(
+                        &mut database,
+                        due,
+                        due - Duration::seconds(1),
+                        &quick_chat_path,
+                    )
+                    .unwrap();
+                assert_eq!(due_runs.len(), 1);
+                let target = due_runs.remove(0);
+                publish_automatic_result(&mut database, &target.automation_run_id, "Daily result");
+                assert!(service.settle_runs(&mut database, Utc::now()).unwrap());
+                target
+            } else {
+                let target = run_manual(&mut database, "automation-delete-run-1");
+                service
+                    .interrupt_before_runtime(&mut database, &target.automation_run_id)
+                    .unwrap();
+                target
+            };
+            let terminal: (String, String) = database
+                .connection()
+                .query_row(
+                    "SELECT status, trigger_kind FROM automation_run WHERE id=?1",
+                    [&target.automation_run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                terminal,
+                if completed_daily {
+                    ("completed".into(), "scheduled".into())
+                } else {
+                    ("failed".into(), "manual".into())
+                }
+            );
+            let kept = run_manual(&mut database, "automation-delete-run-2");
+            let definition = service.get(&database, automation_id).unwrap().unwrap();
+            assert_eq!(definition.next_run_at.is_some(), completed_daily);
+            let notification_count =
+                "SELECT COUNT(*) FROM automation_notification_delivery WHERE automation_run_id=?1";
+            assert_eq!(
+                count(&database, notification_count, &target.automation_run_id),
+                3
+            );
+
+            let views = ThreadAttachmentViewStore::for_test(&database).unwrap();
+            views
+                .ensure_empty_camp_ready(&mut database, &target.camp_id)
+                .unwrap();
+            let output =
+                crate::storage_layout::ThreadOutputDirectory::prepare(&database, &target.camp_id)
+                    .unwrap()
+                    .output_root;
+            std::fs::write(output.join("daily-result.txt"), b"Daily output").unwrap();
+            let version = database
+                .connection()
+                .query_row(
+                    "SELECT version FROM camp WHERE id=?1",
+                    [&target.camp_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let operation_id = Uuid::new_v4().to_string();
+            let mut envelope = user_command(
+                &operation_id,
+                DeleteThreadCommand {
+                    camp_id: target.camp_id.clone(),
+                    expected_version: version,
+                    force: false,
+                    workspace_disposition: MissionWorkspaceDisposition::Retain,
+                },
+            );
+            envelope.camp_id = Some(target.camp_id.clone());
+            let accepted = deletion.accept(&mut database, &envelope).unwrap();
+            assert_eq!(accepted.result.status, CommandResultStatus::Accepted);
+            assert_eq!(accepted.result.payload["operationId"], operation_id);
+            let candidate = deletion.due_camps(&database, 1).unwrap().remove(0);
+            let cleanup = views
+                .prepare_camp_delete_cleanup(&mut database, &target.camp_id, &operation_id)
+                .unwrap()
+                .unwrap();
+
+            // Fail after the occurrence/CASCADE deletes. Five attempts are
+            // required to prove rollback and the persisted attention threshold.
+            database
+                .connection()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_automation_thread_delete BEFORE DELETE ON camp
+                 BEGIN SELECT RAISE(ABORT, 'injected Thread deletion failure'); END;",
+                )
+                .unwrap();
+            for attempt in 1..=5 {
+                let error = deletion
+                    .commit_business_delete(&mut database, &views, &candidate, &cleanup)
+                    .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("injected Thread deletion failure"),
+                    "unexpected deletion error: {error:#}"
+                );
+                assert_eq!(
+                    deletion
+                        .record_camp_failure(&database, &candidate, "database_delete_failed",)
+                        .unwrap(),
+                    attempt == 5
+                );
+            }
+            assert_eq!(
+                count(&database, notification_count, &target.automation_run_id),
+                3
+            );
+            assert_eq!(
+                count(
+                    &database,
+                    "SELECT COUNT(*) FROM automation_run WHERE id=?1",
+                    &target.automation_run_id
+                ),
+                1
+            );
+            assert!(output.exists());
+            let issues = deletion.issues(&database).unwrap();
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0].operation_id, operation_id);
+            assert!(deletion.due_camps(&database, 1).unwrap().is_empty());
+            database
+                .connection()
+                .execute_batch("DROP TRIGGER fail_automation_thread_delete")
+                .unwrap();
+
+            let retried = deletion
+                .retry(
+                    &mut database,
+                    &user_command(
+                        &Uuid::new_v4().to_string(),
+                        RetryThreadDeletionCommand {
+                            operation_id: operation_id.clone(),
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(retried.result.code, "camp.deletion_retry_accepted");
+            assert_eq!(retried.result.payload["operationId"], operation_id);
+            assert!(deletion.issues(&database).unwrap().is_empty());
+            let candidate = deletion.due_camps(&database, 1).unwrap().remove(0);
+            assert_eq!(candidate.operation_id, operation_id);
+            deletion
+                .commit_business_delete(&mut database, &views, &candidate, &cleanup)
+                .unwrap();
+            views
+                .complete_camp_delete_cleanup(
+                    &mut database,
+                    &ThreadAttachmentStore::new(&directory),
+                    &cleanup,
+                )
+                .unwrap();
+            assert!(!output.exists());
+
+            for (table, deleted_id, kept_id) in [
+                ("camp", &target.camp_id, &kept.camp_id),
+                (
+                    "automation_run",
+                    &target.automation_run_id,
+                    &kept.automation_run_id,
+                ),
+            ] {
+                let sql = format!("SELECT COUNT(*) FROM {table} WHERE id=?1");
+                assert_eq!(count(&database, &sql, deleted_id), 0);
+                assert_eq!(count(&database, &sql, kept_id), 1);
+            }
+            assert_eq!(
+                count(&database, notification_count, &target.automation_run_id),
+                0
+            );
+            let remaining_definition = service.get(&database, automation_id).unwrap().unwrap();
+            assert_eq!(remaining_definition.enabled, definition.enabled);
+            assert_eq!(remaining_definition.next_run_at, definition.next_run_at);
+            for event in ["camp.deleted", "camp.deletion_completed"] {
+                let events: i64 = database
+                    .connection()
+                    .query_row(
+                        "SELECT COUNT(*) FROM event_log WHERE camp_id=?1 AND event_type=?2",
+                        params![target.camp_id, event],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(events, 1);
+            }
+            let replay = deletion.accept(&mut database, &envelope).unwrap();
+            assert!(replay.replayed);
+            assert_eq!(replay.result.payload, accepted.result.payload);
+            let violations: i64 = database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(violations, 0);
+            // The View owner seals the shared camps directory after cleanup.
+            // Restore only this fixture's parent before removing the fixture.
+            crate::platform::private_storage::prepare_private_directory(
+                &views.root().join("camps"),
+            )
+            .unwrap();
+            drop(views);
+            remove_test_database(database, directory);
+        }
+    }
+
+    #[test]
+    fn scheduled_once_overlap_is_skipped_and_closed_definition_can_run_manually() {
+        let service = AutomationService::default();
+        let (mut database, directory, quick_chat_path) = test_database();
+        let local_due = Local::now() + Duration::days(1);
+        let create = service
+            .create(
+                &mut database,
+                &user_command(
+                    "automation-once-create",
+                    CreateAutomationCommand {
+                        thread_naming: Default::default(),
+                        name: Some("🌸".repeat(80)),
+                        prompt: "Run exactly once.".to_string(),
+                        member_id: "agent_1".to_string(),
+                        project_ref: AutomationProjectRef::QuickChat,
+                        schedule: AutomationSchedule::Once {
+                            date: local_due.format("%Y-%m-%d").to_string(),
+                            at: local_due.format("%H:%M").to_string(),
+                        },
+                        notify_channels: Vec::new(),
+                    },
+                ),
+            )
+            .expect("one-time Automation should be created");
+        let automation_id = create.result.payload["automationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let due = parse_timestamp(create.result.payload["nextRunAt"].as_str().unwrap()).unwrap();
+
+        let manual = service
+            .run_now(
+                &mut database,
+                &user_command(
+                    "automation-once-manual-run",
+                    RunAutomationCommand {
+                        automation_id: automation_id.clone(),
+                    },
+                ),
+                CURRENT_USER_ID,
+                &quick_chat_path,
+            )
+            .expect("manual run should start");
+        assert_eq!(manual.result.payload["status"], "started");
+        let (manual_title, created_at): (String, String) = database.connection().query_row(
+            "SELECT camp.title, run.created_at FROM automation_run run JOIN camp ON camp.id=run.camp_id WHERE run.id=?1", [manual.result.payload["runId"].as_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(
+            manual_title,
+            format!(
+                "{} · {}",
+                "🌸".repeat(80),
+                parse_timestamp(&created_at)
+                    .unwrap()
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M")
+            )
+        );
+        assert_ne!(
+            manual_title,
+            format!(
+                "{} · {}",
+                "🌸".repeat(80),
+                due.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            )
+        );
+
+        let dispatches = service
+            .claim_due(
+                &mut database,
+                due + Duration::seconds(1),
+                due - Duration::seconds(1),
+                &quick_chat_path,
+            )
+            .expect("scheduled occurrence should be claimed");
+        assert!(dispatches.is_empty());
+        let definition = service
+            .get(&database, &automation_id)
+            .unwrap()
+            .expect("Automation should remain readable");
+        assert!(!definition.enabled);
+        assert!(definition.next_run_at.is_none());
+        let skipped: (String, String) = database
+            .connection()
+            .query_row(
+                "SELECT status, reason FROM automation_run WHERE automation_id = ?1 AND trigger_kind = 'scheduled'",
+                [&automation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(skipped, ("skipped".into(), "overlap".into()));
+        let manual_run_id = manual.result.payload["runId"].as_str().unwrap();
+        service
+            .interrupt_before_runtime(&mut database, manual_run_id)
+            .expect("manual run should settle for cleanup");
+
+        let closed_manual = service
+            .run_now(
+                &mut database,
+                &user_command(
+                    "automation-once-closed-manual-run",
+                    RunAutomationCommand {
+                        automation_id: automation_id.clone(),
+                    },
+                ),
+                CURRENT_USER_ID,
+                &quick_chat_path,
+            )
+            .expect("a closed one-time Automation should run manually");
+        assert_eq!(closed_manual.result.payload["status"], "started");
+        let closed_manual_run_id = closed_manual.result.payload["runId"]
+            .as_str()
+            .expect("manual AutomationRun ID should be returned");
+
+        let overlapping_manual = service
+            .run_now(
+                &mut database,
+                &user_command(
+                    "automation-once-closed-manual-overlap",
+                    RunAutomationCommand {
+                        automation_id: automation_id.clone(),
+                    },
+                ),
+                CURRENT_USER_ID,
+                &quick_chat_path,
+            )
+            .expect("manual overlap should be recorded for a closed Automation");
+        assert_eq!(overlapping_manual.result.payload["status"], "skipped");
+        assert_eq!(overlapping_manual.result.payload["reason"], "overlap");
+
+        let definition = service
+            .get(&database, &automation_id)
+            .unwrap()
+            .expect("Automation should remain readable");
+        assert!(!definition.enabled);
+        assert!(definition.next_run_at.is_none());
+        service
+            .interrupt_before_runtime(&mut database, closed_manual_run_id)
+            .expect("closed manual run should settle for cleanup");
+
+        // Claim a delayed scheduled occurrence directly at the atomic admission seam.
+        let record = load_automation_record(database.connection(), &automation_id)
+            .unwrap()
+            .unwrap();
+        let tx = database.connection_mut().transaction().unwrap();
+        let scheduled_at = due + Duration::days(1);
+        let admitted = claim_occurrence_in_tx(
+            &tx,
+            &record,
+            scheduled_at,
+            "scheduled",
+            true,
+            CURRENT_USER_ID,
+            &quick_chat_path,
+        )
+        .unwrap();
+        let title: String = tx
+            .query_row(
+                "SELECT title FROM camp WHERE id=?1",
+                [admitted.camp_id.unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            title,
+            format!(
+                "{} · {}",
+                "🌸".repeat(80),
+                scheduled_at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            )
+        );
+        tx.commit().unwrap();
+        remove_test_database(database, directory);
+    }
+
+    #[test]
+    fn full_form_update_with_unchanged_schedule_preserves_the_due_occurrence() {
+        let service = AutomationService::default();
+        let (mut database, directory, quick_chat_path) = test_database();
+        let schedule = AutomationSchedule::Daily {
+            at: "09:00".to_string(),
+        };
+        let create = service
+            .create(
+                &mut database,
+                &user_command(
+                    "automation-delayed-tick-create",
+                    CreateAutomationCommand {
+                        thread_naming: Default::default(),
+                        name: Some("Delayed tick".to_string()),
+                        prompt: "Run after an ordinary scheduler delay.".to_string(),
+                        member_id: "agent_1".to_string(),
+                        project_ref: AutomationProjectRef::QuickChat,
+                        schedule: schedule.clone(),
+                        notify_channels: Vec::new(),
+                    },
+                ),
+            )
+            .expect("one-time Automation should be created");
+        let automation_id = create.result.payload["automationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let due = Utc::now() - Duration::seconds(1);
+        database
+            .connection()
+            .execute(
+                "UPDATE automation SET next_run_at = ?2 WHERE id = ?1",
+                params![automation_id, timestamp(due)],
+            )
+            .unwrap();
+
+        let updated = service
+            .update(
+                &mut database,
+                &user_command(
+                    "automation-delayed-tick-update",
+                    UpdateAutomationCommand {
+                        thread_naming: Some(AutomationThreadNaming {
+                            include_time: false,
+                            ..Default::default()
+                        }),
+                        automation_id: automation_id.clone(),
+                        expected_version: 1,
+                        name: Some("Delayed tick renamed".to_string()),
+                        prompt: Some(
+                            "Run the edited instruction without losing the due trigger."
+                                .to_string(),
+                        ),
+                        member_id: Some("agent_1".to_string()),
+                        project_ref: Some(AutomationProjectRef::QuickChat),
+                        schedule: Some(schedule),
+                        notify_channels: Some(Vec::new()),
+                        enabled: None,
+                    },
+                ),
+            )
+            .expect("full-form update should succeed");
+        assert_eq!(updated.result.payload["nextRunAt"], timestamp(due));
+        assert!(
+            !service
+                .get(&database, &automation_id)
+                .unwrap()
+                .unwrap()
+                .thread_naming
+                .include_time
+        );
+        assert_eq!(
+            service.next_wake_at(&database, due).unwrap(),
+            Some(parse_timestamp(&timestamp(due)).unwrap())
+        );
+
+        let dispatches = service
+            .claim_due(
+                &mut database,
+                Utc::now(),
+                due - Duration::days(1),
+                &quick_chat_path,
+            )
+            .expect("the preserved occurrence should still be claimed");
+
+        assert_eq!(dispatches.len(), 1);
+        let run: (String, Option<String>, String, i64, String) = database
+            .connection()
+            .query_row(
+                "SELECT status, reason, scheduled_for, automation_version, prompt FROM automation_run WHERE automation_id = ?1",
+                [&automation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let scheduled_title: String = database.connection().query_row(
+            "SELECT camp.title FROM automation_run run JOIN camp ON camp.id=run.camp_id WHERE run.id=?1",
+            [&dispatches[0].automation_run_id], |row| row.get(0)).unwrap();
+        assert_eq!(
+            scheduled_title,
+            format!(
+                "Delayed tick renamed · {}",
+                due.with_timezone(&Local).format("%Y-%m-%d")
+            )
+        );
+        assert_eq!(
+            run,
+            (
+                "running".into(),
+                None,
+                timestamp(due),
+                2,
+                "Run the edited instruction without losing the due trigger.".into(),
+            )
+        );
+        service
+            .interrupt_before_runtime(&mut database, &dispatches[0].automation_run_id)
+            .expect("test run should settle");
+
+        let before_edit = service
+            .next_wake_at(&database, Utc::now())
+            .unwrap()
+            .unwrap();
+        let mut previous = before_edit;
+        for days in [2, 1] {
+            let target = (before_edit + Duration::days(days)).with_timezone(&chrono::Local);
+            let version = service
+                .get(&database, &automation_id)
+                .unwrap()
+                .unwrap()
+                .version;
+            let updated = service
+                .update(
+                    &mut database,
+                    &user_command(
+                        &format!("replace-deadline-{days}"),
+                        UpdateAutomationCommand {
+                            thread_naming: None,
+                            automation_id: automation_id.clone(),
+                            expected_version: version,
+                            name: None,
+                            prompt: None,
+                            member_id: None,
+                            project_ref: None,
+                            schedule: Some(AutomationSchedule::Once {
+                                date: target.format("%Y-%m-%d").to_string(),
+                                at: target.format("%H:%M").to_string(),
+                            }),
+                            notify_channels: None,
+                            enabled: Some(true),
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_ne!(
+                updated.result.status,
+                crate::command::CommandResultStatus::Rejected
+            );
+            let edited = service
+                .next_wake_at(&database, Utc::now())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                Some(timestamp(edited)),
+                service
+                    .get(&database, &automation_id)
+                    .unwrap()
+                    .unwrap()
+                    .next_run_at
+            );
+            if days == 1 {
+                assert!(
+                    edited < previous,
+                    "an earlier edit must replace the later reminder"
+                );
+            }
+            previous = edited;
+        }
+        let version = service
+            .get(&database, &automation_id)
+            .unwrap()
+            .unwrap()
+            .version;
+        service
+            .close(
+                &mut database,
+                &user_command(
+                    "close-deadline",
+                    CloseAutomationCommand {
+                        automation_id: automation_id.clone(),
+                        expected_version: version,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(service.next_wake_at(&database, Utc::now()).unwrap(), None);
+        let version = service
+            .get(&database, &automation_id)
+            .unwrap()
+            .unwrap()
+            .version;
+        service
+            .delete(
+                &mut database,
+                &user_command(
+                    "delete-deadline",
+                    DeleteAutomationCommand {
+                        automation_id,
+                        expected_version: version,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(service.next_wake_at(&database, Utc::now()).unwrap(), None);
+        remove_test_database(database, directory);
+    }
+
+    #[test]
+    fn cron_wildcard_step_one_has_the_same_weekly_occurrences_as_wildcard() {
+        let after = local_datetime(
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let wildcard = AutomationSchedule::Cron {
+            expression: "0 9 * * 1".to_string(),
+        };
+        let wildcard_step = AutomationSchedule::Cron {
+            expression: "0 9 */1 * 1".to_string(),
+        };
+
+        let next = next_occurrence_after(&wildcard, after).unwrap().unwrap();
+        assert_eq!(
+            next_occurrence_after(&wildcard_step, after).unwrap(),
+            Some(next)
+        );
+        assert_eq!(next.with_timezone(&Local).weekday(), chrono::Weekday::Mon);
+        assert_eq!(
+            next.with_timezone(&Local).format("%H:%M").to_string(),
+            "09:00"
+        );
+
+        let latest_at = next + Duration::days(3);
+        assert_eq!(
+            latest_occurrence_at_or_before(&wildcard, latest_at).unwrap(),
+            Some(next)
+        );
+        assert_eq!(
+            latest_occurrence_at_or_before(&wildcard_step, latest_at).unwrap(),
+            Some(next)
+        );
+        assert!(parse_cron_expression("0 9 1 * * 2027").is_err());
+    }
+
+    #[test]
+    fn settle_runs_reaches_a_terminal_run_after_32_older_active_runs() {
+        let service = AutomationService::default();
+        let (mut database, directory, quick_chat_path) = test_database();
+        for index in 0..33 {
+            let (automation_id, _) = create_manual_automation(
+                &service,
+                &mut database,
+                &format!("automation-settlement-create-{index}"),
+                &format!("Keep settlement fixture {index} active."),
+            );
+            let started = service
+                .run_now(
+                    &mut database,
+                    &user_command(
+                        &format!("automation-settlement-run-{index}"),
+                        RunAutomationCommand { automation_id },
+                    ),
+                    CURRENT_USER_ID,
+                    &quick_chat_path,
+                )
+                .expect("Automation should start");
+            assert_eq!(started.result.payload["status"], "started");
+        }
+        let last_run_id: String = database
+            .connection()
+            .query_row(
+                "SELECT id FROM automation_run WHERE status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        publish_automatic_result(
+            &mut database,
+            &last_run_id,
+            "Result after the first 32 active runs.",
+        );
+
+        assert!(service.settle_runs(&mut database, Utc::now()).unwrap());
+        let status: String = database
+            .connection()
+            .query_row(
+                "SELECT status FROM automation_run WHERE id = ?1",
+                [&last_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        let remaining: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM automation_run WHERE status = 'running'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 32);
+
+        remove_test_database(database, directory);
+    }
+
+    #[test]
+    fn terminal_public_result_and_notification_outcomes_settle_independently() {
+        let service = AutomationService::default();
+        let (mut database, directory, quick_chat_path) = test_database();
+        let (automation_id, _) = create_manual_automation(
+            &service,
+            &mut database,
+            "automation-notification-create",
+            "Prepare a concise result.",
+        );
+        let started = service
+            .run_now(
+                &mut database,
+                &user_command(
+                    "automation-notification-run",
+                    RunAutomationCommand {
+                        automation_id: automation_id.clone(),
+                    },
+                ),
+                CURRENT_USER_ID,
+                &quick_chat_path,
+            )
+            .unwrap();
+        let automation_run_id = started.result.payload["runId"].as_str().unwrap();
+        let result_message_id =
+            publish_automatic_result(&mut database, automation_run_id, "Scheduled result");
+
+        assert!(service.settle_runs(&mut database, Utc::now()).unwrap());
+        assert!(!service.settle_runs(&mut database, Utc::now()).unwrap());
+        let terminal: (String, Option<String>, String) = database
+            .connection()
+            .query_row(
+                "SELECT status, reason, result_message_id FROM automation_run WHERE id = ?1",
+                [automation_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(terminal, ("completed".into(), None, result_message_id));
+        assert!(
+            service
+                .has_ready_notification(&database, Utc::now())
+                .unwrap()
+        );
+        let pending: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM automation_notification_delivery WHERE automation_run_id = ?1 AND status = 'pending'",
+                [automation_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 2);
+        let observed = Utc::now();
+        assert_eq!(
+            service.next_wake_at(&database, observed).unwrap(),
+            None,
+            "already-announced due notifications must not spin the Automation driver"
+        );
+        let retry_at = observed + Duration::seconds(5);
+        database.connection().execute(
+            "UPDATE automation_notification_delivery SET available_at=?1 WHERE status='pending'",
+            [timestamp(retry_at)],
+        ).unwrap();
+        assert_eq!(
+            service.next_wake_at(&database, observed).unwrap(),
+            Some(parse_timestamp(&timestamp(retry_at)).unwrap())
+        );
+        assert_eq!(service.next_wake_at(&database, retry_at).unwrap(), None);
+        database.connection().execute(
+            "UPDATE automation_notification_delivery SET available_at=?1 WHERE status='pending'",
+            [timestamp(observed)],
+        ).unwrap();
+
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE automation_notification_delivery
+                SET status = 'attempting', attempt_count = 3,
+                    lease_owner = 'crashed-notification-host',
+                    lease_expires_at = ?2
+                WHERE automation_run_id = ?1 AND provider = 'feishu'
+                "#,
+                params![
+                    automation_run_id,
+                    timestamp(Utc::now() - Duration::seconds(1))
+                ],
+            )
+            .unwrap();
+
+        for provider in ["feishu", "dingtalk"] {
+            let transaction = database.connection_mut().transaction().unwrap();
+            let claims = claim_notification_deliveries(
+                &transaction,
+                provider,
+                "notification-test-host",
+                10,
+                &Utc::now(),
+            )
+            .unwrap();
+            assert!(claims.is_empty());
+            transaction.commit().unwrap();
+        }
+        let exhausted: (String, i64, String, bool) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, attempt_count, failure_code, ended_at IS NOT NULL
+                FROM automation_notification_delivery
+                WHERE automation_run_id = ?1 AND provider = 'feishu'
+                "#,
+                [automation_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            exhausted,
+            ("failed".into(), 3, "lease_expired".into(), true)
+        );
+        let view = service.get(&database, &automation_id).unwrap().unwrap();
+        let last_run = view.last_run.unwrap();
+        assert_eq!(last_run.status, "completed");
+        assert_eq!(last_run.notification_status, "failed");
+
+        remove_test_database(database, directory);
+    }
+
+    #[test]
+    fn pre_sleep_tick_cannot_claim_and_resume_records_only_the_missed_once() {
+        let service = AutomationService::default();
+        let (mut database, directory, quick_chat_path) = test_database();
+        let local_due = Local::now() + Duration::days(1);
+        let create = service
+            .create(
+                &mut database,
+                &user_command(
+                    "automation-missed-create",
+                    CreateAutomationCommand {
+                        thread_naming: Default::default(),
+                        name: Some("Missed once".to_string()),
+                        prompt: "Run if the app is awake.".to_string(),
+                        member_id: "agent_1".to_string(),
+                        project_ref: AutomationProjectRef::QuickChat,
+                        schedule: AutomationSchedule::Once {
+                            date: local_due.format("%Y-%m-%d").to_string(),
+                            at: local_due.format("%H:%M").to_string(),
+                        },
+                        notify_channels: Vec::new(),
+                    },
+                ),
+            )
+            .expect("one-time Automation should be created");
+        let automation_id = create.result.payload["automationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let due = parse_timestamp(create.result.payload["nextRunAt"].as_str().unwrap()).unwrap();
+
+        // 33 definitions exercise two full 16-row skipped batches plus the tail.
+        for index in 1..33 {
+            service
+                .create(
+                    &mut database,
+                    &user_command(
+                        &format!("missed-batch-{index}"),
+                        CreateAutomationCommand {
+                            thread_naming: Default::default(),
+                            name: None,
+                            prompt: "missed backlog".into(),
+                            member_id: "agent_1".into(),
+                            project_ref: AutomationProjectRef::QuickChat,
+                            schedule: AutomationSchedule::Once {
+                                date: local_due.format("%Y-%m-%d").to_string(),
+                                at: local_due.format("%H:%M").to_string(),
+                            },
+                            notify_channels: Vec::new(),
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            service.next_wake_at(&database, due).unwrap(),
+            Some(parse_timestamp(&timestamp(due)).unwrap())
+        );
+        let stale_tick = service
+            .claim_due(
+                &mut database,
+                due - Duration::seconds(1),
+                due - Duration::days(1),
+                &quick_chat_path,
+            )
+            .expect("a pre-sleep tick should remain safe if processed after wake");
+        assert!(stale_tick.is_empty());
+        let run_count: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM automation_run WHERE automation_id = ?1",
+                [&automation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 0);
+
+        let dispatches = service
+            .claim_due(
+                &mut database,
+                due + Duration::minutes(10),
+                due + Duration::minutes(10),
+                &quick_chat_path,
+            )
+            .expect("missed occurrence should settle");
+        assert!(dispatches.is_empty());
+        assert_eq!(
+            service.next_wake_at(&database, due).unwrap(),
+            Some(parse_timestamp(&timestamp(due)).unwrap()),
+            "empty dispatches do not mean skipped backlog has drained"
+        );
+        for _ in 0..2 {
+            assert!(
+                service
+                    .claim_due(
+                        &mut database,
+                        due + Duration::minutes(10),
+                        due + Duration::minutes(10),
+                        &quick_chat_path
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(service.next_wake_at(&database, due).unwrap(), None);
+        let skipped: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM automation_run WHERE status='skipped' AND reason='missed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(skipped, 33);
+        let definition = service.get(&database, &automation_id).unwrap().unwrap();
+        assert!(!definition.enabled);
+        assert!(definition.next_run_at.is_none());
+        let occurrence: (i64, String, String, Option<String>) = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*), status, reason, camp_id FROM automation_run WHERE automation_id = ?1",
+                [&automation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence, (1, "skipped".into(), "missed".into(), None));
+
+        remove_test_database(database, directory);
+    }
+}

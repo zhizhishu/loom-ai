@@ -1,0 +1,19 @@
+{
+  "sessionId": "questionnaire-session",
+  "toolCall": {
+    "toolCallId": "clarify-questionnaire-prompt",
+    "title": "Which color?",
+    "kind": "other",
+    "status": "pending",
+    "sessionUpdate": "tool_call_update",
+    "content": [
+      {"type": "content", "content": {"type": "text", "text": "Which color?"}}
+    ],
+    "rawInput": {"question": "Which color?", "choices": ["Blue", "Green"]}
+  },
+  "options": [
+    {"optionId": "choice-0", "name": "Blue", "kind": "allow_once"},
+    {"optionId": "choice-1", "name": "Green", "kind": "allow_once"},
+    {"optionId": "skip", "name": "Skip", "kind": "reject_once"}
+  ]
+}

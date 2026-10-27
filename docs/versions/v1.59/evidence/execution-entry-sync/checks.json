@@ -1,0 +1,490 @@
+{
+  "date": "2026-09-14",
+  "branch": "rovai/unified-rust-host",
+  "base": "43d39fabe3f32f4e23a150a6da0b0d132157c460",
+  "importedMain": "42e1e6d1c8b10c0f3860035243c7b72dcd126734",
+  "sourceSha256": {
+    "apps/desktop/src/renderer/src/CampDetailPopover.tsx": "d64e4037df1c2caaf98c9fafe633be5b5efb7d93efc1ee173f35ddba0936094d",
+    "apps/desktop/src/renderer/src/CampWorkspace.tsx": "99e215f73f7cf66df15779a748bd7800d6c7c11eb2155a5f753011d4a8874fb2",
+    "apps/desktop/src/renderer/src/styles.css": "bc68637aa6672e746a467e4fc5210db9bb9118480e77ac3e999c022e11d186fb",
+    "apps/web/src/mobile.css": "b6b4b2465d478df8a1a03aed78d4107d344f55668721177ba0b38ce825dcdd82",
+    "scripts/lib/host-web-parity.test.mjs": "a8a3bfea7e7144df2c668fede1f3005528aed7b3ab7bfbad722d9ea70dda7452",
+    "scripts/lib/host-web-mobile.test.mjs": "1dc134d042df5e269310c692a626ab80010f8d47a4cf8bf16b017740bef2d6bb",
+    "scripts/fixtures/host-web-parity/main.cjs": "ae1f699b4fc541b0d68610b8246d2a13168132fe0b20a12fa2d757ec17aae728"
+  },
+  "commands": [
+    {
+      "command": "pnpm typecheck",
+      "result": "passed"
+    },
+    {
+      "command": "pnpm exec tsc --noEmit -p scripts/fixtures/host-web-parity/tsconfig.json",
+      "result": "passed"
+    },
+    {
+      "command": "pnpm build:desktop",
+      "result": "passed; includes Web build; existing chunk-size warning"
+    },
+    {
+      "command": "pnpm test",
+      "result": "passed",
+      "vitest": {
+        "files": 198,
+        "passed": 2015
+      },
+      "node": {
+        "passed": 317,
+        "skipped": 2
+      }
+    },
+    {
+      "command": "pnpm test:execution-avatar-rail",
+      "result": "passed; native Electron input, both themes, 0/1/2/3/5 running members, duplicate Runs, forced colors, reduced motion, 200% layout"
+    },
+    {
+      "command": "pnpm test:file-reference-navigation",
+      "result": "passed; native Electron reading anchors and horizontal containment"
+    },
+    {
+      "command": "pnpm test:host-web-parity",
+      "result": "passed",
+      "scenarios": 28
+    },
+    {
+      "command": "node --test --test-name-pattern='phone execution' scripts/lib/host-web-mobile.test.mjs",
+      "result": "passed"
+    },
+    {
+      "command": "pnpm test:rust:staged",
+      "result": "No staged Rust changes; skipped Rust tests"
+    },
+    {
+      "command": "DOCS_BASE_REF=42e1e6d1 pnpm docs:check:ci",
+      "result": "passed; docs:test and docs:check also passed inside pnpm test"
+    }
+  ],
+  "parity": {
+    "simulation": true,
+    "realRuntime": false,
+    "headlessChromeFocus": "CDP foreground focus emulation",
+    "electronFocus": "isolated hidden WebContents focus",
+    "webWidths": [
+      768,
+      1040,
+      1440
+    ],
+    "checks": [
+      {
+        "surface": "desktop",
+        "theme": "day",
+        "scenario": "camp",
+        "actions": [
+          "simulated-send-appends-message-and-clears-this-draft"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "day",
+        "scenario": "new",
+        "actions": [
+          "simulated-authorized-workspace-picker",
+          "select-one-member",
+          "create-and-open-fresh-camp"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "day",
+        "scenario": "running",
+        "actions": [
+          "shared-running-avatars-and-overflow",
+          "dual-orbit-browser-geometry",
+          "full-running-names-on-focus",
+          "collapsed-entry-retains-running-signal",
+          "production-current-command-and-icon",
+          "collapsed-running-highlight",
+          "expanded-static-result",
+          "collapse-retains-reading-anchor",
+          "touch-cue-and-44px-target",
+          "reduced-motion",
+          "entry-reduced-motion",
+          "simulated-stop-clears-entry-running-state"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "day",
+        "scenario": "mobile-running",
+        "actions": [
+          "shared-running-avatars-and-overflow",
+          "dual-orbit-browser-geometry",
+          "full-running-names-on-focus",
+          "collapsed-entry-retains-running-signal",
+          "entry-reduced-motion",
+          "simulated-stop-clears-entry-running-state"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "day",
+        "scenario": "approval",
+        "actions": []
+      },
+      {
+        "surface": "desktop",
+        "theme": "day",
+        "scenario": "file",
+        "actions": []
+      },
+      {
+        "surface": "desktop",
+        "theme": "day",
+        "scenario": "member",
+        "actions": [
+          "production-runtime-form-saves-simulated-versioned-configuration"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "night",
+        "scenario": "camp",
+        "actions": [
+          "simulated-send-appends-message-and-clears-this-draft"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "night",
+        "scenario": "new",
+        "actions": [
+          "simulated-authorized-workspace-picker",
+          "select-one-member",
+          "create-and-open-fresh-camp"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "night",
+        "scenario": "running",
+        "actions": [
+          "shared-running-avatars-and-overflow",
+          "dual-orbit-browser-geometry",
+          "full-running-names-on-focus",
+          "collapsed-entry-retains-running-signal",
+          "production-current-command-and-icon",
+          "collapsed-running-highlight",
+          "expanded-static-result",
+          "collapse-retains-reading-anchor",
+          "touch-cue-and-44px-target",
+          "reduced-motion",
+          "entry-reduced-motion",
+          "simulated-stop-clears-entry-running-state"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "night",
+        "scenario": "mobile-running",
+        "actions": [
+          "shared-running-avatars-and-overflow",
+          "dual-orbit-browser-geometry",
+          "full-running-names-on-focus",
+          "collapsed-entry-retains-running-signal",
+          "entry-reduced-motion",
+          "simulated-stop-clears-entry-running-state"
+        ]
+      },
+      {
+        "surface": "desktop",
+        "theme": "night",
+        "scenario": "approval",
+        "actions": []
+      },
+      {
+        "surface": "desktop",
+        "theme": "night",
+        "scenario": "file",
+        "actions": []
+      },
+      {
+        "surface": "desktop",
+        "theme": "night",
+        "scenario": "member",
+        "actions": [
+          "production-runtime-form-saves-simulated-versioned-configuration"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "day",
+        "scenario": "camp",
+        "actions": [
+          "simulated-send-appends-message-and-clears-this-draft"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "day",
+        "scenario": "new",
+        "actions": [
+          "simulated-authorized-workspace-picker",
+          "select-one-member",
+          "create-and-open-fresh-camp"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "day",
+        "scenario": "running",
+        "actions": [
+          "shared-running-avatars-and-overflow",
+          "dual-orbit-browser-geometry",
+          "full-running-names-on-focus",
+          "collapsed-entry-retains-running-signal",
+          "production-current-command-and-icon",
+          "collapsed-running-highlight",
+          "expanded-static-result",
+          "collapse-retains-reading-anchor",
+          "touch-cue-and-44px-target",
+          "reduced-motion",
+          "entry-reduced-motion",
+          "simulated-stop-clears-entry-running-state"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "day",
+        "scenario": "mobile-running",
+        "actions": [
+          "shared-running-avatars-and-overflow",
+          "dual-orbit-browser-geometry",
+          "full-running-names-on-focus",
+          "collapsed-entry-retains-running-signal",
+          "entry-reduced-motion",
+          "simulated-stop-clears-entry-running-state"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "day",
+        "scenario": "approval",
+        "actions": []
+      },
+      {
+        "surface": "web",
+        "theme": "day",
+        "scenario": "file",
+        "actions": [
+          "production-markdown-preview",
+          "explicit-download-adapter-saves-fixed-sample"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "day",
+        "scenario": "member",
+        "actions": [
+          "production-runtime-form-saves-simulated-versioned-configuration"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "night",
+        "scenario": "camp",
+        "actions": [
+          "simulated-send-appends-message-and-clears-this-draft"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "night",
+        "scenario": "new",
+        "actions": [
+          "simulated-authorized-workspace-picker",
+          "select-one-member",
+          "create-and-open-fresh-camp"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "night",
+        "scenario": "running",
+        "actions": [
+          "shared-running-avatars-and-overflow",
+          "dual-orbit-browser-geometry",
+          "full-running-names-on-focus",
+          "collapsed-entry-retains-running-signal",
+          "production-current-command-and-icon",
+          "collapsed-running-highlight",
+          "expanded-static-result",
+          "collapse-retains-reading-anchor",
+          "touch-cue-and-44px-target",
+          "reduced-motion",
+          "entry-reduced-motion",
+          "simulated-stop-clears-entry-running-state"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "night",
+        "scenario": "mobile-running",
+        "actions": [
+          "shared-running-avatars-and-overflow",
+          "dual-orbit-browser-geometry",
+          "full-running-names-on-focus",
+          "collapsed-entry-retains-running-signal",
+          "entry-reduced-motion",
+          "simulated-stop-clears-entry-running-state"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "night",
+        "scenario": "approval",
+        "actions": []
+      },
+      {
+        "surface": "web",
+        "theme": "night",
+        "scenario": "file",
+        "actions": [
+          "production-markdown-preview",
+          "explicit-download-adapter-saves-fixed-sample"
+        ]
+      },
+      {
+        "surface": "web",
+        "theme": "night",
+        "scenario": "member",
+        "actions": [
+          "production-runtime-form-saves-simulated-versioned-configuration"
+        ]
+      }
+    ]
+  },
+  "mobile": {
+    "productionComponents": true,
+    "simulatedEvidence": true,
+    "realRuntime": false,
+    "widths": [
+      360,
+      390,
+      430,
+      844
+    ],
+    "themes": [
+      "day",
+      "night"
+    ],
+    "checks": [
+      "10-avatar-wrap",
+      "3-runs",
+      "independent-disclosures-retained-across-member-switch",
+      "shared-command-group",
+      "rotation"
+    ]
+  },
+  "prototype": {
+    "proposalOnly": true,
+    "productionComponents": true,
+    "realRuntime": false,
+    "browser": "macOS Chrome emulation",
+    "checks": [
+      {
+        "theme": "day",
+        "width": 360,
+        "overflow": false,
+        "frameOverflow": false,
+        "hit": 44,
+        "ringContained": true,
+        "animation": "camp-execution-orbit"
+      },
+      {
+        "theme": "day",
+        "width": 390,
+        "overflow": false,
+        "frameOverflow": false,
+        "hit": 44,
+        "ringContained": true,
+        "animation": "camp-execution-orbit"
+      },
+      {
+        "theme": "day",
+        "width": 430,
+        "overflow": false,
+        "frameOverflow": false,
+        "hit": 44,
+        "ringContained": true,
+        "animation": "camp-execution-orbit"
+      },
+      {
+        "theme": "day",
+        "width": 844,
+        "overflow": false,
+        "frameOverflow": false,
+        "hit": 44,
+        "ringContained": true,
+        "animation": "camp-execution-orbit"
+      },
+      {
+        "theme": "night",
+        "width": 360,
+        "overflow": false,
+        "frameOverflow": false,
+        "hit": 44,
+        "ringContained": true,
+        "animation": "camp-execution-orbit"
+      },
+      {
+        "theme": "night",
+        "width": 390,
+        "overflow": false,
+        "frameOverflow": false,
+        "hit": 44,
+        "ringContained": true,
+        "animation": "camp-execution-orbit"
+      },
+      {
+        "theme": "night",
+        "width": 430,
+        "overflow": false,
+        "frameOverflow": false,
+        "hit": 44,
+        "ringContained": true,
+        "animation": "camp-execution-orbit"
+      },
+      {
+        "theme": "night",
+        "width": 844,
+        "overflow": false,
+        "frameOverflow": false,
+        "hit": 44,
+        "ringContained": true,
+        "animation": "camp-execution-orbit"
+      }
+    ],
+    "interactions": [
+      "execution-tab",
+      "10-members",
+      "3-runs",
+      "stop-removes-orbit",
+      "waiting-and-idle-no-orbit",
+      "system-reduced-motion",
+      "review-motion-control"
+    ],
+    "file": "rovai-mobile-execution-orbits.html",
+    "sha256": "86836acbd4c1f1a44ac3a7c800cc594584139c27912a50883d8a2b7a610c876b"
+  },
+  "limits": [
+    "No real Runtime started in this batch",
+    "No real iOS or Android device qualification",
+    "Mobile dual-orbit is a local review proposal only; production keeps its dot",
+    "No daily App installation",
+    "No Rust source changed; staged routing checked separately"
+  ],
+  "harnessCorrections": [
+    "Hidden Electron needed WebContents focus; Chrome headless needed foreground focus emulation for React focus events",
+    "Entry reopening explicitly selects the first member before inspecting its command fixture",
+    "Ten-member addition covers entry count, orbits and stop; command interaction remains covered in the existing single-running case and native/mobile owner suites"
+  ]
+}

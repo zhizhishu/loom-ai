@@ -1,0 +1,7415 @@
+use crate::message_quote::{MessageQuoteSnapshot, QuoteStorage, load_quotes};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{
+    agent_run_file_change::{AgentRunFileChangesView, list_completed_run_file_changes},
+    agent_run_image::{AgentRunImagesView, list_camp_images},
+    camp_attachment::DIRECTORY_MEDIA_TYPE,
+    camp_content::{StructuredThreadMessageContent, normalize_content, render_current_plain_text},
+    camp_id::ThreadId,
+    camp_message_publication::public_camp_message_publication_cte,
+    canonical_activity::CanonicalRuntimeActivity,
+    command::{canonical_json_digest, project_persisted_command_result_event_payload},
+    current_input_skill::CurrentInputSkillResolution,
+    db::Database,
+    git::{GitCapabilityState, GitObservation},
+    local_attachment_source::{
+        LocalAttachmentAvailability, LocalAttachmentSourceView, parse_source_attachments,
+    },
+    mcp_projection::McpExposureSnapshot,
+    runtime_failure::{RuntimeFailureView, context_payload_too_large_failure},
+    skill_projection::SkillExposureSnapshot,
+};
+
+mod navigation;
+use navigation::*;
+mod replies;
+mod user_anchors;
+pub use replies::{ReplyPage, ReplyPageParams};
+pub use user_anchors::{ThreadUserAnchorIndex, ThreadUserAnchorPreview};
+mod message_model;
+pub use message_model::ThreadMessageRuntimeModelView;
+
+pub const READ_MODEL_SCHEMA_VERSION: i64 = 36;
+pub const EVENT_BATCH_SCHEMA_VERSION: i64 = 9;
+pub const NAVIGATION_SCHEMA_VERSION: i64 = 3;
+pub const EXECUTION_EVIDENCE_PAGE_SCHEMA_VERSION: i64 = 1;
+pub const CAMP_MESSAGE_AROUND_SCHEMA_VERSION: i64 = 1;
+pub const CAMP_MESSAGE_FIND_SCHEMA_VERSION: i64 = 1;
+pub const CAMP_OPEN_SCHEMA_VERSION: i64 = 9;
+pub const CAMP_MESSAGE_PAGE_SCHEMA_VERSION: i64 = 1;
+pub const AGENT_RUN_DIAGNOSTIC_SCHEMA_VERSION: i64 = 1;
+pub const NAVIGATION_RECENT_CAMP_LIMIT: usize = 5;
+const EXECUTION_EVIDENCE_SNAPSHOT_LIMIT: i64 = 1_200;
+const CAMP_MESSAGE_AROUND_RADIUS: i64 = 20;
+const CAMP_MESSAGE_FIND_QUERY_MAX_SCALARS: usize = 512;
+const CAMP_OPEN_TASK_LIMIT: i64 = 100;
+const CAMP_OPEN_MESSAGE_LIMIT: i64 = 20;
+const CAMP_OPEN_DELIVERY_LIMIT: i64 = 200;
+const CAMP_OPEN_TURN_LIMIT: i64 = 64;
+const CAMP_OPEN_AGENT_RUN_LIMIT: i64 = 96;
+const CAMP_OPEN_APPROVAL_LIMIT: i64 = 32;
+
+const FIND_NAVIGATION_CAMP_SQL: &str = r#"
+    SELECT camp.id, camp.title, camp.activation_state, camp.project_binding_kind, camp.project_path,
+           channel_conversation.provider, channel_conversation.conversation_kind
+    FROM camp
+    LEFT JOIN channel_conversation_binding AS channel_binding ON channel_binding.camp_id = camp.id
+    LEFT JOIN channel_conversation ON channel_conversation.id = channel_binding.channel_conversation_id
+    LEFT JOIN camp_composer_draft ON camp_composer_draft.camp_id = camp.id
+    WHERE camp.id = ?1
+      AND camp.deletion_operation_id IS NULL
+      AND (camp.activation_state = 'active'
+        OR EXISTS(SELECT 1 FROM pending_camp_draft_presence d WHERE d.camp_id = camp.id AND d.client_id = 'desktop')
+        OR length(trim(COALESCE(camp_composer_draft.body, ''))) > 0
+        OR EXISTS(SELECT 1 FROM prepared_attachment WHERE camp_id = camp.id))
+"#;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationThreadTarget {
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_source: Option<ThreadChannelSource>,
+    pub activation_state: String,
+    pub project_binding_kind: String,
+    pub project_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationLeadSummary {
+    pub agent_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationThreadItem {
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_source: Option<ThreadChannelSource>,
+    pub activation_state: String,
+    pub project_binding_kind: String,
+    pub project_path: String,
+    pub default_lead: Option<NavigationLeadSummary>,
+    pub marker: String,
+    pub last_activity_at: String,
+    pub last_activity_global_sequence: i64,
+    pub latest_completion_global_sequence: i64,
+    pub last_seen_global_sequence: i64,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationThreadGroup {
+    pub total_count: usize,
+    #[serde(rename = "recentThreads", alias = "recentCamps")]
+    pub recent_camps: Vec<NavigationThreadItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectNavigationGroup {
+    pub project_key: String,
+    pub name: String,
+    pub project_path: String,
+    pub last_activity_at: String,
+    pub last_activity_global_sequence: i64,
+    pub total_count: usize,
+    #[serde(rename = "recentThreads", alias = "recentCamps")]
+    pub recent_camps: Vec<NavigationThreadItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationSnapshot {
+    pub schema_version: i64,
+    pub through_global_sequence: i64,
+    pub quick_chat: NavigationThreadGroup,
+    pub projects: Vec<ProjectNavigationGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationThreadPage {
+    pub schema_version: i64,
+    pub through_global_sequence: i64,
+    pub project_path: Option<String>,
+    pub total_count: usize,
+    pub next_offset: Option<usize>,
+    #[serde(rename = "threads", alias = "camps")]
+    pub camps: Vec<NavigationThreadItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadViewedAcknowledgement {
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub last_seen_global_sequence: i64,
+    pub changed: bool,
+    pub navigation: NavigationThreadRows,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationThreadRows {
+    pub group_keys: Vec<String>,
+    pub through_global_sequence: i64,
+    #[serde(rename = "threads", alias = "camps")]
+    pub camps: Vec<NavigationThreadItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListItem {
+    pub id: String,
+    pub title: String,
+    pub project_path: String,
+    pub default_lead_agent_id: Option<String>,
+    pub active_member_count: i64,
+    pub tasks_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_task_count: Option<i64>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadView {
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_source: Option<ThreadChannelSource>,
+    pub activation_state: String,
+    pub project_binding_kind: String,
+    pub project_path: String,
+    pub default_lead_agent_id: Option<String>,
+    pub membership_generation: i64,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadChannelSource {
+    pub provider: String,
+    pub conversation_kind: String,
+}
+
+pub(crate) fn camp_channel_source_from_row(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<ThreadChannelSource>> {
+    let provider = row.get::<_, Option<String>>(column)?;
+    let conversation_kind = row.get::<_, Option<String>>(column + 1)?;
+    Ok(provider
+        .zip(conversation_kind)
+        .and_then(|(provider, conversation_kind)| {
+            matches!(
+                (provider.as_str(), conversation_kind.as_str()),
+                ("feishu" | "lark", "p2p" | "group" | "topic") | ("dingtalk", "p2p" | "group")
+            )
+            .then_some(ThreadChannelSource {
+                provider,
+                conversation_kind,
+            })
+        }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMemberView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast: Option<crate::camp_fast::ThreadMemberFastView>,
+    pub agent_id: String,
+    pub display_name: String,
+    pub avatar_ref: Option<String>,
+    pub team_role: String,
+    pub accent: String,
+    pub membership_status: String,
+    pub leave_requested_at: Option<String>,
+    pub profile_presence: String,
+    pub member_order: i64,
+    pub is_default_lead: bool,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMembershipReconciliationView {
+    pub id: String,
+    pub agent_id: String,
+    pub membership_version: i64,
+    pub status: String,
+    pub reason_code: String,
+    pub target_run_count: i64,
+    pub settled_run_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskView {
+    pub task_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub title: String,
+    pub description: String,
+    pub status: String,
+    pub assignee_agent_id: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub completion_summary: Option<String>,
+    pub cancel_reason: Option<String>,
+    pub created_by_type: String,
+    pub created_by_id: String,
+    pub source_agent_run_id: Option<String>,
+    pub closed_by_type: Option<String>,
+    pub closed_by_id: Option<String>,
+    pub closed_by_agent_run_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub available_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessageView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_start: Option<Value>,
+    pub quotes: Vec<MessageQuoteSnapshot>,
+    pub id: String,
+    pub sequence: i64,
+    pub timeline_global_sequence: Option<i64>,
+    pub author_type: String,
+    pub author_id: String,
+    pub author_display_name: Option<String>,
+    pub source_agent_run_id: Option<String>,
+    pub runtime_model: Option<ThreadMessageRuntimeModelView>,
+    pub body: String,
+    pub content: StructuredThreadMessageContent,
+    pub attachments: Vec<ThreadMessageAttachmentView>,
+    pub address_mode: String,
+    pub addressed_agent_ids: Value,
+    #[serde(rename = "replyToThreadMessageId", alias = "replyToCampMessageId")]
+    pub reply_to_camp_message_id: Option<String>,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: Option<String>,
+    pub presentation: Option<Value>,
+    pub created_at: String,
+    pub withdrawn: bool,
+    pub can_withdraw: bool,
+    pub version: i64,
+}
+
+pub type ThreadMessageAttachmentView = LocalAttachmentSourceView;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnView {
+    pub id: String,
+    pub trigger_type: String,
+    pub trigger_id: String,
+    pub status: String,
+    pub cancel_requested_at: Option<String>,
+    pub aggregate_reason_code: Option<String>,
+    pub execution_budget: ThreadTurnExecutionBudgetView,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnExecutionBudgetView {
+    pub schema_version: i64,
+    pub accepted_at: String,
+    pub deadline_at: Option<String>,
+    pub elapsed_seconds: Option<i64>,
+    pub max_agent_run_responsibilities: i64,
+    pub max_accepted_a2a: i64,
+    pub allocated_agent_run_responsibilities: i64,
+    pub accepted_a2a: i64,
+    pub exhausted_at: Option<String>,
+    pub exhaustion_reason: Option<String>,
+    pub exhaustion_command_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunWorkspaceView {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunView {
+    pub can_steer: bool,
+    pub steer_unavailable_reason: Option<crate::steer::SteerUnavailableReason>,
+    pub id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: Option<String>,
+    pub input_message_ids: Vec<String>,
+    pub anchor_message_id: Option<String>,
+    pub public_tail_sequence_at_start: Option<i64>,
+    pub input_summary: Option<String>,
+    pub has_accepted_continuation: bool,
+    pub conversation_id: String,
+    pub agent_id: String,
+    pub task_id: Option<String>,
+    pub responsibility_key: String,
+    pub responsibility_generation: i64,
+    pub purpose: String,
+    pub completion_role: String,
+    pub status: String,
+    pub wait_reason: Option<String>,
+    pub cancel_requested_at: Option<String>,
+    pub cancel_reason_code: Option<String>,
+    pub cancel_acknowledged_at: Option<String>,
+    pub terminal_resolution_source: Option<String>,
+    pub terminal_reason_code: Option<String>,
+    pub failure: Option<RuntimeFailureView>,
+    pub runtime_model: Option<ThreadMessageRuntimeModelView>,
+    pub execution_epoch: i64,
+    pub permission_semantics: String,
+    pub invocation_kind: String,
+    pub trigger_delivery_generation: i64,
+    pub a2a_parent_agent_run_id: Option<String>,
+    pub a2a_root_agent_run_id: Option<String>,
+    pub a2a_depth: i64,
+    pub execution_evidence_count: i64,
+    pub execution_evidence_change_sequence: i64,
+    pub has_unsettled_external_effects: bool,
+    pub workspace: Option<RunWorkspaceView>,
+    pub starting_git_observation: Option<GitObservation>,
+    pub ending_git_observation: Option<GitObservation>,
+    pub version: i64,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunDiagnosticRuntimeView {
+    pub adapter_kind: String,
+    pub runtime_installation_id: Option<String>,
+    pub effective_config_digest: String,
+    pub binding_compatibility_digest: Option<String>,
+    pub permission_semantics: String,
+    pub observed_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunDiagnosticOutputView {
+    pub final_output_digest: Option<String>,
+    #[serde(rename = "finalThreadMessageId", alias = "finalCampMessageId")]
+    pub final_camp_message_id: Option<String>,
+    pub public_output: Option<String>,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunDiagnosticGitView {
+    pub starting: Option<AgentRunDiagnosticGitObservationView>,
+    pub ending: Option<AgentRunDiagnosticGitObservationView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunDiagnosticGitObservationView {
+    pub state: GitCapabilityState,
+    pub object_format: Option<String>,
+    pub head_commit: Option<String>,
+    pub branch: Option<String>,
+    pub dirty: Option<bool>,
+    pub observed_at: String,
+}
+
+impl From<GitObservation> for AgentRunDiagnosticGitObservationView {
+    fn from(observation: GitObservation) -> Self {
+        Self {
+            state: observation.state,
+            object_format: observation.object_format,
+            head_commit: observation.head_commit,
+            branch: observation.branch,
+            dirty: observation.dirty,
+            observed_at: observation.observed_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunDiagnosticContextManifestView {
+    pub manifest_id: Option<String>,
+    pub rendered_payload_digest: Option<String>,
+    pub charter_delivery_mode: Option<String>,
+    #[serde(
+        rename = "threadMessageBoundarySequence",
+        alias = "campMessageBoundarySequence"
+    )]
+    pub camp_message_boundary_sequence: Option<i64>,
+    pub skill_exposure_digest: Option<String>,
+    pub mcp_exposure_digest: Option<String>,
+    pub mcp_projection_digest: Option<String>,
+    pub attachment_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunDiagnosticEvidenceView {
+    pub count: i64,
+    pub first_evidence_sequence: Option<i64>,
+    pub last_evidence_sequence: Option<i64>,
+}
+
+/// Closed, user-readable execution summary for local Runtime diagnostics.
+///
+/// This view deliberately excludes the raw effective Runtime configuration,
+/// Runtime input, Bootstrap, Dynamic Context, environment and credentials.
+/// Runtime final output is not a durable Core fact; only an explicitly
+/// published Camp message may appear as `publicOutput`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunDiagnosticView {
+    pub schema_version: i64,
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: Option<String>,
+    pub conversation_id: String,
+    pub agent_id: String,
+    pub status: String,
+    pub wait_reason: Option<String>,
+    pub failure: Option<RuntimeFailureView>,
+    pub version: i64,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub runtime: AgentRunDiagnosticRuntimeView,
+    pub output: AgentRunDiagnosticOutputView,
+    pub git: AgentRunDiagnosticGitView,
+    pub context_manifest: AgentRunDiagnosticContextManifestView,
+    pub evidence: AgentRunDiagnosticEvidenceView,
+    pub observed_through_global_sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunExecutionEvidenceView {
+    pub id: String,
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub sequence: i64,
+    pub operation_id: Option<String>,
+    pub revision: Option<i64>,
+    pub change_sequence: Option<i64>,
+    pub event_type: String,
+    pub kind: String,
+    pub phase: String,
+    pub payload: Value,
+    pub content_blob_id: Option<String>,
+    pub content_byte_count: i64,
+    pub is_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_truncated: Option<bool>,
+    pub occurred_at: String,
+    pub canonical: Option<CanonicalRuntimeActivity>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunExecutionEvidencePage {
+    pub schema_version: i64,
+    pub agent_run_id: String,
+    pub requested_after_sequence: i64,
+    pub next_after_sequence: i64,
+    pub through_sequence: i64,
+    pub has_more: bool,
+    pub evidence: Vec<AgentRunExecutionEvidenceView>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextAttachmentMetadataView {
+    pub attachment_id: String,
+    pub name: String,
+    pub media_type: String,
+    pub byte_size: i64,
+    pub location_ref: String,
+    pub content_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInputDeliveryView {
+    pub id: String,
+    pub execution_epoch: i64,
+    pub status: String,
+    pub native_input_id: Option<String>,
+    #[serde(
+        rename = "boundaryThreadMessageSequence",
+        alias = "boundaryCampMessageSequence"
+    )]
+    pub boundary_camp_message_sequence: i64,
+    pub prepared_at: String,
+    pub accepted_at: Option<String>,
+    pub resolved_at: Option<String>,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+    pub bootstrap_redelivery_present: bool,
+    pub bootstrap_redelivery_revision: Option<i64>,
+    pub bootstrap_redelivery_evidence_id: Option<String>,
+    pub bootstrap_redelivery_envelope_version: Option<i64>,
+    pub bootstrap_redelivery_formatter_version: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextManifestView {
+    pub id: String,
+    pub agent_run_id: String,
+    pub bootstrap: NativeSessionBootstrapEvidenceView,
+    pub native_binding_generation: i64,
+    #[serde(
+        rename = "threadMessageBoundarySequence",
+        alias = "campMessageBoundarySequence"
+    )]
+    pub camp_message_boundary_sequence: i64,
+    pub conversation_message_boundary_sequence: i64,
+    pub history_fence_version: i64,
+    pub global_public_message_boundary: i64,
+    #[serde(rename = "historyThreads", alias = "historyCamps")]
+    pub history_camps: Vec<ContextManifestHistoryThreadView>,
+    pub raw_message_count: usize,
+    pub previous_accepted_public_boundary_sequence: i64,
+    pub context_delivery_profile_version: i64,
+    pub context_delivery_profile: Option<Value>,
+    pub context_delivery_profile_digest: Option<String>,
+    pub originating_public_user_message_ref: Option<Value>,
+    pub recent_message_count: usize,
+    pub omitted_message_count: Option<i64>,
+    pub omitted_message_sequence_start: Option<i64>,
+    pub omitted_message_sequence_end: Option<i64>,
+    pub omission_entries: Vec<Value>,
+    pub collaboration_state_digest: String,
+    pub collaboration_state_included: bool,
+    pub shared_message_evidence: Vec<Value>,
+    pub shared_message_evidence_digest: Option<String>,
+    pub run_fact_refs: Vec<RunFactRefView>,
+    pub run_fact_payload: Option<Value>,
+    pub run_fact_digest: Option<String>,
+    pub workspace_fact: Option<Value>,
+    pub workspace_fact_digest: Option<String>,
+    pub workspace_fact_included: bool,
+    pub current_input_source: Value,
+    pub attachment_refs: Vec<ThreadAttachmentRefView>,
+    pub attachment_digest: Option<String>,
+    pub skill_exposure: SkillExposureSnapshot,
+    pub skill_exposure_digest: Option<String>,
+    pub current_input_skill_resolution: CurrentInputSkillResolution,
+    pub current_input_skill_resolution_digest: Option<String>,
+    pub message_projection_audience: String,
+    pub a2a_guidance_evidence: Option<Value>,
+    pub a2a_guidance_evidence_digest: Option<String>,
+    pub mcp_exposure: McpExposureSnapshot,
+    pub mcp_exposure_digest: Option<String>,
+    pub mcp_projection_digest: Option<String>,
+    pub self_active_task_evidence: Option<Value>,
+    pub self_active_task_evidence_digest: Option<String>,
+    pub formatter_version: i64,
+    pub rendered_payload_digest: Option<String>,
+    pub delivery: Option<RuntimeInputDeliveryView>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFactRefView {
+    pub fact: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextManifestHistoryThreadView {
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    #[serde(rename = "threadTitle", alias = "campTitle")]
+    pub camp_title: String,
+    pub last_visible_activity_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionBootstrapEvidenceView {
+    pub id: String,
+    pub conversation_id: String,
+    pub native_binding_id: String,
+    pub native_binding_generation: i64,
+    pub contract_version: String,
+    pub bootstrap_formatter_version: i64,
+    pub session_charter_digest: String,
+    pub memory_entrypoint_digest: String,
+    pub observed_memory_revisions: Vec<Value>,
+    pub authorization_basis_digest: String,
+    pub delivery_mode: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadAttachmentRefView {
+    pub attachment_id: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionView {
+    pub id: String,
+    pub agent_run_id: String,
+    pub action_kind: String,
+    pub action_summary: String,
+    pub control_mode: String,
+    pub policy_decision: String,
+    pub status: String,
+    pub action_digest: String,
+    pub effect_disposition: Option<String>,
+    pub not_executed_reason: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalView {
+    pub id: String,
+    pub action_id: String,
+    pub action_kind: String,
+    pub action_summary: String,
+    pub canonical_input: Value,
+    pub reason: Option<String>,
+    pub agent_run_id: String,
+    pub agent_id: String,
+    pub adapter_kind: String,
+    pub native_method: Option<String>,
+    pub request_digest: Option<String>,
+    pub permission_semantics: String,
+    pub options: Vec<RuntimePermissionOptionView>,
+    pub status: String,
+    pub requested_for_user_id: String,
+    pub resolved_by_type: Option<String>,
+    pub resolved_by_id: Option<String>,
+    pub resolution_code: Option<String>,
+    pub version: i64,
+    pub requested_at: String,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePermissionOptionView {
+    pub option_id: String,
+    pub kind: String,
+    pub label: String,
+    pub consequence: String,
+    pub native_response_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainEventView {
+    pub global_sequence: i64,
+    pub event_id: Option<String>,
+    pub event_type: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: Option<String>,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<String>,
+    pub actor_type: Option<String>,
+    pub actor_id: Option<String>,
+    pub source_agent_run_id: Option<String>,
+    pub execution_epoch: Option<i64>,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSnapshot {
+    pub schema_version: i64,
+    pub through_global_sequence: i64,
+    #[serde(rename = "thread", alias = "camp")]
+    pub camp: ThreadView,
+    pub members: Vec<ThreadMemberView>,
+    pub membership_reconciliations: Vec<ThreadMembershipReconciliationView>,
+    pub tasks_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<TaskView>>,
+    pub member_creations: Vec<crate::member_studio::MemberCreationView>,
+    pub messages: Vec<ThreadMessageView>,
+    pub message_deliveries: Vec<MessageDeliveryView>,
+    pub turns: Vec<ThreadTurnView>,
+    pub agent_runs: Vec<AgentRunView>,
+    pub execution_evidence: Vec<AgentRunExecutionEvidenceView>,
+    pub agent_run_file_changes: Vec<AgentRunFileChangesView>,
+    pub agent_run_images: Vec<AgentRunImagesView>,
+    pub context_manifests: Vec<ContextManifestView>,
+    pub approvals: Vec<ApprovalView>,
+    pub actions: Vec<ActionView>,
+    pub timeline: Vec<DomainEventView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadOpenCollectionCoverage {
+    pub loaded_count: i64,
+    pub total_count: i64,
+    pub omitted_count: i64,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadOpenMessageCoverage {
+    pub loaded_count: i64,
+    pub total_count: i64,
+    pub omitted_count: i64,
+    pub complete: bool,
+    pub oldest_loaded_sequence: Option<i64>,
+    pub newest_loaded_sequence: Option<i64>,
+    pub has_earlier: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadOpenCoverage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<ThreadOpenCollectionCoverage>,
+    pub messages: ThreadOpenMessageCoverage,
+    pub message_deliveries: ThreadOpenCollectionCoverage,
+    pub turns: ThreadOpenCollectionCoverage,
+    pub agent_runs: ThreadOpenCollectionCoverage,
+    pub approvals: ThreadOpenCollectionCoverage,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadOpenProjection {
+    pub schema_version: i64,
+    pub through_global_sequence: i64,
+    #[serde(rename = "thread", alias = "camp")]
+    pub camp: ThreadView,
+    pub members: Vec<ThreadMemberView>,
+    pub membership_reconciliations: Vec<ThreadMembershipReconciliationView>,
+    pub tasks_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<TaskView>>,
+    pub member_creations: Vec<crate::member_studio::MemberCreationView>,
+    pub messages: Vec<ThreadMessageView>,
+    pub message_deliveries: Vec<MessageDeliveryView>,
+    pub turns: Vec<ThreadTurnView>,
+    pub agent_runs: Vec<AgentRunView>,
+    pub execution_evidence: Vec<AgentRunExecutionEvidenceView>,
+    pub agent_run_file_changes: Vec<AgentRunFileChangesView>,
+    pub agent_run_images: Vec<AgentRunImagesView>,
+    pub approvals: Vec<ApprovalView>,
+    pub coverage: ThreadOpenCoverage,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessagePage {
+    pub schema_version: i64,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub through_global_sequence: i64,
+    pub requested_before_sequence: i64,
+    pub next_before_sequence: Option<i64>,
+    pub has_more: bool,
+    pub messages: Vec<ThreadMessageView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessageAroundSnapshot {
+    pub schema_version: i64,
+    pub through_global_sequence: i64,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub anchor_message_id: String,
+    pub source_available: bool,
+    pub messages: Vec<ThreadMessageView>,
+    pub next_message_sequence: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessageFindMatch {
+    pub message_id: String,
+    pub message_sequence: i64,
+    pub occurrence_index: i64,
+    pub start_offset: i64,
+    pub end_offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessageFindSnapshot {
+    pub schema_version: i64,
+    pub through_global_sequence: i64,
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub query: String,
+    pub total_match_count: i64,
+    pub selected_match_index: Option<i64>,
+    pub r#match: Option<ThreadMessageFindMatch>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageDeliveryView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_delivery_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_request: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub input_message_ids: Vec<String>,
+    pub id: String,
+    pub message_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
+    pub camp_turn_id: Option<String>,
+    pub task_id: Option<String>,
+    pub recipient_agent_id: String,
+    pub recipient_membership_version_at_admission: Option<i64>,
+    pub status: String,
+    pub dispatch_phase: String,
+    pub wait_condition: Option<String>,
+    pub dispatch_attempt_count: i64,
+    pub retry_generation: i64,
+    pub context_manifest_id: Option<String>,
+    pub target_agent_run_id: Option<String>,
+    pub manual_intervention_required: bool,
+    pub failure_code: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub ended_at: Option<String>,
+    #[serde(flatten)]
+    pub kind: MessageDeliveryKindView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "deliveryKind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum MessageDeliveryKindView {
+    PublicA2a {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_agent_run_id: Option<String>,
+        dispatch_disposition: String,
+        completion_role: Option<String>,
+        gather_id: Option<String>,
+        gather_dispatch_delivery_id: Option<String>,
+        recipient_canonical_position: i64,
+        edge_kind: String,
+        target_parent_agent_run_id: Option<String>,
+        return_to_agent_run_id: Option<String>,
+    },
+    GatherCompletion {
+        dispatch_disposition: String,
+        completion_role: String,
+        gather_id: String,
+        target_conversation_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventBatch {
+    pub schema_version: i64,
+    pub requested_after_global_sequence: i64,
+    pub next_global_sequence: i64,
+    pub through_global_sequence: i64,
+    pub reset_required: bool,
+    pub has_more: bool,
+    pub events: Vec<DomainEventView>,
+}
+
+#[derive(Debug, Default)]
+pub struct ReadModelService;
+
+impl ReadModelService {
+    pub fn camp_exists(&self, database: &Database, camp_id: &str) -> Result<bool> {
+        database
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM camp WHERE id = ?1 AND deletion_operation_id IS NULL)",
+                [camp_id],
+                |row| row.get(0),
+            )
+            .context("failed to check Thread existence")
+    }
+
+    pub fn camp_is_pending(&self, database: &Database, camp_id: &str) -> Result<bool> {
+        database
+            .connection()
+            .query_row(
+                "SELECT activation_state = 'pending' FROM camp WHERE id = ?1 AND deletion_operation_id IS NULL",
+                [camp_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|pending| pending.unwrap_or(false))
+            .context("failed to check Thread activation state")
+    }
+
+    pub fn list_camps(&self, database: &Database) -> Result<Vec<ThreadListItem>> {
+        let tasks_enabled = crate::task_capability::enabled(database.connection())?;
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT camp.id, camp.title, camp.project_path,
+                   camp.default_lead_agent_id,
+                   (SELECT COUNT(*) FROM camp_member
+                    JOIN agent_profile ON agent_profile.id = camp_member.agent_id
+                    WHERE camp_member.camp_id = camp.id
+                      AND camp_member.status = 'active'
+                      AND camp_member.leave_requested_at IS NULL
+                      AND agent_profile.profile_status = 'present'),
+                   CASE WHEN ?1 THEN (SELECT COUNT(*) FROM task
+                    WHERE task.camp_id = camp.id
+                      AND task.status NOT IN ('completed', 'cancelled')) ELSE NULL END,
+                   camp.updated_at
+            FROM camp
+            WHERE camp.activation_state = 'active'
+              AND camp.deletion_operation_id IS NULL
+            ORDER BY camp.updated_at DESC, camp.id
+            "#,
+        )?;
+        statement
+            .query_map([tasks_enabled], |row| {
+                Ok(ThreadListItem {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    project_path: row.get(2)?,
+                    default_lead_agent_id: row.get(3)?,
+                    active_member_count: row.get(4)?,
+                    tasks_enabled,
+                    open_task_count: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list Thread read models")
+    }
+
+    pub fn navigation_snapshot(&self, database: &mut Database) -> Result<NavigationSnapshot> {
+        self.navigation_snapshot_with_group_limits(
+            database,
+            &BTreeMap::new(),
+            &crate::draft_client::DraftClient::default(),
+        )
+    }
+
+    pub fn navigation_snapshot_with_group_limits(
+        &self,
+        database: &mut Database,
+        group_limits: &BTreeMap<String, usize>,
+        client: &crate::draft_client::DraftClient,
+    ) -> Result<NavigationSnapshot> {
+        self.navigation_snapshot_for_groups(database, group_limits, None, client)
+    }
+
+    pub fn navigation_snapshot_for_groups(
+        &self,
+        database: &mut Database,
+        group_limits: &BTreeMap<String, usize>,
+        group_keys: Option<&[String]>,
+        client: &crate::draft_client::DraftClient,
+    ) -> Result<NavigationSnapshot> {
+        let transaction = database.connection_mut().transaction()?;
+        let through_global_sequence = current_global_sequence(&transaction)?;
+        let (quick_chat, projects) =
+            load_navigation_groups(&transaction, client, group_limits, group_keys)?;
+        transaction.commit()?;
+        Ok(NavigationSnapshot {
+            schema_version: NAVIGATION_SCHEMA_VERSION,
+            through_global_sequence,
+            quick_chat,
+            projects,
+        })
+    }
+
+    pub fn navigation_group_camps(
+        &self,
+        database: &mut Database,
+        project_path: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<NavigationThreadPage> {
+        self.navigation_group_camps_for_client(
+            database,
+            project_path,
+            offset,
+            limit,
+            &crate::draft_client::DraftClient::default(),
+        )
+    }
+
+    pub fn navigation_group_camps_for_client(
+        &self,
+        database: &mut Database,
+        project_path: Option<&str>,
+        offset: usize,
+        limit: usize,
+        client: &crate::draft_client::DraftClient,
+    ) -> Result<NavigationThreadPage> {
+        let limit = limit.clamp(1, 200);
+        let transaction = database.connection_mut().transaction()?;
+        let through_global_sequence = current_global_sequence(&transaction)?;
+        let key = project_path
+            .map(|path| format!("directory:{path}"))
+            .unwrap_or_else(|| "quick-chat".into());
+        let total_count = navigation_group_count(&transaction, client, &key)?;
+        let start = offset.min(total_count);
+        let end = start.saturating_add(limit).min(total_count);
+        let next_offset = (end < total_count).then_some(end);
+        let camps = load_navigation_group(&transaction, client, &key, start, limit)?;
+        transaction.commit()?;
+        Ok(NavigationThreadPage {
+            schema_version: NAVIGATION_SCHEMA_VERSION,
+            through_global_sequence,
+            project_path: project_path.map(str::to_string),
+            total_count,
+            next_offset,
+            camps,
+        })
+    }
+
+    pub fn navigation_camps(
+        &self,
+        database: &mut Database,
+        camp_ids: &[String],
+        client: &crate::draft_client::DraftClient,
+    ) -> Result<NavigationThreadRows> {
+        let tx = database.connection_mut().transaction()?;
+        let result = NavigationThreadRows {
+            group_keys: navigation_camp_group_keys(&tx, camp_ids)?,
+            through_global_sequence: current_global_sequence(&tx)?,
+            camps: load_navigation_rows(&tx, client, camp_ids)?,
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn find_navigation_camp(
+        &self,
+        database: &Database,
+        camp_id: &ThreadId,
+    ) -> Result<Option<NavigationThreadTarget>> {
+        database
+            .connection()
+            .query_row(FIND_NAVIGATION_CAMP_SQL, [camp_id], |row| {
+                Ok(NavigationThreadTarget {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    channel_source: camp_channel_source_from_row(row, 5)?,
+                    activation_state: row.get(2)?,
+                    project_binding_kind: row.get(3)?,
+                    project_path: row.get(4)?,
+                })
+            })
+            .optional()
+            .context("failed to find navigation Thread by ID")
+    }
+
+    pub fn acknowledge_camp_viewed(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+        through_global_sequence: i64,
+    ) -> Result<ThreadViewedAcknowledgement> {
+        self.acknowledge_camp_viewed_for_client(
+            database,
+            camp_id,
+            through_global_sequence,
+            &crate::draft_client::DraftClient::default(),
+        )
+    }
+
+    pub fn acknowledge_camp_viewed_for_client(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+        through_global_sequence: i64,
+        client: &crate::draft_client::DraftClient,
+    ) -> Result<ThreadViewedAcknowledgement> {
+        if through_global_sequence < 0 {
+            anyhow::bail!("Viewed sequence must not be negative");
+        }
+        let transaction = database.connection_mut().transaction()?;
+        let current = current_global_sequence(&transaction)?;
+        if through_global_sequence > current {
+            anyhow::bail!("Viewed sequence is ahead of the current event sequence");
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM camp WHERE id = ?1)",
+            [camp_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("Thread does not exist");
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = transaction.execute(
+            r#"
+            INSERT INTO camp_view_state(camp_id, last_seen_global_sequence, updated_at)
+            SELECT ?1, ?2, ?3
+            WHERE ?2 > COALESCE((SELECT last_seen_global_sequence FROM camp_view_state WHERE camp_id=?1), 0)
+            ON CONFLICT(camp_id) DO UPDATE SET
+                last_seen_global_sequence = MAX(
+                    camp_view_state.last_seen_global_sequence,
+                    excluded.last_seen_global_sequence
+                ),
+                updated_at = CASE
+                    WHEN excluded.last_seen_global_sequence
+                       > camp_view_state.last_seen_global_sequence
+                    THEN excluded.updated_at
+                    ELSE camp_view_state.updated_at
+                END
+            WHERE excluded.last_seen_global_sequence > camp_view_state.last_seen_global_sequence
+            "#,
+            params![camp_id, through_global_sequence, now],
+        )?;
+        let last_seen_global_sequence = transaction.query_row(
+            "SELECT COALESCE((SELECT last_seen_global_sequence FROM camp_view_state WHERE camp_id = ?1), 0)",
+            [camp_id],
+            |row| row.get(0),
+        )?;
+        let navigation = NavigationThreadRows {
+            group_keys: navigation_camp_group_keys(&transaction, &[camp_id.to_string()])?,
+            through_global_sequence: current,
+            camps: load_navigation_rows(&transaction, client, &[camp_id.to_string()])?,
+        };
+        transaction.commit()?;
+        Ok(ThreadViewedAcknowledgement {
+            camp_id: camp_id.to_string(),
+            last_seen_global_sequence,
+            changed: changed > 0,
+            navigation,
+        })
+    }
+
+    pub fn camp_snapshot(&self, database: &mut Database, camp_id: &str) -> Result<ThreadSnapshot> {
+        let transaction = database.connection_mut().transaction()?;
+        let through_global_sequence = current_global_sequence(&transaction)?;
+        let camp = load_camp(&transaction, camp_id)?.context("Thread does not exist")?;
+        let members = load_members(&transaction, camp_id, camp.default_lead_agent_id.as_deref())?;
+        let membership_reconciliations = load_membership_reconciliations(&transaction, camp_id)?;
+        let tasks_enabled = crate::task_capability::enabled(&transaction)?;
+        let tasks = tasks_enabled
+            .then(|| load_tasks(&transaction, camp_id, None))
+            .transpose()?;
+        let member_creations = crate::member_studio::list_member_creations(&transaction, camp_id)?;
+        let messages = load_messages(&transaction, camp_id, 1_000)?;
+        let message_deliveries = load_message_deliveries(&transaction, camp_id, None)?;
+        let turns = load_turns(&transaction, camp_id, None)?;
+        let agent_runs = load_agent_runs(&transaction, camp_id, None)?;
+        let mut execution_evidence = load_execution_evidence(
+            &transaction,
+            camp_id,
+            Some(EXECUTION_EVIDENCE_SNAPSHOT_LIMIT),
+            false,
+        )?;
+        let agent_run_file_changes = list_completed_run_file_changes(&transaction, camp_id)?;
+        let agent_run_images = list_camp_images(&transaction, camp_id)?;
+        let context_manifests = load_context_manifests(&transaction, camp_id)?;
+        let approvals = load_approvals(&transaction, camp_id, false, None)?;
+        let actions = load_actions(&transaction, camp_id)?;
+        let timeline = load_events(
+            &transaction,
+            Some(camp_id),
+            0,
+            through_global_sequence,
+            500,
+            true,
+            false,
+        )?;
+        transaction.commit()?;
+        crate::execution_text::overlay(database, &mut execution_evidence)?;
+        Ok(ThreadSnapshot {
+            schema_version: READ_MODEL_SCHEMA_VERSION,
+            through_global_sequence,
+            camp,
+            members,
+            membership_reconciliations,
+            tasks_enabled,
+            tasks,
+            member_creations,
+            messages,
+            message_deliveries,
+            turns,
+            agent_runs,
+            execution_evidence,
+            agent_run_file_changes,
+            agent_run_images,
+            context_manifests,
+            approvals,
+            actions,
+            timeline,
+        })
+    }
+
+    pub fn camp_open_projection(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+    ) -> Result<ThreadOpenProjection> {
+        let transaction = database.connection_mut().transaction()?;
+        let through_global_sequence = current_global_sequence(&transaction)?;
+        let camp = load_camp(&transaction, camp_id)?.context("Thread does not exist")?;
+        let members = load_members(&transaction, camp_id, camp.default_lead_agent_id.as_deref())?;
+        let membership_reconciliations = load_membership_reconciliations(&transaction, camp_id)?;
+        let tasks_enabled = crate::task_capability::enabled(&transaction)?;
+        let counts = load_camp_open_counts(&transaction, camp_id, tasks_enabled)?;
+        let tasks = tasks_enabled
+            .then(|| load_tasks(&transaction, camp_id, Some(CAMP_OPEN_TASK_LIMIT)))
+            .transpose()?;
+        let member_creations = crate::member_studio::list_member_creations(&transaction, camp_id)?;
+        let messages = load_open_messages(&transaction, camp_id, CAMP_OPEN_MESSAGE_LIMIT)?;
+        let message_deliveries =
+            load_message_deliveries(&transaction, camp_id, Some(CAMP_OPEN_DELIVERY_LIMIT))?;
+        let turns = load_turns(&transaction, camp_id, Some(CAMP_OPEN_TURN_LIMIT))?;
+        let agent_runs = load_agent_runs(&transaction, camp_id, Some(CAMP_OPEN_AGENT_RUN_LIMIT))?;
+        // Execution content is requested only by an opened, visible Run surface.
+        let execution_evidence = Vec::new();
+        let agent_run_file_changes = list_completed_run_file_changes(&transaction, camp_id)?;
+        let agent_run_images = list_camp_images(&transaction, camp_id)?;
+        let approvals =
+            load_approvals(&transaction, camp_id, true, Some(CAMP_OPEN_APPROVAL_LIMIT))?;
+        let coverage = ThreadOpenCoverage {
+            tasks: tasks
+                .as_ref()
+                .map(|tasks| collection_coverage(tasks.len(), counts.tasks)),
+            messages: message_coverage(&messages, counts.messages),
+            message_deliveries: collection_coverage(
+                message_deliveries.len(),
+                counts.message_deliveries,
+            ),
+            turns: collection_coverage(turns.len(), counts.turns),
+            agent_runs: collection_coverage(agent_runs.len(), counts.agent_runs),
+            approvals: collection_coverage(approvals.len(), counts.pending_approvals),
+        };
+        transaction.commit()?;
+        Ok(ThreadOpenProjection {
+            schema_version: CAMP_OPEN_SCHEMA_VERSION,
+            through_global_sequence,
+            camp,
+            members,
+            membership_reconciliations,
+            tasks_enabled,
+            tasks,
+            member_creations,
+            messages,
+            message_deliveries,
+            turns,
+            agent_runs,
+            execution_evidence,
+            agent_run_file_changes,
+            agent_run_images,
+            approvals,
+            coverage,
+        })
+    }
+
+    pub fn camp_messages_page(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+        before_sequence: i64,
+        through_global_sequence: i64,
+        limit: i64,
+    ) -> Result<ThreadMessagePage> {
+        if before_sequence <= 0 {
+            anyhow::bail!("Thread Message cursor must be positive");
+        }
+        if through_global_sequence < 0 {
+            anyhow::bail!("Thread Message high-water must not be negative");
+        }
+        let limit = limit.clamp(1, 100);
+        let transaction = database.connection_mut().transaction()?;
+        let current_sequence = current_global_sequence(&transaction)?;
+        if through_global_sequence > current_sequence {
+            anyhow::bail!("Thread Message high-water is ahead of the current event sequence");
+        }
+        load_camp(&transaction, camp_id)?.context("Thread does not exist")?;
+        let mut messages = load_messages_before(&transaction, camp_id, before_sequence, limit + 1)?;
+        let has_more = messages.len() > limit as usize;
+        if has_more {
+            messages.remove(0);
+        }
+        let next_before_sequence = has_more
+            .then(|| messages.first().map(|message| message.sequence))
+            .flatten();
+        transaction.commit()?;
+        Ok(ThreadMessagePage {
+            schema_version: CAMP_MESSAGE_PAGE_SCHEMA_VERSION,
+            camp_id: camp_id.to_string(),
+            through_global_sequence,
+            requested_before_sequence: before_sequence,
+            next_before_sequence,
+            has_more,
+            messages,
+        })
+    }
+
+    pub fn camp_messages_around(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+        message_id: &str,
+    ) -> Result<ThreadMessageAroundSnapshot> {
+        let transaction = database.connection_mut().transaction()?;
+        let through_global_sequence = current_global_sequence(&transaction)?;
+        let anchor_sequence = transaction
+            .query_row(
+                r#"
+                SELECT sequence
+                FROM camp_message
+                WHERE id = ?2
+                  AND camp_id = ?1
+                  AND tombstoned_at IS NULL
+                "#,
+                params![camp_id, message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let messages = match anchor_sequence {
+            Some(sequence) => load_messages_around(
+                &transaction,
+                camp_id,
+                message_id,
+                sequence,
+                CAMP_MESSAGE_AROUND_RADIUS,
+            )?,
+            None => Vec::new(),
+        };
+        // A real next-row boundary distinguishes adjacent windows from an unloaded gap;
+        // sequence numbers themselves need not be contiguous.
+        let next_message_sequence = match messages.last() {
+            Some(last) => transaction.query_row(
+                "SELECT MIN(sequence) FROM camp_message
+                WHERE camp_id = ?1 AND tombstoned_at IS NULL AND sequence > ?2",
+                params![camp_id, last.sequence],
+                |row| row.get(0),
+            )?,
+            None => None,
+        };
+        transaction.commit()?;
+        Ok(ThreadMessageAroundSnapshot {
+            schema_version: CAMP_MESSAGE_AROUND_SCHEMA_VERSION,
+            through_global_sequence,
+            camp_id: camp_id.to_string(),
+            anchor_message_id: message_id.to_string(),
+            source_available: anchor_sequence.is_some(),
+            messages,
+            next_message_sequence,
+        })
+    }
+
+    pub fn camp_messages_find(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+        query: &str,
+        selected_match_index: Option<i64>,
+        anchor_message_id: Option<&str>,
+    ) -> Result<ThreadMessageFindSnapshot> {
+        validate_camp_message_find_query(query)?;
+
+        let transaction = database.connection_mut().transaction()?;
+        let through_global_sequence = current_global_sequence(&transaction)?;
+        load_camp(&transaction, camp_id)?.context("Thread does not exist")?;
+        let anchor_sequence = match anchor_message_id {
+            Some(message_id) => transaction
+                .query_row(
+                    r#"
+                    SELECT sequence
+                    FROM camp_message
+                    WHERE camp_id = ?1
+                      AND id = ?2
+                      AND tombstoned_at IS NULL
+                    "#,
+                    params![camp_id, message_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        let mut statement = transaction.prepare(
+            r#"
+            SELECT id, sequence, structured_content_json
+            FROM camp_message
+            WHERE camp_id = ?1
+              AND tombstoned_at IS NULL
+              AND author_type IN ('user', 'agent', 'external_principal')
+            ORDER BY sequence ASC, id ASC
+            "#,
+        )?;
+        let rows = statement
+            .query_map([camp_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let mut candidates = Vec::<ThreadMessageFindCandidate>::new();
+        for (message_id, message_sequence, structured_content_json) in rows {
+            let content =
+                serde_json::from_str::<StructuredThreadMessageContent>(&structured_content_json)
+                    .map(normalize_content)
+                    .context("ThreadMessage Structured Content is invalid")?;
+            let body = render_structured_message_content(&transaction, &content)?;
+            candidates.push(ThreadMessageFindCandidate {
+                message_id,
+                message_sequence,
+                body,
+            });
+        }
+
+        let matches = flatten_camp_message_find_matches(candidates, query);
+        let total_match_count = matches.len() as i64;
+        let (normalized_selected_index, selected_match) =
+            select_camp_message_find_match(&matches, selected_match_index, anchor_sequence);
+        transaction.commit()?;
+
+        Ok(ThreadMessageFindSnapshot {
+            schema_version: CAMP_MESSAGE_FIND_SCHEMA_VERSION,
+            through_global_sequence,
+            camp_id: camp_id.to_string(),
+            query: query.to_string(),
+            total_match_count,
+            selected_match_index: normalized_selected_index,
+            r#match: selected_match,
+        })
+    }
+
+    pub fn agent_run_execution_evidence_page(
+        &self,
+        database: &mut Database,
+        camp_id: &str,
+        agent_run_id: &str,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<AgentRunExecutionEvidencePage> {
+        if after_sequence < 0 {
+            anyhow::bail!("Execution Evidence sequence must not be negative");
+        }
+        let limit = limit.clamp(1, 1_000);
+        let transaction = database.connection_mut().transaction()?;
+        let belongs_to_camp: bool = transaction.query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM agent_run
+                LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                WHERE agent_run.id = ?1
+                  AND COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?2
+            )
+            "#,
+            params![agent_run_id, camp_id],
+            |row| row.get(0),
+        )?;
+        if !belongs_to_camp {
+            anyhow::bail!("AgentRun does not exist in this Thread");
+        }
+        let through_sequence: i64 = transaction.query_row(
+            r#"
+            SELECT COALESCE(MAX(sequence), 0)
+            FROM agent_run_execution_evidence
+            WHERE agent_run_id = ?1
+            "#,
+            [agent_run_id],
+            |row| row.get(0),
+        )?;
+        if after_sequence > through_sequence {
+            anyhow::bail!("Execution Evidence sequence is ahead of this AgentRun");
+        }
+        let mut evidence = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT id, agent_run_id, execution_epoch, sequence,
+                       event_type, kind, phase, rovai_execution_preview(storage_version, payload_preview_json, input_preview_json, result_preview_json, result_digest),
+                       content_blob_id, content_byte_count,
+                       is_truncated, occurred_at,
+                       operation_id, revision, change_sequence, output_truncated
+                FROM agent_run_execution_evidence
+                WHERE agent_run_id = ?1 AND sequence > ?2
+                ORDER BY sequence
+                LIMIT ?3
+                "#,
+            )?;
+            statement
+                .query_map(
+                    params![agent_run_id, after_sequence, limit + 1],
+                    execution_evidence_row,
+                )?
+                .map(|row| execution_evidence_view(row?))
+                .collect::<Result<Vec<_>>>()?
+        };
+        attach_canonical_activity(&transaction, &mut evidence)?;
+        let has_more = evidence.len() > limit as usize;
+        if has_more {
+            evidence.truncate(limit as usize);
+        }
+        let next_after_sequence = evidence
+            .last()
+            .map_or(through_sequence, |item| item.sequence);
+        transaction.commit()?;
+        crate::execution_text::overlay(database, &mut evidence)?;
+        Ok(AgentRunExecutionEvidencePage {
+            schema_version: EXECUTION_EVIDENCE_PAGE_SCHEMA_VERSION,
+            agent_run_id: agent_run_id.to_string(),
+            requested_after_sequence: after_sequence,
+            next_after_sequence,
+            through_sequence,
+            has_more,
+            evidence,
+        })
+    }
+
+    pub fn agent_run_diagnostic(
+        &self,
+        database: &mut Database,
+        agent_run_id: &str,
+    ) -> Result<AgentRunDiagnosticView> {
+        let transaction = database.connection_mut().transaction()?;
+        let observed_through_global_sequence = current_global_sequence(&transaction)?;
+        let row = transaction
+            .query_row(
+                r#"
+                SELECT agent_run.id, agent_run.execution_epoch,
+                       COALESCE(agent_run.camp_id, camp_turn.camp_id),
+                       agent_run.camp_turn_id,
+                       agent_run.conversation_id, conversation.agent_id,
+                       agent_run.status, agent_run.wait_reason,
+                       agent_run.public_runtime_failure_json,
+                       agent_run.version, agent_run.created_at,
+                       agent_run.started_at, agent_run.ended_at,
+                       agent_run.runtime_adapter_kind,
+                       agent_run.runtime_installation_id,
+                       agent_run.effective_config_json,
+                       agent_run.runtime_binding_compatibility_digest,
+                       agent_run.permission_semantics,
+                       agent_run.runtime_observed_model_id,
+                       agent_run.starting_git_observation_json,
+                       agent_run.ending_git_observation_json,
+                       agent_run.final_camp_message_id,
+                       (SELECT body FROM camp_message
+                        WHERE camp_message.id = agent_run.final_camp_message_id
+                          AND camp_message.camp_id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+                          AND camp_message.tombstoned_at IS NULL),
+                       (SELECT json_extract(event_log.payload_json, '$.finalOutputDigest')
+                        FROM event_log
+                        WHERE event_log.event_type = 'agent_run.succeeded'
+                          AND event_log.entity_type = 'agent_run'
+                          AND event_log.entity_id = agent_run.id
+                        ORDER BY event_log.global_sequence DESC
+                        LIMIT 1),
+                       (SELECT COUNT(*) FROM agent_run_execution_evidence
+                        WHERE agent_run_execution_evidence.agent_run_id = agent_run.id),
+                       (SELECT MIN(sequence) FROM agent_run_execution_evidence
+                        WHERE agent_run_execution_evidence.agent_run_id = agent_run.id),
+                       (SELECT MAX(sequence) FROM agent_run_execution_evidence
+                        WHERE agent_run_execution_evidence.agent_run_id = agent_run.id)
+                FROM agent_run
+                LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                JOIN conversation ON conversation.id = agent_run.conversation_id
+                WHERE agent_run.id = ?1
+                "#,
+                [agent_run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, Option<String>>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, Option<String>>(18)?,
+                        row.get::<_, Option<String>>(19)?,
+                        row.get::<_, Option<String>>(20)?,
+                        row.get::<_, Option<String>>(21)?,
+                        row.get::<_, Option<String>>(22)?,
+                        row.get::<_, Option<String>>(23)?,
+                        row.get::<_, i64>(24)?,
+                        row.get::<_, Option<i64>>(25)?,
+                        row.get::<_, Option<i64>>(26)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("AgentRun does not exist")?;
+        let effective_config: Value = serde_json::from_str(&row.15)
+            .context("AgentRun effective Runtime configuration is invalid")?;
+        let adapter_kind = row
+            .13
+            .clone()
+            .or_else(|| {
+                effective_config
+                    .get("adapterKind")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .context("AgentRun has no frozen Runtime adapter")?;
+        let failure = row
+            .8
+            .as_deref()
+            .map(serde_json::from_str::<RuntimeFailureView>)
+            .transpose()
+            .context("AgentRun public Runtime failure is invalid")?;
+        let starting = row
+            .19
+            .as_deref()
+            .map(serde_json::from_str::<GitObservation>)
+            .transpose()
+            .context("AgentRun starting Git observation is invalid")?
+            .map(AgentRunDiagnosticGitObservationView::from);
+        let ending = row
+            .20
+            .as_deref()
+            .map(serde_json::from_str::<GitObservation>)
+            .transpose()
+            .context("AgentRun ending Git observation is invalid")?
+            .map(AgentRunDiagnosticGitObservationView::from);
+        let context_manifest = transaction
+            .query_row(
+                r#"
+                SELECT manifest.id, manifest.rendered_payload_digest,
+                       bootstrap.delivery_mode,
+                       manifest.camp_message_boundary_sequence,
+                       manifest.skill_exposure_digest,
+                       manifest.mcp_exposure_digest,
+                       manifest.mcp_projection_digest,
+                       manifest.attachment_digest
+                FROM context_manifest AS manifest
+                JOIN native_session_bootstrap_evidence AS bootstrap
+                  ON bootstrap.id = manifest.bootstrap_evidence_id
+                WHERE manifest.agent_run_id = ?1
+                ORDER BY manifest.created_at DESC, manifest.id DESC
+                LIMIT 1
+                "#,
+                [agent_run_id],
+                |manifest| {
+                    Ok(AgentRunDiagnosticContextManifestView {
+                        manifest_id: Some(manifest.get(0)?),
+                        rendered_payload_digest: manifest.get(1)?,
+                        charter_delivery_mode: Some(manifest.get(2)?),
+                        camp_message_boundary_sequence: Some(manifest.get(3)?),
+                        skill_exposure_digest: manifest.get(4)?,
+                        mcp_exposure_digest: manifest.get(5)?,
+                        mcp_projection_digest: manifest.get(6)?,
+                        attachment_digest: manifest.get(7)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or(AgentRunDiagnosticContextManifestView {
+                manifest_id: None,
+                rendered_payload_digest: None,
+                charter_delivery_mode: None,
+                camp_message_boundary_sequence: None,
+                skill_exposure_digest: None,
+                mcp_exposure_digest: None,
+                mcp_projection_digest: None,
+                attachment_digest: None,
+            });
+        let unavailable_reason = if row.6 != "succeeded" {
+            Some("run_not_succeeded".to_string())
+        } else if row.21.is_none() {
+            Some("not_published".to_string())
+        } else if row.22.is_none() {
+            Some("published_message_unavailable".to_string())
+        } else {
+            None
+        };
+        let view = AgentRunDiagnosticView {
+            schema_version: AGENT_RUN_DIAGNOSTIC_SCHEMA_VERSION,
+            agent_run_id: row.0,
+            execution_epoch: row.1,
+            camp_id: row.2,
+            camp_turn_id: row.3,
+            conversation_id: row.4,
+            agent_id: row.5,
+            status: row.6,
+            wait_reason: row.7,
+            failure,
+            version: row.9,
+            created_at: row.10,
+            started_at: row.11,
+            ended_at: row.12,
+            runtime: AgentRunDiagnosticRuntimeView {
+                adapter_kind,
+                runtime_installation_id: row.14,
+                effective_config_digest: canonical_json_digest(&effective_config)?,
+                binding_compatibility_digest: row.16,
+                permission_semantics: row.17,
+                observed_model_id: row.18,
+            },
+            output: AgentRunDiagnosticOutputView {
+                final_output_digest: row.23,
+                final_camp_message_id: row.21,
+                public_output: row.22,
+                unavailable_reason,
+            },
+            git: AgentRunDiagnosticGitView { starting, ending },
+            context_manifest,
+            evidence: AgentRunDiagnosticEvidenceView {
+                count: row.24,
+                first_evidence_sequence: row.25,
+                last_evidence_sequence: row.26,
+            },
+            observed_through_global_sequence,
+        };
+        transaction.commit()?;
+        Ok(view)
+    }
+
+    pub fn events_since(
+        &self,
+        database: &mut Database,
+        camp_id: Option<&str>,
+        after_global_sequence: i64,
+        limit: i64,
+    ) -> Result<EventBatch> {
+        if after_global_sequence < 0 {
+            anyhow::bail!("Event sequence marker must not be negative");
+        }
+        let limit = limit.clamp(1, 2_000);
+        let transaction = database.connection_mut().transaction()?;
+        let through_global_sequence = current_global_sequence(&transaction)?;
+        let oldest = transaction
+            .query_row(
+                "SELECT MIN(global_sequence) FROM event_log WHERE global_sequence IS NOT NULL",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .unwrap_or(through_global_sequence + 1);
+        let reset_required = after_global_sequence > through_global_sequence
+            || (after_global_sequence > 0 && after_global_sequence < oldest - 1);
+        let events = if reset_required {
+            Vec::new()
+        } else {
+            load_events(
+                &transaction,
+                camp_id,
+                after_global_sequence,
+                through_global_sequence,
+                limit + 1,
+                false,
+                false,
+            )?
+        };
+        let has_more = events.len() > limit as usize;
+        let mut events = events;
+        if has_more {
+            events.truncate(limit as usize);
+        }
+        let next_global_sequence = if has_more {
+            events
+                .last()
+                .map_or(after_global_sequence, |event| event.global_sequence)
+        } else {
+            through_global_sequence
+        };
+        transaction.commit()?;
+        Ok(EventBatch {
+            schema_version: EVENT_BATCH_SCHEMA_VERSION,
+            requested_after_global_sequence: after_global_sequence,
+            next_global_sequence,
+            through_global_sequence,
+            reset_required,
+            has_more,
+            events,
+        })
+    }
+}
+
+fn project_display_name(project_path: &str) -> String {
+    Path::new(project_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Untitled Project")
+        .to_string()
+}
+
+fn current_global_sequence(transaction: &Transaction<'_>) -> Result<i64> {
+    transaction
+        .query_row(
+            "SELECT last_sequence FROM event_sequence WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to capture global event sequence")
+}
+
+struct ThreadOpenCounts {
+    tasks: i64,
+    messages: i64,
+    message_deliveries: i64,
+    turns: i64,
+    agent_runs: i64,
+    pending_approvals: i64,
+}
+
+fn load_camp_open_counts(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    tasks_enabled: bool,
+) -> Result<ThreadOpenCounts> {
+    transaction
+        .query_row(
+            r#"
+            SELECT
+              CASE WHEN ?2 THEN (SELECT COUNT(*) FROM task WHERE camp_id = ?1) ELSE 0 END,
+              (SELECT COUNT(*) FROM camp_message
+               WHERE camp_id = ?1 AND tombstoned_at IS NULL),
+              (SELECT COUNT(*)
+               FROM camp_message_delivery AS current_delivery
+               LEFT JOIN camp_message AS message
+                 ON message.id = current_delivery.message_id
+               WHERE current_delivery.camp_id = ?1
+                 AND ((current_delivery.source_kind = 'message' AND message.tombstoned_at IS NULL)
+                   OR current_delivery.source_kind = 'continuation'))
+              +
+              (SELECT COUNT(*)
+               FROM message_delivery AS legacy_delivery
+               WHERE legacy_delivery.camp_id = ?1
+                 AND legacy_delivery.delivery_kind IN ('public_a2a', 'gather_completion')
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM camp_message_delivery AS current_delivery
+                   WHERE current_delivery.id = legacy_delivery.id
+                 )),
+              (SELECT COUNT(*) FROM camp_turn WHERE camp_id = ?1 AND kind = 'camp'),
+              (SELECT COUNT(*)
+               FROM agent_run
+               LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+               WHERE COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?1
+                 AND agent_run.invocation_kind <> 'single_chat'),
+              (SELECT COUNT(*)
+               FROM approval
+               JOIN action_execution ON action_execution.id = approval.action_id
+               JOIN agent_run ON agent_run.id = action_execution.agent_run_id
+               LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+               JOIN conversation ON conversation.id = agent_run.conversation_id
+               WHERE COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?1
+                 AND approval.status = 'pending'
+                 AND conversation.kind <> 'single_chat')
+            "#,
+            params![camp_id, tasks_enabled],
+            |row| {
+                Ok(ThreadOpenCounts {
+                    tasks: row.get(0)?,
+                    messages: row.get(1)?,
+                    message_deliveries: row.get(2)?,
+                    turns: row.get(3)?,
+                    agent_runs: row.get(4)?,
+                    pending_approvals: row.get(5)?,
+                })
+            },
+        )
+        .context("failed to count Thread open projection coverage")
+}
+
+fn collection_coverage(loaded_count: usize, total_count: i64) -> ThreadOpenCollectionCoverage {
+    let loaded_count = i64::try_from(loaded_count).unwrap_or(i64::MAX);
+    let omitted_count = total_count.saturating_sub(loaded_count);
+    ThreadOpenCollectionCoverage {
+        loaded_count,
+        total_count,
+        omitted_count,
+        complete: omitted_count == 0,
+    }
+}
+
+fn message_coverage(messages: &[ThreadMessageView], total_count: i64) -> ThreadOpenMessageCoverage {
+    let base = collection_coverage(messages.len(), total_count);
+    ThreadOpenMessageCoverage {
+        loaded_count: base.loaded_count,
+        total_count: base.total_count,
+        omitted_count: base.omitted_count,
+        complete: base.complete,
+        oldest_loaded_sequence: messages.first().map(|message| message.sequence),
+        newest_loaded_sequence: messages.last().map(|message| message.sequence),
+        has_earlier: base.omitted_count > 0,
+    }
+}
+
+fn load_camp(transaction: &Transaction<'_>, camp_id: &str) -> Result<Option<ThreadView>> {
+    transaction
+        .query_row(
+            r#"
+            SELECT camp.id, camp.title, camp.activation_state, camp.project_binding_kind, camp.project_path,
+                   camp.default_lead_agent_id, camp.membership_generation,
+                   camp.version, camp.created_at, camp.updated_at,
+                   channel_conversation.provider, channel_conversation.conversation_kind,
+                   (SELECT id FROM mission WHERE mission.camp_id=camp.id)
+            FROM camp
+            LEFT JOIN channel_conversation_binding AS channel_binding ON channel_binding.camp_id = camp.id
+            LEFT JOIN channel_conversation ON channel_conversation.id = channel_binding.channel_conversation_id
+            WHERE camp.id = ?1
+              AND camp.deletion_operation_id IS NULL
+            "#,
+            [camp_id],
+            |row| {
+                Ok(ThreadView {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    channel_source: camp_channel_source_from_row(row, 10)?,
+                    mission_id: row.get(12)?,
+                    activation_state: row.get(2)?,
+                    project_binding_kind: row.get(3)?,
+                    project_path: row.get(4)?,
+                    default_lead_agent_id: row.get(5)?,
+                    membership_generation: row.get(6)?,
+                    version: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to load Thread read model")
+}
+
+fn load_members(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    default_lead: Option<&str>,
+) -> Result<Vec<ThreadMemberView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT camp_member.agent_id, agent_profile.display_name,
+               agent_profile.avatar_ref, agent_profile.team_role,
+               agent_profile.accent, camp_member.status,
+               camp_member.leave_requested_at, agent_profile.profile_status,
+               agent_profile.member_order, camp_member.version
+        FROM camp_member
+        JOIN agent_profile ON agent_profile.id = camp_member.agent_id
+        WHERE camp_member.camp_id = ?1
+        ORDER BY agent_profile.member_order, camp_member.agent_id
+        "#,
+    )?;
+    let mut members = statement
+        .query_map([camp_id], |row| {
+            let agent_id: String = row.get(0)?;
+            Ok(ThreadMemberView {
+                fast: None,
+                is_default_lead: default_lead == Some(agent_id.as_str()),
+                agent_id,
+                display_name: row.get(1)?,
+                avatar_ref: row.get(2)?,
+                team_role: row.get(3)?,
+                accent: row.get(4)?,
+                membership_status: row.get(5)?,
+                leave_requested_at: row.get(6)?,
+                profile_presence: row.get(7)?,
+                member_order: row.get(8)?,
+                version: row.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load Thread members")?;
+    for member in &mut members {
+        member.fast = crate::camp_fast::view_on_connection(transaction, camp_id, &member.agent_id)?;
+    }
+    Ok(members)
+}
+
+fn load_membership_reconciliations(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+) -> Result<Vec<ThreadMembershipReconciliationView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT id, agent_id, membership_version, status, reason_code,
+               target_run_count, settled_run_count, created_at, updated_at
+        FROM camp_membership_reconciliation
+        WHERE camp_id = ?1 AND status = 'reconciling'
+        ORDER BY created_at, id
+        "#,
+    )?;
+    statement
+        .query_map([camp_id], |row| {
+            Ok(ThreadMembershipReconciliationView {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                membership_version: row.get(2)?,
+                status: row.get(3)?,
+                reason_code: row.get(4)?,
+                target_run_count: row.get(5)?,
+                settled_run_count: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load Thread membership reconciliations")
+}
+
+fn load_tasks(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    limit: Option<i64>,
+) -> Result<Vec<TaskView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT id, camp_id, title, description, acceptance_criteria_json,
+               status, assignee_agent_id, blocked_reason, completion_summary, cancel_reason,
+               created_by_type, created_by_id, source_agent_run_id,
+               closed_by_type, closed_by_id, closed_by_agent_run_id,
+               created_at, updated_at, closed_at
+        FROM task
+        WHERE camp_id = ?1
+        ORDER BY
+          CASE
+            WHEN ?2 IS NOT NULL AND status IN ('pending', 'in_progress', 'blocked') THEN 0
+            WHEN ?2 IS NOT NULL THEN 1
+            ELSE 0
+          END,
+          created_at DESC, id
+        LIMIT COALESCE(?2, -1)
+        "#,
+    )?;
+    let rows = statement.query_map(params![camp_id, limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, Option<String>>(12)?,
+            row.get::<_, Option<String>>(13)?,
+            row.get::<_, Option<String>>(14)?,
+            row.get::<_, Option<String>>(15)?,
+            row.get::<_, String>(16)?,
+            row.get::<_, String>(17)?,
+            row.get::<_, Option<String>>(18)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (
+            id,
+            task_camp_id,
+            title,
+            description,
+            acceptance_criteria_json,
+            status,
+            assignee,
+            blocked_reason,
+            completion_summary,
+            cancel_reason,
+            created_by_type,
+            created_by_id,
+            source_agent_run_id,
+            closed_by_type,
+            closed_by_id,
+            closed_by_agent_run_id,
+            created_at,
+            updated_at,
+            closed_at,
+        ) = row?;
+        let available_actions = if matches!(status.as_str(), "completed" | "cancelled") {
+            Vec::new()
+        } else {
+            vec!["update".to_string()]
+        };
+        let legacy_acceptance_criteria =
+            serde_json::from_str::<Vec<String>>(&acceptance_criteria_json)
+                .context("Task acceptance criteria are invalid")?;
+        result.push(TaskView {
+            task_id: id,
+            camp_id: task_camp_id,
+            title,
+            description: crate::collaboration::synthesize_task_description(
+                &description,
+                &legacy_acceptance_criteria,
+            ),
+            status,
+            assignee_agent_id: assignee,
+            blocked_reason,
+            completion_summary,
+            cancel_reason,
+            created_by_type,
+            created_by_id,
+            source_agent_run_id,
+            closed_by_type,
+            closed_by_id,
+            closed_by_agent_run_id,
+            created_at,
+            updated_at,
+            closed_at,
+            available_actions,
+        });
+    }
+    Ok(result)
+}
+
+struct ThreadMessageRow {
+    id: String,
+    sequence: i64,
+    timeline_global_sequence: Option<i64>,
+    author_type: String,
+    author_id: String,
+    source_agent_run_id: Option<String>,
+    _stored_body: String,
+    structured_content_json: String,
+    source_attachments_json: String,
+    address_mode: String,
+    addressed_agent_ids_json: String,
+    reply_to_camp_message_id: Option<String>,
+    camp_turn_id: Option<String>,
+    presentation_json: Option<String>,
+    created_at: String,
+    recall_state: String,
+    version: i64,
+}
+
+fn camp_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadMessageRow> {
+    Ok(ThreadMessageRow {
+        id: row.get(0)?,
+        sequence: row.get(1)?,
+        timeline_global_sequence: row.get(2)?,
+        author_type: row.get(3)?,
+        author_id: row.get(4)?,
+        source_agent_run_id: row.get(5)?,
+        _stored_body: row.get(6)?,
+        structured_content_json: row.get(7)?,
+        source_attachments_json: row.get(8)?,
+        address_mode: row.get(9)?,
+        addressed_agent_ids_json: row.get(10)?,
+        reply_to_camp_message_id: row.get(11)?,
+        camp_turn_id: row.get(12)?,
+        presentation_json: row.get(13)?,
+        created_at: row.get(14)?,
+        recall_state: row.get(15)?,
+        version: row.get(16)?,
+    })
+}
+
+// Camp open reads business projections without resolving publication events.
+// Snapshot/history readers retain their event sequence through load_messages.
+fn load_open_messages(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    limit: i64,
+) -> Result<Vec<ThreadMessageView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT id, sequence, NULL AS timeline_global_sequence,
+               author_type, author_id,
+               source_agent_run_id, body, structured_content_json,
+               source_attachments_json, address_mode,
+               addressed_agent_ids_json, reply_to_camp_message_id, camp_turn_id,
+               CASE WHEN author_type = 'agent'
+                    THEN recipient_presentation_json
+                    ELSE presentation_json
+               END, created_at, recall_state, version
+        FROM camp_message
+        WHERE camp_id = ?1 AND tombstoned_at IS NULL
+        ORDER BY sequence DESC LIMIT ?2
+        "#,
+    )?;
+    let rows = statement
+        .query_map(params![camp_id, limit], camp_message_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut messages = hydrate_message_views(transaction, rows)?;
+    messages.reverse();
+    Ok(messages)
+}
+
+fn load_messages(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    limit: i64,
+) -> Result<Vec<ThreadMessageView>> {
+    let publication_cte = public_camp_message_publication_cte();
+    let sql = format!(
+        r#"
+        WITH {publication_cte}
+        SELECT camp_message.id, camp_message.sequence,
+               publication.global_sequence,
+               author_type, author_id,
+               source_agent_run_id, body, structured_content_json,
+               source_attachments_json, address_mode,
+               addressed_agent_ids_json,
+               reply_to_camp_message_id, camp_turn_id,
+               CASE WHEN author_type = 'agent'
+                    THEN recipient_presentation_json
+                    ELSE presentation_json
+               END, created_at, recall_state, version
+        FROM camp_message
+        LEFT JOIN public_camp_message_publication AS publication
+          ON publication.message_id = camp_message.id
+        WHERE camp_id = ?1 AND tombstoned_at IS NULL
+        ORDER BY sequence DESC LIMIT ?2
+        "#
+    );
+    let mut statement = transaction.prepare(&sql)?;
+    let rows = statement
+        .query_map(params![camp_id, limit], camp_message_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut messages = hydrate_message_views(transaction, rows)?;
+    messages.reverse();
+    Ok(messages)
+}
+
+fn load_messages_before(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    before_sequence: i64,
+    limit: i64,
+) -> Result<Vec<ThreadMessageView>> {
+    let publication_cte = public_camp_message_publication_cte();
+    let sql = format!(
+        r#"
+        WITH {publication_cte}
+        SELECT camp_message.id, camp_message.sequence,
+               publication.global_sequence,
+               author_type, author_id,
+               source_agent_run_id, body, structured_content_json,
+               source_attachments_json, address_mode,
+               addressed_agent_ids_json,
+               reply_to_camp_message_id, camp_turn_id,
+               CASE WHEN author_type = 'agent'
+                    THEN recipient_presentation_json
+                    ELSE presentation_json
+               END, created_at, recall_state, version
+        FROM camp_message
+        LEFT JOIN public_camp_message_publication AS publication
+          ON publication.message_id = camp_message.id
+        WHERE camp_id = ?1
+          AND tombstoned_at IS NULL
+          AND sequence < ?2
+        ORDER BY sequence DESC, id DESC
+        LIMIT ?3
+        "#
+    );
+    let mut statement = transaction.prepare(&sql)?;
+    let rows = statement
+        .query_map(params![camp_id, before_sequence, limit], camp_message_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut messages = hydrate_message_views(transaction, rows)?;
+    messages.reverse();
+    Ok(messages)
+}
+
+fn load_messages_around(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    message_id: &str,
+    anchor_sequence: i64,
+    radius: i64,
+) -> Result<Vec<ThreadMessageView>> {
+    let publication_cte = public_camp_message_publication_cte();
+    let sql = format!(
+        r#"
+        WITH {publication_cte}, window_ids(id) AS (
+            SELECT id FROM (
+                SELECT id
+                FROM camp_message
+                WHERE camp_id = ?1
+                  AND tombstoned_at IS NULL
+                  AND sequence < ?3
+                ORDER BY sequence DESC
+                LIMIT ?4
+            )
+            UNION ALL
+            SELECT id
+            FROM camp_message
+            WHERE camp_id = ?1
+              AND id = ?2
+              AND tombstoned_at IS NULL
+            UNION ALL
+            SELECT id FROM (
+                SELECT id
+                FROM camp_message
+                WHERE camp_id = ?1
+                  AND tombstoned_at IS NULL
+                  AND sequence > ?3
+                ORDER BY sequence ASC
+                LIMIT ?4
+            )
+        )
+        SELECT camp_message.id, camp_message.sequence,
+               publication.global_sequence,
+               camp_message.author_type, camp_message.author_id,
+               camp_message.source_agent_run_id, camp_message.body,
+               camp_message.structured_content_json,
+               camp_message.source_attachments_json, camp_message.address_mode,
+               camp_message.addressed_agent_ids_json,
+               camp_message.reply_to_camp_message_id, camp_message.camp_turn_id,
+               CASE WHEN camp_message.author_type = 'agent'
+                    THEN camp_message.recipient_presentation_json
+                    ELSE camp_message.presentation_json
+               END,
+               camp_message.created_at, camp_message.recall_state,
+               camp_message.version
+        FROM camp_message
+        JOIN window_ids ON window_ids.id = camp_message.id
+        LEFT JOIN public_camp_message_publication AS publication
+          ON publication.message_id = camp_message.id
+        ORDER BY camp_message.sequence ASC, camp_message.id ASC
+        "#
+    );
+    let mut statement = transaction.prepare(&sql)?;
+    let rows = statement
+        .query_map(
+            params![camp_id, message_id, anchor_sequence, radius],
+            camp_message_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    hydrate_message_views(transaction, rows)
+}
+
+fn hydrate_message_views(
+    transaction: &Transaction<'_>,
+    rows: Vec<ThreadMessageRow>,
+) -> Result<Vec<ThreadMessageView>> {
+    let requested_message_ids = rows.iter().map(|row| &row.id).collect::<Vec<_>>();
+    let requested_message_ids_json = serde_json::to_string(&requested_message_ids)?;
+    let mut models_by_message_id =
+        message_model::load_message_models(transaction, &requested_message_ids_json)?;
+    let mut attachments_by_message_id = BTreeMap::<String, Vec<ThreadMessageAttachmentView>>::new();
+    for row in &rows {
+        let source_attachments = parse_source_attachments(&row.source_attachments_json)?;
+        if !source_attachments.is_empty() {
+            attachments_by_message_id.insert(
+                row.id.clone(),
+                source_attachments
+                    .iter()
+                    .map(|source_ref| source_ref.view(LocalAttachmentAvailability::Unknown))
+                    .collect(),
+            );
+        }
+    }
+    let mut attachment_statement = transaction.prepare(
+        r#"
+        WITH requested AS (
+            SELECT CAST(value AS TEXT) AS camp_message_id
+            FROM json_each(?1)
+        )
+        SELECT attachment.camp_message_id, attachment.id, attachment.display_name,
+               attachment.media_type, attachment.byte_size, attachment.preview_kind,
+               attachment.kind, attachment.file_count, attachment.storage_model
+        FROM (
+            SELECT legacy.camp_message_id, legacy.id, legacy.display_name,
+                   legacy.media_type, legacy.byte_size, legacy.preview_kind,
+                   NULL AS kind, NULL AS file_count,
+                   'legacy_v1' AS storage_model, legacy.position AS ordinal
+            FROM requested
+            JOIN message_attachment AS legacy
+              ON legacy.camp_message_id = requested.camp_message_id
+            UNION ALL
+            SELECT reference.camp_message_id, managed.id,
+                   reference.display_name_snapshot, managed.media_type,
+                   managed.byte_size, managed.preview_kind,
+                   managed.kind, managed.file_count,
+                   'managed_v2', reference.ordinal
+            FROM requested
+            JOIN camp_message_attachment_ref AS reference
+              ON reference.camp_message_id = requested.camp_message_id
+            JOIN managed_attachment AS managed
+              ON managed.camp_id = reference.camp_id
+             AND managed.id = reference.attachment_id
+        ) AS attachment
+        ORDER BY attachment.camp_message_id, attachment.ordinal, attachment.id
+        "#,
+    )?;
+    let attachment_rows = attachment_statement
+        .query_map([requested_message_ids_json], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (
+        message_id,
+        id,
+        display_name,
+        media_type,
+        byte_size,
+        preview_kind,
+        persisted_kind,
+        persisted_file_count,
+        storage_model,
+    ) in attachment_rows
+    {
+        let (kind, file_count) = if storage_model == "managed_v2" {
+            (
+                persisted_kind.context("Managed Attachment has no persisted kind")?,
+                u64::try_from(
+                    persisted_file_count
+                        .context("Managed Attachment has no persisted file count")?,
+                )?,
+            )
+        } else if media_type == DIRECTORY_MEDIA_TYPE {
+            ("directory".to_string(), 0)
+        } else {
+            ("file".to_string(), 1)
+        };
+        let attachment = ThreadMessageAttachmentView {
+            id,
+            display_name,
+            pasted_text_preview: None,
+            kind,
+            file_count: Some(file_count),
+            media_type: Some(media_type),
+            byte_size: Some(byte_size.max(0) as u64),
+            preview_kind,
+            availability: LocalAttachmentAvailability::Unknown,
+        };
+        attachments_by_message_id
+            .entry(message_id)
+            .or_default()
+            .push(attachment);
+    }
+    drop(attachment_statement);
+    rows.into_iter()
+        .map(|row| {
+            let content =
+                serde_json::from_str::<StructuredThreadMessageContent>(&row.structured_content_json)
+                    .map(normalize_content)
+                    .context("ThreadMessage Structured Content is invalid")?;
+            let body = render_structured_message_content(transaction, &content)?;
+            let attachments = attachments_by_message_id
+                .remove(&row.id)
+                .unwrap_or_default();
+            let author_display_name = if row.author_type == "external_principal" {
+                transaction
+                    .query_row(
+                        "SELECT display_name FROM external_principal WHERE id = ?1",
+                        [&row.author_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+            } else {
+                None
+            };
+            let mission_start=transaction.query_row("SELECT s.mission_id,m.title,m.description FROM mission_start s JOIN mission m ON m.id=s.mission_id WHERE s.message_id=?1",[&row.id],|r|Ok(serde_json::json!({"missionId":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"description":r.get::<_,String>(2)?}))).optional()?;
+            // Older Steer deliveries did not close the stored recall window.
+            // Read them using the same recognition boundary as withdrawal.
+            let can_withdraw = row.recall_state == "recallable"
+                && !transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM camp_message_delivery WHERE message_id=?1 AND status<>'waiting')
+                     OR EXISTS(SELECT 1 FROM agent_run_input WHERE message_id=?1)",
+                    [&row.id], |r| r.get::<_, bool>(0),
+                )?;
+            Ok(ThreadMessageView {
+                mission_start,
+                runtime_model: models_by_message_id.remove(&row.id),
+                quotes: load_quotes(transaction, QuoteStorage::CampMessage, &row.id)?,
+                id: row.id,
+                sequence: row.sequence,
+                timeline_global_sequence: row.timeline_global_sequence,
+                author_type: row.author_type,
+                author_id: row.author_id,
+                author_display_name,
+                source_agent_run_id: row.source_agent_run_id,
+                body,
+                content,
+                attachments,
+                address_mode: row.address_mode,
+                addressed_agent_ids: serde_json::from_str(&row.addressed_agent_ids_json)?,
+                reply_to_camp_message_id: row.reply_to_camp_message_id,
+                camp_turn_id: row.camp_turn_id,
+                presentation: row
+                    .presentation_json
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .context("ThreadMessage presentation is invalid")?,
+                created_at: row.created_at,
+                withdrawn: row.recall_state == "withdrawn",
+                can_withdraw,
+                version: row.version,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+fn render_structured_message_content(
+    transaction: &Transaction<'_>,
+    content: &[crate::camp_content::StructuredThreadMessageSegment],
+) -> Result<String> {
+    render_current_plain_text(transaction, content)
+}
+
+fn validate_camp_message_find_query(query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        anyhow::bail!("Thread Message find query must not be blank");
+    }
+    if query.chars().count() > CAMP_MESSAGE_FIND_QUERY_MAX_SCALARS {
+        anyhow::bail!(
+            "Thread Message find query must not exceed {CAMP_MESSAGE_FIND_QUERY_MAX_SCALARS} Unicode scalars"
+        );
+    }
+    Ok(())
+}
+
+fn fold_with_source_offsets(value: &str) -> (Vec<char>, Vec<usize>) {
+    let mut folded = Vec::new();
+    let mut source_offsets = Vec::new();
+    for (source_offset, character) in value.chars().enumerate() {
+        for folded_character in character.to_lowercase() {
+            folded.push(folded_character);
+            source_offsets.push(source_offset);
+        }
+    }
+    (folded, source_offsets)
+}
+
+fn case_insensitive_scalar_match_ranges(value: &str, query: &str) -> Vec<(usize, usize)> {
+    let (folded_value, source_offsets) = fold_with_source_offsets(value);
+    let (folded_query, _) = fold_with_source_offsets(query);
+    if folded_query.is_empty() || folded_query.len() > folded_value.len() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::<(usize, usize)>::new();
+    let mut folded_offset = 0;
+    while folded_offset + folded_query.len() <= folded_value.len() {
+        if folded_value[folded_offset..folded_offset + folded_query.len()] == folded_query {
+            let start_offset = source_offsets[folded_offset];
+            let end_offset = source_offsets[folded_offset + folded_query.len() - 1] + 1;
+            let does_not_overlap = match ranges.last() {
+                Some((_, previous_end)) => start_offset >= *previous_end,
+                None => true,
+            };
+            if does_not_overlap {
+                ranges.push((start_offset, end_offset));
+            }
+            folded_offset += folded_query.len();
+        } else {
+            folded_offset += 1;
+        }
+    }
+    ranges
+}
+
+struct ThreadMessageFindCandidate {
+    message_id: String,
+    message_sequence: i64,
+    body: String,
+}
+
+fn flatten_camp_message_find_matches(
+    mut candidates: Vec<ThreadMessageFindCandidate>,
+    query: &str,
+) -> Vec<ThreadMessageFindMatch> {
+    candidates.sort_by(|left, right| {
+        left.message_sequence
+            .cmp(&right.message_sequence)
+            .then_with(|| left.message_id.cmp(&right.message_id))
+    });
+    candidates
+        .into_iter()
+        .flat_map(|candidate| {
+            case_insensitive_scalar_match_ranges(&candidate.body, query)
+                .into_iter()
+                .enumerate()
+                .map(
+                    move |(occurrence_index, (start_offset, end_offset))| ThreadMessageFindMatch {
+                        message_id: candidate.message_id.clone(),
+                        message_sequence: candidate.message_sequence,
+                        occurrence_index: occurrence_index as i64,
+                        start_offset: start_offset as i64,
+                        end_offset: end_offset as i64,
+                    },
+                )
+        })
+        .collect()
+}
+
+fn select_camp_message_find_match(
+    matches: &[ThreadMessageFindMatch],
+    requested_index: Option<i64>,
+    anchor_sequence: Option<i64>,
+) -> (Option<i64>, Option<ThreadMessageFindMatch>) {
+    let total_match_count = matches.len() as i64;
+    let selected_index = if total_match_count == 0 {
+        None
+    } else if let Some(index) = requested_index {
+        Some(index.rem_euclid(total_match_count))
+    } else {
+        Some(
+            anchor_sequence
+                .and_then(|sequence| {
+                    matches
+                        .iter()
+                        .position(|candidate| candidate.message_sequence >= sequence)
+                })
+                .unwrap_or(0) as i64,
+        )
+    };
+    let selected_match = selected_index
+        .and_then(|index| matches.get(index as usize))
+        .cloned();
+    (selected_index, selected_match)
+}
+
+fn load_turns(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    limit: Option<i64>,
+) -> Result<Vec<ThreadTurnView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT id, trigger_type, trigger_id, status,
+               cancel_requested_at, aggregate_reason_code,
+               execution_budget_schema_version,
+               execution_budget_accepted_at,
+               execution_budget_deadline_at,
+               execution_budget_elapsed_seconds,
+               execution_budget_max_agent_run_responsibilities,
+               execution_budget_max_accepted_a2a,
+               execution_budget_root_agent_run_responsibilities
+                 + agent_run_responsibilities_allocated,
+               accepted_a2a_allocated,
+               execution_budget_exhausted_at,
+               execution_budget_exhaustion_reason,
+               execution_budget_exhaustion_command_id,
+               version, created_at, updated_at, ended_at
+        FROM camp_turn WHERE camp_id = ?1 AND kind = 'camp'
+        ORDER BY
+          CASE
+            WHEN ?2 IS NOT NULL AND status IN ('running', 'waiting') THEN 0
+            WHEN ?2 IS NOT NULL THEN 1
+            ELSE 0
+          END,
+          created_at DESC, id
+        LIMIT COALESCE(?2, -1)
+        "#,
+    )?;
+    statement
+        .query_map(params![camp_id, limit], |row| {
+            Ok(ThreadTurnView {
+                id: row.get(0)?,
+                trigger_type: row.get(1)?,
+                trigger_id: row.get(2)?,
+                status: row.get(3)?,
+                cancel_requested_at: row.get(4)?,
+                aggregate_reason_code: row.get(5)?,
+                execution_budget: ThreadTurnExecutionBudgetView {
+                    schema_version: row.get(6)?,
+                    accepted_at: row.get(7)?,
+                    deadline_at: row.get(8)?,
+                    elapsed_seconds: row.get(9)?,
+                    max_agent_run_responsibilities: row.get(10)?,
+                    max_accepted_a2a: row.get(11)?,
+                    allocated_agent_run_responsibilities: row.get(12)?,
+                    accepted_a2a: row.get(13)?,
+                    exhausted_at: row.get(14)?,
+                    exhaustion_reason: row.get(15)?,
+                    exhaustion_command_id: row.get(16)?,
+                },
+                version: row.get(17)?,
+                created_at: row.get(18)?,
+                updated_at: row.get(19)?,
+                ended_at: row.get(20)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load CampTurns")
+}
+
+fn load_message_deliveries(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    limit: Option<i64>,
+) -> Result<Vec<MessageDeliveryView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        WITH projected_delivery AS (
+          SELECT current_delivery.id,
+                 message.id AS message_id,
+                 message.camp_turn_id,
+                 source_run.task_id,
+                 current_delivery.recipient_agent_id,
+                 current_delivery.status,
+                 CASE current_delivery.status
+                   WHEN 'waiting' THEN 'never_attempted'
+                   WHEN 'claimed' THEN CASE WHEN current_delivery.requested_mode = 'steer'
+                     AND (SELECT input.dispatch_started_at FROM context_manifest AS manifest
+                       JOIN runtime_input_delivery AS input ON input.context_manifest_id=manifest.id
+                       WHERE manifest.source_delivery_id=current_delivery.id
+                       ORDER BY input.input_sequence DESC LIMIT 1) IS NOT NULL
+                     THEN 'attempting' ELSE 'materialized' END
+                   ELSE 'terminal'
+                 END AS dispatch_phase,
+                 NULL AS wait_condition,
+                 CASE current_delivery.status
+                   WHEN 'waiting' THEN 0
+                   ELSE 1
+                 END AS dispatch_attempt_count,
+                 0 AS retry_generation,
+                 NULL AS context_manifest_id,
+                 current_delivery.claimed_agent_run_id AS target_agent_run_id,
+                 0 AS manual_intervention_required,
+                 current_delivery.failure_code,
+                 current_delivery.version,
+                 current_delivery.created_at,
+                 current_delivery.updated_at,
+                 current_delivery.ended_at,
+                 'public_a2a' AS delivery_kind,
+                 'dispatch' AS dispatch_disposition,
+                 NULL AS completion_role,
+                 NULL AS gather_id,
+                 NULL AS gather_dispatch_delivery_id,
+                 COALESCE((
+                   SELECT CAST(recipient.key AS INTEGER)
+                   FROM json_each(message.addressed_agent_ids_json) AS recipient
+                   WHERE recipient.value = current_delivery.recipient_agent_id
+                   ORDER BY CAST(recipient.key AS INTEGER)
+                   LIMIT 1
+                 ), 0) AS recipient_canonical_position,
+                 'forward' AS edge_kind,
+                 NULL AS target_parent_agent_run_id,
+                 NULL AS return_to_agent_run_id,
+                 NULL AS target_conversation_id,
+                 current_delivery.recipient_membership_version_at_admission,
+                 message.source_agent_run_id,
+                 current_delivery.queue_sequence,
+                 CASE WHEN continuation.delivery_id IS NOT NULL THEN 1 END AS continuation_request,
+                 (SELECT json_group_array(message_id) FROM (
+                   SELECT message_id FROM agent_run_input
+                   WHERE agent_run_id = continuation.source_agent_run_id ORDER BY ordinal
+                 )) AS input_message_ids
+          FROM camp_message_delivery AS current_delivery
+          LEFT JOIN camp_run_continuation AS continuation ON continuation.delivery_id = current_delivery.id
+          JOIN camp_message AS message
+            ON message.id = COALESCE(current_delivery.message_id, (
+              SELECT message_id FROM agent_run_input
+              WHERE agent_run_id = continuation.source_agent_run_id ORDER BY ordinal LIMIT 1
+            ))
+          LEFT JOIN agent_run AS source_run
+            ON source_run.id = message.source_agent_run_id
+          WHERE current_delivery.camp_id = ?1
+            AND (message.tombstoned_at IS NULL OR continuation.delivery_id IS NOT NULL)
+
+          UNION ALL
+
+          SELECT legacy_delivery.id,
+                 legacy_delivery.message_id,
+                 legacy_delivery.camp_turn_id,
+                 legacy_delivery.task_id,
+                 legacy_delivery.recipient_agent_id,
+                 legacy_delivery.status,
+                 legacy_delivery.dispatch_phase,
+                 legacy_delivery.wait_condition,
+                 legacy_delivery.dispatch_attempt_count,
+                 legacy_delivery.retry_generation,
+                 legacy_delivery.context_manifest_id,
+                 legacy_delivery.target_agent_run_id,
+                 legacy_delivery.manual_intervention_required,
+                 legacy_delivery.failure_code,
+                 legacy_delivery.version,
+                 legacy_delivery.created_at,
+                 legacy_delivery.updated_at,
+                 legacy_delivery.ended_at,
+                 legacy_delivery.delivery_kind,
+                 legacy_delivery.dispatch_disposition,
+                 legacy_delivery.completion_role,
+                 legacy_delivery.gather_id,
+                 legacy_delivery.gather_dispatch_delivery_id,
+                 legacy_delivery.recipient_canonical_position,
+                 legacy_delivery.edge_kind,
+                 legacy_delivery.target_parent_agent_run_id,
+                 legacy_delivery.return_to_agent_run_id,
+                 legacy_delivery.target_conversation_id,
+                 legacy_delivery.recipient_membership_version_at_admission,
+                 legacy_delivery.source_agent_run_id,
+                 legacy_delivery.queue_sequence,
+                 NULL AS continuation_request,
+                 '[]' AS input_message_ids
+          FROM message_delivery AS legacy_delivery
+          WHERE legacy_delivery.camp_id = ?1
+            AND legacy_delivery.delivery_kind IN ('public_a2a', 'gather_completion')
+            AND NOT EXISTS (
+              SELECT 1
+              FROM camp_message_delivery AS current_delivery
+              WHERE current_delivery.id = legacy_delivery.id
+            )
+        )
+        SELECT id, message_id, camp_turn_id, task_id, recipient_agent_id,
+               status, dispatch_phase,
+               wait_condition, dispatch_attempt_count, retry_generation,
+               context_manifest_id, target_agent_run_id,
+               manual_intervention_required, failure_code,
+               version, created_at, updated_at, ended_at,
+               delivery_kind, dispatch_disposition, completion_role,
+               gather_id, gather_dispatch_delivery_id,
+               recipient_canonical_position, edge_kind,
+               target_parent_agent_run_id, return_to_agent_run_id,
+               target_conversation_id,
+               recipient_membership_version_at_admission, source_agent_run_id, continuation_request, input_message_ids,
+               (SELECT requested_mode FROM camp_message_delivery d WHERE d.id=projected_delivery.id),
+               (SELECT i.status FROM context_manifest m JOIN runtime_input_delivery i ON i.context_manifest_id=m.id
+                WHERE m.source_delivery_id=projected_delivery.id ORDER BY i.input_sequence DESC LIMIT 1)
+        FROM projected_delivery
+        ORDER BY
+          CASE
+            WHEN ?2 IS NOT NULL
+             AND status IN ('pending', 'running', 'waiting', 'claimed') THEN 0
+            WHEN ?2 IS NOT NULL THEN 1
+            ELSE 0
+          END,
+          CASE WHEN ?2 IS NULL THEN created_at END ASC,
+          CASE WHEN ?2 IS NOT NULL THEN created_at END DESC,
+          queue_sequence, id
+        LIMIT COALESCE(?2, -1)
+        "#,
+    )?;
+    let mut deliveries = statement
+        .query_map(params![camp_id, limit], |row| {
+            let delivery_kind = row.get::<_, String>(18)?;
+            let kind = match delivery_kind.as_str() {
+                "public_a2a" => MessageDeliveryKindView::PublicA2a {
+                    source_agent_run_id: row.get(29)?,
+                    dispatch_disposition: row.get(19)?,
+                    completion_role: row.get(20)?,
+                    gather_id: row.get(21)?,
+                    gather_dispatch_delivery_id: row.get(22)?,
+                    recipient_canonical_position: row.get::<_, Option<i64>>(23)?.ok_or_else(
+                        || {
+                            rusqlite::Error::InvalidColumnType(
+                                23,
+                                "recipient_canonical_position".to_string(),
+                                rusqlite::types::Type::Null,
+                            )
+                        },
+                    )?,
+                    edge_kind: row.get::<_, Option<String>>(24)?.ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            24,
+                            "edge_kind".to_string(),
+                            rusqlite::types::Type::Null,
+                        )
+                    })?,
+                    target_parent_agent_run_id: row.get(25)?,
+                    return_to_agent_run_id: row.get(26)?,
+                },
+                "gather_completion" => MessageDeliveryKindView::GatherCompletion {
+                    dispatch_disposition: row.get(19)?,
+                    completion_role: row.get::<_, Option<String>>(20)?.ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            20,
+                            "completion_role".to_string(),
+                            rusqlite::types::Type::Null,
+                        )
+                    })?,
+                    gather_id: row.get::<_, Option<String>>(21)?.ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            21,
+                            "gather_id".to_string(),
+                            rusqlite::types::Type::Null,
+                        )
+                    })?,
+                    target_conversation_id: row.get::<_, Option<String>>(27)?.ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            27,
+                            "target_conversation_id".to_string(),
+                            rusqlite::types::Type::Null,
+                        )
+                    })?,
+                },
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Ok(MessageDeliveryView {
+                requested_mode: row.get(32)?,
+                input_delivery_status: row.get(33)?,
+                continuation_request: row.get(30)?,
+                input_message_ids: serde_json::from_str(&row.get::<_, String>(31)?).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            31,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    },
+                )?,
+                id: row.get(0)?,
+                message_id: row.get(1)?,
+                camp_turn_id: row.get(2)?,
+                task_id: row.get(3)?,
+                recipient_agent_id: row.get(4)?,
+                recipient_membership_version_at_admission: row.get(28)?,
+                status: row.get(5)?,
+                dispatch_phase: row.get(6)?,
+                wait_condition: row.get(7)?,
+                dispatch_attempt_count: row.get(8)?,
+                retry_generation: row.get(9)?,
+                context_manifest_id: row.get(10)?,
+                target_agent_run_id: row.get(11)?,
+                manual_intervention_required: row.get::<_, i64>(12)? != 0,
+                failure_code: row.get(13)?,
+                version: row.get(14)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
+                ended_at: row.get(17)?,
+                kind,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if limit.is_some() {
+        // Preserve the SQL queue_sequence order when timestamps are equal.
+        deliveries.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    }
+    Ok(deliveries)
+}
+
+fn load_agent_runs(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    limit: Option<i64>,
+) -> Result<Vec<AgentRunView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT agent_run.id, agent_run.camp_turn_id,
+               agent_run.conversation_id, conversation.agent_id,
+               agent_run.task_id, agent_run.responsibility_key,
+               agent_run.responsibility_generation, agent_run.purpose,
+               agent_run.completion_role,
+               CASE
+                 WHEN agent_run.status = 'failed'
+                  AND COALESCE(agent_run.last_error_code, '') = 'accepted_input_outcome_unknown'
+                  AND agent_run.cancel_requested_at IS NOT NULL
+                  AND COALESCE(agent_run.cancel_reason_code, '') <> 'accepted_input_outcome_unknown'
+                  AND agent_run.terminal_resolution_source IS NULL
+                 THEN 'cancelled'
+                 ELSE agent_run.status
+               END,
+               agent_run.wait_reason,
+               agent_run.cancel_requested_at,
+               agent_run.cancel_reason_code,
+               agent_run.cancel_acknowledged_at,
+               agent_run.terminal_resolution_source,
+               CASE WHEN agent_run.terminal_reason_code IS NULL
+                   AND agent_run.status = 'failed' AND agent_run.last_error_code IN (
+                   'agent_unavailable',
+                   'member_away',
+                   'member_removed',
+                   'runtime_not_configured',
+                   'runtime_configuration_invalid',
+                   'runtime_configuration_adapter_mismatch',
+                   'conversation_runtime_override_unsupported',
+                   'adapter_installation_missing',
+                   'adapter_installation_disabled',
+                   'runtime_permission_adapter_mismatch',
+                   'runtime_permission_schema_mismatch',
+                   'runtime_permission_values_invalid',
+                   'runtime_permission_option_unknown',
+                   'runtime_permission_option_unsupported',
+                   'runtime_permission_value_invalid',
+                   'runtime_permission_value_required',
+                   'runtime_model_options_invalid',
+                   'runtime_model_unavailable',
+                   'runtime_model_option_unknown',
+                   'runtime_model_option_invalid',
+                   'runtime_adapter_not_implemented'
+               ) THEN agent_run.last_error_code ELSE agent_run.terminal_reason_code END,
+               agent_run.execution_epoch, agent_run.permission_semantics,
+               agent_run.invocation_kind,
+               agent_run.trigger_delivery_generation,
+               agent_run.a2a_parent_agent_run_id,
+               agent_run.a2a_root_agent_run_id, agent_run.a2a_depth,
+               (SELECT COUNT(*)
+                FROM agent_run_execution_evidence
+                WHERE agent_run_execution_evidence.agent_run_id = agent_run.id),
+               agent_run.execution_evidence_change_sequence,
+               CASE
+                 WHEN agent_run.cancel_requested_at IS NOT NULL
+                  AND agent_run.terminal_resolution_source IS NULL
+                  AND (
+                    agent_run.status = 'cancelled'
+                    OR (
+                      agent_run.status = 'failed'
+                      AND COALESCE(agent_run.last_error_code, '') = 'accepted_input_outcome_unknown'
+                    )
+                  )
+                 THEN 0
+                 ELSE (
+                 EXISTS(
+                   SELECT 1 FROM approval
+                   JOIN action_execution
+                     ON action_execution.id = approval.action_id
+                   WHERE action_execution.agent_run_id = agent_run.id
+                     AND approval.status = 'pending'
+                 )
+                 OR EXISTS(
+                   SELECT 1 FROM action_execution
+                   WHERE action_execution.agent_run_id = agent_run.id
+                     AND (
+                       action_execution.status IN ('prepared', 'executing')
+                       OR (
+                         action_execution.status = 'unknown'
+                         AND action_execution.unknown_disposition = 'active'
+                       )
+                     )
+                 )
+                 OR EXISTS(
+                   SELECT 1 FROM runtime_delivery_checkpoint
+                   WHERE runtime_delivery_checkpoint.agent_run_id = agent_run.id
+                     AND runtime_delivery_checkpoint.status IN (
+                       'pending', 'delivering', 'failed'
+                     )
+                 )
+                 OR EXISTS(
+                   SELECT 1 FROM runtime_input_delivery
+                   WHERE runtime_input_delivery.agent_run_id = agent_run.id
+                     AND runtime_input_delivery.status IN ('prepared', 'delivery_unknown')
+                 )
+                 OR COALESCE(agent_run.last_error_code, '') = 'accepted_input_outcome_unknown'
+                 OR (
+                   agent_run.status IN ('failed', 'cancelled')
+                   AND COALESCE(agent_run.last_error_code, '')
+                       IN ('planned_shutdown_outcome_unknown', 'accepted_input_outcome_unknown')
+                   AND EXISTS(
+                     SELECT 1 FROM runtime_input_delivery
+                     WHERE runtime_input_delivery.agent_run_id = agent_run.id
+                       AND runtime_input_delivery.status = 'accepted'
+                   )
+                 )
+               ) END,
+               agent_run.workspace_json,
+               agent_run.starting_git_observation_json,
+               agent_run.ending_git_observation_json,
+               camp.project_path, agent_run.version,
+               agent_run.created_at, agent_run.started_at,
+               agent_run.ended_at, agent_run.updated_at,
+               agent_run.public_runtime_failure_json,
+               agent_run.runtime_model_selection_json,
+               agent_run.runtime_observed_model_id,
+               COALESCE((
+                 SELECT json_group_array(input.message_id)
+                 FROM (
+                   SELECT message_id
+                   FROM agent_run_input
+                   WHERE agent_run_id = agent_run.id
+                   ORDER BY ordinal
+                 ) AS input
+               ), '[]'),
+               agent_run.anchor_message_id,
+               COALESCE(
+                 (SELECT message_id FROM agent_run_input
+                  WHERE agent_run_id = agent_run.id ORDER BY ordinal LIMIT 1),
+                 agent_run.anchor_message_id,
+                 agent_run.trigger_camp_message_id,
+                 CASE WHEN camp_turn.trigger_type = 'camp_message'
+                      THEN camp_turn.trigger_id END
+               ),
+               continued.source_agent_run_id IS NOT NULL,
+               agent_run.current_public_tail_sequence,
+               agent_run.runtime_adapter_kind,
+               agent_run.last_error_code
+        FROM agent_run
+        LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+        JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+        JOIN conversation ON conversation.id = agent_run.conversation_id
+        LEFT JOIN (
+            SELECT DISTINCT continuation.source_agent_run_id
+            FROM camp_message_delivery AS delivery
+            JOIN camp_run_continuation AS continuation ON continuation.delivery_id = delivery.id
+            WHERE delivery.camp_id = ?1
+        ) AS continued ON continued.source_agent_run_id = agent_run.id
+        WHERE camp.id = ?1
+          AND agent_run.invocation_kind <> 'single_chat'
+        ORDER BY
+          CASE
+            WHEN ?2 IS NOT NULL
+             AND (agent_run.status IN ('queued', 'running', 'waiting') OR (
+               agent_run.status IN ('failed', 'cancelled')
+               AND COALESCE(agent_run.last_error_code, '') IN ('planned_shutdown_outcome_unknown', 'accepted_input_outcome_unknown')
+               AND NOT (
+                 agent_run.cancel_requested_at IS NOT NULL
+                 AND agent_run.terminal_resolution_source IS NULL
+               )
+             )) THEN 0
+            WHEN ?2 IS NOT NULL THEN 1
+            ELSE 0
+          END,
+          agent_run.created_at DESC, agent_run.id
+        LIMIT COALESCE(?2, -1)
+        "#,
+    )?;
+    let rows = statement
+        .query_map(params![camp_id, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, String>(17)?,
+                row.get::<_, String>(18)?,
+                row.get::<_, i64>(19)?,
+                row.get::<_, Option<String>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, i64>(22)?,
+                row.get::<_, i64>(23)?,
+                row.get::<_, i64>(24)?,
+                row.get::<_, i64>(25)? != 0,
+                row.get::<_, Option<String>>(26)?,
+                row.get::<_, Option<String>>(27)?,
+                row.get::<_, Option<String>>(28)?,
+                row.get::<_, String>(29)?,
+                row.get::<_, i64>(30)?,
+                row.get::<_, String>(31)?,
+                row.get::<_, Option<String>>(32)?,
+                row.get::<_, Option<String>>(33)?,
+                row.get::<_, String>(34)?,
+                row.get::<_, Option<String>>(35)?,
+                row.get::<_, Option<String>>(36)?,
+                row.get::<_, Option<String>>(37)?,
+                row.get::<_, String>(38)?,
+                row.get::<_, Option<String>>(39)?,
+                row.get::<_, Option<String>>(40)?,
+                row.get::<_, bool>(41)?,
+                row.get::<_, Option<i64>>(42)?,
+                row.get::<_, Option<String>>(43)?,
+                row.get::<_, Option<String>>(44)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let message_ids = rows
+        .iter()
+        .filter_map(|row| row.40.as_deref())
+        .collect::<BTreeSet<_>>();
+    let summaries = load_run_input_summaries(transaction, camp_id, &message_ids)?;
+    rows.into_iter()
+        .map(
+            |(
+                id,
+                camp_turn_id,
+                conversation_id,
+                agent_id,
+                task_id,
+                responsibility_key,
+                responsibility_generation,
+                purpose,
+                completion_role,
+                status,
+                wait_reason,
+                cancel_requested_at,
+                cancel_reason_code,
+                cancel_acknowledged_at,
+                terminal_resolution_source,
+                terminal_reason_code,
+                execution_epoch,
+                permission_semantics,
+                invocation_kind,
+                trigger_delivery_generation,
+                a2a_parent_agent_run_id,
+                a2a_root_agent_run_id,
+                a2a_depth,
+                execution_evidence_count,
+                execution_evidence_change_sequence,
+                has_unsettled_external_effects,
+                workspace,
+                starting_git_observation,
+                ending_git_observation,
+                project_path,
+                version,
+                created_at,
+                started_at,
+                ended_at,
+                updated_at,
+                public_runtime_failure_json,
+                runtime_model_selection,
+                runtime_observed_model_id,
+                input_message_ids_json,
+                anchor_message_id,
+                summary_message_id,
+                has_accepted_continuation,
+                public_tail_sequence_at_start,
+                runtime_adapter_kind,
+                last_error_code,
+            )| {
+                // Older claim failures recorded only the stable code. Recover the
+                // same safe explanation without rewriting history or guessing a Runtime.
+                let failure = public_runtime_failure_json
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .context("AgentRun public Runtime failure is invalid")?
+                    .or_else(|| {
+                        (status == "failed"
+                            && invocation_kind == "batch"
+                            && started_at.is_none()
+                            && last_error_code.as_deref() == Some("context_payload_too_large"))
+                        .then(|| {
+                            runtime_adapter_kind
+                                .as_deref()?
+                                .parse()
+                                .ok()
+                                .map(context_payload_too_large_failure)
+                        })
+                        .flatten()
+                    });
+                let steer = if matches!(status.as_str(), "queued" | "running" | "waiting") {
+                    crate::steer::active_input_availability(transaction, &id, execution_epoch)?
+                } else {
+                    crate::steer::ActiveInputAvailability::default()
+                };
+                Ok(AgentRunView {
+                    can_steer: steer.can_steer,
+                    steer_unavailable_reason: steer.unavailable_reason,
+                    id,
+                    camp_turn_id,
+                    input_message_ids: serde_json::from_str(&input_message_ids_json)
+                        .context("AgentRun input Message IDs are invalid")?,
+                    anchor_message_id,
+                    public_tail_sequence_at_start,
+                    input_summary: summary_message_id
+                        .and_then(|id| summaries.get(&id).cloned().flatten()),
+                    has_accepted_continuation,
+                    conversation_id,
+                    agent_id,
+                    task_id,
+                    responsibility_key,
+                    responsibility_generation,
+                    purpose,
+                    completion_role,
+                    status,
+                    wait_reason,
+                    cancel_requested_at,
+                    cancel_reason_code,
+                    cancel_acknowledged_at,
+                    terminal_resolution_source,
+                    terminal_reason_code,
+                    failure,
+                    runtime_model: message_model::project_model(
+                        runtime_adapter_kind.as_deref(),
+                        runtime_model_selection.as_deref(),
+                        runtime_observed_model_id,
+                    ),
+                    execution_epoch,
+                    permission_semantics,
+                    invocation_kind,
+                    trigger_delivery_generation,
+                    a2a_parent_agent_run_id,
+                    a2a_root_agent_run_id,
+                    a2a_depth,
+                    execution_evidence_count,
+                    execution_evidence_change_sequence,
+                    has_unsettled_external_effects,
+                    workspace: Some(match workspace {
+                        Some(value) => {
+                            let workspace: Value = serde_json::from_str(&value)?;
+                            let path = workspace
+                                .get("path")
+                                .or_else(|| workspace.get("executionRoot"))
+                                .and_then(Value::as_str)
+                                .context("AgentRun Workspace has no path")?;
+                            Ok::<_, anyhow::Error>(RunWorkspaceView {
+                                path: path.to_string(),
+                            })?
+                        }
+                        None => RunWorkspaceView { path: project_path },
+                    }),
+                    starting_git_observation: starting_git_observation
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()
+                        .context("AgentRun starting Git observation is invalid")?,
+                    ending_git_observation: ending_git_observation
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()
+                        .context("AgentRun ending Git observation is invalid")?,
+                    version,
+                    created_at,
+                    started_at,
+                    ended_at,
+                    updated_at,
+                })
+            },
+        )
+        .collect()
+}
+
+// Title sources are loaded by exact ID for the selected Runs, independently of
+// the conversation's message page. Reuse message rendering and attachment order
+// without reading publication events, attachment files, or unrelated history.
+fn load_run_input_summaries(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    message_ids: &BTreeSet<&str>,
+) -> Result<BTreeMap<String, Option<String>>> {
+    if message_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT message.id, message.sequence, NULL AS timeline_global_sequence,
+               message.author_type, message.author_id, message.source_agent_run_id,
+               message.body, message.structured_content_json,
+               message.source_attachments_json, message.address_mode,
+               message.addressed_agent_ids_json, message.reply_to_camp_message_id,
+               message.camp_turn_id,
+               CASE WHEN message.author_type = 'agent'
+                    THEN message.recipient_presentation_json ELSE message.presentation_json END,
+               message.created_at, message.recall_state, message.version
+        FROM json_each(?2) AS requested
+        JOIN camp_message AS message ON message.id = requested.value
+        WHERE message.camp_id = ?1 AND message.tombstoned_at IS NULL
+        "#,
+    )?;
+    let rows = statement
+        .query_map(
+            params![camp_id, serde_json::to_string(message_ids)?],
+            camp_message_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(hydrate_message_views(transaction, rows)?
+        .into_iter()
+        .map(|message| {
+            let summary = if message.withdrawn {
+                Some("Message withdrawn".to_string())
+            } else {
+                let body = message
+                    .body
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let text = if !body.is_empty() {
+                    Some(body)
+                } else {
+                    message.attachments.first().map(|attachment| {
+                        if message.attachments.len() > 1 {
+                            format!(
+                                "{} 等 {} 个附件",
+                                attachment.display_name,
+                                message.attachments.len()
+                            )
+                        } else {
+                            attachment.display_name.clone()
+                        }
+                    })
+                };
+                text.map(|text| {
+                    let mut chars = text.chars();
+                    let mut summary = chars.by_ref().take(240).collect::<String>();
+                    if chars.next().is_some() {
+                        summary.pop();
+                        summary.push('…');
+                    }
+                    summary
+                })
+            };
+            (message.id, summary)
+        })
+        .collect())
+}
+
+fn load_execution_evidence(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    limit: Option<i64>,
+    active_only: bool,
+) -> Result<Vec<AgentRunExecutionEvidenceView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        WITH selected AS MATERIALIZED (
+          SELECT evidence.id, evidence.occurred_at, evidence.agent_run_id, evidence.sequence
+          FROM agent_run_execution_evidence AS evidence
+          JOIN agent_run ON agent_run.id = evidence.agent_run_id
+          LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+          WHERE COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?1
+            AND agent_run.invocation_kind <> 'single_chat'
+            AND (?3 = 0 OR agent_run.status IN ('queued', 'running', 'waiting'))
+          ORDER BY evidence.occurred_at DESC,
+                   evidence.agent_run_id DESC, evidence.sequence DESC
+          LIMIT ?2
+        )
+        SELECT evidence.id, evidence.agent_run_id, evidence.execution_epoch,
+               evidence.sequence, evidence.event_type, evidence.kind, evidence.phase,
+               rovai_execution_preview(evidence.storage_version, evidence.payload_preview_json, evidence.input_preview_json, evidence.result_preview_json, evidence.result_digest),
+               evidence.content_blob_id, evidence.content_byte_count, evidence.is_truncated, evidence.occurred_at,
+               evidence.operation_id, evidence.revision, evidence.change_sequence, evidence.output_truncated
+        FROM selected JOIN agent_run_execution_evidence AS evidence ON evidence.id=selected.id
+        ORDER BY selected.occurred_at, selected.agent_run_id, selected.sequence
+        "#,
+    )?;
+    let mut evidence = statement
+        .query_map(
+            params![camp_id, limit.unwrap_or(-1), active_only],
+            execution_evidence_row,
+        )?
+        .map(|row| execution_evidence_view(row?))
+        .collect::<Result<Vec<_>>>()?;
+    attach_canonical_activity(transaction, &mut evidence)?;
+    Ok(evidence)
+}
+
+pub(crate) fn public_execution_evidence_for_agent_run(
+    connection: &Connection,
+    agent_run_id: &str,
+) -> Result<Vec<AgentRunExecutionEvidenceView>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT evidence.id, evidence.agent_run_id, evidence.execution_epoch,
+               evidence.sequence, evidence.event_type, evidence.kind,
+               evidence.phase, rovai_execution_preview(evidence.storage_version, evidence.payload_preview_json, evidence.input_preview_json, evidence.result_preview_json, evidence.result_digest),
+               evidence.content_blob_id, evidence.content_byte_count,
+               evidence.is_truncated, evidence.occurred_at,
+               evidence.operation_id, evidence.revision, evidence.change_sequence,
+               evidence.output_truncated
+        FROM agent_run_execution_evidence AS evidence
+        WHERE evidence.agent_run_id = ?1
+          AND evidence.event_type NOT IN (
+              'agent.reasoning.summary.delta', 'agent.thought.delta',
+              'agent.reasoning.summary.block', 'agent.thought.block',
+              'runtime.compaction.display'
+          )
+        ORDER BY evidence.sequence
+        "#,
+    )?;
+    let mut evidence = statement
+        .query_map([agent_run_id], execution_evidence_row)?
+        .map(|row| execution_evidence_view(row?))
+        .collect::<Result<Vec<_>>>()?;
+    drop(statement);
+    attach_canonical_activity(connection, &mut evidence)?;
+    Ok(evidence)
+}
+
+pub(crate) type ExecutionEvidenceRow = (
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    bool,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<bool>,
+);
+
+pub(crate) fn execution_evidence_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ExecutionEvidenceRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get::<_, i64>(10)? != 0,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get::<_, Option<i64>>(15)?.map(|value| value != 0),
+    ))
+}
+
+pub(crate) fn execution_evidence_view(
+    row: ExecutionEvidenceRow,
+) -> Result<AgentRunExecutionEvidenceView> {
+    let (
+        id,
+        agent_run_id,
+        execution_epoch,
+        sequence,
+        event_type,
+        kind,
+        phase,
+        payload,
+        content_blob_id,
+        content_byte_count,
+        is_truncated,
+        occurred_at,
+        operation_id,
+        revision,
+        change_sequence,
+        output_truncated,
+    ) = row;
+    Ok(AgentRunExecutionEvidenceView {
+        id,
+        agent_run_id,
+        execution_epoch,
+        sequence,
+        operation_id,
+        revision,
+        change_sequence,
+        event_type,
+        kind,
+        phase,
+        payload: serde_json::from_str(&payload)
+            .context("Execution Evidence payload preview is invalid")?,
+        content_blob_id,
+        content_byte_count,
+        is_truncated,
+        output_truncated,
+        occurred_at,
+        canonical: None,
+    })
+}
+
+pub(crate) fn attach_canonical_activity(
+    connection: &Connection,
+    evidence: &mut [AgentRunExecutionEvidenceView],
+) -> Result<()> {
+    attach_canonical_activity_projection(connection, evidence, false)
+}
+
+pub(crate) fn attach_canonical_activity_projection(
+    connection: &Connection,
+    evidence: &mut [AgentRunExecutionEvidenceView],
+    metadata_only: bool,
+) -> Result<()> {
+    if evidence.is_empty() {
+        return Ok(());
+    }
+    let mut requested = evidence
+        .iter()
+        .map(|item| (&item.id, &item.agent_run_id, item.execution_epoch))
+        .collect::<Vec<_>>();
+    let requested_json = serde_json::to_string(&requested)?;
+    // Format 3 owns its metadata. Resolve only requested primary keys, without scanning
+    // every activity (or patch) in these Runs to attach a page or one expanded result.
+    let mut canonical_by_evidence_id = BTreeMap::new();
+    let mut unified = connection.prepare("SELECT e.id,e.activity_meta_json,e.operation_id,e.sequence,e.revision
+        FROM json_each(?1) requested JOIN agent_run_execution_evidence e ON e.id=json_extract(requested.value,'$[0]')
+        WHERE e.agent_run_id=json_extract(requested.value,'$[1]') AND e.execution_epoch=json_extract(requested.value,'$[2]')
+          AND e.storage_version IN (3,4) AND e.activity_meta_json IS NOT NULL")?;
+    let rows = unified.query_map([&requested_json], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, metadata, operation, sequence, revision) = row?;
+        let mut activity = crate::execution_evidence::activity_from_stored_metadata(
+            &metadata, &id, &operation, sequence, revision,
+        )?;
+        if metadata_only {
+            if let Some(diff) = activity.diff_projection.as_mut() {
+                diff.entries = Some(Vec::new());
+            }
+        }
+        canonical_by_evidence_id.insert(id, activity);
+    }
+    drop(unified);
+    requested.retain(|(id, _, _)| !canonical_by_evidence_id.contains_key(*id));
+    if requested.is_empty() {
+        for item in evidence {
+            item.canonical = canonical_by_evidence_id.remove(&item.id);
+        }
+        return Ok(());
+    }
+    let requested_json = serde_json::to_string(&requested)?;
+    let mut statement = connection.prepare(
+        r#"
+        WITH requested AS MATERIALIZED (
+            SELECT
+                CAST(json_extract(value, '$[0]') AS TEXT) AS evidence_id,
+                CAST(json_extract(value, '$[1]') AS TEXT) AS agent_run_id,
+                CAST(json_extract(value, '$[2]') AS INTEGER) AS execution_epoch
+            FROM json_each(?1)
+        ), candidates AS MATERIALIZED (
+            SELECT source.value AS requested_evidence_id, activity.*
+            FROM (SELECT DISTINCT agent_run_id, execution_epoch FROM requested) AS target
+            JOIN canonical_runtime_activity AS activity
+              ON activity.agent_run_id = target.agent_run_id
+             AND activity.execution_epoch = target.execution_epoch
+            JOIN json_each(activity.source_evidence_ids_json) AS source
+            WHERE activity.classifier_version IN (?2, ?3, ?4, ?5)
+        )
+        SELECT requested.evidence_id,
+               activity.operation_id, activity.classifier_version,
+               activity.activity_domain,
+               activity.semantic_kind, activity.tool_name,
+               activity.presentation_hint,
+               CASE WHEN ?6 THEN json_set(activity.diff_projection_json, '$.entries', json('[]'))
+                    ELSE activity.diff_projection_json END,
+               activity.phase, activity.outcome,
+               activity.credibility, activity.coverage_level,
+               activity.source_authority, activity.source_evidence_ids_json,
+               activity.first_evidence_sequence,
+               activity.last_evidence_sequence, activity.revision
+        FROM requested
+        JOIN candidates AS activity
+          ON activity.agent_run_id = requested.agent_run_id
+         AND activity.execution_epoch = requested.execution_epoch
+         AND activity.requested_evidence_id = requested.evidence_id
+        ORDER BY requested.evidence_id,
+                 CASE activity.classifier_version
+                   WHEN ?2 THEN 0
+                   WHEN ?3 THEN 1
+                   WHEN ?4 THEN 2
+                   ELSE 3
+                 END
+        "#,
+    )?;
+    let rows = statement.query_map(
+        params![
+            requested_json,
+            crate::canonical_activity::CLASSIFIER_VERSION,
+            crate::canonical_activity::PREVIOUS_CLASSIFIER_VERSION,
+            crate::canonical_activity::INTERMEDIATE_CLASSIFIER_VERSION,
+            crate::canonical_activity::LEGACY_CLASSIFIER_VERSION,
+            metadata_only,
+        ],
+        |row| {
+            let diff_projection: Option<String> = row.get(7)?;
+            let evidence_ids: String = row.get(13)?;
+            let canonical = CanonicalRuntimeActivity {
+                operation_id: row.get(1)?,
+                classifier_version: row.get(2)?,
+                activity_domain: row.get(3)?,
+                semantic_kind: row.get(4)?,
+                tool_name: row.get(5)?,
+                presentation_hint: row.get(6)?,
+                diff_projection: diff_projection
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                phase: row.get(8)?,
+                outcome: row.get(9)?,
+                credibility: row.get(10)?,
+                coverage_level: row.get(11)?,
+                source_authority: row.get(12)?,
+                source_evidence_ids: serde_json::from_str(&evidence_ids).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                first_evidence_sequence: row.get(14)?,
+                last_evidence_sequence: row.get(15)?,
+                revision: row.get(16)?,
+            };
+            Ok((row.get::<_, String>(0)?, canonical))
+        },
+    )?;
+    for row in rows {
+        let (evidence_id, canonical) = row?;
+        canonical_by_evidence_id
+            .entry(evidence_id)
+            .or_insert(canonical);
+    }
+    drop(statement);
+    for item in evidence {
+        item.canonical = canonical_by_evidence_id.remove(&item.id);
+    }
+    Ok(())
+}
+
+fn load_context_manifests(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+) -> Result<Vec<ContextManifestView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT manifest.id, manifest.agent_run_id,
+               manifest.native_binding_generation,
+               manifest.camp_message_boundary_sequence,
+               manifest.conversation_message_boundary_sequence,
+               manifest.raw_message_refs_json,
+               manifest.collaboration_state_digest,
+               manifest.run_fact_refs_json,
+               manifest.run_fact_digest,
+               manifest.current_input_source_json,
+               manifest.attachment_refs_json,
+               manifest.attachment_digest,
+               manifest.skill_exposure_json,
+               manifest.skill_exposure_digest,
+               manifest.current_input_skill_resolution_json,
+               manifest.current_input_skill_resolution_digest,
+               manifest.mcp_exposure_json,
+               manifest.mcp_exposure_digest,
+               manifest.mcp_projection_digest,
+               manifest.formatter_version,
+               manifest.rendered_payload_digest,
+               manifest.created_at,
+               manifest.history_fence_version,
+               manifest.global_public_message_boundary,
+               manifest.previous_accepted_public_boundary_sequence,
+               manifest.context_delivery_profile_version,
+               manifest.context_delivery_profile_json,
+               manifest.context_delivery_profile_digest,
+               manifest.originating_public_user_message_ref_json,
+               manifest.recent_message_refs_json,
+               manifest.omitted_message_count,
+               manifest.omitted_message_sequence_start,
+               manifest.omitted_message_sequence_end,
+               json_object(
+                   'id', bootstrap.id,
+                   'conversationId', bootstrap.conversation_id,
+                   'nativeBindingId', bootstrap.native_binding_id,
+                   'nativeBindingGeneration', bootstrap.native_binding_generation,
+                   'contractVersion', bootstrap.contract_version,
+                   'bootstrapFormatterVersion', bootstrap.bootstrap_formatter_version,
+                   'sessionCharterDigest', bootstrap.session_charter_digest,
+                   'memoryEntrypointDigest', bootstrap.memory_entrypoint_digest,
+                   'observedMemoryRevisions', json(bootstrap.observed_memory_revisions_json),
+                   'authorizationBasisDigest', bootstrap.authorization_basis_digest,
+                   'deliveryMode', bootstrap.delivery_mode,
+                   'createdAt', bootstrap.created_at
+               ),
+               delivery.id, delivery.execution_epoch, delivery.status,
+               delivery.native_input_id, delivery.boundary_camp_message_sequence,
+               delivery.prepared_at, delivery.accepted_at, delivery.resolved_at,
+               delivery.last_error, delivery.updated_at,
+               manifest.collaboration_state_included,
+               manifest.shared_message_evidence_json,
+               manifest.shared_message_evidence_digest,
+               manifest.run_fact_payload_json,
+               delivery.bootstrap_redelivery_present,
+               delivery.bootstrap_redelivery_revision,
+               delivery.bootstrap_redelivery_evidence_id,
+               delivery.bootstrap_redelivery_envelope_version,
+               delivery.bootstrap_redelivery_formatter_version,
+               manifest.omission_entries_json,
+               manifest.self_active_task_evidence_json,
+               manifest.self_active_task_evidence_digest,
+               manifest.message_projection_audience,
+               manifest.a2a_guidance_evidence_json,
+               manifest.a2a_guidance_evidence_digest,
+               manifest.workspace_fact_json,
+               manifest.workspace_fact_digest,
+               manifest.workspace_fact_included
+        FROM context_manifest AS manifest
+        JOIN native_session_bootstrap_evidence AS bootstrap
+          ON bootstrap.id = manifest.bootstrap_evidence_id
+        JOIN agent_run ON agent_run.id = manifest.agent_run_id
+        LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+        LEFT JOIN runtime_input_delivery AS delivery
+          ON delivery.id = (
+              SELECT candidate.id
+              FROM runtime_input_delivery AS candidate
+              WHERE candidate.context_manifest_id = manifest.id
+              ORDER BY candidate.execution_epoch DESC,
+                       candidate.prepared_at DESC, candidate.id DESC
+              LIMIT 1
+          )
+        WHERE COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?1
+        ORDER BY manifest.created_at DESC, manifest.id
+        "#,
+    )?;
+    let rows = statement
+        .query_map([camp_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, String>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, i64>(19)?,
+                row.get::<_, Option<String>>(20)?,
+                row.get::<_, String>(21)?,
+                row.get::<_, i64>(22)?,
+                row.get::<_, i64>(23)?,
+                row.get::<_, i64>(24)?,
+                row.get::<_, i64>(25)?,
+                row.get::<_, Option<String>>(26)?,
+                row.get::<_, Option<String>>(27)?,
+                row.get::<_, Option<String>>(28)?,
+                row.get::<_, String>(29)?,
+                row.get::<_, Option<i64>>(30)?,
+                row.get::<_, Option<i64>>(31)?,
+                row.get::<_, Option<i64>>(32)?,
+                row.get::<_, String>(33)?,
+                row.get::<_, Option<String>>(34)?,
+                row.get::<_, Option<i64>>(35)?,
+                row.get::<_, Option<String>>(36)?,
+                row.get::<_, Option<String>>(37)?,
+                row.get::<_, Option<i64>>(38)?,
+                row.get::<_, Option<String>>(39)?,
+                row.get::<_, Option<String>>(40)?,
+                row.get::<_, Option<String>>(41)?,
+                row.get::<_, Option<String>>(42)?,
+                row.get::<_, Option<String>>(43)?,
+                row.get::<_, bool>(44)?,
+                row.get::<_, String>(45)?,
+                row.get::<_, Option<String>>(46)?,
+                row.get::<_, Option<String>>(47)?,
+                row.get::<_, Option<bool>>(48)?,
+                row.get::<_, Option<i64>>(49)?,
+                row.get::<_, Option<String>>(50)?,
+                row.get::<_, Option<i64>>(51)?,
+                row.get::<_, Option<i64>>(52)?,
+                row.get::<_, String>(53)?,
+                row.get::<_, Option<String>>(54)?,
+                row.get::<_, Option<String>>(55)?,
+                row.get::<_, String>(56)?,
+                row.get::<_, Option<String>>(57)?,
+                row.get::<_, Option<String>>(58)?,
+                row.get::<_, Option<String>>(59)?,
+                row.get::<_, Option<String>>(60)?,
+                row.get::<_, bool>(61)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|row| {
+            let raw_message_refs = serde_json::from_str::<Vec<Value>>(&row.5)
+                .context("ContextManifest raw message references are invalid")?;
+            let run_fact_refs = serde_json::from_str::<Vec<RunFactRefView>>(&row.7)
+                .context("ContextManifest Run Fact references are invalid")?;
+            let shared_message_evidence = serde_json::from_str::<Vec<Value>>(&row.45)
+                .context("ContextManifest Shared Message evidence is invalid")?;
+            let run_fact_payload = row
+                .47
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
+                .context("ContextManifest Run Fact payload is invalid")?;
+            let omission_entries = serde_json::from_str::<Vec<Value>>(&row.53)
+                .context("ContextManifest omission evidence is invalid")?;
+            let self_active_task_evidence = row
+                .54
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
+                .context("ContextManifest Self Active Task evidence is invalid")?;
+            let a2a_guidance_evidence = row
+                .57
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
+                .context("ContextManifest A2A Guidance evidence is invalid")?;
+            let current_input_source = serde_json::from_str::<Value>(&row.9)
+                .context("ContextManifest Current Input source is invalid")?;
+            let attachment_refs = serde_json::from_str::<Vec<ThreadAttachmentRefView>>(&row.10)
+                .context("ContextManifest attachment references are invalid")?;
+            let skill_exposure = serde_json::from_str::<SkillExposureSnapshot>(&row.12)
+                .context("ContextManifest Skill exposure is invalid")?;
+            let current_input_skill_resolution =
+                serde_json::from_str::<CurrentInputSkillResolution>(&row.14)
+                    .context("ContextManifest Current Input Skill resolution is invalid")?;
+            let mcp_exposure = serde_json::from_str::<McpExposureSnapshot>(&row.16)
+                .context("ContextManifest MCP exposure is invalid")?;
+            let context_delivery_profile = row
+                .26
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("ContextManifest delivery profile is invalid")?;
+            let originating_public_user_message_ref = row
+                .28
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("ContextManifest originating message reference is invalid")?;
+            let recent_message_count = serde_json::from_str::<Vec<Value>>(&row.29)
+                .context("ContextManifest recent message references are invalid")?
+                .len();
+            let bootstrap = serde_json::from_str::<NativeSessionBootstrapEvidenceView>(&row.33)
+                .context("ContextManifest Native Session Bootstrap is invalid")?;
+            let delivery = row
+                .34
+                .clone()
+                .map(|id| {
+                    Ok::<RuntimeInputDeliveryView, anyhow::Error>(RuntimeInputDeliveryView {
+                        id,
+                        execution_epoch: row
+                            .35
+                            .context("Context delivery has no execution epoch")?,
+                        status: row.36.clone().context("Context delivery has no status")?,
+                        native_input_id: row.37.clone(),
+                        boundary_camp_message_sequence: row
+                            .38
+                            .context("Context delivery has no message boundary")?,
+                        prepared_at: row
+                            .39
+                            .clone()
+                            .context("Context delivery has no prepared time")?,
+                        accepted_at: row.40.clone(),
+                        resolved_at: row.41.clone(),
+                        last_error: row.42.clone(),
+                        updated_at: row
+                            .43
+                            .clone()
+                            .context("Context delivery has no updated time")?,
+                        bootstrap_redelivery_present: row.48.unwrap_or(false),
+                        bootstrap_redelivery_revision: row.49,
+                        bootstrap_redelivery_evidence_id: row.50.clone(),
+                        bootstrap_redelivery_envelope_version: row.51,
+                        bootstrap_redelivery_formatter_version: row.52,
+                    })
+                })
+                .transpose()?;
+            Ok(ContextManifestView {
+                id: row.0.clone(),
+                agent_run_id: row.1,
+                bootstrap,
+                native_binding_generation: row.2,
+                camp_message_boundary_sequence: row.3,
+                conversation_message_boundary_sequence: row.4,
+                history_fence_version: row.22,
+                global_public_message_boundary: row.23,
+                history_camps: load_context_manifest_history_camps(transaction, &row.0)?,
+                raw_message_count: raw_message_refs.len(),
+                previous_accepted_public_boundary_sequence: row.24,
+                context_delivery_profile_version: row.25,
+                context_delivery_profile,
+                context_delivery_profile_digest: row.27,
+                originating_public_user_message_ref,
+                recent_message_count,
+                omitted_message_count: row.30,
+                omitted_message_sequence_start: row.31,
+                omitted_message_sequence_end: row.32,
+                omission_entries,
+                collaboration_state_digest: row.6,
+                collaboration_state_included: row.44,
+                shared_message_evidence,
+                shared_message_evidence_digest: row.46,
+                run_fact_refs,
+                run_fact_payload,
+                run_fact_digest: row.8,
+                workspace_fact: row.59.as_deref().map(serde_json::from_str).transpose()?,
+                workspace_fact_digest: row.60,
+                workspace_fact_included: row.61,
+                current_input_source,
+                attachment_refs,
+                attachment_digest: row.11,
+                skill_exposure,
+                skill_exposure_digest: row.13,
+                current_input_skill_resolution,
+                current_input_skill_resolution_digest: row.15,
+                message_projection_audience: row.56,
+                a2a_guidance_evidence,
+                a2a_guidance_evidence_digest: row.58,
+                mcp_exposure,
+                mcp_exposure_digest: row.17,
+                mcp_projection_digest: row.18,
+                self_active_task_evidence,
+                self_active_task_evidence_digest: row.55,
+                formatter_version: row.19,
+                rendered_payload_digest: row.20,
+                delivery,
+                created_at: row.21,
+            })
+        })
+        .collect()
+}
+
+fn load_context_manifest_history_camps(
+    transaction: &Transaction<'_>,
+    context_manifest_id: &str,
+) -> Result<Vec<ContextManifestHistoryThreadView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT camp_id, camp_title, last_visible_activity_at
+        FROM context_manifest_history_camp
+        WHERE context_manifest_id = ?1
+        ORDER BY camp_id
+        "#,
+    )?;
+    statement
+        .query_map([context_manifest_id], |row| {
+            Ok(ContextManifestHistoryThreadView {
+                camp_id: row.get(0)?,
+                camp_title: row.get(1)?,
+                last_visible_activity_at: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn load_approvals(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    pending_only: bool,
+    limit: Option<i64>,
+) -> Result<Vec<ApprovalView>> {
+    load_conversation_approvals(transaction, camp_id, None, pending_only, limit)
+}
+
+pub(crate) fn load_conversation_approvals(
+    connection: &rusqlite::Connection,
+    camp_id: &str,
+    conversation_id: Option<&str>,
+    pending_only: bool,
+    limit: Option<i64>,
+) -> Result<Vec<ApprovalView>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT approval.id, approval.action_id, approval.action_kind,
+               approval.action_summary, approval.status,
+               approval.requested_for_user_id, approval.version,
+               approval.requested_at, approval.resolved_at,
+               approval.resolved_by_type, approval.resolved_by_id,
+               approval.resolution_code, approval.request_json, approval.reason,
+               agent_run.id, conversation.agent_id,
+               COALESCE(agent_run.runtime_adapter_kind, 'unknown'),
+               action_execution.native_request_method,
+               action_execution.native_request_digest,
+               agent_run.permission_semantics,
+               approval.native_options_json
+        FROM approval
+        JOIN action_execution ON action_execution.id = approval.action_id
+        JOIN agent_run ON agent_run.id = action_execution.agent_run_id
+        LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+        JOIN conversation ON conversation.id = agent_run.conversation_id
+        WHERE COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?1
+          AND (?2 = 0 OR approval.status = 'pending')
+          AND ((?4 IS NULL AND conversation.kind <> 'single_chat')
+            OR (?4 IS NOT NULL AND conversation.kind = 'single_chat' AND conversation.id = ?4))
+        ORDER BY approval.requested_at DESC, approval.id
+        LIMIT COALESCE(?3, -1)
+        "#,
+    )?;
+    statement
+        .query_map(
+            params![camp_id, pending_only, limit, conversation_id],
+            |row| {
+                let canonical_input_json = row.get::<_, String>(12)?;
+                let canonical_input =
+                    serde_json::from_str(&canonical_input_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            12,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let native_options_json = row.get::<_, String>(20)?;
+                let options =
+                    serde_json::from_str::<Vec<RuntimePermissionOptionView>>(&native_options_json)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                20,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                Ok(ApprovalView {
+                    id: row.get(0)?,
+                    action_id: row.get(1)?,
+                    action_kind: row.get(2)?,
+                    action_summary: row.get(3)?,
+                    canonical_input,
+                    reason: row.get(13)?,
+                    agent_run_id: row.get(14)?,
+                    agent_id: row.get(15)?,
+                    adapter_kind: row.get(16)?,
+                    native_method: row.get(17)?,
+                    request_digest: row.get(18)?,
+                    permission_semantics: row.get(19)?,
+                    options,
+                    status: row.get(4)?,
+                    requested_for_user_id: row.get(5)?,
+                    resolved_by_type: row.get(9)?,
+                    resolved_by_id: row.get(10)?,
+                    resolution_code: row.get(11)?,
+                    version: row.get(6)?,
+                    requested_at: row.get(7)?,
+                    resolved_at: row.get(8)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load Action Approvals")
+}
+
+fn load_actions(transaction: &Transaction<'_>, camp_id: &str) -> Result<Vec<ActionView>> {
+    let mut statement = transaction.prepare(
+        r#"
+        SELECT action_execution.id, action_execution.agent_run_id,
+               action_execution.action_kind, action_execution.action_summary,
+               action_execution.control_mode, action_execution.policy_decision,
+               action_execution.status, action_execution.action_digest,
+               action_execution.effect_disposition,
+               action_execution.not_executed_reason,
+               action_execution.version, action_execution.created_at,
+               action_execution.updated_at
+        FROM action_execution
+        JOIN agent_run ON agent_run.id = action_execution.agent_run_id
+        LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+        WHERE COALESCE(agent_run.camp_id, camp_turn.camp_id) = ?1
+        ORDER BY action_execution.created_at DESC, action_execution.id
+        "#,
+    )?;
+    statement
+        .query_map([camp_id], |row| {
+            Ok(ActionView {
+                id: row.get(0)?,
+                agent_run_id: row.get(1)?,
+                action_kind: row.get(2)?,
+                action_summary: row.get(3)?,
+                control_mode: row.get(4)?,
+                policy_decision: row.get(5)?,
+                status: row.get(6)?,
+                action_digest: row.get(7)?,
+                effect_disposition: row.get(8)?,
+                not_executed_reason: row.get(9)?,
+                version: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load Actions")
+}
+
+fn load_events(
+    transaction: &Transaction<'_>,
+    camp_id: Option<&str>,
+    after: i64,
+    through: i64,
+    limit: i64,
+    newest_first_window: bool,
+    presentation_only: bool,
+) -> Result<Vec<DomainEventView>> {
+    let tasks_enabled = crate::task_capability::enabled(transaction)?;
+    let task_join = if tasks_enabled {
+        "LEFT JOIN task ON task.id = event_log.task_id"
+    } else {
+        ""
+    };
+    let task_scope = if tasks_enabled {
+        "OR (event_log.camp_id IS NULL AND task.camp_id = ?3)"
+    } else {
+        ""
+    };
+    let task_filter = if tasks_enabled {
+        ""
+    } else {
+        "AND COALESCE(event_log.entity_type, '') <> 'task'"
+    };
+    let order = if newest_first_window { "DESC" } else { "ASC" };
+    let sql = format!(
+        r#"
+        SELECT event_log.global_sequence, event_log.event_id,
+               event_log.event_type, event_log.camp_id,
+               event_log.entity_type, event_log.entity_id,
+               event_log.actor_type, event_log.actor_id,
+               event_log.source_agent_run_id, event_log.execution_epoch,
+               event_log.payload_json, event_log.command_type,
+               event_log.result_status, event_log.result_code,
+               event_log.result_payload_json, event_log.result_entity_type,
+               event_log.result_entity_id, event_log.created_at
+        FROM event_log
+        {task_join}
+        WHERE event_log.global_sequence > ?1
+          AND event_log.global_sequence <= ?2
+          AND (?3 IS NULL
+               OR event_log.camp_id = ?3
+               {task_scope})
+          {task_filter}
+          AND (?5 = 0
+               OR event_log.entity_type = 'task'
+               OR event_log.event_type = 'camp_turn.cancel_requested')
+        ORDER BY event_log.global_sequence {order}
+        LIMIT ?4
+        "#,
+    );
+    let mut statement = transaction.prepare(&sql)?;
+    let rows = statement
+        .query_map(
+            params![after, through, camp_id, limit, presentation_only],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, String>(17)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut events = rows
+        .into_iter()
+        .map(
+            |(
+                global_sequence,
+                event_id,
+                event_type,
+                camp_id,
+                entity_type,
+                entity_id,
+                actor_type,
+                actor_id,
+                source_agent_run_id,
+                execution_epoch,
+                payload_json,
+                command_type,
+                result_status,
+                result_code,
+                result_payload_json,
+                result_entity_type,
+                result_entity_id,
+                created_at,
+            )| {
+                let payload = if event_type == "command.result" {
+                    project_persisted_command_result_event_payload(
+                        &payload_json,
+                        command_type.as_deref(),
+                        result_status.as_deref(),
+                        result_code.as_deref(),
+                        result_payload_json.as_deref(),
+                        result_entity_type.as_deref(),
+                        result_entity_id.as_deref(),
+                    )
+                } else {
+                    serde_json::from_str(&payload_json)
+                        .context("failed to decode persisted domain event payload")
+                }
+                .with_context(|| {
+                    format!(
+                        "failed to project event {} at global sequence {global_sequence}",
+                        event_id.as_deref().unwrap_or("<missing>")
+                    )
+                })?;
+                Ok(DomainEventView {
+                    global_sequence,
+                    event_id,
+                    event_type: crate::thread_compat::public_host_method(&event_type),
+                    camp_id,
+                    entity_type,
+                    entity_id,
+                    actor_type,
+                    actor_id,
+                    source_agent_run_id,
+                    execution_epoch,
+                    payload,
+                    created_at,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    if newest_first_window {
+        events.reverse();
+    }
+    Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CAMP_MESSAGE_FIND_QUERY_MAX_SCALARS, ThreadMessageFindCandidate,
+        case_insensitive_scalar_match_ranges, flatten_camp_message_find_matches,
+        select_camp_message_find_match, validate_camp_message_find_query,
+    };
+
+    #[test]
+    fn conversation_find_ranges_are_case_insensitive_non_overlapping_unicode_scalars() {
+        assert_eq!(
+            case_insensitive_scalar_match_ranges("A中a İ", "a"),
+            vec![(0, 1), (2, 3)]
+        );
+        assert_eq!(
+            case_insensitive_scalar_match_ranges("İstanbul", "i\u{307}"),
+            vec![(0, 1)]
+        );
+        assert_eq!(
+            case_insensitive_scalar_match_ranges("aaaa", "aa"),
+            vec![(0, 2), (2, 4)]
+        );
+    }
+
+    #[test]
+    fn conversation_find_flattens_orders_selects_and_wraps_without_a_database() {
+        let matches = flatten_camp_message_find_matches(
+            vec![
+                ThreadMessageFindCandidate {
+                    message_id: "later".to_string(),
+                    message_sequence: 2,
+                    body: "NEEDLE late".to_string(),
+                },
+                ThreadMessageFindCandidate {
+                    message_id: "first".to_string(),
+                    message_sequence: 1,
+                    body: "Needle 中 needle".to_string(),
+                },
+            ],
+            "needle",
+        );
+        assert_eq!(
+            matches
+                .iter()
+                .map(|item| (
+                    item.message_id.as_str(),
+                    item.occurrence_index,
+                    item.start_offset,
+                    item.end_offset,
+                ))
+                .collect::<Vec<_>>(),
+            vec![("first", 0, 0, 6), ("first", 1, 9, 15), ("later", 0, 0, 6),]
+        );
+
+        for (requested, anchor, expected_index, expected_message) in [
+            (Some(0), None, Some(0), Some("first")),
+            (Some(-1), None, Some(2), Some("later")),
+            (Some(4), None, Some(1), Some("first")),
+            (None, Some(2), Some(2), Some("later")),
+            (None, Some(3), Some(0), Some("first")),
+        ] {
+            let (selected_index, selected) =
+                select_camp_message_find_match(&matches, requested, anchor);
+            assert_eq!(selected_index, expected_index);
+            assert_eq!(
+                selected.as_ref().map(|item| item.message_id.as_str()),
+                expected_message
+            );
+        }
+        assert_eq!(
+            select_camp_message_find_match(&[], None, None),
+            (None, None)
+        );
+
+        assert!(validate_camp_message_find_query("  ").is_err());
+        assert!(
+            validate_camp_message_find_query(&"中".repeat(CAMP_MESSAGE_FIND_QUERY_MAX_SCALARS + 1))
+                .is_err()
+        );
+        assert!(validate_camp_message_find_query("中").is_ok());
+    }
+
+    #[test]
+    fn public_delivery_projection_preserves_causal_source_not_target_lineage() {
+        // Own the SQL -> public DTO seam with a minimal table, not another full Camp fixture.
+        // Existing read-model tests cover messages/evidence, not delivery source attribution.
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(r#"
+            CREATE TABLE camp_message (
+                id TEXT, camp_id TEXT, author_type TEXT, tombstoned_at TEXT,
+                camp_turn_id TEXT, addressed_agent_ids_json TEXT,
+                source_agent_run_id TEXT
+            );
+            CREATE TABLE agent_run (id TEXT, task_id TEXT);
+            CREATE TABLE camp_run_continuation (delivery_id TEXT, source_agent_run_id TEXT);
+            CREATE TABLE agent_run_input (agent_run_id TEXT, message_id TEXT, ordinal INTEGER);
+            CREATE TABLE camp_message_delivery (
+                id TEXT PRIMARY KEY, camp_id TEXT, message_id TEXT,
+                recipient_agent_id TEXT,
+                recipient_membership_version_at_admission INTEGER,
+                queue_sequence INTEGER, status TEXT, claimed_agent_run_id TEXT,
+                failure_code TEXT, version INTEGER, created_at TEXT,
+                updated_at TEXT, ended_at TEXT
+            );
+            CREATE TABLE message_delivery (
+                id TEXT, camp_id TEXT, message_id TEXT DEFAULT 'message',
+                camp_turn_id TEXT DEFAULT 'turn', task_id TEXT,
+                recipient_agent_id TEXT DEFAULT 'recipient', status TEXT,
+                dispatch_phase TEXT DEFAULT 'terminal', wait_condition TEXT,
+                dispatch_attempt_count INTEGER DEFAULT 1, retry_generation INTEGER DEFAULT 0,
+                context_manifest_id TEXT, target_agent_run_id TEXT,
+                manual_intervention_required INTEGER DEFAULT 0, failure_code TEXT,
+                version INTEGER DEFAULT 1, created_at TEXT DEFAULT '2026-08-31T00:00:00Z',
+                updated_at TEXT DEFAULT '2026-08-31T00:00:00Z', ended_at TEXT,
+                delivery_kind TEXT, dispatch_disposition TEXT DEFAULT 'dispatch',
+                completion_role TEXT DEFAULT 'required', gather_id TEXT,
+                gather_dispatch_delivery_id TEXT, recipient_canonical_position INTEGER,
+                edge_kind TEXT, target_parent_agent_run_id TEXT, return_to_agent_run_id TEXT,
+                target_conversation_id TEXT, recipient_membership_version_at_admission INTEGER DEFAULT 1,
+                source_agent_run_id TEXT, queue_sequence INTEGER DEFAULT 1
+            );
+            INSERT INTO agent_run VALUES ('current-sender', NULL);
+            INSERT INTO camp_message VALUES
+                ('current-message', 'camp', 'agent', NULL, NULL,
+                 '["current-recipient"]', 'current-sender'),
+                ('user-message', 'camp', 'user', NULL, NULL,
+                 '["current-recipient"]', NULL);
+            INSERT INTO camp_message_delivery VALUES
+                ('current', 'camp', 'current-message', 'current-recipient', 1, 2,
+                 'claimed', 'current-target', NULL, 1,
+                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z', NULL),
+                ('user-current', 'camp', 'user-message', 'current-recipient', 1, 1,
+                 'waiting', NULL, NULL, 1,
+                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z', NULL);
+            INSERT INTO message_delivery (
+                id, camp_id, status, delivery_kind, recipient_canonical_position, edge_kind,
+                source_agent_run_id, target_parent_agent_run_id, target_agent_run_id, return_to_agent_run_id
+            ) VALUES
+                ('pending', 'camp', 'pending', 'public_a2a', 0, 'forward', 'sender', 'sender', NULL, NULL),
+                ('running', 'camp', 'running', 'public_a2a', 1, 'forward', 'sender', 'sender', 'receiver', NULL),
+                ('return', 'camp', 'settled', 'public_a2a', 0, 'return', 'child', 'ancestor', 'continuation', 'caller'),
+                ('captured', 'camp', 'settled', 'public_a2a', 0, 'return', 'child', NULL, NULL, 'caller'),
+                ('current', 'camp', 'settled', 'public_a2a', 0, 'forward', 'legacy-sender', NULL, NULL, NULL);
+            UPDATE message_delivery SET dispatch_disposition = 'gather_captured', gather_id = 'gather'
+                WHERE id = 'captured';
+            INSERT INTO message_delivery (
+                id, camp_id, status, delivery_kind, gather_id, target_conversation_id
+            ) VALUES ('completion', 'camp', 'pending', 'gather_completion', 'gather', 'conversation');
+            ALTER TABLE camp_message_delivery ADD COLUMN requested_mode TEXT DEFAULT 'start';
+            CREATE TABLE context_manifest(id TEXT, source_delivery_id TEXT);
+            CREATE TABLE runtime_input_delivery(context_manifest_id TEXT, status TEXT, input_sequence INTEGER, dispatch_started_at TEXT);
+        "#).unwrap();
+        let transaction = connection.transaction().unwrap();
+        // Full Snapshot and bounded Camp-open use the same projection with different ordering.
+        for limit in [None, Some(10)] {
+            let deliveries = super::load_message_deliveries(&transaction, "camp", limit).unwrap();
+            assert_eq!(deliveries.len(), 7);
+            for delivery in deliveries {
+                let value = serde_json::to_value(&delivery).unwrap();
+                match delivery.id.as_str() {
+                    "pending" | "running" => assert_eq!(value["sourceAgentRunId"], "sender"),
+                    "return" | "captured" => assert_eq!(value["sourceAgentRunId"], "child"),
+                    "current" => {
+                        assert_eq!(value["sourceAgentRunId"], "current-sender");
+                        assert_eq!(value["targetAgentRunId"], "current-target");
+                        assert!(value["threadTurnId"].is_null());
+                    }
+                    "user-current" => {
+                        assert!(value.get("sourceAgentRunId").is_none());
+                        assert_eq!(value["status"], "waiting");
+                        assert!(value["targetAgentRunId"].is_null());
+                    }
+                    "completion" => assert!(value.get("sourceAgentRunId").is_none()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        transaction
+            .execute_batch(
+                "UPDATE camp_message_delivery SET requested_mode='steer' WHERE id='user-current';
+            INSERT INTO context_manifest VALUES('steer-manifest','user-current');
+            INSERT INTO runtime_input_delivery(context_manifest_id, status, input_sequence) VALUES('steer-manifest','delivery_unknown',1);",
+            )
+            .unwrap();
+        let pending = super::load_message_deliveries(&transaction, "camp", None).unwrap();
+        let pending = pending.iter().find(|d| d.id == "user-current").unwrap();
+        assert_eq!(pending.requested_mode.as_deref(), Some("steer"));
+        assert_eq!(
+            pending.input_delivery_status.as_deref(),
+            Some("delivery_unknown")
+        );
+        transaction
+            .execute("UPDATE runtime_input_delivery SET status='accepted'", [])
+            .unwrap();
+        let accepted = super::load_message_deliveries(&transaction, "camp", Some(10)).unwrap();
+        assert_eq!(
+            accepted
+                .iter()
+                .find(|d| d.id == "user-current")
+                .unwrap()
+                .input_delivery_status
+                .as_deref(),
+            Some("accepted")
+        );
+    }
+}
+
+#[cfg(all(test, feature = "slow-tests"))]
+#[path = "read_model/camp_open_tests.rs"]
+mod camp_open_slow_tests;
+
+#[cfg(all(test, feature = "slow-tests"))]
+mod slow_tests {
+    use super::*;
+    use crate::{
+        agent_profile::configure_test_runtime,
+        camp_attachment::ThreadAttachmentStore,
+        camp_content::StructuredThreadMessageSegment as Segment,
+        collaboration::{
+            AddThreadMemberCommand, CollaborationService, CreateThreadCommand, ProjectBindingKind,
+            RenameThreadCommand, TestThreadConversationCommand, TestThreadMessageAddress,
+            TestThreadMessageCommand,
+        },
+        command::{ActorRef, COMMAND_RESULT_STORAGE_MARKER_JSON, CommandEnvelope},
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn user_envelope<P>(command_id: &str, camp_id: Option<&str>, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::User {
+                user_id: "local_user".to_string(),
+            },
+            camp_id: camp_id.map(str::to_string),
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn snapshot_projects_current_names_from_structured_mentions() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-read-model-structured-message-{}",
+            Uuid::new_v4()
+        ));
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        let collaboration = CollaborationService::default();
+        let created = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "create-structured-read-camp",
+                    None,
+                    CreateThreadCommand::for_test_with_members(
+                        directory.join("workspace").to_string_lossy().to_string(),
+                        &["agent_2"],
+                        "agent_2",
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(ReadModelService.camp_exists(&database, &camp_id).unwrap());
+        assert!(
+            !ReadModelService
+                .camp_exists(&database, "missing-camp")
+                .unwrap()
+        );
+        let content = vec![
+            Segment::Text {
+                text: "请 ".to_string(),
+            },
+            Segment::MemberMention {
+                agent_id: "agent_2".to_string(),
+            },
+            Segment::Text {
+                text: " 处理".to_string(),
+            },
+        ];
+        let draft = ThreadAttachmentStore::new(&directory)
+            .save_content(
+                &mut database,
+                &camp_id,
+                0,
+                crate::camp_content::composer_document_from_content(&content).unwrap(),
+            )
+            .unwrap();
+        collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "send-structured-read-message",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: Some(draft.revision),
+                        body: String::new(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Default,
+                        reply_to_camp_message_id: None,
+                        execution: None,
+                    },
+                ),
+            )
+            .unwrap();
+        collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "send-legacy-read-message",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: "旧消息仍是 @muwa".to_string(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Default,
+                        reply_to_camp_message_id: None,
+                        execution: None,
+                    },
+                ),
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE agent_profile
+                SET display_name = '木瓦（新名）', version = version + 1,
+                    updated_at = '2026-08-03T00:01:00Z'
+                WHERE id = 'agent_2'
+                "#,
+                [],
+            )
+            .unwrap();
+
+        let snapshot = ReadModelService
+            .camp_snapshot(&mut database, &camp_id)
+            .unwrap();
+        assert_eq!(snapshot.schema_version, READ_MODEL_SCHEMA_VERSION);
+        let serialized_snapshot = serde_json::to_value(&snapshot).unwrap();
+        for retired_field in ["inboxMessages", "conversationInputs"] {
+            assert!(
+                serialized_snapshot.get(retired_field).is_none(),
+                "public ThreadSnapshot must not expose retired {retired_field}"
+            );
+        }
+        assert!(serialized_snapshot.get("messageDeliveries").is_some());
+        assert!(snapshot.agent_runs.iter().all(|run| {
+            serde_json::to_value(run)
+                .unwrap()
+                .get("sourceInboxMessageId")
+                .is_none()
+        }));
+        assert!(
+            serde_json::to_value(&snapshot.members[0])
+                .unwrap()
+                .get("handle")
+                .is_none()
+        );
+        assert_eq!(snapshot.messages[0].body, "请 @木瓦（新名） 处理");
+        assert_eq!(snapshot.messages[0].content, content);
+        assert_eq!(snapshot.messages[1].body, "旧消息仍是 @muwa");
+        assert_eq!(
+            snapshot.messages[1].content,
+            vec![Segment::Text {
+                text: "旧消息仍是 @muwa".to_string(),
+            }]
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snapshot_treats_accepted_input_without_shutdown_error_as_settled() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-read-model-null-unsettled-effect-{}",
+            Uuid::new_v4()
+        ));
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        configure_test_runtime(&database, &["agent_1"]);
+        let created = CollaborationService::default()
+            .create_test_camp_conversation(
+                &mut database,
+                &user_envelope(
+                    "null-unsettled-effect-create",
+                    None,
+                    TestThreadConversationCommand {
+                        project_path: workspace.to_string_lossy().to_string(),
+                        project_binding_kind: ProjectBindingKind::Directory,
+                        body: "验证空错误码投影".to_string(),
+                        address: TestThreadMessageAddress::Default,
+                        purpose: "验证外部效果布尔值非空".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"].as_str().unwrap();
+        let agent_run_id = created.result.payload["agentRunIds"][0].as_str().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO runtime_input_delivery(
+                    id, agent_run_id, execution_epoch, context_manifest_id,
+                    native_binding_id, native_binding_generation,
+                    boundary_camp_message_sequence, dynamic_payload_digest,
+                    status, native_input_id, prepared_at, accepted_at, updated_at,
+                    runtime_attachment_auth_receipt_version,
+                    runtime_attachment_auth_receipt_json,
+                    runtime_attachment_auth_receipt_digest,
+                    runtime_request_digest
+                ) VALUES (
+                    'null-unsettled-effect-input', ?1, 1,
+                    'null-unsettled-effect-manifest', 'null-unsettled-effect-binding',
+                    1, 1, 'sha256:null-unsettled-effect', 'accepted',
+                    'null-unsettled-effect-native-input', ?2, ?2, ?2,
+                    1, '{"schemaVersion":1}', 'sha256:test-auth', 'sha256:test-request'
+                )
+                "#,
+                params![agent_run_id, now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'failed', last_error_code = NULL,
+                    ended_at = ?2, updated_at = ?2
+                WHERE id = ?1
+                "#,
+                params![agent_run_id, now],
+            )
+            .unwrap();
+
+        let snapshot = ReadModelService
+            .camp_snapshot(&mut database, camp_id)
+            .unwrap();
+        let run = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == agent_run_id)
+            .unwrap();
+        assert!(!run.has_unsettled_external_effects);
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn message_around_reads_a_bounded_old_window_without_leaking_unavailable_sources() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-read-model-message-around-{}",
+            Uuid::new_v4()
+        ));
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        let collaboration = CollaborationService::default();
+        let created = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "create-message-around-camp",
+                    None,
+                    CreateThreadCommand::for_test(
+                        directory.join("workspace").to_string_lossy().to_string(),
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let other = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "create-other-message-around-camp",
+                    None,
+                    CreateThreadCommand::for_test(
+                        directory
+                            .join("other-workspace")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                ),
+            )
+            .unwrap();
+        let other_camp_id = other.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let transaction = database.connection_mut().transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    r#"
+                    INSERT INTO camp_message(
+                        id, camp_id, sequence, author_type, author_id, body,
+                        structured_content_json, content_digest, address_mode,
+                        addressed_agent_ids_json, version, created_at, updated_at
+                    ) VALUES (
+                        ?1, ?2, ?3, 'user', 'local_user', ?4,
+                        ?5, ?6, 'default', '[]', 1, ?7, ?7
+                    )
+                    "#,
+                )
+                .unwrap();
+            for sequence in 1..=1_050_i64 {
+                let message_id = format!("around-message-{sequence}");
+                let body = format!("消息 {sequence}");
+                let content =
+                    serde_json::to_string(&vec![Segment::Text { text: body.clone() }]).unwrap();
+                statement
+                    .execute(params![
+                        message_id,
+                        camp_id,
+                        sequence,
+                        body,
+                        content,
+                        format!("sha256:around-{sequence}"),
+                        format!("2026-08-01T00:00:{:02}Z", sequence % 60),
+                    ])
+                    .unwrap();
+            }
+        }
+        let attachment_path = directory.join("anchor-attachment.txt");
+        let missing_source_path = directory.join("missing-history-source.txt");
+        let source_attachments_json = json!([{
+            "id": "00000000-0000-4000-8000-000000000001",
+            "sourcePath": missing_source_path,
+            "displayName": "source.txt",
+            "kind": "file",
+            "mediaType": "text/plain",
+            "observedByteSize": 17
+        }])
+        .to_string();
+        transaction
+            .execute(
+                "UPDATE camp_message SET source_attachments_json = ?2 WHERE camp_id = ?1 AND id = 'around-message-25'",
+                params![camp_id, source_attachments_json],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                r#"
+                INSERT INTO message_attachment(
+                    id, camp_id, camp_message_id, conversation_message_id,
+                    position, display_name, media_type, byte_size,
+                    content_digest, storage_path, preview_kind,
+                    created_by_type, created_by_id, created_at
+                ) VALUES (
+                    'around-attachment', ?1, 'around-message-25', NULL,
+                    0, 'anchor.txt', 'text/plain', 12,
+                    'sha256:anchor-attachment', ?2, 'none',
+                    'user', 'local_user', '2026-08-01T00:00:00Z'
+                )
+                "#,
+                params![camp_id, attachment_path.to_string_lossy()],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let read_model = ReadModelService;
+        let recent = read_model.camp_snapshot(&mut database, &camp_id).unwrap();
+        assert_eq!(recent.messages.len(), 1_000);
+        assert!(
+            recent
+                .messages
+                .iter()
+                .all(|message| message.id != "around-message-25")
+        );
+
+        let open = read_model
+            .camp_open_projection(&mut database, &camp_id)
+            .unwrap();
+        assert_eq!(open.schema_version, CAMP_OPEN_SCHEMA_VERSION);
+        assert_eq!(open.messages.len(), CAMP_OPEN_MESSAGE_LIMIT as usize);
+        assert_eq!(open.messages.first().unwrap().sequence, 1_031);
+        assert_eq!(open.messages.last().unwrap().sequence, 1_050);
+        assert_eq!(open.coverage.messages.loaded_count, 20);
+        assert_eq!(open.coverage.messages.total_count, 1_050);
+        assert_eq!(open.coverage.messages.omitted_count, 1_030);
+        assert!(open.coverage.messages.has_earlier);
+        assert!(!open.coverage.messages.complete);
+        let serialized_open = serde_json::to_value(&open).unwrap();
+        assert!(serialized_open.get("contextManifests").is_none());
+        assert!(serialized_open.get("actions").is_none());
+
+        let earlier = read_model
+            .camp_messages_page(
+                &mut database,
+                &camp_id,
+                1_031,
+                open.through_global_sequence,
+                50,
+            )
+            .unwrap();
+        assert_eq!(earlier.schema_version, CAMP_MESSAGE_PAGE_SCHEMA_VERSION);
+        assert_eq!(earlier.messages.len(), 50);
+        assert_eq!(earlier.messages.first().unwrap().sequence, 981);
+        assert_eq!(earlier.messages.last().unwrap().sequence, 1_030);
+        assert!(earlier.has_more);
+        assert_eq!(earlier.next_before_sequence, Some(981));
+        let oldest = read_model
+            .camp_messages_page(
+                &mut database,
+                &camp_id,
+                51,
+                open.through_global_sequence,
+                100,
+            )
+            .unwrap();
+        assert_eq!(oldest.messages.len(), 50);
+        assert_eq!(oldest.messages.first().unwrap().sequence, 1);
+        assert_eq!(oldest.messages.last().unwrap().sequence, 50);
+        assert!(!oldest.has_more);
+        assert_eq!(oldest.next_before_sequence, None);
+        assert!(
+            read_model
+                .camp_messages_page(
+                    &mut database,
+                    &camp_id,
+                    1_031,
+                    open.through_global_sequence + 1,
+                    50,
+                )
+                .is_err()
+        );
+
+        let around = read_model
+            .camp_messages_around(&mut database, &camp_id, "around-message-25")
+            .unwrap();
+        assert_eq!(around.schema_version, CAMP_MESSAGE_AROUND_SCHEMA_VERSION);
+        assert_eq!(around.camp_id, camp_id);
+        assert_eq!(around.anchor_message_id, "around-message-25");
+        assert!(around.source_available);
+        assert_eq!(around.messages.len(), 41);
+        assert_eq!(around.messages.first().unwrap().sequence, 5);
+        assert_eq!(around.messages.last().unwrap().sequence, 45);
+        assert_eq!(around.next_message_sequence, Some(46));
+        assert!(
+            around
+                .messages
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+        let anchor = around
+            .messages
+            .iter()
+            .find(|message| message.id == around.anchor_message_id)
+            .unwrap();
+        assert_eq!(anchor.attachments.len(), 2);
+        assert_eq!(anchor.attachments[0].display_name, "source.txt");
+        assert_eq!(anchor.attachments[0].kind, "file");
+        assert_eq!(anchor.attachments[0].file_count, Some(1));
+        assert_eq!(
+            anchor.attachments[0].availability,
+            LocalAttachmentAvailability::Unknown
+        );
+        assert_eq!(anchor.attachments[1].display_name, "anchor.txt");
+
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE message_attachment
+                SET media_type = 'inode/directory',
+                    storage_path = '/missing/terminal-attachment',
+                    runtime_projection_state = 'failed'
+                WHERE id = 'around-attachment'
+                "#,
+                [],
+            )
+            .unwrap();
+        let failed_projection = read_model
+            .camp_messages_around(&mut database, &camp_id, "around-message-25")
+            .expect("a failed attachment source must not make Camp history unreadable");
+        let failed_attachment = &failed_projection
+            .messages
+            .iter()
+            .find(|message| message.id == failed_projection.anchor_message_id)
+            .unwrap()
+            .attachments[1];
+        assert_eq!(failed_attachment.kind, "directory");
+        assert_eq!(failed_attachment.file_count, Some(0));
+        assert_eq!(
+            failed_attachment.availability,
+            LocalAttachmentAvailability::Unknown
+        );
+
+        for (requested_camp, requested_message) in [
+            (other_camp_id.as_str(), "around-message-25"),
+            (camp_id.as_str(), "missing-message"),
+        ] {
+            let unavailable = read_model
+                .camp_messages_around(&mut database, requested_camp, requested_message)
+                .unwrap();
+            assert!(!unavailable.source_available);
+            assert!(unavailable.messages.is_empty());
+            assert_eq!(unavailable.camp_id, requested_camp);
+            assert_eq!(unavailable.anchor_message_id, requested_message);
+        }
+
+        database
+            .connection()
+            .execute(
+                "UPDATE camp_message SET tombstoned_at = '2026-08-01T01:00:00Z' WHERE id = 'around-message-25'",
+                [],
+            )
+            .unwrap();
+        let tombstoned = read_model
+            .camp_messages_around(&mut database, &camp_id, "around-message-25")
+            .unwrap();
+        assert!(!tombstoned.source_available);
+        assert!(tombstoned.messages.is_empty());
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn conversation_find_projects_only_current_camp_public_human_bodies() {
+        let (mut database, directory) = crate::test_support::fresh_schema_database_fast();
+        let collaboration = CollaborationService::default();
+        let created = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "create-conversation-find-camp",
+                    None,
+                    CreateThreadCommand::for_test(
+                        directory.join("workspace").to_string_lossy().to_string(),
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let other = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "create-other-conversation-find-camp",
+                    None,
+                    CreateThreadCommand::for_test(
+                        directory
+                            .join("other-workspace")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                ),
+            )
+            .unwrap();
+        let other_camp_id = other.result.payload["threadId"].as_str().unwrap();
+        let transaction = database.connection_mut().transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    r#"
+                    INSERT INTO camp_message(
+                        id, camp_id, sequence, author_type, author_id, body,
+                        structured_content_json, content_digest, address_mode,
+                        addressed_agent_ids_json, tombstoned_at,
+                        version, created_at, updated_at
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6,
+                        ?7, ?8, 'default', '[]', ?9,
+                        1, '2026-08-18T00:00:00Z', '2026-08-18T00:00:00Z'
+                    )
+                    "#,
+                )
+                .unwrap();
+            for (id, message_camp_id, sequence, author_type, author_id, body, tombstoned_at) in [
+                (
+                    "find-message-1",
+                    camp_id.as_str(),
+                    1,
+                    "user",
+                    "local_user",
+                    "Needle one NEEDLE",
+                    None,
+                ),
+                (
+                    "find-message-2",
+                    camp_id.as_str(),
+                    2,
+                    "system",
+                    "system",
+                    "needle hidden system",
+                    None,
+                ),
+                (
+                    "find-message-3",
+                    camp_id.as_str(),
+                    3,
+                    "agent",
+                    "agent-test",
+                    "prefix needle suffix",
+                    None,
+                ),
+                (
+                    "find-message-4",
+                    camp_id.as_str(),
+                    4,
+                    "user",
+                    "local_user",
+                    "attachment only",
+                    None,
+                ),
+                (
+                    "find-message-5",
+                    camp_id.as_str(),
+                    5,
+                    "user",
+                    "local_user",
+                    "needle late",
+                    None,
+                ),
+                (
+                    "find-message-6",
+                    camp_id.as_str(),
+                    6,
+                    "user",
+                    "local_user",
+                    "needle tombstoned",
+                    Some("2026-08-18T01:00:00Z"),
+                ),
+                (
+                    "find-other-camp-message",
+                    other_camp_id,
+                    1,
+                    "user",
+                    "local_user",
+                    "needle hidden other camp",
+                    None,
+                ),
+            ] {
+                let content = serde_json::to_string(&vec![Segment::Text {
+                    text: body.to_string(),
+                }])
+                .unwrap();
+                statement
+                    .execute(params![
+                        id,
+                        message_camp_id,
+                        sequence,
+                        author_type,
+                        author_id,
+                        body,
+                        content,
+                        format!("sha256:{id}"),
+                        tombstoned_at,
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction
+            .execute(
+                r#"
+                INSERT INTO message_attachment(
+                    id, camp_id, camp_message_id, conversation_message_id,
+                    position, display_name, media_type, byte_size,
+                    content_digest, storage_path, preview_kind,
+                    created_by_type, created_by_id, created_at
+                ) VALUES (
+                    'find-attachment', ?1, 'find-message-4', NULL,
+                    0, 'needle.txt', 'text/plain', 1,
+                    'sha256:find-attachment', '/tmp/find-attachment', 'none',
+                    'user', 'local_user', '2026-08-18T00:00:00Z'
+                )
+                "#,
+                [camp_id.as_str()],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let read_model = ReadModelService;
+        let anchored = read_model
+            .camp_messages_find(
+                &mut database,
+                &camp_id,
+                "needle",
+                None,
+                Some("find-message-3"),
+            )
+            .unwrap();
+        assert_eq!(anchored.schema_version, CAMP_MESSAGE_FIND_SCHEMA_VERSION);
+        assert_eq!(anchored.total_match_count, 4);
+        assert_eq!(anchored.selected_match_index, Some(2));
+        assert_eq!(
+            anchored.r#match,
+            Some(ThreadMessageFindMatch {
+                message_id: "find-message-3".to_string(),
+                message_sequence: 3,
+                occurrence_index: 0,
+                start_offset: 7,
+                end_offset: 13,
+            })
+        );
+
+        let selected = (0..anchored.total_match_count)
+            .map(|index| {
+                read_model
+                    .camp_messages_find(&mut database, &camp_id, "needle", Some(index), None)
+                    .unwrap()
+                    .r#match
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| (item.message_id.as_str(), item.occurrence_index))
+                .collect::<Vec<_>>(),
+            vec![
+                ("find-message-1", 0),
+                ("find-message-1", 1),
+                ("find-message-3", 0),
+                ("find-message-5", 0),
+            ]
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn conversation_find_returns_one_selected_match_from_the_transactional_high_water() {
+        let (mut database, directory) = crate::test_support::fresh_schema_database_fast();
+        let created = CollaborationService::default()
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "create-find-snapshot-camp",
+                    None,
+                    CreateThreadCommand::for_test(
+                        directory.join("workspace").to_string_lossy().to_string(),
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"].as_str().unwrap();
+        let expected_high_water: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COALESCE(MAX(global_sequence), 0) FROM event_log",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let transaction = database.connection_mut().transaction().unwrap();
+        for (id, sequence, body) in [
+            ("find-snapshot-1", 1, "needle first needle"),
+            ("find-snapshot-2", 2, "final needle"),
+        ] {
+            let content = serde_json::to_string(&vec![Segment::Text {
+                text: body.to_string(),
+            }])
+            .unwrap();
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO camp_message(
+                        id, camp_id, sequence, author_type, author_id, body,
+                        structured_content_json, content_digest, address_mode,
+                        addressed_agent_ids_json, version, created_at, updated_at
+                    ) VALUES (
+                        ?1, ?2, ?3, 'user', 'local_user', ?4,
+                        ?5, ?6, 'default', '[]', 1,
+                        '2026-08-18T00:00:00Z', '2026-08-18T00:00:00Z'
+                    )
+                    "#,
+                    params![id, camp_id, sequence, body, content, format!("sha256:{id}")],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let snapshot = ReadModelService
+            .camp_messages_find(
+                &mut database,
+                camp_id,
+                "needle",
+                None,
+                Some("find-snapshot-2"),
+            )
+            .unwrap();
+        assert_eq!(snapshot.through_global_sequence, expected_high_water);
+        assert_eq!(snapshot.total_match_count, 3);
+        assert_eq!(snapshot.selected_match_index, Some(2));
+        assert_eq!(
+            snapshot.r#match,
+            Some(ThreadMessageFindMatch {
+                message_id: "find-snapshot-2".to_string(),
+                message_sequence: 2,
+                occurrence_index: 0,
+                start_offset: 6,
+                end_offset: 12,
+            })
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn create_navigation_camp(
+        database: &mut Database,
+        collaboration: &CollaborationService,
+        command_suffix: &str,
+        project_path: &Path,
+        project_binding_kind: ProjectBindingKind,
+        title: &str,
+    ) -> String {
+        let mut command = CreateThreadCommand::for_test(project_path.to_string_lossy().to_string());
+        command.project_binding_kind = project_binding_kind;
+        let created = collaboration
+            .create_camp(
+                database,
+                &user_envelope(
+                    &format!("navigation-create-{command_suffix}"),
+                    None,
+                    command,
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        collaboration
+            .add_camp_member(
+                database,
+                &user_envelope(
+                    &format!("navigation-member-{command_suffix}"),
+                    Some(&camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_1".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let version = database
+            .connection()
+            .query_row(
+                "SELECT version FROM camp WHERE id = ?1",
+                [&camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        collaboration
+            .rename_camp(
+                database,
+                &user_envelope(
+                    &format!("navigation-title-{command_suffix}"),
+                    Some(&camp_id),
+                    RenameThreadCommand {
+                        camp_id: camp_id.clone(),
+                        title: title.to_string(),
+                        expected_version: version,
+                    },
+                ),
+            )
+            .unwrap();
+        collaboration
+            .send_test_camp_message(
+                database,
+                &user_envelope(
+                    &format!("navigation-message-{command_suffix}"),
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: format!("用户消息 {command_suffix}"),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Default,
+                        reply_to_camp_message_id: None,
+                        execution: None,
+                    },
+                ),
+            )
+            .unwrap();
+        camp_id
+    }
+
+    #[test]
+    fn navigation_groups_camps_and_reads_requested_prefixes_with_default_five() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-navigation-groups-test-{}", Uuid::new_v4()));
+        let quick_chat_root = directory.join("quick-chat");
+        let project_root = directory.join("rovai-ai");
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        let collaboration = CollaborationService::default();
+        for index in 0..6 {
+            create_navigation_camp(
+                &mut database,
+                &collaboration,
+                &format!("quick-chat-{index}"),
+                &quick_chat_root,
+                ProjectBindingKind::QuickChat,
+                &format!("快速对话 {index}"),
+            );
+        }
+        for index in 0..6 {
+            create_navigation_camp(
+                &mut database,
+                &collaboration,
+                &format!("project-{index}"),
+                &project_root,
+                ProjectBindingKind::Directory,
+                &format!("项目对话 {index}"),
+            );
+        }
+
+        let read_model = ReadModelService;
+        let snapshot = read_model.navigation_snapshot(&mut database).unwrap();
+        assert_eq!(snapshot.schema_version, NAVIGATION_SCHEMA_VERSION);
+        assert_eq!(snapshot.quick_chat.total_count, 6);
+        assert_eq!(snapshot.quick_chat.recent_camps.len(), 5);
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.projects[0].name, "rovai-ai");
+        assert_eq!(snapshot.projects[0].total_count, 6);
+        assert_eq!(snapshot.projects[0].recent_camps.len(), 5);
+        assert!(
+            snapshot
+                .quick_chat
+                .recent_camps
+                .iter()
+                .chain(
+                    snapshot
+                        .projects
+                        .iter()
+                        .flat_map(|project| &project.recent_camps)
+                )
+                .all(|camp| camp.channel_source.is_none())
+        );
+        assert_eq!(
+            snapshot.projects[0].project_path,
+            project_root.to_string_lossy()
+        );
+        assert_eq!(
+            snapshot.projects[0].project_key,
+            format!("directory:{}", project_root.to_string_lossy())
+        );
+
+        let page = read_model
+            .navigation_group_camps(&mut database, None, 2, 3)
+            .unwrap();
+        assert_eq!(page.total_count, 6);
+        assert_eq!(page.camps.len(), 3);
+        assert_eq!(page.next_offset, Some(5));
+        let final_page = read_model
+            .navigation_group_camps(&mut database, None, 5, 3)
+            .unwrap();
+        assert_eq!(final_page.camps.len(), 1);
+        assert_eq!(final_page.next_offset, None);
+
+        // Exact lookup must reach beyond the five recent Camps without reading history.
+        let older = &final_page.camps[0];
+        assert!(
+            snapshot
+                .quick_chat
+                .recent_camps
+                .iter()
+                .all(|camp| camp.id != older.id)
+        );
+        for camp in [older, &snapshot.projects[0].recent_camps[0]] {
+            let found = read_model
+                .find_navigation_camp(&database, &ThreadId::parse(&camp.id).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.id, camp.id);
+            assert_eq!(found.title, camp.title);
+            assert_eq!(found.project_path, camp.project_path);
+            assert_eq!(found.activation_state, camp.activation_state);
+            assert_eq!(found.project_binding_kind, camp.project_binding_kind);
+        }
+        assert!(
+            read_model
+                .find_navigation_camp(&database, &ThreadId::new())
+                .unwrap()
+                .is_none()
+        );
+
+        let plan = database
+            .connection()
+            .prepare(&format!("EXPLAIN QUERY PLAN {FIND_NAVIGATION_CAMP_SQL}"))
+            .unwrap()
+            .query_map([&older.id], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH camp USING INDEX") && step.contains("id=?")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.starts_with("SCAN ")),
+            "{plan:?}"
+        );
+
+        // Existing transaction fixture owns default, independent group selection,
+        // minimum and oversized prefix contracts; no parallel database fixture.
+        for (quick_limit, project_limit, expected_quick, expected_project) in
+            [(0, 0, 5, 5), (15, 5, 6, 5), (5, 15, 5, 6), (25, 25, 6, 6)]
+        {
+            let expanded = read_model
+                .navigation_snapshot_with_group_limits(
+                    &mut database,
+                    &BTreeMap::from([
+                        ("quick-chat".to_string(), quick_limit),
+                        (snapshot.projects[0].project_key.clone(), project_limit),
+                        ("directory:/unknown".to_string(), usize::MAX),
+                    ]),
+                    &crate::draft_client::DraftClient::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                expanded.through_global_sequence,
+                snapshot.through_global_sequence
+            );
+            assert_eq!(expanded.quick_chat.recent_camps.len(), expected_quick);
+            assert_eq!(expanded.projects[0].recent_camps.len(), expected_project);
+            assert_eq!(expanded.projects.len(), 1);
+            for (actual, expected) in expanded.quick_chat.recent_camps.iter().zip(
+                read_model
+                    .navigation_group_camps(&mut database, None, 0, 200)
+                    .unwrap()
+                    .camps,
+            ) {
+                assert_eq!(actual.id, expected.id);
+                assert_eq!(actual.marker, expected.marker);
+            }
+        }
+
+        // Empty pending Camps remain outside navigation; a saved draft makes one discoverable.
+        let mut pending_command =
+            CreateThreadCommand::for_test(project_root.to_string_lossy().to_string());
+        pending_command.activation_state = crate::collaboration::ThreadActivationState::Pending;
+        let pending = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope("navigation-pending", None, pending_command),
+            )
+            .unwrap();
+        let pending_id =
+            ThreadId::parse(pending.result.payload["threadId"].as_str().unwrap()).unwrap();
+        assert!(
+            read_model
+                .find_navigation_camp(&database, &pending_id)
+                .unwrap()
+                .is_none()
+        );
+        ThreadAttachmentStore::new(&directory)
+            .save_body(&mut database, pending_id.as_str(), "saved draft")
+            .unwrap();
+        assert_eq!(
+            read_model
+                .find_navigation_camp(&database, &pending_id)
+                .unwrap()
+                .unwrap()
+                .activation_state,
+            "pending"
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn navigation_order_advances_only_for_published_human_messages() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-navigation-human-order-test-{}",
+            Uuid::new_v4()
+        ));
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        // Exercise the persisted author/publication join and creation-time fallback,
+        // without launching a Runtime or duplicating channel admission fixtures.
+        database.connection().execute_batch(
+            r#"
+            INSERT INTO camp(id, title, project_binding_kind, project_path, created_at, updated_at)
+            VALUES ('order-a', 'A', 'quick_chat', '/quick-chat', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                   ('order-b', 'B', 'quick_chat', '/quick-chat', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z');
+            "#,
+        ).unwrap();
+        let mut previous = ReadModelService.navigation_snapshot(&mut database).unwrap();
+        assert_eq!(previous.quick_chat.recent_camps[0].id, "order-b");
+        for (index, (event_type, author, advances)) in [
+            ("camp_message.sent", Some("agent"), false),
+            ("camp_message.public_a2a_sent", Some("agent"), false),
+            ("camp_message.sent", Some("system"), false),
+            ("agent_run.queued", None, false),
+            ("agent_run.started", None, false),
+            ("agent_run.succeeded", None, false),
+            ("agent_run.failed", None, false),
+            ("agent_run.cancelled", None, false),
+            ("camp_turn.status_changed", None, false),
+            ("camp_message.created", Some("user"), false),
+            ("camp_message.sent", Some("user"), true),
+            ("camp_message.sent", Some("external_principal"), true),
+            ("camp_message.public_a2a_sent", Some("agent"), false),
+            ("agent_run.succeeded", None, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = previous.quick_chat.recent_camps.last().unwrap();
+            let camp_id = target.id.clone();
+            let entity_id = format!("order-event-{index}");
+            // Equal timestamps on successive human messages also exercise the sequence tie-break.
+            let timestamp = "2026-02-01T00:00:00Z";
+            if let Some(author) = author {
+                database
+                    .connection()
+                    .execute(
+                        r#"
+                    INSERT INTO camp_message(
+                        id, camp_id, sequence, author_type, author_id, body,
+                        structured_content_json, content_digest, address_mode,
+                        addressed_agent_ids_json, version, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 'order-author', 'message', '[]', ?1,
+                              'default', '[]', 1, ?5, ?5)
+                    "#,
+                        params![entity_id, camp_id, index as i64 + 1, author, timestamp],
+                    )
+                    .unwrap();
+            }
+            database
+                .connection()
+                .execute(
+                    r#"
+                INSERT INTO event_log(event_id, event_type, payload_json, camp_id,
+                                      entity_type, entity_id, actor_type, actor_id, created_at)
+                VALUES (?1, ?2, '{"status":"cancelled"}', ?3, ?4, ?1, 'system', 'order-test', ?5)
+                "#,
+                    params![
+                        entity_id,
+                        event_type,
+                        camp_id,
+                        if author.is_some() {
+                            "camp_message"
+                        } else {
+                            "agent_run"
+                        },
+                        timestamp
+                    ],
+                )
+                .unwrap();
+            let next = ReadModelService.navigation_snapshot(&mut database).unwrap();
+            if advances {
+                let first = &next.quick_chat.recent_camps[0];
+                assert_eq!(first.id, camp_id, "{event_type}/{author:?}");
+                assert_eq!(first.last_activity_at, timestamp);
+                assert!(first.last_activity_global_sequence > target.last_activity_global_sequence);
+            } else {
+                for (actual, expected) in next
+                    .quick_chat
+                    .recent_camps
+                    .iter()
+                    .zip(&previous.quick_chat.recent_camps)
+                {
+                    assert_eq!(actual.id, expected.id, "{event_type}/{author:?}");
+                    assert_eq!(actual.last_activity_at, expected.last_activity_at);
+                    assert_eq!(
+                        actual.last_activity_global_sequence,
+                        expected.last_activity_global_sequence
+                    );
+                }
+            }
+            previous = next;
+        }
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn navigation_reply_marker_requires_publication_and_view_ack_is_monotonic() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-navigation-marker-test-{}", Uuid::new_v4()));
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        configure_test_runtime(&database, &["agent_1"]);
+        let collaboration = CollaborationService::default();
+        let created = collaboration
+            .create_test_camp_conversation(
+                &mut database,
+                &user_envelope(
+                    "navigation-running-camp",
+                    None,
+                    TestThreadConversationCommand {
+                        project_path: directory.join("workspace").to_string_lossy().to_string(),
+                        project_binding_kind: crate::collaboration::ProjectBindingKind::Directory,
+                        body: "请开始工作".to_string(),
+                        address: TestThreadMessageAddress::Default,
+                        purpose: "执行测试".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let read_model = ReadModelService;
+        let running = read_model.navigation_snapshot(&mut database).unwrap();
+        assert_eq!(running.projects[0].recent_camps[0].marker, "loading");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'failed', ended_at = ?2, updated_at = ?2,
+                    last_error_code = 'test_failure'
+                WHERE id = ?1
+                "#,
+                params![
+                    created.result.payload["agentRunIds"][0].as_str().unwrap(),
+                    now
+                ],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE camp_turn SET status = 'failed', ended_at = ?2, updated_at = ?2 WHERE camp_id = ?1",
+                params![camp_id, now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO event_log(
+                    event_id, event_type, payload_json, camp_id,
+                    entity_type, entity_id, actor_type, actor_id, created_at
+                ) VALUES (?1, 'agent_run.failed', '{}', ?2, 'agent_run', ?3,
+                          'system', 'test-runtime', ?4)
+                "#,
+                params![
+                    Uuid::new_v4().to_string(),
+                    camp_id,
+                    created.result.payload["agentRunIds"][0].as_str().unwrap(),
+                    now,
+                ],
+            )
+            .unwrap();
+
+        let terminal_only = read_model.navigation_snapshot(&mut database).unwrap();
+        assert_eq!(
+            terminal_only.projects[0].recent_camps[0].marker, "none",
+            "Run failure is not a new reply"
+        );
+        database.connection().execute("INSERT INTO camp_message(id,camp_id,sequence,author_type,author_id,body,structured_content_json,content_digest,address_mode,addressed_agent_ids_json,version,created_at,updated_at)
+          VALUES('published-reply',?1,2,'agent','agent_1','reply','[{\"kind\":\"text\",\"text\":\"reply\"}]','reply','default','[]',1,?2,?2)",params![camp_id,now]).unwrap();
+        database.connection().execute("INSERT INTO event_log(event_id,event_type,payload_json,camp_id,entity_type,entity_id,actor_type,actor_id,created_at) VALUES('reply-publication','camp_message.sent','{}',?1,'camp_message','published-reply','system','test-runtime',?2)",params![camp_id,now]).unwrap();
+        let completed = read_model.navigation_snapshot(&mut database).unwrap();
+        let item = &completed.projects[0].recent_camps[0];
+        assert_eq!(item.marker, "unread_completed");
+        assert!(item.latest_completion_global_sequence > 0);
+        assert_eq!(
+            item.last_activity_at,
+            running.projects[0].recent_camps[0].last_activity_at
+        );
+        assert_eq!(
+            item.last_activity_global_sequence,
+            running.projects[0].recent_camps[0].last_activity_global_sequence
+        );
+        let activity_at = item.last_activity_at.clone();
+        let acknowledged = read_model
+            .acknowledge_camp_viewed(&mut database, &camp_id, completed.through_global_sequence)
+            .unwrap();
+        assert_eq!(
+            acknowledged.last_seen_global_sequence,
+            completed.through_global_sequence
+        );
+        let older_ack = read_model
+            .acknowledge_camp_viewed(&mut database, &camp_id, 1)
+            .unwrap();
+        assert!(acknowledged.changed);
+        assert!(!older_ack.changed);
+        assert_eq!(acknowledged.navigation.camps[0].marker, "none");
+        assert_eq!(
+            older_ack.last_seen_global_sequence,
+            completed.through_global_sequence
+        );
+        let viewed = read_model.navigation_snapshot(&mut database).unwrap();
+        assert_eq!(viewed.projects[0].recent_camps[0].marker, "none");
+
+        let version: i64 = database
+            .connection()
+            .query_row(
+                "SELECT version FROM camp WHERE id = ?1",
+                [&camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        collaboration
+            .rename_camp(
+                &mut database,
+                &user_envelope(
+                    "navigation-rename-after-completion",
+                    Some(&camp_id),
+                    RenameThreadCommand {
+                        camp_id: camp_id.clone(),
+                        title: "重命名不改变活动".to_string(),
+                        expected_version: version,
+                    },
+                ),
+            )
+            .unwrap();
+        let renamed = read_model.navigation_snapshot(&mut database).unwrap();
+        assert_eq!(
+            renamed.projects[0].recent_camps[0].last_activity_at,
+            activity_at
+        );
+        assert_eq!(
+            renamed.projects[0].recent_camps[0].title,
+            "重命名不改变活动"
+        );
+
+        let published_reply_sequence =
+            renamed.projects[0].recent_camps[0].latest_completion_global_sequence;
+        database.connection().execute("INSERT INTO event_log(event_id,event_type,payload_json,camp_id,entity_type,entity_id,actor_type,actor_id,created_at)
+            VALUES('reply-duplicate','camp_message.public_a2a_sent','{}',?1,'camp_message','published-reply','system','test-runtime',?2)",params![camp_id,now]).unwrap();
+        let duplicate = read_model.navigation_snapshot(&mut database).unwrap();
+        assert_eq!(
+            duplicate.projects[0].recent_camps[0].latest_completion_global_sequence,
+            published_reply_sequence,
+            "a second publication event does not create a newer reply"
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE camp_message SET tombstoned_at = ?1 WHERE id = 'published-reply'",
+                params![now],
+            )
+            .unwrap();
+        let withdrawn = read_model.navigation_snapshot(&mut database).unwrap();
+        assert_eq!(
+            withdrawn.projects[0].recent_camps[0].latest_completion_global_sequence,
+            0
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snapshot_marker_and_incremental_events_have_no_lost_window() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-read-model-test-{}", Uuid::new_v4()));
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        let collaboration = CollaborationService::default();
+        let camp = collaboration
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    "read-create-camp",
+                    None,
+                    CreateThreadCommand::for_test(workspace.to_string_lossy().to_string()),
+                ),
+            )
+            .unwrap();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        collaboration
+            .add_camp_member(
+                &mut database,
+                &user_envelope(
+                    "read-add-member",
+                    Some(&camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "read-first-message",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: "快照内消息".to_string(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Default,
+                        reply_to_camp_message_id: None,
+                        execution: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let read_model = ReadModelService;
+        let snapshot = read_model.camp_snapshot(&mut database, &camp_id).unwrap();
+        assert_eq!(snapshot.schema_version, READ_MODEL_SCHEMA_VERSION);
+        assert_eq!(snapshot.messages.len(), 1);
+        assert!(snapshot.messages[0].timeline_global_sequence.is_some());
+        assert!(
+            snapshot
+                .timeline
+                .iter()
+                .all(|event| event.global_sequence <= snapshot.through_global_sequence)
+        );
+
+        collaboration
+            .send_test_camp_message(
+                &mut database,
+                &user_envelope(
+                    "read-after-snapshot",
+                    Some(&camp_id),
+                    TestThreadMessageCommand {
+                        camp_id: camp_id.clone(),
+                        draft_revision: None,
+                        body: "快照后消息".to_string(),
+                        prepared_attachment_ids: Vec::new(),
+                        address: TestThreadMessageAddress::Default,
+                        reply_to_camp_message_id: None,
+                        execution: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let first_batch = read_model
+            .events_since(
+                &mut database,
+                Some(&camp_id),
+                snapshot.through_global_sequence,
+                100,
+            )
+            .unwrap();
+        assert_eq!(first_batch.schema_version, EVENT_BATCH_SCHEMA_VERSION);
+        assert!(!first_batch.reset_required);
+        assert!(!first_batch.events.is_empty());
+        assert!(first_batch.events.iter().all(|event| {
+            event.global_sequence > snapshot.through_global_sequence
+                && event.global_sequence <= first_batch.through_global_sequence
+        }));
+        let replay = read_model
+            .events_since(
+                &mut database,
+                Some(&camp_id),
+                snapshot.through_global_sequence,
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            first_batch
+                .events
+                .iter()
+                .map(|event| event.global_sequence)
+                .collect::<Vec<_>>(),
+            replay
+                .events
+                .iter()
+                .map(|event| event.global_sequence)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first_batch.next_global_sequence,
+            first_batch.through_global_sequence
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn execution_evidence_is_counted_in_snapshot_and_paged_by_agent_run() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-evidence-page-test-{}", Uuid::new_v4()));
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        configure_test_runtime(&database, &["agent_1"]);
+        let created = CollaborationService::default()
+            .create_test_camp_conversation(
+                &mut database,
+                &user_envelope(
+                    "evidence-page-create",
+                    None,
+                    TestThreadConversationCommand {
+                        project_path: workspace.to_string_lossy().to_string(),
+                        project_binding_kind: ProjectBindingKind::Directory,
+                        body: "记录执行过程".to_string(),
+                        address: TestThreadMessageAddress::Default,
+                        purpose: "验证执行过程分页".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"].as_str().unwrap();
+        let agent_run_id = created.result.payload["agentRunIds"][0].as_str().unwrap();
+        crate::execution_storage_probe::compare(&database, camp_id, agent_run_id, &directory);
+        let now = chrono::Utc::now().to_rfc3339();
+        for sequence in 1..=3 {
+            database
+                .connection()
+                .execute(
+                    r#"
+                    INSERT INTO agent_run_execution_evidence(
+                        id, agent_run_id, execution_epoch, sequence,
+                        event_type, kind, phase, source_event_key,
+                        payload_preview_json, content_blob_id,
+                        content_byte_count, is_truncated, occurred_at,
+                        revision, change_sequence, updated_at
+                    ) VALUES (
+                        ?1, ?2, 0, ?3, 'agent.text.delta', 'narration',
+                        'updated', NULL, ?4, NULL, 32, 0, ?5, 1, ?3, ?5
+                    )
+                    "#,
+                    params![
+                        format!("evidence-{sequence}"),
+                        agent_run_id,
+                        sequence,
+                        json!({ "itemId": null, "delta": format!("片段{sequence}") }).to_string(),
+                        now,
+                    ],
+                )
+                .unwrap();
+        }
+        database.connection().execute(
+            "UPDATE agent_run_execution_evidence SET event_type = 'activity.started', kind = 'command', phase = 'started', payload_preview_json = ?1 WHERE id = 'evidence-3'",
+            [json!({"item": {"id": "command-1", "type": "commandExecution", "command": "TOKEN=fixture-value cargo test", "status": "inProgress"}}).to_string()],
+        ).unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO agent_run_execution_evidence(
+                    id, agent_run_id, execution_epoch, sequence,
+                    event_type, kind, phase, source_event_key,
+                    payload_preview_json, content_blob_id,
+                    content_byte_count, is_truncated, occurred_at,
+                    revision, change_sequence, updated_at
+                ) VALUES (
+                    'evidence-4', ?1, 0, 4, 'activity.completed', 'command',
+                    'completed', 'activity.completed:command-1:completed',
+                    ?2, NULL, 96, 0, ?3, 1, 4, ?3
+                )
+                "#,
+                params![
+                    agent_run_id,
+                    json!({
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "status": "completed",
+                            "aggregatedOutput": "fixture output must load only on expansion"
+                        }
+                    })
+                    .to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET execution_evidence_change_sequence = 4 WHERE id = ?1",
+                [agent_run_id],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO canonical_runtime_activity(
+                    agent_run_id, execution_epoch, operation_id, classifier_version,
+                    activity_domain, semantic_kind, tool_name, presentation_hint,
+                    phase, outcome, credibility, coverage_level, source_authority,
+                    source_evidence_ids_json, first_evidence_sequence,
+                    last_evidence_sequence, revision, created_at, updated_at
+                ) VALUES (
+                    ?1, 0, 'operation-command-1', 'activity-v1',
+                    'shell', 'shell.execute', NULL, '执行 Shell 命令',
+                    'terminal', 'succeeded', 'runtime_structured', 'fine_grained',
+                    'runtime', '["evidence-3","evidence-4"]', 3, 4, 1, ?2, ?2
+                )
+                "#,
+                params![agent_run_id, now],
+            )
+            .unwrap();
+
+        let read_model = ReadModelService;
+        let snapshot = read_model.camp_snapshot(&mut database, camp_id).unwrap();
+        assert_eq!(snapshot.agent_runs[0].execution_evidence_count, 4);
+        assert_eq!(
+            snapshot
+                .execution_evidence
+                .iter()
+                .find(|evidence| evidence.id == "evidence-4")
+                .and_then(|evidence| evidence.canonical.as_ref())
+                .map(|canonical| canonical.activity_domain.as_str()),
+            Some("shell")
+        );
+        assert_eq!(
+            snapshot
+                .execution_evidence
+                .iter()
+                .find(|evidence| evidence.id == "evidence-3")
+                .and_then(|evidence| evidence.canonical.as_ref())
+                .map(|canonical| canonical.operation_id.as_str()),
+            Some("operation-command-1")
+        );
+
+        let first = read_model
+            .agent_run_execution_evidence_page(&mut database, camp_id, agent_run_id, 0, 2)
+            .unwrap();
+        assert_eq!(first.schema_version, EXECUTION_EVIDENCE_PAGE_SCHEMA_VERSION);
+        assert_eq!(first.requested_after_sequence, 0);
+        assert_eq!(first.next_after_sequence, 2);
+        assert_eq!(first.through_sequence, 4);
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .evidence
+                .iter()
+                .map(|evidence| evidence.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let second = read_model
+            .agent_run_execution_evidence_page(
+                &mut database,
+                camp_id,
+                agent_run_id,
+                first.next_after_sequence,
+                2,
+            )
+            .unwrap();
+        assert!(!second.has_more);
+        assert_eq!(second.next_after_sequence, 4);
+        assert_eq!(second.evidence.len(), 2);
+        assert_eq!(
+            second.evidence[0].payload["item"]["command"],
+            "TOKEN=fixture-value cargo test"
+        );
+        assert_eq!(
+            second.evidence[0]
+                .canonical
+                .as_ref()
+                .map(|canonical| canonical.operation_id.as_str()),
+            Some("operation-command-1")
+        );
+        assert_eq!(
+            second.evidence[1]
+                .canonical
+                .as_ref()
+                .map(|canonical| canonical.semantic_kind.as_deref()),
+            Some(Some("shell.execute"))
+        );
+        assert!(
+            read_model
+                .agent_run_execution_evidence_page(
+                    &mut database,
+                    "another-camp",
+                    agent_run_id,
+                    0,
+                    2,
+                )
+                .is_err()
+        );
+
+        let latest =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, None, 1)
+                .unwrap();
+        assert_eq!(latest.evidence.len(), 1);
+        assert_eq!(latest.evidence[0].sequence, 3);
+        assert_eq!(latest.evidence[0].id, "evidence-4");
+        assert_eq!(
+            latest.evidence[0].payload["item"]["command"],
+            "TOKEN=fixture-value cargo test"
+        );
+        assert!(
+            latest.evidence[0].payload["item"]
+                .get("aggregatedOutput")
+                .is_none()
+        );
+        assert!(latest.evidence[0].is_truncated);
+        assert_eq!(latest.next_before_sequence, Some(3));
+        // The operation stays at display position 3 even though completion changed raw sequence 4.
+        let delta =
+            crate::execution_window::read_changes(&mut database, camp_id, agent_run_id, 3, &[], 1)
+                .unwrap();
+        assert_eq!(delta.evidence.len(), 1);
+        assert_eq!(delta.evidence[0].sequence, 3);
+        assert_eq!(delta.evidence[0].id, "evidence-4");
+        assert_eq!(delta.next_after_change_sequence, 4);
+        assert!(!delta.has_more);
+        assert!(
+            delta.evidence[0].payload["item"]
+                .get("aggregatedOutput")
+                .is_none()
+        );
+        let first_delta =
+            crate::execution_window::read_changes(&mut database, camp_id, agent_run_id, 0, &[], 1)
+                .unwrap();
+        assert!(first_delta.has_more);
+        assert_eq!(first_delta.next_after_change_sequence, 1);
+        let second_delta =
+            crate::execution_window::read_changes(&mut database, camp_id, agent_run_id, 1, &[], 1)
+                .unwrap();
+        assert_eq!(second_delta.next_after_change_sequence, 2);
+        let forward = crate::execution_window::read_range(
+            &mut database,
+            camp_id,
+            agent_run_id,
+            None,
+            Some(1),
+            1,
+        )
+        .unwrap();
+        assert_eq!(forward.evidence[0].sequence, 2);
+        assert_eq!(forward.next_after_sequence, Some(2));
+        assert!(
+            crate::execution_window::read_changes(
+                &mut database,
+                "another-camp",
+                agent_run_id,
+                0,
+                &[],
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            crate::execution_window::read_changes(&mut database, camp_id, agent_run_id, 99, &[], 1)
+                .is_err()
+        );
+        let older = crate::execution_window::read_page(
+            &mut database,
+            camp_id,
+            agent_run_id,
+            latest.next_before_sequence,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            older
+                .evidence
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!older.has_more);
+        assert!(
+            crate::execution_window::read_page(
+                &mut database,
+                "another-camp",
+                agent_run_id,
+                None,
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(0), 1)
+                .is_err()
+        );
+
+        let transaction = database.connection_mut().transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    r#"
+                    INSERT INTO agent_run_execution_evidence(
+                        id, agent_run_id, execution_epoch, sequence,
+                        event_type, kind, phase, source_event_key,
+                        payload_preview_json, content_blob_id,
+                        content_byte_count, is_truncated, occurred_at
+                    ) VALUES (
+                        ?1, ?2, 0, ?3, 'agent.text.delta', 'narration',
+                        'updated', NULL, ?4, NULL, 32, 0, ?5
+                    )
+                    "#,
+                )
+                .unwrap();
+            for sequence in 5..=85 {
+                statement
+                    .execute(params![
+                        format!("evidence-{sequence}"),
+                        agent_run_id,
+                        sequence,
+                        json!({ "itemId": null, "delta": format!("片段{sequence}") }).to_string(),
+                        now,
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+
+        let open = read_model
+            .camp_open_projection(&mut database, camp_id)
+            .unwrap();
+        assert!(open.execution_evidence.is_empty());
+        assert_eq!(
+            open.agent_runs
+                .iter()
+                .find(|run| run.id == agent_run_id)
+                .map(|run| run.execution_evidence_count),
+            Some(85)
+        );
+        assert!(
+            serde_json::to_value(&open).unwrap()["coverage"]
+                .get("executionEvidence")
+                .is_none()
+        );
+        database.connection().execute("UPDATE canonical_runtime_activity SET phase = 'started', outcome = 'unsettled' WHERE operation_id = 'operation-command-1'", []).unwrap();
+        let pinned =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, None, 2)
+                .unwrap();
+        assert_eq!(
+            pinned
+                .evidence
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![84, 85]
+        );
+        assert_eq!(pinned.next_before_sequence, Some(84));
+        assert_eq!(pinned.active_evidence.len(), 1);
+        assert_eq!(pinned.active_evidence[0].sequence, 3);
+        database.connection().execute("UPDATE canonical_runtime_activity SET phase = 'terminal', outcome = 'succeeded' WHERE operation_id = 'operation-command-1'", []).unwrap();
+        let settled =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, None, 2)
+                .unwrap();
+        assert!(settled.active_evidence.is_empty());
+
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO agent_run_execution_evidence(
+                    id, agent_run_id, execution_epoch, sequence,
+                    event_type, kind, phase, source_event_key,
+                    payload_preview_json, content_blob_id,
+                    content_byte_count, is_truncated, occurred_at
+                ) VALUES (
+                    'evidence-compaction', ?1, 0, 86,
+                    'runtime.compaction.display', 'step', 'completed',
+                    'runtime.compaction.display:compact-1:completed',
+                    ?2, NULL, 96, 0, ?3
+                )
+                "#,
+                params![
+                    agent_run_id,
+                    json!({
+                        "schemaVersion": 1,
+                        "compactionId": "compact-1",
+                        "adapterKind": "codex-cli",
+                        "phase": "completed"
+                    })
+                    .to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+        let local = read_model
+            .agent_run_execution_evidence_page(&mut database, camp_id, agent_run_id, 85, 2)
+            .unwrap();
+        assert_eq!(local.evidence[0].event_type, "runtime.compaction.display");
+        let transaction = database.connection_mut().transaction().unwrap();
+        let public = public_execution_evidence_for_agent_run(&transaction, agent_run_id).unwrap();
+        assert!(
+            public
+                .iter()
+                .all(|evidence| evidence.event_type != "runtime.compaction.display")
+        );
+        transaction.commit().unwrap();
+
+        // A CLI carrier and its Core operation may straddle a page boundary.
+        // Exact result association travels as metadata, without either output body.
+        let response = json!({"taskId": "fixture-task", "title": "fixture"});
+        let response_digest = crate::command::canonical_json_digest(&response).unwrap();
+        for (id, sequence, event_type, payload) in [
+            (
+                "carrier-start",
+                90,
+                "activity.started",
+                json!({"item": {"id": "carrier", "type": "commandExecution", "command": "rovai task get --task-id fixture-task --json", "status": "inProgress"}}),
+            ),
+            (
+                "core-get",
+                91,
+                "runtime.action",
+                json!({"canonicalTool": "team.get_task", "sourceAuthority": "core", "agentOutputDigest": response_digest, "coreEnvelope": {"ok": true, "operation": "team.get_task"}}),
+            ),
+            (
+                "carrier-end",
+                94,
+                "activity.completed",
+                json!({"resultDigest": response_digest, "item": {"id": "carrier", "type": "commandExecution", "status": "completed", "aggregatedOutput": response.to_string()}}),
+            ),
+        ] {
+            database.connection().execute(
+                "INSERT INTO agent_run_execution_evidence(id, agent_run_id, execution_epoch, sequence, event_type, kind, phase, payload_preview_json, content_byte_count, is_truncated, occurred_at)
+                 VALUES(?1, ?2, 0, ?3, ?4, 'command', 'completed', ?5, 100, 0, ?6)",
+                params![id, agent_run_id, sequence, event_type, payload.to_string(), now],
+            ).unwrap();
+        }
+        for (id, domain, authority, credibility, sources, first, last) in [
+            (
+                "carrier",
+                "shell",
+                "runtime",
+                "runtime_structured",
+                "[\"carrier-start\",\"carrier-end\"]",
+                90,
+                94,
+            ),
+            (
+                "core-get",
+                "tool",
+                "core",
+                "core_verified",
+                "[\"core-get\"]",
+                91,
+                91,
+            ),
+        ] {
+            database.connection().execute(
+                "INSERT INTO canonical_runtime_activity(agent_run_id, execution_epoch, operation_id, classifier_version, activity_domain, phase, outcome, credibility, coverage_level, source_authority, source_evidence_ids_json, first_evidence_sequence, last_evidence_sequence, revision, created_at, updated_at)
+                 VALUES(?1, 0, ?2, 'activity-v1', ?3, 'terminal', 'succeeded', ?4, 'fine_grained', ?5, ?6, ?7, ?8, 1, ?9, ?9)",
+                params![agent_run_id, id, domain, credibility, authority, sources, first, last, now],
+            ).unwrap();
+        }
+        let carrier =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(91), 1)
+                .unwrap();
+        assert_eq!(carrier.evidence[0].sequence, 90);
+        assert_eq!(
+            carrier.evidence[0].payload["executionWindowBuiltinOperation"],
+            "team.get_task"
+        );
+        assert!(
+            carrier.evidence[0].payload["item"]
+                .get("aggregatedOutput")
+                .is_none()
+        );
+        database.connection().execute("UPDATE agent_run_execution_evidence SET payload_preview_json = json_set(payload_preview_json, '$.agentOutputDigest', 'different') WHERE id = 'core-get'", []).unwrap();
+        let distinct =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(91), 1)
+                .unwrap();
+        assert!(
+            distinct.evidence[0]
+                .payload
+                .get("executionWindowBuiltinOperation")
+                .is_none()
+        );
+        database.connection().execute(
+            "UPDATE agent_run_execution_evidence SET payload_preview_json = ?2 WHERE id = ?1",
+            params!["carrier-end", json!({"item": {"id": "carrier", "type": "commandExecution", "status": "completed", "aggregatedOutput": response.to_string()}}).to_string()],
+        ).unwrap();
+        database.connection().execute(
+            "UPDATE agent_run_execution_evidence SET payload_preview_json = ?2 WHERE id = ?1",
+            params!["core-get", json!({"canonicalTool": "team.get_task", "sourceAuthority": "core", "coreEnvelope": {"ok": true, "operation": "team.get_task", "result": response}}).to_string()],
+        ).unwrap();
+        let historical =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(91), 1)
+                .unwrap();
+        assert_eq!(
+            historical.evidence[0].payload["executionWindowBuiltinOperation"],
+            "team.get_task"
+        );
+        database.connection().execute("UPDATE agent_run_execution_evidence SET payload_preview_json = json_set(payload_preview_json, '$.coreEnvelope.result.title', 'different') WHERE id = 'core-get'", []).unwrap();
+        let historical_distinct =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(91), 1)
+                .unwrap();
+        assert!(
+            historical_distinct.evidence[0]
+                .payload
+                .get("executionWindowBuiltinOperation")
+                .is_none()
+        );
+
+        // New lifecycle storage assigns one sequence to each operation. The
+        // completed Shell row follows its Core invocation rather than enclosing
+        // it, and a page containing only the Shell still carries the association.
+        for (id, sequence, event_type, kind, payload) in [
+            (
+                "single-core",
+                95,
+                "runtime.action",
+                "tool_result",
+                json!({"canonicalTool": "team.get_task", "sourceAuthority": "core", "agentOutputDigest": response_digest, "coreEnvelope": {"ok": true, "operation": "team.get_task"}}),
+            ),
+            (
+                "single-shell",
+                96,
+                "activity.completed",
+                "command",
+                json!({"resultDigest": response_digest, "item": {"id": "single-carrier", "type": "commandExecution", "command": "rovai task get --task-id fixture-task", "status": "completed"}}),
+            ),
+        ] {
+            database.connection().execute(
+                "INSERT INTO agent_run_execution_evidence(id, agent_run_id, execution_epoch, sequence, event_type, kind, phase, payload_preview_json, content_byte_count, is_truncated, occurred_at)
+                 VALUES(?1, ?2, 0, ?3, ?4, ?5, 'completed', ?6, 100, 0, ?7)",
+                params![id, agent_run_id, sequence, event_type, kind, payload.to_string(), now],
+            ).unwrap();
+        }
+        for (id, domain, authority, credibility, sequence) in [
+            ("single-core", "tool", "core", "core_verified", 95),
+            ("single-shell", "shell", "runtime", "runtime_structured", 96),
+        ] {
+            database.connection().execute(
+                "INSERT INTO canonical_runtime_activity(agent_run_id, execution_epoch, operation_id, classifier_version, activity_domain, phase, outcome, credibility, coverage_level, source_authority, source_evidence_ids_json, first_evidence_sequence, last_evidence_sequence, revision, created_at, updated_at)
+                 VALUES(?1, 0, ?2, 'activity-v1', ?3, 'terminal', 'succeeded', ?4, 'fine_grained', ?5, ?6, ?7, ?7, 1, ?8, ?8)",
+                params![agent_run_id, id, domain, credibility, authority, format!("[\"{id}\"]"), sequence, now],
+            ).unwrap();
+        }
+        let single =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(97), 1)
+                .unwrap();
+        assert_eq!(single.evidence[0].sequence, 96);
+        assert_eq!(
+            single.evidence[0].payload["executionWindowBuiltinOperation"],
+            "team.get_task"
+        );
+        database.connection().execute(
+            "UPDATE agent_run_execution_evidence SET payload_preview_json = json_set(payload_preview_json, '$.resultDigest', 'different') WHERE id = 'single-shell'", [],
+        ).unwrap();
+        let distinct_single =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(97), 1)
+                .unwrap();
+        assert!(
+            distinct_single.evidence[0]
+                .payload
+                .get("executionWindowBuiltinOperation")
+                .is_none()
+        );
+
+        // Some Runtimes persist the Shell started event first and update that
+        // same row at completion. Its one sequence then precedes the Core row.
+        for (id, sequence, event_type, kind, payload) in [
+            (
+                "early-shell",
+                97,
+                "activity.completed",
+                "command",
+                json!({"resultDigest": response_digest, "item": {"id": "early-carrier", "type": "commandExecution", "command": "rovai task get --task-id fixture-task", "status": "completed"}}),
+            ),
+            (
+                "late-core",
+                98,
+                "runtime.action",
+                "tool_result",
+                json!({"canonicalTool": "team.get_task", "sourceAuthority": "core", "agentOutputDigest": response_digest, "coreEnvelope": {"ok": true, "operation": "team.get_task"}}),
+            ),
+        ] {
+            database.connection().execute(
+                "INSERT INTO agent_run_execution_evidence(id, agent_run_id, execution_epoch, sequence, event_type, kind, phase, payload_preview_json, content_byte_count, is_truncated, occurred_at)
+                 VALUES(?1, ?2, 0, ?3, ?4, ?5, 'completed', ?6, 100, 0, ?7)",
+                params![id, agent_run_id, sequence, event_type, kind, payload.to_string(), now],
+            ).unwrap();
+        }
+        for (id, domain, authority, credibility, sequence) in [
+            ("early-shell", "shell", "runtime", "runtime_structured", 97),
+            ("late-core", "tool", "core", "core_verified", 98),
+        ] {
+            database.connection().execute(
+                "INSERT INTO canonical_runtime_activity(agent_run_id, execution_epoch, operation_id, classifier_version, activity_domain, phase, outcome, credibility, coverage_level, source_authority, source_evidence_ids_json, first_evidence_sequence, last_evidence_sequence, revision, created_at, updated_at)
+                 VALUES(?1, 0, ?2, 'activity-v1', ?3, 'terminal', 'succeeded', ?4, 'fine_grained', ?5, ?6, ?7, ?7, 1, ?8, ?8)",
+                params![agent_run_id, id, domain, credibility, authority, format!("[\"{id}\"]"), sequence, now],
+            ).unwrap();
+        }
+        let early =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(98), 1)
+                .unwrap();
+        assert_eq!(early.evidence[0].sequence, 97);
+        assert_eq!(
+            early.evidence[0].payload["executionWindowBuiltinOperation"],
+            "team.get_task"
+        );
+
+        // TRAE CLI reports the Shell command in runtime.action input, while
+        // the window omits the Core envelope from its public summary.
+        let trae_digest =
+            crate::command::canonical_json_digest(&json!({"taskId": "trae-task"})).unwrap();
+        for (id, sequence, kind, payload) in [
+            (
+                "trae-shell",
+                99,
+                "tool_result",
+                json!({"kind": "execute", "input": "rovai task get --task-id trae-task", "resultDigest": trae_digest, "status": "completed"}),
+            ),
+            (
+                "trae-core",
+                100,
+                "tool_result",
+                json!({"canonicalTool": "team.get_task", "sourceAuthority": "core", "agentOutputDigest": trae_digest, "coreEnvelope": {"ok": true, "operation": "team.get_task"}}),
+            ),
+        ] {
+            database.connection().execute(
+                "INSERT INTO agent_run_execution_evidence(id, agent_run_id, execution_epoch, sequence, event_type, kind, phase, payload_preview_json, content_byte_count, is_truncated, occurred_at)
+                 VALUES(?1, ?2, 0, ?3, 'runtime.action', ?4, 'completed', ?5, 100, 0, ?6)",
+                params![id, agent_run_id, sequence, kind, payload.to_string(), now],
+            ).unwrap();
+        }
+        for (id, domain, authority, credibility, sequence) in [
+            ("trae-shell", "shell", "runtime", "runtime_structured", 99),
+            ("trae-core", "tool", "core", "core_verified", 100),
+        ] {
+            database.connection().execute(
+                "INSERT INTO canonical_runtime_activity(agent_run_id, execution_epoch, operation_id, classifier_version, activity_domain, phase, outcome, credibility, coverage_level, source_authority, source_evidence_ids_json, first_evidence_sequence, last_evidence_sequence, revision, created_at, updated_at)
+                 VALUES(?1, 0, ?2, 'activity-v1', ?3, 'terminal', 'succeeded', ?4, 'fine_grained', ?5, ?6, ?7, ?7, 1, ?8, ?8)",
+                params![agent_run_id, id, domain, credibility, authority, format!("[\"{id}\"]"), sequence, now],
+            ).unwrap();
+        }
+        let trae =
+            crate::execution_window::read_page(&mut database, camp_id, agent_run_id, Some(100), 1)
+                .unwrap();
+        assert_eq!(trae.evidence[0].sequence, 99);
+        assert_eq!(
+            trae.evidence[0].payload["executionWindowBuiltinOperation"],
+            "team.get_task"
+        );
+
+        assert_execution_block_and_group_cursors(&mut database, camp_id, agent_run_id, &now);
+
+        // Historical Runs still resolve their Camp through CampTurn after the
+        // delivery-first batch model moved new Runs to agent_run.camp_id.
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO camp_turn(
+                    id, camp_id, trigger_type, trigger_id, status,
+                    created_at, updated_at
+                ) VALUES (
+                    'legacy-execution-window-turn', ?1, 'system_event',
+                    'legacy-execution-window-trigger', 'running', ?2, ?2
+                )
+                "#,
+                params![camp_id, now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE agent_run
+                SET camp_turn_id = 'legacy-execution-window-turn',
+                    trigger_camp_message_id = anchor_message_id,
+                    camp_id = NULL, anchor_message_id = NULL,
+                    current_public_tail_sequence = NULL,
+                    invocation_kind = 'direct'
+                WHERE id = ?1
+                "#,
+                [agent_run_id],
+            )
+            .unwrap();
+        assert!(
+            !crate::execution_window::read_page(&mut database, camp_id, agent_run_id, None, 1,)
+                .unwrap()
+                .evidence
+                .is_empty()
+        );
+        assert_eq!(
+            crate::execution_window::read_changes(&mut database, camp_id, agent_run_id, 0, &[], 1,)
+                .unwrap()
+                .next_after_change_sequence,
+            1
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // This extends the existing SQLite pagination owner: a large collapsed group must
+    // stay one block, and an old child can change without the group's tail moving.
+    fn assert_execution_block_and_group_cursors(
+        database: &mut Database,
+        camp: &str,
+        run: &str,
+        now: &str,
+    ) {
+        use crate::execution_window::{
+            read_block_changes, read_block_page, read_group_changes, read_group_page,
+        };
+        let old = read_block_page(database, camp, run, None, None, 1).unwrap();
+        let old_count = old.blocks[0].tool_count;
+        database.connection().execute(
+            "UPDATE agent_run_execution_evidence SET payload_preview_json = json_set(payload_preview_json, '$.input', 'rovai task get --task-id trae-task && echo extra') WHERE id = 'trae-shell'", [],
+        ).unwrap();
+        let mixed = read_block_page(database, camp, run, None, None, 1).unwrap();
+        assert_eq!(
+            mixed.blocks[0].tool_count,
+            old_count + 1,
+            "mixed Shell work is a separate step"
+        );
+        let end = 10_101;
+        let tx = database.connection_mut().transaction().unwrap();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO agent_run_execution_evidence(id, agent_run_id, execution_epoch, sequence, event_type, kind, phase,
+                 payload_preview_json, content_byte_count, is_truncated, occurred_at, revision, change_sequence, updated_at)
+                 VALUES(?1, ?2, 0, ?3, ?4, ?5, 'completed', ?6, 100, 0, ?7, 1, ?3, ?7)"
+            ).unwrap();
+            for sequence in 101..=end + 1 {
+                let root = sequence == 101 || sequence == end + 1;
+                let payload = if root {
+                    json!({"text": format!("boundary {sequence}")})
+                } else {
+                    json!({"item": {"type": "commandExecution", "command": format!("echo {sequence}"),
+                        "status": "completed", "aggregatedOutput": "saved result must not enter the folded page"}})
+                };
+                insert
+                    .execute(params![
+                        format!("block-fixture-{sequence}"),
+                        run,
+                        sequence,
+                        if root {
+                            "agent.text.block"
+                        } else {
+                            "activity.completed"
+                        },
+                        if root { "narration" } else { "command" },
+                        payload.to_string(),
+                        now
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.execute(
+            "UPDATE agent_run SET execution_evidence_change_sequence = ?1 WHERE id = ?2",
+            params![end + 1, run],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let started = std::time::Instant::now();
+        let page = read_block_page(database, camp, run, None, None, 2).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(page.schema_version, 3);
+        assert_eq!(page.blocks.len(), 2);
+        let group = &page.blocks[0];
+        assert_eq!(
+            (group.sequence, group.last_sequence, group.tool_count),
+            (102, end, 10_000)
+        );
+        assert_eq!(group.evidence.len(), 1);
+        assert_eq!(group.evidence[0].sequence, end);
+        assert_eq!(page.next_before_sequence, Some(102));
+        let bytes = serde_json::to_vec(&page).unwrap().len();
+        assert!(
+            bytes < 16_384,
+            "10,000 closed commands have a bounded transport: {bytes}"
+        );
+        eprintln!(
+            "execution block probe: commands=10000 response_bytes={bytes} read_ms={}",
+            elapsed.as_millis()
+        );
+        assert!(
+            !serde_json::to_string(&page)
+                .unwrap()
+                .contains("saved result must not")
+        );
+        let prior = read_block_page(database, camp, run, Some(102), None, 1).unwrap();
+        assert_eq!(prior.blocks[0].sequence, 101);
+        let first = read_group_page(database, camp, run, 102, None, Some(101), 24).unwrap();
+        assert_eq!(first.evidence.len(), 24);
+        assert_eq!(first.evidence.first().unwrap().sequence, 102);
+        assert_eq!(first.next_after_sequence, Some(125));
+        let next = read_group_page(
+            database,
+            camp,
+            run,
+            102,
+            None,
+            first.next_after_sequence,
+            24,
+        )
+        .unwrap();
+        assert_eq!(next.evidence.first().unwrap().sequence, 126);
+        let tail = read_group_page(database, camp, run, 102, None, None, 24).unwrap();
+        assert_eq!(tail.evidence.last().unwrap().sequence, end);
+        assert_eq!(tail.next_before_sequence, Some(end - 23));
+        assert!(read_group_page(database, "other-thread", run, 102, None, None, 24).is_err());
+        assert!(read_group_page(database, camp, run, 101, None, None, 24).is_err());
+        assert!(read_group_page(database, camp, run, 102, Some(110), Some(120), 24).is_err());
+        assert!(read_block_page(database, "other-thread", run, None, None, 2).is_err());
+        database.connection().execute(
+            "UPDATE agent_run_execution_evidence SET phase = 'failed', revision = 2, change_sequence = ?1 WHERE id = 'block-fixture-110'",
+            [end + 2],
+        ).unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET execution_evidence_change_sequence = ?1 WHERE id = ?2",
+                params![end + 2, run],
+            )
+            .unwrap();
+        let changed = read_block_changes(database, camp, run, end + 1, &[], 1).unwrap();
+        assert_eq!(changed.blocks.len(), 1);
+        assert_eq!(changed.blocks[0].key, group.key);
+        assert_eq!(changed.blocks[0].counts.failed, 1);
+        assert_eq!(changed.blocks[0].evidence[0].sequence, end);
+        let children =
+            read_group_changes(database, camp, run, 102, end + 1, 102, Some(125), 24).unwrap();
+        assert_eq!(children.evidence.len(), 1);
+        assert_eq!(children.evidence[0].sequence, 110);
+        assert_eq!(children.evidence[0].phase, "failed");
+        let outside =
+            read_group_changes(database, camp, run, 102, end + 1, 126, Some(149), 24).unwrap();
+        assert!(outside.evidence.is_empty());
+        assert_eq!(outside.next_after_change_sequence, end + 2);
+        let last_id = format!("block-fixture-{end}");
+        database.connection().execute(
+            "INSERT INTO canonical_runtime_activity(agent_run_id, execution_epoch, operation_id, classifier_version, activity_domain, phase, outcome, credibility, coverage_level, source_authority, source_evidence_ids_json, first_evidence_sequence, last_evidence_sequence, revision, created_at, updated_at)
+             VALUES(?1, 0, ?2, 'activity-v1', 'shell', 'started', 'unknown', 'runtime_structured', 'fine_grained', 'runtime', ?3, ?4, ?4, 1, ?5, ?5)",
+            params![run, last_id, json!([last_id]).to_string(), end, now],
+        ).unwrap();
+        database.connection().execute("UPDATE agent_run_execution_evidence SET payload_preview_json = '{\"item\":{\"type\":\"commandExecution\"}}', phase = 'started' WHERE id = ?1", [&last_id]).unwrap();
+        let visibility: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/fixtures/execution-shell-visibility.json"
+        ))
+        .unwrap();
+        for case in visibility.as_array().unwrap() {
+            database.connection().execute("UPDATE canonical_runtime_activity SET presentation_hint = ?1, tool_name = ?2 WHERE agent_run_id = ?3 AND operation_id = ?4", params![case["title"].as_str(), case["toolName"].as_str(), run, last_id]).unwrap();
+            let page = read_block_page(database, camp, run, None, None, 2).unwrap();
+            let visible = case["visible"] == true;
+            assert_eq!(
+                page.blocks[0].tool_count,
+                if visible { 10000 } else { 9999 },
+                "{case}"
+            );
+            assert_eq!(
+                page.blocks[0].evidence[0].sequence,
+                if visible { end } else { end - 1 },
+                "hidden tail must not hide earlier work: {case}"
+            );
+        }
+        // Exercise the real catalog/digest path, including repeated response digests.
+        // Modern carriers are adjacent candidates in one in-memory index, not N SQL scans.
+        let tx = database.connection_mut().transaction().unwrap();
+        for sequence in 102..=end {
+            let shell = sequence % 2 == 0;
+            let id = format!("block-fixture-{sequence}");
+            let payload = if shell {
+                json!({"resultDigest":"same-result", "item":{"type":"commandExecution","command":"rovai task get --task-id fixture"}})
+            } else {
+                json!({"sourceAuthority":"core", "canonicalTool":"team.get_task", "agentOutputDigest":"same-result", "coreEnvelope":{"ok":true,"operation":"team.get_task"}})
+            };
+            tx.execute("UPDATE agent_run_execution_evidence SET event_type = ?1, phase = 'completed', payload_preview_json = ?2 WHERE id = ?3", params![if shell { "activity.completed" } else { "runtime.action" }, payload.to_string(), id]).unwrap();
+            tx.execute(
+                "INSERT OR REPLACE INTO canonical_runtime_activity(agent_run_id, execution_epoch, operation_id, classifier_version, activity_domain, phase, outcome, credibility, coverage_level, source_authority, source_evidence_ids_json, first_evidence_sequence, last_evidence_sequence, revision, created_at, updated_at)
+                 VALUES(?1, 0, ?2, 'activity-v1', ?3, 'terminal', 'succeeded', ?4, 'fine_grained', ?5, ?6, ?7, ?7, 1, ?8, ?8)",
+                params![run, id, if shell { "shell" } else { "tool" }, if shell { "runtime_structured" } else { "core_verified" }, if shell { "runtime" } else { "core" }, json!([id]).to_string(), sequence, now],
+            ).unwrap();
+        }
+        tx.commit().unwrap();
+        let started = std::time::Instant::now();
+        let page = read_block_page(database, camp, run, None, None, 2).unwrap();
+        // Repeated adjacent equal responses are ambiguous for every middle Shell, and remain separate.
+        assert_eq!(page.blocks[0].tool_count, 9999);
+        assert!(serde_json::to_vec(&page).unwrap().len() < 16384);
+        eprintln!(
+            "execution carrier probe: canonical_rows=10000 read_ms={}",
+            started.elapsed().as_millis()
+        );
+        // A historical started/ended lifetime can have no sequence strictly inside it.
+        // Core callbacks elsewhere do not turn that empty interval into an invalid range.
+        for (id, sequence, event) in [
+            ("adjacent-start", end + 2, "activity.started"),
+            ("adjacent-end", end + 3, "activity.completed"),
+        ] {
+            database.connection().execute(
+                "INSERT INTO agent_run_execution_evidence(id, agent_run_id, execution_epoch, sequence, event_type, kind, phase, payload_preview_json, content_byte_count, is_truncated, occurred_at)
+                 VALUES(?1, ?2, 0, ?3, ?4, 'command', 'completed', ?5, 100, 0, ?6)",
+                params![id, run, sequence, event, json!({"item":{"type":"commandExecution","command":"rovai task get --task-id fixture"}}).to_string(), now],
+            ).unwrap();
+        }
+        database.connection().execute(
+            "INSERT INTO canonical_runtime_activity(agent_run_id, execution_epoch, operation_id, classifier_version, activity_domain, phase, outcome, credibility, coverage_level, source_authority, source_evidence_ids_json, first_evidence_sequence, last_evidence_sequence, revision, created_at, updated_at)
+             VALUES(?1, 0, 'adjacent-shell', 'activity-v1', 'shell', 'terminal', 'succeeded', 'runtime_structured', 'fine_grained', 'runtime', '[\"adjacent-start\",\"adjacent-end\"]', ?2, ?3, 1, ?4, ?4)",
+            params![run, end + 2, end + 3, now],
+        ).unwrap();
+        let adjacent = read_block_page(database, camp, run, None, None, 1).unwrap();
+        assert_eq!(adjacent.blocks[0].tool_count, 1);
+        assert_eq!(adjacent.blocks[0].evidence[0].sequence, end + 2);
+    }
+
+    #[test]
+    fn agent_run_diagnostic_projects_only_safe_frozen_and_public_facts() {
+        let directory = std::env::temp_dir().join(format!(
+            "rovai-agent-run-diagnostic-test-{}",
+            Uuid::new_v4()
+        ));
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        configure_test_runtime(&database, &["agent_1"]);
+        let created = CollaborationService::default()
+            .create_test_camp_conversation(
+                &mut database,
+                &user_envelope(
+                    "diagnostic-create",
+                    None,
+                    TestThreadConversationCommand {
+                        project_path: workspace.to_string_lossy().to_string(),
+                        project_binding_kind: ProjectBindingKind::Directory,
+                        body: "诊断任务".to_string(),
+                        address: TestThreadMessageAddress::Default,
+                        purpose: "验证安全诊断投影".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        let agent_run_id = created.result.payload["agentRunIds"][0].as_str().unwrap();
+        let diagnostic = ReadModelService
+            .agent_run_diagnostic(&mut database, agent_run_id)
+            .unwrap();
+        let serialized = serde_json::to_value(&diagnostic).unwrap();
+
+        assert_eq!(
+            diagnostic.schema_version,
+            AGENT_RUN_DIAGNOSTIC_SCHEMA_VERSION
+        );
+        assert_eq!(diagnostic.agent_run_id, agent_run_id);
+        assert!(!diagnostic.runtime.effective_config_digest.is_empty());
+        assert_eq!(diagnostic.output.public_output, None);
+        assert_eq!(
+            diagnostic.output.unavailable_reason.as_deref(),
+            Some("run_not_succeeded")
+        );
+        let text = serialized.to_string();
+        assert!(!text.contains("effectiveConfigJson"));
+        assert!(!text.contains("runtimePayloadDigest"));
+        assert!(!text.contains(&workspace.to_string_lossy().to_string()));
+        assert!(!text.contains("repositoryRoot"));
+        assert!(!text.contains("gitCommonDir"));
+        assert!(!text.contains("executablePath"));
+        assert!(!text.contains("credential"));
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snapshot_batches_canonical_activity_for_the_full_evidence_window() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-evidence-batch-test-{}", Uuid::new_v4()));
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        configure_test_runtime(&database, &["agent_1"]);
+        let created = CollaborationService::default()
+            .create_test_camp_conversation(
+                &mut database,
+                &user_envelope(
+                    "evidence-batch-create",
+                    None,
+                    TestThreadConversationCommand {
+                        project_path: workspace.to_string_lossy().to_string(),
+                        project_binding_kind: ProjectBindingKind::Directory,
+                        body: "验证完整 Evidence 窗口批量投影".to_string(),
+                        address: TestThreadMessageAddress::Default,
+                        purpose: "验证 Snapshot 批量 Canonical Activity".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        let camp_id = created.result.payload["threadId"].as_str().unwrap();
+        let agent_run_id = created.result.payload["agentRunIds"][0].as_str().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let transaction = database.connection_mut().transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    r#"
+                    INSERT INTO agent_run_execution_evidence(
+                        id, agent_run_id, execution_epoch, sequence,
+                        event_type, kind, phase, source_event_key,
+                        payload_preview_json, content_blob_id,
+                        content_byte_count, is_truncated, occurred_at
+                    ) VALUES (
+                        ?1, ?2, 0, ?3, 'activity.completed', 'command',
+                        'completed', NULL, ?4, NULL, 32, 0, ?5
+                    )
+                    "#,
+                )
+                .unwrap();
+            for sequence in 1..=EXECUTION_EVIDENCE_SNAPSHOT_LIMIT {
+                statement
+                    .execute(params![
+                        format!("batch-evidence-{sequence}"),
+                        agent_run_id,
+                        sequence,
+                        json!({ "sequence": sequence }).to_string(),
+                        now,
+                    ])
+                    .unwrap();
+            }
+        }
+        let group_count = (EXECUTION_EVIDENCE_SNAPSHOT_LIMIT + 99) / 100;
+        for group in 0..group_count {
+            let first_sequence = group * 100 + 1;
+            let last_sequence = (first_sequence + 99).min(EXECUTION_EVIDENCE_SNAPSHOT_LIMIT);
+            let evidence_ids = (first_sequence..=last_sequence)
+                .map(|sequence| format!("batch-evidence-{sequence}"))
+                .collect::<Vec<_>>();
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO canonical_runtime_activity(
+                        agent_run_id, execution_epoch, operation_id, classifier_version,
+                        activity_domain, semantic_kind, tool_name, presentation_hint,
+                        phase, outcome, credibility, coverage_level, source_authority,
+                        source_evidence_ids_json, first_evidence_sequence,
+                        last_evidence_sequence, revision, created_at, updated_at
+                    ) VALUES (
+                        ?1, 0, ?2, 'activity-v1', 'shell', 'shell.execute', NULL,
+                        '执行 Shell 命令', 'terminal', 'succeeded',
+                        'runtime_structured', 'fine_grained', 'runtime',
+                        ?3, ?4, ?5, 1, ?6, ?6
+                    )
+                    "#,
+                    params![
+                        agent_run_id,
+                        format!("batch-operation-{group}"),
+                        serde_json::to_string(&evidence_ids).unwrap(),
+                        first_sequence,
+                        last_sequence,
+                        now,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let snapshot = ReadModelService
+            .camp_snapshot(&mut database, camp_id)
+            .unwrap();
+        assert_eq!(
+            snapshot.execution_evidence.len(),
+            EXECUTION_EVIDENCE_SNAPSHOT_LIMIT as usize
+        );
+        assert!(
+            snapshot
+                .execution_evidence
+                .iter()
+                .all(|evidence| evidence.canonical.is_some())
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn event_reader_requests_snapshot_after_retention_gap() {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-read-gap-test-{}", Uuid::new_v4()));
+        let mut database = crate::test_support::fresh_schema_database_at(&directory);
+        for sequence in 0..6 {
+            database
+                .connection()
+                .execute(
+                    r#"
+                    INSERT INTO event_log(
+                        event_id, event_type, payload_json, actor_type,
+                        actor_id, created_at
+                    ) VALUES (?1, 'test.event', '{}', 'system', 'test', ?2)
+                    "#,
+                    params![
+                        format!("gap-event-{sequence}"),
+                        chrono::Utc::now().to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+        }
+        database
+            .connection()
+            .execute("DELETE FROM event_log WHERE global_sequence <= 4", [])
+            .unwrap();
+        let batch = ReadModelService
+            .events_since(&mut database, None, 1, 100)
+            .unwrap();
+        assert!(batch.reset_required);
+        assert!(batch.events.is_empty());
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn event_reader_hydrates_mixed_command_result_storage_without_changing_pagination() {
+        let (mut database, directory) = crate::test_support::fresh_schema_database_fast();
+        let after: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COALESCE(MAX(global_sequence), 0) FROM event_log",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_payload = json!({
+            "commandType": "test.old",
+            "status": "applied",
+            "code": "test.old.applied",
+            "result": { "historical": true },
+            "resultEntity": null,
+            "historicalExtension": "must remain",
+        });
+        let large_result = json!({
+            "nested": {
+                "text": "大正文🧭".repeat(32 * 1024),
+                "values": [null, true, 42],
+            }
+        });
+        let large_result_json = serde_json::to_string(&large_result).unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO event_log(
+                    event_id, event_type, payload_json, actor_type, actor_id,
+                    command_id, command_type, request_digest, request_digest_version,
+                    result_status, result_code, result_payload_json, created_at
+                ) VALUES (
+                    'mixed-old-command', 'command.result', ?1, 'system', 'fixture',
+                    'mixed-old-command-id', 'test.old', 'old-digest', 1,
+                    'applied', 'test.old.applied', '{"historical":true}',
+                    '2026-09-07T00:00:01Z'
+                )
+                "#,
+                [old_payload.to_string()],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO event_log(event_id,event_type,payload_json,actor_type,actor_id,created_at)
+                 VALUES ('mixed-ordinary','test.ordinary','{\"ordinary\":true}','system','fixture','2026-09-07T00:00:02Z')",
+                [],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO event_log(
+                    event_id, event_type, payload_json, camp_id, entity_type, entity_id,
+                    actor_type, actor_id, command_id, command_type, request_digest,
+                    request_digest_version, result_status, result_code, result_payload_json,
+                    result_entity_type, result_entity_id, created_at
+                ) VALUES (
+                    'mixed-new-command', 'command.result', ?1, 'camp-mixed', 'task', 'task-1',
+                    'user', 'local_user', 'mixed-new-command-id', 'test.new', 'new-digest',
+                    1, 'accepted', 'test.new.accepted', ?2,
+                    'task', 'task-1', '2026-09-07T00:00:03Z'
+                )
+                "#,
+                params![COMMAND_RESULT_STORAGE_MARKER_JSON, large_result_json,],
+            )
+            .unwrap();
+        let sequences = database
+            .connection()
+            .prepare(
+                "SELECT event_id, global_sequence FROM event_log
+                 WHERE event_id LIKE 'mixed-%' ORDER BY global_sequence",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        let first = ReadModelService
+            .events_since(&mut database, None, after, 2)
+            .unwrap();
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.event_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["mixed-old-command", "mixed-ordinary"]
+        );
+        assert_eq!(first.events[0].payload, old_payload);
+        assert_eq!(first.events[1].payload, json!({ "ordinary": true }));
+        assert_eq!(first.next_global_sequence, sequences[1].1);
+
+        let second = ReadModelService
+            .events_since(&mut database, None, first.next_global_sequence, 2)
+            .unwrap();
+        assert!(!second.has_more);
+        assert_eq!(
+            second.through_global_sequence,
+            first.through_global_sequence
+        );
+        assert_eq!(second.next_global_sequence, second.through_global_sequence);
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(
+            second.events[0].event_id.as_deref(),
+            Some("mixed-new-command")
+        );
+        assert_eq!(second.events[0].event_type, "command.result");
+        assert_eq!(second.events[0].camp_id.as_deref(), Some("camp-mixed"));
+        assert_eq!(second.events[0].entity_type.as_deref(), Some("task"));
+        assert_eq!(second.events[0].entity_id.as_deref(), Some("task-1"));
+        assert_eq!(second.events[0].actor_type.as_deref(), Some("user"));
+        assert_eq!(second.events[0].actor_id.as_deref(), Some("local_user"));
+        assert_eq!(second.events[0].created_at, "2026-09-07T00:00:03Z");
+        assert_eq!(
+            second.events[0].payload,
+            json!({
+                "commandType": "test.new",
+                "status": "accepted",
+                "code": "test.new.accepted",
+                "result": large_result,
+                "resultEntity": { "entityType": "task", "entityId": "task-1" },
+            })
+        );
+        assert_eq!(second.events[0].global_sequence, sequences[2].1);
+
+        let new_logical_bytes = database
+            .connection()
+            .query_row(
+                "SELECT length(CAST(payload_json AS BLOB))
+                        + length(CAST(result_payload_json AS BLOB))
+                 FROM event_log WHERE event_id='mixed-new-command'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let old_format_payload_json = serde_json::to_string(&second.events[0].payload).unwrap();
+        let old_logical_bytes =
+            old_format_payload_json.len() as i64 + large_result_json.len() as i64;
+        assert_eq!(
+            old_logical_bytes - new_logical_bytes,
+            old_format_payload_json.len() as i64 - COMMAND_RESULT_STORAGE_MARKER_JSON.len() as i64
+        );
+        assert!(new_logical_bytes * 2 < old_logical_bytes + 256);
+
+        database
+            .connection()
+            .execute(
+                "UPDATE event_log SET payload_json='{\"_rovaiStorage\":\"command-result-columns-v2\"}'
+                 WHERE event_id='mixed-new-command'",
+                [],
+            )
+            .unwrap();
+        let error = ReadModelService
+            .events_since(&mut database, None, sequences[1].1, 2)
+            .expect_err("an unknown storage marker must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("mixed-new-command"));
+        assert!(message.contains(&sequences[2].1.to_string()));
+        assert!(!message.contains("大正文🧭"));
+        assert!(!message.contains("command-result-columns-v2"));
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}

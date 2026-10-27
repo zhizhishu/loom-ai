@@ -1,0 +1,47 @@
+{
+  "sourceCommit": "ee224fa0cb7a2114183ad43abefbc89c78975178",
+  "version": "0.2.5",
+  "architecture": "arm64",
+  "signature": "ad-hoc",
+  "source": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-web-recovery/dist/mac-arm64/Rovai AI.app",
+  "target": "/Applications/Rovai AI.app",
+  "backup": "/Applications/Rovai AI.backup-before-shared-defaults-20260913T135905Z.app",
+  "oldProcesses": [
+    {
+      "pid": 12732,
+      "parentPid": 1,
+      "executable": "/Applications/Rovai AI.app/Contents/MacOS/Rovai AI"
+    },
+    {
+      "pid": 12754,
+      "parentPid": 12732,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper"
+    },
+    {
+      "pid": 12757,
+      "parentPid": 12732,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper"
+    },
+    {
+      "pid": 12766,
+      "parentPid": 12732,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper (Renderer).app/Contents/MacOS/Rovai AI Helper (Renderer)"
+    },
+    {
+      "pid": 12767,
+      "parentPid": 12732,
+      "executable": "/Applications/Rovai AI.app/Contents/Resources/bin/rovai-host"
+    }
+  ],
+  "installed": true,
+  "hashes": {
+    "Contents/Resources/app.asar": "4d39737da4ea335b3b325a72cae666dac222289fc510f85f03c594d3b3b01414",
+    "Contents/Resources/bin/rovai-core": "b784143d8a033fd14e51e72223175b3c2b5d4691ebf565e5d50dd98e1e8e5c3f",
+    "Contents/Resources/bin/rovai-host": "ab715739b16ec25b661767be9da0cdcea384a8086378e70e16b82a3509b35e98",
+    "Contents/Resources/bin/rovai": "a1580627f26819a3773b95ec3900c60dce88e83f77596ed4f29f95b09cfa3de3"
+  },
+  "oldProcessesStillAlive": true,
+  "restarted": false,
+  "dailyUserDataModifiedByInstaller": false,
+  "verifiedAt": "2026-09-13T13:59:48.837581+00:00"
+}

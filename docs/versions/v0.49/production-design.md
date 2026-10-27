@@ -1,0 +1,392 @@
+---
+document_type: production-design
+version: v0.49
+authority: desktop-shell-renderer-and-pending-camp-contract
+status: frozen
+implementation_status: in_progress
+last_updated: 2026-08-09
+---
+
+# v0.49 通用、启动与新对话设置生产设计
+
+本文冻结 v0.49 的 Electron Desktop Shell、Preload bridge 与 Renderer 交互合同。全局视觉、
+布局、Token、状态和无障碍继续以[全局设计系统](../../../DESIGN.md)和
+[设置工作区策略](../../../apps/desktop/.impeccable/surfaces/settings-workspace.md)为准；Camp、Member、
+Memory 与 Navigation 的存在性继续以 Core 当前 Read Side 为准。本文只授权 ADR-0145 所需的
+Pending Camp activation、Migration 67、Navigation/Snapshot 投影、首消息原子激活与窄清理；不授权
+其它 Runtime、审批、执行或恢复协议变化。
+
+## 1. 设置导航与 General 页面
+
+设置覆盖侧栏固定为以下七项，顺序不可由字母排序或历史默认值改变：
+
+1. 通用；
+2. Skill；
+3. MCP；
+4. Agent 运行时；
+5. 外观；
+6. 通知；
+7. 诊断。
+
+全新安装第一次进入设置默认选择“通用”。每次用户选择分类后，Electron Main 原子保存
+`lastSettingsSection`；之后从普通“设置”入口进入时跨 Main Window Session 恢复该分类。队员页
+等明确深链到“Agent 运行时”时，该分类同样成为新的最后选择。
+
+设置页仍是临时覆盖面：
+
+- 进入设置前的当前稳定页面继续保存在 Renderer 会话中；
+- “返回 App”返回该页面及其 Camp/Member/Tab，不强制进入 Quick Chat；
+- 设置分类选择不改变 Restorable Location；
+- 在设置中关闭窗口或退出应用，下一个 Main Window Session 仍按进入设置前最后成功显示的
+  Restorable Location 解析，永远不直接打开设置。
+
+General 页面只使用一个共享页头：
+
+```text
+Settings / General
+
+通用
+设置 Rovai-ai 的启动方式、新对话与窗口行为。
+```
+
+页头下方按“启动 / 新对话 / 窗口”排列三个无外框 section，使用现有 `section-block`、分隔线、Switch、
+Radio 和 Button 语法，不增加卡片墙或第二层设置导航。
+
+## 2. 启动区
+
+### 登录时启动 Rovai-ai
+
+第一行使用一个标准 Switch：
+
+```text
+登录时启动 Rovai-ai                       [开关]
+登录 macOS 后自动打开 Rovai-ai。
+```
+
+状态完全来自 Electron Main 对 macOS `mainAppService` 的实时读取：
+
+| Shell 状态 | Switch | 辅助文案与操作 |
+| --- | --- | --- |
+| `enabled` | checked | 已开启，无额外警告 |
+| `not-registered` | unchecked | 默认说明 |
+| `requires-approval` | checked | `等待系统授权，当前尚未生效。`；显示“打开系统设置” |
+| `not-found` | unchecked | `未找到 Rovai-ai 登录项服务，请重新安装或修复应用。` |
+| `development` | unchecked + disabled | `仅在已安装的 Rovai-ai 应用中可配置` |
+| `loading` / `submitting` | 保留最近系统值 + disabled | 使用明确读取/保存中说明，不乐观声称生效 |
+| `read-error` | 保留最近系统值或 unchecked | 显示可重试错误；不能写入应用 Boolean 作为替代真源 |
+
+`requires-approval` 的 checked 只表示系统已经持有注册请求；同一行必须同时说明“当前尚未生效”，
+不能仅靠开关暗示已经成功。用户关闭该开关时调用系统注销，并在读回 `not-registered` 后显示关闭。
+
+“打开系统设置”由 Electron Main 打开 macOS 登录项设置位置。应用从系统设置重新获得焦点、General
+页重新显示或用户完成一次开关写入后，都重新读取系统状态。Renderer 不轮询磁盘、不缓存期望值，
+也不从上次提交结果猜测最终状态。
+
+Development 判定使用 `app.isPackaged`。未打包的 Electron/Vite 进程不得调用
+`setLoginItemSettings`，不得注册 Electron executable、开发目录、Shell wrapper 或隐藏启动参数。
+已安装应用只使用 `type: "mainAppService"` 与 `openAtLogin`；禁止设置 `openAsHidden`、额外 CLI
+参数、后台 agent/daemon service 或“登录后不显示窗口”。
+
+Rovai-ai 安装或首次启动本身不调用注册 API；全新安装的默认状态因此是系统
+`not-registered`/unchecked。若重装后 macOS 仍保留一条有效注册，应用诚实显示该系统状态，
+不使用本地“首次运行”标记强制注销。
+
+### 启动后打开
+
+使用一个 `fieldset` 与两个原生语义 Radio：
+
+```text
+启动后打开
+
+◉ 上次使用的位置
+  恢复最近打开的对话、队员页或记忆页。
+
+○ 快速对话
+  每次启动都从快速对话首页开始。
+```
+
+默认值是 `last_location`。切换只保存下一 Main Window Session 使用的 Startup Location
+Preference，不立即导航当前窗口，也不改变当前 Restorable Location。Radio 提交失败时恢复最近
+成功保存的值、保留焦点并显示就地错误。
+
+区末尾固定显示：
+
+> 此设置只决定启动后显示的位置。已有 Camp、草稿、任务、审批和运行记录仍按 Rovai-ai 的
+> 既有恢复规则处理。
+
+## 3. 新对话默认配置、一键创建与当前项目
+
+### 默认队员与 Lead
+
+全新安装保持“尚未配置”，不得静默选择全部在队队员。用户选择只修改 Renderer 草稿；满足
+“至少一位在队队员、默认 Lead 属于所选队员”后，点击“保存默认配置”才通过窄 Preload bridge
+原子替换已保存配置。未保存草稿显示明确提示，不能被创建入口或开启确认读取。
+
+保存时只校验 Member lifecycle：队员必须为 `present` 且未 removed，Lead 必须属于该集合。
+Runtime 是否配置、readiness 与当前 availability 不参与结构有效性判断。
+
+已保存队员永久移除、暂时离队、缺失，或默认 Lead 不再有效时：
+
+- 原成员 ID 与 Lead ID 原样保留，不删除、不替换、不重排；
+- 持久 `newConversationDefaultsRequireConfirmation = true`，即使队员重新归队也不自动解锁；
+- 用户必须重新选择并点击“保存默认配置”，才用显式新快照清除锁存状态；
+- 已开启的一键创建保持开启，但所有入口改走创建 Dialog。
+
+### 一键创建 Switch、确认与帮助
+
+Switch 默认关闭。每次 `false -> true` 必须先打开非 danger Dialog“开启一键创建新对话？”，列出
+左上角“新对话”、已有 Project `＋`、快速对话 `＋` 和“项目”标题 `＋`（选择目录后直接创建），
+并说明项目由使用的新建入口决定、展示已保存默认队员与 Lead。主按钮
+固定写“开启一键创建”；取消不写偏好。未保存草稿、未配置或锁存失效时不能开启。
+
+标题旁 `?` 是非点击帮助标记。鼠标悬浮时显示“一键创建如何工作？”Tooltip，移开 `?` 立即隐藏，
+分别说明左上入口取当前项目、已有 Project `＋` 取对应项目、快速对话 `＋` 取快速对话、“项目”标题
+`＋` 取新选择目录，队员/Lead 始终来自本页保存值，关闭 Switch 恢复 Dialog。该标记不响应点击或
+键盘聚焦，并与 App 内其他视觉 `?` 统一使用纯 Hover 规则。
+
+Switch 开启时始终显示一行摘要。配置有效时为“当前生效：{当前项目} · {N} 位默认队员 · Lead
+{名称}”；锁存或实时校验失效时使用 attention 文案“默认队员配置需要重新确认。一键创建时将改为
+打开创建弹窗。”。
+
+### 当前项目与四个创建入口
+
+Renderer 使用版本化 localStorage 记录 `{ kind: "quick_chat" } | { kind: "directory", projectPath }`：
+
+- 点击 Project/快速对话文件夹或其中任意 Camp 更新当前项目；
+- 新 Main Window Session 读取最后成功保存值；directory Project 不存在时回退并写回快速对话；
+- 当前项目不是 Restorable Location、Core Project 实体或 Camp binding mutation；
+- 文件夹/名称主行同时选择当前项目并切换展开状态，主行自身通过
+  `aria-expanded / aria-controls` 表达状态，不显示独立 disclosure。三点菜单与 `＋` 保持为右侧独立兄弟按钮，
+  不触发选择或展开；两者默认同时隐藏，在目录整行
+  Hover 或键盘 `focus-visible` 时同时显示；鼠标点击目录后移出不能因残留焦点继续显示，触摸环境
+  保持可见。`＋` 只发起对应项目的新建，取消 Dialog 不改变当前项目，成功进入 Camp 后才由
+  Camp binding 更新当前项目；
+- “项目”标题 `＋` 一键创建成功后，即使新 Camp 仍为空 Pending、因而不进入 Core Navigation，
+  Renderer 也必须把已经校验且已成为当前项目的工作目录补成零 Camp 的 Shell 投影。该行显示
+  “还没有对话”并保留项目级 `＋`，但在 Core 尚无 canonical Project group 前不提供置顶；它不让
+  空 Pending 出现在侧栏，也不创建 Project 领域实体。空 Pending 离开后可被清理，当前项目目录行
+  仍保留；新窗口重新通过 `workspaces.inspect` 校验，目录失效才回退快速对话；
+- 普通 Project、置顶 Project 与 Quick Chat 的 Camp 列表统一以最近 5 条开始；“查看更多”每次按
+  `offset = 已读取服务端条目数 / limit = 10` 增量读取并按 Camp ID 去重。“收起”只恢复 5 条可见，
+  缓存、目录展开状态和 canonical group key 均保留；置顶位置变化不触发预取或状态迁移；
+- 当前项目不使用稳定底色；当前 Camp 使用稳定灰底、左侧品牌标记与字重，不使用蓝色底。
+
+一键创建关闭时，四个入口打开同一 Dialog：左上入口预选当前项目，两个文件夹入口预选各自项目，
+“项目”标题 `＋` 先选择工作目录并将其作为预选值。
+开启且配置有效时调用 `camps.create` 创建 `activationState = pending` 的 Core-owned 草稿，名称为
+`null`、协作模式固定 `peer`。Core 拒绝、
+配置失效或默认 Lead 无效时打开 Dialog，保留入口目标项目。失效说明必须列出被过滤的成员姓名与
+状态、原 Lead 状态及本次临时 Lead；若锁存仍在但保存值已恢复可用，则说明仍按保存值预选并要求
+确认。提示固定声明本次 Dialog 调整不会修改“设置 → 通用”的保存配置。该范围只删除
+Renderer 的协作方式选择与文案，不删除 Core/IPC/SQLite 的 `collaborationMode`。
+
+Dialog Header 说明改为“确定这段对话的工作环境与队员。”；Footer 删除模式摘要。可选名称默认
+收起，展开自动聚焦，提供规范化名称摘要、Unicode scalar `0 / 80` 计数、清空按钮和 80 上限。
+
+一键入口创建的 Pending 只在 Core Composer Draft 出现非空白正文或已准备附件后进入 Navigation，
+并显示灰色“草稿”标签；空 Pending 不进入侧栏或 Camp history，不提交 Restorable Location。离开
+空 Pending 时调用只允许删除无正文、无附件、无消息/Task/Conversation/执行事实 Pending 的窄命令；
+进程中断遗漏的空 Pending 由 Core 启动清理。非空 Pending 可跨窗口/应用重启恢复，清空后再次退出
+仍可安全丢弃。第一条消息成功写入时在同一事务中把 Pending 激活为 Active；任何发送拒绝保留原状态
+与精确 Draft Revision。Pending 激活前不开放重命名、置顶、Lead 修改或 Inspector 业务 mutation。
+普通创建 Dialog 固定提交 `activationState = active`，继续保留显式创建的零消息 Camp。
+
+## 4. Main Window Session 与一次性解析
+
+Electron Main 每次调用 `createWindow()` 建立新的 Main Window Session，并为该窗口冻结一份
+`DesktopStartupSnapshot`。启动解析在该会话中只能从 `unresolved` 前进一次，不能因 React
+重渲染、Navigation refresh、Core restart 或窗口恢复再次开始。
+
+| 事件 | 是否创建新会话 | 是否解析启动位置 |
+| --- | --- | --- |
+| 应用冷启动并创建窗口 | 是 | 是 |
+| macOS 关闭最后窗口后从 Dock 重新创建窗口 | 是 | 是 |
+| 已有窗口时第二实例唤醒 | 否 | 否，只聚焦/恢复 |
+| 已有窗口时点击 Dock | 否 | 否，只聚焦/恢复 |
+| 最小化后恢复 | 否 | 否 |
+| Core restart / Navigation refresh | 否 | 否 |
+
+Main 在创建窗口时读取 Startup Location Preference 与当时的 Restorable Location，随后对同一
+窗口的重复 `desktopSession.getStartupSnapshot()` 返回同一冻结值。当前窗口内修改启动偏好只影响
+之后创建的窗口。
+
+Renderer 初始显示稳定的“正在恢复上次位置”启动门，不得先闪现 Quick Chat 再跳转。解析结果只
+能是：
+
+- `quick_chat`：显示 Quick Chat；
+- `camp(campId)`：Core 确认当前 Camp 存在后显示；
+- `members(agentId, tab)`：Core 确认 Member 可管理后显示对应队员与页签；
+- `members(null, tab)`：进入队员页并按当前权威顺序选择首个可管理队员，或显示空状态；
+- `memory`：显示记忆一级页；
+- `waiting_for_core`：保留冻结目标，等待并重试权威读取。
+
+用户偏好 `quick_chat` 时不验证旧恢复目标，只为本次窗口选择 Quick Chat。Quick Chat 成功显示后
+仍依“成功显示即提交”成为新的 Restorable Location；之后改回 `last_location` 时，下一窗口恢复
+的是此后最近成功显示的稳定位置，而不是被跳过的旧目标。
+
+## 5. Restorable Location 提交与验证
+
+Restorable Location 只有四种稳定形态：
+
+```ts
+type RestorableLocation =
+  | { kind: "quick_chat" }
+  | { kind: "camp"; campId: string }
+  | { kind: "members"; agentId: string | null; tab: "identity" | "runtime" }
+  | { kind: "memory" }
+```
+
+明确没有 `settings`、`new_conversation`、`notifications`、`command_palette`、`approval`、
+`dialog`、`toast` 或错误页形态。Camp Inspector、Memory 内部过滤、滚动位置、Draft Dialog、
+通知焦点和临时 Drawer 也不进入该记录。
+
+### 提交边界
+
+Renderer 只在目标页面满足“权威读取成功并已经成为可见一级页面”后调用 Shell 提交：
+
+- Quick Chat：Navigation 初始读取已经进入可显示状态；
+- Camp：`camps.snapshot` 返回当前 Active Camp，或返回已经有权威非空 Composer Draft、因而进入
+  Navigation 的 Pending Camp；空 Pending 不提交；
+- 队员页：`members.list/get` 已确认可管理集合，最终选中队员与 `identity/runtime` 页签已显示；
+- 记忆页：页面初始权威读取完成并显示主页面或合法空状态。
+
+提交发生在稳定导航完成后，不等 `before-quit`。重复提交完全相同目标可以 no-op；文件写失败不
+撤销已经完成的页面导航，但要给出非阻塞错误并在下一次稳定导航或显式重试时再次提交。
+
+### 权威验证结果
+
+| 恢复输入 | 权威结果 | 行为 | 是否清除旧目标 |
+| --- | --- | --- | --- |
+| Camp ID | Active Camp 存在，或 Pending Camp 仍有权威非空 Draft | 显示 Camp，随后提交该 Camp | 否 |
+| Camp ID | Pending Camp 已为空并被启动清理 | 显示 Quick Chat，成功后提交 Quick Chat | 是，以新提交替代 |
+| Camp ID | 明确 `not_found/deleted` | 显示 Quick Chat，成功后提交 Quick Chat | 是，以新提交替代 |
+| Member ID | 当前且未 removed | 显示该队员与所存页签 | 否 |
+| Member ID | 明确 removed/not found | 进入队员页；按 Member Order 先 present 后 away 选择首个可管理队员，保留所存页签；没有则空状态 | 是，提交最终队员目标 |
+| 任意 Core-backed 目标 | Core starting/restarting/unreachable/timeout | 保持启动门并继续恢复同一冻结目标；可显示“重试”和诊断入口 | 否 |
+| 恢复文件损坏或目标字段不合法 | 本地校验失败 | 回退 Quick Chat，成功后提交完整安全记录 | 是，以新提交替代 |
+
+实现必须使用结构化错误或明确 Read Side 结果区分“确定不存在”和“暂时不可读取”，不得通过错误
+字符串、一次 Health failure 或空的旧 Navigation Snapshot 推断删除。Core 暂时失败后成功时继续
+验证最初冻结目标，不重新读取偏好并选择另一条启动路线。
+
+## 6. Desktop Shell 持久化与 bridge
+
+v0.49 延续 `appearance.json`、`navigation.json`、`window-state.json` 的 Main-owned 本地偏好模式，
+新增两个相互隔离的 Shell 文件：
+
+| 文件 | 内容 | 缺失/损坏默认值 |
+| --- | --- | --- |
+| `<userData>/general-preferences.json` | `schemaVersion: 2`、启动/分类偏好、默认队员/Lead、失效锁存与一键创建开关 | `last_location`、`general`、未配置、关闭 |
+| `<userData>/restorable-location.json` | `schemaVersion: 1`、一个 `RestorableLocation` | 没有有效目标；本次进入 Quick Chat |
+| `<userData>/window-state.json` | 现有 `schemaVersion: 1`、normal bounds | 默认尺寸并在选定显示器居中 |
+
+三个文件分别损坏时不得互相清空。所有写入使用同目录临时文件、`0600`、`wx`、完整 JSON 和原子
+rename；失败清理临时文件。Reader 只接受精确 schema、有限 enum、有限长度非空 ID 和 finite
+bounds，不透传未知字段。任何 Shell 文件都不包含 Camp title、Member display name、Navigation
+Snapshot、用户正文、Runtime 状态或系统登录项 Boolean。
+
+Login Item Registration 不进入上述文件。它每次通过 Electron
+`getLoginItemSettings({ type: "mainAppService" })` 读取，并通过
+`setLoginItemSettings({ type: "mainAppService", openAtLogin })` 修改后读回。
+
+Preload bridge 在现有 context isolation/sandbox 下增加窄接口：
+
+```ts
+interface DesktopSessionApi {
+  getStartupSnapshot(): Promise<DesktopStartupSnapshot>
+  commitRestorableLocation(location: RestorableLocation): Promise<void>
+}
+
+interface GeneralPreferencesApi {
+  get(): Promise<GeneralPreferencesSnapshot>
+  setStartupLocationMode(mode: StartupLocationMode): Promise<GeneralPreferencesSnapshot>
+  setLastSettingsSection(section: SettingsSection): Promise<GeneralPreferencesSnapshot>
+  setNewConversationDefaults(defaults: NewConversationDefaults): Promise<GeneralPreferencesSnapshot>
+  setOneClickNewConversationEnabled(enabled: boolean): Promise<GeneralPreferencesSnapshot>
+  invalidateNewConversationDefaults(): Promise<GeneralPreferencesSnapshot>
+}
+
+interface LoginItemApi {
+  get(): Promise<LoginItemSnapshot>
+  setEnabled(enabled: boolean): Promise<LoginItemSnapshot>
+  openSystemSettings(): Promise<void>
+}
+
+interface WindowControlsApi {
+  getResetCapability(): Promise<{ canReset: boolean; reason: "fullscreen" | null }>
+  resetBounds(): Promise<{ performed: boolean; reason: "fullscreen" | null }>
+}
+```
+
+Main 对所有 Renderer 输入做穷尽 enum/shape/length 校验。Renderer 不获得文件路径、任意 JSON 写入、
+任意 Shell URL 或通用 BrowserWindow 控制能力。上述接口不是 CoreMethod，不进入 Core allowlist。
+
+## 7. 窗口区与几何规则
+
+页面固定显示：
+
+```text
+窗口
+
+Rovai-ai 会自动保存窗口大小和位置，并确保下次打开时窗口仍位于可见的显示器区域。
+
+[重置窗口大小与位置]
+```
+
+窗口状态始终保存，不增加“记住窗口位置”Switch。Main 使用 normal bounds，move/resize 采用现有
+debounce，关闭窗口前再进行一次 best-effort flush；全屏 bounds 不覆盖最后 normal bounds。
+
+### 创建窗口
+
+1. 读取并校验保存的 width/height/x/y；
+2. 在所有 display work area 中选择与保存 bounds 相交面积最大的显示器；
+3. 如果没有有效交集（例如外接显示器已移除），选择 primary display；
+4. 将尺寸限制在 `1040×700` 最小值与目标 work area 可容纳范围内；
+5. 将 x/y clamp 到目标 work area，保证窗口完整可见；
+6. 没有有效保存状态时使用 `1440×920`（受 work area 限制）并居中。
+
+### 重置
+
+Reset 以当前窗口 bounds 匹配的显示器作为“当前显示器”，使用 `1440×920` 默认尺寸（受其 work
+area 限制）计算精确居中 bounds，并立即写回 `window-state.json`。它只调用 BrowserWindow 几何
+能力，不刷新 Renderer，因此不得改变当前 View、Camp、Member、Tab、Memory、Settings、Draft、
+Approval、AgentRun、滚动或焦点链。
+
+若 `mainWindow.isFullScreen()` 为 true：
+
+- Renderer 禁用按钮并显示“请先退出全屏，再重置窗口大小与位置”；
+- Main 即使收到伪造/竞态 IPC 也返回 `performed: false, reason: "fullscreen"`；
+- 不登记 pending reset，不在退出全屏后自动执行。
+
+窗口进入或退出全屏、目标 display 变化以及 General 页面重新获得焦点时刷新 reset capability。
+
+## 8. 状态、焦点与错误恢复
+
+- General 页面即使某一 Shell 读取失败，页头、另一个 section 和设置导航仍可用；
+- 登录项、启动偏好与窗口重置各有独立 loading/submitting/error 状态，不能使用一个全页 busy；
+- Radio、Switch 与 Reset 都有可访问名称、文字状态和 `focus-visible`，不只靠颜色；
+- 打开系统设置后，焦点回到 Rovai-ai 时恢复到原按钮附近并刷新系统状态；
+- `requires-approval`、`not-found` 和写失败使用持久 inline status，而非只显示 Toast；
+- 成功保存启动偏好或完成窗口重置可以使用 `aria-live="polite"` 的短反馈；
+- Startup Gate 的重试不改变冻结目标，打开诊断也不提交 Settings 为 Restorable Location。
+
+## 9. 负向边界
+
+General 的全部写操作只进入 Electron Main 或 macOS 系统：
+
+- 不调用 Core command；
+- 不写 SQLite；
+- 不产生 Camp event、CampMessage、Task、AgentRun、Native Session、Approval 或 audit；
+- 不改变 Runtime model、permission、Memory policy、Notification rule 或 execution recovery；
+- Core 权威读取只用于恢复目标验证，不能被包装成偏好事件或审计动作。
+
+登录启动创建普通可见主窗口，不使用隐藏窗口、Tray-only、后台 silent mode 或自动运行任务。
+
+## 10. 非目标
+
+- 语言、自动更新、系统通知规则；
+- 关闭窗口行为和后台驻留策略；
+- 默认 Project、模型、Runtime、权限或 Memory；
+- 自动批准或是否恢复未完成执行；
+- 多窗口并发、窗口布局集合、记住全屏/最大化状态；
+- Windows/Linux 登录项实现。

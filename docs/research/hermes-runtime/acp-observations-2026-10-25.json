@@ -1,0 +1,205 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-25",
+  "productionCommit": "376f3c22e1031a6f966163e7f7679cd57e14ead2",
+  "hermes": {
+    "version": "0.22.4",
+    "commit": "4d04303818b61bf3aa09278af48356315515965b",
+    "sourcePatched": false
+  },
+  "environment": {
+    "platform": "macOS arm64",
+    "isolatedUserHome": true,
+    "preExistingSharedGateway": true,
+    "provider": "controlled loopback Responses",
+    "realPaidModel": false,
+    "fixtureRoot": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-hermes-native-session-jvtuGH",
+    "productionTransportChanged": false,
+    "dailyHermesConfigurationChanged": false
+  },
+  "command": "node scripts/smoke-hermes-native-session.mjs <official-source> <prepared-python> --observations",
+  "runs": {
+    "count": 15,
+    "statuses": {
+      "cancelled": 1,
+      "failed": 2,
+      "succeeded": 12
+    },
+    "expectedFailures": [
+      "Core SIGKILL",
+      "provider failure after a successful model/tool call"
+    ]
+  },
+  "checks": {
+    "noHermesContextProjection": true,
+    "concurrentMembers": true,
+    "backgroundUsesRunAtCallTime": true,
+    "noActiveOrUnknownSessionRejected": true,
+    "gatewaySurvivesCoreShutdown": true,
+    "nativeCompactionNoRulesRedelivery": true,
+    "nativeSystemPromptPreserved": true,
+    "nativeConfigUnchanged": true,
+    "mcpNewAndColdResumeWithPartialFailure": true,
+    "fixedCliWithoutAcpPathInjection": true,
+    "cancelDoesNotStopOtherSession": true,
+    "mcpRebindAfterNativeGatewayRestart": true,
+    "coreKillDoesNotKillGatewayOrReplay": true,
+    "failedAfterKnownUsage": true,
+    "actualModelInputsMatchRulesDelivery": true,
+    "noHermesCompatibilityDigests": true,
+    "cliEntryInstalledBeforeRuns": true,
+    "cumulativeAndResetUsageNotMisattributed": true,
+    "originalSessionColdResume": true
+  },
+  "compaction": {
+    "nativeAutomaticCommitted": 2,
+    "nativeManualProbe": {
+      "clientCompactionOptIn": true,
+      "summaryRequests": 1,
+      "stopReason": "end_turn"
+    },
+    "optInInitializeCount": 1,
+    "acpLifecycleUpdates": 0,
+    "historicalSummaryReplayFrames": 6,
+    "reportedProvenanceDepths": [
+      0
+    ],
+    "coreCompactionObservations": 0,
+    "rulesRedelivery": false,
+    "conclusion": "Native compaction runs; official ACP does not expose live lifecycle here. Replay summary markers are not current-Run events."
+  },
+  "usage": {
+    "comparison": [
+      {
+        "label": "A6",
+        "provider": {
+          "inputTokens": 500,
+          "outputTokens": 50
+        },
+        "terminalUsage": {
+          "inputTokens": 500,
+          "outputTokens": 50,
+          "totalTokens": 550
+        },
+        "errorCode": null
+      },
+      {
+        "label": "A7",
+        "provider": {
+          "inputTokens": 1100,
+          "outputTokens": 20
+        },
+        "terminalUsage": {
+          "inputTokens": 1100,
+          "outputTokens": 20,
+          "totalTokens": 1120
+        },
+        "errorCode": null
+      },
+      {
+        "label": "A8",
+        "provider": {
+          "inputTokens": 200,
+          "outputTokens": 20
+        },
+        "terminalUsage": {
+          "inputTokens": 1300,
+          "outputTokens": 40,
+          "totalTokens": 1340
+        },
+        "errorCode": null
+      },
+      {
+        "label": "B2",
+        "provider": {
+          "inputTokens": 200,
+          "outputTokens": 20
+        },
+        "terminalUsage": null,
+        "errorCode": null
+      },
+      {
+        "label": "B4",
+        "provider": {
+          "inputTokens": 200,
+          "outputTokens": 20
+        },
+        "terminalUsage": {
+          "inputTokens": 400,
+          "outputTokens": 40,
+          "totalTokens": 440
+        },
+        "errorCode": null
+      },
+      {
+        "label": "B5",
+        "provider": {
+          "inputTokens": 100,
+          "outputTokens": 10
+        },
+        "terminalUsage": null,
+        "errorCode": -32603
+      }
+    ],
+    "updateShapes": [
+      {
+        "kind": "usage_update",
+        "keys": [
+          "size",
+          "used",
+          "sessionUpdate"
+        ],
+        "meta": [],
+        "hermesMeta": []
+      }
+    ],
+    "coreRunSummaryRows": 15,
+    "coreUnknownRows": 15,
+    "counterLifetime": "resident native Agent; may reset within the same logical Session",
+    "conclusion": "Direct totals overcount reused Agents; blind cross-Run subtraction miscounts resets; failed PromptResponse omits already known usage.",
+    "cost": "unknown; no estimates"
+  },
+  "priorAttempts": [
+    {
+      "fixture": "rovai-hermes-native-session-5hdcKf",
+      "result": "fixture error after 12 baseline Runs",
+      "reason": "test sent string where ModelSelection DTO was required; fixed and rerun"
+    },
+    {
+      "fixture": "rovai-hermes-native-session-V6h85I",
+      "result": "15-Run matrix passed; cumulative/failure observations reproduced",
+      "limitation": "viewer attached after A6; final run retains it before A6 and adds explicit compaction opt-in/manual probe"
+    }
+  ],
+  "upstreamAtVerification": {
+    "compactionIssue": "https://github.com/NousResearch/hermes-agent/issues/137752",
+    "compactionPr": "https://github.com/NousResearch/hermes-agent/pull/137950",
+    "state": "both open",
+    "standard": "https://agentclientprotocol.com/rfds/session-compaction"
+  },
+  "notImplemented": [
+    "live compaction ingestion",
+    "per-Run token billing from ambiguous native counters",
+    "production standard compaction capability advertisement"
+  ],
+  "notRun": [
+    "new paid-model acceptance",
+    "other-platform matrix",
+    "upstream candidate patch",
+    "Renderer visual acceptance"
+  ],
+  "evidenceHashes": {
+    "acp.jsonl": "e86a4662301d50094d850d65175e3a14995b950232626cbe5467fd330a5042d0",
+    "observations.json": "bda4e699c794b13cce6121b3fab48223a03f0a66760eb6ae54b4eafe5f95c59a",
+    "report.json": "7fdf5a49539e2d52a12ac0621f9c8cb5f1248f21fd48bc1e8ad666be1ad7cd3e"
+  },
+  "validation": {
+    "nativeObservationProbe": "passed: 15 Runs and explicit opt-in manual compression probe",
+    "usageParserRegression": "1 passed, 0 failed (exact existing owner)",
+    "nodeSyntax": "both changed scripts passed",
+    "gitDiffCheck": "passed",
+    "documentationTests": "10 passed, 0 failed",
+    "documentationCurrentGate": "passed",
+    "documentationDiffGate": "passed against 376f3c22e"
+  }
+}

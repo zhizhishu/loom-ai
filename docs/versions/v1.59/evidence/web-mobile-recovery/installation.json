@@ -1,0 +1,85 @@
+{
+  "status": "passed",
+  "installedAt": "2026-09-14T10:18:22.611Z",
+  "sourceCommit": "7d497e2560df557cf7db43b2723deb0313a08925",
+  "mergedMain": "0bfc35b0dc68d99eeb483f59406e3beca84a2840",
+  "version": "0.2.6",
+  "platform": "darwin",
+  "arch": "arm64",
+  "source": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-web-recovery/dist/mac-arm64/Rovai AI.app",
+  "installed": "/Applications/Rovai AI.app",
+  "backup": "/Applications/Rovai AI.backup-before-recovery-7d497e25-20260914T101039Z.app",
+  "signatureVerification": "App/Host/Core/CLI ad-hoc signature, architecture and Bundle ID at source, same-volume staging, canonical target",
+  "installer": "pnpm install:mac:daily",
+  "hashes": {
+    "Contents/Resources/app.asar": {
+      "source": "7d376cef7783e3e46d6208e4d6b38ca4a08c3c680a5cc7e3fbf9248157257d80",
+      "installed": "7d376cef7783e3e46d6208e4d6b38ca4a08c3c680a5cc7e3fbf9248157257d80",
+      "backup": "57cb12df2e22ba7e7af44b48ad6ae56c32ee62d0353d1987c4a4f81d2e7d10ea"
+    },
+    "Contents/Resources/bin/rovai-host": {
+      "source": "ca7f9693c10113a315c7b207dac74038e6bf5a89ba93f0c3489110448c3ad452",
+      "installed": "ca7f9693c10113a315c7b207dac74038e6bf5a89ba93f0c3489110448c3ad452",
+      "backup": "288180ad096f64212fa30f9827b0a34cfd1517621e4d3da66c12148b233885e8"
+    },
+    "Contents/Resources/bin/rovai-core": {
+      "source": "27f313b5bb93026dc9e89467100805cd6b20de6f4de1485e07f9cb9c95ea6549",
+      "installed": "27f313b5bb93026dc9e89467100805cd6b20de6f4de1485e07f9cb9c95ea6549",
+      "backup": "27f313b5bb93026dc9e89467100805cd6b20de6f4de1485e07f9cb9c95ea6549"
+    },
+    "Contents/Resources/bin/rovai": {
+      "source": "acabda226432e733dae4e7ac6ddcc05112230d961daea67382aaa411e9d7462b",
+      "installed": "acabda226432e733dae4e7ac6ddcc05112230d961daea67382aaa411e9d7462b",
+      "backup": "acabda226432e733dae4e7ac6ddcc05112230d961daea67382aaa411e9d7462b"
+    }
+  },
+  "webFilesMatched": 138,
+  "processes": [
+    {
+      "pid": 98109,
+      "parentPid": 1,
+      "startedAt": "Mon Sep 14 17:09:16 2026",
+      "path": "/Applications/Rovai AI.app/Contents/MacOS/Rovai AI",
+      "aliveWithSameStartTime": true,
+      "observedPath": "/Applications/Rovai AI.app/Contents/MacOS/Rovai AI"
+    },
+    {
+      "pid": 98120,
+      "parentPid": 98109,
+      "startedAt": "Mon Sep 14 17:09:17 2026",
+      "path": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper",
+      "aliveWithSameStartTime": true,
+      "observedPath": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper"
+    },
+    {
+      "pid": 98121,
+      "parentPid": 98109,
+      "startedAt": "Mon Sep 14 17:09:18 2026",
+      "path": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper",
+      "aliveWithSameStartTime": true,
+      "observedPath": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper"
+    },
+    {
+      "pid": 98131,
+      "parentPid": 98109,
+      "startedAt": "Mon Sep 14 17:09:19 2026",
+      "path": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper (Renderer).app/Contents/MacOS/Rovai AI Helper (Renderer)",
+      "aliveWithSameStartTime": true,
+      "observedPath": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper (Renderer).app/Contents/MacOS/Rovai AI Helper (Renderer)"
+    },
+    {
+      "pid": 98137,
+      "parentPid": 98109,
+      "startedAt": "Mon Sep 14 17:09:19 2026",
+      "path": "/Applications/Rovai AI.app/Contents/Resources/bin/rovai-host",
+      "aliveWithSameStartTime": true,
+      "observedPath": "/Applications/Rovai AI.app/Contents/Resources/bin/rovai-host"
+    }
+  ],
+  "allRecordedProcessesStillAlive": true,
+  "dailyUserDataModifiedByInstaller": false,
+  "dailyProcessRestartedByInstaller": false,
+  "activeProcessIsPreviousVersion": true,
+  "activation": "Exit the current App when ready and open /Applications/Rovai AI.app explicitly.",
+  "previousPersistentAuthFormatCompatible": true
+}

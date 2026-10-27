@@ -1,0 +1,206 @@
+---
+document_type: implementation-plan
+version: v0.58
+authority: implementation-plan-and-acceptance
+status: in_progress
+last_updated: 2026-08-11
+---
+
+# v0.58 实施与验收计划
+
+## Checkpoint 0：长期边界
+
+- [x] 冻结 logical Runtime identity 与 mutable Installation/effective Runtime 的职责；
+- [x] 明确一次 rebind 上限和 refresh 后的第二次完整校验；
+- [x] 新增 ADR-0156 并更新 Runtime Architecture 与 CURRENT 路由。
+
+## Checkpoint 1：Core 与持久化
+
+- [x] dispatch 对可恢复 blocker/fingerprint drift 执行同步 refresh、re-resolve 与 rebind；
+- [x] rebind 原子校验 logical identity、current snapshot、config digest、Run fence 与次数上限；
+- [x] Migration 72 增加 initial Runtime evidence 和 `runtime_rebind_count`，既有 Run 原位回填；
+- [x] 用户消息与 Message Delivery 两条生产 Run 创建路径写入 initial evidence；
+- [x] 成功路径写入 `runtime_drift_detected` / `runtime_rebound`，失败保留具体 blocker/error code。
+
+## Checkpoint 2：验证
+
+- [x] 单元测试覆盖 runtime-default 漂移、Installation/policy identity 拒绝、initial/effective evidence、
+  原子 rebind 和第二次 rebind 拒绝；
+- [x] 完整 Rust workspace test、Clippy、format 与通用文档门禁通过；
+- [x] 回填实际命令、测试计数与当前限制；
+- [ ] 使用可控 Copilot CLI v1/v2 fixture 或真实原地升级完成 dispatch smoke，确认同一 Run 继续；
+- [ ] 完成 Runtime drift smoke 后把版本状态同步为 complete。
+
+## Checkpoint 3：真实请求复盘修正
+
+- [x] Session Charter 明确 Runtime final 不进入公屏、公开回复必须成功调用 `rovai send`；
+- [x] Charter 文案变化不进入 Native Binding compatibility digest，不主动轮换既有 Session；
+- [x] ADR-0157 删除未进入 Runtime Context 的 `expectedOutput` IPC、持久化与读模型字段；
+- [x] Migration 73 原位删除 `agent_run.expected_output` 并保留历史 Run 其余事实；
+- [x] Canonical Activity lifecycle merge 保留 ACP started kind/title，稀疏 terminal 只更新状态；
+- [x] Codex 保留 app-server `commandActions` 的安全结构字段，并在 `title` 为空时生成有界 command/file presentation hint；
+- [x] Stop 只选择拥有 queued/running/waiting AgentRun 的 running/waiting Turn；
+- [x] 增加 Charter、Canonical lifecycle 和 Renderer cancellation 回归测试。
+
+## Checkpoint 4：受管 Skill 默认全 Runtime 投递
+
+- [x] 新安装的 Rovai 内置 Skill 默认启用并创建全部九个 Skill Group Assignment；
+- [x] 新导入 Skill 同样默认启用并创建全部九个 Skill Group Assignment；
+- [x] Migration 74 为既有 active Skill 一次性补齐缺失分组，并保留当前 Revision 与显式启停状态；
+- [x] 迁移后用户删除的分组与禁用状态在后续启动中保持，不由 bundled install 强制恢复；
+- [x] Core 回归、Skill smoke 断言、ADR、领域术语和设置 UI 合同同步默认差异。
+- [x] Skill 启停事务提交后立即返回并只把已知 projection 标记 dirty，目录对账留到下一次相关 Run
+  preflight；Renderer 只更新当前行，Switch 不显示“已启用 / 已停用 / 保存中”，通过
+  `aria-checked` 与动作型可访问名称表达状态。
+
+## Checkpoint 5：内置 Tasteful UI Skill
+
+- [x] 固定 `tasteful-ui` 上游 Revision `159ccd47a320f3a7bd0289d07366d422211895a1`，完整引入 81 个上游文件；
+- [x] 补充 MIT `LICENSE`、固定来源 `NOTICE` 与匹配的 `agents/openai.yaml`，不引入启动时网络依赖；
+- [x] Core 构建时递归生成完整 84 文件 bundled manifest，拒绝符号链接和非普通文件；
+- [x] 新安装 `tasteful-ui` 复用内置 Skill 的默认启用、全九组分配、不可变 Revision 和用户修改保持语义；
+- [x] Core、Skill smoke、Renderer acceptance、领域词汇与 ADR 官方集合清单同步为六个。
+- [x] Skill 设置从真实上游元数据派生“GitHub / Rovai / 用户导入”短标签，仓库、来源与 Revision
+  进入详情，并用带列名的投递范围、无文案状态 Switch 与详情替代三点元数据菜单。
+
+## Checkpoint 6：会话叙述与工件双宽度
+
+- [x] 用户消息移除独占 `brand-soft` 气泡，与 Agent 普通正文共用开放阅读平面；
+- [x] 同一作者的相邻真实消息只收紧间距，不隐藏 metadata 或创建回合模型；
+- [x] `min-width: 1800px` 时会话工作列扩展至 1040px，叙述保持约 76ch，代码与表格最多使用 930px；
+- [x] Hover、Focus、Copy、A2A、Task、Approval、AgentRun 与 Composer 边界保持不变；
+- [x] 用户、Agent 与 A2A 消息的 Copy 统一锚定消息内容列右上角，不跟随正文或 footer 尺寸漂移；
+- [x] 完成 packaged App 的 1440×920、2560×1440、1040×700 会话视觉验收。
+
+## Checkpoint 7：聚焦 Camp Inspector
+
+- [x] ordinary Inspector 只保留“任务 / 队员”，删除 Context Delivery 与重复 Approval Tab、state、
+  JSX 和专属样式；ContextManifest/Core evidence 保持不变；
+- [x] “队员”页按当前 CampMember 顺序显示真实身份、Presence、Runtime readiness 与 Lead，并以既有
+  versioned `camps.changeDefaultLead` 作为唯一 Camp-local Lead mutation；
+- [x] Approval Dock 成为唯一普通审批决定 surface，支持收起；Header 与通知摘要只展开、定位并聚焦
+  Dock，不改变 Inspector 显隐或页签；
+- [x] ADR-0160、Run Process Detail Surface v3、UI/Architecture/current-version 路由和自动验收脚本同步；
+- [x] 完成 packaged App 的 1440×920、1040×700、200% zoom 双页签、Lead 菜单与 Header-to-Dock
+  焦点验收。
+
+## Checkpoint 8：Runtime-produced 输入确认
+
+- [x] 只有匹配 Native Conversation 的 forward/send 之后出现 `streamGenerateContent ResponseID`，才在
+  `agy --print` 仍运行时报告 accepted evidence；child start、Session 创建和本地 forwarding 不单独 ACK；
+- [x] Core 在早期 evidence 上先绑定 Prepared Native Session，再持久化 Runtime Input Delivery ACK，
+  同时保留成功退出和可验证 final-output failure 的 terminal fallback；
+- [x] accepted 后的非零退出、取消或输出失败确定性结算当前 Run，不降级为 `delivery_unknown`；早期与
+  terminal Session/Turn identity 不一致时 fail closed；
+- [x] fixture 覆盖乱序/缺失 marker、new/resumed Session、ACK 先于 final、非零退出和 ACK 后取消；
+- [x] 本机 `agy 1.1.12` 只读 smoke 观察到匹配 marker、最终 stdout 与成功退出，兼容性清单同步 focused
+  evidence，且不替代 `1.1.11` 十三工具 qualification。
+- [x] Claude Code 改用 `stream-json + include-partial-messages`；只有匹配 Session 的模型 stream/assistant
+  event 提前确认，system/Hook/status 不确认，success result 保留 terminal fallback；accepted 后失败不降级；
+- [x] ACP Host 把 Delivery identity 绑定到唯一 active prompt；六个 ACP Runtime 不再在 stdin flush 后 ACK，
+  只接受 prompt-bound agent/thought/plan/tool/permission event 或成功 response，明确 error 结算 `not_accepted`；
+- [x] fixture 覆盖 Claude ACK 先于 result、Session mismatch、ACP allowlist/metadata 负例，以及
+  `not_accepted -> prepared` 重试和 accepted 不可降级；本机 Claude Code `2.1.220` focused smoke 观察到
+  `system init -> stream_event/message_start -> success result` 的顺序。
+
+## Checkpoint 9：队员与记忆页面顶部收口
+
+- [x] 队员与记忆内容跨越 App Shell 两行，删除两页独立的 50px 空白 `WindowDragStrip`；
+- [x] 两页现有 Header 继续提供窗口拖拽，全部真实操作继续显式 `no-drag`，不恢复重复 AppHeader；
+- [x] 队员页从 3px Steel 顶边进入 30px 留白与现有身份 Header；记忆页同步 P2 kicker、底对齐操作和
+  1080px 有效内容宽度，保留真实 Memory Read Side、治理与 mutation；
+- [x] `App.test.ts`、`theme-tokens.test.ts` 与 packaged App 验收脚本锁定无空白顶栏、Header 几何和
+  1440×920 / 1040×700 无横向溢出；
+- [x] 当前 UI 详规与最终 P2 原型说明明确页面级 Header 是两页唯一右侧顶部，禁止以后恢复占位条。
+
+## Checkpoint 10：Execution Drawer 可调高度
+
+- [x] Drawer 顶边增加轻量 Steel resize separator，支持鼠标、触控和指针捕获，上拖扩大、下拖缩小；
+- [x] 补齐水平 separator 的 ARIA 数值、方向键、PageUp/PageDown、Home/End 与 Enter/Space 恢复默认；
+- [x] 高度只保存在 Main Window Session，切换 Agent、收起重开与离开 Camp 返回时沿用，不写 Core；
+- [x] 根据会话列、执行台与 viewport 动态 clamp，并在 sticky-bottom 跟随时继续定位最新输出；
+- [x] Renderer helper 单测、类型检查、文档合同和 packaged acceptance 脚本同步；
+- [x] 使用最新签名 App 完成 1440×920、1040×700、200% zoom 的真实拖拽、键盘、保持与无覆盖验收。
+
+## Checkpoint 11：事件驱动 Skill projection
+
+- [x] 删除 App 启动全量 root reconcile、30 秒 Skill interval 与配置 mutation 后的全量 filesystem
+  reconcile；Library/Runtime 配置变化只在 SQLite 标记已有 Observation roots dirty/pending cleanup；
+- [x] AgentRun preflight 先在路径解析前拒绝 removed root，只 canonicalize 当前 execution root，按目标
+  Runtime Groups 与同 root active Run Groups reconcile 最新 Library state，并在 error/stale 时阻止启动；
+- [x] `SkillExposureSnapshot` 只冻结启动时 identity/Revision/path/status/conflict Evidence；不同 Agent 的
+  新 Run 不等待旧 Run、不维护 projection generation，旧 Run 之后允许看到共享目录的新内容；
+- [x] Migration 75 增加 projection root access/dirty/cleanup state，并把遗留
+  `skill_projection_drain` waiting Run 原位恢复 queued；
+- [x] Main-owned removed Project preference 在 Core 启动时只做 DB-only sync；移除时无 active Run 可做
+  一次受管 cleanup，有 active Run 则在 terminal 后完成，恢复目录只标 active + dirty；
+- [x] 普通 diagnostics 改读 stored observation/root state，不以历史 Observation 调度目录访问；用户
+  显式 `skills.reconcile` 仍可修复 active known roots；
+- [x] ADR-0161、Skill Projection Reconciliation Architecture、领域术语、current-version 与 UI 的
+  Project removal 边界同步。
+
+## Checkpoint 12：Skill 身份色与列表可读性
+
+- [x] 每个 Skill 复用持久 `Skill.id` 的 FNV-1a 映射，从共享 `--identity-1..8` 选择标记色；名称、
+  启停和 Revision 更新不改变颜色，内置与 Imported Skill 不维护名称特例；
+- [x] 首层来源标签收敛为“Rovai / GitHub / 用户导入”，仓库、上游 Revision、安装与导入来源全部
+  移入详情；详情保持统一 Steel rail/Porcelain background，不继承身份色；
+- [x] Skill 名称、说明、来源标签分别提高到 14/12.5/10.5px，添加区、搜索、投递范围菜单与详情同步
+  提高字号和控件高度；
+- [x] 启停控件收敛为 34×20 Steel Switch，不显示“已启用 / 已停用 / 保存中”，保留 `role="switch"`、
+  `aria-checked`、动作型可访问名称和行级 busy；
+- [x] Renderer 测试、Arctic Dawn/UI acceptance 合同与 packaged capture 同步；真实 `Skill.id` hash、
+  主行无 provenance、详情来源、中性色详情和 Steel Switch 均由脚本计算样式验证；
+- [x] 签名 App 在 1440×920 及同物理画布 200%（720×460 CSS viewport / DPR 2）通过完整操作链，
+  页面和设置面板均无横向溢出。
+
+已完成自动化验证：
+
+- `cargo test --workspace`：Library 333、CLI 10、Core binary 62 通过，3 个既有手工 Runtime smoke ignored；
+- `pnpm test`：文档治理 21、Vitest 270、Node qualification/benchmark 151 通过；
+- `cargo test -p rovai-core codex_ -- --nocapture`：Codex structured presentation、Adapter 与 MCP fixture 通过；
+- `cargo test -p rovai-core rebind -- --nocapture`：2 个新增 rebind 测试通过；
+- `cargo test -p rovai-core db::tests::v72_backfills_initial_runtime_evidence_without_overwriting_existing_values -- --nocapture`：Migration 72 回填测试通过；
+- `cargo test -p rovai-core db::tests::v73_removes_expected_output_without_losing_agent_runs -- --nocapture`：Migration 73 删列与历史 Run 保留测试通过；
+- `pnpm exec vitest run apps/desktop/src/renderer/src/theme-tokens.test.ts apps/desktop/src/renderer/src/App.test.ts`：2 个文件、82 项 Renderer 契约通过；
+- `pnpm exec vitest run`：40 个文件、270 项 Renderer 测试通过；Skill 定向测试与 CSS 契约为 2 个文件、24 项；
+- `pnpm typecheck` 与 `pnpm build:desktop`：TypeScript、Main/Preload/Renderer 生产构建通过；
+- `pnpm package:mac` 与 `scripts/capture-skills.mjs`：签名 App 的 1440×920、200% zoom 两套隔离
+  `userData` 验收通过；六个 official Skill 的真实 UUID hash、字号、短来源、无文案 Steel Switch、
+  中性详情、九组菜单与无横向溢出均通过；
+- `pnpm package:mac` 与 `pnpm accept:runtime-activity-ui`：签名 App 验收通过；2560×1440 下会话列 1040px、叙述 622.31px、Composer 1040px，1040×700 无整页或会话列横向溢出；
+- 本 worktree `pnpm package:mac`：arm64 签名 App 构建通过，`codesign --verify --deep --strict` 及 Core、CLI、native host 单体签名校验通过；
+- `pnpm accept:memory-ui`：1440×920 与 1040×700 的日间/夜间 packaged App 均无 50px 空白顶栏；内容顶点为 0、Memory Library 顶点为 3、Header 顶点为 33，3px Steel 顶边、kicker、操作底对齐与无横向溢出通过；
+- `pnpm accept:runtime-activity-ui`：Execution Drawer separator 键盘从 160px 调到 240px、真实指针从
+  302px 调到 238px，收起重开保持且 Enter 恢复默认；1040×700 最大 391px 时保留 111.5px 时间线，
+  200% zoom 最大 102px 时保留 52px 时间线，Drawer、Composer 与 Stop 无可见覆盖；
+- `scripts/capture-camp-inspectors.mjs`：签名 App 在 1440×920、1040×700 与 200% zoom 下均只显示“任务 / 队员”，Lead 菜单真实 mutation、Header-to-Dock 聚焦、Inspector 状态保持及无横向溢出通过；
+- `pnpm accept:runtime-activity-ui`：9 条 Agent 消息及 A2A footer 的 Copy 均使用 `top: -2px; right: 0` 内容列锚点，聚焦态不覆盖收件人；
+- `pnpm accept:structured-mentions-ui`：用户消息真实 Hover 显示右上角 Copy，原生拖选、`Command+C`、整条复制与剪贴板恢复通过；
+- `pnpm accept:member-lifecycle-ui`：队员页内容顶点为 0、Workbench 顶点为 3、Header 顶点为 33 且无 50px 空白顶栏；用户消息透明开放表面、原生文本选择、Copy、Mention、成员页返回与 200% zoom/reduced motion 回归通过；
+- `cargo test -p rovai-core official_skills_default_to_all_groups_and_preserve_user_changes -- --nocapture`：内置 Skill 初始九组与后续用户修改保持通过；
+- `cargo test -p rovai-core imports_default_to_all_groups_and_updates_preserve_user_changes -- --nocapture`：Imported Skill 初始九组与 Revision 更新保持通过；
+- `cargo test -p rovai-core v74_assigns_every_active_skill_to_all_runtime_groups_once -- --nocapture`：Migration 74 对内置与 Imported Skill 的一次性回填通过；
+- `cargo test -p rovai-core skill_projection::tests -- --nocapture`：21 项通过；覆盖配置变化 DB-only dirty、历史 Observation 不调度、removed root 启动同步与终态清理、当前 root Run 前修复/强校验、project-owned non-overwrite，以及旧 Run 继续时新 Run 使用最新 Revision；
+- `cargo test -p rovai-core v75_persists_skill_projection_root_access_without_reapplying_it -- --nocapture`：Migration 75 root-access/dirty/cleanup 状态持久化通过；
+- `cargo test -p rovai-core removed_skill_project_roots_are_explicit_normalized_and_deduplicated -- --nocapture`：Main 传入 Core 的 removed-root 启动参数只接受规范绝对路径并稳定去重；
+- `cargo test -p rovai-core antigravity::tests -- --nocapture`：Antigravity 8 项通过、1 项真实 Runtime smoke ignored；覆盖 early accepted、terminal failure、取消与日志清理；
+- 本机 `agy 1.1.12 --print --mode plan --sandbox` focused smoke：匹配 Conversation 的 forward/send 后观察到 `streamGenerateContent ResponseID`，stdout `ACK-SMOKE` 且 exit 0；
+- `cargo test -p rovai-core claude::tests -- --nocapture`：Claude 4 项通过；覆盖 init 负例、Session fencing、early ACK 与 terminal result；
+- `cargo test -p rovai-core only_active_prompt_response_events_prove_acp_input_acceptance -- --nocapture` 与
+  `explicit_runtime_rejection_does_not_advance_or_downgrade_input_acceptance -- --nocapture`：ACP accepted allowlist、
+  metadata 负例、明确拒绝、可重试和 accepted 不可降级通过；
+- 本机 Claude Code `2.1.220 --output-format stream-json --include-partial-messages` focused smoke：匹配 Session
+  的 `system init` 后出现 `stream_event/message_start`，随后 success result 与 `CLAUDE-STREAM-ACK-SMOKE`；
+- `cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 通过；
+- `pnpm docs:test`：21 个测试通过；`pnpm docs:check` 通过，覆盖 58 个版本目录与 161 个 ADR。
+
+当前限制：自动 rebind 按 AgentRun 持久化限制为一次；尚未用真实 Copilot CLI 原地升级验证
+`dispatch -> refresh -> rebind -> launch` 的完整进程链路，因此本版本仍为 `in_progress`。
+
+## 完成条件
+
+- [ ] 正常受信 CLI 原地升级不再产生 `runtime_integrity_failed` terminal Run；
+- [x] identity/trust/auth/model/permission/protocol 无法重新确认时仍 fail closed；
+- [x] 初始与有效 executable evidence 可审计，rebind 次数跨重启保持有界；
+- [x] 文档、Migration、Core 实现和测试结论一致。

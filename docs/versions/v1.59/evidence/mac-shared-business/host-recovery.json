@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "coreBinary": "rovai-host",
+  "adapterKind": "codex-cli",
+  "runtimeVersion": "codex-cli 0.153.4",
+  "campId": "rvcamp_01m2bjgqvyff8vqcf54sxm9vvc",
+  "agentRunId": "e8be80d6-59ae-4e0b-b6e1-296681606f5d",
+  "originalExecutionEpoch": 1,
+  "recoveredExecutionEpoch": 1,
+  "acceptedInputHeldBehindRecoveryBlocker": true,
+  "acceptedInputOutcomeClosedUnknown": true,
+  "originalPromptResent": false,
+  "contextManifestPreserved": true,
+  "taskId": "68a1dbdf-dfca-44a7-8984-80a93072a706",
+  "taskCommandReplayStable": true,
+  "duplicateAgentRuns": 0,
+  "duplicateTasks": 0,
+  "cleanSecondRestart": true
+}

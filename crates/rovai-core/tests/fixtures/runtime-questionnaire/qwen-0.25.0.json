@@ -1,0 +1,39 @@
+{
+  "sessionId": "questionnaire-session",
+  "toolCall": {
+    "toolCallId": "questionnaire-tool",
+    "status": "pending",
+    "title": "Ask user 1 question",
+    "content": [],
+    "locations": [],
+    "kind": "think",
+    "rawInput": {
+      "questions": [{
+        "question": "Which color?",
+        "header": "Color",
+        "options": [
+          {"label": "Blue", "description": "Blue fixture"},
+          {"label": "Green", "description": "Green fixture"}
+        ],
+        "multiSelect": false
+      }]
+    },
+    "_meta": {
+      "toolName": "ask_user_question",
+      "qwenInteractionKind": "user_question",
+      "qwenQuestions": [{
+        "question": "Which color?",
+        "header": "Color",
+        "options": [
+          {"label": "Blue", "description": "Blue fixture"},
+          {"label": "Green", "description": "Green fixture"}
+        ],
+        "multiSelect": false
+      }]
+    }
+  },
+  "options": [
+    {"optionId": "proceed_once", "name": "Submit", "kind": "allow_once"},
+    {"optionId": "cancel", "name": "Cancel", "kind": "reject_once"}
+  ]
+}

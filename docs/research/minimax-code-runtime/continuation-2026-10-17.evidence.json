@@ -1,0 +1,283 @@
+{
+  "status": "partial",
+  "date": "2026-10-17",
+  "productDefaultChanged": false,
+  "upstreamEntryAvailableInPublished0612": false,
+  "coreRevision": "e359b08721f4f363f4b53a0bf9bd414169309374",
+  "sourceCandidate": {
+    "baseCommit": "9a935605956c4500e9cb415f29258e2887e97817",
+    "version": "0.6.5",
+    "policy": "MCODE_DISABLE_ASK_USER=1, ACP only",
+    "changedLines": 7,
+    "patchSha256": "ceface2c2cafd421fdda96518e684113700fe045d00a374cf0121f0ec1b2771c",
+    "installedInProduct": false,
+    "cases": [
+      {
+        "name": "ordinary-native-default",
+        "status": "passed",
+        "pid": 12070,
+        "sessionId": "mvs_a567b02d6a254488b9fc046e828c0fc0",
+        "calls": 1
+      },
+      {
+        "name": "disabled-exact-resume",
+        "status": "passed",
+        "pid": 12114,
+        "sessionId": "mvs_a567b02d6a254488b9fc046e828c0fc0",
+        "calls": 1
+      },
+      {
+        "name": "warm-permission-provider-refresh",
+        "status": "passed",
+        "pid": 12114,
+        "sessionId": "mvs_a567b02d6a254488b9fc046e828c0fc0",
+        "calls": 1
+      },
+      {
+        "name": "disabled-cold-resume",
+        "status": "passed",
+        "pid": 12152,
+        "sessionId": "mvs_a567b02d6a254488b9fc046e828c0fc0",
+        "calls": 1
+      },
+      {
+        "name": "ordinary-native-after-host-policy",
+        "status": "passed",
+        "pid": 12173,
+        "sessionId": "mvs_a567b02d6a254488b9fc046e828c0fc0",
+        "calls": 1
+      }
+    ],
+    "modelRequests": [
+      {
+        "stage": "ordinary-native-default",
+        "label": "a",
+        "protocolPath": "/v1/chat/completions",
+        "tools": [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "grep",
+          "glob",
+          "todowrite",
+          "skill",
+          "ask_user",
+          "request_feature_enable",
+          "web_fetch",
+          "web_search",
+          "task",
+          "task_append",
+          "task_query",
+          "task_output",
+          "task_stop",
+          "website_deploy",
+          "update_goal",
+          "get_goal"
+        ],
+        "expectedKey": true
+      },
+      {
+        "stage": "disabled-exact-resume",
+        "label": "a",
+        "protocolPath": "/v1/chat/completions",
+        "tools": [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "grep",
+          "glob",
+          "todowrite",
+          "skill",
+          "web_fetch",
+          "web_search",
+          "task",
+          "task_append",
+          "task_query",
+          "task_output",
+          "task_stop",
+          "website_deploy",
+          "update_goal",
+          "get_goal"
+        ],
+        "expectedKey": true
+      },
+      {
+        "stage": "warm-permission-provider-refresh",
+        "label": "b",
+        "protocolPath": "/v1/chat/completions",
+        "tools": [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "grep",
+          "glob",
+          "todowrite",
+          "skill",
+          "web_fetch",
+          "web_search",
+          "task",
+          "task_append",
+          "task_query",
+          "task_output",
+          "task_stop",
+          "website_deploy",
+          "update_goal",
+          "get_goal"
+        ],
+        "expectedKey": true
+      },
+      {
+        "stage": "disabled-cold-resume",
+        "label": "b",
+        "protocolPath": "/v1/chat/completions",
+        "tools": [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "grep",
+          "glob",
+          "todowrite",
+          "skill",
+          "web_fetch",
+          "web_search",
+          "task",
+          "task_append",
+          "task_query",
+          "task_output",
+          "task_stop",
+          "website_deploy",
+          "update_goal",
+          "get_goal"
+        ],
+        "expectedKey": true
+      },
+      {
+        "stage": "ordinary-native-after-host-policy",
+        "label": "b",
+        "protocolPath": "/v1/chat/completions",
+        "tools": [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "grep",
+          "glob",
+          "todowrite",
+          "skill",
+          "ask_user",
+          "request_feature_enable",
+          "web_fetch",
+          "web_search",
+          "task",
+          "task_append",
+          "task_query",
+          "task_output",
+          "task_stop",
+          "website_deploy",
+          "update_goal",
+          "get_goal"
+        ],
+        "expectedKey": true
+      }
+    ],
+    "sourceBuild": "passed",
+    "sourceTypecheck": "passed",
+    "sourceSmokeTests": {
+      "passed": 3
+    }
+  },
+  "officialAppAcceptance": {
+    "runtimeVersion": "0.6.12",
+    "providerFormat": "openai-responses",
+    "model": "gpt-6",
+    "channel": "development",
+    "threadId": "rvcamp_01m5440xzxefss5k4dskt5fgfg",
+    "runs": [
+      {
+        "id": "362ca71b-4b3c-464f-bead-8872ab32fb02",
+        "status": "succeeded",
+        "last_error_code": null,
+        "uncached_input_tokens": 19391,
+        "cache_read_tokens": 88320,
+        "output_tokens": 529,
+        "usage_quality": "runtime_reported_partial",
+        "publicMessages": 1,
+        "finalOutputDigestPresent": true
+      },
+      {
+        "id": "071de216-dc4b-44cf-ba4e-af454283c1a5",
+        "status": "succeeded",
+        "last_error_code": null,
+        "uncached_input_tokens": 1488,
+        "cache_read_tokens": 38144,
+        "output_tokens": 107,
+        "usage_quality": "runtime_reported_partial",
+        "publicMessages": 1,
+        "finalOutputDigestPresent": true
+      },
+      {
+        "id": "b05e60c9-d116-48f6-8244-701752a004fc",
+        "status": "succeeded",
+        "last_error_code": null,
+        "uncached_input_tokens": 1371,
+        "cache_read_tokens": 40448,
+        "output_tokens": 108,
+        "usage_quality": "runtime_reported_partial",
+        "publicMessages": 1,
+        "finalOutputDigestPresent": true
+      }
+    ],
+    "binding": {
+      "native_binding_id": "6063fdad-2588-43db-929d-2f0408b94719",
+      "native_session_id": "mvs_933693f876474c268411babe02431e7b"
+    },
+    "samePidSuccessors": {
+      "before": [
+        12956
+      ],
+      "after": [
+        12956
+      ],
+      "scope": "second to third Run, same Conversation"
+    },
+    "fileContent": "color=teal\n",
+    "retainedForUser": true,
+    "screenshot": "minimax-revision-dev.png",
+    "allRunsHadFinalText": true,
+    "emptyFinalEvidence": "prior controlled four-case acceptance, not these real-model Runs",
+    "fileDiffScreenshot": "minimax-revision-file-diff.png",
+    "retainedView": "Thread result and native file diff: color=blue → color=teal"
+  },
+  "limitations": [
+    "No native questionnaire default hiding in the official product; productDefaultChanged remains false.",
+    "Public source reports 0.6.5 and is not a replacement for the installed 0.6.12 release.",
+    "A separate Core/source-candidate trial failed with runtime_alternate_candidate_probe_failed; no new adapter qualification was granted.",
+    "Partial usage is not a complete bill. No new cold App/Core, cross-Session A-B-A, concurrency, or full CLI/Skills/MCP qualification."
+  ],
+  "upstreamPublication": {
+    "authorized": false,
+    "submitted": false,
+    "pendingUserDecision": true
+  },
+  "validation": {
+    "rustWorkspace": {
+      "passed": 473,
+      "ignored": 1,
+      "failed": 0
+    },
+    "documentationTests": {
+      "passed": 10,
+      "failed": 0
+    },
+    "documentationGates": [
+      "docs:check",
+      "docs:check:ci"
+    ],
+    "scriptSyntax": "passed",
+    "productionRustChangedThisRound": false
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "productionCommit": "34dd2e2f9994abd60f559446208f5858cf028e2f",
+  "officialHermesVersion": "0.22.4",
+  "officialHermesCommit": "4d04303818b61bf3aa09278af48356315515965b",
+  "platform": "macOS arm64",
+  "fixture": "rovai-hermes-real-model-WDyVxp",
+  "result": "passed",
+  "failure": null,
+  "provider": "existing Sub2API Responses provider, unchanged upstream requests and responses",
+  "rawReportSha256": "5e0a8b5a8a57e1f35cf79023ad121156e599c12a3dd18a0ec2abd638f05768ce",
+  "checks": {
+    "fourRootsAndPreview": true,
+    "concurrentRealMembers": true,
+    "originalSessionColdResume": true,
+    "customProviderSettingsSkipped": true,
+    "explicitUnlistedModelUsed": true,
+    "explicitUntrustedSkillFileUsed": true,
+    "sharedGatewaySurvivesCore": true,
+    "configurationUnchanged": true
+  },
+  "runs": [
+    {
+      "label": "B0",
+      "runId": "c1d1b933-95fa-4aa2-9de1-aa496e8432bc",
+      "status": "succeeded",
+      "expectedModel": "gpt-6.1-sol",
+      "nativeSessionId": "local-16a00344577b74ef91eada9d0784803bbda0914d6b853e0d86dda34013063361",
+      "messageId": "cf9f24cc-def1-4004-8cc0-814079966af2",
+      "attachedModelId": "custom:sub2api:gpt-6.1-sol",
+      "nativeModelId": "custom:sub2api:gpt-6.1-sol",
+      "setters": [
+        {
+          "method": "session/set_mode",
+          "modeId": "dont_ask"
+        }
+      ],
+      "rules": "initial",
+      "modelRequests": 3,
+      "catalogContainsTarget": true
+    },
+    {
+      "label": "A0",
+      "runId": "2aef8c32-e994-4dfd-b251-144f8e0e7ac3",
+      "status": "succeeded",
+      "expectedModel": "gpt-6.1-sol",
+      "nativeSessionId": "local-533d245519c6b7e4a0ec86a93f798f04a9b1c91317674f504166a13d3ff90dd5",
+      "messageId": "957367ab-8e20-4afd-ba4c-399a84a50be3",
+      "attachedModelId": "custom:sub2api:gpt-6.1-sol",
+      "nativeModelId": "custom:sub2api:gpt-6.1-sol",
+      "setters": [
+        {
+          "method": "session/set_mode",
+          "modeId": "dont_ask"
+        }
+      ],
+      "rules": "initial",
+      "modelRequests": 5,
+      "catalogContainsTarget": true
+    },
+    {
+      "label": "A1",
+      "runId": "0709b744-f225-471f-9346-748caa593aad",
+      "status": "succeeded",
+      "expectedModel": "gpt-6.1-sol",
+      "nativeSessionId": "local-533d245519c6b7e4a0ec86a93f798f04a9b1c91317674f504166a13d3ff90dd5",
+      "messageId": "0c75aca5-f949-4b74-b625-0e6566c7d6de",
+      "attachedModelId": "custom:gpt-6.1-sol",
+      "nativeModelId": "custom:gpt-6.1-sol",
+      "setters": [],
+      "rules": "none",
+      "modelRequests": 3,
+      "catalogContainsTarget": true,
+      "selectedModelId": "custom:sub2api:gpt-6.1-sol"
+    },
+    {
+      "label": "A2",
+      "runId": "2cb56562-dc18-4339-ac4e-ed8983ee74e8",
+      "status": "succeeded",
+      "expectedModel": "gpt-5.6-sol",
+      "nativeSessionId": "local-533d245519c6b7e4a0ec86a93f798f04a9b1c91317674f504166a13d3ff90dd5",
+      "messageId": "d1659700-c603-43dc-aaa7-192f59b6c056",
+      "attachedModelId": "custom:gpt-6.1-sol",
+      "nativeModelId": "custom:sub2api:gpt-5.6-sol",
+      "setters": [
+        {
+          "method": "session/set_model",
+          "modelId": "custom:sub2api:gpt-5.6-sol"
+        },
+        {
+          "method": "session/set_mode",
+          "modeId": "default"
+        }
+      ],
+      "rules": "none",
+      "modelRequests": 3,
+      "catalogContainsTarget": false,
+      "selectedModelId": "custom:sub2api:gpt-5.6-sol"
+    },
+    {
+      "label": "A3",
+      "runId": "499a78c5-1929-43a6-8f6e-b63ff209b6ad",
+      "status": "succeeded",
+      "expectedModel": "gpt-5.6-sol",
+      "nativeSessionId": "local-533d245519c6b7e4a0ec86a93f798f04a9b1c91317674f504166a13d3ff90dd5",
+      "messageId": "167fff5d-9486-4e9b-b6cc-7f726075ee5b",
+      "attachedModelId": "custom:gpt-5.6-sol",
+      "nativeModelId": "custom:gpt-5.6-sol",
+      "setters": [],
+      "rules": "none",
+      "modelRequests": 3,
+      "catalogContainsTarget": true,
+      "selectedModelId": "custom:sub2api:gpt-5.6-sol"
+    }
+  ],
+  "requests": {
+    "total": 19,
+    "main": 17,
+    "auxiliary": 2,
+    "allMainHttp200": true,
+    "allMainCompleted": true,
+    "allMainResponseModelMatchesRequest": true,
+    "models": [
+      "gpt-5.6-sol",
+      "gpt-6.1-sol"
+    ],
+    "toolNames": [
+      "read_file",
+      "terminal",
+      "write_file"
+    ]
+  },
+  "limitations": [
+    "Different explicit named providers are covered by deterministic tests, not a second real provider account.",
+    "No new performance, compaction, cancellation, MCP, images, execute_code, subagent or platform matrix.",
+    "No daily App install, daily Gateway connection, upstream patch, production observer or model-visible wrapper."
+  ]
+}

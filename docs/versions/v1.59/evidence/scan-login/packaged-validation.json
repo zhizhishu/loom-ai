@@ -1,0 +1,19 @@
+{
+  "status": "passed",
+  "sourceCommit": "4c92c500129be3e2c5bf2850bf196383ecbfb65c",
+  "scanFromDesktopQr": true,
+  "regeneratedOldQrRejected": true,
+  "repeatedExchangeRejected": true,
+  "platform": "darwin",
+  "architecture": "arm64",
+  "package": "daily-ad-hoc",
+  "isolated": true,
+  "packagedDesktopReady": true,
+  "packagedHostedWeb": true,
+  "sameEditorAfterReload": true,
+  "unsavedComposerRestored": true,
+  "controlsStartLeft": true,
+  "noHealthyHostText": true,
+  "webStopKeepsCoreReady": true,
+  "noRuntime": true
+}

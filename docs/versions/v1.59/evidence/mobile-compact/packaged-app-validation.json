@@ -1,0 +1,17 @@
+{
+  "channel": "packaged_app_acceptance",
+  "app": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-web-recovery/dist/mac-arm64/Rovai AI.app",
+  "userData": "/private/var/folders/49/z0f8w56s28j4pfc7t80cm3w80000gq/T/rovai-mobile-packaged-ohIaHG/user-data",
+  "skillLibraryRoot": "/private/var/folders/49/z0f8w56s28j4pfc7t80cm3w80000gq/T/rovai-mobile-packaged-ohIaHG/user-data/managed-skill-library",
+  "mcpConfigPath": "/private/var/folders/49/z0f8w56s28j4pfc7t80cm3w80000gq/T/rovai-mobile-packaged-ohIaHG/user-data/mcp.json",
+  "runtime": false,
+  "passed": true,
+  "checks": [
+    "packaged-host-ready",
+    "isolated-camp-create",
+    "desktop-entries-preserved",
+    "desktop-task-open-close"
+  ],
+  "errors": [],
+  "sourceCommit": "85c7519c5736c5cc06afd5518dd5c3e4e30d6eb6"
+}

@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-25",
+  "platform": "macOS arm64",
+  "runtime": "official Hermes 0.22.4",
+  "rovaiCommit": "37f017b6815d9599bbc4d834749ce38cb128d70f",
+  "nativeCommit": "4d04303818b61bf3aa09278af48356315515965b",
+  "command": "node scripts/smoke-hermes-native-session.mjs <official-source> <prepared-python> --real-model gpt-5.6-sol",
+  "transport": "Real Sub2API Responses service; test relay forwards actual responses unchanged; test ACP observer records closed metadata without changing messages.",
+  "isolation": "One disposable user Home per attempt, pre-existing test Gateway, independent Core data/Skill Library/MCP/project; no daily App or Gateway.",
+  "fixture": "rovai-hermes-real-model-BhSkZF",
+  "checks": {
+    "fourRootsAndPreview": true,
+    "concurrentRealMembers": true,
+    "originalSessionColdResume": true,
+    "exactSettingsSkipped": true,
+    "explicitUnlistedModelUsed": true,
+    "explicitUntrustedSkillFileUsed": true,
+    "sharedGatewaySurvivesCore": true,
+    "configurationUnchanged": true,
+    "eachRunExactlyOnePublicSend": true,
+    "allMainResponsesMatchRequestedModel": true
+  },
+  "runs": [
+    {
+      "label": "B0",
+      "runId": "0201b16c-fb64-4b8a-8707-725bc260cbcd",
+      "status": "succeeded",
+      "expectedModel": "gpt-6.1-sol",
+      "nativeSessionId": "local-f6fe66dc03ee044a3e4e14267f4faaee38242c28eb418255dc9769a48dc95e0c",
+      "messageId": "646e4fbf-a231-46d0-be3e-deb0221bd2bb",
+      "attachedModelId": "custom:sub2api:gpt-6.1-sol",
+      "nativeModelId": "custom:sub2api:gpt-6.1-sol",
+      "setters": [
+        {
+          "method": "session/set_mode",
+          "modeId": "dont_ask"
+        }
+      ],
+      "rules": "initial",
+      "modelRequests": 4,
+      "catalogContainsTarget": true
+    },
+    {
+      "label": "A0",
+      "runId": "cc1c3cfa-b5c0-44a2-9225-32c105321a21",
+      "status": "succeeded",
+      "expectedModel": "gpt-6.1-sol",
+      "nativeSessionId": "local-a878db749680f6e29324894e6542a22dd0b9922e31e8f2b017b7cb1780ed2315",
+      "messageId": "d6467d96-0db3-4d66-bcee-e8ea70b8f65f",
+      "attachedModelId": "custom:sub2api:gpt-6.1-sol",
+      "nativeModelId": "custom:sub2api:gpt-6.1-sol",
+      "setters": [
+        {
+          "method": "session/set_mode",
+          "modeId": "dont_ask"
+        }
+      ],
+      "rules": "initial",
+      "modelRequests": 5,
+      "catalogContainsTarget": true
+    },
+    {
+      "label": "A1",
+      "runId": "348e7bed-b441-4413-9647-f9f4dd2883c0",
+      "status": "succeeded",
+      "expectedModel": "gpt-6.1-sol",
+      "nativeSessionId": "local-a878db749680f6e29324894e6542a22dd0b9922e31e8f2b017b7cb1780ed2315",
+      "messageId": "85fee899-20af-435e-8758-8b0e7ab6d3e8",
+      "attachedModelId": "custom:gpt-6.1-sol",
+      "nativeModelId": "custom:gpt-6.1-sol",
+      "setters": [],
+      "rules": "none",
+      "modelRequests": 3,
+      "catalogContainsTarget": true
+    },
+    {
+      "label": "A2",
+      "runId": "c616c9d6-9e67-4cc2-9384-771012268a19",
+      "status": "succeeded",
+      "expectedModel": "gpt-5.6-sol",
+      "nativeSessionId": "local-a878db749680f6e29324894e6542a22dd0b9922e31e8f2b017b7cb1780ed2315",
+      "messageId": "053b8be2-a545-44ab-aa0a-691d848c1af2",
+      "attachedModelId": "custom:gpt-6.1-sol",
+      "nativeModelId": "custom:sub2api:gpt-5.6-sol",
+      "setters": [
+        {
+          "method": "session/set_model",
+          "modelId": "custom:sub2api:gpt-5.6-sol"
+        },
+        {
+          "method": "session/set_mode",
+          "modeId": "default"
+        }
+      ],
+      "rules": "none",
+      "modelRequests": 3,
+      "catalogContainsTarget": false
+    },
+    {
+      "label": "A3",
+      "runId": "a0b2bc11-46cf-40d0-a7fb-c9b55ad8f32d",
+      "status": "succeeded",
+      "expectedModel": "gpt-5.6-sol",
+      "nativeSessionId": "local-a878db749680f6e29324894e6542a22dd0b9922e31e8f2b017b7cb1780ed2315",
+      "messageId": "d924e92d-e557-412a-9115-59885fcd2f57",
+      "attachedModelId": "custom:gpt-5.6-sol",
+      "nativeModelId": "custom:gpt-5.6-sol",
+      "setters": [],
+      "rules": "none",
+      "modelRequests": 3,
+      "catalogContainsTarget": true
+    }
+  ],
+  "modelCalls": {
+    "total": 20,
+    "main": 18,
+    "auxiliary": 2,
+    "requestedModels": [
+      "gpt-5.6-sol",
+      "gpt-6.1-sol"
+    ],
+    "allMainHttp200AndCompleted": true,
+    "tools": [
+      "read_file",
+      "terminal",
+      "write_file"
+    ]
+  },
+  "priorAttempt": {
+    "fixture": "rovai-hermes-real-model-RRSFv4",
+    "nativeRunsSucceeded": 3,
+    "modelCalls": 13,
+    "outcome": "Probe equality expectation failed; native tasks and public Sends succeeded. No production failure or automatic task replay.",
+    "details": "After first generation, native resume reported custom:gpt-6.1-sol rather than custom:sub2api:gpt-6.1-sol. Rovai correctly issued set_model because the complete IDs differed. The next fixture selected the actual complete native row for the equality case; no production normalization was added."
+  },
+  "setupIncident": "Before isolated execution, importing official bootstrap while inspecting an existing interpreter used daily Home and triggered native dependency preparation, then failed to import yaml. No daily Session/Gateway was started. Source remained clean and config/.env/install-stamp mtimes predated this run. Installation cache changes were not exhaustively audited.",
+  "limitations": [
+    "No new real-model compaction, cancellation, MCP, image, execute_code, subagent or platform matrix.",
+    "Exact same ID/mode skips setters; a changed native Provider prefix still requires setting.",
+    "Skills discovery/explicit file reference is not native enablement.",
+    "Test process observer overhead is not production performance evidence.",
+    "Request counts and observed provider usage are not a Core per-Run billing claim."
+  ]
+}

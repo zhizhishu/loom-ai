@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-26",
+  "productionCommit": "b2d96361808a7ede28ec81a4461dd5f392d1bad4",
+  "hermes": {
+    "version": "0.22.4",
+    "commit": "4d04303818b61bf3aa09278af48356315515965b",
+    "sourcePatched": false
+  },
+  "environment": {
+    "platform": "macOS arm64",
+    "isolatedUserHome": true,
+    "preExistingSharedGateway": true,
+    "provider": "controlled loopback Responses",
+    "realPaidModel": false,
+    "desktopUiAcceptance": false,
+    "fixtureRoot": "/private/var/folders/pm/zmpfxggd0glcm8vx3p3y3mmr0000gq/T/rovai-hermes-native-session-J3CKxe",
+    "productionTransportChanged": false,
+    "dailyHermesConfigurationChanged": false,
+    "fixtureConfigAndEnvUnchangedDuringRuns": true,
+    "fixtureOwnedProcessesAfterCleanup": 0
+  },
+  "command": "node scripts/smoke-hermes-native-session.mjs <official-source> <prepared-python> --questionnaires",
+  "runs": {
+    "count": 16,
+    "statuses": {
+      "cancelled": 1,
+      "failed": 4,
+      "succeeded": 11
+    },
+    "expectedFailures": [
+      "B2: Core SIGKILL",
+      "Q0: choice question unsupported",
+      "Q1: open question unsupported",
+      "Q2: question after successful public Send unsupported"
+    ],
+    "expectedCancellation": "A5: native cancellation"
+  },
+  "questionnaires": {
+    "checks": {
+      "choices": true,
+      "open": true,
+      "exactCancelReceipts": 3,
+      "noUserAnswers": true,
+      "noQuestionnaireApprovals": true,
+      "ordinaryApprovals": 1,
+      "publicSendPreserved": true,
+      "originalSessionColdResume": true
+    },
+    "cases": [
+      {
+        "label": "Q0",
+        "runId": "830b269b-8b07-4c32-9ed7-31692dc08719",
+        "nativeSessionId": "local-09b09498810ade0d82c90a09fd12417dd260f3b7bc09a06adc32560033d27b93",
+        "rules": "initial",
+        "status": "failed",
+        "last_error_code": "runtime_questionnaire_unsupported",
+        "manual_retry_allowed": 0
+      },
+      {
+        "label": "Q1",
+        "runId": "26b4defc-6d67-4f71-ae25-471bf9abe758",
+        "nativeSessionId": "local-09b09498810ade0d82c90a09fd12417dd260f3b7bc09a06adc32560033d27b93",
+        "rules": "none",
+        "status": "failed",
+        "last_error_code": "runtime_questionnaire_unsupported",
+        "manual_retry_allowed": 0
+      },
+      {
+        "label": "Q2",
+        "runId": "2e66b4b7-9d15-4fd7-a2c7-6e9f221749f4",
+        "nativeSessionId": "local-09b09498810ade0d82c90a09fd12417dd260f3b7bc09a06adc32560033d27b93",
+        "rules": "none",
+        "status": "failed",
+        "last_error_code": "runtime_questionnaire_unsupported",
+        "manual_retry_allowed": 0
+      },
+      {
+        "label": "Q3",
+        "runId": "fabfe70a-0900-450d-bcfd-51f75aa04e52",
+        "nativeSessionId": "local-09b09498810ade0d82c90a09fd12417dd260f3b7bc09a06adc32560033d27b93",
+        "rules": "none",
+        "status": "succeeded",
+        "last_error_code": null,
+        "manual_retry_allowed": 0
+      }
+    ],
+    "observedNativeResponse": {
+      "status": "unanswered",
+      "user_response": null,
+      "outcome": "timed_out"
+    },
+    "nativeNoticeBoundary": "Native tool emits a 60m timeout notice even though the cancelled permission settles promptly; no answer or Skip option was selected.",
+    "questionnaireApprovalCount": 0,
+    "ordinaryCommandApprovalCount": 1,
+    "officialPermissionBuilderMatchesFixture": true
+  },
+  "existingNativeChecks": {
+    "noHermesContextProjection": true,
+    "concurrentMembers": true,
+    "backgroundUsesRunAtCallTime": true,
+    "noActiveOrUnknownSessionRejected": true,
+    "gatewaySurvivesCoreShutdown": true,
+    "nativeCompactionNoRulesRedelivery": true,
+    "nativeSystemPromptPreserved": true,
+    "nativeConfigUnchanged": true,
+    "mcpNewAndColdResumeWithPartialFailure": true,
+    "fixedCliWithoutAcpPathInjection": true,
+    "cancelDoesNotStopOtherSession": true,
+    "mcpRebindAfterNativeGatewayRestart": true,
+    "questionnaires": {
+      "choices": true,
+      "open": true,
+      "exactCancelReceipts": 3,
+      "noUserAnswers": true,
+      "noQuestionnaireApprovals": true,
+      "ordinaryApprovals": 1,
+      "publicSendPreserved": true,
+      "originalSessionColdResume": true
+    },
+    "coreKillDoesNotKillGatewayOrReplay": true,
+    "actualModelInputsMatchRulesDelivery": true,
+    "noHermesCompatibilityDigests": true,
+    "cliEntryInstalledBeforeRuns": true,
+    "originalSessionColdResume": true
+  },
+  "checks": {
+    "workspaceRust": {
+      "passed": 480,
+      "failed": 0,
+      "ignored": 1
+    },
+    "extendedOwners": [
+      "approval_selects_the_exact_native_option_id",
+      "acp_prompt_failure_is_retryable_only_when_input_was_not_accepted",
+      "acp_bypass_modes_auto_allow_protocol_permission_requests"
+    ],
+    "extendedOwnersPassed": 3,
+    "rendererTestsPassed": 199,
+    "coreAndCliBuild": "passed",
+    "rustFormat": "passed"
+  },
+  "attempts": [
+    {
+      "fixture": "rovai-hermes-native-session-KhP4h1",
+      "result": "fixture assertion failed at Q2",
+      "reason": "Test wrongly rejected the legitimate shell-command approval before Send. Q0/Q1 already produced cancelled receipts and unsupported status."
+    },
+    {
+      "fixture": "rovai-hermes-native-session-JlTmiy",
+      "result": "fixture finalization assertion failed",
+      "reason": "All four questionnaire cases passed; final common payload verification lacked rules metadata for Q Runs. Added metadata and corrected total Run count and observation-only guards."
+    },
+    {
+      "fixture": "rovai-hermes-native-session-J3CKxe",
+      "result": "passed",
+      "exitCode": 0
+    }
+  ],
+  "artifactSha256": {
+    "questionnaires.json": "dd66136634e291330e874dc81d21ad9faa9584d9c9981b03fdec5e4f70d25f58",
+    "report.json": "1ef938df4d2c61c33d38560b5b5b3b35d117bdc666d4a61bde27e8a01c457f7f"
+  }
+}

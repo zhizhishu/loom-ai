@@ -1,0 +1,256 @@
+{
+  "date": "2026-10-25",
+  "scope": "unpatched Hermes plugin research; not production or live Core collaboration qualification",
+  "rovaiBase": "ba136f0ca2778f3c85c02eb64484ebb648121730",
+  "hermesCommit": "4d04303818b61bf3aa09278af48356315515965b",
+  "hermesVersion": "0.22.4",
+  "platform": "macOS arm64",
+  "pluginVersion": "0.1.0",
+  "terminalBackend": "local",
+  "shell": "/bin/bash",
+  "verdict": {
+    "commandMarkerInjection": "demonstrated",
+    "validRovaiSend": "not_attempted_without_trusted_binding",
+    "nativeExecutionToCoreRunBinding": "not_established",
+    "productionSwitch": "not_performed"
+  },
+  "checks": {
+    "filesAloneDoNotActivatePlugin": true,
+    "enableChangedConfigAndHotReloadedExistingGateway": true,
+    "stableTurnDifferentApiAndToolIds": true,
+    "observedTurnIdsAbsentFromAcpBeforeInjection": true,
+    "idleViewerReceivesOtherClientsToolCalls": true,
+    "coldResumeKeepsSessionAndTaskButChangesTurn": true,
+    "twoSessionsReceiveOwnNativeTurnMarkers": true,
+    "backgroundKeepsOldMarkerAcrossNextTurn": true,
+    "backgroundWorkdirTimeoutArgumentsPreserved": true,
+    "exportRemainsWhenInjectionStops": true,
+    "unselectedUserSessionUnchanged": true,
+    "subshellContainsMarkerButAlsoLosesOriginalExport": true,
+    "middlewareExceptionDoesNotBlockCommand": true,
+    "ordinaryTaskDoesNotChangeConfig": true,
+    "disableHotReloadStopsPluginButKeepsSnapshotResidue": true,
+    "sharedGatewaySurvivesAcpExit": true,
+    "dotenvUnchanged": true,
+    "upstreamSourceUnpatched": true,
+    "ownedGatewayStopped": true
+  },
+  "exposure": {
+    "markerPathInProviderRequests": true,
+    "nativeRiskAssessmentRequestsContainingPath": 5,
+    "otherProviderRequestsContainingPath": 0,
+    "markerPathInAcpEvents": true,
+    "approvalRequestsContainingPath": 6,
+    "authorityTokenEverSupplied": false
+  },
+  "completedPromptCount": 15,
+  "concurrentObservedSessions": true,
+  "nativeIdentifierSamples": [
+    {
+      "scenario": "observe-a",
+      "sessionId": "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292",
+      "taskIds": [
+        "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292"
+      ],
+      "turnIds": [
+        "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:430192dd"
+      ],
+      "apiRequestIds": [
+        "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:430192dd:api:1",
+        "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:430192dd:api:2"
+      ],
+      "toolCallIds": [
+        "d9296db3-6691-4363-81ce-31d6c0f15923",
+        "0aef5fc2-de8a-475e-a3c4-906f6de42b12"
+      ]
+    },
+    {
+      "scenario": "observe-b",
+      "sessionId": "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae",
+      "taskIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae"
+      ],
+      "turnIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:db7dc31a"
+      ],
+      "apiRequestIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:db7dc31a:api:1",
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:db7dc31a:api:2"
+      ],
+      "toolCallIds": [
+        "f70ce478-34bd-482f-83ac-1aed76faf502",
+        "f4ef7d3c-61c6-46cd-8cf0-e70270f9d0f7"
+      ]
+    },
+    {
+      "scenario": "observe-a-resume",
+      "sessionId": "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292",
+      "taskIds": [
+        "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292"
+      ],
+      "turnIds": [
+        "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:e5689a3d"
+      ],
+      "apiRequestIds": [
+        "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292:e5689a3d:api:1"
+      ],
+      "toolCallIds": [
+        "273bf880-292c-4262-9f75-10a6c01e52fd"
+      ]
+    },
+    {
+      "scenario": "marker-background",
+      "sessionId": "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae",
+      "taskIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae"
+      ],
+      "turnIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:a8efc392"
+      ],
+      "apiRequestIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:a8efc392:api:1"
+      ],
+      "toolCallIds": [
+        "a2bf7403-ab9d-4468-9f23-aaf3c5345a8f"
+      ]
+    },
+    {
+      "scenario": "marker-background-next",
+      "sessionId": "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae",
+      "taskIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae"
+      ],
+      "turnIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:8cab0b50"
+      ],
+      "apiRequestIds": [
+        "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae:8cab0b50:api:1"
+      ],
+      "toolCallIds": [
+        "47682bb2-d2a6-454f-ad2e-79fc44898792"
+      ]
+    }
+  ],
+  "idleViewer": {
+    "submittedPromptCount": 0,
+    "otherClientsToolCallsReceived": true,
+    "sharedToolCallIds": [
+      "d9296db3-6691-4363-81ce-31d6c0f15923",
+      "0aef5fc2-de8a-475e-a3c4-906f6de42b12"
+    ]
+  },
+  "wireFields": {
+    "middleware": [
+      "api_request_id",
+      "args",
+      "middleware_schema_version",
+      "original_args",
+      "session_id",
+      "task_id",
+      "telemetry_schema_version",
+      "tool_call_id",
+      "tool_name",
+      "turn_id"
+    ],
+    "acpToolNotification": [
+      "jsonrpc",
+      "method",
+      "params"
+    ],
+    "acpParams": [
+      "sessionId",
+      "update"
+    ],
+    "acpToolUpdate": [
+      "content",
+      "kind",
+      "locations",
+      "title",
+      "toolCallId",
+      "sessionUpdate"
+    ],
+    "promptResult": [
+      "stopReason",
+      "usage"
+    ]
+  },
+  "nativeAdmissionSamples": [
+    {
+      "admissionId": "3aa61405dd634bf280c25cf0e3f001ac",
+      "nativeRequestId": "7533950083de429da9921814d2df1f9e",
+      "nativeSessionId": "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292",
+      "generation": 2,
+      "status": "terminal"
+    },
+    {
+      "admissionId": "3f53f6846ddb455785961b909940a3f9",
+      "nativeRequestId": "f6cf19c9f6514c889dd2740ff90826fe",
+      "nativeSessionId": "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292",
+      "generation": 3,
+      "status": "terminal"
+    },
+    {
+      "admissionId": "459f382cfff641da9dd800ba56a9582a",
+      "nativeRequestId": "df2c8a58c0aa40c6b81b904ca1fe808f",
+      "nativeSessionId": "local-5ed84a41aaac15decd749101ae812c50a0a94b2bc8e62c20d08d05ba0cceabae",
+      "generation": 2,
+      "status": "terminal"
+    },
+    {
+      "admissionId": "e8d8c2fab76a4229b7c3b9df54c729ab",
+      "nativeRequestId": "5760c3448eac4633bba81609b1c0d66e",
+      "nativeSessionId": "local-59af09edbd28c6f273c9a1b314530ebbffab866ff3073d054306c772c241f292",
+      "generation": 4,
+      "status": "terminal"
+    }
+  ],
+  "configChanges": {
+    "pluginFiles": [
+      "plugins/rovai-middleware-probe/plugin.yaml",
+      "plugins/rovai-middleware-probe/__init__.py"
+    ],
+    "fixtureSetup": [
+      "plugins.entries.rovai-middleware-probe.settings.probe_root"
+    ],
+    "enable": [
+      "plugins.enabled",
+      "plugins.disabled"
+    ],
+    "ordinaryTask": [],
+    "dotenvChanged": false,
+    "existingGatewayHotReload": true,
+    "gatewayRestartRequiredInTest": false
+  },
+  "stageC": "not run: pre-tool trusted execution-to-Run association is missing; background markers do not qualify lease rotation",
+  "notVerified": [
+    "two real Core members directly publishing via rovai send",
+    "next Run lease authorization",
+    "old credential copy rejection under plugin transport",
+    "old native execution starting a new tool after the next Run begins",
+    "automatic compaction and session rotation",
+    "execute_code terminal and direct subprocess paths",
+    "subagents and managed workers",
+    "remote terminal backends",
+    "plugin host isolation mode",
+    "paid provider and other operating systems",
+    "full R2 process lifecycle and Home migration"
+  ],
+  "fixtureCorrection": {
+    "earlyProbeSharedDependencyCacheWrite": true,
+    "affected": "PM runtime generation and selection, not Hermes source or user configuration",
+    "previousSelectionRestored": true,
+    "probeCreatedUnleasedGenerationMovedIntoDisposableEvidence": true,
+    "finalProbeUsesCleanSourceCloneAndIndependentHome": true
+  },
+  "artifacts": {
+    "middleware-feasibility-probe.mjs": {
+      "sha256": "895bbd926dbe67bff1230325447a90b9e4c0253d0579aacca01cfe57cd629cd9"
+    },
+    "middleware-probe-plugin/__init__.py": {
+      "sha256": "714d85b06efc626d80770d23ada057df00ee8d9453f92a879c8337ac106f2236"
+    },
+    "middleware-probe-plugin/plugin.yaml": {
+      "sha256": "fa0a5cc2f62049131f768902a829a11050f79fe0eb2c4ebde237e831c713ce0c"
+    }
+  }
+}

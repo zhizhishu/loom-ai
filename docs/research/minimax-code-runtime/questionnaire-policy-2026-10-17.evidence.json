@@ -1,0 +1,437 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-17",
+  "userSteeringSequence": 37,
+  "scope": "Production completion policy and actionable unsupported-questionnaire failure; cancellation without answering; successor Session continuity",
+  "platform": "macOS arm64",
+  "sourceBaseCommit": "2294e1b5000d59806ed4bb1a4da3a95d573817c1",
+  "productionCodeChangedThisRound": true,
+  "dailyNativeConfigurationChanged": false,
+  "questionnaireToolsHidden": false,
+  "upstreamCandidateInstalled": false,
+  "automaticThreadQuestionBridge": false,
+  "automaticReplay": false,
+  "questionnaires": {
+    "kind": "official-cli-with-deterministic-local-provider",
+    "nativeVersion": "0.6.12",
+    "status": "passed",
+    "caseCount": 12,
+    "runCount": 11,
+    "runOutcomes": {
+      "succeeded": 7,
+      "failed": 4
+    },
+    "cases": [
+      {
+        "name": "QUESTION_BASELINE",
+        "status": "passed",
+        "run": "7242a333-81a4-4574-9aeb-920f64a32f15"
+      },
+      {
+        "name": "ASK_SINGLE",
+        "status": "passed",
+        "run": "48a1fcf7-5be3-4873-9a44-b5cbadc2c396",
+        "runOutcome": "failed",
+        "publicSendCount": 0,
+        "retryable": false,
+        "failure": {
+          "code": "runtime_questionnaire_unsupported",
+          "origin": "compatibility",
+          "summary": "原生问卷暂不受支持",
+          "detail": "原生问卷暂不受支持，未提交答案。请发送新消息，在对话中补充信息或继续任务。"
+        },
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "AFTER_ASK_SINGLE",
+        "status": "passed",
+        "run": "ae08631b-5f50-4eff-b1ba-4261170eb24c",
+        "sameSession": true,
+        "coreRestarted": false,
+        "sameCoreChildPids": true
+      },
+      {
+        "name": "ASK_MULTIPLE",
+        "status": "passed",
+        "run": "158385ec-aca6-470a-909d-e6c4fc6a099e",
+        "runOutcome": "failed",
+        "publicSendCount": 0,
+        "retryable": false,
+        "failure": {
+          "code": "runtime_questionnaire_unsupported",
+          "origin": "compatibility",
+          "summary": "原生问卷暂不受支持",
+          "detail": "原生问卷暂不受支持，未提交答案。请发送新消息，在对话中补充信息或继续任务。"
+        },
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "AFTER_ASK_MULTIPLE",
+        "status": "passed",
+        "run": "7b44eb87-7f0c-4a54-a85a-45bcdb6ab1d8",
+        "sameSession": true,
+        "coreRestarted": true,
+        "sameCoreChildPids": false
+      },
+      {
+        "name": "SEND_ASK",
+        "status": "passed",
+        "run": "8ea6454d-47e4-4582-95c3-e90acae563ed",
+        "runOutcome": "failed",
+        "publicSendCount": 1,
+        "retryable": false,
+        "failure": {
+          "code": "runtime_questionnaire_unsupported",
+          "origin": "compatibility",
+          "summary": "消息已发送，但运行结束校验失败",
+          "detail": "消息已发送；原生问卷暂不受支持，未提交答案。请发送新消息，在对话中补充信息或继续任务。"
+        },
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "AFTER_SEND_ASK",
+        "status": "passed",
+        "run": "085dfca6-c340-493e-8a0a-351af71dd1f7",
+        "sameSession": true,
+        "coreRestarted": false,
+        "sameCoreChildPids": true
+      },
+      {
+        "name": "ASK_DEFAULT",
+        "status": "passed",
+        "run": "fa2d2968-6726-49aa-a3c1-20bb94b07c60",
+        "runOutcome": "failed",
+        "publicSendCount": 0,
+        "retryable": false,
+        "failure": {
+          "code": "runtime_questionnaire_unsupported",
+          "origin": "compatibility",
+          "summary": "原生问卷暂不受支持",
+          "detail": "原生问卷暂不受支持，未提交答案。请发送新消息，在对话中补充信息或继续任务。"
+        },
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "AFTER_ASK_DEFAULT",
+        "status": "passed",
+        "run": "56c0d09f-30ac-4d36-a534-ea4bab99cc1d",
+        "sameSession": true,
+        "coreRestarted": false,
+        "sameCoreChildPids": true
+      },
+      {
+        "name": "ordinary ALLOW after questionnaire",
+        "status": "passed",
+        "run": "153c4039-39b0-4624-9865-9271437d4b68",
+        "approvals": 1
+      },
+      {
+        "name": "ordinary DENY after questionnaire",
+        "status": "passed",
+        "run": "72272002-99f0-4708-9769-58f6c4859aaa",
+        "approvals": 1
+      },
+      {
+        "name": "native ask_user remains enabled; no synthetic answer injected",
+        "status": "passed"
+      }
+    ],
+    "runs": [
+      {
+        "id": "7242a333-81a4-4574-9aeb-920f64a32f15",
+        "status": "succeeded",
+        "last_error_code": null
+      },
+      {
+        "id": "48a1fcf7-5be3-4873-9a44-b5cbadc2c396",
+        "status": "failed",
+        "last_error_code": "runtime_questionnaire_unsupported"
+      },
+      {
+        "id": "ae08631b-5f50-4eff-b1ba-4261170eb24c",
+        "status": "succeeded",
+        "last_error_code": null
+      },
+      {
+        "id": "158385ec-aca6-470a-909d-e6c4fc6a099e",
+        "status": "failed",
+        "last_error_code": "runtime_questionnaire_unsupported"
+      },
+      {
+        "id": "7b44eb87-7f0c-4a54-a85a-45bcdb6ab1d8",
+        "status": "succeeded",
+        "last_error_code": null
+      },
+      {
+        "id": "8ea6454d-47e4-4582-95c3-e90acae563ed",
+        "status": "failed",
+        "last_error_code": "runtime_questionnaire_unsupported"
+      },
+      {
+        "id": "085dfca6-c340-493e-8a0a-351af71dd1f7",
+        "status": "succeeded",
+        "last_error_code": null
+      },
+      {
+        "id": "fa2d2968-6726-49aa-a3c1-20bb94b07c60",
+        "status": "failed",
+        "last_error_code": "runtime_questionnaire_unsupported"
+      },
+      {
+        "id": "56c0d09f-30ac-4d36-a534-ea4bab99cc1d",
+        "status": "succeeded",
+        "last_error_code": null
+      },
+      {
+        "id": "153c4039-39b0-4624-9865-9271437d4b68",
+        "status": "succeeded",
+        "last_error_code": null
+      },
+      {
+        "id": "72272002-99f0-4708-9769-58f6c4859aaa",
+        "status": "succeeded",
+        "last_error_code": null
+      }
+    ],
+    "rawReportSha256": "a71511b053792b802961e2cd383c29516995de0b697c9c4ea1602982546428ff",
+    "hostObservation": "Core direct-child PID set only; not cross-Session or concurrency qualification",
+    "command": "node scripts/smoke-minimax-runtime.mjs /absolute/path/to/mcode --questionnaires-only --fixture-root /absolute/empty-fixture"
+  },
+  "completion": {
+    "kind": "official-cli-with-deterministic-local-provider",
+    "nativeVersion": "0.6.12",
+    "status": "passed",
+    "caseCount": 5,
+    "runCount": 4,
+    "runOutcomes": {
+      "succeeded": 2,
+      "failed": 2
+    },
+    "cases": [
+      {
+        "name": "SEND_EMPTY",
+        "status": "passed",
+        "run": "54ed5c0e-4eaa-4235-b58d-e1de5e46ac91"
+      },
+      {
+        "name": "AFTER_EMPTY",
+        "status": "passed",
+        "run": "5f67a863-517f-4ac9-9797-187045ba5bc1"
+      },
+      {
+        "name": "empty final accepts one committed send; same Host follow-up succeeds",
+        "status": "passed"
+      },
+      {
+        "name": "EMPTY_NO_SEND",
+        "status": "passed",
+        "run": "c089c066-7e71-4411-8396-c86b5b505659"
+      },
+      {
+        "name": "SEND_ERROR",
+        "status": "passed",
+        "run": "0884b3c3-3e2a-48e8-92f1-ab4c0aadaec1"
+      }
+    ],
+    "runs": [
+      {
+        "id": "54ed5c0e-4eaa-4235-b58d-e1de5e46ac91",
+        "status": "succeeded",
+        "last_error_code": null
+      },
+      {
+        "id": "5f67a863-517f-4ac9-9797-187045ba5bc1",
+        "status": "succeeded",
+        "last_error_code": null
+      },
+      {
+        "id": "c089c066-7e71-4411-8396-c86b5b505659",
+        "status": "failed",
+        "last_error_code": "runtime_missing_final_output"
+      },
+      {
+        "id": "0884b3c3-3e2a-48e8-92f1-ab4c0aadaec1",
+        "status": "failed",
+        "last_error_code": "runtime_prompt_runtime_error"
+      }
+    ],
+    "rawReportSha256": "4acdaf01dfa2e85e80aa72ea85af8a6805d597ac0170d7d8d72edbcb344dbb76",
+    "command": "node scripts/smoke-minimax-runtime.mjs /absolute/path/to/mcode --completion-only --fixture-root /absolute/empty-fixture"
+  },
+  "realLlm": {
+    "kind": "real-llm-development-app",
+    "nativeVersion": "0.6.12",
+    "status": "passed",
+    "caseCount": 2,
+    "runCount": 2,
+    "runOutcomes": {
+      "failed": 1,
+      "succeeded": 1
+    },
+    "cases": [
+      {
+        "name": "real ask_user cancelled without an answer",
+        "run": "9db610b3-8fc5-44a5-a4f5-0aa83d3b03a4",
+        "outcome": "failed",
+        "error": "runtime_questionnaire_unsupported",
+        "publicSendCount": 0,
+        "nativeQuestionnaires": [
+          {
+            "status": "dismissed",
+            "dismissed": true,
+            "answerAbsent": true
+          }
+        ]
+      },
+      {
+        "name": "real successor recalls context, writes, checks and publishes",
+        "run": "0cac8eaa-cf4c-424b-895a-ef865e13429b",
+        "outcome": "succeeded",
+        "publicSendCount": 1,
+        "sameSession": true
+      }
+    ],
+    "runs": [
+      {
+        "id": "9db610b3-8fc5-44a5-a4f5-0aa83d3b03a4",
+        "status": "failed",
+        "last_error_code": "runtime_questionnaire_unsupported"
+      },
+      {
+        "id": "0cac8eaa-cf4c-424b-895a-ef865e13429b",
+        "status": "succeeded",
+        "last_error_code": null
+      }
+    ],
+    "rawReportSha256": "d225007e1a6eec61334d147a974865e82f0a3693ac1aaa79d6d6fa8bc5d972ba",
+    "provider": "Sub2API",
+    "model": "gpt-6",
+    "apiFormat": "openai-responses",
+    "threadId": "rvcamp_01m554d8ctebsrx3y0q39nbapz",
+    "threadTitle": "MiniMax · 问卷取消已落地",
+    "sameSession": true,
+    "hostPidObservation": "not_observed; live probe returned empty PID arrays",
+    "fileReadAndAsserted": true,
+    "continuityMarker": "ASK-CANCEL-714",
+    "publicSuccessMarker": "MINIMAX_QUESTIONNAIRE_SUCCESSOR_OK",
+    "developmentWindowLeftOpen": true,
+    "failure": {
+      "code": "runtime_questionnaire_unsupported",
+      "origin": "compatibility",
+      "phase": "execution",
+      "summary": "原生问卷暂不受支持",
+      "detail": "原生问卷暂不受支持，未提交答案。请发送新消息，在对话中补充信息或继续任务。",
+      "retryable": false
+    }
+  },
+  "uiVerification": {
+    "threadDomObserved": true,
+    "failedQuestionnaireReceiptObserved": true,
+    "successorPublicMessageAndFileChangeObserved": true,
+    "newFailureReadFromDevelopmentAppDatabase": true,
+    "failureDetailIndependentVisualCheck": false,
+    "limitation": "Native UI automation selected an older Electron process sharing the same app path; old screenshots are not new evidence"
+  },
+  "fallbackScope": {
+    "nativePermissionQuestionnaireObserved": false,
+    "existingExtendedTestOwner": "acp::tests::approval_selects_the_exact_native_option_id"
+  },
+  "validation": [
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests application::tests::acp_prompt_failure_is_retryable_only_when_input_was_not_accepted -- --exact",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests acp::tests::final_agent_message_uses_complete_assistant_suffix_after_last_tool_activity -- --exact",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "cargo test -p rovai-core --lib --features extended-tests acp::tests::approval_selects_the_exact_native_option_id -- --exact",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "pnpm test:rust:pr",
+      "attempt": 1,
+      "exitCode": 101,
+      "coreLibraryPassed": 426,
+      "coreLibraryFailed": 1,
+      "coreLibraryIgnored": 1,
+      "failureOwner": "runtime_probe_process::tests::successful_leader_with_stdio_holding_descendant_finishes_bounded",
+      "failure": "runtime_probe_stdout_cleanup_timed_out"
+    },
+    {
+      "command": "cargo test -p rovai-core --lib runtime_probe_process::tests::successful_leader_with_stdio_holding_descendant_finishes_bounded -- --exact",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "node --check scripts/smoke-minimax-runtime.mjs",
+      "status": "passed"
+    },
+    {
+      "command": "pnpm docs:test",
+      "passed": 10,
+      "failed": 0
+    },
+    {
+      "command": "pnpm docs:check",
+      "status": "passed"
+    },
+    {
+      "command": "DOCS_BASE_REF=2294e1b50 pnpm docs:check:ci",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "pnpm test:rust:pr",
+      "attempt": 2,
+      "exitCode": 0,
+      "passed": 473,
+      "failed": 0,
+      "ignored": 1,
+      "logSha256": "e94d57e9b27792aee91113649f891b0c03141a26c55bd45b474fe39022e6c253"
+    }
+  ],
+  "newRustTestsAdded": 0,
+  "limitations": [
+    "Unsupported questionnaire stops the current Run; next instruction required",
+    "Tools remain visible and a later turn may ask again",
+    "Usage remains partial or unknown, not a complete bill",
+    "Preview and existing CLI/Skills/MCP/platform limits unchanged",
+    "Live Session continuity does not qualify same PID, cross-Session or concurrent isolation"
+  ],
+  "productionSourceFileSha256": {
+    "crates/rovai-core/src/acp.rs": "1ed5927251c0e792ec1a27e692f12e7faf0240ad4811dc489a4ce7bdbbec7cea",
+    "crates/rovai-core/src/application.rs": "a3c72c46c77f9b85703b5a7362a755ed104ec9df6e4fd7d322d24bfebdee9b25"
+  }
+}

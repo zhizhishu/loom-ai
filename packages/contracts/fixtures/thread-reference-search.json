@@ -1,0 +1,92 @@
+[
+  {
+    "title": "État",
+    "query": "État",
+    "expected": true
+  },
+  {
+    "title": "État",
+    "query": "é",
+    "expected": true
+  },
+  {
+    "title": "État",
+    "query": "É",
+    "expected": true
+  },
+  {
+    "title": "État",
+    "query": "ét",
+    "expected": true
+  },
+  {
+    "title": "ＡＰＩ",
+    "query": "ＡＰＩ",
+    "expected": true
+  },
+  {
+    "title": "ＡＰＩ",
+    "query": "api",
+    "expected": true
+  },
+  {
+    "title": "API",
+    "query": "ａｐｉ",
+    "expected": true
+  },
+  {
+    "title": "登录改造",
+    "query": "登改",
+    "expected": true
+  },
+  {
+    "title": "登录改造",
+    "query": "改登",
+    "expected": false
+  },
+  {
+    "title": "ΟΣ",
+    "query": "ΟΣ",
+    "expected": true
+  },
+  {
+    "title": "İstanbul",
+    "query": "İs",
+    "expected": true
+  },
+  {
+    "title": "100%_完成",
+    "query": "%_",
+    "expected": true
+  },
+  {
+    "title": "100%_完成",
+    "query": "_%",
+    "expected": false
+  },
+  {
+    "title": "a\\b",
+    "query": "\\",
+    "expected": true
+  },
+  {
+    "title": "登录改造",
+    "query": "登改﻿",
+    "expected": true
+  },
+  {
+    "title": "登录改造",
+    "query": "​",
+    "expected": false
+  },
+  {
+    "title": "Straße",
+    "query": "STRASSE",
+    "expected": false
+  },
+  {
+    "title": "登录改造",
+    "query": " \t﻿",
+    "expected": true
+  }
+]

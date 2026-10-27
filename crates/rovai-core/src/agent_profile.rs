@@ -1,0 +1,9877 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    str::FromStr,
+};
+
+#[cfg(all(test, unix, feature = "slow-tests"))]
+use std::os::unix::fs::PermissionsExt;
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::{
+    agent_identity::allocate_agent_id,
+    agent_runtime_adapter::{
+        ANTIGRAVITY_RUNTIME_DEFAULT_MODEL_ID, AdapterRuntimeResolutionInput,
+        AgentRuntimeAdapterRegistry, CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID, ExecutableFileIdentity,
+        PI_MACHINE_PROTOCOL, PI_RUNTIME_DEFAULT_MODEL_ID, TRAE_RUNTIME_DEFAULT_MODEL_ID,
+        claude_code_catalog_has_native_evidence, observe_executable_file_identity,
+        trae_static_permission_options, validate_machine_ready_snapshot,
+    },
+    collaboration::end_camp_membership,
+    command::{
+        CommandEnvelope, CommandExecution, CommandHandlerResult, DomainCommand,
+        DomainCommandGateway, EntityReference, canonical_json_digest, sealed,
+    },
+    db::Database,
+    member_avatar::validate_member_avatar_update,
+    runtime_failure::RuntimeFailureView,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterKind {
+    CodexCli,
+    Pi,
+    OpencodeCli,
+    CopilotCli,
+    ClaudeCodeCli,
+    ClineCli,
+    CommandCodeCli,
+    KiroCli,
+    QoderCli,
+    CodebuddyCli,
+    QwenCode,
+    TraeCnCli,
+    CursorAgent,
+    KimiCodeCli,
+    MinimaxCodeCli,
+    HermesCli,
+    GrokBuild,
+    DeepseekHarness,
+    ZcodeApp,
+    AntigravityApp,
+}
+
+/// The only two ways a Runtime may publish assistant output into the Camp.
+///
+/// This is deliberately owned by the adapter catalog rather than inferred from
+/// stdout or Renderer state.  A Runtime that does not expose a trustworthy
+/// final boundary must use `ExplicitSendOnly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicOutputMode {
+    ExplicitSendOnly,
+    AssistantFinalVisible,
+}
+
+impl PublicOutputMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitSendOnly => "explicit_send_only",
+            Self::AssistantFinalVisible => "assistant_final_visible",
+        }
+    }
+}
+
+/// The Core-owned terminal safety policy for a successful Run that never
+/// accepted a Camp Message Send.
+///
+/// This is deliberately separate from [`PublicOutputMode`]: every shipped
+/// Adapter remains `explicit_send_only`, while a reliable Adapter final may be
+/// offered to Core as a narrowly scoped zero-send recovery candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingSendRecoveryMode {
+    Disabled,
+    IfNoAcceptedSend,
+}
+
+impl MissingSendRecoveryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::IfNoAcceptedSend => "if_no_accepted_send",
+        }
+    }
+}
+
+impl AdapterKind {
+    pub const ALL: [Self; 20] = [
+        Self::CodexCli,
+        Self::Pi,
+        Self::OpencodeCli,
+        Self::CopilotCli,
+        Self::ClaudeCodeCli,
+        Self::ClineCli,
+        Self::CommandCodeCli,
+        Self::AntigravityApp,
+        Self::KiroCli,
+        Self::QoderCli,
+        Self::CodebuddyCli,
+        Self::QwenCode,
+        Self::TraeCnCli,
+        Self::CursorAgent,
+        Self::KimiCodeCli,
+        Self::MinimaxCodeCli,
+        Self::HermesCli,
+        Self::GrokBuild,
+        Self::DeepseekHarness,
+        Self::ZcodeApp,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexCli => "codex-cli",
+            Self::Pi => "pi",
+            Self::OpencodeCli => "opencode-cli",
+            Self::CopilotCli => "copilot-cli",
+            Self::ClaudeCodeCli => "claude-code-cli",
+            Self::ClineCli => "cline-cli",
+            Self::CommandCodeCli => "command-code-cli",
+            Self::KiroCli => "kiro-cli",
+            Self::QoderCli => "qoder-cli",
+            Self::CodebuddyCli => "codebuddy-cli",
+            Self::QwenCode => "qwen-code",
+            Self::TraeCnCli => "trae-cn-cli",
+            Self::CursorAgent => "cursor-agent",
+            Self::KimiCodeCli => "kimi-code-cli",
+            Self::MinimaxCodeCli => "minimax-code-cli",
+            Self::HermesCli => "hermes-cli",
+            Self::GrokBuild => "grok-build",
+            Self::DeepseekHarness => "deepseek-harness",
+            Self::ZcodeApp => "zcode-app",
+            Self::AntigravityApp => "antigravity-app",
+        }
+    }
+
+    pub fn command_name(self) -> &'static str {
+        match self {
+            Self::CodexCli => "codex",
+            Self::Pi => "pi",
+            Self::OpencodeCli => "opencode",
+            Self::CopilotCli => "copilot",
+            Self::ClaudeCodeCli => "claude",
+            Self::ClineCli => "cline",
+            Self::CommandCodeCli => "command-code",
+            Self::KiroCli => "kiro-cli",
+            Self::QoderCli => "qodercli",
+            Self::CodebuddyCli => "codebuddy",
+            Self::QwenCode => "qwen",
+            Self::TraeCnCli => "traecli",
+            Self::CursorAgent => "cursor-agent",
+            Self::KimiCodeCli => "kimi",
+            Self::MinimaxCodeCli => "mcode",
+            Self::HermesCli => "hermes",
+            Self::GrokBuild => "grok",
+            Self::DeepseekHarness => "dsh",
+            Self::ZcodeApp => "ZCode",
+            Self::AntigravityApp => "agy",
+        }
+    }
+
+    /// Candidate executable names in discovery order.
+    ///
+    /// Cursor's installer publishes both `cursor-agent` and the generic
+    /// `agent` alias. The latter is shared by other products, so discovery
+    /// must validate Cursor's reported version before committing it.
+    pub fn command_names(self) -> &'static [&'static str] {
+        match self {
+            Self::CursorAgent => &["cursor-agent", "agent"],
+            Self::Pi => &["pi"],
+            Self::KimiCodeCli => &["kimi"],
+            Self::MinimaxCodeCli => &["mcode"],
+            Self::HermesCli => &["hermes"],
+            Self::GrokBuild => &["grok"],
+            Self::DeepseekHarness => &["dsh"],
+            Self::ZcodeApp => &["ZCode"],
+            Self::CodexCli => &["codex"],
+            Self::OpencodeCli => &["opencode"],
+            Self::CopilotCli => &["copilot"],
+            Self::ClaudeCodeCli => &["claude"],
+            Self::ClineCli => &["cline"],
+            Self::CommandCodeCli => &["command-code", "cmdc"],
+            Self::KiroCli => &["kiro-cli"],
+            Self::QoderCli => &["qodercli"],
+            Self::CodebuddyCli => &["codebuddy"],
+            Self::QwenCode => &["qwen"],
+            Self::TraeCnCli => &["traecli"],
+            Self::AntigravityApp => &["agy"],
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::CodexCli => "Codex CLI",
+            Self::Pi => "Pi Coding Agent",
+            Self::OpencodeCli => "OpenCode",
+            Self::CopilotCli => "GitHub Copilot",
+            Self::ClaudeCodeCli => "Claude Code",
+            Self::ClineCli => "Cline",
+            Self::CommandCodeCli => "Command Code",
+            Self::KiroCli => "Kiro",
+            Self::QoderCli => "Qoder",
+            Self::CodebuddyCli => "CodeBuddy",
+            Self::QwenCode => "Qwen Code",
+            Self::TraeCnCli => "TRAE CLI",
+            Self::CursorAgent => "Cursor Agent",
+            Self::KimiCodeCli => "Kimi Code",
+            Self::MinimaxCodeCli => "MiniMax Code",
+            Self::HermesCli => "Hermes Agent",
+            Self::GrokBuild => "Grok Build",
+            Self::DeepseekHarness => "DeepSeek Harness",
+            Self::ZcodeApp => "ZCode",
+            Self::AntigravityApp => "Antigravity",
+        }
+    }
+
+    pub fn uses_acp(self) -> bool {
+        matches!(
+            self,
+            Self::OpencodeCli
+                | Self::CopilotCli
+                | Self::CommandCodeCli
+                | Self::ClineCli
+                | Self::KiroCli
+                | Self::QoderCli
+                | Self::CodebuddyCli
+                | Self::QwenCode
+                | Self::TraeCnCli
+                | Self::CursorAgent
+                | Self::KimiCodeCli
+                | Self::MinimaxCodeCli
+                | Self::HermesCli
+                | Self::GrokBuild
+                | Self::DeepseekHarness
+                | Self::ZcodeApp
+        )
+    }
+
+    pub fn override_environment_key(self) -> &'static str {
+        match self {
+            Self::CodexCli => "ROVAI_CODEX_BIN",
+            Self::Pi => "ROVAI_PI_BIN",
+            Self::OpencodeCli => "ROVAI_OPENCODE_BIN",
+            Self::CopilotCli => "ROVAI_COPILOT_BIN",
+            Self::ClaudeCodeCli => "ROVAI_CLAUDE_CODE_BIN",
+            Self::ClineCli => "ROVAI_CLINE_BIN",
+            Self::CommandCodeCli => "ROVAI_COMMAND_CODE_BIN",
+            Self::KiroCli => "ROVAI_KIRO_BIN",
+            Self::QoderCli => "ROVAI_QODER_BIN",
+            Self::CodebuddyCli => "ROVAI_CODEBUDDY_BIN",
+            Self::QwenCode => "ROVAI_QWEN_BIN",
+            Self::TraeCnCli => "ROVAI_TRAE_CN_BIN",
+            Self::CursorAgent => "ROVAI_CURSOR_BIN",
+            Self::KimiCodeCli => "ROVAI_KIMI_BIN",
+            Self::MinimaxCodeCli => "ROVAI_MINIMAX_CODE_BIN",
+            Self::HermesCli => "ROVAI_HERMES_BIN",
+            Self::GrokBuild => "ROVAI_GROK_BIN",
+            Self::DeepseekHarness => "ROVAI_DEEPSEEK_HARNESS_BIN",
+            Self::ZcodeApp => "ROVAI_ZCODE_BIN",
+            Self::AntigravityApp => "ROVAI_ANTIGRAVITY_BIN",
+        }
+    }
+
+    /// Freeze the public output boundary for each shipped adapter.
+    ///
+    /// Every shipped adapter requires an explicit `camp.message.send` call.
+    /// Runtime final boundaries remain execution evidence and never publish a
+    /// Camp message implicitly.
+    pub const fn public_output_mode(self) -> PublicOutputMode {
+        match self {
+            Self::CodexCli
+            | Self::Pi
+            | Self::OpencodeCli
+            | Self::CopilotCli
+            | Self::CommandCodeCli
+            | Self::ClineCli
+            | Self::ClaudeCodeCli
+            | Self::KiroCli
+            | Self::QoderCli
+            | Self::CodebuddyCli
+            | Self::QwenCode
+            | Self::TraeCnCli
+            | Self::CursorAgent
+            | Self::KimiCodeCli
+            | Self::MinimaxCodeCli
+            | Self::HermesCli
+            | Self::GrokBuild
+            | Self::DeepseekHarness
+            | Self::ZcodeApp
+            | Self::AntigravityApp => PublicOutputMode::ExplicitSendOnly,
+        }
+    }
+
+    /// Freeze the missing-send safety net independently from ordinary Runtime
+    /// public output.  Every shipped Adapter has a dedicated, tested final
+    /// boundary and therefore participates in zero-send recovery.
+    pub const fn missing_send_recovery_mode(self) -> MissingSendRecoveryMode {
+        match self {
+            Self::CodexCli
+            | Self::Pi
+            | Self::OpencodeCli
+            | Self::CopilotCli
+            | Self::CommandCodeCli
+            | Self::ClineCli
+            | Self::ClaudeCodeCli
+            | Self::KiroCli
+            | Self::QoderCli
+            | Self::CodebuddyCli
+            | Self::QwenCode
+            | Self::TraeCnCli
+            | Self::KimiCodeCli
+            | Self::MinimaxCodeCli
+            | Self::HermesCli
+            | Self::GrokBuild
+            | Self::DeepseekHarness
+            | Self::ZcodeApp
+            | Self::AntigravityApp => MissingSendRecoveryMode::IfNoAcceptedSend,
+            Self::CursorAgent => MissingSendRecoveryMode::Disabled,
+        }
+    }
+}
+
+impl FromStr for AdapterKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "codex-cli" => Ok(Self::CodexCli),
+            "pi" => Ok(Self::Pi),
+            "opencode-cli" => Ok(Self::OpencodeCli),
+            "copilot-cli" => Ok(Self::CopilotCli),
+            "claude-code-cli" => Ok(Self::ClaudeCodeCli),
+            "cline-cli" => Ok(Self::ClineCli),
+            "command-code-cli" => Ok(Self::CommandCodeCli),
+            "kiro-cli" => Ok(Self::KiroCli),
+            "qoder-cli" => Ok(Self::QoderCli),
+            "codebuddy-cli" => Ok(Self::CodebuddyCli),
+            "qwen-code" => Ok(Self::QwenCode),
+            "trae-cn-cli" => Ok(Self::TraeCnCli),
+            "cursor-agent" => Ok(Self::CursorAgent),
+            "kimi-code-cli" => Ok(Self::KimiCodeCli),
+            "minimax-code-cli" => Ok(Self::MinimaxCodeCli),
+            "hermes-cli" => Ok(Self::HermesCli),
+            "grok-build" => Ok(Self::GrokBuild),
+            "deepseek-harness" => Ok(Self::DeepseekHarness),
+            "zcode-app" => Ok(Self::ZcodeApp),
+            "antigravity-app" => Ok(Self::AntigravityApp),
+            _ => anyhow::bail!("unsupported Adapter kind: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationSource {
+    Manual,
+    Env,
+    InheritedPath,
+    LoginShell,
+    KnownLocation,
+    Custom,
+}
+
+impl InstallationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Env => "env",
+            Self::InheritedPath => "inherited_path",
+            Self::LoginShell => "login_shell",
+            Self::KnownLocation => "known_location",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+impl FromStr for InstallationSource {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "env" => Ok(Self::Env),
+            "inherited_path" => Ok(Self::InheritedPath),
+            "login_shell" => Ok(Self::LoginShell),
+            "known_location" => Ok(Self::KnownLocation),
+            "custom" => Ok(Self::Custom),
+            _ => anyhow::bail!("unsupported installation source: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationClass {
+    ManagedDefault,
+    Custom,
+}
+
+impl FromStr for InstallationClass {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "managed_default" => Ok(Self::ManagedDefault),
+            "custom" => Ok(Self::Custom),
+            _ => anyhow::bail!("unsupported installation class: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DshModelSource {
+    Native,
+    Web,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ModelSelection {
+    RuntimeDefault,
+    Explicit {
+        #[serde(rename = "modelId")]
+        model_id: String,
+        #[serde(default)]
+        options: Value,
+        #[serde(default, rename = "dshSource", skip_serializing_if = "Option::is_none")]
+        dsh_source: Option<DshModelSource>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterPermissionConfig {
+    pub adapter_kind: AdapterKind,
+    pub schema_version: i64,
+    pub values: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResolvedRuntimeBinding {
+    pub adapter_kind: AdapterKind,
+    pub installation_id: String,
+    pub model: ModelSelection,
+    pub permissions: AdapterPermissionConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberRuntimeConfiguration {
+    pub adapter_kind: AdapterKind,
+    pub model: ModelSelection,
+    pub permissions: AdapterPermissionConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedModelSelection {
+    pub source: String,
+    pub model_id: String,
+    pub options: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_source: Option<DshModelSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrozenAgentRuntimeConfig {
+    // Historical environment references are ignored, including malformed ones.
+    // The in-memory launch map never participates in Run or Fleet identity.
+    #[serde(skip)]
+    pub environment: Option<crate::member_environment::LaunchEnvironment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_api: Option<crate::runtime_custom_api::CustomApiSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camp_fast: Option<crate::camp_fast::FrozenThreadMemberFast>,
+    pub adapter_kind: AdapterKind,
+    pub installation_id: String,
+    pub installation_generation: i64,
+    pub search_environment_generation: i64,
+    pub executable_path: String,
+    pub auth_scope: String,
+    pub reported_version: Option<String>,
+    pub executable_fingerprint: String,
+    pub capabilities: Vec<String>,
+    pub protocol_version: String,
+    pub model: ResolvedModelSelection,
+    pub permissions: AdapterPermissionConfig,
+    pub native_session_compatibility_key: Option<String>,
+    pub binding_compatibility_digest: Option<String>,
+    pub host_config_digest: Option<String>,
+    pub config_digest: String,
+}
+
+impl FrozenAgentRuntimeConfig {
+    pub(crate) fn refresh_config_digest(&mut self) -> Result<()> {
+        self.config_digest.clear();
+        self.config_digest = canonical_json_digest(&serde_json::to_value(&*self)?)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeConfigurationBlocker {
+    pub code: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOptionDescriptor {
+    pub key: String,
+    pub label: String,
+    pub value_type: String,
+    pub values: Vec<ValueChoice>,
+    pub default_value: Option<String>,
+    pub scope: RuntimeOptionScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValueChoice {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeOptionScope {
+    Run,
+    Session,
+    Host,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDescriptor {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The Runtime's model entry only; never the surrounding initialization/account response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_metadata: Option<Value>,
+    pub is_default: bool,
+    pub hidden: bool,
+    pub deprecated: bool,
+    pub options: Vec<ModelOptionDescriptor>,
+}
+
+pub const MODEL_CATALOG_REVALIDATE_AFTER_SECONDS: i64 = 60;
+pub const MODEL_CATALOG_MAX_SERVICE_AGE_SECONDS: i64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeModelCatalogCacheStatus {
+    Fresh,
+    Stale,
+    Expired,
+    Unavailable,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeModelCatalogCacheView {
+    pub status: RuntimeModelCatalogCacheStatus,
+    pub observed_at: Option<String>,
+    pub revalidate_after: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+impl RuntimeModelCatalogCacheView {
+    pub fn is_serviceable(&self) -> bool {
+        matches!(
+            self.status,
+            RuntimeModelCatalogCacheStatus::Fresh | RuntimeModelCatalogCacheStatus::Stale
+        )
+    }
+
+    pub fn needs_revalidation(&self) -> bool {
+        self.status != RuntimeModelCatalogCacheStatus::Fresh
+    }
+}
+
+fn model_catalog_has_native_evidence(
+    adapter_kind: AdapterKind,
+    models: &[ModelDescriptor],
+) -> bool {
+    adapter_kind != AdapterKind::ClaudeCodeCli || claude_code_catalog_has_native_evidence(models)
+}
+
+pub fn runtime_model_catalog_cache_view(
+    adapter_kind: AdapterKind,
+    snapshot: Option<&AdapterCapabilitySnapshot>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RuntimeModelCatalogCacheView {
+    runtime_model_catalog_cache_view_at(
+        adapter_kind,
+        snapshot,
+        (adapter_kind != AdapterKind::MinimaxCodeCli)
+            .then(|| snapshot.and_then(|snapshot| snapshot.last_successful_probe_at.as_deref()))
+            .flatten(),
+        now,
+    )
+}
+
+fn runtime_model_catalog_cache_view_at(
+    adapter_kind: AdapterKind,
+    snapshot: Option<&AdapterCapabilitySnapshot>,
+    catalog_succeeded_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RuntimeModelCatalogCacheView {
+    let Some(snapshot) = snapshot else {
+        return RuntimeModelCatalogCacheView {
+            status: RuntimeModelCatalogCacheStatus::Unavailable,
+            observed_at: None,
+            revalidate_after: None,
+            expires_at: None,
+        };
+    };
+    if snapshot.stale_at.is_some() {
+        return RuntimeModelCatalogCacheView {
+            status: RuntimeModelCatalogCacheStatus::Invalidated,
+            observed_at: (snapshot.probe_status == "ready")
+                .then(|| catalog_succeeded_at.map(str::to_owned))
+                .flatten(),
+            revalidate_after: None,
+            expires_at: None,
+        };
+    }
+    let retained_lkg = snapshot.probe_status != "ready"
+        && catalog_succeeded_at.is_some()
+        && !snapshot.models.is_empty();
+    if (snapshot.probe_status != "ready" && !retained_lkg)
+        || !model_catalog_has_native_evidence(adapter_kind, &snapshot.models)
+    {
+        return RuntimeModelCatalogCacheView {
+            status: RuntimeModelCatalogCacheStatus::Unavailable,
+            observed_at: None,
+            revalidate_after: None,
+            expires_at: None,
+        };
+    }
+    catalog_observation_cache_view(catalog_succeeded_at, retained_lkg, now)
+}
+
+fn catalog_observation_cache_view(
+    catalog_succeeded_at: Option<&str>,
+    needs_revalidation: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RuntimeModelCatalogCacheView {
+    let observed_at = catalog_succeeded_at.map(str::to_owned);
+    let Some(observed_at_value) = observed_at.as_deref() else {
+        return RuntimeModelCatalogCacheView {
+            status: RuntimeModelCatalogCacheStatus::Unavailable,
+            observed_at,
+            revalidate_after: None,
+            expires_at: None,
+        };
+    };
+    let Ok(observed_at_time) = chrono::DateTime::parse_from_rfc3339(observed_at_value)
+        .map(|value| value.with_timezone(&chrono::Utc))
+    else {
+        return RuntimeModelCatalogCacheView {
+            status: RuntimeModelCatalogCacheStatus::Unavailable,
+            observed_at,
+            revalidate_after: None,
+            expires_at: None,
+        };
+    };
+    let revalidate_after =
+        observed_at_time + chrono::Duration::seconds(MODEL_CATALOG_REVALIDATE_AFTER_SECONDS);
+    let expires_at =
+        observed_at_time + chrono::Duration::seconds(MODEL_CATALOG_MAX_SERVICE_AGE_SECONDS);
+    let status = if now >= expires_at {
+        RuntimeModelCatalogCacheStatus::Expired
+    } else if needs_revalidation || now >= revalidate_after {
+        RuntimeModelCatalogCacheStatus::Stale
+    } else {
+        RuntimeModelCatalogCacheStatus::Fresh
+    };
+    RuntimeModelCatalogCacheView {
+        status,
+        observed_at,
+        revalidate_after: Some(revalidate_after.to_rfc3339()),
+        expires_at: Some(expires_at.to_rfc3339()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionOptionDescriptor {
+    pub key: String,
+    pub label: String,
+    pub description: String,
+    pub value_type: String,
+    pub choices: Vec<ValueChoice>,
+    pub recommended_value: Value,
+    pub scope: RuntimeOptionScope,
+    pub risk: String,
+    pub supported: bool,
+    pub required: bool,
+    pub unsupported_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterCapabilitySnapshot {
+    pub reported_version: Option<String>,
+    pub executable_fingerprint: Option<String>,
+    pub authentication_status: String,
+    pub probe_status: String,
+    pub permission_schema_version: i64,
+    pub permission_schema_digest: String,
+    pub capabilities: Vec<String>,
+    pub protocols: Vec<String>,
+    pub models: Vec<ModelDescriptor>,
+    pub permission_options: Vec<PermissionOptionDescriptor>,
+    pub observed_at: Option<String>,
+    pub last_attempted_at: String,
+    pub last_successful_probe_at: Option<String>,
+    pub stale_at: Option<String>,
+    pub last_error: Option<String>,
+    pub native_session_compatibility_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterInstallationView {
+    pub id: String,
+    pub adapter_kind: AdapterKind,
+    pub executable_path: String,
+    pub command_name: String,
+    pub installation_class: InstallationClass,
+    pub source: InstallationSource,
+    pub auth_scope: String,
+    pub enabled: bool,
+    pub generation: i64,
+    pub path_state: String,
+    pub version: i64,
+    pub referenced_profile_count: i64,
+    pub snapshot: Option<AdapterCapabilitySnapshot>,
+    pub permission_options: Vec<PermissionOptionDescriptor>,
+    pub model_catalog: RuntimeModelCatalogCacheView,
+    pub member_runtime_defaults: Option<MemberRuntimeConfiguration>,
+    pub last_probe_attempt: Option<AdapterProbeAttempt>,
+    pub relocation_history: Vec<AdapterRelocationAudit>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl AdapterInstallationView {
+    /// Browsing an unchanged environment's LKG does not authorize saving a new selection.
+    pub fn model_catalog_can_display(&self) -> bool {
+        self.model_catalog.is_serviceable()
+            || (self.model_catalog.status == RuntimeModelCatalogCacheStatus::Expired
+                && self.snapshot.as_ref().is_some_and(|snapshot| {
+                    self.adapter_kind == AdapterKind::Pi
+                        || (snapshot.probe_status == "ready"
+                            && snapshot.stale_at.is_none()
+                            && model_catalog_has_native_evidence(
+                                self.adapter_kind,
+                                &snapshot.models,
+                            ))
+                }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterProbeAttempt {
+    pub id: String,
+    pub installation_id: String,
+    pub status: String,
+    pub failure_class: String,
+    pub diagnostic_code: Option<String>,
+    pub candidate_path: String,
+    pub executable_fingerprint: Option<String>,
+    pub attempted_at: String,
+    pub retry_after: Option<String>,
+    pub failure: Option<RuntimeFailureView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterRelocationAudit {
+    pub id: String,
+    pub installation_id: String,
+    pub previous_path: String,
+    pub next_path: Option<String>,
+    pub previous_fingerprint: Option<String>,
+    pub next_fingerprint: Option<String>,
+    pub source: Option<InstallationSource>,
+    pub result: String,
+    pub diagnostic_code: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberThreadMembershipView {
+    #[serde(rename = "threadId", alias = "campId")]
+    pub camp_id: String,
+    pub project_path: String,
+    pub membership_status: String,
+    pub is_default_lead: bool,
+    pub joined_at: String,
+    pub left_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeReadinessStatus {
+    RuntimeNotConfigured,
+    NeedsAttention,
+    LightReady,
+    InstalledUnverified,
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeReadinessBlocker {
+    pub code: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeReadiness {
+    pub status: RuntimeReadinessStatus,
+    pub blockers: Vec<RuntimeReadinessBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProfileView {
+    pub agent_id: String,
+    pub display_name: String,
+    pub avatar_ref: Option<String>,
+    pub accent: Option<String>,
+    pub team_role: String,
+    pub professional_responsibilities: String,
+    pub personality_traits: Vec<String>,
+    pub working_principles: String,
+    pub growth_topic: String,
+    pub default_capabilities: Vec<String>,
+    pub presence: String,
+    pub runtime_configuration: Option<MemberRuntimeConfiguration>,
+    pub runtime_readiness: RuntimeReadiness,
+    pub member_order: i64,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub removed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CreateAgentProfileCommand {
+    pub display_name: String,
+    #[serde(default)]
+    pub avatar_ref: Option<String>,
+    pub team_role: String,
+    pub professional_responsibilities: String,
+    pub personality_traits: Vec<String>,
+    pub working_principles: String,
+    pub growth_topic: String,
+}
+
+impl sealed::Sealed for CreateAgentProfileCommand {}
+impl DomainCommand for CreateAgentProfileCommand {
+    const TYPE: &'static str = "agent_profile.create";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAgentProfileCommand {
+    pub agent_id: String,
+    pub expected_version: i64,
+    pub display_name: String,
+    pub team_role: String,
+    pub professional_responsibilities: String,
+    pub personality_traits: Vec<String>,
+    pub working_principles: String,
+    pub growth_topic: String,
+}
+
+impl sealed::Sealed for UpdateAgentProfileCommand {}
+impl DomainCommand for UpdateAgentProfileCommand {
+    const TYPE: &'static str = "agent_profile.update";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SetAgentProfileAvatarCommand {
+    pub agent_id: String,
+    pub expected_version: i64,
+    pub avatar_ref: Option<String>,
+}
+
+impl sealed::Sealed for SetAgentProfileAvatarCommand {}
+impl DomainCommand for SetAgentProfileAvatarCommand {
+    const TYPE: &'static str = "agent_profile.avatar.set";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMemberRuntimeConfigurationCommand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_update: Option<crate::member_environment::EnvironmentUpdateReceipt>,
+    pub agent_id: String,
+    pub expected_version: i64,
+    pub adapter_kind: AdapterKind,
+    pub model: ModelSelection,
+    pub permissions: AdapterPermissionConfig,
+}
+
+impl sealed::Sealed for SetMemberRuntimeConfigurationCommand {}
+impl DomainCommand for SetMemberRuntimeConfigurationCommand {
+    const TYPE: &'static str = "agent_profile.runtime.set";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearMemberRuntimeConfigurationCommand {
+    pub agent_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for ClearMemberRuntimeConfigurationCommand {}
+impl DomainCommand for ClearMemberRuntimeConfigurationCommand {
+    const TYPE: &'static str = "agent_profile.runtime.clear";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMemberPresenceCommand {
+    pub agent_id: String,
+    pub expected_version: i64,
+    pub presence: String,
+}
+
+impl sealed::Sealed for SetMemberPresenceCommand {}
+impl DomainCommand for SetMemberPresenceCommand {
+    const TYPE: &'static str = "agent_profile.presence.set";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveMemberCommand {
+    pub agent_id: String,
+    pub expected_version: i64,
+    pub confirmation_name: String,
+}
+
+impl sealed::Sealed for RemoveMemberCommand {}
+impl DomainCommand for RemoveMemberCommand {
+    const TYPE: &'static str = "agent_profile.remove";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberRemovalPreview {
+    pub agent_id: String,
+    pub display_name: String,
+    pub version: i64,
+    pub non_terminal_agent_run_count: i64,
+    #[serde(
+        rename = "currentThreadMembershipCount",
+        alias = "currentCampMembershipCount"
+    )]
+    pub current_camp_membership_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_assigned_task_count: Option<i64>,
+    #[serde(rename = "defaultLeadThreadCount", alias = "defaultLeadCampCount")]
+    pub default_lead_camp_count: i64,
+    #[serde(rename = "soleMemberThreadCount", alias = "soleMemberCampCount")]
+    pub sole_member_camp_count: i64,
+    pub affected_threads: Vec<MemberRemovalThreadImpact>,
+    pub removable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberRemovalThreadImpact {
+    pub thread_id: String,
+    pub title: String,
+    pub remaining_member_count: i64,
+    pub was_default_lead: bool,
+    pub next_default_lead_agent_id: Option<String>,
+    pub next_default_lead_display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderAgentProfilesCommand {
+    pub ordered_agent_ids: Vec<String>,
+}
+
+impl sealed::Sealed for ReorderAgentProfilesCommand {}
+impl DomainCommand for ReorderAgentProfilesCommand {
+    const TYPE: &'static str = "agent_profile.reorder";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAdapterInstallationCommand {
+    pub adapter_kind: AdapterKind,
+    pub executable_path: String,
+    pub command_name: String,
+    pub source: InstallationSource,
+    pub auth_scope: String,
+}
+
+impl sealed::Sealed for CreateAdapterInstallationCommand {}
+impl DomainCommand for CreateAdapterInstallationCommand {
+    const TYPE: &'static str = "adapter_installation.create";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAdapterInstallationCommand {
+    pub installation_id: String,
+    pub expected_version: i64,
+    pub executable_path: String,
+    pub command_name: String,
+    pub source: InstallationSource,
+    pub auth_scope: String,
+    pub enabled: bool,
+}
+
+impl sealed::Sealed for UpdateAdapterInstallationCommand {}
+impl DomainCommand for UpdateAdapterInstallationCommand {
+    const TYPE: &'static str = "adapter_installation.update";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordAdapterCapabilitySnapshotCommand {
+    pub installation_id: String,
+    pub expected_installation_version: i64,
+    pub snapshot: AdapterCapabilitySnapshot,
+    #[serde(default)]
+    pub failure: Option<RuntimeFailureView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeEntrypointLocatorIdentity {
+    pub entrypoint_kind: String,
+    pub canonical_shim_path: String,
+    pub shim_content_digest: String,
+    pub canonical_interpreter_path: String,
+    pub interpreter_fingerprint: String,
+    pub resolved_target_path: String,
+    pub resolved_target_fingerprint: String,
+    pub compatibility_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedManagedInstallation {
+    /// Whether this request read the complete model options (MiniMax catalog intent).
+    pub model_catalog_complete: bool,
+    /// Captured with the snapshot fingerprint before acquiring the database lock.
+    pub executable_file_identity: Option<ExecutableFileIdentity>,
+    pub adapter_kind: AdapterKind,
+    pub executable_path: String,
+    pub command_name: String,
+    pub source: InstallationSource,
+    pub auth_scope: String,
+    pub snapshot: AdapterCapabilitySnapshot,
+    pub entrypoint_locator_identity: Option<RuntimeEntrypointLocatorIdentity>,
+}
+
+/// Installation identity only. This is not protocol or authentication evidence.
+#[derive(Debug, Clone)]
+pub struct DiscoveredRuntimeEntry {
+    pub adapter_kind: AdapterKind,
+    pub executable_path: String,
+    pub source: InstallationSource,
+    pub executable_fingerprint: String,
+    pub entrypoint_locator_identity: Option<RuntimeEntrypointLocatorIdentity>,
+}
+
+/// A consistent file identity and fingerprint, not Runtime health evidence.
+/// Private fields keep the SQL commit from accepting unverified metadata.
+#[derive(Debug)]
+pub struct VerifiedDiscoveredRuntimeEntry {
+    entry: DiscoveredRuntimeEntry,
+    identity: ExecutableFileIdentity,
+}
+
+impl VerifiedDiscoveredRuntimeEntry {
+    pub fn executable_file_identity(&self) -> &ExecutableFileIdentity {
+        &self.identity
+    }
+
+    pub fn entry(&self) -> &DiscoveredRuntimeEntry {
+        &self.entry
+    }
+
+    pub fn is_current(&self) -> bool {
+        crate::agent_runtime_adapter::observe_executable_file_identity(Path::new(
+            &self.entry.executable_path,
+        ))
+        .is_ok_and(|identity| identity == self.identity)
+            && crate::runtime_discovery::entrypoint_locator_identity_is_current(
+                self.entry.entrypoint_locator_identity.as_ref(),
+            )
+    }
+
+    /// Static discovery performs one stable read, or reuses the identity already
+    /// persisted for this exact path. No health evidence is produced.
+    pub fn discover(
+        adapter_kind: AdapterKind,
+        executable_path: String,
+        source: InstallationSource,
+        entrypoint_locator_identity: Option<RuntimeEntrypointLocatorIdentity>,
+        previous: Option<(&str, &ExecutableFileIdentity)>,
+    ) -> Result<Self> {
+        use crate::agent_runtime_adapter::{
+            executable_fingerprint, observe_executable_file_identity,
+        };
+        let path = Path::new(&executable_path);
+        let before = observe_executable_file_identity(path)?;
+        // Windows command shims retain their full dependency verification.
+        let reusable = !path.extension().is_some_and(|extension| {
+            cfg!(windows)
+                && matches!(
+                    extension.to_str().map(str::to_ascii_lowercase).as_deref(),
+                    Some("cmd" | "bat")
+                )
+        });
+        let fingerprint = match previous.filter(|(_, identity)| reusable && *identity == &before) {
+            Some((fingerprint, _)) => fingerprint.to_owned(),
+            None => executable_fingerprint(path)?,
+        };
+        let after = observe_executable_file_identity(path)?;
+        anyhow::ensure!(
+            before == after,
+            "Runtime entry changed during installation discovery"
+        );
+        anyhow::ensure!(
+            crate::runtime_discovery::entrypoint_locator_identity_is_current(
+                entrypoint_locator_identity.as_ref()
+            ),
+            "Runtime entrypoint locator changed during installation discovery"
+        );
+        Ok(Self {
+            entry: DiscoveredRuntimeEntry {
+                adapter_kind,
+                executable_path,
+                source,
+                executable_fingerprint: fingerprint,
+                entrypoint_locator_identity,
+            },
+            identity: after,
+        })
+    }
+}
+
+impl DiscoveredRuntimeEntry {
+    /// Rechecks the executable and entrypoint dependencies. The supplied identity
+    /// must have been verified together with this entry's fingerprint. Async callers
+    /// must run this in a blocking worker before acquiring the database lock.
+    pub fn verify(
+        self,
+        verified_identity: Option<&ExecutableFileIdentity>,
+    ) -> Result<VerifiedDiscoveredRuntimeEntry> {
+        validate_installation(&self.executable_path, "default")?;
+        let identity = match crate::agent_runtime_adapter::verify_executable_integrity(
+            Path::new(&self.executable_path),
+            verified_identity,
+            &self.executable_fingerprint,
+        )? {
+            crate::agent_runtime_adapter::ExecutableIntegrityStatus::Unchanged => verified_identity
+                .context("unchanged Runtime entry requires its verified identity")?
+                .clone(),
+            crate::agent_runtime_adapter::ExecutableIntegrityStatus::Reverified(identity) => {
+                identity
+            }
+            _ => anyhow::bail!("Runtime entry changed during installation discovery"),
+        };
+        anyhow::ensure!(
+            crate::runtime_discovery::entrypoint_locator_identity_is_current(
+                self.entrypoint_locator_identity.as_ref()
+            ),
+            "Runtime entrypoint locator changed during installation discovery"
+        );
+        Ok(VerifiedDiscoveredRuntimeEntry {
+            entry: self,
+            identity,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredManagedInstallation {
+    /// Captured with the snapshot fingerprint before acquiring the database lock.
+    pub executable_file_identity: Option<ExecutableFileIdentity>,
+    pub adapter_kind: AdapterKind,
+    pub executable_path: String,
+    pub command_name: String,
+    pub source: InstallationSource,
+    pub auth_scope: String,
+    pub snapshot: AdapterCapabilitySnapshot,
+    pub entrypoint_locator_identity: Option<RuntimeEntrypointLocatorIdentity>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedProbeFailure<'a> {
+    pub adapter_kind: AdapterKind,
+    pub auth_scope: &'a str,
+    pub candidate_path: &'a str,
+    pub fingerprint: Option<&'a str>,
+    pub source: Option<InstallationSource>,
+    pub failure_class: &'a str,
+    pub diagnostic_code: &'a str,
+    pub failure: Option<&'a RuntimeFailureView>,
+}
+
+impl sealed::Sealed for RecordAdapterCapabilitySnapshotCommand {}
+impl DomainCommand for RecordAdapterCapabilitySnapshotCommand {
+    const TYPE: &'static str = "adapter_installation.snapshot.record";
+}
+
+#[derive(Debug, Default)]
+pub struct AgentProfileService {
+    gateway: DomainCommandGateway,
+}
+
+impl AgentProfileService {
+    pub fn all_profile_ids(&self, database: &Database) -> Result<BTreeSet<String>> {
+        let mut statement = database
+            .connection()
+            .prepare("SELECT id FROM agent_profile ORDER BY id")?;
+        Ok(statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?)
+    }
+
+    pub fn selected_runtime_counts(
+        &self,
+        database: &Database,
+    ) -> Result<BTreeMap<AdapterKind, usize>> {
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT selected_runtime_adapter_kind, COUNT(*)
+            FROM agent_profile
+            WHERE profile_status <> 'removed'
+              AND selected_runtime_adapter_kind IS NOT NULL
+            GROUP BY selected_runtime_adapter_kind
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            let (runtime_kind, count) = row?;
+            counts.insert(AdapterKind::from_str(&runtime_kind)?, count.max(0) as usize);
+        }
+        Ok(counts)
+    }
+
+    pub fn list_profiles(&self, database: &Database) -> Result<Vec<AgentProfileView>> {
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT id, display_name, avatar_ref,
+                   NULLIF(accent, ''), team_role, professional_responsibilities,
+                   personality_traits_json, working_principles, growth_topic,
+                   default_capabilities_json, profile_status,
+                   selected_runtime_adapter_kind,
+                   default_runtime_installation_id, default_model_selection_json,
+                   default_permission_config_json, version, created_at, updated_at,
+                   removed_at, member_order
+            FROM agent_profile
+            WHERE profile_status <> 'removed'
+            ORDER BY member_order, id
+            "#,
+        )?;
+        let rows = statement.query_map([], raw_agent_profile_from_row)?;
+        let mut profiles = Vec::new();
+        for row in rows {
+            profiles.push(self.materialize_profile(database, row?)?);
+        }
+        Ok(profiles)
+    }
+
+    pub fn get_profile(
+        &self,
+        database: &Database,
+        agent_id: &str,
+    ) -> Result<Option<AgentProfileView>> {
+        let raw = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT id, display_name, avatar_ref,
+                       NULLIF(accent, ''), team_role, professional_responsibilities,
+                       personality_traits_json, working_principles, growth_topic,
+                       default_capabilities_json, profile_status,
+                       selected_runtime_adapter_kind,
+                       default_runtime_installation_id, default_model_selection_json,
+                       default_permission_config_json, version, created_at, updated_at,
+                       removed_at, member_order
+                FROM agent_profile
+                WHERE id = ?1 AND profile_status <> 'removed'
+                "#,
+                [agent_id],
+                raw_agent_profile_from_row,
+            )
+            .optional()?;
+        raw.map(|profile| self.materialize_profile(database, profile))
+            .transpose()
+    }
+
+    pub fn reorder_profiles(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<ReorderAgentProfilesCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, crate::command::ActorRef::User { .. }) {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.reorder_user_required",
+                    json!({}),
+                ));
+            }
+            let existing = {
+                let mut statement = transaction
+                    .prepare("SELECT id FROM agent_profile WHERE profile_status <> 'removed'")?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?
+            };
+            let requested = envelope
+                .payload
+                .ordered_agent_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            if requested.len() != envelope.payload.ordered_agent_ids.len() || requested != existing
+            {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.invalid_order",
+                    json!({
+                        "expectedAgentIds": existing,
+                        "receivedAgentIds": envelope.payload.ordered_agent_ids,
+                    }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            for (member_order, agent_id) in envelope.payload.ordered_agent_ids.iter().enumerate() {
+                transaction.execute(
+                    r#"
+                    UPDATE agent_profile
+                    SET member_order = ?2, version = version + 1, updated_at = ?3
+                    WHERE id = ?1
+                    "#,
+                    params![agent_id, member_order as i64, now],
+                )?;
+            }
+            Ok(CommandHandlerResult::applied(
+                "agent_profile.reordered",
+                json!({
+                    "orderedAgentIds": envelope.payload.ordered_agent_ids,
+                }),
+                None,
+            ))
+        })
+    }
+
+    pub fn list_camp_memberships(
+        &self,
+        database: &Database,
+        agent_id: &str,
+    ) -> Result<Vec<MemberThreadMembershipView>> {
+        let mut statement = database.connection().prepare(
+            r#"
+            SELECT camp.id, camp.project_path, camp_member.status,
+                   COALESCE(camp.default_lead_agent_id = camp_member.agent_id, 0),
+                   camp_member.joined_at, camp_member.left_at
+            FROM camp_member
+            JOIN camp ON camp.id = camp_member.camp_id
+            WHERE camp_member.agent_id = ?1
+            ORDER BY camp_member.status = 'active' DESC, camp.updated_at DESC, camp.id
+            "#,
+        )?;
+        statement
+            .query_map([agent_id], |row| {
+                Ok(MemberThreadMembershipView {
+                    camp_id: row.get(0)?,
+                    project_path: row.get(1)?,
+                    membership_status: row.get(2)?,
+                    is_default_lead: row.get(3)?,
+                    joined_at: row.get(4)?,
+                    left_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list AgentProfile Thread memberships")
+    }
+
+    pub fn list_installations(&self, database: &Database) -> Result<Vec<AdapterInstallationView>> {
+        let mut installations = {
+            let mut statement = database.connection().prepare(
+                r#"
+                SELECT installation.id, installation.adapter_kind,
+                       installation.executable_path, installation.command_name,
+                       installation.installation_class, installation.source,
+                       installation.auth_scope, installation.enabled,
+                       installation.generation, installation.path_state,
+                       installation.version, installation.created_at,
+                       installation.updated_at,
+                       snapshot.reported_version, snapshot.executable_fingerprint,
+                       snapshot.authentication_status, snapshot.probe_status,
+                       snapshot.permission_schema_version,
+                       snapshot.permission_schema_digest,
+                       snapshot.capabilities_json, snapshot.protocols_json,
+                       snapshot.model_catalog_json, snapshot.permission_options_json,
+                       snapshot.observed_at, snapshot.last_attempted_at,
+                       snapshot.last_successful_probe_at, snapshot.stale_at,
+                       snapshot.last_error, snapshot.native_session_compatibility_key,
+                       (SELECT COUNT(*) FROM agent_profile
+                        WHERE agent_profile.default_runtime_installation_id = installation.id
+                          AND agent_profile.profile_status <> 'removed'),
+                       attempt.id, attempt.status, attempt.failure_class,
+                       attempt.diagnostic_code, attempt.candidate_path,
+                       attempt.executable_fingerprint, attempt.attempted_at,
+                       attempt.retry_after, attempt.public_runtime_failure_json,
+                       CASE WHEN installation.adapter_kind = 'minimax-code-cli'
+                            THEN snapshot.model_catalog_succeeded_at
+                            ELSE COALESCE(snapshot.model_catalog_succeeded_at, snapshot.last_successful_probe_at) END,
+                       identity.executable_fingerprint,
+                       (SELECT generation FROM runtime_search_environment_state WHERE singleton = 1)
+                FROM adapter_installation AS installation
+                LEFT JOIN runtime_executable_identity AS identity
+                  ON identity.installation_id = installation.id
+                 AND identity.executable_path = installation.executable_path
+                LEFT JOIN adapter_capability_snapshot AS snapshot
+                  ON snapshot.installation_id = installation.id
+                LEFT JOIN adapter_probe_attempt AS attempt
+                  ON attempt.id = (
+                      SELECT candidate.id
+                      FROM adapter_probe_attempt AS candidate
+                      WHERE candidate.installation_id = installation.id
+                        AND candidate.executable_fingerprint
+                            IS COALESCE(identity.executable_fingerprint, snapshot.executable_fingerprint)
+                      ORDER BY candidate.attempted_at DESC, candidate.id DESC
+                      LIMIT 1
+                  )
+                ORDER BY installation.adapter_kind,
+                         installation.installation_class,
+                         installation.created_at, installation.id
+                "#,
+            )?;
+            statement
+                .query_map([], installation_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("failed to list Adapter installations")?
+        };
+        for installation in &mut installations {
+            installation.member_runtime_defaults =
+                if installation.enabled && installation.path_state == "valid" {
+                    Some(member_runtime_defaults(installation.adapter_kind))
+                } else {
+                    None
+                };
+            installation.relocation_history = relocation_history(database, &installation.id, 20)?;
+        }
+        Ok(installations)
+    }
+
+    pub fn managed_installation(
+        &self,
+        database: &Database,
+        adapter_kind: AdapterKind,
+        auth_scope: &str,
+    ) -> Result<Option<AdapterInstallationView>> {
+        Ok(self
+            .list_installations(database)?
+            .into_iter()
+            .find(|installation| {
+                installation.adapter_kind == adapter_kind
+                    && installation.auth_scope == auth_scope
+                    && installation.installation_class == InstallationClass::ManagedDefault
+            }))
+    }
+
+    pub fn mark_managed_installation_path_missing_if_current(
+        &self,
+        database: &mut Database,
+        adapter_kind: AdapterKind,
+        auth_scope: &str,
+        installation_id: &str,
+        expected_executable_path: &str,
+        search_generation: u64,
+    ) -> Result<bool> {
+        let search_generation = i64::try_from(search_generation)
+            .context("Runtime Search Environment generation overflow")?;
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        Ok(database.connection_mut().execute(
+            r#"
+            UPDATE adapter_installation
+            SET path_state = 'path_missing', version = version + 1, updated_at = ?6
+            WHERE id = ?1
+              AND adapter_kind = ?2
+              AND auth_scope = ?3
+              AND installation_class = 'managed_default'
+              AND executable_path = ?4
+              AND path_state <> 'path_missing'
+              AND EXISTS (
+                  SELECT 1
+                  FROM runtime_search_environment_state
+                  WHERE singleton = 1 AND generation = ?5
+              )
+            "#,
+            params![
+                installation_id,
+                adapter_kind.as_str(),
+                auth_scope,
+                expected_executable_path,
+                search_generation,
+                updated_at,
+            ],
+        )? == 1)
+    }
+
+    pub fn verified_executable_identity(
+        &self,
+        database: &Database,
+        installation_id: &str,
+        executable_path: &str,
+        executable_fingerprint: &str,
+    ) -> Result<Option<ExecutableFileIdentity>> {
+        Ok(self
+            .recorded_executable_identity(database, installation_id, executable_path)?
+            .filter(|(fingerprint, _)| fingerprint == executable_fingerprint)
+            .map(|(_, identity)| identity))
+    }
+
+    pub fn recorded_executable_identity(
+        &self,
+        database: &Database,
+        installation_id: &str,
+        executable_path: &str,
+    ) -> Result<Option<(String, ExecutableFileIdentity)>> {
+        database
+            .connection()
+            .query_row(
+                r#"
+                SELECT identity.byte_size, identity.modified_at_unix_nanos,
+                       identity.file_id, identity.executable_fingerprint
+                FROM runtime_executable_identity AS identity
+                JOIN adapter_installation AS installation
+                  ON installation.id = identity.installation_id
+                WHERE identity.installation_id = ?1
+                  AND identity.executable_path = ?2
+                  AND installation.executable_path = ?2
+                "#,
+                params![installation_id, executable_path],
+                |row| {
+                    let byte_size = row.get::<_, i64>(0)?;
+                    Ok((
+                        row.get(3)?,
+                        ExecutableFileIdentity {
+                            byte_size: u64::try_from(byte_size).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    rusqlite::types::Type::Integer,
+                                    Box::new(error),
+                                )
+                            })?,
+                            modified_at_unix_nanos: row.get(1)?,
+                            file_id: row.get(2)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .context("failed to load verified Runtime executable identity")
+    }
+
+    pub fn runtime_entrypoint_locator_identity(
+        &self,
+        database: &Database,
+        installation_id: &str,
+    ) -> Result<Option<RuntimeEntrypointLocatorIdentity>> {
+        // This is the saved route for re-resolution, not launch authorization.
+        // Keep it readable when integrity invalidation removed file identity;
+        // discovery rechecks the shim, interpreter and resolved target off-lock.
+        database
+            .connection()
+            .query_row(
+                r#"
+                SELECT locator.entrypoint_kind, locator.canonical_shim_path,
+                       locator.shim_content_digest,
+                       locator.canonical_interpreter_path,
+                       locator.interpreter_fingerprint,
+                       locator.resolved_target_path,
+                       locator.resolved_target_fingerprint,
+                       locator.compatibility_fingerprint
+                FROM runtime_entrypoint_locator_identity AS locator
+                JOIN adapter_installation AS installation
+                  ON installation.id = locator.installation_id
+                WHERE locator.installation_id = ?1
+                  AND locator.resolved_target_path = installation.executable_path
+                "#,
+                [installation_id],
+                |row| {
+                    Ok(RuntimeEntrypointLocatorIdentity {
+                        entrypoint_kind: row.get(0)?,
+                        canonical_shim_path: row.get(1)?,
+                        shim_content_digest: row.get(2)?,
+                        canonical_interpreter_path: row.get(3)?,
+                        interpreter_fingerprint: row.get(4)?,
+                        resolved_target_path: row.get(5)?,
+                        resolved_target_fingerprint: row.get(6)?,
+                        compatibility_fingerprint: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to load Runtime entrypoint locator identity")
+    }
+
+    pub fn runtime_dispatch_blocker(
+        &self,
+        database: &Database,
+        runtime: &FrozenAgentRuntimeConfig,
+    ) -> Result<Option<RuntimeConfigurationBlocker>> {
+        self.runtime_dispatch_blocker_for_connection(database.connection(), runtime)
+    }
+
+    pub(crate) fn runtime_dispatch_blocker_for_connection(
+        &self,
+        connection: &Connection,
+        runtime: &FrozenAgentRuntimeConfig,
+    ) -> Result<Option<RuntimeConfigurationBlocker>> {
+        let current = connection
+            .query_row(
+                r#"
+                SELECT installation.adapter_kind, installation.executable_path,
+                       installation.generation, installation.enabled,
+                       installation.path_state,
+                       COALESCE(identity.executable_fingerprint, snapshot.executable_fingerprint)
+                FROM adapter_installation AS installation
+                LEFT JOIN adapter_capability_snapshot AS snapshot
+                  ON snapshot.installation_id = installation.id
+                LEFT JOIN runtime_executable_identity AS identity ON identity.installation_id = installation.id
+                WHERE installation.id = ?1
+                "#,
+                [&runtime.installation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            adapter_kind,
+            executable_path,
+            generation,
+            enabled,
+            path_state,
+            executable_fingerprint,
+        )) = current
+        else {
+            return Ok(Some(runtime_blocker(
+                "adapter_installation_missing",
+                json!({ "installationId": runtime.installation_id }),
+            )));
+        };
+        if !enabled {
+            return Ok(Some(runtime_blocker(
+                "adapter_installation_disabled",
+                json!({ "installationId": runtime.installation_id }),
+            )));
+        }
+        // A live Command Host is admitted by its installation identity. Disk
+        // entry observations belong to the Fleet's cold startup branch.
+        let command = runtime.adapter_kind == AdapterKind::CommandCodeCli;
+        if adapter_kind != runtime.adapter_kind.as_str()
+            || (!command
+                && (executable_path != runtime.executable_path
+                    || generation != runtime.installation_generation
+                    || executable_fingerprint.as_deref()
+                        != Some(runtime.executable_fingerprint.as_str())))
+        {
+            return Ok(Some(runtime_blocker(
+                "runtime_snapshot_changed",
+                json!({ "installationId": runtime.installation_id }),
+            )));
+        }
+        if !command && path_state != "valid" {
+            return Ok(Some(runtime_blocker(
+                "runtime_path_invalid",
+                json!({
+                    "installationId": runtime.installation_id,
+                    "pathState": path_state,
+                }),
+            )));
+        }
+        Ok(None)
+    }
+
+    pub fn resolve_rebound_runtime(
+        &self,
+        database: &Database,
+        frozen: &FrozenAgentRuntimeConfig,
+    ) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
+        let mut model_options = frozen.model.options.clone();
+        if frozen.adapter_kind == AdapterKind::CodexCli
+            && frozen.camp_fast.is_some()
+            && let Some(options) = model_options.as_object_mut()
+        {
+            // Camp request audit is not a model descriptor option.
+            options.remove("serviceTier");
+        }
+        let model = match frozen.model.source.as_str() {
+            "runtime_default" => ModelSelection::RuntimeDefault,
+            "explicit" => ModelSelection::Explicit {
+                dsh_source: frozen.model.dsh_source,
+                model_id: frozen.model.model_id.clone(),
+                options: model_options,
+            },
+            _ => anyhow::bail!("frozen Runtime model source is invalid"),
+        };
+        let mut rebound = match resolve_frozen_runtime_binding_with_snapshot(
+            database.connection(),
+            &ResolvedRuntimeBinding {
+                adapter_kind: frozen.adapter_kind,
+                installation_id: frozen.installation_id.clone(),
+                model,
+                permissions: frozen.permissions.clone(),
+            },
+            Some(frozen.custom_api.clone()),
+            None,
+        )? {
+            Ok(runtime) => runtime,
+            Err(blocker) => return Ok(Err(blocker)),
+        };
+        // Re-probing may change executable evidence, never the admitted Run's Camp intent.
+        rebound.environment = frozen.environment.clone();
+        rebound.camp_fast = frozen.camp_fast.clone();
+        if frozen.adapter_kind == AdapterKind::CodexCli
+            && frozen.camp_fast.is_some()
+            && let Some(tier) = frozen.model.options.get("serviceTier")
+        {
+            rebound.model.options["serviceTier"] = tier.clone();
+        }
+        rebound.refresh_config_digest()?;
+        Ok(Ok(rebound))
+    }
+
+    pub fn record_verified_executable_identity(
+        &self,
+        database: &mut Database,
+        installation_id: &str,
+        executable_path: &str,
+        executable_fingerprint: &str,
+        identity: &ExecutableFileIdentity,
+    ) -> Result<bool> {
+        let transaction = database.connection_mut().transaction()?;
+        let current = transaction.query_row(
+            r#"
+                SELECT COUNT(*)
+                FROM adapter_installation AS installation
+                JOIN runtime_executable_identity AS snapshot
+                  ON snapshot.installation_id = installation.id
+                WHERE installation.id = ?1
+                  AND installation.executable_path = ?2
+                  AND snapshot.executable_fingerprint = ?3
+                "#,
+            params![installation_id, executable_path, executable_fingerprint],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if current {
+            upsert_runtime_executable_identity(
+                &transaction,
+                installation_id,
+                executable_path,
+                executable_fingerprint,
+                identity,
+                &chrono::Utc::now().to_rfc3339(),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(current)
+    }
+
+    pub fn mark_runtime_integrity_changed(
+        &self,
+        database: &mut Database,
+        installation_id: &str,
+        executable_path: &str,
+        executable_fingerprint: &str,
+    ) -> Result<bool> {
+        let transaction = database.connection_mut().transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = transaction.execute(
+            r#"
+            UPDATE adapter_capability_snapshot
+            SET stale_at = COALESCE(stale_at, ?4),
+                last_error = 'runtime_executable_identity_changed'
+            WHERE installation_id = ?1
+              AND executable_fingerprint = ?3
+              AND EXISTS (
+                  SELECT 1
+                  FROM adapter_installation
+                  WHERE adapter_installation.id = ?1
+                    AND adapter_installation.executable_path = ?2
+              )
+            "#,
+            params![
+                installation_id,
+                executable_path,
+                executable_fingerprint,
+                now
+            ],
+        )? != 0;
+        if changed {
+            transaction.execute(
+                "DELETE FROM runtime_executable_identity WHERE installation_id = ?1",
+                [installation_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn commit_verified_managed_installation(
+        &self,
+        database: &mut Database,
+        mut verified: VerifiedManagedInstallation,
+    ) -> Result<String> {
+        validate_installation(&verified.executable_path, &verified.auth_scope)?;
+        validate_command_name(&verified.command_name)?;
+        validate_snapshot(&verified.snapshot)?;
+        validate_machine_ready_snapshot(verified.adapter_kind, &verified.snapshot)?;
+        if verified.snapshot.probe_status != "ready"
+            || verified.snapshot.executable_fingerprint.is_none()
+        {
+            anyhow::bail!("managed Installation requires a successful deep probe");
+        }
+        if verified.source == InstallationSource::Custom {
+            anyhow::bail!("managed Installation cannot use a custom source");
+        }
+        let verified_fingerprint = verified
+            .snapshot
+            .executable_fingerprint
+            .as_deref()
+            .context("managed Installation requires an executable fingerprint")?;
+        let next_locator_fingerprint = verified
+            .entrypoint_locator_identity
+            .as_ref()
+            .map(|identity| identity.compatibility_fingerprint.as_str());
+        let executable_identity = verified.executable_file_identity;
+        if verified.adapter_kind == AdapterKind::TraeCnCli && executable_identity.is_none() {
+            anyhow::bail!("TRAE machine Ready requires the current executable identity");
+        }
+
+        let transaction = database.connection_mut().transaction()?;
+        // Static discovery may already have recorded an upgrade while the old
+        // health snapshot remains stale. Only the current installation advances.
+        let existing = transaction
+            .query_row(
+                r#"
+                SELECT installation.id, installation.executable_path,
+                       installation.generation, installation.version,
+                       COALESCE(identity.executable_fingerprint, snapshot.executable_fingerprint),
+                       locator.compatibility_fingerprint
+                FROM adapter_installation AS installation
+                LEFT JOIN runtime_executable_identity AS identity
+                  ON identity.installation_id = installation.id
+                 AND identity.executable_path = installation.executable_path
+                LEFT JOIN adapter_capability_snapshot AS snapshot
+                  ON snapshot.installation_id = installation.id
+                LEFT JOIN runtime_entrypoint_locator_identity AS locator
+                  ON locator.installation_id = installation.id
+                WHERE installation.adapter_kind = ?1
+                  AND installation.auth_scope = ?2
+                  AND installation.installation_class = 'managed_default'
+                "#,
+                params![verified.adapter_kind.as_str(), verified.auth_scope],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let (installation_id, previous_path, previous_fingerprint, identity_changed) = if let Some(
+            (id, path, _generation, _version, fingerprint, locator_fingerprint),
+        ) =
+            existing
+        {
+            let identity_changed = path != verified.executable_path
+                || fingerprint != verified.snapshot.executable_fingerprint;
+            let compatibility_changed =
+                identity_changed || locator_fingerprint.as_deref() != next_locator_fingerprint;
+            if compatibility_changed {
+                if verified.adapter_kind == AdapterKind::MinimaxCodeCli
+                    && !verified.model_catalog_complete
+                {
+                    transaction.execute(
+                        "UPDATE adapter_capability_snapshot SET stale_at = ?2 WHERE installation_id = ?1",
+                        params![id, now],
+                    )?;
+                }
+                transaction.execute(
+                    r#"
+                        UPDATE adapter_installation
+                        SET executable_path = ?2, command_name = ?3, source = ?4,
+                            enabled = 1, path_state = 'valid',
+                            generation = generation + 1,
+                            version = version + 1, updated_at = ?5
+                        WHERE id = ?1
+                        "#,
+                    params![
+                        id,
+                        verified.executable_path,
+                        verified.command_name,
+                        verified.source.as_str(),
+                        now,
+                    ],
+                )?;
+            } else {
+                transaction.execute(
+                    r#"
+                        UPDATE adapter_installation
+                        SET enabled = 1, path_state = 'valid',
+                            version = version + CASE WHEN path_state <> 'valid' THEN 1 ELSE 0 END,
+                            updated_at = ?2
+                        WHERE id = ?1
+                        "#,
+                    params![id, now],
+                )?;
+            }
+            (id, path, fingerprint, identity_changed)
+        } else {
+            let id = format!("adapter-installation-{}", Uuid::new_v4());
+            transaction.execute(
+                r#"
+                    INSERT INTO adapter_installation(
+                        id, adapter_kind, executable_path, command_name,
+                        installation_class, source, auth_scope, enabled,
+                        generation, path_state, version, created_at, updated_at
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, 'managed_default', ?5, ?6, 1,
+                        1, 'valid', 1, ?7, ?7
+                    )
+                    "#,
+                params![
+                    id,
+                    verified.adapter_kind.as_str(),
+                    verified.executable_path,
+                    verified.command_name,
+                    verified.source.as_str(),
+                    verified.auth_scope,
+                    now,
+                ],
+            )?;
+            (id, String::new(), None, false)
+        };
+
+        verified.snapshot.models =
+            merge_persisted_dsh_options(&transaction, &installation_id, &verified.snapshot.models)?;
+        upsert_successful_capability_snapshot(
+            &transaction,
+            &installation_id,
+            &verified.snapshot,
+            verified.adapter_kind != AdapterKind::MinimaxCodeCli || verified.model_catalog_complete,
+        )?;
+        if let (Some(identity), Some(fingerprint)) = (
+            executable_identity.as_ref(),
+            verified.snapshot.executable_fingerprint.as_deref(),
+        ) {
+            upsert_runtime_executable_identity(
+                &transaction,
+                &installation_id,
+                &verified.executable_path,
+                fingerprint,
+                identity,
+                &verified.snapshot.last_attempted_at,
+            )?;
+        }
+        replace_runtime_entrypoint_locator_identity(
+            &transaction,
+            &installation_id,
+            &verified.executable_path,
+            verified_fingerprint,
+            verified.entrypoint_locator_identity.as_ref(),
+            &verified.snapshot.last_attempted_at,
+        )?;
+        insert_probe_attempt(
+            &transaction,
+            &installation_id,
+            "ready",
+            "none",
+            None,
+            &verified.executable_path,
+            verified.snapshot.executable_fingerprint.as_deref(),
+            &verified.snapshot.last_attempted_at,
+            None,
+            None,
+        )?;
+        if identity_changed {
+            transaction.execute(
+                r#"
+                INSERT INTO adapter_relocation_audit(
+                    id, installation_id, previous_path, next_path,
+                    previous_fingerprint, next_fingerprint, source,
+                    result, diagnostic_code, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'succeeded', NULL, ?8)
+                "#,
+                params![
+                    format!("adapter-relocation-{}", Uuid::new_v4()),
+                    installation_id,
+                    previous_path,
+                    verified.executable_path,
+                    previous_fingerprint,
+                    verified.snapshot.executable_fingerprint,
+                    verified.source.as_str(),
+                    now,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(installation_id)
+    }
+
+    /// A version read is program metadata, not authentication or health evidence.
+    /// Only the still-current executable may update the existing snapshot field.
+    pub fn record_runtime_version(
+        &self,
+        database: &mut Database,
+        installation_id: &str,
+        executable_path: &str,
+        fingerprint: &str,
+        reported_version: &str,
+    ) -> Result<bool> {
+        let version = reported_version.trim();
+        if version.is_empty() || fingerprint.is_empty() {
+            return Ok(false);
+        }
+        let transaction = database.connection_mut().transaction()?;
+        let current = transaction.query_row(
+            "SELECT installation.adapter_kind, snapshot.executable_fingerprint
+             FROM adapter_installation installation
+             JOIN runtime_executable_identity identity ON identity.installation_id = installation.id
+             LEFT JOIN adapter_capability_snapshot snapshot ON snapshot.installation_id = installation.id
+             WHERE installation.id = ?1 AND installation.executable_path = ?2
+               AND installation.enabled = 1 AND installation.path_state = 'valid'
+               AND identity.executable_path = ?2 AND identity.executable_fingerprint = ?3",
+            params![installation_id, executable_path, fingerprint],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        ).optional()?;
+        let Some((kind, previous_fingerprint)) = current else {
+            return Ok(false);
+        };
+        if previous_fingerprint
+            .as_deref()
+            .is_some_and(|old| old != fingerprint)
+        {
+            // Static discovery retains a stale snapshot after replacement. A
+            // new version must not relabel that older program's health evidence.
+            let mut snapshot = AgentRuntimeAdapterRegistry::default().light_ready_snapshot(
+                AdapterKind::from_str(&kind)?,
+                Some(version.to_string()),
+                fingerprint.to_string(),
+                chrono::Utc::now().to_rfc3339(),
+            )?;
+            snapshot.probe_status = "installed_unverified".into();
+            snapshot.last_error = None;
+            upsert_static_capability_snapshot(&transaction, installation_id, &snapshot)?;
+        } else {
+            transaction.execute(
+                "INSERT INTO adapter_capability_snapshot(
+                installation_id, reported_version, executable_fingerprint,
+                authentication_status, probe_status, last_attempted_at)
+             VALUES (?1, ?2, ?3, 'unknown', 'installed_unverified', ?4)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                reported_version = excluded.reported_version,
+                executable_fingerprint = excluded.executable_fingerprint",
+                params![
+                    installation_id,
+                    version,
+                    fingerprint,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// A catalog-only success never manufactures new authentication/capability
+    /// evidence or advances last_successful_probe_at / installation generation.
+    pub fn commit_runtime_model_catalog(
+        &self,
+        database: &mut Database,
+        expected: &AdapterInstallationView,
+        models: &[ModelDescriptor],
+        succeeded_at: &str,
+    ) -> Result<bool> {
+        let Some(snapshot) = expected.snapshot.as_ref() else {
+            return Ok(false);
+        };
+        let transaction = database.connection_mut().transaction()?;
+        let models = merge_persisted_dsh_options(&transaction, &expected.id, models)?;
+        let updated = transaction.execute(
+            "UPDATE adapter_capability_snapshot SET model_catalog_json = ?2, model_catalog_succeeded_at = ?3
+             WHERE installation_id = ?1 AND probe_status = 'ready'
+               AND authentication_status = 'authenticated' AND stale_at IS NULL
+               AND executable_fingerprint = ?4 AND permission_schema_digest = ?5
+               AND last_successful_probe_at IS ?6
+               AND EXISTS(SELECT 1 FROM adapter_installation installation
+                 WHERE installation.id = ?1 AND installation.generation = ?7
+                   AND installation.executable_path = ?8 AND installation.enabled = 1
+                   AND installation.path_state = 'valid' AND installation.auth_scope = ?9
+                   AND installation.adapter_kind = ?10)",
+            params![expected.id, serde_json::to_string(&models)?, succeeded_at,
+                snapshot.executable_fingerprint, snapshot.permission_schema_digest,
+                snapshot.last_successful_probe_at, expected.generation, expected.executable_path,
+                expected.auth_scope, expected.adapter_kind.as_str()],
+        )? != 0;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    /// Pi catalogs carry their own identity in the existing sentinel's metadata.
+    /// The row may exist solely as catalog storage; no health evidence is invented
+    /// and an existing health failure or invalidation is never cleared here.
+    pub fn commit_pi_model_catalog(
+        &self,
+        database: &mut Database,
+        expected: &AdapterInstallationView,
+        fingerprint: &str,
+        search_generation: u64,
+        models: &[ModelDescriptor],
+        observed_at: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            expected.adapter_kind == AdapterKind::Pi,
+            "expected Pi installation"
+        );
+        let search_generation = i64::try_from(search_generation)
+            .context("Runtime Search Environment generation overflow")?;
+        let mut models = models.to_vec();
+        let sentinel = models
+            .iter_mut()
+            .find(|model| model.id == PI_RUNTIME_DEFAULT_MODEL_ID)
+            .context("Pi catalog has no native default entry")?;
+        sentinel.runtime_metadata = Some(json!({"piCatalogIdentity": {
+            "installationGeneration": expected.generation,
+            "executableFingerprint": fingerprint,
+            "searchGeneration": search_generation,
+        }}));
+        let transaction = database.connection_mut().transaction()?;
+        let updated = transaction.execute(
+            "INSERT INTO adapter_capability_snapshot(
+                installation_id, authentication_status, probe_status, last_attempted_at,
+                model_catalog_json, model_catalog_succeeded_at)
+             SELECT installation.id, 'unknown', 'installed_unverified', ?2, ?3, ?2
+             FROM adapter_installation installation
+             JOIN runtime_executable_identity identity ON identity.installation_id = installation.id
+             WHERE installation.id = ?1 AND installation.adapter_kind = 'pi'
+               AND installation.generation = ?4 AND installation.executable_path = ?5
+               AND installation.enabled = 1 AND installation.path_state = 'valid'
+               AND installation.auth_scope = ?6
+               AND identity.executable_path = ?5 AND identity.executable_fingerprint = ?7
+               AND EXISTS(SELECT 1 FROM runtime_search_environment_state
+                          WHERE singleton = 1 AND generation = ?8)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                model_catalog_json = excluded.model_catalog_json,
+                model_catalog_succeeded_at = excluded.model_catalog_succeeded_at",
+            params![
+                expected.id,
+                observed_at,
+                serde_json::to_string(&models)?,
+                expected.generation,
+                expected.executable_path,
+                expected.auth_scope,
+                fingerprint,
+                search_generation
+            ],
+        )? != 0;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    pub fn commit_discovered_runtime_entry(
+        &self,
+        database: &mut Database,
+        verified: VerifiedDiscoveredRuntimeEntry,
+        existing_installation_id: Option<&str>,
+    ) -> Result<String> {
+        let VerifiedDiscoveredRuntimeEntry { entry, identity } = verified;
+        let transaction = database.connection_mut().transaction()?;
+        let existing = transaction.query_row(
+            "SELECT installation.id, installation.executable_path,
+                    COALESCE(identity.executable_fingerprint, snapshot.executable_fingerprint),
+                    locator.compatibility_fingerprint, installation.adapter_kind
+             FROM adapter_installation AS installation
+             LEFT JOIN runtime_executable_identity AS identity ON identity.installation_id = installation.id
+             LEFT JOIN adapter_capability_snapshot AS snapshot ON snapshot.installation_id = installation.id
+             LEFT JOIN runtime_entrypoint_locator_identity AS locator ON locator.installation_id = installation.id
+             WHERE (?1 IS NOT NULL AND installation.id = ?1)
+                OR (?1 IS NULL AND installation.adapter_kind = ?2 AND installation.auth_scope = 'default'
+                    AND installation.installation_class = 'managed_default')",
+            params![existing_installation_id, entry.adapter_kind.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?)),
+        ).optional()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = if let Some((id, previous_path, previous_fingerprint, locator, kind)) = existing {
+            if kind != entry.adapter_kind.as_str() {
+                anyhow::bail!("Runtime entry changed Adapter identity");
+            }
+            let changed = previous_path != entry.executable_path
+                || previous_fingerprint.as_deref() != Some(&entry.executable_fingerprint)
+                || locator.as_deref()
+                    != entry
+                        .entrypoint_locator_identity
+                        .as_ref()
+                        .map(|value| value.compatibility_fingerprint.as_str());
+            transaction.execute(
+                "UPDATE adapter_installation SET executable_path = ?2, path_state = 'valid',
+                    generation = generation + ?3,
+                    version = version + CASE WHEN path_state <> 'valid' OR ?3 = 1 THEN 1 ELSE 0 END,
+                    updated_at = ?4 WHERE id = ?1",
+                params![id, entry.executable_path, i64::from(changed), now],
+            )?;
+            if changed {
+                transaction.execute("UPDATE adapter_capability_snapshot SET stale_at = ?2 WHERE installation_id = ?1", params![id, now])?;
+                transaction.execute(
+                    "INSERT INTO adapter_relocation_audit(id, installation_id, previous_path, next_path,
+                       previous_fingerprint, next_fingerprint, source, result, diagnostic_code, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'succeeded', NULL, ?8)",
+                    params![format!("adapter-relocation-{}", Uuid::new_v4()), id, previous_path, entry.executable_path,
+                        previous_fingerprint, entry.executable_fingerprint, entry.source.as_str(), now],
+                )?;
+            }
+            id
+        } else {
+            if existing_installation_id.is_some() {
+                anyhow::bail!("Runtime installation no longer exists");
+            }
+            let id = format!("adapter-installation-{}", Uuid::new_v4());
+            transaction.execute(
+                "INSERT INTO adapter_installation(id, adapter_kind, executable_path, command_name, installation_class,
+                    source, auth_scope, enabled, generation, path_state, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'managed_default', ?5, 'default', 1, 1, 'valid', 1, ?6, ?6)",
+                params![id, entry.adapter_kind.as_str(), entry.executable_path, entry.adapter_kind.command_name(), entry.source.as_str(), now],
+            )?;
+            id
+        };
+        upsert_runtime_executable_identity(
+            &transaction,
+            &id,
+            &entry.executable_path,
+            &entry.executable_fingerprint,
+            &identity,
+            &now,
+        )?;
+        replace_runtime_entrypoint_locator_identity(
+            &transaction,
+            &id,
+            &entry.executable_path,
+            &entry.executable_fingerprint,
+            entry.entrypoint_locator_identity.as_ref(),
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    pub fn commit_discovered_managed_installation(
+        &self,
+        database: &mut Database,
+        discovered: DiscoveredManagedInstallation,
+    ) -> Result<String> {
+        validate_installation(&discovered.executable_path, &discovered.auth_scope)?;
+        validate_command_name(&discovered.command_name)?;
+        validate_snapshot(&discovered.snapshot)?;
+        if !is_static_snapshot_status(&discovered.snapshot.probe_status)
+            || discovered.snapshot.executable_fingerprint.is_none()
+        {
+            anyhow::bail!("static managed Installation requires bounded discovery evidence");
+        }
+        if discovered.source == InstallationSource::Custom {
+            anyhow::bail!("managed Installation cannot use a custom source");
+        }
+        let discovered_fingerprint = discovered
+            .snapshot
+            .executable_fingerprint
+            .as_deref()
+            .context("static managed Installation requires an executable fingerprint")?;
+        let next_locator_fingerprint = discovered
+            .entrypoint_locator_identity
+            .as_ref()
+            .map(|identity| identity.compatibility_fingerprint.as_str());
+        let executable_identity = discovered.executable_file_identity;
+        let executable_is_usable = executable_identity.is_some();
+
+        let transaction = database.connection_mut().transaction()?;
+        // Installation changes and preservation of health evidence have separate
+        // fingerprints: static discovery can advance only the former.
+        let existing = transaction
+            .query_row(
+                r#"
+                SELECT installation.id, installation.executable_path,
+                       COALESCE(identity.executable_fingerprint, snapshot.executable_fingerprint), snapshot.probe_status,
+                       snapshot.permission_schema_version,
+                       snapshot.permission_schema_digest,
+                       snapshot.permission_options_json,
+                       snapshot.model_catalog_json,
+                       snapshot.last_successful_probe_at,
+                       locator.compatibility_fingerprint,
+                       CASE WHEN installation.adapter_kind = 'minimax-code-cli'
+                            THEN snapshot.model_catalog_succeeded_at
+                            ELSE COALESCE(snapshot.model_catalog_succeeded_at, snapshot.last_successful_probe_at) END,
+                       snapshot.executable_fingerprint
+                FROM adapter_installation AS installation
+                LEFT JOIN runtime_executable_identity AS identity
+                  ON identity.installation_id = installation.id
+                 AND identity.executable_path = installation.executable_path
+                LEFT JOIN adapter_capability_snapshot AS snapshot
+                  ON snapshot.installation_id = installation.id
+                LEFT JOIN runtime_entrypoint_locator_identity AS locator
+                  ON locator.installation_id = installation.id
+                WHERE installation.adapter_kind = ?1
+                  AND installation.auth_scope = ?2
+                  AND installation.installation_class = 'managed_default'
+                "#,
+                params![discovered.adapter_kind.as_str(), discovered.auth_scope],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let next_fingerprint = discovered.snapshot.executable_fingerprint.as_deref();
+        let (
+            installation_id,
+            previous_path,
+            previous_fingerprint,
+            identity_changed,
+            preserve_existing,
+            normalize_legacy_trae_schema,
+            retained_lkg,
+        ) = if let Some((
+            id,
+            path,
+            fingerprint,
+            probe_status,
+            permission_schema_version,
+            permission_schema_digest,
+            permission_options_json,
+            model_catalog_json,
+            last_successful_probe_at,
+            locator_fingerprint,
+            catalog_succeeded_at,
+            snapshot_fingerprint,
+        )) = existing
+        {
+            let identity_changed =
+                path != discovered.executable_path || fingerprint.as_deref() != next_fingerprint;
+            let compatibility_changed =
+                identity_changed || locator_fingerprint.as_deref() != next_locator_fingerprint;
+            let snapshot_compatibility_changed =
+                compatibility_changed || snapshot_fingerprint.as_deref() != next_fingerprint;
+            transaction.execute(
+                if compatibility_changed {
+                    r#"
+                    UPDATE adapter_installation
+                    SET executable_path = ?2, command_name = ?3, source = ?4,
+                        enabled = 1, path_state = 'valid',
+                        generation = generation + 1, version = version + 1,
+                        updated_at = ?5
+                    WHERE id = ?1
+                    "#
+                } else {
+                    r#"
+                    UPDATE adapter_installation
+                    SET command_name = ?3, source = ?4, enabled = 1,
+                        path_state = 'valid',
+                        version = version + CASE WHEN path_state <> 'valid' THEN 1 ELSE 0 END,
+                        updated_at = ?5
+                    WHERE id = ?1
+                    "#
+                },
+                params![
+                    id,
+                    discovered.executable_path,
+                    discovered.command_name,
+                    discovered.source.as_str(),
+                    now,
+                ],
+            )?;
+            let schema_matches = permission_schema_digest.as_deref()
+                == Some(discovered.snapshot.permission_schema_digest.as_str());
+            let normalize_legacy_trae_schema = !schema_matches
+                && discovered.adapter_kind == AdapterKind::TraeCnCli
+                && probe_status.as_deref() == Some("ready")
+                && match (
+                    permission_schema_version,
+                    permission_schema_digest.as_deref(),
+                    permission_options_json.as_deref(),
+                ) {
+                    (Some(version), Some(digest), Some(options_json)) => {
+                        legacy_trae_permission_schema_can_normalize(
+                            version,
+                            digest,
+                            options_json,
+                            &discovered.snapshot,
+                        )?
+                    }
+                    _ => false,
+                };
+            let preserve_existing = !snapshot_compatibility_changed
+                && (schema_matches || normalize_legacy_trae_schema)
+                && (probe_status.as_deref() == Some("ready")
+                    || (probe_status.as_deref() == Some("light_ready")
+                        && discovered.snapshot.probe_status == "light_failed"
+                        && executable_is_usable));
+            let retained_lkg = snapshot_compatibility_changed
+                .then(|| {
+                    let models_json = model_catalog_json?;
+                    let last_successful_probe_at = last_successful_probe_at?;
+                    let models = serde_json::from_str::<Vec<ModelDescriptor>>(&models_json).ok()?;
+                    (!models.is_empty()).then_some((
+                        models_json,
+                        last_successful_probe_at,
+                        catalog_succeeded_at,
+                    ))
+                })
+                .flatten();
+            (
+                id,
+                path,
+                fingerprint,
+                identity_changed,
+                preserve_existing,
+                normalize_legacy_trae_schema,
+                retained_lkg,
+            )
+        } else {
+            let id = format!("adapter-installation-{}", Uuid::new_v4());
+            transaction.execute(
+                r#"
+                INSERT INTO adapter_installation(
+                    id, adapter_kind, executable_path, command_name,
+                    installation_class, source, auth_scope, enabled,
+                    generation, path_state, version, created_at, updated_at
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, 'managed_default', ?5, ?6, 1,
+                    1, 'valid', 1, ?7, ?7
+                )
+                "#,
+                params![
+                    id,
+                    discovered.adapter_kind.as_str(),
+                    discovered.executable_path,
+                    discovered.command_name,
+                    discovered.source.as_str(),
+                    discovered.auth_scope,
+                    now,
+                ],
+            )?;
+            (id, String::new(), None, false, false, false, None)
+        };
+
+        if !preserve_existing {
+            upsert_static_capability_snapshot(
+                &transaction,
+                &installation_id,
+                &discovered.snapshot,
+            )?;
+        } else if normalize_legacy_trae_schema {
+            transaction.execute(
+                r#"
+                UPDATE adapter_capability_snapshot
+                SET permission_schema_digest = ?2
+                WHERE installation_id = ?1
+                "#,
+                params![
+                    installation_id,
+                    discovered.snapshot.permission_schema_digest,
+                ],
+            )?;
+        }
+        if let Some((models_json, last_successful_probe_at, catalog_succeeded_at)) = retained_lkg {
+            transaction.execute(
+                r#"
+                UPDATE adapter_capability_snapshot
+                SET model_catalog_json = ?2,
+                    last_successful_probe_at = ?3,
+                    model_catalog_succeeded_at = ?4
+                WHERE installation_id = ?1
+                "#,
+                params![
+                    installation_id,
+                    models_json,
+                    last_successful_probe_at,
+                    catalog_succeeded_at
+                ],
+            )?;
+        }
+        if let (Some(identity), Some(fingerprint)) =
+            (executable_identity.as_ref(), next_fingerprint)
+        {
+            upsert_runtime_executable_identity(
+                &transaction,
+                &installation_id,
+                &discovered.executable_path,
+                fingerprint,
+                identity,
+                &discovered.snapshot.last_attempted_at,
+            )?;
+        }
+        replace_runtime_entrypoint_locator_identity(
+            &transaction,
+            &installation_id,
+            &discovered.executable_path,
+            discovered_fingerprint,
+            discovered.entrypoint_locator_identity.as_ref(),
+            &discovered.snapshot.last_attempted_at,
+        )?;
+        if identity_changed {
+            transaction.execute(
+                r#"
+                INSERT INTO adapter_relocation_audit(
+                    id, installation_id, previous_path, next_path,
+                    previous_fingerprint, next_fingerprint, source,
+                    result, diagnostic_code, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'succeeded', NULL, ?8)
+                "#,
+                params![
+                    format!("adapter-relocation-{}", Uuid::new_v4()),
+                    installation_id,
+                    previous_path,
+                    discovered.executable_path,
+                    previous_fingerprint,
+                    discovered.snapshot.executable_fingerprint,
+                    discovered.source.as_str(),
+                    now,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(installation_id)
+    }
+
+    pub fn record_managed_probe_failure(
+        &self,
+        database: &mut Database,
+        failure: ManagedProbeFailure<'_>,
+    ) -> Result<()> {
+        let ManagedProbeFailure {
+            adapter_kind,
+            auth_scope,
+            candidate_path,
+            fingerprint,
+            source,
+            failure_class,
+            diagnostic_code,
+            failure,
+        } = failure;
+        if let Some(failure) = failure {
+            failure.validate()?;
+            if failure.runtime_kind != adapter_kind {
+                anyhow::bail!("public Runtime failure kind must match managed Adapter probe");
+            }
+        }
+        let transaction = database.connection_mut().transaction()?;
+        let existing = transaction
+            .query_row(
+                r#"
+                SELECT id, executable_path
+                FROM adapter_installation
+                WHERE adapter_kind = ?1 AND auth_scope = ?2
+                  AND installation_class = 'managed_default'
+                "#,
+                params![adapter_kind.as_str(), auth_scope],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((installation_id, previous_path)) = existing else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        let targets_current_installation =
+            runtime_candidate_targets_installation(&previous_path, candidate_path);
+        let recorded_failure_class = if targets_current_installation {
+            failure_class
+        } else {
+            "transient"
+        };
+        let recorded_diagnostic_code = if targets_current_installation {
+            diagnostic_code
+        } else {
+            "runtime_alternate_candidate_probe_failed"
+        };
+        let attempted_at = chrono::Utc::now().to_rfc3339();
+        let retry_after =
+            next_probe_retry_after(&transaction, &installation_id, recorded_failure_class)?;
+        insert_probe_attempt(
+            &transaction,
+            &installation_id,
+            "failed",
+            recorded_failure_class,
+            Some(recorded_diagnostic_code),
+            candidate_path,
+            fingerprint,
+            &attempted_at,
+            retry_after.as_deref(),
+            failure,
+        )?;
+        if recorded_failure_class != "transient" {
+            transaction.execute(
+                r#"
+                UPDATE adapter_capability_snapshot
+                SET stale_at = CASE
+                        WHEN probe_status = 'ready' THEN COALESCE(stale_at, ?2)
+                        ELSE stale_at
+                    END,
+                    last_error = ?3
+                WHERE installation_id = ?1
+                "#,
+                params![installation_id, attempted_at, recorded_diagnostic_code],
+            )?;
+        }
+        if recorded_failure_class == "path_missing" {
+            transaction.execute(
+                r#"
+                UPDATE adapter_installation
+                SET path_state = 'path_missing',
+                    version = version + CASE WHEN path_state <> 'path_missing' THEN 1 ELSE 0 END,
+                    updated_at = ?2
+                WHERE id = ?1
+                "#,
+                params![installation_id, attempted_at],
+            )?;
+        }
+        if !targets_current_installation {
+            let previous_fingerprint = transaction
+                .query_row(
+                    r#"
+                    SELECT executable_fingerprint
+                    FROM adapter_capability_snapshot
+                    WHERE installation_id = ?1
+                    "#,
+                    [&installation_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            transaction.execute(
+                r#"
+                INSERT INTO adapter_relocation_audit(
+                    id, installation_id, previous_path, next_path,
+                    previous_fingerprint, next_fingerprint, source,
+                    result, diagnostic_code, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'failed', ?8, ?9)
+                "#,
+                params![
+                    format!("adapter-relocation-{}", Uuid::new_v4()),
+                    installation_id,
+                    previous_path,
+                    candidate_path,
+                    previous_fingerprint,
+                    fingerprint,
+                    source.map(InstallationSource::as_str),
+                    diagnostic_code,
+                    attempted_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn create_profile(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CreateAgentProfileCommand>,
+    ) -> Result<CommandExecution> {
+        self.create_profile_with_creation_source(database, envelope, None)
+    }
+
+    pub(crate) fn create_profile_with_creation_source(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CreateAgentProfileCommand>,
+        source: Option<&crate::team_tool::AuthenticatedTeamToolRun>,
+    ) -> Result<CommandExecution> {
+        let identity = normalize_member_identity(
+            &envelope.payload.display_name,
+            &envelope.payload.team_role,
+            &envelope.payload.professional_responsibilities,
+            &envelope.payload.personality_traits,
+            &envelope.payload.working_principles,
+            &envelope.payload.growth_topic,
+        )?;
+        crate::member_avatar::validate_new_member_avatar_ref(
+            envelope.payload.avatar_ref.as_deref(),
+        )?;
+        self.gateway.execute(database, envelope, |transaction| {
+            if profile_display_name_exists(transaction, &identity.display_name, None)? {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.display_name_conflict",
+                    json!({ "displayName": identity.display_name }),
+                ));
+            }
+            let id = allocate_agent_id(transaction)?;
+            let profile_uuid = Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                INSERT INTO agent_profile(
+                    uuid, id, slug, handle, display_name, avatar_ref,
+                    team_role, professional_responsibilities, personality_traits_json,
+                    working_principles, growth_topic,
+                    default_capabilities_json, accent,
+                    runtime_enabled, visual_state_json, profile_status, member_order, version,
+                    created_at, updated_at, archived_at
+                ) VALUES (
+                    ?9, ?1, ?1, NULL, ?2, ?10,
+                    ?3, ?4, ?5,
+                    ?6, ?7,
+                    '[]', '',
+                    0, '{}', 'present',
+                    (SELECT COALESCE(MAX(member_order), -1) + 1 FROM agent_profile), 1,
+                    ?8, ?8, NULL
+                )
+                "#,
+                params![
+                    id,
+                    identity.display_name,
+                    identity.team_role,
+                    identity.professional_responsibilities,
+                    serde_json::to_string(&identity.personality_traits)?,
+                    identity.working_principles,
+                    identity.growth_topic,
+                    now,
+                    profile_uuid,
+                    envelope.payload.avatar_ref,
+                ],
+            )?;
+            if let Some(source) = source {
+                let creator_display_name = transaction.query_row(
+                    "SELECT display_name FROM agent_profile WHERE id=?1",
+                    [&source.agent_id],
+                    |row| row.get(0),
+                )?;
+                crate::member_studio::record_member_creation(
+                    transaction,
+                    source,
+                    &crate::member_studio::MemberCreationView {
+                        creation_id: envelope.command_id.clone(),
+                        source_agent_run_id: Some(source.agent_run_id.clone()),
+                        agent_id: id.clone(),
+                        display_name: identity.display_name.clone(),
+                        avatar_ref: envelope.payload.avatar_ref.clone(),
+                        team_role: identity.team_role.clone(),
+                        professional_responsibilities: identity
+                            .professional_responsibilities
+                            .clone(),
+                        personality_traits: identity.personality_traits.clone(),
+                        creator_agent_id: source.agent_id.clone(),
+                        creator_display_name,
+                        created_at: now.clone(),
+                    },
+                )?;
+            }
+            Ok(CommandHandlerResult::applied(
+                "agent_profile.created",
+                json!({ "agentId": id, "version": 1 }),
+                Some(EntityReference {
+                    entity_type: "agent_profile".to_string(),
+                    entity_id: id,
+                }),
+            ))
+        })
+    }
+
+    pub fn update_profile(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<UpdateAgentProfileCommand>,
+    ) -> Result<CommandExecution> {
+        let identity = normalize_member_identity(
+            &envelope.payload.display_name,
+            &envelope.payload.team_role,
+            &envelope.payload.professional_responsibilities,
+            &envelope.payload.personality_traits,
+            &envelope.payload.working_principles,
+            &envelope.payload.growth_topic,
+        )?;
+        self.gateway.execute(database, envelope, |transaction| {
+            let Some((version, presence)) =
+                profile_version_and_presence(transaction, &envelope.payload.agent_id)?
+            else {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_found",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            };
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            if presence == "removed" {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.removed",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            if profile_display_name_exists(
+                transaction,
+                &identity.display_name,
+                Some(&envelope.payload.agent_id),
+            )? {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.display_name_conflict",
+                    json!({ "displayName": identity.display_name }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE agent_profile
+                SET display_name = ?2,
+                    team_role = ?3,
+                    professional_responsibilities = ?4,
+                    personality_traits_json = ?5,
+                    working_principles = ?6,
+                    growth_topic = ?7,
+                    version = version + 1, updated_at = ?8
+                WHERE id = ?1 AND version = ?9
+                "#,
+                params![
+                    envelope.payload.agent_id,
+                    identity.display_name,
+                    identity.team_role,
+                    identity.professional_responsibilities,
+                    serde_json::to_string(&identity.personality_traits)?,
+                    identity.working_principles,
+                    identity.growth_topic,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            Ok(profile_updated_result(
+                &envelope.payload.agent_id,
+                version + 1,
+                "agent_profile.updated",
+            ))
+        })
+    }
+
+    pub fn set_avatar(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SetAgentProfileAvatarCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            let Some((version, current_avatar_ref, presence)) =
+                profile_version_and_avatar_ref(transaction, &envelope.payload.agent_id)?
+            else {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_found",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            };
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            if presence == "removed" {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.removed",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            validate_member_avatar_update(
+                current_avatar_ref.as_deref(),
+                envelope.payload.avatar_ref.as_deref(),
+            )?;
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE agent_profile
+                SET avatar_ref = ?2, version = version + 1, updated_at = ?3
+                WHERE id = ?1 AND version = ?4
+                "#,
+                params![
+                    envelope.payload.agent_id,
+                    envelope.payload.avatar_ref,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            Ok(profile_updated_result(
+                &envelope.payload.agent_id,
+                version + 1,
+                "agent_profile.avatar_updated",
+            ))
+        })
+    }
+
+    pub fn set_runtime(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SetMemberRuntimeConfigurationCommand>,
+    ) -> Result<CommandExecution> {
+        self.set_runtime_with_environment(database, envelope, None)
+    }
+
+    pub fn set_runtime_with_environment(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SetMemberRuntimeConfigurationCommand>,
+        environment: Option<&crate::member_environment::PreparedEnvironment>,
+    ) -> Result<CommandExecution> {
+        anyhow::ensure!(
+            envelope.payload.environment_update.is_some() == environment.is_some(),
+            "Private environment update is unavailable"
+        );
+        self.gateway.execute(database, envelope, |transaction| {
+            let Some((version, presence)) =
+                profile_version_and_presence(transaction, &envelope.payload.agent_id)?
+            else {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_found",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            };
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            if presence == "removed" {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.removed",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            let Some(ready) =
+                configurable_managed_runtime(transaction, envelope.payload.adapter_kind)?
+            else {
+                return Ok(CommandHandlerResult::rejected(
+                    "runtime_configuration_unavailable",
+                    json!({ "adapterKind": envelope.payload.adapter_kind }),
+                ));
+            };
+            if envelope.payload.permissions.adapter_kind != envelope.payload.adapter_kind {
+                return Ok(CommandHandlerResult::rejected(
+                    "runtime_permission_adapter_mismatch",
+                    json!({
+                        "adapterKind": envelope.payload.adapter_kind,
+                        "permissionAdapterKind": envelope.payload.permissions.adapter_kind,
+                    }),
+                ));
+            }
+            let mut binding = ResolvedRuntimeBinding {
+                adapter_kind: envelope.payload.adapter_kind,
+                installation_id: ready.installation_id.clone(),
+                model: envelope.payload.model.clone(),
+                permissions: envelope.payload.permissions.clone(),
+            };
+            if binding.adapter_kind == AdapterKind::DeepseekHarness {
+                if let ModelSelection::Explicit { model_id, dsh_source, .. } = &mut binding.model {
+                    if dsh_source.is_none() {
+                        let previous: Option<String> = transaction.query_row(
+                            "SELECT default_model_selection_json FROM agent_profile WHERE id = ?1 AND selected_runtime_adapter_kind = 'deepseek-harness'",
+                            [&envelope.payload.agent_id], |row| row.get(0),
+                        ).optional()?.flatten();
+                        let catalog: Option<String> = transaction.query_row(
+                            "SELECT model_catalog_json FROM adapter_capability_snapshot WHERE installation_id = ?1",
+                            [&ready.installation_id], |row| row.get(0),
+                        ).optional()?;
+                        *dsh_source = previous.and_then(|value| serde_json::from_str::<ModelSelection>(&value).ok())
+                            .and_then(|selection| match selection {
+                                ModelSelection::Explicit { model_id: previous_id, dsh_source, .. } if previous_id == *model_id => Some(dsh_source.unwrap_or(DshModelSource::Native)),
+                                _ => None,
+                            }).or_else(|| {
+                                serde_json::from_str::<Vec<ModelDescriptor>>(catalog.as_deref()?).ok()?
+                                    .into_iter().find(|model| model.id == *model_id)?
+                                    .runtime_metadata?.get("dshSource")
+                                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                            });
+                    }
+                }
+            } else if let ModelSelection::Explicit { dsh_source, .. } = &mut binding.model {
+                *dsh_source = None;
+            }
+            // Saving configuration records exact user intent. Dynamic catalog validation
+            // belongs to the real Host, including when an old diagnostic failed.
+            if let ModelSelection::Explicit { model_id, options, .. } = &binding.model
+                && (model_id.trim().is_empty() || !options.is_object()
+                    || (binding.adapter_kind == AdapterKind::Pi && options.as_object().is_some_and(|options| {
+                        options.iter().any(|(key, value)| key != "thinking_level" || !value.is_string())
+                    })))
+            {
+                return Ok(CommandHandlerResult::rejected(
+                    "runtime_model_options_invalid",
+                    json!({"modelId": model_id}),
+                ));
+            }
+            let validation_binding = ResolvedRuntimeBinding {
+                model: ModelSelection::RuntimeDefault,
+                ..binding.clone()
+            };
+            if let Some(issue) = runtime_configuration_issue(
+                &ready.models_json,
+                ready.permission_schema_version,
+                &ready.permissions_json,
+                &validation_binding,
+            )? {
+                return Ok(CommandHandlerResult::rejected(issue.code, issue.payload));
+            }
+            if let Some(environment) = environment {
+                environment.commit(transaction)?;
+            } else {
+                crate::member_environment::validate_saved_model(
+                    transaction, &envelope.payload.agent_id, binding.adapter_kind, &binding.model,
+                )?;
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE agent_profile
+                SET selected_runtime_adapter_kind = ?2,
+                    default_runtime_installation_id = ?3,
+                    default_model_selection_json = ?4,
+                    default_permission_config_json = ?5,
+                    default_runtime_generation = ?8,
+                    version = version + 1, updated_at = ?6
+                WHERE id = ?1 AND version = ?7
+                "#,
+                params![
+                    envelope.payload.agent_id,
+                    envelope.payload.adapter_kind.as_str(),
+                    ready.installation_id,
+                    serde_json::to_string(&binding.model)?,
+                    serde_json::to_string(&binding.permissions)?,
+                    now,
+                    envelope.payload.expected_version,
+                    ready.installation_generation,
+                ],
+            )?;
+            Ok(profile_updated_result(
+                &envelope.payload.agent_id,
+                version + 1,
+                "agent_profile.runtime_configured",
+            ))
+        })
+    }
+
+    pub fn clear_runtime(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<ClearMemberRuntimeConfigurationCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            let Some((version, presence)) =
+                profile_version_and_presence(transaction, &envelope.payload.agent_id)?
+            else {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_found",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            };
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            if presence == "removed" {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.removed",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE agent_profile
+                SET selected_runtime_adapter_kind = NULL,
+                    default_runtime_installation_id = NULL,
+                    default_model_selection_json = NULL,
+                    default_runtime_generation = NULL,
+                    default_permission_config_json = NULL,
+                    version = version + 1, updated_at = ?2
+                WHERE id = ?1 AND version = ?3
+                "#,
+                params![
+                    envelope.payload.agent_id,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            Ok(profile_updated_result(
+                &envelope.payload.agent_id,
+                version + 1,
+                "agent_profile.runtime_cleared",
+            ))
+        })
+    }
+
+    pub fn set_presence(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SetMemberPresenceCommand>,
+    ) -> Result<CommandExecution> {
+        if !matches!(envelope.payload.presence.as_str(), "present" | "away") {
+            anyhow::bail!("Member Presence must be present or away");
+        }
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, crate::command::ActorRef::User { .. }) {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.presence_user_required",
+                    json!({}),
+                ));
+            }
+            let Some((version, current_presence)) =
+                profile_version_and_presence(transaction, &envelope.payload.agent_id)?
+            else {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_found",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            };
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            if current_presence == "removed" {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.removed",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE agent_profile
+                SET profile_status = ?2,
+                    version = version + 1, updated_at = ?3
+                WHERE id = ?1 AND version = ?4
+                "#,
+                params![
+                    envelope.payload.agent_id,
+                    envelope.payload.presence,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            Ok(profile_updated_result(
+                &envelope.payload.agent_id,
+                version + 1,
+                "agent_profile.presence_changed",
+            ))
+        })
+    }
+
+    pub fn removal_preview(
+        &self,
+        database: &Database,
+        agent_id: &str,
+    ) -> Result<Option<MemberRemovalPreview>> {
+        let preview = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT profile.id, profile.display_name, profile.version,
+                       (SELECT COUNT(*)
+                        FROM agent_run
+                        JOIN conversation
+                          ON conversation.id = agent_run.conversation_id
+                        WHERE conversation.agent_id = profile.id
+                          AND agent_run.status IN ('queued', 'running', 'waiting')),
+                       CASE WHEN ?2 THEN (SELECT COUNT(*) FROM task
+                        WHERE assignee_agent_id = profile.id
+                          AND status IN ('pending', 'in_progress', 'blocked')) ELSE NULL END
+                FROM agent_profile AS profile
+                WHERE profile.id = ?1 AND profile.profile_status <> 'removed'
+                "#,
+                params![
+                    agent_id,
+                    crate::task_capability::enabled(database.connection())?
+                ],
+                |row| {
+                    let non_terminal_agent_run_count = row.get::<_, i64>(3)?;
+                    Ok(MemberRemovalPreview {
+                        agent_id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        version: row.get(2)?,
+                        non_terminal_agent_run_count,
+                        current_camp_membership_count: 0,
+                        open_assigned_task_count: row.get(4)?,
+                        default_lead_camp_count: 0,
+                        sole_member_camp_count: 0,
+                        affected_threads: Vec::new(),
+                        removable: non_terminal_agent_run_count == 0,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to load member removal preview")?;
+        let Some(mut preview) = preview else {
+            return Ok(None);
+        };
+        let mut statement = database.connection().prepare(
+            r#"
+            WITH affected AS (
+                SELECT camp.id, camp.title,
+                       COALESCE(camp.default_lead_agent_id = ?1, 0) AS was_lead,
+                       (SELECT COUNT(*)
+                        FROM camp_member AS peer
+                        JOIN agent_profile AS profile ON profile.id = peer.agent_id
+                        WHERE peer.camp_id = camp.id AND peer.agent_id <> ?1
+                          AND peer.status = 'active' AND peer.leave_requested_at IS NULL
+                          AND profile.profile_status <> 'removed') AS remaining,
+                       CASE WHEN camp.default_lead_agent_id = ?1 THEN
+                           (SELECT peer.agent_id
+                            FROM camp_member AS peer
+                            JOIN agent_profile AS profile ON profile.id = peer.agent_id
+                            WHERE peer.camp_id = camp.id AND peer.agent_id <> ?1
+                              AND peer.status = 'active' AND peer.leave_requested_at IS NULL
+                              AND profile.profile_status = 'present'
+                            ORDER BY profile.member_order, profile.id LIMIT 1)
+                       ELSE camp.default_lead_agent_id END AS next_lead
+                FROM camp
+                JOIN camp_member AS own ON own.camp_id = camp.id
+                WHERE own.agent_id = ?1 AND own.status = 'active'
+            )
+            SELECT affected.id, affected.title, affected.remaining, affected.was_lead,
+                   affected.next_lead, profile.display_name
+            FROM affected LEFT JOIN agent_profile AS profile ON profile.id = affected.next_lead
+            ORDER BY affected.id
+            "#,
+        )?;
+        preview.affected_threads = statement
+            .query_map([agent_id], |row| {
+                Ok(MemberRemovalThreadImpact {
+                    thread_id: row.get(0)?,
+                    title: row.get(1)?,
+                    remaining_member_count: row.get(2)?,
+                    was_default_lead: row.get(3)?,
+                    next_default_lead_agent_id: row.get(4)?,
+                    next_default_lead_display_name: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        preview.current_camp_membership_count = preview.affected_threads.len() as i64;
+        preview.default_lead_camp_count = preview
+            .affected_threads
+            .iter()
+            .filter(|camp| camp.was_default_lead)
+            .count() as i64;
+        preview.sole_member_camp_count = preview
+            .affected_threads
+            .iter()
+            .filter(|camp| camp.remaining_member_count == 0)
+            .count() as i64;
+        Ok(Some(preview))
+    }
+
+    pub fn remove_member(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RemoveMemberCommand>,
+    ) -> Result<CommandExecution> {
+        let mut settled_run_ids = Vec::new();
+        let execution = self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, crate::command::ActorRef::User { .. }) {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.remove_user_required",
+                    json!({}),
+                ));
+            }
+            let current = transaction
+                .query_row(
+                    r#"
+                    SELECT version, display_name, profile_status
+                    FROM agent_profile WHERE id = ?1
+                    "#,
+                    [&envelope.payload.agent_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((version, display_name, presence)) = current else {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_found",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            };
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            if presence == "removed" {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.removed",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            if envelope.payload.confirmation_name != display_name {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.confirmation_name_mismatch",
+                    json!({ "displayName": display_name }),
+                ));
+            }
+            let non_terminal_agent_run_count = transaction.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM agent_run
+                JOIN conversation
+                  ON conversation.id = agent_run.conversation_id
+                WHERE conversation.agent_id = ?1
+                  AND status IN ('queued', 'running', 'waiting')
+                "#,
+                [&envelope.payload.agent_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if non_terminal_agent_run_count > 0 {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.non_terminal_runs",
+                    json!({ "count": non_terminal_agent_run_count }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let current_camps = {
+                let mut statement = transaction.prepare(
+                    r#"
+                    SELECT camp_id FROM camp_member
+                    WHERE agent_id = ?1 AND status = 'active'
+                    ORDER BY camp_id
+                    "#,
+                )?;
+                statement
+                    .query_map([&envelope.payload.agent_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for camp_id in current_camps {
+                let outcome = end_camp_membership(
+                    transaction,
+                    &camp_id,
+                    &envelope.payload.agent_id,
+                    None,
+                    "agent_profile_removed",
+                    &envelope.command_id,
+                    &envelope.actor,
+                    envelope.execution_epoch,
+                    &now,
+                )?;
+                settled_run_ids.extend(outcome.affected_run_ids);
+            }
+            transaction.execute(
+                r#"
+                UPDATE agent_profile
+                SET profile_status = 'removed', removed_at = ?2,
+                    version = version + 1, updated_at = ?2
+                WHERE id = ?1 AND version = ?3
+                "#,
+                params![
+                    envelope.payload.agent_id,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            Ok(profile_updated_result(
+                &envelope.payload.agent_id,
+                version + 1,
+                "agent_profile.removed",
+            ))
+        })?;
+        crate::runtime::pump_targets_after_runs_terminal(database, &settled_run_ids)?;
+        Ok(execution)
+    }
+
+    pub fn create_installation(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CreateAdapterInstallationCommand>,
+    ) -> Result<CommandExecution> {
+        validate_installation(
+            &envelope.payload.executable_path,
+            &envelope.payload.auth_scope,
+        )?;
+        validate_command_name(&envelope.payload.command_name)?;
+        self.gateway.execute(database, envelope, |transaction| {
+            let existing = transaction
+                .query_row(
+                    r#"
+                    SELECT id FROM adapter_installation
+                    WHERE adapter_kind = ?1 AND executable_path = ?2 AND auth_scope = ?3
+                      AND installation_class = 'custom'
+                    "#,
+                    params![
+                        envelope.payload.adapter_kind.as_str(),
+                        envelope.payload.executable_path,
+                        envelope.payload.auth_scope,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                return Ok(CommandHandlerResult::rejected(
+                    "adapter_installation.already_exists",
+                    json!({ "installationId": id }),
+                ));
+            }
+            let id = format!("adapter-installation-{}", Uuid::new_v4());
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                INSERT INTO adapter_installation(
+                    id, adapter_kind, executable_path, command_name,
+                    installation_class, source, auth_scope,
+                    enabled, generation, path_state, version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, 'custom', ?5, ?6,
+                          1, 1, 'valid', 1, ?7, ?7)
+                "#,
+                params![
+                    id,
+                    envelope.payload.adapter_kind.as_str(),
+                    envelope.payload.executable_path,
+                    envelope.payload.command_name,
+                    envelope.payload.source.as_str(),
+                    envelope.payload.auth_scope,
+                    now,
+                ],
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "adapter_installation.created",
+                json!({ "installationId": id, "version": 1 }),
+                Some(EntityReference {
+                    entity_type: "adapter_installation".to_string(),
+                    entity_id: id,
+                }),
+            ))
+        })
+    }
+
+    pub fn update_installation(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<UpdateAdapterInstallationCommand>,
+    ) -> Result<CommandExecution> {
+        validate_installation(
+            &envelope.payload.executable_path,
+            &envelope.payload.auth_scope,
+        )?;
+        validate_command_name(&envelope.payload.command_name)?;
+        self.gateway.execute(database, envelope, |transaction| {
+            let current = transaction
+                .query_row(
+                    "SELECT adapter_kind, version,
+                        executable_path = ?2 AND command_name = ?3 AND source = ?4
+                        AND auth_scope = ?5 AND enabled = ?6
+                     FROM adapter_installation WHERE id = ?1",
+                    params![
+                        envelope.payload.installation_id,
+                        envelope.payload.executable_path,
+                        envelope.payload.command_name,
+                        envelope.payload.source.as_str(),
+                        envelope.payload.auth_scope,
+                        envelope.payload.enabled,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, bool>(2)?)),
+                )
+                .optional()?;
+            let Some((adapter_kind, version, unchanged)) = current else {
+                return Ok(CommandHandlerResult::rejected(
+                    "adapter_installation.not_found",
+                    json!({ "installationId": envelope.payload.installation_id }),
+                ));
+            };
+            if unchanged {
+                return Ok(CommandHandlerResult::applied(
+                    "adapter_installation.unchanged",
+                    json!({ "installationId": envelope.payload.installation_id, "version": version }),
+                    Some(EntityReference {
+                        entity_type: "adapter_installation".to_string(),
+                        entity_id: envelope.payload.installation_id.clone(),
+                    }),
+                ));
+            }
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            let conflict = transaction
+                .query_row(
+                    r#"
+                    SELECT id FROM adapter_installation
+                    WHERE adapter_kind = ?1 AND executable_path = ?2 AND auth_scope = ?3
+                      AND id <> ?4
+                      AND installation_class = 'custom'
+                    "#,
+                    params![
+                        adapter_kind,
+                        envelope.payload.executable_path,
+                        envelope.payload.auth_scope,
+                        envelope.payload.installation_id,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(id) = conflict {
+                return Ok(CommandHandlerResult::rejected(
+                    "adapter_installation.already_exists",
+                    json!({ "installationId": id }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE adapter_installation
+                SET executable_path = ?2, command_name = ?3, source = ?4,
+                    auth_scope = ?5, enabled = ?6,
+                    path_state = 'valid', generation = generation + 1,
+                    version = version + 1, updated_at = ?7
+                WHERE id = ?1 AND version = ?8
+                "#,
+                params![
+                    envelope.payload.installation_id,
+                    envelope.payload.executable_path,
+                    envelope.payload.command_name,
+                    envelope.payload.source.as_str(),
+                    envelope.payload.auth_scope,
+                    envelope.payload.enabled,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            transaction.execute(
+                r#"
+                UPDATE adapter_capability_snapshot
+                SET stale_at = COALESCE(stale_at, ?2),
+                    last_error = 'installation_configuration_changed'
+                WHERE installation_id = ?1
+                "#,
+                params![envelope.payload.installation_id, now],
+            )?;
+            Ok(CommandHandlerResult::applied(
+                "adapter_installation.updated",
+                json!({
+                    "installationId": envelope.payload.installation_id,
+                    "version": version + 1,
+                }),
+                Some(EntityReference {
+                    entity_type: "adapter_installation".to_string(),
+                    entity_id: envelope.payload.installation_id.clone(),
+                }),
+            ))
+        })
+    }
+
+    pub fn record_snapshot(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RecordAdapterCapabilitySnapshotCommand>,
+    ) -> Result<CommandExecution> {
+        validate_snapshot(&envelope.payload.snapshot)?;
+        if let Some(failure) = envelope.payload.failure.as_ref() {
+            failure.validate()?;
+            if envelope.payload.snapshot.probe_status == "ready" {
+                anyhow::bail!("successful Runtime probe must not carry a public failure");
+            }
+        }
+        let executable_identity = if matches!(
+            envelope.payload.snapshot.probe_status.as_str(),
+            "ready" | "light_ready" | "light_failed" | "installed_unverified"
+        ) {
+            database
+                .connection()
+                .query_row(
+                    "SELECT executable_path FROM adapter_installation WHERE id = ?1",
+                    [&envelope.payload.installation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|path| {
+                    observe_executable_file_identity(Path::new(&path))
+                        .ok()
+                        .map(|identity| (path, identity))
+                })
+        } else {
+            None
+        };
+        self.gateway.execute(database, envelope, |transaction| {
+            let installation = transaction
+                .query_row(
+                    "SELECT version, adapter_kind FROM adapter_installation WHERE id = ?1",
+                    [&envelope.payload.installation_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((version, adapter_kind)) = installation else {
+                return Ok(CommandHandlerResult::rejected(
+                    "adapter_installation.not_found",
+                    json!({ "installationId": envelope.payload.installation_id }),
+                ));
+            };
+            if version != envelope.payload.expected_installation_version {
+                return Ok(version_conflict(version));
+            }
+            let adapter_kind = AdapterKind::from_str(&adapter_kind)?;
+            validate_machine_ready_snapshot(adapter_kind, &envelope.payload.snapshot)?;
+            if adapter_kind == AdapterKind::TraeCnCli
+                && envelope.payload.snapshot.probe_status == "ready"
+                && executable_identity.is_none()
+            {
+                anyhow::bail!("TRAE machine Ready requires the current executable identity");
+            }
+            if let Some(failure) = envelope.payload.failure.as_ref()
+                && failure.runtime_kind != adapter_kind
+            {
+                anyhow::bail!("public Runtime failure kind must match Adapter installation");
+            }
+            let snapshot = &envelope.payload.snapshot;
+            let successful = snapshot.probe_status == "ready";
+            let previous_snapshot = transaction
+                .query_row(
+                    r#"
+                    SELECT executable_fingerprint, probe_status,
+                           permission_schema_digest
+                    FROM adapter_capability_snapshot
+                    WHERE installation_id = ?1
+                    "#,
+                    [&envelope.payload.installation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let previous_fingerprint = previous_snapshot
+                .as_ref()
+                .and_then(|(fingerprint, _, _)| fingerprint.clone());
+            if is_static_snapshot_status(&snapshot.probe_status) {
+                let preserve_ready = previous_snapshot.as_ref().is_some_and(
+                    |(fingerprint, probe_status, permission_schema_digest)| {
+                        probe_status == "ready"
+                            && fingerprint.as_deref() == snapshot.executable_fingerprint.as_deref()
+                            && permission_schema_digest == &snapshot.permission_schema_digest
+                    },
+                );
+                let identity_changed = previous_fingerprint.is_some()
+                    && snapshot.executable_fingerprint.is_some()
+                    && previous_fingerprint != snapshot.executable_fingerprint;
+                if identity_changed {
+                    transaction.execute(
+                        r#"
+                        UPDATE adapter_installation
+                        SET generation = generation + 1, version = version + 1,
+                            path_state = 'valid', updated_at = ?2
+                        WHERE id = ?1
+                        "#,
+                        params![envelope.payload.installation_id, snapshot.last_attempted_at,],
+                    )?;
+                } else {
+                    transaction.execute(
+                        r#"
+                        UPDATE adapter_installation
+                        SET path_state = 'valid', updated_at = ?2
+                        WHERE id = ?1
+                        "#,
+                        params![envelope.payload.installation_id, snapshot.last_attempted_at,],
+                    )?;
+                }
+                if !preserve_ready {
+                    upsert_static_capability_snapshot(
+                        transaction,
+                        &envelope.payload.installation_id,
+                        snapshot,
+                    )?;
+                }
+                if let (Some((executable_path, identity)), Some(executable_fingerprint)) = (
+                    executable_identity.as_ref(),
+                    snapshot.executable_fingerprint.as_deref(),
+                ) {
+                    upsert_runtime_executable_identity(
+                        transaction,
+                        &envelope.payload.installation_id,
+                        executable_path,
+                        executable_fingerprint,
+                        identity,
+                        &snapshot.last_attempted_at,
+                    )?;
+                }
+                return Ok(CommandHandlerResult::applied(
+                    "adapter_installation.static_snapshot_recorded",
+                    json!({
+                        "installationId": envelope.payload.installation_id,
+                        "probeStatus": snapshot.probe_status,
+                        "preservedReadySnapshot": preserve_ready,
+                    }),
+                    Some(EntityReference {
+                        entity_type: "adapter_installation".to_string(),
+                        entity_id: envelope.payload.installation_id.clone(),
+                    }),
+                ));
+            }
+            let failure_class = if successful {
+                "none"
+            } else if snapshot.probe_status == "not_installed" {
+                "path_missing"
+            } else if snapshot.probe_status == "authentication_required" {
+                "authentication_required"
+            } else if snapshot.probe_status == "missing_capabilities" {
+                "incompatible"
+            } else if previous_fingerprint.is_some()
+                && snapshot.executable_fingerprint.is_some()
+                && previous_fingerprint != snapshot.executable_fingerprint
+            {
+                "identity_changed"
+            } else {
+                "transient"
+            };
+            let diagnostic_code = probe_diagnostic_code(&snapshot.probe_status, failure_class);
+            let candidate_path = transaction.query_row(
+                "SELECT executable_path FROM adapter_installation WHERE id = ?1",
+                [&envelope.payload.installation_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let retry_after = if successful {
+                None
+            } else {
+                next_probe_retry_after(
+                    transaction,
+                    &envelope.payload.installation_id,
+                    failure_class,
+                )?
+            };
+            insert_probe_attempt(
+                transaction,
+                &envelope.payload.installation_id,
+                if successful { "ready" } else { "failed" },
+                failure_class,
+                diagnostic_code,
+                &candidate_path,
+                snapshot.executable_fingerprint.as_deref(),
+                &snapshot.last_attempted_at,
+                retry_after.as_deref(),
+                envelope.payload.failure.as_ref(),
+            )?;
+            if successful {
+                upsert_successful_capability_snapshot(
+                    transaction,
+                    &envelope.payload.installation_id,
+                    snapshot,
+                    adapter_kind != AdapterKind::MinimaxCodeCli,
+                )?;
+                if let (Some((executable_path, identity)), Some(executable_fingerprint)) = (
+                    executable_identity.as_ref(),
+                    snapshot.executable_fingerprint.as_deref(),
+                ) {
+                    upsert_runtime_executable_identity(
+                        transaction,
+                        &envelope.payload.installation_id,
+                        executable_path,
+                        executable_fingerprint,
+                        identity,
+                        &snapshot.last_attempted_at,
+                    )?;
+                }
+                transaction.execute(
+                    r#"
+                    UPDATE adapter_installation
+                    SET path_state = 'valid', updated_at = ?2
+                    WHERE id = ?1
+                    "#,
+                    params![envelope.payload.installation_id, snapshot.last_attempted_at],
+                )?;
+            } else if failure_class != "transient" {
+                transaction.execute(
+                    r#"
+                    UPDATE adapter_capability_snapshot
+                    SET stale_at = COALESCE(stale_at, ?2),
+                        last_error = ?3
+                    WHERE installation_id = ?1
+                    "#,
+                    params![
+                        envelope.payload.installation_id,
+                        snapshot.last_attempted_at,
+                        diagnostic_code,
+                    ],
+                )?;
+                if failure_class == "path_missing" {
+                    transaction.execute(
+                        r#"
+                        UPDATE adapter_installation
+                        SET path_state = 'path_missing', updated_at = ?2
+                        WHERE id = ?1
+                        "#,
+                        params![envelope.payload.installation_id, snapshot.last_attempted_at],
+                    )?;
+                }
+            }
+            Ok(CommandHandlerResult::applied(
+                if successful {
+                    "adapter_installation.snapshot_recorded"
+                } else {
+                    "adapter_installation.probe_attempt_recorded"
+                },
+                json!({
+                    "installationId": envelope.payload.installation_id,
+                    "probeStatus": snapshot.probe_status,
+                    "failureClass": failure_class,
+                }),
+                Some(EntityReference {
+                    entity_type: "adapter_installation".to_string(),
+                    entity_id: envelope.payload.installation_id.clone(),
+                }),
+            ))
+        })
+    }
+
+    fn materialize_profile(
+        &self,
+        database: &Database,
+        raw: RawAgentProfile,
+    ) -> Result<AgentProfileView> {
+        let default_capabilities = serde_json::from_str(&raw.default_capabilities_json)
+            .context("invalid AgentProfile default capabilities")?;
+        let personality_traits = serde_json::from_str(&raw.personality_traits_json)
+            .context("invalid AgentProfile personality traits")?;
+        let resolved_runtime_binding = match (
+            raw.selected_runtime_adapter_kind,
+            raw.installation_id,
+            raw.model_selection_json,
+            raw.permission_config_json,
+        ) {
+            (None, None, None, None) => None,
+            (Some(adapter_kind), Some(installation_id), Some(model), Some(permissions)) => {
+                Some(ResolvedRuntimeBinding {
+                    adapter_kind: AdapterKind::from_str(&adapter_kind)?,
+                    installation_id,
+                    model: serde_json::from_str(&model)
+                        .context("invalid AgentProfile model selection")?,
+                    permissions: serde_json::from_str(&permissions)
+                        .context("invalid AgentProfile permission configuration")?,
+                })
+            }
+            _ => anyhow::bail!("AgentProfile Runtime configuration must be complete or absent"),
+        };
+        let runtime_readiness = runtime_readiness(database, resolved_runtime_binding.as_ref())?;
+        let runtime_configuration =
+            resolved_runtime_binding
+                .as_ref()
+                .map(|binding| MemberRuntimeConfiguration {
+                    adapter_kind: binding.adapter_kind,
+                    model: binding.model.clone(),
+                    permissions: binding.permissions.clone(),
+                });
+        Ok(AgentProfileView {
+            agent_id: raw.id,
+            display_name: raw.display_name,
+            avatar_ref: raw.avatar_ref,
+            accent: raw.accent,
+            team_role: raw.team_role,
+            professional_responsibilities: raw.professional_responsibilities,
+            personality_traits,
+            working_principles: raw.working_principles,
+            growth_topic: raw.growth_topic,
+            default_capabilities,
+            presence: raw.presence,
+            runtime_configuration,
+            runtime_readiness,
+            member_order: raw.member_order,
+            version: raw.version,
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+            removed_at: raw.removed_at,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RawAgentProfile {
+    id: String,
+    display_name: String,
+    avatar_ref: Option<String>,
+    accent: Option<String>,
+    team_role: String,
+    professional_responsibilities: String,
+    personality_traits_json: String,
+    working_principles: String,
+    growth_topic: String,
+    default_capabilities_json: String,
+    presence: String,
+    selected_runtime_adapter_kind: Option<String>,
+    installation_id: Option<String>,
+    model_selection_json: Option<String>,
+    permission_config_json: Option<String>,
+    member_order: i64,
+    version: i64,
+    created_at: String,
+    updated_at: String,
+    removed_at: Option<String>,
+}
+
+fn raw_agent_profile_from_row(row: &Row<'_>) -> rusqlite::Result<RawAgentProfile> {
+    let selected_runtime_adapter_kind = row.get::<_, Option<String>>(11)?;
+    let installation_id = row.get::<_, Option<String>>(12)?;
+    let model_selection_json = row.get::<_, Option<String>>(13)?;
+    let permission_config_json = row.get::<_, Option<String>>(14)?;
+    Ok(RawAgentProfile {
+        id: row.get(0)?,
+        display_name: row.get(1)?,
+        avatar_ref: row.get(2)?,
+        accent: row.get(3)?,
+        team_role: row.get(4)?,
+        professional_responsibilities: row.get(5)?,
+        personality_traits_json: row.get(6)?,
+        working_principles: row.get(7)?,
+        growth_topic: row.get(8)?,
+        default_capabilities_json: row.get(9)?,
+        presence: row.get(10)?,
+        selected_runtime_adapter_kind,
+        installation_id,
+        model_selection_json,
+        permission_config_json,
+        member_order: row.get(19)?,
+        version: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        removed_at: row.get(18)?,
+    })
+}
+
+fn installation_from_row(row: &Row<'_>) -> rusqlite::Result<AdapterInstallationView> {
+    let adapter_kind = AdapterKind::from_str(&row.get::<_, String>(1)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, error.into())
+    })?;
+    let installation_class =
+        InstallationClass::from_str(&row.get::<_, String>(4)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, error.into())
+        })?;
+    let source = InstallationSource::from_str(&row.get::<_, String>(5)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, error.into())
+    })?;
+    let probe_status = row.get::<_, Option<String>>(16)?;
+    let snapshot = if let Some(probe_status) = probe_status {
+        let capabilities = decode_json_column::<Vec<String>>(row, 19)?;
+        let protocols = decode_json_column::<Vec<String>>(row, 20)?;
+        let models = decode_json_column::<Vec<ModelDescriptor>>(row, 21)?;
+        let permission_options = decode_json_column::<Vec<PermissionOptionDescriptor>>(row, 22)?;
+        Some(AdapterCapabilitySnapshot {
+            reported_version: row.get(13)?,
+            executable_fingerprint: row.get(14)?,
+            authentication_status: row.get(15)?,
+            probe_status,
+            permission_schema_version: row.get(17)?,
+            permission_schema_digest: row.get(18)?,
+            capabilities,
+            protocols,
+            models,
+            permission_options,
+            observed_at: row.get(23)?,
+            last_attempted_at: row.get(24)?,
+            last_successful_probe_at: row.get(25)?,
+            stale_at: row.get(26)?,
+            last_error: row.get(27)?,
+            native_session_compatibility_key: row.get(28)?,
+        })
+    } else {
+        None
+    };
+    let last_probe_attempt = if let Some(id) = row.get::<_, Option<String>>(30)? {
+        Some(AdapterProbeAttempt {
+            id,
+            installation_id: row.get(0)?,
+            status: row.get(31)?,
+            failure_class: row.get(32)?,
+            diagnostic_code: row.get(33)?,
+            candidate_path: row.get(34)?,
+            executable_fingerprint: row.get(35)?,
+            attempted_at: row.get(36)?,
+            retry_after: row.get(37)?,
+            failure: row
+                .get::<_, Option<String>>(38)?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        38,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })?,
+        })
+    } else {
+        None
+    };
+    let catalog_succeeded_at = row.get::<_, Option<String>>(39)?;
+    let mut model_catalog = runtime_model_catalog_cache_view_at(
+        adapter_kind,
+        snapshot.as_ref(),
+        catalog_succeeded_at.as_deref(),
+        chrono::Utc::now(),
+    );
+    if adapter_kind == AdapterKind::Pi {
+        let identity = snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .models
+                    .iter()
+                    .find(|model| model.id == PI_RUNTIME_DEFAULT_MODEL_ID)
+            })
+            .and_then(|model| model.runtime_metadata.as_ref())
+            .and_then(|metadata| metadata.get("piCatalogIdentity"));
+        if let Some(identity) = identity {
+            let fingerprint: Option<String> = row.get(40)?;
+            let current = row.get::<_, bool>(7)?
+                && row.get::<_, String>(9)? == "valid"
+                && identity["installationGeneration"].as_i64() == Some(row.get(8)?)
+                && identity["searchGeneration"].as_i64() == Some(row.get(41)?)
+                && fingerprint.is_some()
+                && identity["executableFingerprint"].as_str() == fingerprint.as_deref();
+            model_catalog = catalog_observation_cache_view(
+                catalog_succeeded_at.as_deref(),
+                snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.models.iter().any(|model| {
+                        model.id != PI_RUNTIME_DEFAULT_MODEL_ID
+                            && model.runtime_metadata.as_ref().is_none_or(|metadata| {
+                                metadata["piThinkingSchemaVersion"] != 1
+                                    || !matches!(
+                                        metadata["piThinkingState"].as_str(),
+                                        Some("known" | "unknown")
+                                    )
+                            })
+                    })
+                }),
+                chrono::Utc::now(),
+            );
+            if !current {
+                model_catalog.status = RuntimeModelCatalogCacheStatus::Invalidated;
+                model_catalog.revalidate_after = None;
+                model_catalog.expires_at = None;
+            }
+        } else if model_catalog.status == RuntimeModelCatalogCacheStatus::Fresh {
+            // Legacy/full-check observations have no independent ownership. Keep
+            // their existing visibility but request one catalog-only observation.
+            model_catalog.status = RuntimeModelCatalogCacheStatus::Stale;
+        }
+    }
+    Ok(AdapterInstallationView {
+        id: row.get(0)?,
+        adapter_kind,
+        executable_path: row.get(2)?,
+        command_name: row.get(3)?,
+        installation_class,
+        source,
+        auth_scope: row.get(6)?,
+        enabled: row.get(7)?,
+        generation: row.get(8)?,
+        path_state: row.get(9)?,
+        version: row.get(10)?,
+        referenced_profile_count: row.get(29)?,
+        snapshot,
+        permission_options: AgentRuntimeAdapterRegistry::default().permission_options(adapter_kind),
+        model_catalog,
+        member_runtime_defaults: None,
+        last_probe_attempt,
+        relocation_history: Vec::new(),
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn relocation_history(
+    database: &Database,
+    installation_id: &str,
+    limit: i64,
+) -> Result<Vec<AdapterRelocationAudit>> {
+    let mut statement = database.connection().prepare(
+        r#"
+        SELECT id, installation_id, previous_path, next_path,
+               previous_fingerprint, next_fingerprint, source,
+               result, diagnostic_code, created_at
+        FROM adapter_relocation_audit
+        WHERE installation_id = ?1
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?2
+        "#,
+    )?;
+    let rows = statement.query_map(params![installation_id, limit], |row| {
+        let source = row
+            .get::<_, Option<String>>(6)?
+            .map(|value| {
+                InstallationSource::from_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(AdapterRelocationAudit {
+            id: row.get(0)?,
+            installation_id: row.get(1)?,
+            previous_path: row.get(2)?,
+            next_path: row.get(3)?,
+            previous_fingerprint: row.get(4)?,
+            next_fingerprint: row.get(5)?,
+            source,
+            result: row.get(7)?,
+            diagnostic_code: row.get(8)?,
+            created_at: row.get(9)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to list Adapter relocation audit")
+}
+
+fn upsert_successful_capability_snapshot(
+    transaction: &Transaction<'_>,
+    installation_id: &str,
+    snapshot: &AdapterCapabilitySnapshot,
+    catalog_complete: bool,
+) -> Result<()> {
+    if snapshot.probe_status != "ready" {
+        anyhow::bail!("only a successful probe can replace the capability snapshot");
+    }
+    // Health and a complete MiniMax options catalog have separate success times.
+    // Preserve a complete catalog only inside its existing identity/config scope.
+    let retained_catalog = if catalog_complete {
+        None
+    } else {
+        transaction
+            .query_row(
+                "SELECT model_catalog_json, model_catalog_succeeded_at
+             FROM adapter_capability_snapshot WHERE installation_id = ?1
+               AND stale_at IS NULL AND executable_fingerprint = ?2
+               AND permission_schema_digest = ?3 AND model_catalog_succeeded_at IS NOT NULL",
+                params![
+                    installation_id,
+                    snapshot.executable_fingerprint,
+                    snapshot.permission_schema_digest
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+    };
+    let models = match &retained_catalog {
+        Some((models, _)) => serde_json::from_str(models)?,
+        None => snapshot.models.clone(),
+    };
+    let catalog_succeeded_at = if catalog_complete {
+        Some(snapshot.last_attempted_at.as_str())
+    } else {
+        retained_catalog.as_ref().map(|(_, time)| time.as_str())
+    };
+    transaction.execute(
+        r#"
+        INSERT INTO adapter_capability_snapshot(
+            installation_id, reported_version, executable_fingerprint,
+            authentication_status, probe_status, permission_schema_version,
+            permission_schema_digest,
+            capabilities_json, protocols_json, model_catalog_json,
+            permission_options_json, observed_at, last_attempted_at,
+            last_successful_probe_at, stale_at, last_error,
+            native_session_compatibility_key
+        ) VALUES (
+            ?1, ?2, ?3, ?4, 'ready', ?5, ?6, ?7, ?8, ?9,
+            ?10, ?11, ?12, ?12, NULL, NULL, ?13
+        )
+        ON CONFLICT(installation_id) DO UPDATE SET
+            reported_version = COALESCE(NULLIF(TRIM(excluded.reported_version), ''),
+                CASE WHEN NULLIF(excluded.executable_fingerprint, '') = adapter_capability_snapshot.executable_fingerprint
+                    THEN adapter_capability_snapshot.reported_version END),
+            executable_fingerprint = excluded.executable_fingerprint,
+            authentication_status = excluded.authentication_status,
+            probe_status = 'ready',
+            permission_schema_version = excluded.permission_schema_version,
+            permission_schema_digest = excluded.permission_schema_digest,
+            capabilities_json = excluded.capabilities_json,
+            protocols_json = excluded.protocols_json,
+            model_catalog_json = excluded.model_catalog_json,
+            permission_options_json = excluded.permission_options_json,
+            observed_at = excluded.observed_at,
+            last_attempted_at = excluded.last_attempted_at,
+            last_successful_probe_at = excluded.last_successful_probe_at,
+            stale_at = NULL,
+            last_error = NULL,
+            native_session_compatibility_key =
+                excluded.native_session_compatibility_key
+        "#,
+        params![
+            installation_id,
+            snapshot.reported_version,
+            snapshot.executable_fingerprint,
+            snapshot.authentication_status,
+            snapshot.permission_schema_version,
+            snapshot.permission_schema_digest,
+            serde_json::to_string(&snapshot.capabilities)?,
+            serde_json::to_string(&snapshot.protocols)?,
+            serde_json::to_string(&models)?,
+            serde_json::to_string(&snapshot.permission_options)?,
+            snapshot.observed_at,
+            snapshot.last_attempted_at,
+            snapshot.native_session_compatibility_key,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE adapter_capability_snapshot SET model_catalog_succeeded_at = ?2 WHERE installation_id = ?1",
+        params![installation_id, catalog_succeeded_at],
+    )?;
+    Ok(())
+}
+
+/// One transaction-owned merge for full checks and targeted catalog reads.
+/// Never resurrect removed models or carry capabilities across routes/configs.
+fn merge_persisted_dsh_options(
+    transaction: &Transaction<'_>,
+    installation_id: &str,
+    incoming: &[ModelDescriptor],
+) -> Result<Vec<ModelDescriptor>> {
+    let mut models = incoming.to_vec();
+    if !models.iter().any(|model| {
+        model
+            .runtime_metadata
+            .as_ref()
+            .is_some_and(|meta| meta["dshOptionsContext"].is_string())
+    }) {
+        return Ok(models);
+    }
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT snapshot.model_catalog_json FROM adapter_capability_snapshot snapshot
+             JOIN adapter_installation installation ON installation.id = snapshot.installation_id
+             WHERE installation.id = ?1 AND installation.adapter_kind = 'deepseek-harness'",
+            [installation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let previous: Vec<ModelDescriptor> = previous
+        .map(|json| serde_json::from_str(&json))
+        .transpose()?
+        .unwrap_or_default();
+    for model in &mut models {
+        let Some(meta) = model.runtime_metadata.as_mut() else {
+            continue;
+        };
+        let Some(old) = previous.iter().find(|old| old.id == model.id) else {
+            continue;
+        };
+        let Some(old_meta) = old.runtime_metadata.as_ref() else {
+            continue;
+        };
+        if !meta["dshOptionsContext"].is_string()
+            || meta["dshOptionsContext"] != old_meta["dshOptionsContext"]
+            || meta["dshSource"] != old_meta["dshSource"]
+            || old_meta["dshOptionsResolved"] != true
+        {
+            continue;
+        }
+        let old_at = old_meta["dshOptionsObservedAt"]
+            .as_str()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        let new_at = meta["dshOptionsObservedAt"]
+            .as_str()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        if old_at.is_some() && (meta["dshOptionsResolved"] != true || old_at > new_at) {
+            model.options = old.options.clone();
+            meta["dshOptionsResolved"] = json!(true);
+            meta["dshOptionsObservedAt"] = old_meta["dshOptionsObservedAt"].clone();
+        }
+    }
+    Ok(models)
+}
+
+fn upsert_static_capability_snapshot(
+    transaction: &Transaction<'_>,
+    installation_id: &str,
+    snapshot: &AdapterCapabilitySnapshot,
+) -> Result<()> {
+    if !is_static_snapshot_status(&snapshot.probe_status) {
+        anyhow::bail!("only bounded discovery evidence can replace a static snapshot");
+    }
+    transaction.execute(
+        r#"
+        INSERT INTO adapter_capability_snapshot(
+            installation_id, reported_version, executable_fingerprint,
+            authentication_status, probe_status, permission_schema_version,
+            permission_schema_digest,
+            capabilities_json, protocols_json, model_catalog_json,
+            permission_options_json, observed_at, last_attempted_at,
+            last_successful_probe_at, stale_at, last_error,
+            native_session_compatibility_key
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, NULL, NULL, ?14, NULL
+        )
+        ON CONFLICT(installation_id) DO UPDATE SET
+            reported_version = COALESCE(NULLIF(TRIM(excluded.reported_version), ''),
+                CASE WHEN NULLIF(excluded.executable_fingerprint, '') = adapter_capability_snapshot.executable_fingerprint
+                    THEN adapter_capability_snapshot.reported_version END),
+            executable_fingerprint = excluded.executable_fingerprint,
+            authentication_status = excluded.authentication_status,
+            probe_status = excluded.probe_status,
+            permission_schema_version = excluded.permission_schema_version,
+            permission_schema_digest = excluded.permission_schema_digest,
+            capabilities_json = excluded.capabilities_json,
+            protocols_json = excluded.protocols_json,
+            model_catalog_json = excluded.model_catalog_json,
+            permission_options_json = excluded.permission_options_json,
+            observed_at = excluded.observed_at,
+            last_attempted_at = excluded.last_attempted_at,
+            last_successful_probe_at = NULL,
+            model_catalog_succeeded_at = NULL,
+            stale_at = NULL,
+            last_error = excluded.last_error,
+            native_session_compatibility_key = NULL
+        "#,
+        params![
+            installation_id,
+            snapshot.reported_version,
+            snapshot.executable_fingerprint,
+            snapshot.authentication_status,
+            snapshot.probe_status,
+            snapshot.permission_schema_version,
+            snapshot.permission_schema_digest,
+            serde_json::to_string(&snapshot.capabilities)?,
+            serde_json::to_string(&snapshot.protocols)?,
+            serde_json::to_string(&snapshot.models)?,
+            serde_json::to_string(&snapshot.permission_options)?,
+            snapshot.observed_at,
+            snapshot.last_attempted_at,
+            snapshot.last_error,
+        ],
+    )?;
+    Ok(())
+}
+
+fn is_static_snapshot_status(probe_status: &str) -> bool {
+    matches!(
+        probe_status,
+        "light_ready" | "light_failed" | "installed_unverified"
+    )
+}
+
+#[cfg(all(test, feature = "slow-tests"))]
+fn is_preflight_required_status(probe_status: Option<&str>) -> bool {
+    probe_status == Some("light_ready")
+}
+
+fn runtime_candidate_targets_installation(installation_path: &str, candidate_path: &str) -> bool {
+    let installation_path = Path::new(installation_path);
+    let candidate_path = Path::new(candidate_path);
+    let canonical_installation = installation_path
+        .canonicalize()
+        .unwrap_or_else(|_| installation_path.to_path_buf());
+    let canonical_candidate = candidate_path
+        .canonicalize()
+        .unwrap_or_else(|_| candidate_path.to_path_buf());
+    canonical_installation == canonical_candidate
+}
+
+fn provisional_runtime_protocol(adapter_kind: AdapterKind) -> &'static str {
+    match adapter_kind {
+        AdapterKind::CodexCli => "codex-app-server-v2",
+        AdapterKind::Pi => PI_MACHINE_PROTOCOL,
+        AdapterKind::ClaudeCodeCli => "claude-code-print-v1",
+        AdapterKind::AntigravityApp => "antigravity-app-cli-v1",
+        AdapterKind::OpencodeCli
+        | AdapterKind::CopilotCli
+        | AdapterKind::KiroCli
+        | AdapterKind::QoderCli
+        | AdapterKind::CodebuddyCli
+        | AdapterKind::QwenCode
+        | AdapterKind::TraeCnCli
+        | AdapterKind::CursorAgent
+        | AdapterKind::KimiCodeCli
+        | AdapterKind::MinimaxCodeCli
+        | AdapterKind::HermesCli
+        | AdapterKind::GrokBuild
+        | AdapterKind::DeepseekHarness
+        | AdapterKind::CommandCodeCli => "acp-v1",
+        AdapterKind::ClineCli => "acp-v1",
+        AdapterKind::ZcodeApp => crate::zcode::PROTOCOL,
+    }
+}
+
+fn upsert_runtime_executable_identity(
+    transaction: &Transaction<'_>,
+    installation_id: &str,
+    executable_path: &str,
+    executable_fingerprint: &str,
+    identity: &ExecutableFileIdentity,
+    verified_at: &str,
+) -> Result<()> {
+    let byte_size = i64::try_from(identity.byte_size)
+        .context("Runtime executable size exceeds SQLite range")?;
+    transaction.execute(
+        r#"
+        INSERT INTO runtime_executable_identity(
+            installation_id, executable_path, executable_fingerprint,
+            byte_size, modified_at_unix_nanos, file_id, verified_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(installation_id) DO UPDATE SET
+            executable_path = excluded.executable_path,
+            executable_fingerprint = excluded.executable_fingerprint,
+            byte_size = excluded.byte_size,
+            modified_at_unix_nanos = excluded.modified_at_unix_nanos,
+            file_id = excluded.file_id,
+            verified_at = excluded.verified_at
+        "#,
+        params![
+            installation_id,
+            executable_path,
+            executable_fingerprint,
+            byte_size,
+            identity.modified_at_unix_nanos,
+            identity.file_id,
+            verified_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn replace_runtime_entrypoint_locator_identity(
+    transaction: &Transaction<'_>,
+    installation_id: &str,
+    executable_path: &str,
+    executable_fingerprint: &str,
+    identity: Option<&RuntimeEntrypointLocatorIdentity>,
+    verified_at: &str,
+) -> Result<()> {
+    let Some(identity) = identity else {
+        transaction.execute(
+            "DELETE FROM runtime_entrypoint_locator_identity WHERE installation_id = ?1",
+            [installation_id],
+        )?;
+        return Ok(());
+    };
+    if !matches!(
+        identity.entrypoint_kind.as_str(),
+        "npm_cmd_shim" | "pnpm_cmd_shim"
+    ) || identity.canonical_shim_path.is_empty()
+        || identity.canonical_interpreter_path.is_empty()
+        || identity.resolved_target_path != executable_path
+        || identity.resolved_target_fingerprint != executable_fingerprint
+        || !identity.shim_content_digest.starts_with("sha256:")
+        || !identity.interpreter_fingerprint.starts_with("sha256:")
+        || !identity.resolved_target_fingerprint.starts_with("sha256:")
+        || !identity.compatibility_fingerprint.starts_with("sha256:")
+    {
+        anyhow::bail!("Runtime entrypoint locator identity is inconsistent with the executable");
+    }
+    transaction.execute(
+        r#"
+        INSERT INTO runtime_entrypoint_locator_identity(
+            installation_id, entrypoint_kind, canonical_shim_path,
+            shim_content_digest, canonical_interpreter_path,
+            interpreter_fingerprint, resolved_target_path,
+            resolved_target_fingerprint, compatibility_fingerprint, verified_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(installation_id) DO UPDATE SET
+            entrypoint_kind = excluded.entrypoint_kind,
+            canonical_shim_path = excluded.canonical_shim_path,
+            shim_content_digest = excluded.shim_content_digest,
+            canonical_interpreter_path = excluded.canonical_interpreter_path,
+            interpreter_fingerprint = excluded.interpreter_fingerprint,
+            resolved_target_path = excluded.resolved_target_path,
+            resolved_target_fingerprint = excluded.resolved_target_fingerprint,
+            compatibility_fingerprint = excluded.compatibility_fingerprint,
+            verified_at = excluded.verified_at
+        "#,
+        params![
+            installation_id,
+            identity.entrypoint_kind,
+            identity.canonical_shim_path,
+            identity.shim_content_digest,
+            identity.canonical_interpreter_path,
+            identity.interpreter_fingerprint,
+            identity.resolved_target_path,
+            identity.resolved_target_fingerprint,
+            identity.compatibility_fingerprint,
+            verified_at,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_probe_attempt(
+    transaction: &Transaction<'_>,
+    installation_id: &str,
+    status: &str,
+    failure_class: &str,
+    diagnostic_code: Option<&str>,
+    candidate_path: &str,
+    executable_fingerprint: Option<&str>,
+    attempted_at: &str,
+    retry_after: Option<&str>,
+    failure: Option<&RuntimeFailureView>,
+) -> Result<()> {
+    let public_runtime_failure_json = failure.map(serde_json::to_string).transpose()?;
+    transaction.execute(
+        r#"
+        INSERT INTO adapter_probe_attempt(
+            id, installation_id, status, failure_class,
+            diagnostic_code, candidate_path, executable_fingerprint,
+            attempted_at, retry_after, public_runtime_failure_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+        params![
+            format!("adapter-probe-{}", Uuid::new_v4()),
+            installation_id,
+            status,
+            failure_class,
+            diagnostic_code,
+            candidate_path,
+            executable_fingerprint,
+            attempted_at,
+            retry_after,
+            public_runtime_failure_json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn next_probe_retry_after(
+    transaction: &Transaction<'_>,
+    installation_id: &str,
+    failure_class: &str,
+) -> Result<Option<String>> {
+    if failure_class == "none" {
+        return Ok(None);
+    }
+    let consecutive_failures: i64 = transaction.query_row(
+        r#"
+        SELECT COUNT(*)
+        FROM adapter_probe_attempt AS failed
+        WHERE failed.installation_id = ?1
+          AND failed.status = 'failed'
+          AND failed.attempted_at > COALESCE((
+              SELECT MAX(succeeded.attempted_at)
+              FROM adapter_probe_attempt AS succeeded
+              WHERE succeeded.installation_id = ?1
+                AND succeeded.status = 'ready'
+          ), '')
+        "#,
+        [installation_id],
+        |row| row.get(0),
+    )?;
+    let exponent =
+        u32::try_from(consecutive_failures.clamp(0, 8)).context("probe retry exponent overflow")?;
+    let delay_seconds = (60_i64.saturating_mul(1_i64 << exponent)).min(6 * 60 * 60);
+    Ok(Some(
+        (chrono::Utc::now() + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
+    ))
+}
+
+fn decode_json_column<T>(row: &Row<'_>, index: usize) -> rusqlite::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let json = row.get::<_, String>(index)?;
+    serde_json::from_str(&json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
+    })
+}
+
+pub fn resolve_frozen_runtime(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+    agent_id: &str,
+) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
+    let profile = transaction
+        .query_row(
+            r#"
+            SELECT agent_profile.profile_status,
+                   agent_profile.selected_runtime_adapter_kind,
+                   agent_profile.default_runtime_installation_id,
+                   agent_profile.default_model_selection_json,
+                   agent_profile.default_permission_config_json,
+                   conversation.provider_override, conversation.model_override,
+                   CASE WHEN conversation.native_session_id IS NOT NULL
+                        THEN conversation.native_binding_compatibility_digest END
+            FROM conversation
+            JOIN agent_profile ON agent_profile.id = conversation.agent_id
+            WHERE conversation.id = ?1 AND conversation.agent_id = ?2
+            "#,
+            params![conversation_id, agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        status,
+        selected_runtime_adapter_kind,
+        installation_id,
+        model_json,
+        permissions_json,
+        provider_override,
+        model_override,
+        native_binding_compatibility_digest,
+    )) = profile
+    else {
+        return Ok(Err(runtime_blocker(
+            "agent_unavailable",
+            json!({ "agentId": agent_id }),
+        )));
+    };
+    if status != "present" {
+        return Ok(Err(runtime_blocker(
+            if status == "away" {
+                "member_away"
+            } else {
+                "member_removed"
+            },
+            json!({ "agentId": agent_id, "presence": status }),
+        )));
+    }
+    if provider_override
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || model_override
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Ok(Err(runtime_blocker(
+            "conversation_runtime_override_unsupported",
+            json!({ "conversationId": conversation_id }),
+        )));
+    }
+    let (selected_runtime_adapter_kind, installation_id, model_json, permissions_json) = match (
+        selected_runtime_adapter_kind,
+        installation_id,
+        model_json,
+        permissions_json,
+    ) {
+        (None, None, None, None) => {
+            return Ok(Err(runtime_blocker(
+                "runtime_not_configured",
+                json!({ "agentId": agent_id }),
+            )));
+        }
+        (Some(adapter_kind), Some(installation_id), Some(model), Some(permissions)) => {
+            (adapter_kind, installation_id, model, permissions)
+        }
+        _ => {
+            return Ok(Err(runtime_blocker(
+                "runtime_configuration_invalid",
+                json!({ "agentId": agent_id }),
+            )));
+        }
+    };
+    // A malformed member record is a lane failure; SQL/storage errors above
+    // remain outer errors so a database outage cannot be mistaken for bad input.
+    let binding = (|| -> Result<ResolvedRuntimeBinding> {
+        Ok(ResolvedRuntimeBinding {
+            adapter_kind: AdapterKind::from_str(&selected_runtime_adapter_kind)?,
+            installation_id: installation_id.clone(),
+            model: serde_json::from_str(&model_json)?,
+            permissions: serde_json::from_str(&permissions_json)?,
+        })
+    })();
+    let binding = match binding {
+        Ok(binding) => binding,
+        Err(_) => {
+            return Ok(Err(runtime_blocker(
+                "runtime_configuration_invalid",
+                json!({"agentId": agent_id}),
+            )));
+        }
+    };
+    if binding.permissions.adapter_kind != binding.adapter_kind {
+        return Ok(Err(runtime_blocker(
+            "runtime_configuration_adapter_mismatch",
+            json!({
+                "agentId": agent_id,
+                "adapterKind": selected_runtime_adapter_kind,
+            }),
+        )));
+    }
+    let mut result = resolve_frozen_runtime_binding_with_snapshot(
+        transaction,
+        &binding,
+        None,
+        native_binding_compatibility_digest.as_deref(),
+    )?;
+    if let Ok(runtime) = &mut result {
+        crate::camp_fast::freeze(transaction, conversation_id, agent_id, runtime)?;
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_frozen_runtime_binding(
+    transaction: &Connection,
+    binding: &ResolvedRuntimeBinding,
+) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
+    resolve_frozen_runtime_binding_with_snapshot(transaction, binding, None, None)
+}
+
+fn resolve_frozen_runtime_binding_with_snapshot(
+    transaction: &Connection,
+    binding: &ResolvedRuntimeBinding,
+    frozen_api: Option<Option<crate::runtime_custom_api::CustomApiSnapshot>>,
+    native_binding_compatibility_digest: Option<&str>,
+) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
+    let installation_id = binding.installation_id.clone();
+    let installation = transaction
+        .query_row(
+            r#"
+            SELECT installation.adapter_kind, installation.executable_path,
+                   installation.auth_scope, installation.generation,
+                   installation.enabled,
+                   CASE WHEN snapshot.executable_fingerprint = identity.executable_fingerprint THEN snapshot.reported_version END,
+                   COALESCE(identity.executable_fingerprint, snapshot.executable_fingerprint),
+                   COALESCE((
+                       SELECT generation
+                       FROM runtime_search_environment_state
+                       WHERE singleton = 1
+                   ), 0)
+            FROM adapter_installation AS installation
+            LEFT JOIN adapter_capability_snapshot AS snapshot
+              ON snapshot.installation_id = installation.id
+            LEFT JOIN runtime_executable_identity AS identity ON identity.installation_id = installation.id
+            WHERE installation.id = ?1
+            "#,
+            [&installation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        adapter_kind,
+        executable_path,
+        auth_scope,
+        installation_generation,
+        enabled,
+        reported_version,
+        executable_fingerprint,
+        search_environment_generation,
+    )) = installation
+    else {
+        return Ok(Err(runtime_blocker(
+            "adapter_installation_missing",
+            json!({ "installationId": installation_id }),
+        )));
+    };
+    if !enabled {
+        return Ok(Err(runtime_blocker(
+            "adapter_installation_disabled",
+            json!({ "installationId": installation_id }),
+        )));
+    }
+    let adapter_kind = AdapterKind::from_str(&adapter_kind)?;
+    if adapter_kind != binding.adapter_kind || adapter_kind != binding.permissions.adapter_kind {
+        return Ok(Err(runtime_blocker(
+            "runtime_permission_adapter_mismatch",
+            json!({ "installationId": installation_id }),
+        )));
+    }
+    // Installation records carry launch intent only. The real Host validates the
+    // selected model and protocol before it can receive any task input.
+    let executable_fingerprint = executable_fingerprint.unwrap_or_default();
+    let registry = AgentRuntimeAdapterRegistry::default();
+    let permission_descriptors = registry.permission_options(adapter_kind);
+    let mut validation_binding = binding.clone();
+    validation_binding.model = ModelSelection::RuntimeDefault;
+    if let ModelSelection::Explicit {
+        model_id, options, ..
+    } = &binding.model
+        && (model_id.trim().is_empty() || !options.is_object())
+    {
+        return Ok(Err(runtime_blocker(
+            "runtime_model_options_invalid",
+            json!({"modelId": model_id}),
+        )));
+    }
+    if let Some(issue) = runtime_configuration_issue(
+        "[]",
+        1,
+        &serde_json::to_string(&permission_descriptors)?,
+        &validation_binding,
+    )? {
+        return Ok(Err(runtime_blocker(issue.code, issue.payload)));
+    }
+    let model = match resolve_model_selection(
+        adapter_kind,
+        &provisional_runtime_models(adapter_kind),
+        &binding.model,
+    )? {
+        Ok(model) => model,
+        Err(blocker) => return Ok(Err(blocker)),
+    };
+    let capabilities = Vec::new();
+    let protocol = provisional_runtime_protocol(adapter_kind);
+    let protocols = vec![protocol.to_owned()];
+    let native_session_compatibility_key = None;
+    let projection = match AgentRuntimeAdapterRegistry::default().resolve_runtime(
+        adapter_kind,
+        AdapterRuntimeResolutionInput {
+            installation_id: &installation_id,
+            executable_path: &executable_path,
+            auth_scope: &auth_scope,
+            reported_version: reported_version.as_deref(),
+            executable_fingerprint: &executable_fingerprint,
+            protocols: &protocols,
+            native_session_compatibility_key: native_session_compatibility_key.as_deref(),
+            permissions: &binding.permissions,
+            permission_descriptors: &permission_descriptors,
+        },
+    ) {
+        Ok(projection) => projection,
+        Err(error) => {
+            return Ok(Err(runtime_blocker(
+                "runtime_adapter_not_implemented",
+                json!({
+                    "adapterKind": adapter_kind,
+                    "detail": error.to_string(),
+                }),
+            )));
+        }
+    };
+    let custom_api = match frozen_api {
+        Some(snapshot) => snapshot,
+        // Existing sessions that excluded the default Host connection (notably
+        // pre-upgrade member-env sessions) keep that identity only when today's
+        // installation/protocol/permission projection still matches exactly.
+        // Do not read member env or historical environment plans to decide this.
+        None if adapter_kind != AdapterKind::CommandCodeCli
+            && native_binding_compatibility_digest.is_some()
+            && native_binding_compatibility_digest
+                == projection.binding_compatibility_digest.as_deref() =>
+        {
+            None
+        }
+        None => {
+            crate::runtime_startup::snapshot_from_connection(transaction, binding.adapter_kind)?
+        }
+    };
+    let mut frozen = FrozenAgentRuntimeConfig {
+        environment: None,
+        custom_api,
+        camp_fast: None,
+        adapter_kind,
+        installation_id,
+        installation_generation,
+        search_environment_generation,
+        executable_path,
+        auth_scope,
+        reported_version,
+        executable_fingerprint,
+        capabilities,
+        protocol_version: projection.protocol_version,
+        model,
+        permissions: binding.permissions.clone(),
+        native_session_compatibility_key,
+        binding_compatibility_digest: projection.binding_compatibility_digest,
+        host_config_digest: projection.host_config_digest,
+        config_digest: String::new(),
+    };
+    if let Some(api) = &frozen.custom_api
+        && !matches!(
+            adapter_kind,
+            AdapterKind::CommandCodeCli | AdapterKind::HermesCli
+        )
+    {
+        let identity = api.identity()?;
+        frozen.host_config_digest = Some(canonical_json_digest(&json!({
+            "native": frozen.host_config_digest, "customApi": identity
+        }))?);
+        frozen.binding_compatibility_digest = Some(canonical_json_digest(&json!({
+            "native": frozen.binding_compatibility_digest, "customApi": identity
+        }))?);
+    }
+    frozen.refresh_config_digest()?;
+    Ok(Ok(frozen))
+}
+
+fn resolve_model_selection(
+    adapter_kind: AdapterKind,
+    models: &[ModelDescriptor],
+    selection: &ModelSelection,
+) -> Result<std::result::Result<ResolvedModelSelection, RuntimeConfigurationBlocker>> {
+    let dsh_source = match selection {
+        ModelSelection::Explicit { dsh_source, .. }
+            if adapter_kind == AdapterKind::DeepseekHarness =>
+        {
+            *dsh_source
+        }
+        _ => None,
+    };
+    let (source, model, configured_options) = match selection {
+        ModelSelection::RuntimeDefault => {
+            return Ok(Ok(ResolvedModelSelection {
+                dsh_source,
+                source: "runtime_default".to_string(),
+                model_id: runtime_default_model_id(adapter_kind),
+                options: json!({}),
+            }));
+        }
+        ModelSelection::Explicit {
+            model_id, options, ..
+        } => {
+            if model_id.trim().is_empty() {
+                return Ok(Err(runtime_blocker(
+                    "runtime_model_unavailable",
+                    json!({ "modelId": model_id }),
+                )));
+            }
+            let Some(configured_options) = options.as_object() else {
+                return Ok(Err(runtime_blocker(
+                    "runtime_model_options_invalid",
+                    json!({ "modelId": model_id }),
+                )));
+            };
+            if adapter_kind == AdapterKind::DeepseekHarness {
+                // Preserve explicit intent, including a now unsupported value;
+                // the selected live model validates it before any prompt.
+                return Ok(Ok(ResolvedModelSelection {
+                    dsh_source,
+                    source: "explicit".to_string(),
+                    model_id: model_id.clone(),
+                    options: Value::Object(configured_options.clone()),
+                }));
+            }
+            let model = models
+                .iter()
+                .find(|model| model.id == *model_id && !model.hidden && !model.deprecated);
+            if model.is_none() {
+                // The cached catalog is a configuration aid, not execution truth. Preserve a
+                // saved or manually entered explicit selection so the real Runtime Session can make
+                // the final decision without silently falling back.
+                return Ok(Ok(ResolvedModelSelection {
+                    dsh_source,
+                    source: "explicit".to_string(),
+                    model_id: model_id.clone(),
+                    options: Value::Object(configured_options.clone()),
+                }));
+            }
+            (
+                "explicit",
+                model.expect("model was checked above"),
+                Some(options),
+            )
+        }
+    };
+    let mut options = serde_json::Map::new();
+    let configured_options = configured_options.and_then(Value::as_object);
+    for descriptor in &model.options {
+        if let Some(value) = configured_options.and_then(|values| values.get(&descriptor.key)) {
+            options.insert(descriptor.key.clone(), value.clone());
+        } else if let Some(default_value) = &descriptor.default_value {
+            options.insert(descriptor.key.clone(), Value::String(default_value.clone()));
+        }
+    }
+    Ok(Ok(ResolvedModelSelection {
+        dsh_source,
+        source: source.to_string(),
+        model_id: model.id.clone(),
+        options: Value::Object(options),
+    }))
+}
+
+fn runtime_blocker(code: &str, payload: Value) -> RuntimeConfigurationBlocker {
+    RuntimeConfigurationBlocker {
+        code: code.to_string(),
+        payload,
+    }
+}
+
+#[cfg(any(test, feature = "slow-tests"))]
+#[doc(hidden)]
+pub fn configure_test_runtime(database: &Database, agent_ids: &[&str]) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let installation_id = "adapter-test-codex";
+    let executable_path = std::env::current_exe()
+        .expect("test executable path should be available")
+        .to_string_lossy()
+        .to_string();
+    let executable_fingerprint =
+        crate::agent_runtime_adapter::executable_fingerprint(Path::new(&executable_path))
+            .expect("test executable should be fingerprinted");
+    database
+        .connection()
+        .execute(
+            r#"
+            INSERT OR IGNORE INTO adapter_installation(
+                id, adapter_kind, executable_path, command_name,
+                installation_class, source, auth_scope,
+                enabled, version, created_at, updated_at
+            ) VALUES (?1, 'codex-cli', ?2, 'codex', 'managed_default', 'custom',
+                      'test-user', 1, 1, ?3, ?3)
+            "#,
+            params![installation_id, executable_path, now],
+        )
+        .expect("test Adapter installation should be inserted");
+    let models = vec![ModelDescriptor {
+        description: None,
+        runtime_metadata: None,
+        id: "gpt-test".to_string(),
+        display_name: "GPT Test".to_string(),
+        is_default: true,
+        hidden: false,
+        deprecated: false,
+        options: vec![ModelOptionDescriptor {
+            key: "reasoning_effort".to_string(),
+            label: "Reasoning effort".to_string(),
+            value_type: "enum".to_string(),
+            values: vec![ValueChoice {
+                value: "high".to_string(),
+                label: "High".to_string(),
+            }],
+            default_value: Some("high".to_string()),
+            scope: RuntimeOptionScope::Run,
+        }],
+    }];
+    let permissions = vec![
+        PermissionOptionDescriptor {
+            key: "sandbox_mode".to_string(),
+            label: "sandbox_mode".to_string(),
+            description: String::new(),
+            value_type: "enum".to_string(),
+            choices: vec![ValueChoice {
+                value: "workspace-write".to_string(),
+                label: "workspace-write".to_string(),
+            }],
+            recommended_value: json!("workspace-write"),
+            scope: RuntimeOptionScope::Session,
+            risk: "normal".to_string(),
+            supported: true,
+            required: true,
+            unsupported_reason: None,
+        },
+        PermissionOptionDescriptor {
+            key: "approval_policy".to_string(),
+            label: "approval_policy".to_string(),
+            description: String::new(),
+            value_type: "enum".to_string(),
+            choices: vec![ValueChoice {
+                value: "on-request".to_string(),
+                label: "on-request".to_string(),
+            }],
+            recommended_value: json!("on-request"),
+            scope: RuntimeOptionScope::Session,
+            risk: "normal".to_string(),
+            supported: true,
+            required: true,
+            unsupported_reason: None,
+        },
+    ];
+    database
+        .connection()
+        .execute(
+            r#"
+            INSERT OR REPLACE INTO adapter_capability_snapshot(
+                installation_id, reported_version, executable_fingerprint,
+                authentication_status, probe_status, permission_schema_version,
+                capabilities_json, protocols_json, model_catalog_json,
+                permission_options_json, observed_at, last_attempted_at,
+                stale_at, last_error
+            ) VALUES (?1, 'codex-cli test', ?2, 'authenticated',
+                      'ready', 1, ?3, ?4, ?5, ?6, ?7, ?7, NULL, NULL)
+            "#,
+            params![
+                installation_id,
+                executable_fingerprint,
+                serde_json::to_string(&vec![
+                    "app_server.initialize",
+                    "model.list",
+                    "structured_permission_request"
+                ])
+                .unwrap(),
+                serde_json::to_string(&vec!["codex-app-server-v2"]).unwrap(),
+                serde_json::to_string(&models).unwrap(),
+                serde_json::to_string(&permissions).unwrap(),
+                now,
+            ],
+        )
+        .expect("test Adapter snapshot should be inserted");
+    let model = serde_json::to_string(&ModelSelection::RuntimeDefault).unwrap();
+    let permissions = serde_json::to_string(&AdapterPermissionConfig {
+        adapter_kind: AdapterKind::CodexCli,
+        schema_version: 1,
+        values: json!({
+            "sandbox_mode": "workspace-write",
+            "approval_policy": "on-request",
+        }),
+    })
+    .unwrap();
+    for agent_id in agent_ids {
+        database
+            .connection()
+            .execute(
+                r#"
+                UPDATE agent_profile
+                SET selected_runtime_adapter_kind = 'codex-cli',
+                    default_runtime_installation_id = ?2,
+                    default_model_selection_json = ?3,
+                    default_permission_config_json = ?4
+                WHERE id = ?1
+                "#,
+                params![agent_id, installation_id, model, permissions],
+            )
+            .expect("test AgentProfile Runtime should be configured");
+    }
+}
+
+fn runtime_readiness(
+    database: &Database,
+    binding: Option<&ResolvedRuntimeBinding>,
+) -> Result<RuntimeReadiness> {
+    let Some(binding) = binding else {
+        return Ok(RuntimeReadiness {
+            status: RuntimeReadinessStatus::RuntimeNotConfigured,
+            blockers: vec![RuntimeReadinessBlocker {
+                code: "runtime_not_configured".to_string(),
+                detail: None,
+            }],
+        });
+    };
+    let installation = database
+        .connection()
+        .query_row(
+            "SELECT adapter_kind, enabled FROM adapter_installation WHERE id = ?1",
+            [&binding.installation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()?;
+    let Some((adapter_kind, enabled)) = installation else {
+        return Ok(needs_attention("adapter_installation_missing", None));
+    };
+    if !enabled {
+        return Ok(needs_attention("adapter_installation_disabled", None));
+    }
+    if adapter_kind != binding.adapter_kind.as_str() {
+        return Ok(needs_attention(
+            "runtime_configuration_adapter_mismatch",
+            None,
+        ));
+    }
+    if binding.permissions.adapter_kind != binding.adapter_kind {
+        return Ok(needs_attention("runtime_permission_adapter_mismatch", None));
+    }
+    let mut validation = binding.clone();
+    validation.model = ModelSelection::RuntimeDefault;
+    if let Some(issue) = runtime_configuration_issue(
+        "[]",
+        1,
+        &serde_json::to_string(
+            &AgentRuntimeAdapterRegistry::default().permission_options(binding.adapter_kind),
+        )?,
+        &validation,
+    )? {
+        return Ok(needs_attention(issue.code, Some(issue.payload.to_string())));
+    }
+    Ok(RuntimeReadiness {
+        status: RuntimeReadinessStatus::InstalledUnverified,
+        blockers: Vec::new(),
+    })
+}
+
+fn needs_attention(code: &str, detail: Option<String>) -> RuntimeReadiness {
+    RuntimeReadiness {
+        status: RuntimeReadinessStatus::NeedsAttention,
+        blockers: vec![RuntimeReadinessBlocker {
+            code: code.to_string(),
+            detail,
+        }],
+    }
+}
+
+struct ConfigurableManagedRuntime {
+    installation_id: String,
+    installation_generation: i64,
+    permission_schema_version: i64,
+    models_json: String,
+    permissions_json: String,
+}
+
+fn configurable_managed_runtime(
+    transaction: &Transaction<'_>,
+    adapter_kind: AdapterKind,
+) -> Result<Option<ConfigurableManagedRuntime>> {
+    let installation = transaction
+        .query_row(
+            "SELECT id, generation FROM adapter_installation
+         WHERE adapter_kind = ?1 AND auth_scope = 'default'
+           AND installation_class = 'managed_default' AND enabled = 1",
+            [adapter_kind.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    installation
+        .map(|(installation_id, installation_generation)| {
+            Ok(ConfigurableManagedRuntime {
+                installation_id,
+                installation_generation,
+                permission_schema_version: 1,
+                models_json: "[]".to_string(),
+                permissions_json: serde_json::to_string(
+                    &AgentRuntimeAdapterRegistry::default().permission_options(adapter_kind),
+                )?,
+            })
+        })
+        .transpose()
+}
+
+fn probe_diagnostic_code(probe_status: &str, failure_class: &str) -> Option<&'static str> {
+    match (probe_status, failure_class) {
+        ("ready", _) => None,
+        (_, "path_missing") => Some("runtime_path_missing"),
+        (_, "identity_changed") => Some("runtime_identity_changed"),
+        (_, "authentication_required") => Some("runtime_authentication_required"),
+        (_, "incompatible") => Some("runtime_capability_incompatible"),
+        _ => Some("runtime_probe_transient_failure"),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct NormalizedMemberIdentity {
+    pub(crate) display_name: String,
+    pub(crate) team_role: String,
+    pub(crate) professional_responsibilities: String,
+    pub(crate) personality_traits: Vec<String>,
+    pub(crate) working_principles: String,
+    pub(crate) growth_topic: String,
+}
+
+pub(crate) fn validate_stored_member_identity(
+    display_name: &str,
+    team_role: &str,
+    professional_responsibilities: &str,
+    personality_traits: &[String],
+    working_principles: &str,
+    growth_topic: &str,
+) -> Result<()> {
+    let normalized = normalize_member_identity(
+        display_name,
+        team_role,
+        professional_responsibilities,
+        personality_traits,
+        working_principles,
+        growth_topic,
+    )?;
+    if normalized.display_name != display_name
+        || normalized.team_role != team_role
+        // Existing rows may use Rust's former whitespace set; reading never rewrites them.
+        || (normalized.professional_responsibilities != professional_responsibilities
+            && professional_responsibilities.trim() != professional_responsibilities)
+        || normalized.personality_traits != personality_traits
+        || normalized.working_principles != working_principles
+        || normalized.growth_topic != growth_topic
+    {
+        anyhow::bail!("stored AgentProfile Member Identity is not normalized");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_member_identity_input(
+    display_name: &str,
+    team_role: &str,
+    professional_responsibilities: &str,
+    personality_traits: &[String],
+    working_principles: &str,
+    growth_topic: &str,
+) -> Result<()> {
+    normalize_member_identity(
+        display_name,
+        team_role,
+        professional_responsibilities,
+        personality_traits,
+        working_principles,
+        growth_topic,
+    )?;
+    Ok(())
+}
+
+pub const PROFESSIONAL_RESPONSIBILITIES_MAX_SCALARS: usize = 10_000;
+pub const PROFESSIONAL_RESPONSIBILITIES_TOO_LONG: &str = "专业职责最多 10,000 个字符。";
+
+/// ECMAScript String.trim whitespace, matching the existing identity editor.
+/// U+FEFF is trimmed; U+0085 is retained. Interior formatting is untouched.
+pub fn normalize_professional_responsibilities(value: &str) -> Result<String> {
+    let value = value.trim_matches(|c| {
+        matches!(c,
+            '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' |
+            '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' |
+            '\u{205f}' | '\u{3000}' | '\u{feff}'
+        )
+    });
+    anyhow::ensure!(
+        value.chars().count() <= PROFESSIONAL_RESPONSIBILITIES_MAX_SCALARS,
+        PROFESSIONAL_RESPONSIBILITIES_TOO_LONG
+    );
+    Ok(value.to_owned())
+}
+
+pub(crate) fn normalize_member_identity(
+    display_name: &str,
+    team_role: &str,
+    professional_responsibilities: &str,
+    personality_traits: &[String],
+    working_principles: &str,
+    growth_topic: &str,
+) -> Result<NormalizedMemberIdentity> {
+    let display_name = display_name.trim().to_string();
+    if display_name.is_empty() || display_name.chars().count() > 80 {
+        anyhow::bail!("AgentProfile displayName must be 1-80 characters");
+    }
+    if team_role
+        .chars()
+        .any(|character| character == '\n' || character == '\r' || character.is_control())
+    {
+        anyhow::bail!("AgentProfile teamRole must be a single line without control characters");
+    }
+    let team_role = collapse_whitespace(team_role);
+    if team_role.chars().count() > 120 {
+        anyhow::bail!("AgentProfile teamRole must not exceed 120 characters");
+    }
+    let professional_responsibilities =
+        normalize_professional_responsibilities(professional_responsibilities)?;
+    let working_principles = working_principles.trim().to_string();
+    let growth_topic = growth_topic.trim().to_string();
+    for (field, value) in [
+        ("workingPrinciples", &working_principles),
+        ("growthTopic", &growth_topic),
+    ] {
+        if value.chars().count() > 300 {
+            anyhow::bail!("AgentProfile {field} must not exceed 300 characters");
+        }
+    }
+    let mut normalized_traits = Vec::with_capacity(personality_traits.len());
+    let mut seen = BTreeSet::new();
+    for trait_value in personality_traits {
+        if trait_value
+            .chars()
+            .any(|character| character == '\n' || character == '\r' || character.is_control())
+        {
+            anyhow::bail!(
+                "AgentProfile personalityTraits must not contain newlines or control characters"
+            );
+        }
+        let normalized = collapse_whitespace(trait_value);
+        let length = normalized.chars().count();
+        if !(1..=16).contains(&length) {
+            anyhow::bail!("AgentProfile personality trait must be 1-16 characters");
+        }
+        if !seen.insert(normalized.to_lowercase()) {
+            continue;
+        }
+        normalized_traits.push(normalized);
+        if normalized_traits.len() > 6 {
+            anyhow::bail!("AgentProfile personalityTraits must contain at most 6 tags");
+        }
+    }
+    Ok(NormalizedMemberIdentity {
+        display_name,
+        team_role,
+        professional_responsibilities,
+        personality_traits: normalized_traits,
+        working_principles,
+        growth_topic,
+    })
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn validate_command_name(command_name: &str) -> Result<()> {
+    if command_name.trim().is_empty()
+        || command_name.len() > 128
+        || command_name.contains(['/', '\\', '\0'])
+    {
+        anyhow::bail!("Runtime commandName must be a plain command name");
+    }
+    Ok(())
+}
+
+struct RuntimeConfigurationIssue {
+    code: &'static str,
+    payload: Value,
+}
+
+fn runtime_configuration_issue(
+    models_json: &str,
+    permission_schema_version: i64,
+    permissions_json: &str,
+    configuration: &ResolvedRuntimeBinding,
+) -> Result<Option<RuntimeConfigurationIssue>> {
+    let issue = |code, payload| Some(RuntimeConfigurationIssue { code, payload });
+    let models: Vec<ModelDescriptor> =
+        serde_json::from_str(models_json).context("invalid Adapter model catalog")?;
+    if let ModelSelection::Explicit {
+        model_id, options, ..
+    } = &configuration.model
+    {
+        if model_id.trim().is_empty() {
+            return Ok(issue(
+                "runtime_model_unavailable",
+                json!({ "modelId": model_id }),
+            ));
+        }
+        let Some(model) = models
+            .iter()
+            .find(|model| &model.id == model_id && !model.hidden && !model.deprecated)
+        else {
+            return Ok(issue(
+                "runtime_model_unavailable",
+                json!({ "modelId": model_id }),
+            ));
+        };
+        let option_descriptors = model
+            .options
+            .iter()
+            .map(|descriptor| (descriptor.key.as_str(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        let Some(options) = options.as_object() else {
+            return Ok(issue(
+                "runtime_model_options_invalid",
+                json!({ "modelId": model_id }),
+            ));
+        };
+        for (key, value) in options {
+            let Some(descriptor) = option_descriptors.get(key.as_str()) else {
+                return Ok(issue(
+                    "runtime_model_option_unknown",
+                    json!({ "modelId": model_id, "option": key }),
+                ));
+            };
+            let valid = value.as_str().is_some_and(|value| {
+                descriptor
+                    .values
+                    .iter()
+                    .any(|candidate| candidate.value == value)
+            });
+            if !valid {
+                return Ok(issue(
+                    "runtime_model_option_invalid",
+                    json!({ "modelId": model_id, "option": key, "value": value }),
+                ));
+            }
+        }
+    }
+
+    if configuration.permissions.schema_version != permission_schema_version {
+        return Ok(issue(
+            "runtime_permission_schema_mismatch",
+            json!({
+                "configuredSchemaVersion": configuration.permissions.schema_version,
+                "currentSchemaVersion": permission_schema_version,
+            }),
+        ));
+    }
+    let descriptors: Vec<PermissionOptionDescriptor> =
+        serde_json::from_str(permissions_json).context("invalid Adapter permission descriptors")?;
+    let descriptor_by_key = descriptors
+        .iter()
+        .map(|descriptor| (descriptor.key.as_str(), descriptor))
+        .collect::<BTreeMap<_, _>>();
+    let Some(values) = configuration.permissions.values.as_object() else {
+        return Ok(issue("runtime_permission_values_invalid", json!({})));
+    };
+    if configuration.adapter_kind == AdapterKind::Pi {
+        return Ok(None);
+    }
+    for (key, value) in values {
+        let Some(descriptor) = descriptor_by_key.get(key.as_str()) else {
+            return Ok(issue(
+                "runtime_permission_option_unknown",
+                json!({ "option": key }),
+            ));
+        };
+        if !descriptor.supported {
+            return Ok(issue(
+                "runtime_permission_option_unsupported",
+                json!({
+                    "option": key,
+                    "reason": descriptor.unsupported_reason,
+                }),
+            ));
+        }
+        if !permission_value_matches_descriptor(value, descriptor) {
+            return Ok(issue(
+                "runtime_permission_value_invalid",
+                json!({ "option": key, "value": value }),
+            ));
+        }
+    }
+    if let Some(missing) = descriptors.iter().find(|descriptor| {
+        descriptor.supported && descriptor.required && !values.contains_key(&descriptor.key)
+    }) {
+        return Ok(issue(
+            "runtime_permission_value_required",
+            json!({ "option": missing.key }),
+        ));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+#[test]
+fn model_option_validation_rejects_preserved_effort_after_catalog_refresh() {
+    let models = vec![ModelDescriptor {
+        id: "gpt-next".to_string(),
+        display_name: "GPT Next".to_string(),
+        description: None,
+        runtime_metadata: None,
+        is_default: false,
+        hidden: false,
+        deprecated: false,
+        options: vec![ModelOptionDescriptor {
+            key: "reasoning_effort".to_string(),
+            label: "Reasoning effort".to_string(),
+            value_type: "enum".to_string(),
+            values: vec![ValueChoice {
+                value: "low".to_string(),
+                label: "Low".to_string(),
+            }],
+            default_value: Some("low".to_string()),
+            scope: RuntimeOptionScope::Run,
+        }],
+    }];
+    let binding = ResolvedRuntimeBinding {
+        adapter_kind: AdapterKind::CodexCli,
+        installation_id: "test-codex".to_string(),
+        model: ModelSelection::Explicit {
+            dsh_source: None,
+            model_id: "gpt-next".to_string(),
+            options: json!({"reasoning_effort": "high"}),
+        },
+        permissions: AdapterPermissionConfig {
+            adapter_kind: AdapterKind::CodexCli,
+            schema_version: 1,
+            values: json!({}),
+        },
+    };
+
+    let issue =
+        runtime_configuration_issue(&serde_json::to_string(&models).unwrap(), 1, "[]", &binding)
+            .unwrap()
+            .expect("the refreshed model does not support the preserved value");
+    assert_eq!(issue.code, "runtime_model_option_invalid");
+    assert_eq!(issue.payload["value"], "high");
+    let default = ModelSelection::Explicit {
+        model_id: "gpt-next".into(),
+        options: json!({}),
+        dsh_source: Some(DshModelSource::Web),
+    };
+    assert_eq!(
+        resolve_model_selection(AdapterKind::CodexCli, &models, &default)
+            .unwrap()
+            .unwrap()
+            .options,
+        json!({"reasoning_effort":"low"})
+    );
+    let native_default = resolve_model_selection(AdapterKind::DeepseekHarness, &models, &default)
+        .unwrap()
+        .unwrap();
+    assert_eq!(native_default.options, json!({}));
+    assert_eq!(native_default.dsh_source, Some(DshModelSource::Web));
+    let unsupported = ModelSelection::Explicit {
+        model_id: "gpt-next".into(),
+        options: json!({"reasoning_effort":"max"}),
+        dsh_source: Some(DshModelSource::Web),
+    };
+    for catalog in [models.as_slice(), &[]] {
+        assert_eq!(
+            resolve_model_selection(AdapterKind::DeepseekHarness, catalog, &unsupported)
+                .unwrap()
+                .unwrap()
+                .options,
+            json!({"reasoning_effort":"max"})
+        );
+        let manual = resolve_model_selection(
+            AdapterKind::ClaudeCodeCli,
+            catalog,
+            &ModelSelection::Explicit {
+                model_id: "provider/private-model".into(),
+                options: json!({}),
+                dsh_source: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(manual.model_id, "provider/private-model");
+        assert_eq!(manual.source, "explicit");
+        assert_eq!(manual.options, json!({}));
+    }
+}
+
+fn member_runtime_defaults(adapter_kind: AdapterKind) -> MemberRuntimeConfiguration {
+    MemberRuntimeConfiguration {
+        adapter_kind,
+        model: ModelSelection::RuntimeDefault,
+        permissions: AdapterPermissionConfig {
+            adapter_kind,
+            schema_version: 1,
+            values: AgentRuntimeAdapterRegistry::default().member_permission_defaults(adapter_kind),
+        },
+    }
+}
+
+fn provisional_runtime_models(adapter_kind: AdapterKind) -> Vec<ModelDescriptor> {
+    vec![ModelDescriptor {
+        description: None,
+        runtime_metadata: None,
+        id: runtime_default_model_id(adapter_kind),
+        display_name: format!("{} runtime default", adapter_kind.as_str()),
+        is_default: true,
+        hidden: false,
+        deprecated: false,
+        options: Vec::new(),
+    }]
+}
+
+fn runtime_default_model_id(adapter_kind: AdapterKind) -> String {
+    match adapter_kind {
+        AdapterKind::Pi => PI_RUNTIME_DEFAULT_MODEL_ID.to_string(),
+        AdapterKind::ClaudeCodeCli => CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID.to_string(),
+        AdapterKind::TraeCnCli => TRAE_RUNTIME_DEFAULT_MODEL_ID.to_string(),
+        AdapterKind::AntigravityApp => ANTIGRAVITY_RUNTIME_DEFAULT_MODEL_ID.to_string(),
+        _ => format!("{}://runtime-default", adapter_kind.as_str()),
+    }
+}
+
+fn permission_value_matches_descriptor(
+    value: &Value,
+    descriptor: &PermissionOptionDescriptor,
+) -> bool {
+    match descriptor.value_type.as_str() {
+        "boolean" => value.is_boolean(),
+        "enum" => value.as_str().is_some_and(|value| {
+            descriptor
+                .choices
+                .iter()
+                .any(|candidate| candidate.value == value)
+        }),
+        "string_list" => value
+            .as_array()
+            .is_some_and(|values| values.iter().all(|value| value.as_str().is_some())),
+        "rule_list" => value.is_array(),
+        _ => false,
+    }
+}
+
+fn validate_installation(executable_path: &str, auth_scope: &str) -> Result<()> {
+    if !Path::new(executable_path).is_absolute() {
+        anyhow::bail!("Adapter executablePath must be absolute");
+    }
+    if auth_scope.trim().is_empty() || auth_scope.len() > 256 {
+        anyhow::bail!("Adapter authScope must be 1-256 characters");
+    }
+    Ok(())
+}
+
+fn validate_snapshot(snapshot: &AdapterCapabilitySnapshot) -> Result<()> {
+    if snapshot.last_attempted_at.trim().is_empty() {
+        anyhow::bail!("Adapter snapshot lastAttemptedAt must not be empty");
+    }
+    if !matches!(
+        snapshot.probe_status.as_str(),
+        "ready"
+            | "light_ready"
+            | "light_failed"
+            | "installed_unverified"
+            | "not_installed"
+            | "authentication_required"
+            | "missing_capabilities"
+            | "probe_failed"
+    ) {
+        anyhow::bail!("Adapter snapshot has an unsupported probeStatus");
+    }
+    if snapshot.authentication_status.trim().is_empty() {
+        anyhow::bail!("Adapter snapshot authenticationStatus must not be empty");
+    }
+    if snapshot.permission_schema_version < 1 {
+        anyhow::bail!("Adapter permission schema version must be positive");
+    }
+    if snapshot.probe_status == "ready" {
+        if snapshot.observed_at.is_none() {
+            anyhow::bail!("Ready Adapter snapshot requires observedAt");
+        }
+        if snapshot
+            .executable_fingerprint
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            anyhow::bail!("Ready Adapter snapshot requires executableFingerprint");
+        }
+        if snapshot.stale_at.is_some() || snapshot.last_error.is_some() {
+            anyhow::bail!("Ready Adapter snapshot cannot be stale or contain lastError");
+        }
+        if snapshot.models.is_empty()
+            || !snapshot
+                .models
+                .iter()
+                .any(|model| model.is_default && !model.hidden && !model.deprecated)
+        {
+            anyhow::bail!("Ready Adapter snapshot requires an available default model");
+        }
+    }
+    if is_static_snapshot_status(&snapshot.probe_status) {
+        if snapshot.observed_at.is_none()
+            || snapshot
+                .executable_fingerprint
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            anyhow::bail!(
+                "Light-ready Adapter snapshot requires static observation and fingerprint"
+            );
+        }
+        if snapshot.authentication_status != "unknown"
+            || snapshot.last_successful_probe_at.is_some()
+            || snapshot.stale_at.is_some()
+        {
+            anyhow::bail!("Static Adapter snapshot cannot claim deep-probe evidence");
+        }
+        if snapshot.probe_status == "light_failed" {
+            if snapshot.last_error.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!("Light-failed Adapter snapshot requires lastError");
+            }
+        } else if snapshot.last_error.is_some() {
+            anyhow::bail!("Successful static Adapter snapshot cannot contain lastError");
+        }
+    }
+    if !matches!(
+        snapshot.probe_status.as_str(),
+        "ready" | "light_ready" | "installed_unverified"
+    ) && snapshot.last_error.is_none()
+    {
+        anyhow::bail!("Failed Adapter snapshot requires lastError");
+    }
+    validate_model_descriptors(&snapshot.models)?;
+    validate_permission_descriptors(&snapshot.permission_options)?;
+    Ok(())
+}
+
+fn validate_model_descriptors(models: &[ModelDescriptor]) -> Result<()> {
+    let mut model_ids = BTreeSet::new();
+    for model in models {
+        if model.id.trim().is_empty() || !model_ids.insert(model.id.as_str()) {
+            anyhow::bail!("Adapter model IDs must be non-empty and unique");
+        }
+        if model.display_name.trim().is_empty() {
+            anyhow::bail!("Adapter model displayName must not be empty");
+        }
+        let mut option_keys = BTreeSet::new();
+        for option in &model.options {
+            if option.key.trim().is_empty() || !option_keys.insert(option.key.as_str()) {
+                anyhow::bail!("Adapter model option keys must be non-empty and unique");
+            }
+            if option.value_type != "enum" {
+                anyhow::bail!("Adapter model option valueType must be enum in v0.03");
+            }
+            let mut values = BTreeSet::new();
+            for choice in &option.values {
+                if choice.value.trim().is_empty() || !values.insert(choice.value.as_str()) {
+                    anyhow::bail!("Adapter model option values must be non-empty and unique");
+                }
+            }
+            if option
+                .default_value
+                .as_ref()
+                .is_some_and(|value| !values.contains(value.as_str()))
+            {
+                anyhow::bail!("Adapter model option defaultValue must be one of its values");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_permission_descriptors(descriptors: &[PermissionOptionDescriptor]) -> Result<()> {
+    let mut keys = BTreeSet::new();
+    for descriptor in descriptors {
+        if descriptor.key.trim().is_empty() || !keys.insert(descriptor.key.as_str()) {
+            anyhow::bail!("Adapter permission keys must be non-empty and unique");
+        }
+        if !matches!(
+            descriptor.value_type.as_str(),
+            "boolean" | "enum" | "string_list" | "rule_list"
+        ) {
+            anyhow::bail!("Adapter permission valueType is unsupported");
+        }
+        if !matches!(
+            descriptor.risk.as_str(),
+            "normal" | "elevated" | "dangerous"
+        ) {
+            anyhow::bail!("Adapter permission risk is unsupported");
+        }
+        if !descriptor.supported {
+            if descriptor.required {
+                anyhow::bail!("An unsupported Adapter permission cannot be required");
+            }
+            if descriptor
+                .unsupported_reason
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                anyhow::bail!("Unsupported Adapter permissions require a reason");
+            }
+            continue;
+        }
+        if !permission_value_matches_descriptor(&descriptor.recommended_value, descriptor) {
+            anyhow::bail!("Adapter permission recommendedValue is invalid");
+        }
+    }
+    Ok(())
+}
+
+fn legacy_trae_permission_schema_can_normalize(
+    previous_schema_version: i64,
+    previous_schema_digest: &str,
+    previous_options_json: &str,
+    current_static_snapshot: &AdapterCapabilitySnapshot,
+) -> Result<bool> {
+    if previous_schema_version != current_static_snapshot.permission_schema_version {
+        return Ok(false);
+    }
+    let static_options = trae_static_permission_options();
+    let static_digest = canonical_json_digest(&serde_json::to_value(&static_options)?)?;
+    if current_static_snapshot.permission_schema_digest != static_digest {
+        return Ok(false);
+    }
+    let Ok(legacy_options) =
+        serde_json::from_str::<Vec<PermissionOptionDescriptor>>(previous_options_json)
+    else {
+        return Ok(false);
+    };
+    if validate_permission_descriptors(&legacy_options).is_err()
+        || canonical_json_digest(&serde_json::to_value(&legacy_options)?)? != previous_schema_digest
+        || legacy_options.len() != static_options.len()
+    {
+        return Ok(false);
+    }
+    Ok(static_options.iter().all(|expected| {
+        legacy_options.iter().any(|candidate| {
+            candidate.key == expected.key
+                && candidate.value_type == expected.value_type
+                && candidate.recommended_value == expected.recommended_value
+                && candidate.scope == expected.scope
+                && candidate.risk == expected.risk
+                && candidate.supported == expected.supported
+                && candidate.required == expected.required
+                && candidate.unsupported_reason == expected.unsupported_reason
+                && expected.choices.iter().all(|expected_choice| {
+                    candidate
+                        .choices
+                        .iter()
+                        .any(|choice| choice.value == expected_choice.value)
+                })
+        })
+    }))
+}
+
+pub(crate) fn profile_display_name_exists(
+    transaction: &Transaction<'_>,
+    display_name: &str,
+    except_id: Option<&str>,
+) -> Result<bool> {
+    let expected = normalized_profile_display_name(display_name);
+    let mut statement = transaction
+        .prepare("SELECT id, display_name FROM agent_profile WHERE (?1 IS NULL OR id <> ?1)")?;
+    let rows = statement.query_map([except_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (_, candidate) = row?;
+        if normalized_profile_display_name(&candidate) == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn normalized_profile_display_name(display_name: &str) -> String {
+    display_name.trim().to_lowercase()
+}
+
+fn profile_version_and_presence(
+    transaction: &Transaction<'_>,
+    profile_id: &str,
+) -> Result<Option<(i64, String)>> {
+    Ok(transaction
+        .query_row(
+            "SELECT version, profile_status FROM agent_profile WHERE id = ?1",
+            [profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+fn profile_version_and_avatar_ref(
+    transaction: &Transaction<'_>,
+    profile_id: &str,
+) -> Result<Option<(i64, Option<String>, String)>> {
+    Ok(transaction
+        .query_row(
+            "SELECT version, avatar_ref, profile_status FROM agent_profile WHERE id = ?1",
+            [profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?)
+}
+
+fn version_conflict(current_version: i64) -> CommandHandlerResult {
+    CommandHandlerResult::rejected(
+        "version_conflict",
+        json!({ "currentVersion": current_version }),
+    )
+}
+
+fn profile_updated_result(profile_id: &str, version: i64, code: &str) -> CommandHandlerResult {
+    CommandHandlerResult::applied(
+        code,
+        json!({ "agentId": profile_id, "version": version }),
+        Some(EntityReference {
+            entity_type: "agent_profile".to_string(),
+            entity_id: profile_id.to_string(),
+        }),
+    )
+}
+
+#[cfg(test)]
+// Pure owner: normalization parity and the scalar boundary do not need a database fixture.
+#[test]
+fn professional_responsibilities_use_trimmed_unicode_scalar_limits() {
+    for text in [
+        "中".repeat(10_000),
+        "😀".repeat(10_000),
+        "e\u{0301}".repeat(5_000),
+        "\"\n\u{0000}中😀".repeat(2_000),
+    ] {
+        let padded = format!(" \u{feff}\r\n{text}\u{3000} ");
+        // A final newline/control may be content; padding is normalized before counting.
+        let expected = text.trim_matches(|c| matches!(c, '\n' | '\r' | ' '));
+        assert_eq!(
+            normalize_professional_responsibilities(&padded).unwrap(),
+            expected
+        );
+        let too_long = format!("中{}", "😀".repeat(10_000));
+        assert_eq!(
+            normalize_professional_responsibilities(&too_long)
+                .unwrap_err()
+                .to_string(),
+            PROFESSIONAL_RESPONSIBILITIES_TOO_LONG
+        );
+    }
+    assert_eq!(
+        normalize_professional_responsibilities(" \u{feff}\n").unwrap(),
+        ""
+    );
+    assert_eq!(
+        normalize_professional_responsibilities("\u{0085}a\u{0085}").unwrap(),
+        "\u{0085}a\u{0085}"
+    );
+    assert_eq!(
+        normalize_professional_responsibilities(" a\n  b ").unwrap(),
+        "a\n  b"
+    );
+    // Historical Rust-normalized FEFF remains readable without a rewrite.
+    assert!(validate_stored_member_identity("A", "", "\u{feff}old\u{feff}", &[], "", "").is_ok());
+    for (role, principles, growth) in [
+        ("x".repeat(121), String::new(), String::new()),
+        (String::new(), "x".repeat(301), String::new()),
+        (String::new(), String::new(), "x".repeat(301)),
+    ] {
+        assert!(normalize_member_identity("A", &role, "", &[], &principles, &growth).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "slow-tests"))]
+mod slow_tests {
+    use super::*;
+    use crate::{
+        collaboration::{AddThreadMemberCommand, CollaborationService, CreateThreadCommand},
+        command::{ActorRef, CommandEnvelope, CommandResultStatus},
+    };
+
+    #[test]
+    fn acp_runtime_classification_covers_every_acp_backed_adapter() {
+        let acp_adapters = AdapterKind::ALL
+            .into_iter()
+            .filter(|kind| kind.uses_acp())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            acp_adapters,
+            vec![
+                AdapterKind::OpencodeCli,
+                AdapterKind::CopilotCli,
+                AdapterKind::ClineCli,
+                AdapterKind::CommandCodeCli,
+                AdapterKind::KiroCli,
+                AdapterKind::QoderCli,
+                AdapterKind::CodebuddyCli,
+                AdapterKind::QwenCode,
+                AdapterKind::TraeCnCli,
+                AdapterKind::CursorAgent,
+                AdapterKind::KimiCodeCli,
+                AdapterKind::MinimaxCodeCli,
+                AdapterKind::GrokBuild,
+                AdapterKind::DeepseekHarness,
+                AdapterKind::ZcodeApp,
+            ]
+        );
+    }
+
+    #[test]
+    fn public_output_mode_requires_explicit_send_for_every_adapter() {
+        for kind in AdapterKind::ALL {
+            assert_eq!(
+                kind.public_output_mode(),
+                PublicOutputMode::ExplicitSendOnly,
+                "{} must require an explicit public send",
+                kind.as_str(),
+            );
+        }
+    }
+
+    #[test]
+    fn missing_send_recovery_follows_each_adapter_final_boundary_evidence() {
+        for kind in AdapterKind::ALL {
+            assert_eq!(
+                kind.missing_send_recovery_mode(),
+                if kind == AdapterKind::CursorAgent {
+                    MissingSendRecoveryMode::Disabled
+                } else {
+                    MissingSendRecoveryMode::IfNoAcceptedSend
+                },
+                "{} must not publish beyond its qualified final boundary",
+                kind.as_str(),
+            );
+            assert_eq!(
+                kind.public_output_mode(),
+                PublicOutputMode::ExplicitSendOnly
+            );
+        }
+    }
+
+    fn database() -> (Database, std::path::PathBuf) {
+        crate::test_support::fresh_schema_database_fast()
+    }
+
+    fn test_executable_path(directory: &Path, stem: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        return directory.join(format!("{stem}.exe"));
+        #[cfg(not(windows))]
+        directory.join(stem)
+    }
+
+    fn production_like_database() -> (Database, std::path::PathBuf) {
+        crate::test_support::fresh_schema_database()
+    }
+
+    fn startup_database() -> (Database, std::path::PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("rovai-agent-profile-test-{}", Uuid::new_v4()));
+        let database = Database::open(&directory).expect("database should open");
+        (database, directory)
+    }
+
+    #[test]
+    fn selected_runtime_counts_include_unresolved_selections_and_exclude_removed_profiles() {
+        let (database, directory) = database();
+        let profiles = AgentProfileService::default()
+            .list_profiles(&database)
+            .unwrap();
+        assert!(profiles.len() >= 2);
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET selected_runtime_adapter_kind = NULL, default_runtime_installation_id = NULL, default_model_selection_json = NULL, default_permission_config_json = NULL",
+                [],
+            )
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                r#"
+                INSERT INTO adapter_installation(
+                    id, adapter_kind, executable_path, command_name,
+                    installation_class, source, auth_scope, enabled,
+                    generation, path_state, version, created_at, updated_at
+                ) VALUES (
+                    'diagnostic-count-installation', 'codex-cli', '/missing/codex', 'codex',
+                    'custom', 'custom', 'default', 1,
+                    1, 'path_missing', 1, ?1, ?1
+                )
+                "#,
+                [&now],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET selected_runtime_adapter_kind = 'codex-cli', default_runtime_installation_id = 'diagnostic-count-installation', default_model_selection_json = '{}', default_permission_config_json = '{}' WHERE id = ?1",
+                [&profiles[0].agent_id],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET selected_runtime_adapter_kind = 'codex-cli', default_runtime_installation_id = 'diagnostic-count-installation', default_model_selection_json = '{}', default_permission_config_json = '{}', profile_status = 'removed', removed_at = ?2 WHERE id = ?1",
+                rusqlite::params![profiles[1].agent_id, now],
+            )
+            .unwrap();
+
+        assert_eq!(
+            AgentProfileService::default()
+                .selected_runtime_counts(&database)
+                .unwrap(),
+            BTreeMap::from([(AdapterKind::CodexCli, 1)])
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn user_command<P>(command_id: &str, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::User {
+                user_id: "local_user".to_string(),
+            },
+            camp_id: None,
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    fn create_identity(display_name: &str, responsibilities: &str) -> CreateAgentProfileCommand {
+        CreateAgentProfileCommand {
+            display_name: display_name.to_string(),
+            avatar_ref: None,
+            team_role: String::new(),
+            professional_responsibilities: responsibilities.to_string(),
+            personality_traits: Vec::new(),
+            working_principles: String::new(),
+            growth_topic: String::new(),
+        }
+    }
+
+    fn update_identity(
+        profile: &AgentProfileView,
+        display_name: &str,
+    ) -> UpdateAgentProfileCommand {
+        UpdateAgentProfileCommand {
+            agent_id: profile.agent_id.clone(),
+            expected_version: profile.version,
+            display_name: display_name.to_string(),
+            team_role: profile.team_role.clone(),
+            professional_responsibilities: profile.professional_responsibilities.clone(),
+            personality_traits: profile.personality_traits.clone(),
+            working_principles: profile.working_principles.clone(),
+            growth_topic: profile.growth_topic.clone(),
+        }
+    }
+
+    #[test]
+    fn six_field_identity_commands_reject_legacy_or_incomplete_payloads() {
+        let current = json!({
+            "displayName": "伙伴",
+            "teamRole": "游学者",
+            "professionalResponsibilities": "调查并实现明确方案。",
+            "personalityTraits": ["好奇"],
+            "workingPrinciples": "",
+            "growthTopic": ""
+        });
+        serde_json::from_value::<CreateAgentProfileCommand>(current)
+            .expect("the complete six-field identity payload should deserialize");
+
+        let legacy = json!({
+            "displayName": "伙伴",
+            "roleTitle": "开发者",
+            "identityTags": ["好奇"],
+            "roleDescription": "实现方案",
+            "instructions": "先测试"
+        });
+        assert!(serde_json::from_value::<CreateAgentProfileCommand>(legacy).is_err());
+
+        let incomplete = json!({
+            "displayName": "伙伴",
+            "teamRole": "游学者",
+            "professionalResponsibilities": "调查并实现明确方案。",
+            "personalityTraits": ["好奇"]
+        });
+        assert!(serde_json::from_value::<CreateAgentProfileCommand>(incomplete).is_err());
+    }
+
+    #[test]
+    fn personality_traits_are_normalized_and_deduplicated_before_the_limit() {
+        let traits = vec![
+            "  好奇  ".to_string(),
+            "好奇".to_string(),
+            "STEADY".to_string(),
+            "steady".to_string(),
+        ];
+        let normalized = normalize_member_identity("伙伴", "  质量   保障  ", "", &traits, "", "")
+            .expect("valid duplicate traits should normalize");
+        assert_eq!(normalized.team_role, "质量 保障");
+        assert_eq!(normalized.personality_traits, vec!["好奇", "STEADY"]);
+
+        let too_many = (1..=7)
+            .map(|index| format!("标签{index}"))
+            .collect::<Vec<_>>();
+        assert!(normalize_member_identity("伙伴", "", "", &too_many, "", "").is_err());
+    }
+
+    fn ready_codex_snapshot() -> AdapterCapabilitySnapshot {
+        let now = chrono::Utc::now().to_rfc3339();
+        AdapterCapabilitySnapshot {
+            reported_version: Some("0.144.6".to_string()),
+            executable_fingerprint: Some("sha256:test".to_string()),
+            authentication_status: "authenticated".to_string(),
+            probe_status: "ready".to_string(),
+            permission_schema_version: 1,
+            permission_schema_digest: "sha256:test-permissions".to_string(),
+            capabilities: vec!["structured_permission_request".to_string()],
+            protocols: vec!["codex-app-server".to_string()],
+            models: vec![ModelDescriptor {
+                description: None,
+                runtime_metadata: None,
+                id: "gpt-test".to_string(),
+                display_name: "GPT Test".to_string(),
+                is_default: true,
+                hidden: false,
+                deprecated: false,
+                options: Vec::new(),
+            }],
+            permission_options: vec![
+                PermissionOptionDescriptor {
+                    key: "sandbox_mode".to_string(),
+                    label: "Sandbox mode".to_string(),
+                    description: "Codex filesystem sandbox mode".to_string(),
+                    value_type: "enum".to_string(),
+                    choices: vec![
+                        ValueChoice {
+                            value: "workspace-write".to_string(),
+                            label: "workspace-write".to_string(),
+                        },
+                        ValueChoice {
+                            value: "danger-full-access".to_string(),
+                            label: "danger-full-access".to_string(),
+                        },
+                    ],
+                    recommended_value: json!("workspace-write"),
+                    scope: RuntimeOptionScope::Session,
+                    risk: "normal".to_string(),
+                    supported: true,
+                    required: true,
+                    unsupported_reason: None,
+                },
+                PermissionOptionDescriptor {
+                    key: "approval_policy".to_string(),
+                    label: "Approval policy".to_string(),
+                    description: "Codex approval policy".to_string(),
+                    value_type: "enum".to_string(),
+                    choices: vec![
+                        ValueChoice {
+                            value: "on-request".to_string(),
+                            label: "on-request".to_string(),
+                        },
+                        ValueChoice {
+                            value: "never".to_string(),
+                            label: "never".to_string(),
+                        },
+                    ],
+                    recommended_value: json!("on-request"),
+                    scope: RuntimeOptionScope::Session,
+                    risk: "normal".to_string(),
+                    supported: true,
+                    required: true,
+                    unsupported_reason: None,
+                },
+            ],
+            observed_at: Some(now.clone()),
+            last_attempted_at: now.clone(),
+            last_successful_probe_at: Some(now),
+            stale_at: None,
+            last_error: None,
+            native_session_compatibility_key: Some("codex-cli:app-server-v2".to_string()),
+        }
+    }
+
+    fn ready_claude_snapshot() -> AdapterCapabilitySnapshot {
+        AgentRuntimeAdapterRegistry::default()
+            .claude_code_capability_snapshot(
+                crate::agent_runtime_adapter::ClaudeCodeProbeObservation {
+                    reported_version: Some("2.1.236".to_string()),
+                    executable_fingerprint: Some("sha256:test".to_string()),
+                    authentication_status: "authenticated".to_string(),
+                    probe_status: "ready".to_string(),
+                    capabilities: vec![
+                        crate::agent_runtime_adapter::CLAUDE_MODEL_CATALOG_CAPABILITY.to_string(),
+                    ],
+                    models: crate::agent_runtime_adapter::claude_code_models(&json!({"models":[{
+                        "value":"provider/custom[extended]", "displayName":"Custom model",
+                        "description":"Runtime description", "resolvedModel":"resolved-vNext",
+                        "supportsEffort": true, "supportedEffortLevels":["high"]
+                    }]}))
+                    .unwrap(),
+                    attempted_at: chrono::Utc::now().to_rfc3339(),
+                    last_error: None,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn dsh_catalog_updates_accumulate_capabilities_without_reviving_removed_routes() {
+        // Owns the persisted merge across full checks and interleaved target reads;
+        // parser tests cannot detect a stale whole-catalog SQL writeback.
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable = test_executable_path(&directory, "dsh-cache");
+        let mut snapshot = ready_codex_snapshot();
+        snapshot.reported_version = Some("0.2.1-alpha.1".into());
+        snapshot.permission_options =
+            AgentRuntimeAdapterRegistry::default().permission_options(AdapterKind::DeepseekHarness);
+        snapshot.capabilities = [
+            "acp.initialize",
+            "session.new",
+            "session.resume",
+            "dsh.model_catalog",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut a = snapshot.models[0].clone();
+        a.id = "[\"relay\",\"a\"]".into();
+        a.runtime_metadata = Some(json!({"dshSource":"web", "dshOptionsContext":"config-1",
+            "dshOptionsResolved":true, "dshOptionsObservedAt":"2026-10-09T10:00:00Z"}));
+        let mut b = a.clone();
+        b.id = "[\"relay\",\"b\"]".into();
+        b.is_default = false;
+        b.runtime_metadata.as_mut().unwrap()["dshOptionsResolved"] = json!(false);
+        b.runtime_metadata.as_mut().unwrap()["dshOptionsObservedAt"] = Value::Null;
+        snapshot.models = vec![a.clone(), b.clone()];
+        let verified = |snapshot| VerifiedManagedInstallation {
+            model_catalog_complete: true,
+            executable_file_identity:
+                crate::agent_runtime_adapter::observe_executable_file_identity(
+                    std::path::Path::new(&(executable.to_string_lossy().into_owned())),
+                )
+                .ok(),
+            adapter_kind: AdapterKind::DeepseekHarness,
+            executable_path: executable.to_string_lossy().into_owned(),
+            command_name: "dsh".into(),
+            source: InstallationSource::Manual,
+            auth_scope: "default".into(),
+            snapshot,
+            entrypoint_locator_identity: None,
+        };
+        service
+            .commit_verified_managed_installation(&mut database, verified(snapshot.clone()))
+            .unwrap();
+        let read = |db: &Database| {
+            service
+                .managed_installation(db, AdapterKind::DeepseekHarness, "default")
+                .unwrap()
+                .unwrap()
+        };
+        let original = read(&database);
+        let mut unobserved_a = a.clone();
+        unobserved_a.runtime_metadata.as_mut().unwrap()["dshOptionsResolved"] = json!(false);
+        unobserved_a.runtime_metadata.as_mut().unwrap()["dshOptionsObservedAt"] = Value::Null;
+        b.runtime_metadata.as_mut().unwrap()["dshOptionsResolved"] = json!(true);
+        b.runtime_metadata.as_mut().unwrap()["dshOptionsObservedAt"] =
+            json!("2026-10-09T10:00:10Z");
+        assert!(
+            service
+                .commit_runtime_model_catalog(
+                    &mut database,
+                    &original,
+                    &[unobserved_a.clone(), b.clone()],
+                    "2026-10-09T10:00:10Z"
+                )
+                .unwrap()
+        );
+        let models = read(&database).snapshot.unwrap().models;
+        assert_eq!(
+            models[0].runtime_metadata, a.runtime_metadata,
+            "B must not reset A's success time"
+        );
+        assert_eq!(
+            models[1].runtime_metadata, b.runtime_metadata,
+            "confirmed empty is a cached result"
+        );
+        // An older A response carrying an unobserved B must retain the newer B.
+        let mut older_a = a.clone();
+        older_a.runtime_metadata.as_mut().unwrap()["dshOptionsObservedAt"] =
+            json!("2026-10-09T09:59:00Z");
+        assert!(
+            service
+                .commit_runtime_model_catalog(
+                    &mut database,
+                    &original,
+                    &[older_a, snapshot.models[1].clone()],
+                    "2026-10-09T10:00:11Z"
+                )
+                .unwrap()
+        );
+        assert_eq!(read(&database).snapshot.unwrap().models, models);
+        snapshot.models = vec![unobserved_a.clone(), snapshot.models[1].clone()];
+        service
+            .commit_verified_managed_installation(&mut database, verified(snapshot.clone()))
+            .unwrap();
+        assert_eq!(
+            read(&database).snapshot.unwrap().models,
+            models,
+            "ordinary refresh retains matching capabilities"
+        );
+        let expected = read(&database);
+        let mut changed_route = unobserved_a.clone();
+        changed_route.runtime_metadata.as_mut().unwrap()["dshSource"] = json!("native");
+        assert!(
+            service
+                .commit_runtime_model_catalog(
+                    &mut database,
+                    &expected,
+                    &[changed_route.clone()],
+                    "2026-10-09T10:00:12Z"
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            read(&database).snapshot.unwrap().models,
+            vec![changed_route],
+            "removed B must not be resurrected"
+        );
+        let mut changed_config = unobserved_a;
+        changed_config.runtime_metadata.as_mut().unwrap()["dshOptionsContext"] = json!("config-2");
+        let expected = read(&database);
+        assert!(
+            service
+                .commit_runtime_model_catalog(
+                    &mut database,
+                    &expected,
+                    &[changed_config.clone()],
+                    "2026-10-09T10:00:13Z"
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            read(&database).snapshot.unwrap().models,
+            vec![changed_config]
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn model_catalog_cache_has_distinct_revalidate_expiry_and_invalidation_states() {
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-08-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut snapshot = ready_codex_snapshot();
+        snapshot.last_successful_probe_at = Some(observed_at.to_rfc3339());
+
+        assert_eq!(
+            runtime_model_catalog_cache_view(
+                AdapterKind::CodexCli,
+                Some(&snapshot),
+                observed_at + chrono::Duration::seconds(59),
+            )
+            .status,
+            RuntimeModelCatalogCacheStatus::Fresh
+        );
+        assert_eq!(
+            runtime_model_catalog_cache_view(
+                AdapterKind::CodexCli,
+                Some(&snapshot),
+                observed_at + chrono::Duration::seconds(60),
+            )
+            .status,
+            RuntimeModelCatalogCacheStatus::Stale
+        );
+        assert_eq!(
+            runtime_model_catalog_cache_view(
+                AdapterKind::CodexCli,
+                Some(&snapshot),
+                observed_at + chrono::Duration::hours(24),
+            )
+            .status,
+            RuntimeModelCatalogCacheStatus::Expired
+        );
+
+        snapshot.stale_at = Some("2026-08-18T12:00:30Z".to_string());
+        assert_eq!(
+            runtime_model_catalog_cache_view(AdapterKind::CodexCli, Some(&snapshot), observed_at)
+                .status,
+            RuntimeModelCatalogCacheStatus::Invalidated
+        );
+
+        snapshot.stale_at = None;
+        snapshot.probe_status = "light_ready".to_string();
+        let light_cache =
+            runtime_model_catalog_cache_view(AdapterKind::CodexCli, Some(&snapshot), observed_at);
+        assert_eq!(light_cache.status, RuntimeModelCatalogCacheStatus::Stale);
+        assert_eq!(light_cache.observed_at, snapshot.last_successful_probe_at);
+        assert_eq!(
+            runtime_model_catalog_cache_view(
+                AdapterKind::CodexCli,
+                Some(&snapshot),
+                observed_at + chrono::Duration::hours(24),
+            )
+            .status,
+            RuntimeModelCatalogCacheStatus::Expired
+        );
+        let native_models = crate::agent_runtime_adapter::claude_code_models(&json!({"models":[
+            {"value":"custom-model","displayName":"Custom model"}
+        ]}))
+        .unwrap();
+        snapshot.models = native_models.clone();
+        snapshot.probe_status = "ready".to_string();
+        assert_eq!(
+            runtime_model_catalog_cache_view(
+                AdapterKind::ClaudeCodeCli,
+                Some(&snapshot),
+                observed_at
+            )
+            .status,
+            RuntimeModelCatalogCacheStatus::Fresh
+        );
+        snapshot.probe_status = "light_ready".to_string();
+        assert_eq!(
+            runtime_model_catalog_cache_view(
+                AdapterKind::ClaudeCodeCli,
+                Some(&snapshot),
+                observed_at
+            )
+            .status,
+            RuntimeModelCatalogCacheStatus::Stale
+        );
+        assert_eq!(
+            runtime_model_catalog_cache_view(
+                AdapterKind::ClaudeCodeCli,
+                Some(&snapshot),
+                observed_at + chrono::Duration::hours(24)
+            )
+            .status,
+            RuntimeModelCatalogCacheStatus::Expired
+        );
+        snapshot.models[1].runtime_metadata = None;
+        for status in ["ready", "light_ready"] {
+            snapshot.probe_status = status.to_string();
+            let legacy = runtime_model_catalog_cache_view(
+                AdapterKind::ClaudeCodeCli,
+                Some(&snapshot),
+                observed_at,
+            );
+            assert_eq!(legacy.status, RuntimeModelCatalogCacheStatus::Unavailable);
+            assert!(legacy.observed_at.is_none());
+        }
+    }
+
+    #[test]
+    fn fingerprint_change_revokes_ready_but_retains_lkg_and_hides_old_attempt() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable_path = directory.join("codex");
+        std::fs::write(&executable_path, b"old-runtime").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let last_successful = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let last_successful_at = last_successful.to_rfc3339();
+        let mut ready = ready_codex_snapshot();
+        ready.executable_fingerprint = Some("sha256:old-runtime".to_string());
+        ready.last_attempted_at = last_successful_at.clone();
+        ready.last_successful_probe_at = Some(last_successful_at.clone());
+        let expected_models = ready.models.clone();
+        service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().to_string())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path: executable_path.to_string_lossy().to_string(),
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: ready,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        service
+            .record_managed_probe_failure(
+                &mut database,
+                ManagedProbeFailure {
+                    adapter_kind: AdapterKind::CodexCli,
+                    auth_scope: "default",
+                    candidate_path: &executable_path.to_string_lossy(),
+                    fingerprint: Some("sha256:old-runtime"),
+                    source: Some(InstallationSource::InheritedPath),
+                    failure_class: "transient",
+                    diagnostic_code: "old_runtime_probe_failed",
+                    failure: None,
+                },
+            )
+            .unwrap();
+
+        std::fs::write(&executable_path, b"new-runtime").unwrap();
+        let static_snapshot = AgentRuntimeAdapterRegistry::default()
+            .light_ready_snapshot(
+                AdapterKind::CodexCli,
+                Some("new-runtime".to_string()),
+                "sha256:new-runtime".to_string(),
+                chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        service
+            .commit_discovered_managed_installation(
+                &mut database,
+                DiscoveredManagedInstallation {
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().to_string())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path: executable_path.to_string_lossy().to_string(),
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: static_snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+
+        let installation = service
+            .managed_installation(&database, AdapterKind::CodexCli, "default")
+            .unwrap()
+            .unwrap();
+        let snapshot = installation.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.probe_status, "light_ready");
+        assert_eq!(
+            snapshot.executable_fingerprint.as_deref(),
+            Some("sha256:new-runtime")
+        );
+        assert_eq!(snapshot.authentication_status, "unknown");
+        assert!(snapshot.capabilities.is_empty());
+        assert!(snapshot.protocols.is_empty());
+        assert!(snapshot.native_session_compatibility_key.is_none());
+        assert_eq!(snapshot.models, expected_models);
+        assert_eq!(
+            snapshot.last_successful_probe_at.as_deref(),
+            Some(last_successful_at.as_str())
+        );
+        assert_eq!(
+            installation.model_catalog.status,
+            RuntimeModelCatalogCacheStatus::Stale
+        );
+        assert!(is_preflight_required_status(Some(&snapshot.probe_status)));
+        assert!(installation.last_probe_attempt.is_none());
+        assert_eq!(
+            runtime_model_catalog_cache_view(
+                AdapterKind::CodexCli,
+                Some(snapshot),
+                last_successful + chrono::Duration::hours(24),
+            )
+            .status,
+            RuntimeModelCatalogCacheStatus::Expired
+        );
+
+        service
+            .record_managed_probe_failure(
+                &mut database,
+                ManagedProbeFailure {
+                    adapter_kind: AdapterKind::CodexCli,
+                    auth_scope: "default",
+                    candidate_path: &executable_path.to_string_lossy(),
+                    fingerprint: Some("sha256:new-runtime"),
+                    source: Some(InstallationSource::InheritedPath),
+                    failure_class: "authentication_required",
+                    diagnostic_code: "runtime_authentication_required",
+                    failure: None,
+                },
+            )
+            .unwrap();
+        let stable_failure = service
+            .managed_installation(&database, AdapterKind::CodexCli, "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stable_failure
+                .last_probe_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.executable_fingerprint.as_deref()),
+            Some("sha256:new-runtime")
+        );
+        assert_eq!(
+            stable_failure.model_catalog.status,
+            RuntimeModelCatalogCacheStatus::Stale
+        );
+        assert!(
+            stable_failure
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.stale_at.is_none())
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_default_freezes_without_catalog_and_preserves_adapter_sentinels() {
+        for (adapter_kind, expected_model_id) in [
+            (AdapterKind::CodexCli, "codex-cli://runtime-default"),
+            (
+                AdapterKind::ClaudeCodeCli,
+                CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID,
+            ),
+            (AdapterKind::TraeCnCli, TRAE_RUNTIME_DEFAULT_MODEL_ID),
+            (
+                AdapterKind::AntigravityApp,
+                ANTIGRAVITY_RUNTIME_DEFAULT_MODEL_ID,
+            ),
+        ] {
+            let resolved =
+                resolve_model_selection(adapter_kind, &[], &ModelSelection::RuntimeDefault)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(resolved.source, "runtime_default");
+            assert_eq!(resolved.model_id, expected_model_id);
+            assert_eq!(resolved.options, json!({}));
+        }
+    }
+
+    #[test]
+    fn expired_catalog_preserves_intent_for_live_host_validation() {
+        for (kind, mut snapshot, model_id) in [
+            (AdapterKind::CodexCli, ready_codex_snapshot(), "gpt-test"),
+            (
+                AdapterKind::ClaudeCodeCli,
+                ready_claude_snapshot(),
+                "provider/custom[extended]",
+            ),
+        ] {
+            let (mut database, directory) = database();
+            let service = AgentProfileService::default();
+            let executable_path = test_executable_path(&directory, "expired-catalog-codex");
+            let expired_at = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+            snapshot.observed_at = Some(expired_at.clone());
+            snapshot.last_attempted_at = expired_at.clone();
+            snapshot.last_successful_probe_at = Some(expired_at);
+            service
+                .commit_verified_managed_installation(
+                    &mut database,
+                    VerifiedManagedInstallation {
+                        model_catalog_complete: true,
+                        executable_file_identity:
+                            crate::agent_runtime_adapter::observe_executable_file_identity(
+                                std::path::Path::new(
+                                    &(executable_path.to_string_lossy().into_owned()),
+                                ),
+                            )
+                            .ok(),
+                        adapter_kind: kind,
+                        executable_path: executable_path.to_string_lossy().into_owned(),
+                        command_name: "codex".to_string(),
+                        source: InstallationSource::InheritedPath,
+                        auth_scope: "default".to_string(),
+                        snapshot: snapshot.clone(),
+                        entrypoint_locator_identity: None,
+                    },
+                )
+                .unwrap();
+            if kind == AdapterKind::ClaudeCodeCli {
+                for model in &mut snapshot.models {
+                    model.runtime_metadata = None;
+                }
+                database.connection().execute(
+                "UPDATE adapter_capability_snapshot SET model_catalog_json = ?1, last_successful_probe_at = ?2 WHERE installation_id IN (SELECT id FROM adapter_installation WHERE adapter_kind = 'claude-code-cli')",
+                params![serde_json::to_string(&snapshot.models).unwrap(), chrono::Utc::now().to_rfc3339()],
+            ).unwrap();
+            }
+            let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
+            let permissions = AdapterPermissionConfig {
+                adapter_kind: kind,
+                schema_version: 1,
+                values: if kind == AdapterKind::ClaudeCodeCli {
+                    json!({"permission_mode":"bypassPermissions"})
+                } else {
+                    json!({"sandbox_mode":"workspace-write", "approval_policy":"on-request"})
+                },
+            };
+            let default_result = service
+                .set_runtime(
+                    &mut database,
+                    &user_command(
+                        "expired-catalog-runtime-default",
+                        SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
+                            agent_id: profile.agent_id.clone(),
+                            expected_version: profile.version,
+                            adapter_kind: kind,
+                            model: ModelSelection::RuntimeDefault,
+                            permissions: permissions.clone(),
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(
+                default_result.result.code,
+                "agent_profile.runtime_configured"
+            );
+
+            let configured = service
+                .get_profile(&database, &profile.agent_id)
+                .unwrap()
+                .unwrap();
+            let explicit_result = service
+                .set_runtime(
+                    &mut database,
+                    &user_command(
+                        "expired-catalog-explicit-model",
+                        SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
+                            agent_id: configured.agent_id,
+                            expected_version: configured.version,
+                            adapter_kind: kind,
+                            model: ModelSelection::Explicit {
+                                dsh_source: None,
+                                model_id: model_id.to_string(),
+                                options: json!({}),
+                            },
+                            permissions,
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(
+                explicit_result.result.code,
+                "agent_profile.runtime_configured"
+            );
+
+            drop(database);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn starter_profiles_are_generic_and_runtime_is_not_configured() {
+        let (database, directory) = startup_database();
+        let profiles = AgentProfileService::default()
+            .list_profiles(&database)
+            .expect("profiles should load");
+        assert_eq!(profiles.len(), 4);
+        let public_profile = serde_json::to_value(&profiles[0]).unwrap();
+        assert!(public_profile.get("uuid").is_none());
+        assert!(public_profile.get("handle").is_none());
+        assert_eq!(public_profile["agentId"], "agent_1");
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile.runtime_configuration.is_none())
+        );
+        assert!(profiles.iter().all(|profile| {
+            profile.runtime_readiness.status == RuntimeReadinessStatus::RuntimeNotConfigured
+        }));
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn profile_creation_allocates_monotonic_agent_ids_without_reusing_removed_values() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let first = service
+            .create_profile(
+                &mut database,
+                &user_command(
+                    "create-agent-five",
+                    create_identity("第五位", "验证首个自定义 Agent ID。"),
+                ),
+            )
+            .unwrap();
+        assert_eq!(first.result.payload["agentId"], "agent_5");
+        let first_profile = service.get_profile(&database, "agent_5").unwrap().unwrap();
+        service
+            .remove_member(
+                &mut database,
+                &user_command(
+                    "remove-agent-five",
+                    RemoveMemberCommand {
+                        agent_id: first_profile.agent_id,
+                        expected_version: first_profile.version,
+                        confirmation_name: first_profile.display_name,
+                    },
+                ),
+            )
+            .unwrap();
+
+        let second = service
+            .create_profile(
+                &mut database,
+                &user_command(
+                    "create-agent-six",
+                    create_identity("第六位", "验证删除后不复用 Agent ID。"),
+                ),
+            )
+            .unwrap();
+        assert_eq!(second.result.payload["agentId"], "agent_6");
+        let (uuid, next_value): (String, i64) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT agent_profile.uuid, agent_id_sequence.next_value
+                FROM agent_profile, agent_id_sequence
+                WHERE agent_profile.id = 'agent_6'
+                  AND agent_id_sequence.singleton = 1
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(Uuid::parse_str(&uuid).is_ok());
+        assert_eq!(next_value, 7);
+        let public_profile =
+            serde_json::to_value(service.get_profile(&database, "agent_6").unwrap()).unwrap();
+        assert!(!public_profile.to_string().contains(&uuid));
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn profile_order_is_user_controlled_atomic_and_stable() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let original = service.list_profiles(&database).unwrap();
+        assert_eq!(original[0].agent_id, "agent_1");
+        let reversed = original
+            .iter()
+            .rev()
+            .map(|profile| profile.agent_id.clone())
+            .collect::<Vec<_>>();
+        let envelope = user_command(
+            "reorder-agent-profiles",
+            ReorderAgentProfilesCommand {
+                ordered_agent_ids: reversed.clone(),
+            },
+        );
+        let first = service
+            .reorder_profiles(&mut database, &envelope)
+            .expect("profile order should change");
+        let replay = service
+            .reorder_profiles(&mut database, &envelope)
+            .expect("same reorder should replay");
+        assert_eq!(first.result.code, "agent_profile.reordered");
+        assert!(replay.replayed);
+        assert_eq!(
+            service
+                .list_profiles(&database)
+                .unwrap()
+                .into_iter()
+                .map(|profile| profile.agent_id)
+                .collect::<Vec<_>>(),
+            reversed
+        );
+
+        let invalid = service
+            .reorder_profiles(
+                &mut database,
+                &user_command(
+                    "invalid-agent-order",
+                    ReorderAgentProfilesCommand {
+                        ordered_agent_ids: vec!["agent_1".to_string()],
+                    },
+                ),
+            )
+            .expect("invalid order should be a durable rejection");
+        assert_eq!(invalid.result.code, "agent_profile.invalid_order");
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn profile_and_installation_commands_are_idempotent_and_explicit() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable_path = test_executable_path(&directory, "fake-codex");
+        std::fs::write(&executable_path, b"codex-v1").expect("fake executable should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
+                .expect("fake executable should be executable");
+        }
+        let executable_fingerprint =
+            crate::agent_runtime_adapter::executable_fingerprint(&executable_path)
+                .expect("test executable should be fingerprinted");
+        let create_profile = user_command(
+            "create-agent",
+            CreateAgentProfileCommand {
+                team_role: "Developer".to_string(),
+                working_principles: "Use repository conventions.".to_string(),
+                ..create_identity("Builder", "Implements scoped changes.")
+            },
+        );
+        let first = service
+            .create_profile(&mut database, &create_profile)
+            .expect("profile should be created");
+        let replay = service
+            .create_profile(&mut database, &create_profile)
+            .expect("profile command should replay");
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        let profile_id = first.result.payload["agentId"]
+            .as_str()
+            .expect("profile id")
+            .to_string();
+
+        let installation = service
+            .create_installation(
+                &mut database,
+                &user_command(
+                    "create-installation",
+                    CreateAdapterInstallationCommand {
+                        adapter_kind: AdapterKind::CodexCli,
+                        executable_path: executable_path.to_string_lossy().into_owned(),
+                        command_name: "codex".to_string(),
+                        source: InstallationSource::Custom,
+                        auth_scope: "default".to_string(),
+                    },
+                ),
+            )
+            .expect("installation should be created");
+        let installation_id = installation.result.payload["installationId"]
+            .as_str()
+            .expect("installation id")
+            .to_string();
+        let unchanged = service
+            .update_installation(
+                &mut database,
+                &user_command(
+                    "unchanged-installation",
+                    UpdateAdapterInstallationCommand {
+                        installation_id: installation_id.clone(),
+                        expected_version: 0,
+                        executable_path: executable_path.to_string_lossy().into_owned(),
+                        command_name: "codex".into(),
+                        source: InstallationSource::Custom,
+                        auth_scope: "default".into(),
+                        enabled: true,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(unchanged.result.code, "adapter_installation.unchanged");
+        assert_eq!(unchanged.result.payload["version"], 1);
+        let profile = service
+            .get_profile(&database, &profile_id)
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert_eq!(profile.agent_id, "agent_5");
+        assert!(
+            serde_json::to_value(&profile)
+                .unwrap()
+                .get("handle")
+                .is_none()
+        );
+        let mut ready_snapshot = ready_codex_snapshot();
+        ready_snapshot.executable_fingerprint = Some(executable_fingerprint.clone());
+        service
+            .record_snapshot(
+                &mut database,
+                &user_command(
+                    "record-snapshot",
+                    RecordAdapterCapabilitySnapshotCommand {
+                        installation_id: installation_id.clone(),
+                        expected_installation_version: 1,
+                        snapshot: ready_snapshot.clone(),
+                        failure: None,
+                    },
+                ),
+            )
+            .expect("snapshot should be recorded");
+        let managed_installation_id = service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().into_owned())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path: executable_path.to_string_lossy().into_owned(),
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: ready_snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .expect("verified managed Installation should be created");
+        service
+            .set_runtime(
+                &mut database,
+                &user_command(
+                    "set-runtime",
+                    SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
+                        agent_id: profile_id.clone(),
+                        expected_version: profile.version,
+                        adapter_kind: AdapterKind::CodexCli,
+                        model: ModelSelection::RuntimeDefault,
+                        permissions: AdapterPermissionConfig {
+                            adapter_kind: AdapterKind::CodexCli,
+                            schema_version: 1,
+                            values: json!({
+                                "sandbox_mode": "danger-full-access",
+                                "approval_policy": "never",
+                            }),
+                        },
+                    },
+                ),
+            )
+            .expect("runtime should be configured");
+        let configured = service
+            .get_profile(&database, &profile_id)
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert!(configured.runtime_configuration.is_some());
+        assert_eq!(
+            configured.runtime_readiness.status,
+            RuntimeReadinessStatus::InstalledUnverified
+        );
+        assert_eq!(
+            configured
+                .runtime_configuration
+                .as_ref()
+                .expect("configured Runtime")
+                .permissions
+                .values,
+            json!({
+                "sandbox_mode": "danger-full-access",
+                "approval_policy": "never",
+            })
+        );
+        let installations = service
+            .list_installations(&database)
+            .expect("installations should load");
+        assert_eq!(
+            installations
+                .iter()
+                .find(|installation| installation.id == managed_installation_id)
+                .expect("managed Installation should remain")
+                .referenced_profile_count,
+            1
+        );
+
+        std::fs::write(&executable_path, b"codex-v2").expect("fake executable should be upgraded");
+        let advisory = service
+            .get_profile(&database, &profile_id)
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert_eq!(
+            advisory.runtime_readiness.status,
+            RuntimeReadinessStatus::InstalledUnverified,
+            "profile reads must not synchronously hash executable contents"
+        );
+        let runtime_configuration = advisory
+            .runtime_configuration
+            .as_ref()
+            .expect("configured profile should retain its Runtime")
+            .clone();
+        let runtime_binding = ResolvedRuntimeBinding {
+            adapter_kind: runtime_configuration.adapter_kind,
+            installation_id: managed_installation_id.clone(),
+            model: runtime_configuration.model.clone(),
+            permissions: runtime_configuration.permissions.clone(),
+        };
+        let transaction = database
+            .connection_mut()
+            .transaction()
+            .expect("execution admission transaction");
+        let frozen = resolve_frozen_runtime_binding(&transaction, &runtime_binding)
+            .expect("runtime resolution should be deterministic")
+            .expect("message admission should use the last verified Runtime snapshot");
+        assert_eq!(frozen.executable_fingerprint, executable_fingerprint);
+        // The admission/rebind seam freezes the connection, including a frozen absence.
+        // Reusing this fixture keeps executable/permission evidence identical across cases.
+        let api = crate::runtime_custom_api::CustomApiSnapshot {
+            // A legacy editor catalog is identity evidence, never an extra model allowlist.
+            configured_model_ids: Some(vec!["retired-editor-only-model".into()]),
+            configuration: crate::runtime_custom_api::CustomApiConfiguration::Codex {
+                mode: Some(crate::runtime_custom_api::ConnectionMode::CustomApi),
+                base_url: "https://old.example/prefix".into(),
+                models: vec![crate::runtime_custom_api::CustomApiModel {
+                    row_id: "fixture".into(),
+                    id: frozen.model.model_id.clone(),
+                    display_name: String::new(),
+                }],
+                default_model: frozen.model.model_id.clone(),
+                default_row_id: Some("fixture".into()),
+            },
+            native_revision: "fixture".into(),
+            credential_version: uuid::Uuid::new_v4().to_string(),
+            provider_id: "relay".into(),
+            explicit_mode: true,
+            credential_source: crate::runtime_custom_api::native::CredentialSource::Missing,
+            context: crate::runtime_custom_api::native::NativeContext {
+                kind: AdapterKind::CodexCli,
+                directory: executable_path.parent().unwrap().join("native"),
+                artifact_root: executable_path.parent().unwrap().join("artifacts"),
+                launcher: None,
+                codex_source: None,
+                environment: Default::default(),
+            },
+        };
+        let custom = resolve_frozen_runtime_binding_with_snapshot(
+            &transaction,
+            &runtime_binding,
+            Some(Some(api.clone())),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(custom.host_config_digest, frozen.host_config_digest);
+        assert_ne!(
+            custom.binding_compatibility_digest,
+            frozen.binding_compatibility_digest
+        );
+        let mut rotated = api.clone();
+        rotated.credential_version = uuid::Uuid::new_v4().to_string();
+        rotated.native_revision = "changed".into();
+        let changed = resolve_frozen_runtime_binding_with_snapshot(
+            &transaction,
+            &runtime_binding,
+            Some(Some(rotated.clone())),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(changed.host_config_digest, custom.host_config_digest);
+        assert_ne!(
+            changed.binding_compatibility_digest,
+            custom.binding_compatibility_digest
+        );
+        let mut stored =
+            serde_json::to_value(crate::runtime_startup::RuntimeStartupConfiguration {
+                ..Default::default()
+            })
+            .unwrap();
+        stored["customApi"] = json!({"retired":true});
+        stored["_connectionMode"] = json!("official_login");
+        transaction.execute("INSERT INTO runtime_startup_setting(runtime_kind,revision,configuration_json,updated_at) VALUES('codex-cli',2,?1,datetime('now'))", [stored.to_string()]).unwrap();
+        assert_eq!(
+            resolve_frozen_runtime_binding_with_snapshot(
+                &transaction,
+                &runtime_binding,
+                Some(custom.custom_api.clone()),
+                None,
+            )
+            .unwrap()
+            .unwrap()
+            .custom_api,
+            Some(api)
+        );
+        assert_eq!(
+            resolve_frozen_runtime_binding_with_snapshot(
+                &transaction,
+                &runtime_binding,
+                Some(frozen.custom_api.clone()),
+                None,
+            )
+            .unwrap()
+            .unwrap()
+            .custom_api,
+            frozen.custom_api
+        );
+        drop(transaction);
+        let verified_identity = service
+            .verified_executable_identity(
+                &database,
+                &managed_installation_id,
+                &executable_path.to_string_lossy(),
+                &executable_fingerprint,
+            )
+            .expect("verified identity should load")
+            .expect("successful probe should persist a lightweight identity");
+        let changed_identity = observe_executable_file_identity(&executable_path)
+            .expect("changed executable identity should be observable");
+        assert_ne!(changed_identity, verified_identity);
+        assert!(
+            service
+                .mark_runtime_integrity_changed(
+                    &mut database,
+                    &managed_installation_id,
+                    &executable_path.to_string_lossy(),
+                    &executable_fingerprint,
+                )
+                .expect("integrity change should be recorded")
+        );
+        let needs_repair = service
+            .get_profile(&database, &profile_id)
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert_eq!(
+            needs_repair.runtime_readiness.status,
+            RuntimeReadinessStatus::InstalledUnverified
+        );
+        let transaction = database
+            .connection_mut()
+            .transaction()
+            .expect("stale Runtime admission transaction");
+        let stale_frozen = resolve_frozen_runtime_binding(&transaction, &runtime_binding)
+            .expect("stale Runtime resolution should remain deterministic")
+            .expect("message admission should retain the last verified Runtime snapshot");
+        drop(transaction);
+        assert!(
+            service
+                .runtime_dispatch_blocker(&database, &stale_frozen)
+                .expect("dispatch readiness should be readable")
+                .is_none(),
+            "file integrity is revalidated by dispatch, not a historical snapshot gate"
+        );
+        std::fs::write(&executable_path, b"codex-v1").expect("fake executable should be restored");
+
+        let mut changed_schema = ready_codex_snapshot();
+        changed_schema.executable_fingerprint = Some(executable_fingerprint);
+        changed_schema.permission_schema_version = 2;
+        service
+            .record_snapshot(
+                &mut database,
+                &user_command(
+                    "record-changed-schema",
+                    RecordAdapterCapabilitySnapshotCommand {
+                        installation_id: managed_installation_id.clone(),
+                        expected_installation_version: 1,
+                        snapshot: changed_schema,
+                        failure: None,
+                    },
+                ),
+            )
+            .expect("changed capability snapshot should be recorded");
+        let refreshed = service
+            .get_profile(&database, &profile_id)
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert_eq!(
+            refreshed.runtime_readiness.status,
+            RuntimeReadinessStatus::InstalledUnverified,
+            "historical diagnostics must not replace the current static permission schema"
+        );
+        assert_eq!(
+            refreshed
+                .runtime_configuration
+                .expect("refreshed Runtime configuration")
+                .permissions
+                .schema_version,
+            1
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn profile_avatar_writes_accept_only_controlled_or_unchanged_legacy_refs() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let original = service
+            .get_profile(&database, "agent_1")
+            .unwrap()
+            .expect("Luoke should exist");
+        let invalid_avatar = service.set_avatar(
+            &mut database,
+            &user_command(
+                "set-invalid-avatar",
+                SetAgentProfileAvatarCommand {
+                    agent_id: original.agent_id.clone(),
+                    expected_version: original.version,
+                    avatar_ref: Some("https://example.com/avatar.png".to_string()),
+                },
+            ),
+        );
+        assert!(
+            invalid_avatar
+                .expect_err("remote avatar should be rejected")
+                .to_string()
+                .contains("avatarRef")
+        );
+
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET avatar_ref = 'legacy://user-avatar' WHERE id = 'agent_1'",
+                [],
+            )
+            .expect("test should install one legacy avatar ref");
+        let legacy = service
+            .get_profile(&database, "agent_1")
+            .unwrap()
+            .expect("Luoke should exist");
+        let preserved = service
+            .update_profile(
+                &mut database,
+                &user_command(
+                    "preserve-legacy-avatar",
+                    update_identity(&legacy, "Legacy Avatar Preserved"),
+                ),
+            )
+            .expect("an unchanged legacy ref should not block unrelated edits");
+        assert_eq!(preserved.result.code, "agent_profile.updated");
+
+        let updated = service
+            .get_profile(&database, "agent_1")
+            .unwrap()
+            .expect("updated Luoke should exist");
+        let changed_legacy = service.set_avatar(
+            &mut database,
+            &user_command(
+                "change-to-another-legacy-avatar",
+                SetAgentProfileAvatarCommand {
+                    agent_id: updated.agent_id.clone(),
+                    expected_version: updated.version,
+                    avatar_ref: Some("legacy://different-avatar".to_string()),
+                },
+            ),
+        );
+        assert!(
+            changed_legacy
+                .expect_err("a different legacy value is a new unsupported write")
+                .to_string()
+                .contains("avatarRef")
+        );
+
+        let controlled = service
+            .set_avatar(
+                &mut database,
+                &user_command(
+                    "replace-legacy-avatar",
+                    SetAgentProfileAvatarCommand {
+                        agent_id: updated.agent_id,
+                        expected_version: updated.version,
+                        avatar_ref: Some(
+                            "rovai://member-avatar/managed/2b945f3f-4b45-4ae5-92b2-739fce600338"
+                                .to_string(),
+                        ),
+                    },
+                ),
+            )
+            .expect("a controlled managed ref should replace a legacy ref");
+        assert_eq!(controlled.result.code, "agent_profile.avatar_updated");
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn camp_membership_read_model_handles_an_unassigned_default_lead() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let collaboration = CollaborationService::default();
+        let created = collaboration
+            .create_camp(
+                &mut database,
+                &user_command(
+                    "create-membership-test-camp",
+                    CreateThreadCommand::for_test_with_members(
+                        directory.join("workspace").to_string_lossy().to_string(),
+                        &["agent_2"],
+                        "agent_2",
+                    ),
+                ),
+            )
+            .expect("Camp should be created");
+        let camp_id = created.result.payload["threadId"]
+            .as_str()
+            .expect("Camp ID should be returned")
+            .to_string();
+        let mut add_member = user_command(
+            "add-membership-test-member",
+            AddThreadMemberCommand {
+                camp_id: camp_id.clone(),
+                agent_id: "agent_2".to_string(),
+                expected_membership_generation: 1,
+                capability_overrides: json!({}),
+                source: None,
+            },
+        );
+        add_member.camp_id = Some(camp_id);
+        collaboration
+            .add_camp_member(&mut database, &add_member)
+            .expect("Camp member should be added");
+        let profile = service
+            .get_profile(&database, "agent_2")
+            .expect("profile should load")
+            .expect("profile should exist");
+
+        let memberships = service
+            .list_camp_memberships(&database, &profile.agent_id)
+            .expect("Camp memberships should load");
+        assert_eq!(memberships.len(), 1);
+        assert!(memberships[0].is_default_lead);
+        assert_eq!(memberships[0].membership_status, "active");
+
+        database
+            .connection()
+            .execute("UPDATE camp SET default_lead_agent_id = NULL", [])
+            .expect("test Camp should allow an unassigned Default Lead");
+        let memberships = service
+            .list_camp_memberships(&database, &profile.agent_id)
+            .expect("membership read model should tolerate an empty Default Lead");
+        assert!(!memberships[0].is_default_lead);
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn runtime_configuration_never_falls_back_to_a_custom_installation() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable_path = test_executable_path(&directory, "custom-codex");
+        let installation = service
+            .create_installation(
+                &mut database,
+                &user_command(
+                    "create-installation",
+                    CreateAdapterInstallationCommand {
+                        adapter_kind: AdapterKind::CodexCli,
+                        executable_path: executable_path.to_string_lossy().into_owned(),
+                        command_name: "codex".to_string(),
+                        source: InstallationSource::Custom,
+                        auth_scope: "default".to_string(),
+                    },
+                ),
+            )
+            .expect("installation should be created");
+        assert_eq!(installation.result.code, "adapter_installation.created");
+        let profile = service
+            .get_profile(&database, "agent_2")
+            .expect("profile should load")
+            .expect("profile should exist");
+        let result = service
+            .set_runtime(
+                &mut database,
+                &user_command(
+                    "set-mismatched-runtime",
+                    SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
+                        agent_id: profile.agent_id,
+                        expected_version: profile.version,
+                        adapter_kind: AdapterKind::CopilotCli,
+                        model: ModelSelection::RuntimeDefault,
+                        permissions: AdapterPermissionConfig {
+                            adapter_kind: AdapterKind::CopilotCli,
+                            schema_version: 1,
+                            values: json!({}),
+                        },
+                    },
+                ),
+            )
+            .expect("unavailable Runtime configuration should be rejected");
+        assert_eq!(result.result.code, "runtime_configuration_unavailable");
+        let selected = service
+            .get_profile(&database, "agent_2")
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert!(selected.runtime_configuration.is_none());
+        assert_eq!(
+            selected.runtime_readiness.status,
+            RuntimeReadinessStatus::RuntimeNotConfigured
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn ready_runtime_configuration_is_atomic_and_uses_explicit_native_values() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable_path = test_executable_path(&directory, "ready-codex");
+        service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().into_owned())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path: executable_path.to_string_lossy().into_owned(),
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: ready_codex_snapshot(),
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        let profile = service.get_profile(&database, "agent_2").unwrap().unwrap();
+        let applied = service
+            .set_runtime(
+                &mut database,
+                &user_command(
+                    "explicit-runtime-config",
+                    SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
+                        agent_id: profile.agent_id.clone(),
+                        expected_version: profile.version,
+                        adapter_kind: AdapterKind::CodexCli,
+                        model: ModelSelection::Explicit {
+                            dsh_source: None,
+                            model_id: "gpt-test".to_string(),
+                            options: json!({}),
+                        },
+                        permissions: AdapterPermissionConfig {
+                            adapter_kind: AdapterKind::CodexCli,
+                            schema_version: 1,
+                            values: json!({
+                                "sandbox_mode": "workspace-write",
+                                "approval_policy": "on-request",
+                            }),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(applied.result.code, "agent_profile.runtime_configured");
+        let configured = service
+            .get_profile(&database, &profile.agent_id)
+            .unwrap()
+            .unwrap();
+        let configuration = configured.runtime_configuration.as_ref().unwrap();
+        assert_eq!(
+            configuration.model,
+            ModelSelection::Explicit {
+                dsh_source: None,
+                model_id: "gpt-test".to_string(),
+                options: json!({}),
+            }
+        );
+        assert_eq!(
+            configuration.permissions.values,
+            json!({
+                "sandbox_mode": "workspace-write",
+                "approval_policy": "on-request",
+            })
+        );
+
+        let rejected = service
+            .set_runtime(
+                &mut database,
+                &user_command(
+                    "invalid-runtime-config",
+                    SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
+                        agent_id: profile.agent_id.clone(),
+                        expected_version: configured.version,
+                        adapter_kind: AdapterKind::CodexCli,
+                        model: ModelSelection::RuntimeDefault,
+                        permissions: AdapterPermissionConfig {
+                            adapter_kind: AdapterKind::CodexCli,
+                            schema_version: 1,
+                            values: json!({
+                                "sandbox_mode": "not-a-native-value",
+                                "approval_policy": "never",
+                            }),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(rejected.result.code, "runtime_permission_value_invalid");
+        let unchanged = service
+            .get_profile(&database, &profile.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.version, configured.version);
+        assert_eq!(
+            unchanged.runtime_configuration,
+            configured.runtime_configuration
+        );
+
+        // This transaction owner also covers preservation vs new selection:
+        // catalog expiry/removal must not turn a permission-only edit into a
+        // new model selection, while options, identity and version remain gated.
+        let original_models = serde_json::to_string(&ready_codex_snapshot().models).unwrap();
+        let expired_at = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        let mut version = unchanged.version;
+        for (
+            index,
+            (
+                removed,
+                changed_options,
+                changed_identity,
+                invalid_permission,
+                stale_version,
+                expected,
+            ),
+        ) in [
+            (
+                false,
+                false,
+                false,
+                false,
+                false,
+                "agent_profile.runtime_configured",
+            ),
+            (
+                true,
+                false,
+                false,
+                false,
+                false,
+                "agent_profile.runtime_configured",
+            ),
+            (
+                true,
+                false,
+                false,
+                false,
+                false,
+                "agent_profile.runtime_configured",
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                false,
+                "runtime_permission_value_invalid",
+            ),
+            (
+                true,
+                true,
+                false,
+                false,
+                false,
+                "agent_profile.runtime_configured",
+            ),
+            (
+                true,
+                false,
+                true,
+                false,
+                false,
+                "agent_profile.runtime_configured",
+            ),
+            (true, false, false, false, true, "version_conflict"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            database.connection().execute(
+                "UPDATE adapter_capability_snapshot SET model_catalog_json = ?1, model_catalog_succeeded_at = ?2",
+                params![if removed { "[]" } else { &original_models },
+                    if index == 2 { chrono::Utc::now().to_rfc3339() } else { expired_at.clone() }],
+            ).unwrap();
+            if changed_identity {
+                database
+                    .connection()
+                    .execute(
+                        "UPDATE adapter_installation SET generation = generation + 1",
+                        [],
+                    )
+                    .unwrap();
+            }
+            let permissions = AdapterPermissionConfig {
+                values: json!({"sandbox_mode": if invalid_permission { "invalid" } else { "workspace-write" }, "approval_policy": "never"}),
+                ..configuration.permissions.clone()
+            };
+            let model = if changed_options {
+                ModelSelection::Explicit {
+                    dsh_source: None,
+                    model_id: "gpt-test".into(),
+                    options: json!({"reasoning_effort":"high"}),
+                }
+            } else {
+                configuration.model.clone()
+            };
+            let result = service
+                .set_runtime(
+                    &mut database,
+                    &user_command(
+                        &format!("retain-model-{index}"),
+                        SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
+                            agent_id: profile.agent_id.clone(),
+                            expected_version: if stale_version { version - 1 } else { version },
+                            adapter_kind: AdapterKind::CodexCli,
+                            model: model.clone(),
+                            permissions,
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(result.result.code, expected, "case {index}");
+            if expected == "agent_profile.runtime_configured" {
+                version += 1;
+            }
+            let saved = service
+                .get_profile(&database, &profile.agent_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.version, version);
+            assert_eq!(
+                saved.runtime_configuration.unwrap().model,
+                if expected == "agent_profile.runtime_configured" {
+                    model
+                } else {
+                    configuration.model.clone()
+                }
+            );
+        }
+
+        // The picker can also save a new ID absent from the native catalog. It is
+        // current member intent, not a catalog entry, including after switching away.
+        for (index, model) in [
+            ModelSelection::Explicit {
+                model_id: "provider/private-model".into(),
+                options: json!({}),
+                dsh_source: None,
+            },
+            ModelSelection::RuntimeDefault,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = service
+                .set_runtime(
+                    &mut database,
+                    &user_command(
+                        &format!("manual-model-{index}"),
+                        SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
+                            agent_id: profile.agent_id.clone(),
+                            expected_version: version,
+                            adapter_kind: AdapterKind::CodexCli,
+                            model: model.clone(),
+                            permissions: configuration.permissions.clone(),
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(result.result.code, "agent_profile.runtime_configured");
+            version += 1;
+            let saved = service
+                .get_profile(&database, &profile.agent_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.version, version);
+            assert_eq!(saved.runtime_configuration.unwrap().model, model);
+            let catalog: String = database.connection().query_row(
+                "SELECT model_catalog_json FROM adapter_capability_snapshot WHERE installation_id IN (SELECT id FROM adapter_installation WHERE adapter_kind = 'codex-cli')",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(catalog, "[]");
+        }
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn background_runtime_discovery_never_materializes_member_configuration() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable_path = test_executable_path(&directory, "background-codex");
+        let profile = service.get_profile(&database, "agent_2").unwrap().unwrap();
+        let selected = service
+            .set_runtime(
+                &mut database,
+                &user_command(
+                    "select-unresolved-codex",
+                    SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
+                        agent_id: profile.agent_id.clone(),
+                        expected_version: profile.version,
+                        adapter_kind: AdapterKind::CodexCli,
+                        model: ModelSelection::RuntimeDefault,
+                        permissions: AdapterPermissionConfig {
+                            adapter_kind: AdapterKind::CodexCli,
+                            schema_version: 1,
+                            values: json!({}),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(selected.result.code, "runtime_configuration_unavailable");
+
+        service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().into_owned())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path: executable_path.to_string_lossy().into_owned(),
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: ready_codex_snapshot(),
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        let still_unresolved = service
+            .get_profile(&database, &profile.agent_id)
+            .unwrap()
+            .unwrap();
+        assert!(still_unresolved.runtime_configuration.is_none());
+        assert_eq!(
+            still_unresolved.runtime_readiness.status,
+            RuntimeReadinessStatus::RuntimeNotConfigured
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_probe_keeps_the_last_successful_catalog_and_marks_it_stale() {
+        for (kind, ready) in [
+            (AdapterKind::CodexCli, ready_codex_snapshot()),
+            (AdapterKind::ClaudeCodeCli, ready_claude_snapshot()),
+        ] {
+            let (mut database, directory) = database();
+            let service = AgentProfileService::default();
+            let executable_path = test_executable_path(&directory, "failed-probe-codex");
+            let installation = service
+                .create_installation(
+                    &mut database,
+                    &user_command(
+                        "create-installation",
+                        CreateAdapterInstallationCommand {
+                            adapter_kind: kind,
+                            executable_path: executable_path.to_string_lossy().into_owned(),
+                            command_name: "codex".to_string(),
+                            source: InstallationSource::Custom,
+                            auth_scope: "default".to_string(),
+                        },
+                    ),
+                )
+                .expect("installation should be created");
+            let installation_id = installation.result.payload["installationId"]
+                .as_str()
+                .expect("installation id")
+                .to_string();
+            service
+                .record_snapshot(
+                    &mut database,
+                    &user_command(
+                        "record-ready-snapshot",
+                        RecordAdapterCapabilitySnapshotCommand {
+                            installation_id: installation_id.clone(),
+                            expected_installation_version: 1,
+                            snapshot: ready.clone(),
+                            failure: None,
+                        },
+                    ),
+                )
+                .expect("ready snapshot should be recorded");
+            let failed_at = chrono::Utc::now().to_rfc3339();
+            service
+                .record_snapshot(
+                    &mut database,
+                    &user_command(
+                        "record-failed-snapshot",
+                        RecordAdapterCapabilitySnapshotCommand {
+                            installation_id: installation_id.clone(),
+                            expected_installation_version: 1,
+                            snapshot: AdapterCapabilitySnapshot {
+                                reported_version: Some("must-not-replace".to_string()),
+                                executable_fingerprint: Some("sha256:test".to_string()),
+                                authentication_status: "unknown".to_string(),
+                                probe_status: "probe_failed".to_string(),
+                                permission_schema_version: 99,
+                                permission_schema_digest: "sha256:failed".to_string(),
+                                capabilities: vec!["must-not-replace".to_string()],
+                                protocols: vec!["must-not-replace".to_string()],
+                                models: Vec::new(),
+                                permission_options: Vec::new(),
+                                observed_at: None,
+                                last_attempted_at: failed_at.clone(),
+                                last_successful_probe_at: None,
+                                stale_at: None,
+                                last_error: Some("probe failed".to_string()),
+                                native_session_compatibility_key: None,
+                            },
+                            failure: None,
+                        },
+                    ),
+                )
+                .expect("failed attempt should be recorded");
+            let installation = service
+                .list_installations(&database)
+                .expect("installations should load")
+                .into_iter()
+                .find(|candidate| candidate.id == installation_id)
+                .expect("installation should remain");
+            let snapshot = installation.snapshot.expect("snapshot should remain");
+            assert_eq!(snapshot.reported_version, ready.reported_version);
+            assert_eq!(snapshot.models, ready.models);
+            assert_eq!(
+                snapshot.last_successful_probe_at,
+                ready.last_successful_probe_at
+            );
+            assert_eq!(snapshot.permission_schema_version, 1);
+            assert_eq!(snapshot.probe_status, "ready");
+            assert_eq!(snapshot.stale_at, None);
+            assert_eq!(
+                installation
+                    .last_probe_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.failure_class.as_str()),
+                Some("transient")
+            );
+            // All three snapshot writers must retain a known version when a
+            // later observation omits it, but never carry it to different bytes.
+            for writer in ["command", "managed", "static"] {
+                let transaction = database.connection_mut().transaction().unwrap();
+                upsert_successful_capability_snapshot(&transaction, &installation_id, &ready, true)
+                    .unwrap();
+                transaction.commit().unwrap();
+                for changed_program in [false, true] {
+                    let mut next = ready.clone();
+                    next.reported_version = None;
+                    if changed_program {
+                        next.executable_fingerprint = Some("sha256:replacement".into());
+                    }
+                    if writer == "command" {
+                        service
+                            .record_snapshot(
+                                &mut database,
+                                &user_command(
+                                    &format!("versionless-{writer}-{changed_program}"),
+                                    RecordAdapterCapabilitySnapshotCommand {
+                                        installation_id: installation_id.clone(),
+                                        expected_installation_version: 1,
+                                        snapshot: next,
+                                        failure: None,
+                                    },
+                                ),
+                            )
+                            .unwrap();
+                    } else {
+                        let transaction = database.connection_mut().transaction().unwrap();
+                        if writer == "managed" {
+                            upsert_successful_capability_snapshot(
+                                &transaction,
+                                &installation_id,
+                                &next,
+                                true,
+                            )
+                            .unwrap();
+                        } else {
+                            next.probe_status = "light_ready".into();
+                            upsert_static_capability_snapshot(
+                                &transaction,
+                                &installation_id,
+                                &next,
+                            )
+                            .unwrap();
+                        }
+                        transaction.commit().unwrap();
+                    }
+                    let saved: Option<String> = database.connection().query_row(
+                        "SELECT reported_version FROM adapter_capability_snapshot WHERE installation_id = ?1",
+                        [&installation_id], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(
+                        saved.as_deref(),
+                        if changed_program {
+                            None
+                        } else {
+                            ready.reported_version.as_deref()
+                        },
+                        "{writer}, changed program: {changed_program}"
+                    );
+                }
+            }
+            drop(database);
+            std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+        }
+    }
+
+    #[test]
+    fn discovered_entry_configures_and_freezes_without_health_evidence() {
+        for kind in [
+            AdapterKind::CodexCli,
+            AdapterKind::ClaudeCodeCli,
+            AdapterKind::TraeCnCli,
+            AdapterKind::Pi,
+            AdapterKind::GrokBuild,
+            AdapterKind::DeepseekHarness,
+        ] {
+            let (mut database, directory) = database();
+            let service = AgentProfileService::default();
+            let executable_path = test_executable_path(&directory, "detected-cli");
+            std::fs::write(&executable_path, b"entry-only-fixture").unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let fingerprint =
+                crate::agent_runtime_adapter::executable_fingerprint(&executable_path).unwrap();
+            std::fs::write(&executable_path, b"changed-between-discovery-and-commit").unwrap();
+            assert!(
+                DiscoveredRuntimeEntry {
+                    adapter_kind: kind,
+                    executable_path: executable_path.to_string_lossy().into_owned(),
+                    executable_fingerprint: fingerprint.clone(),
+                    source: InstallationSource::InheritedPath,
+                    entrypoint_locator_identity: None,
+                }
+                .verify(None)
+                .is_err(),
+                "a newer file identity cannot certify an older content fingerprint"
+            );
+            std::fs::write(&executable_path, b"entry-only-fixture").unwrap();
+            let installation_id = service
+                .commit_discovered_runtime_entry(
+                    &mut database,
+                    DiscoveredRuntimeEntry {
+                        adapter_kind: kind,
+                        executable_path: executable_path.to_string_lossy().into_owned(),
+                        executable_fingerprint: fingerprint.clone(),
+                        source: InstallationSource::InheritedPath,
+                        entrypoint_locator_identity: None,
+                    }
+                    .verify(None)
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+            let installation = service
+                .managed_installation(&database, kind, "default")
+                .unwrap()
+                .unwrap();
+            assert!(
+                installation.snapshot.is_none(),
+                "discovery must not manufacture Ready or auth evidence"
+            );
+            let defaults = installation.member_runtime_defaults.unwrap();
+            let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
+            let selected = ModelSelection::Explicit {
+                dsh_source: None,
+                model_id: "saved-model".to_string(),
+                options: if kind == AdapterKind::Pi {
+                    json!({"thinking_level":"future-native-level"})
+                } else {
+                    json!({"native-option":"saved-value"})
+                },
+            };
+            let configured = service
+                .set_runtime(
+                    &mut database,
+                    &user_command(
+                        "configure-detected",
+                        SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
+                            agent_id: profile.agent_id.clone(),
+                            expected_version: profile.version,
+                            adapter_kind: kind,
+                            model: selected.clone(),
+                            permissions: defaults.permissions.clone(),
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(configured.result.status, CommandResultStatus::Applied);
+            if kind == AdapterKind::Pi {
+                // Schema validation is local even without any health/catalog
+                // evidence; unknown string enums survive save and freeze below.
+                for options in [
+                    json!({"thinking_level":7}),
+                    json!({"reasoning_effort":"high"}),
+                    json!([]),
+                ] {
+                    let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
+                    let result = service
+                        .set_runtime(
+                            &mut database,
+                            &user_command(
+                                &uuid::Uuid::new_v4().to_string(),
+                                SetMemberRuntimeConfigurationCommand {
+                                    environment_update: None,
+                                    agent_id: profile.agent_id,
+                                    expected_version: profile.version,
+                                    adapter_kind: kind,
+                                    model: ModelSelection::Explicit {
+                                        model_id: "saved-model".into(),
+                                        dsh_source: None,
+                                        options,
+                                    },
+                                    permissions: defaults.permissions.clone(),
+                                },
+                            ),
+                        )
+                        .unwrap();
+                    assert_eq!(result.result.code, "runtime_model_options_invalid");
+                }
+                assert_eq!(
+                    service
+                        .get_profile(&database, "agent_1")
+                        .unwrap()
+                        .unwrap()
+                        .runtime_configuration
+                        .unwrap()
+                        .model,
+                    selected
+                );
+            }
+            if kind == AdapterKind::DeepseekHarness {
+                // Reuse the existing no-health database fixture: provenance is
+                // saved intent, independent of a current successful catalog.
+                for (provided, expected) in [
+                    (None, DshModelSource::Native),
+                    (Some(DshModelSource::Web), DshModelSource::Web),
+                    (Some(DshModelSource::Native), DshModelSource::Native),
+                ] {
+                    for source in [provided, None] {
+                        let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
+                        let mut choice = selected.clone();
+                        if let ModelSelection::Explicit { dsh_source, .. } = &mut choice {
+                            *dsh_source = source;
+                        }
+                        let saved = service
+                            .set_runtime(
+                                &mut database,
+                                &user_command(
+                                    &uuid::Uuid::new_v4().to_string(),
+                                    SetMemberRuntimeConfigurationCommand {
+                                        environment_update: None,
+                                        agent_id: profile.agent_id,
+                                        expected_version: profile.version,
+                                        adapter_kind: kind,
+                                        model: choice,
+                                        permissions: defaults.permissions.clone(),
+                                    },
+                                ),
+                            )
+                            .unwrap();
+                        assert_eq!(saved.result.status, CommandResultStatus::Applied);
+                    }
+                    let saved = service
+                        .get_profile(&database, "agent_1")
+                        .unwrap()
+                        .unwrap()
+                        .runtime_configuration
+                        .unwrap()
+                        .model;
+                    let frozen = resolve_frozen_runtime_binding(
+                        database.connection(),
+                        &ResolvedRuntimeBinding {
+                            adapter_kind: kind,
+                            installation_id: installation_id.clone(),
+                            model: saved,
+                            permissions: defaults.permissions.clone(),
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(frozen.model.dsh_source, Some(expected));
+                    assert_eq!(
+                        service
+                            .resolve_rebound_runtime(&database, &frozen)
+                            .unwrap()
+                            .unwrap()
+                            .model
+                            .dsh_source,
+                        Some(expected),
+                        "rebound must retain selection provenance"
+                    );
+                }
+            }
+            if kind == AdapterKind::ClaudeCodeCli {
+                service
+                    .record_managed_probe_failure(
+                        &mut database,
+                        ManagedProbeFailure {
+                            adapter_kind: kind,
+                            auth_scope: "default",
+                            candidate_path: executable_path.to_str().unwrap(),
+                            fingerprint: Some(&fingerprint),
+                            source: Some(InstallationSource::InheritedPath),
+                            failure_class: "transient",
+                            diagnostic_code: "runtime_model_catalog_refresh_failed",
+                            failure: None,
+                        },
+                    )
+                    .unwrap();
+                let after_failure = service
+                    .get_profile(&database, &profile.agent_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    after_failure.runtime_configuration.as_ref().unwrap().model,
+                    selected
+                );
+                let saved_again = service
+                    .set_runtime(
+                        &mut database,
+                        &user_command(
+                            "save-after-catalog-failure",
+                            SetMemberRuntimeConfigurationCommand {
+                                environment_update: None,
+                                agent_id: profile.agent_id.clone(),
+                                expected_version: after_failure.version,
+                                adapter_kind: kind,
+                                model: selected.clone(),
+                                permissions: defaults.permissions.clone(),
+                            },
+                        ),
+                    )
+                    .unwrap();
+                assert_eq!(saved_again.result.status, CommandResultStatus::Applied);
+            }
+            let binding = ResolvedRuntimeBinding {
+                adapter_kind: kind,
+                installation_id,
+                model: selected,
+                permissions: defaults.permissions,
+            };
+            if matches!(kind, AdapterKind::ClaudeCodeCli | AdapterKind::CodexCli) {
+                // The existing admission owner also covers legacy member-env
+                // bindings. Only an exact current projection may retain the
+                // absence of a default Host connection; other guards remain.
+                let old = resolve_frozen_runtime_binding_with_snapshot(
+                    database.connection(),
+                    &binding,
+                    Some(None),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+                let context = crate::runtime_custom_api::native::NativeContext::resolve(
+                    kind,
+                    &Default::default(),
+                    database.path(),
+                )
+                .unwrap();
+                std::fs::create_dir_all(&context.directory).unwrap();
+                std::fs::write(
+                    context.path(),
+                    if kind == AdapterKind::CodexCli {
+                        "model_provider = \"fixture\"\n[model_providers.fixture]\nname = \"Fixture\"\nbase_url = \"https://host.invalid/v1\"\nwire_api = \"responses\"\nenv_key = \"FIXTURE_KEY\"\n"
+                    } else {
+                        r#"{"env":{"ANTHROPIC_BASE_URL":"https://host.invalid","ANTHROPIC_API_KEY":"fixture-host-key"}}"#
+                    },
+                )
+                .unwrap();
+                let hosted = resolve_frozen_runtime_binding(database.connection(), &binding)
+                    .unwrap()
+                    .unwrap();
+                assert!(hosted.custom_api.is_some(), "default Host must be readable");
+                assert_ne!(
+                    hosted.binding_compatibility_digest,
+                    old.binding_compatibility_digest
+                );
+                for previous in [
+                    old.binding_compatibility_digest.as_deref().unwrap(),
+                    hosted.binding_compatibility_digest.as_deref().unwrap(),
+                    "unknown-binding",
+                ] {
+                    let current = resolve_frozen_runtime_binding_with_snapshot(
+                        database.connection(),
+                        &binding,
+                        None,
+                        Some(previous),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    if Some(previous) == old.binding_compatibility_digest.as_deref() {
+                        assert!(current.custom_api.is_none());
+                        assert_eq!(
+                            current.binding_compatibility_digest.as_deref(),
+                            Some(previous)
+                        );
+                        assert_eq!(current.host_config_digest, old.host_config_digest);
+                    } else {
+                        assert!(current.custom_api.is_some());
+                        assert_eq!(
+                            current.binding_compatibility_digest,
+                            hosted.binding_compatibility_digest
+                        );
+                    }
+                }
+                let mut changed = binding.clone();
+                if kind == AdapterKind::CodexCli {
+                    changed.permissions.values["sandbox_mode"] =
+                        if binding.permissions.values["sandbox_mode"] == "read-only" {
+                            json!("workspace-write")
+                        } else {
+                            json!("read-only")
+                        };
+                } else {
+                    changed.permissions.values["permission_mode"] = json!("plan");
+                }
+                let incompatible = resolve_frozen_runtime_binding_with_snapshot(
+                    database.connection(),
+                    &changed,
+                    None,
+                    old.binding_compatibility_digest.as_deref(),
+                )
+                .unwrap()
+                .unwrap();
+                if kind == AdapterKind::CodexCli {
+                    assert!(incompatible.custom_api.is_some());
+                    assert_ne!(
+                        incompatible.binding_compatibility_digest,
+                        old.binding_compatibility_digest
+                    );
+                } else {
+                    // Claude permissions remain Run-scoped: keep the session,
+                    // while the process compatibility digest still changes.
+                    assert_eq!(
+                        incompatible.binding_compatibility_digest,
+                        old.binding_compatibility_digest
+                    );
+                    assert_ne!(incompatible.host_config_digest, old.host_config_digest);
+                }
+                changed.permissions.schema_version += 1;
+                assert!(
+                    resolve_frozen_runtime_binding_with_snapshot(
+                        database.connection(),
+                        &changed,
+                        None,
+                        old.binding_compatibility_digest.as_deref(),
+                    )
+                    .unwrap()
+                    .is_err(),
+                    "legacy identity cannot bypass permission validation"
+                );
+            }
+            let frozen = resolve_frozen_runtime_binding(database.connection(), &binding)
+                .unwrap()
+                .unwrap();
+            assert_eq!(frozen.executable_fingerprint, fingerprint);
+            assert!(frozen.reported_version.is_none());
+            assert!(frozen.capabilities.is_empty());
+            assert_eq!(frozen.model.model_id, "saved-model");
+            assert_eq!(
+                frozen.model.options,
+                if kind == AdapterKind::Pi {
+                    json!({"thinking_level":"future-native-level"})
+                } else {
+                    json!({"native-option":"saved-value"})
+                }
+            );
+            assert!(
+                service
+                    .runtime_dispatch_blocker(&database, &frozen)
+                    .unwrap()
+                    .is_none()
+            );
+            let identity = service
+                .verified_executable_identity(
+                    &database,
+                    &frozen.installation_id,
+                    &frozen.executable_path,
+                    &frozen.executable_fingerprint,
+                )
+                .unwrap()
+                .expect("a new installation needs no health snapshot to reuse file identity");
+            assert!(matches!(
+                crate::agent_runtime_adapter::verify_executable_integrity(
+                    &executable_path,
+                    Some(&identity),
+                    &fingerprint,
+                )
+                .unwrap(),
+                crate::agent_runtime_adapter::ExecutableIntegrityStatus::Unchanged
+            ));
+
+            assert!(
+                service
+                    .record_runtime_version(
+                        &mut database,
+                        &frozen.installation_id,
+                        &frozen.executable_path,
+                        &fingerprint,
+                        " 1.2.3 ",
+                    )
+                    .unwrap()
+            );
+            let observed = service
+                .managed_installation(&database, kind, "default")
+                .unwrap()
+                .unwrap();
+            let snapshot = observed.snapshot.unwrap();
+            assert_eq!(snapshot.reported_version.as_deref(), Some("1.2.3"));
+            assert_eq!(snapshot.probe_status, "installed_unverified");
+            assert!(snapshot.last_successful_probe_at.is_none());
+            for (path, identity, version) in [
+                ("different-path", fingerprint.as_str(), "9.0.0"),
+                (
+                    frozen.executable_path.as_str(),
+                    "obsolete-fingerprint",
+                    "9.0.0",
+                ),
+                (frozen.executable_path.as_str(), fingerprint.as_str(), " "),
+            ] {
+                assert!(
+                    !service
+                        .record_runtime_version(
+                            &mut database,
+                            &frozen.installation_id,
+                            path,
+                            identity,
+                            version,
+                        )
+                        .unwrap()
+                );
+            }
+            assert_eq!(
+                service
+                    .managed_installation(&database, kind, "default")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .unwrap()
+                    .reported_version
+                    .as_deref(),
+                Some("1.2.3")
+            );
+
+            if kind == AdapterKind::CodexCli {
+                // An upgrade leaves the old diagnostic intact; its fingerprint
+                // cannot turn every later Run into another full-file read.
+                let mut old_snapshot = ready_codex_snapshot();
+                old_snapshot.executable_fingerprint = Some(fingerprint.clone());
+                service
+                    .commit_verified_managed_installation(
+                        &mut database,
+                        VerifiedManagedInstallation {
+                            model_catalog_complete: true,
+                            executable_file_identity:
+                                crate::agent_runtime_adapter::observe_executable_file_identity(
+                                    std::path::Path::new(&(frozen.executable_path.clone())),
+                                )
+                                .ok(),
+                            adapter_kind: kind,
+                            executable_path: frozen.executable_path.clone(),
+                            command_name: kind.command_name().into(),
+                            source: InstallationSource::InheritedPath,
+                            auth_scope: "default".into(),
+                            snapshot: old_snapshot,
+                            entrypoint_locator_identity: None,
+                        },
+                    )
+                    .unwrap();
+                std::fs::write(&executable_path, b"upgraded-entry-only-fixture").unwrap();
+                let upgraded =
+                    crate::agent_runtime_adapter::executable_fingerprint(&executable_path).unwrap();
+                service
+                    .commit_discovered_runtime_entry(
+                        &mut database,
+                        DiscoveredRuntimeEntry {
+                            adapter_kind: kind,
+                            executable_path: frozen.executable_path.clone(),
+                            executable_fingerprint: upgraded.clone(),
+                            source: InstallationSource::InheritedPath,
+                            entrypoint_locator_identity: None,
+                        }
+                        .verify(None)
+                        .unwrap(),
+                        Some(&frozen.installation_id),
+                    )
+                    .unwrap();
+                let installation = service
+                    .managed_installation(&database, kind, "default")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    installation.snapshot.unwrap().executable_fingerprint,
+                    Some(fingerprint.clone())
+                );
+                let identity = service
+                    .verified_executable_identity(
+                        &database,
+                        &frozen.installation_id,
+                        &frozen.executable_path,
+                        &upgraded,
+                    )
+                    .unwrap()
+                    .expect("old diagnostics must not hide the upgraded identity");
+                assert!(matches!(
+                    crate::agent_runtime_adapter::verify_executable_integrity(
+                        &executable_path,
+                        Some(&identity),
+                        &upgraded,
+                    )
+                    .unwrap(),
+                    crate::agent_runtime_adapter::ExecutableIntegrityStatus::Unchanged
+                ));
+                assert!(
+                    service
+                        .verified_executable_identity(
+                            &database,
+                            &frozen.installation_id,
+                            &frozen.executable_path,
+                            &fingerprint,
+                        )
+                        .unwrap()
+                        .is_none(),
+                    "an obsolete frozen fingerprint is still fenced"
+                );
+                assert!(
+                    !service
+                        .record_runtime_version(
+                            &mut database,
+                            &frozen.installation_id,
+                            &frozen.executable_path,
+                            &fingerprint,
+                            "old-version",
+                        )
+                        .unwrap()
+                );
+                assert!(
+                    service
+                        .record_runtime_version(
+                            &mut database,
+                            &frozen.installation_id,
+                            &frozen.executable_path,
+                            &upgraded,
+                            "2.0.0",
+                        )
+                        .unwrap()
+                );
+                let snapshot = service
+                    .managed_installation(&database, kind, "default")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .unwrap();
+                assert_eq!(snapshot.reported_version.as_deref(), Some("2.0.0"));
+                assert_eq!(
+                    snapshot.executable_fingerprint.as_deref(),
+                    Some(upgraded.as_str())
+                );
+                assert_eq!(snapshot.probe_status, "installed_unverified");
+                assert_eq!(snapshot.authentication_status, "unknown");
+                assert!(snapshot.capabilities.is_empty());
+                assert!(snapshot.last_successful_probe_at.is_none());
+                database
+                    .connection()
+                    .execute(
+                        "UPDATE adapter_installation SET executable_path = ?2 WHERE id = ?1",
+                        params![
+                            frozen.installation_id,
+                            directory.join("other-entry").to_string_lossy()
+                        ],
+                    )
+                    .unwrap();
+                assert!(
+                    service
+                        .verified_executable_identity(
+                            &database,
+                            &frozen.installation_id,
+                            &frozen.executable_path,
+                            &upgraded,
+                        )
+                        .unwrap()
+                        .is_none(),
+                    "identity must remain bound to the current installation path"
+                );
+            }
+            drop(database);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn verified_relocation_preserves_installation_identity_and_never_commits_a_failed_candidate() {
+        let (mut database, directory) = production_like_database();
+        let service = AgentProfileService::default();
+        let original_path = test_executable_path(&directory, "original-codex");
+        let rejected_path = test_executable_path(&directory, "rejected-codex");
+        let replacement_path = test_executable_path(&directory, "replacement-codex");
+        let mut original_snapshot = ready_codex_snapshot();
+        original_snapshot.executable_fingerprint = Some("sha256:original".to_string());
+        let installation_id = service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(original_path.to_string_lossy().into_owned())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path: original_path.to_string_lossy().into_owned(),
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: original_snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        let profile = service.get_profile(&database, "agent_2").unwrap().unwrap();
+        service
+            .set_runtime(
+                &mut database,
+                &user_command(
+                    "select-managed-codex",
+                    SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
+                        agent_id: profile.agent_id,
+                        expected_version: profile.version,
+                        adapter_kind: AdapterKind::CodexCli,
+                        model: ModelSelection::RuntimeDefault,
+                        permissions: AdapterPermissionConfig {
+                            adapter_kind: AdapterKind::CodexCli,
+                            schema_version: 1,
+                            values: json!({
+                                "sandbox_mode": "danger-full-access",
+                                "approval_policy": "never",
+                            }),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+
+        service
+            .record_managed_probe_failure(
+                &mut database,
+                ManagedProbeFailure {
+                    adapter_kind: AdapterKind::CodexCli,
+                    auth_scope: "default",
+                    candidate_path: &rejected_path.to_string_lossy(),
+                    fingerprint: Some("sha256:wrong-program"),
+                    source: Some(InstallationSource::LoginShell),
+                    failure_class: "identity_changed",
+                    diagnostic_code: "runtime_identity_changed",
+                    failure: None,
+                },
+            )
+            .unwrap();
+        let rejected_candidate = service
+            .managed_installation(&database, AdapterKind::CodexCli, "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected_candidate.id, installation_id);
+        assert_eq!(
+            rejected_candidate.executable_path,
+            original_path.to_string_lossy()
+        );
+        assert_eq!(
+            rejected_candidate
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.executable_fingerprint.as_deref()),
+            Some("sha256:original")
+        );
+        assert_eq!(
+            rejected_candidate
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.stale_at.as_deref()),
+            None
+        );
+        assert_eq!(
+            rejected_candidate.model_catalog.status,
+            RuntimeModelCatalogCacheStatus::Fresh
+        );
+        let current_attempt = rejected_candidate.last_probe_attempt.as_ref().unwrap();
+        assert_eq!(current_attempt.status, "ready");
+        assert_eq!(current_attempt.failure_class, "none");
+        assert_eq!(
+            current_attempt.executable_fingerprint.as_deref(),
+            Some("sha256:original")
+        );
+        let retained_alternate_attempts = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM adapter_probe_attempt
+                WHERE installation_id = ?1
+                  AND executable_fingerprint = 'sha256:wrong-program'
+                  AND failure_class = 'transient'
+                  AND diagnostic_code = 'runtime_alternate_candidate_probe_failed'
+                "#,
+                [&installation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(retained_alternate_attempts, 1);
+        assert_eq!(
+            rejected_candidate.relocation_history[0].source,
+            Some(InstallationSource::LoginShell)
+        );
+        assert_eq!(rejected_candidate.relocation_history[0].result, "failed");
+
+        let mut replacement_snapshot = ready_codex_snapshot();
+        replacement_snapshot.reported_version = Some("0.145.0".to_string());
+        replacement_snapshot.executable_fingerprint = Some("sha256:replacement".to_string());
+        let relocated_id = service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(
+                                &(replacement_path.to_string_lossy().into_owned()),
+                            ),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path: replacement_path.to_string_lossy().into_owned(),
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::KnownLocation,
+                    auth_scope: "default".to_string(),
+                    snapshot: replacement_snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(relocated_id, installation_id);
+        let relocated = service
+            .managed_installation(&database, AdapterKind::CodexCli, "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            relocated.executable_path,
+            replacement_path.to_string_lossy()
+        );
+        assert_eq!(relocated.generation, 2);
+        assert_eq!(relocated.version, 2);
+        assert_eq!(relocated.path_state, "valid");
+        assert_eq!(relocated.relocation_history[0].result, "succeeded");
+        assert_eq!(
+            relocated
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.executable_fingerprint.as_deref()),
+            Some("sha256:replacement")
+        );
+        let resolved_profile = service.get_profile(&database, "agent_2").unwrap().unwrap();
+        assert_eq!(
+            resolved_profile
+                .runtime_configuration
+                .as_ref()
+                .map(|configuration| configuration.adapter_kind),
+            Some(AdapterKind::CodexCli)
+        );
+        assert_eq!(relocated.id, installation_id);
+        assert_eq!(
+            resolved_profile.runtime_readiness.status,
+            RuntimeReadinessStatus::InstalledUnverified
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn setting_a_starter_profile_away_survives_database_reopen() {
+        let (mut database, directory) = production_like_database();
+        let service = AgentProfileService::default();
+        let profile = service
+            .get_profile(&database, "agent_4")
+            .expect("profile should load")
+            .expect("profile should exist");
+        service
+            .set_presence(
+                &mut database,
+                &user_command(
+                    "away-qilu",
+                    SetMemberPresenceCommand {
+                        agent_id: profile.agent_id,
+                        expected_version: profile.version,
+                        presence: "away".to_string(),
+                    },
+                ),
+            )
+            .expect("profile should be away");
+        drop(database);
+
+        let reopened = Database::open(&directory).expect("database should reopen");
+        let profile = service
+            .get_profile(&reopened, "agent_4")
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert_eq!(profile.presence, "away");
+        assert_eq!(
+            profile.runtime_readiness.status,
+            RuntimeReadinessStatus::RuntimeNotConfigured
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn legacy_light_ready_is_launchable_and_missing_paths_remain_refreshable() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable_path = test_executable_path(&directory, "qwen");
+        std::fs::write(&executable_path, b"static-qwen-fixture").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let snapshot = AgentRuntimeAdapterRegistry::default()
+            .light_ready_snapshot(
+                AdapterKind::QwenCode,
+                Some("0.9.0".to_string()),
+                "sha256:qwen-light".to_string(),
+                chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        let installation_id = service
+            .commit_discovered_managed_installation(
+                &mut database,
+                DiscoveredManagedInstallation {
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().to_string())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::QwenCode,
+                    executable_path: executable_path.to_string_lossy().to_string(),
+                    command_name: "qwen".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        let installation = service
+            .managed_installation(&database, AdapterKind::QwenCode, "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            installation.snapshot.as_ref().unwrap().probe_status,
+            "light_ready"
+        );
+        let defaults = installation.member_runtime_defaults.unwrap();
+        assert_eq!(defaults.model, ModelSelection::RuntimeDefault);
+
+        let transient_failure = AgentRuntimeAdapterRegistry::default()
+            .light_failed_snapshot(
+                AdapterKind::QwenCode,
+                None,
+                "sha256:qwen-light".to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                "runtime_version_failed".to_string(),
+            )
+            .unwrap();
+        service
+            .commit_discovered_managed_installation(
+                &mut database,
+                DiscoveredManagedInstallation {
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().to_string())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::QwenCode,
+                    executable_path: executable_path.to_string_lossy().to_string(),
+                    command_name: "qwen".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: transient_failure,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        let preserved = service
+            .managed_installation(&database, AdapterKind::QwenCode, "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preserved.snapshot.as_ref().unwrap().probe_status,
+            "light_ready"
+        );
+        assert_eq!(preserved.generation, installation.generation);
+
+        let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
+        service
+            .set_runtime(
+                &mut database,
+                &user_command(
+                    "configure-light-qwen",
+                    SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
+                        agent_id: profile.agent_id.clone(),
+                        expected_version: profile.version,
+                        adapter_kind: AdapterKind::QwenCode,
+                        model: defaults.model.clone(),
+                        permissions: defaults.permissions.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        let configured = service
+            .get_profile(&database, &profile.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            configured.runtime_readiness.status,
+            RuntimeReadinessStatus::InstalledUnverified
+        );
+
+        let frozen = resolve_frozen_runtime_binding(
+            database.connection(),
+            &ResolvedRuntimeBinding {
+                adapter_kind: AdapterKind::QwenCode,
+                installation_id,
+                model: ModelSelection::RuntimeDefault,
+                permissions: defaults.permissions,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(frozen.model.model_id, "qwen-code://runtime-default");
+        assert_eq!(
+            service
+                .runtime_dispatch_blocker(&database, &frozen)
+                .unwrap()
+                .map(|blocker| blocker.code),
+            None
+        );
+
+        std::fs::remove_file(&executable_path).unwrap();
+        database
+            .record_runtime_search_environment_generation(7, &chrono::Utc::now().to_rfc3339())
+            .unwrap();
+        assert!(
+            !service
+                .mark_managed_installation_path_missing_if_current(
+                    &mut database,
+                    AdapterKind::QwenCode,
+                    "default",
+                    &frozen.installation_id,
+                    &frozen.executable_path,
+                    6,
+                )
+                .unwrap()
+        );
+        assert!(
+            service
+                .mark_managed_installation_path_missing_if_current(
+                    &mut database,
+                    AdapterKind::QwenCode,
+                    "default",
+                    &frozen.installation_id,
+                    &frozen.executable_path,
+                    7,
+                )
+                .unwrap()
+        );
+        let missing = service
+            .managed_installation(&database, AdapterKind::QwenCode, "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing.path_state, "path_missing");
+        assert_eq!(
+            service
+                .runtime_dispatch_blocker(&database, &frozen)
+                .unwrap()
+                .map(|blocker| blocker.code),
+            Some("runtime_path_invalid".to_string())
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn permission_descriptor_drift_does_not_preserve_ready_or_expand_saved_kiro_profiles() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable_path = test_executable_path(&directory, "kiro-cli");
+        std::fs::write(&executable_path, b"static-kiro-fixture").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut legacy_snapshot = AgentRuntimeAdapterRegistry::default()
+            .acp_capability_snapshot(crate::agent_runtime_adapter::AcpProbeObservation {
+                adapter_kind: AdapterKind::KiroCli,
+                reported_version: Some("2.15.0".to_string()),
+                executable_fingerprint: Some("sha256:kiro-static".to_string()),
+                authentication_status: "authenticated".to_string(),
+                probe_status: "ready".to_string(),
+                capabilities: Vec::new(),
+                initialize_result: Some(json!({"protocolVersion": 1})),
+                session_result: Some(json!({
+                    "sessionId": "legacy-kiro",
+                    "models": {
+                        "currentModelId": "claude-sonnet",
+                        "availableModels": [{
+                            "modelId": "claude-sonnet",
+                            "name": "Claude Sonnet"
+                        }]
+                    }
+                })),
+                attempted_at: "2026-08-16T00:00:00Z".to_string(),
+                last_error: None,
+            })
+            .unwrap();
+        legacy_snapshot.permission_options.clear();
+        legacy_snapshot.permission_schema_digest = canonical_json_digest(
+            &serde_json::to_value(&legacy_snapshot.permission_options).unwrap(),
+        )
+        .unwrap();
+
+        service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().to_string())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::KiroCli,
+                    executable_path: executable_path.to_string_lossy().to_string(),
+                    command_name: "kiro-cli".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: legacy_snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
+        // Simulate a member saved by the old schema. Current saves already
+        // reject these incomplete permissions; discovery must not broaden them.
+        database.connection().execute(
+            "UPDATE agent_profile SET selected_runtime_adapter_kind = 'kiro-cli',
+                default_runtime_installation_id = (SELECT id FROM adapter_installation WHERE adapter_kind = 'kiro-cli'),
+                default_model_selection_json = ?2, default_permission_config_json = ?3 WHERE id = ?1",
+            params![profile.agent_id, serde_json::to_string(&ModelSelection::RuntimeDefault).unwrap(),
+                serde_json::to_string(&AdapterPermissionConfig { adapter_kind: AdapterKind::KiroCli, schema_version: 1, values: json!({}) }).unwrap()],
+        ).unwrap();
+
+        let current_snapshot = AgentRuntimeAdapterRegistry::default()
+            .light_ready_snapshot(
+                AdapterKind::KiroCli,
+                Some("2.16.1".to_string()),
+                "sha256:kiro-static".to_string(),
+                "2026-08-17T00:00:00Z".to_string(),
+            )
+            .unwrap();
+        service
+            .commit_discovered_managed_installation(
+                &mut database,
+                DiscoveredManagedInstallation {
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().to_string())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::KiroCli,
+                    executable_path: executable_path.to_string_lossy().to_string(),
+                    command_name: "kiro-cli".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: current_snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+
+        let installation = service
+            .managed_installation(&database, AdapterKind::KiroCli, "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            installation.snapshot.as_ref().unwrap().probe_status,
+            "light_ready"
+        );
+        assert_eq!(
+            installation
+                .member_runtime_defaults
+                .as_ref()
+                .unwrap()
+                .permissions
+                .values,
+            json!({"trust_all_tools": "on"})
+        );
+        let deferred = service
+            .get_profile(&database, &profile.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            deferred
+                .runtime_configuration
+                .as_ref()
+                .unwrap()
+                .permissions
+                .values,
+            json!({}),
+            "a descriptor refresh must not silently broaden an existing member"
+        );
+        assert_eq!(
+            deferred.runtime_readiness.status,
+            RuntimeReadinessStatus::NeedsAttention
+        );
+
+        let verified_snapshot = AgentRuntimeAdapterRegistry::default()
+            .acp_capability_snapshot(crate::agent_runtime_adapter::AcpProbeObservation {
+                adapter_kind: AdapterKind::KiroCli,
+                reported_version: Some("2.16.1".to_string()),
+                executable_fingerprint: Some("sha256:kiro-static".to_string()),
+                authentication_status: "authenticated".to_string(),
+                probe_status: "ready".to_string(),
+                capabilities: Vec::new(),
+                initialize_result: Some(json!({"protocolVersion": 1})),
+                session_result: Some(json!({
+                    "sessionId": "current-kiro",
+                    "models": {
+                        "currentModelId": "claude-sonnet",
+                        "availableModels": [{
+                            "modelId": "claude-sonnet",
+                            "name": "Claude Sonnet"
+                        }]
+                    }
+                })),
+                attempted_at: "2026-08-17T00:01:00Z".to_string(),
+                last_error: None,
+            })
+            .unwrap();
+        service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().to_string())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::KiroCli,
+                    executable_path: executable_path.to_string_lossy().to_string(),
+                    command_name: "kiro-cli".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot: verified_snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+        let configured = service
+            .get_profile(&database, &profile.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            configured
+                .runtime_configuration
+                .as_ref()
+                .unwrap()
+                .permissions
+                .values,
+            json!({}),
+            "a deep probe must not silently broaden an existing member"
+        );
+        assert_eq!(
+            configured.runtime_readiness.status,
+            RuntimeReadinessStatus::NeedsAttention
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn failed_light_probe_retains_diagnostics_without_locking_configuration() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable_path = test_executable_path(&directory, "qwen-failed");
+        std::fs::write(&executable_path, b"static-qwen-fixture").unwrap();
+        let snapshot = AgentRuntimeAdapterRegistry::default()
+            .light_failed_snapshot(
+                AdapterKind::QwenCode,
+                None,
+                "sha256:qwen-light-failed".to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                "runtime_version_failed".to_string(),
+            )
+            .unwrap();
+        service
+            .commit_discovered_managed_installation(
+                &mut database,
+                DiscoveredManagedInstallation {
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.to_string_lossy().to_string())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::QwenCode,
+                    executable_path: executable_path.to_string_lossy().to_string(),
+                    command_name: "qwen".to_string(),
+                    source: InstallationSource::InheritedPath,
+                    auth_scope: "default".to_string(),
+                    snapshot,
+                    entrypoint_locator_identity: None,
+                },
+            )
+            .unwrap();
+
+        let installation = service
+            .managed_installation(&database, AdapterKind::QwenCode, "default")
+            .unwrap()
+            .unwrap();
+        let snapshot = installation.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.probe_status, "light_failed");
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("runtime_version_failed")
+        );
+        assert!(installation.member_runtime_defaults.is_some());
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn removing_a_member_hides_management_and_preserves_its_internal_identity() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let profile = service
+            .get_profile(&database, "agent_4")
+            .expect("profile should load")
+            .expect("profile should exist");
+        let original_handle = database
+            .connection()
+            .query_row(
+                "SELECT COALESCE(handle, '') FROM agent_profile WHERE id = ?1",
+                [&profile.agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("legacy handle should remain internally readable");
+        let preview = service
+            .removal_preview(&database, &profile.agent_id)
+            .expect("preview should load")
+            .expect("member should be removable");
+        assert!(preview.removable);
+        assert_eq!(preview.non_terminal_agent_run_count, 0);
+
+        let mismatch = service
+            .remove_member(
+                &mut database,
+                &user_command(
+                    "remove-qilu-mismatch",
+                    RemoveMemberCommand {
+                        agent_id: profile.agent_id.clone(),
+                        expected_version: profile.version,
+                        confirmation_name: "QILU".to_string(),
+                    },
+                ),
+            )
+            .expect("mismatch should be a durable rejection");
+        assert_eq!(
+            mismatch.result.code,
+            "agent_profile.confirmation_name_mismatch"
+        );
+
+        let removed = service
+            .remove_member(
+                &mut database,
+                &user_command(
+                    "remove-qilu",
+                    RemoveMemberCommand {
+                        agent_id: profile.agent_id.clone(),
+                        expected_version: profile.version,
+                        confirmation_name: profile.display_name.clone(),
+                    },
+                ),
+            )
+            .expect("member should be removed");
+        assert_eq!(removed.result.code, "agent_profile.removed");
+        assert!(
+            service
+                .get_profile(&database, &profile.agent_id)
+                .expect("management read should succeed")
+                .is_none()
+        );
+
+        let retained: (String, String, Option<String>, String, i64) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT COALESCE(handle, ''), display_name, avatar_ref,
+                       profile_status, version
+                FROM agent_profile WHERE id = ?1
+                "#,
+                [&profile.agent_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("removed identity should remain");
+        assert_eq!(retained.0, original_handle);
+        assert_eq!(retained.1, profile.display_name);
+        assert_eq!(retained.2, profile.avatar_ref);
+        assert_eq!(retained.3, "removed");
+        assert_eq!(retained.4, profile.version + 1);
+
+        let reserved_name = service
+            .create_profile(
+                &mut database,
+                &user_command(
+                    "reuse-qilu-name",
+                    create_identity(&profile.display_name, "用于验证名称全局保留。"),
+                ),
+            )
+            .expect("reserved name should be a durable rejection");
+        assert_eq!(
+            reserved_name.result.code,
+            "agent_profile.display_name_conflict"
+        );
+
+        let replacement = service
+            .create_profile(
+                &mut database,
+                &user_command(
+                    "create-qilu-replacement",
+                    create_identity("新绮露", "用于验证后台生成新的内部 ID。"),
+                ),
+            )
+            .expect("replacement profile should be created");
+        assert_eq!(replacement.result.code, "agent_profile.created");
+        let replacement = service
+            .list_profiles(&database)
+            .expect("profiles should load")
+            .into_iter()
+            .find(|candidate| candidate.display_name == "新绮露")
+            .expect("replacement should be visible");
+        assert_eq!(replacement.agent_id, "agent_5");
+        assert!(
+            serde_json::to_value(&replacement)
+                .unwrap()
+                .get("handle")
+                .is_none()
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn profile_display_names_are_globally_unique_and_updates_preserve_legacy_aliases() {
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let created = service
+            .create_profile(
+                &mut database,
+                &user_command(
+                    "create-builder",
+                    create_identity("Builder", "Builds scoped changes."),
+                ),
+            )
+            .expect("profile should be created");
+        let profile_id = created.result.payload["agentId"]
+            .as_str()
+            .expect("profile id");
+        let profile = service
+            .get_profile(&database, profile_id)
+            .expect("profile should load")
+            .expect("profile should exist");
+        let original_handle = database
+            .connection()
+            .query_row(
+                "SELECT COALESCE(handle, '') FROM agent_profile WHERE id = ?1",
+                [&profile.agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("legacy handle should remain internally readable");
+
+        let duplicate = service
+            .create_profile(
+                &mut database,
+                &user_command(
+                    "create-duplicate-builder",
+                    create_identity(" builder ", "Duplicate name."),
+                ),
+            )
+            .expect("duplicate should be a durable rejection");
+        assert_eq!(duplicate.result.code, "agent_profile.display_name_conflict");
+
+        let updated = service
+            .update_profile(
+                &mut database,
+                &user_command("rename-builder", update_identity(&profile, "Builder Prime")),
+            )
+            .expect("profile should update");
+        assert_eq!(updated.result.code, "agent_profile.updated");
+        let updated_profile = service
+            .get_profile(&database, &profile.agent_id)
+            .expect("profile should load")
+            .expect("profile should exist");
+        let updated_handle = database
+            .connection()
+            .query_row(
+                "SELECT COALESCE(handle, '') FROM agent_profile WHERE id = ?1",
+                [&profile.agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("legacy handle should remain internally readable");
+        assert_eq!(updated_handle, original_handle);
+        assert_eq!(updated_profile.display_name, "Builder Prime");
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn starter_profile_user_edits_survive_database_reopen() {
+        let (mut database, directory) = production_like_database();
+        let service = AgentProfileService::default();
+        let profile = service
+            .get_profile(&database, "agent_4")
+            .expect("profile should load")
+            .expect("profile should exist");
+        service
+            .update_profile(
+                &mut database,
+                &user_command(
+                    "edit-qilu",
+                    UpdateAgentProfileCommand {
+                        working_principles: "只在未来 Run 生效。".to_string(),
+                        ..update_identity(&profile, &profile.display_name)
+                    },
+                ),
+            )
+            .expect("profile should be updated");
+        drop(database);
+
+        let reopened = Database::open(&directory).expect("database should reopen");
+        let profile = service
+            .get_profile(&reopened, "agent_4")
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert_eq!(profile.working_principles, "只在未来 Run 生效。");
+        drop(reopened);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn setting_a_default_lead_away_does_not_mutate_the_camp() {
+        let (mut database, directory) = database();
+        let collaboration = CollaborationService::default();
+        let camp = collaboration
+            .create_camp(
+                &mut database,
+                &user_command(
+                    "create-default-lead-camp",
+                    CreateThreadCommand::for_test(
+                        directory.join("quick-chat").to_string_lossy().to_string(),
+                    ),
+                ),
+            )
+            .expect("Camp should be created");
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .expect("Camp ID should be returned")
+            .to_string();
+        collaboration
+            .add_camp_member(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "add-default-lead".to_string(),
+                    actor: ActorRef::User {
+                        user_id: "local_user".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: AddThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_1".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                },
+            )
+            .expect("Default Lead should join the Camp");
+        collaboration
+            .add_camp_member(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "add-default-lead-successor".to_string(),
+                    actor: ActorRef::User {
+                        user_id: "local_user".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: AddThreadMemberCommand {
+                        camp_id: camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                },
+            )
+            .expect("A successor candidate should join the Camp");
+        let service = AgentProfileService::default();
+        let profile = service
+            .get_profile(&database, "agent_1")
+            .expect("profile should load")
+            .expect("profile should exist");
+        let result = service
+            .set_presence(
+                &mut database,
+                &user_command(
+                    "away-luoke",
+                    SetMemberPresenceCommand {
+                        agent_id: profile.agent_id.clone(),
+                        expected_version: profile.version,
+                        presence: "away".to_string(),
+                    },
+                ),
+            )
+            .expect("presence should change independently");
+        assert_eq!(result.result.code, "agent_profile.presence_changed");
+        let (lead, status): (Option<String>, String) = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT camp.default_lead_agent_id, agent_profile.profile_status
+                FROM camp, agent_profile
+                WHERE camp.id = ?1 AND agent_profile.id = ?2
+                "#,
+                params![camp_id, profile.agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("lead and profile should remain queryable");
+        assert_eq!(lead.as_deref(), Some("agent_1"));
+        assert_eq!(status, "away");
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+
+    #[test]
+    fn resolved_command_shim_locator_is_durable_and_invalidates_ready_snapshot_on_change() {
+        let (mut database, directory) = production_like_database();
+        let service = AgentProfileService::default();
+        let executable = test_executable_path(&directory, "resolved-codex");
+        std::fs::write(&executable, b"native codex").unwrap();
+        let executable_path = executable.to_string_lossy().into_owned();
+        let executable_fingerprint = "sha256:test".to_string();
+        let locator = |suffix: &str| RuntimeEntrypointLocatorIdentity {
+            entrypoint_kind: "npm_cmd_shim".to_string(),
+            canonical_shim_path: directory
+                .join("npm/codex.cmd")
+                .to_string_lossy()
+                .into_owned(),
+            shim_content_digest: format!("sha256:shim-{suffix}"),
+            canonical_interpreter_path: directory
+                .join("System32/cmd.exe")
+                .to_string_lossy()
+                .into_owned(),
+            interpreter_fingerprint: "sha256:cmd".to_string(),
+            resolved_target_path: executable_path.clone(),
+            resolved_target_fingerprint: executable_fingerprint.clone(),
+            compatibility_fingerprint: format!("sha256:locator-{suffix}"),
+        };
+        let first_locator = locator("one");
+        let mut ready = ready_codex_snapshot();
+        ready.executable_fingerprint = Some(executable_fingerprint.clone());
+        let installation_id = service
+            .commit_verified_managed_installation(
+                &mut database,
+                VerifiedManagedInstallation {
+                    model_catalog_complete: true,
+                    executable_file_identity:
+                        crate::agent_runtime_adapter::observe_executable_file_identity(
+                            std::path::Path::new(&(executable_path.clone())),
+                        )
+                        .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path: executable_path.clone(),
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::Manual,
+                    auth_scope: "default".to_string(),
+                    snapshot: ready.clone(),
+                    entrypoint_locator_identity: Some(first_locator.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .runtime_entrypoint_locator_identity(&database, &installation_id)
+                .unwrap(),
+            Some(first_locator.clone())
+        );
+
+        database
+            .connection()
+            .execute_batch("SAVEPOINT locator_without_health")
+            .unwrap();
+        for sql in [
+            "UPDATE adapter_capability_snapshot SET executable_fingerprint = 'sha256:old-diagnostic'",
+            "DELETE FROM adapter_capability_snapshot",
+            "DELETE FROM runtime_executable_identity",
+        ] {
+            database.connection().execute(sql, []).unwrap();
+            assert_eq!(
+                service
+                    .runtime_entrypoint_locator_identity(&database, &installation_id)
+                    .unwrap(),
+                Some(first_locator.clone()),
+                "re-resolution must retain its saved locator without diagnostics or after file identity invalidation"
+            );
+        }
+        database
+            .connection()
+            .execute(
+                "UPDATE adapter_installation SET executable_path = ?1 WHERE id = ?2",
+                params![
+                    directory.join("another-target").to_string_lossy(),
+                    installation_id
+                ],
+            )
+            .unwrap();
+        assert!(
+            service
+                .runtime_entrypoint_locator_identity(&database, &installation_id)
+                .unwrap()
+                .is_none()
+        );
+        database
+            .connection()
+            .execute_batch("ROLLBACK TO locator_without_health; RELEASE locator_without_health")
+            .unwrap();
+
+        let second_locator = locator("two");
+        let mut light = ready;
+        light.authentication_status = "unknown".to_string();
+        light.probe_status = "light_ready".to_string();
+        light.capabilities.clear();
+        light.protocols.clear();
+        light.last_successful_probe_at = None;
+        light.native_session_compatibility_key = Some(format!(
+            "runtime-entrypoint:windows-resolved-command-shim-v1:{}",
+            second_locator.compatibility_fingerprint
+        ));
+        service
+            .commit_discovered_managed_installation(
+                &mut database,
+                DiscoveredManagedInstallation {
+                    executable_file_identity: observe_executable_file_identity(Path::new(
+                        &executable_path,
+                    ))
+                    .ok(),
+                    adapter_kind: AdapterKind::CodexCli,
+                    executable_path,
+                    command_name: "codex".to_string(),
+                    source: InstallationSource::Manual,
+                    auth_scope: "default".to_string(),
+                    snapshot: light,
+                    entrypoint_locator_identity: Some(second_locator.clone()),
+                },
+            )
+            .unwrap();
+
+        let installation = service
+            .managed_installation(&database, AdapterKind::CodexCli, "default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(installation.generation, 2);
+        assert_eq!(installation.snapshot.unwrap().probe_status, "light_ready");
+        assert_eq!(
+            service
+                .runtime_entrypoint_locator_identity(&database, &installation_id)
+                .unwrap(),
+            Some(second_locator)
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("temporary database should be removable");
+    }
+}

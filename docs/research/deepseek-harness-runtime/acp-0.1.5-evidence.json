@@ -1,0 +1,906 @@
+{
+  "schemaVersion": 1,
+  "runtime": "deepseek-harness",
+  "runtimeVersion": "0.1.5-rc.2",
+  "platform": "macos-arm64",
+  "date": "2026-09-15",
+  "baseCommit": "19d1ce088b676e2f5cd39c4a29b8e2ac7f4697db",
+  "admission": "qualified",
+  "firstClass": true,
+  "notice": "Sanitized research evidence supporting macOS arm64 qualification only. The adapter-scoped immutable artifact owns platform admission; native-provider and controlled fault-injection results remain separately identified.",
+  "nativeProvider": {
+    "basic": {
+      "modelCount": 4,
+      "model": "deepseek-harness://runtime-default",
+      "hostInstanceId": "7c4d1344-0ad2-47d5-8048-814cf5aefefb",
+      "nativeSessionId": "b218b53d-1168-4004-bb56-03af6724a497"
+    },
+    "fileOperations": [
+      {
+        "name": "read",
+        "agentRunId": "c3b16c71-9c49-41b6-b9f1-b3b774be1c99",
+        "runStatus": "succeeded",
+        "fileEffect": "passed",
+        "typedProjection": "passed",
+        "typedOperationCount": 1,
+        "fileLinkMatchesExpected": true,
+        "diffChangeKind": null
+      },
+      {
+        "name": "add",
+        "agentRunId": "f20896ea-ff72-4792-a93d-d5d5baac1d14",
+        "runStatus": "succeeded",
+        "fileEffect": "passed",
+        "typedProjection": "passed",
+        "typedOperationCount": 1,
+        "fileLinkMatchesExpected": true,
+        "diffChangeKind": null
+      },
+      {
+        "name": "edit",
+        "agentRunId": "11ec0b2c-931c-4b61-ad16-6548a2b4a1fc",
+        "runStatus": "succeeded",
+        "fileEffect": "passed",
+        "typedProjection": "passed",
+        "typedOperationCount": 1,
+        "fileLinkMatchesExpected": true,
+        "diffChangeKind": "update"
+      },
+      {
+        "name": "edit_empty",
+        "agentRunId": "9940b517-29cc-4582-9ceb-35ac93c572b9",
+        "runStatus": "succeeded",
+        "fileEffect": "passed",
+        "typedProjection": "passed",
+        "typedOperationCount": 1,
+        "fileLinkMatchesExpected": true,
+        "diffChangeKind": null
+      }
+    ],
+    "commandOutput": {
+      "outcome": "succeeded",
+      "nativeSessionContinued": true,
+      "warmHostReused": true
+    },
+    "commandOutputMatrix": [
+      {
+        "name": "stdout",
+        "runStatus": "succeeded",
+        "toolStatus": "completed",
+        "toolCallId": "call_00_xmUT4pKOyLcsRwrjYf5k6778",
+        "approvalCount": 0,
+        "outputBytes": 33,
+        "projectionTruncated": false
+      },
+      {
+        "name": "stderr",
+        "runStatus": "succeeded",
+        "toolStatus": "completed",
+        "toolCallId": "call_00_0jamCYZWZyYp7eZfbRaN5611",
+        "approvalCount": 0,
+        "outputBytes": 42,
+        "projectionTruncated": false
+      },
+      {
+        "name": "mixed",
+        "runStatus": "succeeded",
+        "toolStatus": "completed",
+        "toolCallId": "call_00_ET_Bpa7VKGQoUeB9juyVDOL1381",
+        "approvalCount": 0,
+        "outputBytes": 87,
+        "projectionTruncated": false
+      },
+      {
+        "name": "empty",
+        "runStatus": "succeeded",
+        "toolStatus": "completed",
+        "toolCallId": "call_00_ET_PdOBlEaIYvvymrstvOz61409",
+        "approvalCount": 0,
+        "outputBytes": 11,
+        "projectionTruncated": false
+      },
+      {
+        "name": "nonzero",
+        "runStatus": "succeeded",
+        "toolStatus": "failed",
+        "toolCallId": "call_00_ET_mOpwMp1iMGDLspV7UlX22060",
+        "approvalCount": 0,
+        "outputBytes": 57,
+        "projectionTruncated": false
+      },
+      {
+        "name": "large",
+        "runStatus": "succeeded",
+        "toolStatus": "completed",
+        "toolCallId": "call_00_tzu3pxqPRzv9FcsmRPo50575",
+        "approvalCount": 0,
+        "outputBytes": 4055,
+        "projectionTruncated": true
+      }
+    ],
+    "nativeCompactionAndResume": {
+      "multiSessionSwitch": {
+        "passed": true,
+        "distinctSessions": true
+      },
+      "compaction_manual": {
+        "mode": "manual",
+        "completed": true,
+        "before": 0,
+        "after": 1,
+        "nodes": 8,
+        "bootstrapRetained": true,
+        "trigger": "official API control; native summarizer"
+      },
+      "compaction_pressure": {
+        "mode": "pressure",
+        "completed": true,
+        "before": 1,
+        "after": 2,
+        "nodes": 6,
+        "bootstrapRetained": true,
+        "trigger": "official API control; native summarizer"
+      },
+      "compaction_context-overflow": {
+        "mode": "context-overflow",
+        "completed": true,
+        "before": 2,
+        "after": 3,
+        "nodes": 8,
+        "bootstrapRetained": true,
+        "trigger": "official API control; native summarizer"
+      },
+      "compactedColdResume": {
+        "passed": true,
+        "sessionId": "9733deaa-1d95-4612-a223-d0179b00fe92",
+        "hostChanged": true
+      },
+      "invalidResume": {
+        "rejected": true
+      },
+      "automaticPressure": {
+        "passed": true,
+        "bootstrapRetained": true,
+        "before": 3,
+        "after": 4
+      },
+      "automaticOverflowRetry": {
+        "passed": true,
+        "bootstrapRetained": true,
+        "trigger": "one controlled CONTEXT_WINDOW_EXCEEDED at official llm/stream seam; real native compaction and retried model response"
+      },
+      "compaction_cancelled": {
+        "rejected": true,
+        "before": 5,
+        "after": 5,
+        "noFalseCompletion": true
+      },
+      "compaction_failed": {
+        "rejected": true,
+        "before": 5,
+        "after": 5,
+        "noFalseCompletion": true
+      }
+    },
+    "skills": {
+      "ok": true,
+      "importedDefaultEnabled": true,
+      "importedDefaultAllGroups": true,
+      "duplicateImportIdempotent": true,
+      "sourceIndependent": true,
+      "gitignoreUnchanged": true,
+      "projectOwnedConflictPreserved": true,
+      "restartRecovered": true,
+      "importedHardDeleted": true,
+      "runtimes": [
+        {
+          "adapterKind": "deepseek-harness",
+          "reportedVersion": "0.1.5-rc.2",
+          "nativeRoot": ".dsh/skills",
+          "groupKey": "dsh",
+          "cliOperationsMessageLocalAttention": true,
+          "agentRunId": "59d28714-8685-4173-9111-87e91454cd4e"
+        }
+      ]
+    },
+    "builtinCli": {
+      "ok": true,
+      "contractVersion": 24,
+      "ipcProtocolVersion": 2,
+      "operationCountPerRuntime": 22,
+      "expectedOperations": [
+        "automation.close",
+        "automation.create",
+        "automation.delete",
+        "automation.get",
+        "automation.list",
+        "automation.run",
+        "automation.update",
+        "camp.list",
+        "camp.message.send",
+        "camp.read",
+        "camp.search",
+        "history.search",
+        "member.create",
+        "memory.read",
+        "memory.search",
+        "memory.view",
+        "memory.write",
+        "team.create_task",
+        "team.gather",
+        "team.get_task",
+        "team.list_tasks",
+        "team.update_task"
+      ],
+      "results": [
+        {
+          "adapterKind": "deepseek-harness",
+          "reportedVersion": "0.1.5-rc.2",
+          "sourceAgentRunId": "3b8cf07e-b4a1-4ee1-b0a9-60e20a56303e",
+          "resumedAgentRunId": "6ac7994a-a9bd-4e6f-8951-6d4b49dfb945",
+          "gatherCapturedReturnVerified": true,
+          "fullRunEvidenceCount": 70,
+          "legacySendFlagRejected": true,
+          "legacySendJsonRejected": true,
+          "exactAddressingVerifiedInSuccessorRun": true,
+          "staleVersionConflict": true,
+          "initialLeaseFenced": true,
+          "resumedLeaseFenced": true,
+          "logicalConversationContinued": true,
+          "nativeSessionContinued": true
+        }
+      ]
+    },
+    "mcpBeforeSessionLockFix": {
+      "passedTransportAndVisibility": true,
+      "exactResumeQualified": false,
+      "note": "Configuration updates worked but revealed native Session lock conflicts; fixed afterward in shared Fleet."
+    },
+    "usageRunSummaries": [
+      {
+        "agent_run_id": "b3c9faaa-2f83-4521-a8b2-449e33d27c11",
+        "usage_source": "runtime_event",
+        "usage_quality": "runtime_reported",
+        "input_semantics": "exclusive_buckets",
+        "uncached_input_tokens": 9196,
+        "cache_read_tokens": 768,
+        "cache_write_tokens": null,
+        "output_tokens": 114,
+        "reasoning_output_tokens": 104,
+        "cost_amount_decimal": null
+      },
+      {
+        "agent_run_id": "671d605a-8211-41fd-a43a-9120c58ec6da",
+        "usage_source": "runtime_event",
+        "usage_quality": "runtime_reported",
+        "input_semantics": "exclusive_buckets",
+        "uncached_input_tokens": 596,
+        "cache_read_tokens": 20224,
+        "cache_write_tokens": null,
+        "output_tokens": 122,
+        "reasoning_output_tokens": 44,
+        "cost_amount_decimal": null
+      },
+      {
+        "agent_run_id": "afd624e1-9062-4d9e-a156-df9e2f6c76cf",
+        "usage_source": "runtime_event",
+        "usage_quality": "runtime_reported",
+        "input_semantics": "exclusive_buckets",
+        "uncached_input_tokens": 656,
+        "cache_read_tokens": 20992,
+        "cache_write_tokens": null,
+        "output_tokens": 122,
+        "reasoning_output_tokens": 14,
+        "cost_amount_decimal": null
+      },
+      {
+        "agent_run_id": "7186f636-a8a1-4f4a-b35f-ee51bf5789b6",
+        "usage_source": "runtime_event",
+        "usage_quality": "runtime_reported",
+        "input_semantics": "exclusive_buckets",
+        "uncached_input_tokens": 487,
+        "cache_read_tokens": 22016,
+        "cache_write_tokens": null,
+        "output_tokens": 123,
+        "reasoning_output_tokens": 6,
+        "cost_amount_decimal": null
+      },
+      {
+        "agent_run_id": "244c3d28-93a0-4569-a3a9-31b49654980d",
+        "usage_source": "runtime_event",
+        "usage_quality": "runtime_reported",
+        "input_semantics": "exclusive_buckets",
+        "uncached_input_tokens": 554,
+        "cache_read_tokens": 22912,
+        "cache_write_tokens": null,
+        "output_tokens": 168,
+        "reasoning_output_tokens": 0,
+        "cost_amount_decimal": null
+      },
+      {
+        "agent_run_id": "df507971-a659-4066-afb6-77036f285f0a",
+        "usage_source": "runtime_event",
+        "usage_quality": "runtime_reported",
+        "input_semantics": "exclusive_buckets",
+        "uncached_input_tokens": 517,
+        "cache_read_tokens": 23808,
+        "cache_write_tokens": null,
+        "output_tokens": 80,
+        "reasoning_output_tokens": 0,
+        "cost_amount_decimal": null
+      },
+      {
+        "agent_run_id": "e8bc552c-df10-4c5c-9b02-cd8289b1cadd",
+        "usage_source": "runtime_event",
+        "usage_quality": "runtime_reported",
+        "input_semantics": "exclusive_buckets",
+        "uncached_input_tokens": 559,
+        "cache_read_tokens": 24576,
+        "cache_write_tokens": null,
+        "output_tokens": 147,
+        "reasoning_output_tokens": 21,
+        "cost_amount_decimal": null
+      },
+      {
+        "agent_run_id": "9935a103-3e63-43ad-a37f-bd1cce196d96",
+        "usage_source": "runtime_event",
+        "usage_quality": "runtime_reported",
+        "input_semantics": "exclusive_buckets",
+        "uncached_input_tokens": 21614,
+        "cache_read_tokens": 25728,
+        "cache_write_tokens": null,
+        "output_tokens": 264,
+        "reasoning_output_tokens": 74,
+        "cost_amount_decimal": null
+      }
+    ]
+  },
+  "controlledModel": {
+    "mcp": {
+      "ok": true,
+      "modelSource": "scripted MCP-only acceptance fixture; no provider generation",
+      "semantics": "Runtime-native config is preserved; Codex skips collisions, Grok skips active native collisions and adds distinct per-Run servers, while other additive adapters give Rovai the whole-definition precedence",
+      "results": [
+        {
+          "adapterKind": "deepseek-harness",
+          "lifecycle": {
+            "updateObserved": true,
+            "oldHostFenced": true,
+            "adjacentAssignmentIsolated": true,
+            "unassignedNativeRestored": true,
+            "reassignedObserved": true,
+            "deletedNativeRestored": true,
+            "agentRunIds": [
+              "985d09db-50a9-43a8-8e15-47ffbe30db7f",
+              "29981a50-ad00-402c-bc04-72bb566b51bb",
+              "e2c62b7f-e488-4495-bf63-9767b3cc30c2",
+              "191cc9d0-1a5c-40ef-a3cb-9098472af70f",
+              "33889113-7086-4986-8648-24baaf5bb6a1"
+            ]
+          },
+          "safety": {
+            "allowOnceEffectCount": 1,
+            "denyNoEffect": true,
+            "cancelNoEffect": true,
+            "readOnlyNoEffect": true
+          },
+          "reportedVersion": "0.1.5-rc.2",
+          "modelId": "runtime_default",
+          "runtimeNames": [
+            "rovai_smoke",
+            "rovai_smoke_http",
+            "rovai_smoke_stdio"
+          ],
+          "results": [
+            "rovai-projection:deepseek_harness",
+            "rovai-projection-http:deepseek_harness-http",
+            "rovai-projection-stdio:deepseek_harness-stdio"
+          ],
+          "agentRunId": "b97de246-95d0-46d6-8927-7e1df88e8923",
+          "durationMs": 57692
+        }
+      ]
+    }
+  },
+  "blocked": [],
+  "privateLogSha256": {
+    "core": "d8b172e9d81a91a890c22b62d498dcccc892dbfea540828fcadf164905be682d",
+    "command3": "812c4e59c278964ccce0a083c8b848ddca1443a8622eefc7109a5e1fb5767692",
+    "native7": "20965d1f583bcae2baf3126ed42a476908e77f8c971672d75ca02807265d18df",
+    "skills3": "67dcf7a42de1fcbffdb3ed19c1071b96fb9da79c46c80ad56c766805c5ef595e",
+    "builtin2": "13d177796cc734e4ff27c3ec0070a6f5db92dfa942bc0aaf2649474456239e83",
+    "mcp2": "0a73c6f528a47e7e6578532e49fa8e12697a39e3364b9e375d14852a346c3432",
+    "mcp4-scripted": "a77dc5d6218843ed7dfa454d87f5946568e0db45997c9c23f8de8861954f97fe",
+    "minimax-command2": "be834162dd3880fd21ea26c66eae5aec692041c3a30145b61da81102ef535aba",
+    "minimax-cold": "0547d988569c84c04cdccbb1bac02ad2d9ee34412ec37b574a10f00888ae13c8",
+    "minimax-missing2": "11f3826d57a0b7dae7db0c1cd3115285106c3150bc6a3e1f656f8b9088bf8476",
+    "minimax-native2": "6c5dce9d72748f91c8de1c543ace2b21ae98965bc154b2ab4e5021fcc651d945",
+    "minimax-mcp2": "a395c16e5202ef672dd0b24ddba7513755356c4e5ef1a014ae5278f7ce46d346",
+    "minimax-safety3": "910ca3072ae46cdca5c31be7d9cf5d6571f5f6243c36efe9d723c834d7775982",
+    "minimax-explicit2": "e4c155f5d7b73d32fc0ea62f615f9149b70a1a7e8ea926f5ac66eab5bc60aaae",
+    "minimax-native3": "d61e72cff48c8f30c6b4bf832c99531662df21e4fd25df6f7ee4440eb5c59fce",
+    "minimax-keyless2-error": "eb39c74127be9cb965888b65757e775b53bc9a56eb89a50729f4eff4472e5505",
+    "minimax-usage2": "5ae2818a32cd574f5382a9e961585f36f845b2c5d2b14ea824f833c46d55e485",
+    "minimax-usage3": "ce21495ab72a54a20bdf0ee8c1f8b1098b73a083b5e8af6e1780513acd653e36",
+    "minimax-fleet4": "6a99d3b0a142cdbc66c26aaecc1a7e3d15ded2c914b8681dc402d5cda1f8a245"
+  },
+  "localVerification": {
+    "rustLib": {
+      "passed": 813,
+      "failed": 0,
+      "ignored": 6
+    },
+    "rustCli": {
+      "passed": 35,
+      "failed": 0
+    },
+    "acpTerminalSeams": {
+      "passed": 3,
+      "failed": 0
+    },
+    "dshOfficialExtensionOwner": {
+      "passed": 1,
+      "failed": 0
+    },
+    "nodeProtocolAndUiSeams": {
+      "passed": 9,
+      "failed": 0,
+      "byokProtocolAndExtensionOwnersPassed": 7
+    },
+    "workspaceAllTargetsCheck": true,
+    "clippyDenyWarnings": true,
+    "rustfmt": true,
+    "typecheck": true,
+    "desktopAndWebBuild": true,
+    "documentationTestsAndDiffGovernance": true,
+    "vitest": {
+      "latestFullRun": {
+        "passedSuites": 204,
+        "failedSuites": 0,
+        "passedTests": 2072,
+        "failedTests": 0
+      },
+      "isolatedTimingRerun": {
+        "files": [
+          "apps/desktop/src/main/core-client.test.ts",
+          "apps/desktop/src/main/evaluation-host.test.ts"
+        ],
+        "passedTests": 25,
+        "failedTests": 0
+      },
+      "commandOptions": "--maxWorkers=1 --testTimeout=15000 --expect.poll.timeout=15000",
+      "limitation": "Earlier parallel-load timing failures were resolved by reducing test process concurrency; no test was edited or disabled.",
+      "earlierFullRunWithTimingFailures": {
+        "passedSuites": 203,
+        "failedSuites": 1,
+        "passedTests": 2066,
+        "failedTests": 6,
+        "failureFile": "apps/desktop/src/main/core-client.test.ts"
+      }
+    },
+    "rustSlow": {
+      "passed": 310,
+      "failed": 0
+    },
+    "rustPrCommandPassed": true,
+    "nativeConfigurationOwnerPassed": true,
+    "nativeCompactionUsageOwnerPassed": true,
+    "dshSparseUsageParserPassed": true
+  },
+  "byokProvider": {
+    "provider": "MiniMax official Anthropic-compatible endpoint",
+    "model": "MiniMax-M3",
+    "credentialUse": "User-authorized acceptance only; secret inherited in private child environment; production native Home unchanged",
+    "productionCodeCheckpoint": "83ff17de",
+    "basic": {
+      "ok": true,
+      "results": [
+        {
+          "adapterKind": "deepseek-harness",
+          "version": "0.1.5-rc.2",
+          "modelCount": 5,
+          "model": "deepseek-harness://runtime-default",
+          "hostInstanceId": "4171aefb-74f1-49e9-9643-c3521dd6510a",
+          "nativeSessionId": "1387ae3a-c8ba-488b-a58e-12120382f991",
+          "output": "ROVAI_DSH_ACP_OK",
+          "commandOutput": {
+            "marker": "ROVAI_DEEPSEEK_HARNESS_PRINTF_OK",
+            "output": "ROVAI_DEEPSEEK_HARNESS_PRINTF_OK\n",
+            "outcome": "succeeded",
+            "rawOutputDigest": "383c89538e5870fbe191e1ab91cd76b3b01e0733bf10388c7958702a03fa3283",
+            "approvalCount": 0,
+            "nativeSessionContinued": true,
+            "warmHostReused": true,
+            "hostInstanceId": "4171aefb-74f1-49e9-9643-c3521dd6510a"
+          }
+        }
+      ]
+    },
+    "coldResume": {
+      "ok": true,
+      "adapterKind": "deepseek-harness",
+      "continuation": "ACP session/resume",
+      "nativeSessionId": "95220a3a-24b8-471f-8389-5ab9cf6e8af9",
+      "firstHostInstanceId": "9573c93b-8c60-4d3c-8b37-9183a58a218c",
+      "restoredHostInstanceId": "4464ac4a-a314-4a0a-bb72-fe1949a3e502",
+      "sessionMarkerRecovered": true,
+      "replayActionsProjected": 0,
+      "replayApprovalsProjected": 0,
+      "restoredHostLogCount": 0,
+      "postRestoreWrite": "COLD_RESUME_WRITE_OK\n",
+      "cancelStatus": "cancelled",
+      "cancelledFileCreated": false,
+      "invalidSessionFallbackId": "f43ef703-fc00-4638-b449-b52dbe080ff7",
+      "continuityLostCount": 1
+    },
+    "missingSend": {
+      "ok": true,
+      "adapters": [
+        {
+          "adapterKind": "deepseek-harness",
+          "reportedVersion": "0.1.5-rc.2",
+          "model": "deepseek-harness://runtime-default",
+          "zeroSend": "published",
+          "suppression": "suppressed_accepted_send",
+          "acpToolEvents": 2,
+          "nativeToolActivities": null
+        }
+      ]
+    },
+    "compactionCapabilities": {
+      "runtime": "deepseek-harness",
+      "version": "0.1.5-rc.2",
+      "platform": "darwin-arm64",
+      "checks": {
+        "multiSessionSwitch": {
+          "passed": true,
+          "distinctSessions": true,
+          "hostPid": 69001
+        },
+        "capabilities_before_compaction": {
+          "passed": true,
+          "skillLoaded": true,
+          "mcpEffectCount": 1,
+          "approvalCount": 1,
+          "sessionId": "28458a96-1f19-4432-9724-3dabf0f37039"
+        },
+        "compaction_manual": {
+          "mode": "manual",
+          "completed": true,
+          "before": 0,
+          "after": 1,
+          "nodes": 14,
+          "bootstrapRetained": true,
+          "trigger": "official API control; native summarizer"
+        },
+        "capabilities_manual": {
+          "passed": true,
+          "skillLoaded": true,
+          "mcpEffectCount": 1,
+          "approvalCount": 1,
+          "sessionId": "28458a96-1f19-4432-9724-3dabf0f37039"
+        },
+        "compaction_pressure": {
+          "mode": "pressure",
+          "completed": true,
+          "before": 1,
+          "after": 2,
+          "nodes": 12,
+          "bootstrapRetained": true,
+          "trigger": "official API control; native summarizer"
+        },
+        "capabilities_pressure": {
+          "passed": true,
+          "skillLoaded": true,
+          "mcpEffectCount": 1,
+          "approvalCount": 1,
+          "sessionId": "28458a96-1f19-4432-9724-3dabf0f37039"
+        },
+        "compaction_context-overflow": {
+          "mode": "context-overflow",
+          "completed": true,
+          "before": 2,
+          "after": 3,
+          "nodes": 14,
+          "bootstrapRetained": true,
+          "trigger": "official API control; native summarizer"
+        },
+        "capabilities_context-overflow": {
+          "passed": true,
+          "skillLoaded": true,
+          "mcpEffectCount": 1,
+          "approvalCount": 1,
+          "sessionId": "28458a96-1f19-4432-9724-3dabf0f37039"
+        },
+        "compactedColdResume": {
+          "passed": true,
+          "sessionId": "28458a96-1f19-4432-9724-3dabf0f37039",
+          "hostChanged": true
+        },
+        "capabilities_cold_resume": {
+          "passed": true,
+          "skillLoaded": true,
+          "mcpEffectCount": 1,
+          "approvalCount": 1,
+          "sessionId": "28458a96-1f19-4432-9724-3dabf0f37039"
+        },
+        "invalidResume": {
+          "rejected": true
+        },
+        "automaticPressure": {
+          "passed": true,
+          "bootstrapRetained": true,
+          "before": 3,
+          "after": 4
+        },
+        "capabilities_automatic_pressure": {
+          "passed": true,
+          "skillLoaded": true,
+          "mcpEffectCount": 1,
+          "approvalCount": 1,
+          "sessionId": "28458a96-1f19-4432-9724-3dabf0f37039"
+        },
+        "automaticOverflowRetry": {
+          "passed": true,
+          "bootstrapRetained": true,
+          "trigger": "one controlled CONTEXT_WINDOW_EXCEEDED at official llm/stream seam; real native compaction and retried model response"
+        },
+        "capabilities_automatic_overflow_retry": {
+          "passed": true,
+          "skillLoaded": true,
+          "mcpEffectCount": 1,
+          "approvalCount": 1,
+          "sessionId": "28458a96-1f19-4432-9724-3dabf0f37039"
+        },
+        "permissionAfterCompaction": {
+          "denied": true,
+          "effectCount": 0
+        },
+        "compactionUsage": {
+          "passed": true,
+          "automaticSummaryCalls": 2,
+          "idleManualUsageExcluded": true,
+          "observations": [
+            {
+              "seq": 221,
+              "turn": 18,
+              "usage": {
+                "inputTokens": 375,
+                "outputTokens": 455,
+                "cacheReadTokens": 52975
+              }
+            },
+            {
+              "seq": 256,
+              "turn": 20,
+              "usage": {
+                "inputTokens": 482,
+                "outputTokens": 637,
+                "cacheReadTokens": 8365
+              }
+            }
+          ]
+        },
+        "compaction_cancelled": {
+          "rejected": true,
+          "before": 5,
+          "after": 5,
+          "noFalseCompletion": true
+        },
+        "compaction_failed": {
+          "rejected": true,
+          "before": 5,
+          "after": 5,
+          "noFalseCompletion": true
+        }
+      }
+    },
+    "mcp": {
+      "ok": true,
+      "modelSource": "native provider",
+      "semantics": "Runtime-native config is preserved; Codex skips collisions, Grok skips active native collisions and adds distinct per-Run servers, while other additive adapters give Rovai the whole-definition precedence",
+      "results": [
+        {
+          "adapterKind": "deepseek-harness",
+          "lifecycle": {
+            "updateObserved": true,
+            "oldHostFenced": true,
+            "adjacentAssignmentIsolated": true,
+            "unassignedNativeRestored": true,
+            "reassignedObserved": true,
+            "deletedNativeRestored": true,
+            "agentRunIds": [
+              "f71f697d-d65c-4d5a-92f1-00bf2043542c",
+              "7806ac13-d4ed-4292-8dd7-24ae8518afb9",
+              "61d20aff-763e-4d48-897e-0f53b82c8fe4",
+              "9050f7a1-4efb-467c-bbda-35f3e9215cbe",
+              "29824b7b-8f29-41d9-a01b-1bfb31e68840"
+            ]
+          },
+          "safety": {
+            "allowOnceEffectCount": 1,
+            "denyNoEffect": true,
+            "cancelNoEffect": true,
+            "readOnlyNoEffect": true
+          },
+          "reportedVersion": "0.1.5-rc.2",
+          "modelId": "runtime_default",
+          "runtimeNames": [
+            "rovai_smoke",
+            "rovai_smoke_http",
+            "rovai_smoke_stdio"
+          ],
+          "results": [
+            "rovai-projection:deepseek_harness",
+            "rovai-projection-http:deepseek_harness-http",
+            "rovai-projection-stdio:deepseek_harness-stdio"
+          ],
+          "agentRunId": "dfbf1c64-0089-4962-b698-ba6085f4d684",
+          "durationMs": 139428
+        }
+      ]
+    },
+    "safety": {
+      "runtime": "deepseek-harness",
+      "version": "0.1.5-rc.2",
+      "checks": [
+        {
+          "mode": "workspace-write",
+          "tool": "write",
+          "outside": false,
+          "allowed": true,
+          "passed": true,
+          "actualNativeToolObserved": true,
+          "fileCreated": true,
+          "runId": "a3311035-fef4-40a6-85fc-68f74ae37287"
+        },
+        {
+          "mode": "workspace-write",
+          "tool": "bash",
+          "outside": false,
+          "allowed": true,
+          "passed": true,
+          "actualNativeToolObserved": true,
+          "fileCreated": true,
+          "runId": "9386456b-4380-4e72-88ad-71836d62a7e4"
+        },
+        {
+          "mode": "workspace-write",
+          "tool": "write",
+          "outside": true,
+          "allowed": false,
+          "passed": true,
+          "actualNativeToolObserved": true,
+          "fileCreated": false,
+          "runId": "d7d98eb7-4b8f-4ee0-8d62-7d491803b012"
+        },
+        {
+          "mode": "workspace-write",
+          "tool": "bash",
+          "outside": true,
+          "allowed": false,
+          "passed": true,
+          "actualNativeToolObserved": true,
+          "fileCreated": false,
+          "runId": "0acce9a8-ba0a-45d0-aafb-d0b0f9a485fd"
+        },
+        {
+          "mode": "read-only",
+          "tool": "write",
+          "outside": false,
+          "allowed": false,
+          "passed": true,
+          "actualNativeToolObserved": true,
+          "fileCreated": false,
+          "runId": "7bf0f234-8a18-4092-96b3-8229d65489bf"
+        },
+        {
+          "mode": "read-only",
+          "tool": "bash",
+          "outside": false,
+          "allowed": false,
+          "passed": true,
+          "actualNativeToolObserved": true,
+          "fileCreated": false,
+          "runId": "dbcc6a09-8d71-45e3-ad55-9e9e28e0a110"
+        }
+      ],
+      "cleanup": {
+        "passed": true,
+        "descendantsReaped": 1
+      }
+    },
+    "explicitModelPlainTwoTurn": {
+      "ok": true,
+      "results": [
+        {
+          "adapterKind": "deepseek-harness",
+          "version": "0.1.5-rc.2",
+          "modelCount": 5,
+          "model": "[\"minimax-smoke\",\"MiniMax-M3\"]",
+          "hostInstanceId": "fd741fde-4eb2-4dd1-99b1-58853d7471b7",
+          "nativeSessionId": "3efc0349-427f-4ac4-9f29-97c8fb9d8259",
+          "output": "ROVAI_DSH_ACP_OK",
+          "commandOutput": {
+            "marker": "ROVAI_DEEPSEEK_HARNESS_SECOND_TURN_OK",
+            "output": "ROVAI_DEEPSEEK_HARNESS_SECOND_TURN_OK",
+            "outcome": "succeeded",
+            "rawOutputDigest": null,
+            "approvalCount": 0,
+            "nativeSessionContinued": true,
+            "warmHostReused": true,
+            "hostInstanceId": "fd741fde-4eb2-4dd1-99b1-58853d7471b7"
+          }
+        }
+      ]
+    },
+    "missingCredential": {
+      "passed": true,
+      "expectedRunStatus": "failed",
+      "failurePhase": "authentication",
+      "failureCode": "runtime_authentication_required",
+      "retryable": false,
+      "case": "native llm-pi-ai custom route without its apiKeyEnv; no Provider generation"
+    },
+    "usageReconciliation": {
+      "passed": true,
+      "warm": {
+        "runs": 2,
+        "nativeCalls": 3,
+        "automaticSummaryCalls": 1,
+        "totals": {
+          "uncached_input_tokens": 39168,
+          "output_tokens": 479,
+          "cache_read_tokens": 7040
+        },
+        "bucketsMatch": true,
+        "perRunAttributionMatches": true
+      },
+      "cold": {
+        "runs": 3,
+        "nativeCalls": 4,
+        "automaticSummaryCalls": 1,
+        "totals": {
+          "uncached_input_tokens": 39550,
+          "output_tokens": 485,
+          "cache_read_tokens": 16512
+        },
+        "bucketsMatch": true,
+        "perRunAttributionMatches": true
+      },
+      "exactColdResume": true,
+      "noReplay": true
+    },
+    "fleet": {
+      "runtime": "deepseek-harness",
+      "version": "0.1.5-rc.2",
+      "checks": {
+        "concurrency": {
+          "passed": true,
+          "distinctHosts": true,
+          "distinctSessions": true,
+          "exactSwitchBack": true
+        },
+        "coreCrash": {
+          "passed": true,
+          "descendantsReaped": 2
+        },
+        "crashRecovery": {
+          "passed": true,
+          "exactSession": true
+        },
+        "idleEviction": {
+          "passed": true,
+          "elapsedMs": 1845641,
+          "descendantsReaped": 1,
+          "exactResume": true
+        },
+        "plannedShutdown": {
+          "passed": true,
+          "descendantsReaped": 1
+        }
+      }
+    }
+  },
+  "qualificationArtifact": "qualification/runtime-platform/macos-arm64-deepseek-harness-v1.json"
+}

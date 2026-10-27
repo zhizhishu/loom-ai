@@ -1,0 +1,578 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-14",
+  "scope": "Upstream native CLI probes only; no Rovai Host or Server execution on DMIT yet",
+  "sourceCommit": "bda1ab832d48229a4b91c2530a599b32029827cc",
+  "machine": {
+    "provider": "DMIT",
+    "os": "Debian 12",
+    "architecture": "x86_64",
+    "glibc": "2.36",
+    "vCPU": 1,
+    "memoryMiB": 1965,
+    "swapMiB": 1023
+  },
+  "credentials": "User-authorized MiniMax-M3 BYOK; private files under isolated test account; credential values excluded",
+  "guard": {
+    "minimumAvailableMiB": 512,
+    "testCgroupMemoryMaxMiB": 1100,
+    "testCgroupSwapMaxMiB": 64,
+    "sustainedNewSwapStopMiB": 32,
+    "stopOnCgroupMaxOrOom": true,
+    "serialOnly": true
+  },
+  "stop": {
+    "name": "install-kiro",
+    "initial": {
+      "availableKiB": 1676092,
+      "swapUsedKiB": 0
+    },
+    "minimumAvailableKiB": 1667196,
+    "peakTestUserRssKiB": 27908,
+    "maximumSwapUsedKiB": 0,
+    "status": "stopped",
+    "exitCode": -15,
+    "reason": "test_cgroup_memory_pressure",
+    "elapsedSeconds": 14.08,
+    "final": {
+      "availableKiB": 1671372,
+      "swapUsedKiB": 0
+    }
+  },
+  "postStop": {
+    "testProcesses": 0,
+    "testSystemdUnits": 0,
+    "xray": "active",
+    "kernelOomEvents": 0,
+    "swapUsedMiB": 0,
+    "availableMiB": 1640
+  },
+  "results": {
+    "codex": {
+      "runtime": "codex",
+      "version": "codex-cli 0.154.0",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 12.03,
+      "toolFileVerified": true,
+      "markerInOutput": true,
+      "eventTypes": [
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "rovaiIntegration": false,
+      "toolFileMarkerMatches": true,
+      "exactTrailingNewline": true
+    },
+    "claude": {
+      "runtime": "claude",
+      "version": "2.1.270 (Claude Code)",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 10.17,
+      "toolFileVerified": true,
+      "markerInOutput": true,
+      "eventTypes": [
+        "assistant",
+        "result",
+        "system",
+        "user"
+      ],
+      "rovaiIntegration": false,
+      "toolFileMarkerMatches": true,
+      "exactTrailingNewline": true
+    },
+    "pi": {
+      "runtime": "pi",
+      "version": "0.85.1",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 14.42,
+      "toolFileVerified": true,
+      "markerInOutput": true,
+      "eventTypes": [
+        "agent_end",
+        "agent_settled",
+        "agent_start",
+        "message_end",
+        "message_start",
+        "message_update",
+        "session",
+        "tool_execution_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "turn_end",
+        "turn_start"
+      ],
+      "rovaiIntegration": false,
+      "toolFileMarkerMatches": true,
+      "exactTrailingNewline": true
+    },
+    "opencode": {
+      "runtime": "opencode",
+      "version": "1.18.30",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 30.35,
+      "toolFileVerified": false,
+      "markerInOutput": true,
+      "eventTypes": [
+        "step_finish",
+        "step_start",
+        "text",
+        "tool_use"
+      ],
+      "rovaiIntegration": false,
+      "toolFileMarkerMatches": true,
+      "exactTrailingNewline": false
+    },
+    "copilot": {
+      "runtime": "copilot",
+      "version": "GitHub Copilot CLI 1.0.83.\nRun 'copilot update' to check for updates.",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 7.57,
+      "toolFileVerified": false,
+      "markerInOutput": true,
+      "eventTypes": [
+        "assistant.idle",
+        "assistant.message",
+        "assistant.message_delta",
+        "assistant.message_start",
+        "assistant.tool_call_delta",
+        "assistant.turn_end",
+        "assistant.turn_start",
+        "model.call_finished",
+        "model.call_start",
+        "result",
+        "session.info",
+        "session.mcp_servers_loaded",
+        "session.skills_loaded",
+        "session.tools_updated",
+        "tool.execution_complete",
+        "tool.execution_start",
+        "user.message"
+      ],
+      "rovaiIntegration": false,
+      "toolFileMarkerMatches": true,
+      "exactTrailingNewline": false
+    },
+    "qwen": {
+      "runtime": "qwen",
+      "version": "0.23.3",
+      "model": "MiniMax-M3",
+      "provider": "MiniMax BYOK",
+      "os": "Debian 12",
+      "glibc": "2.36",
+      "exitCode": 0,
+      "elapsedSeconds": 4.81,
+      "toolFileVerified": false,
+      "markerInOutput": false,
+      "eventTypes": [
+        "assistant",
+        "result",
+        "stream_event",
+        "system"
+      ],
+      "rovaiIntegration": false,
+      "toolFileMarkerMatches": false,
+      "exactTrailingNewline": false,
+      "providerFailure": "MiniMax Chat Completions: HTTP 400 invalid params, function parameters is empty (2013). CLI incorrectly returned success; no tool file produced. Anthropic protocol has not been retested."
+    }
+  },
+  "installedNotExecuted": {
+    "qoder-cli": "1.1.51",
+    "codebuddy-cli": "2.150.0",
+    "grok-build": "installer passed; version/auth/execution not probed",
+    "cursor-agent": "installer passed; version/auth/execution not probed"
+  },
+  "remaining": {
+    "kiro-cli": "installation stopped by memory guard",
+    "kimi-code-cli": "not attempted after stop",
+    "trae-cn-cli": "not attempted after stop",
+    "zcode-app": "not attempted before stop",
+    "antigravity-app": "not attempted after stop"
+  },
+  "memoryReports": [
+    {
+      "name": "byok-copilot",
+      "initial": {
+        "availableKiB": 1675868,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1479776,
+      "peakTestUserRssKiB": 317816,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 8.02,
+      "final": {
+        "availableKiB": 1680176,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "byok-opencode",
+      "initial": {
+        "availableKiB": 1671120,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1066384,
+      "peakTestUserRssKiB": 715924,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 30.59,
+      "final": {
+        "availableKiB": 1673744,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "byok-pi",
+      "initial": {
+        "availableKiB": 1635348,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1577296,
+      "peakTestUserRssKiB": 150684,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 14.54,
+      "final": {
+        "availableKiB": 1671140,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "byok-qwen",
+      "initial": {
+        "availableKiB": 1679456,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1302028,
+      "peakTestUserRssKiB": 532908,
+      "maximumSwapUsedKiB": 0,
+      "status": "failed",
+      "exitCode": 1,
+      "reason": null,
+      "elapsedSeconds": 5.02,
+      "final": {
+        "availableKiB": 1680056,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "claude-native",
+      "initial": {
+        "availableKiB": 1678984,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1553188,
+      "peakTestUserRssKiB": 245128,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 10.53,
+      "final": {
+        "availableKiB": 1673860,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "codex-native",
+      "initial": {
+        "availableKiB": 1685464,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1607744,
+      "peakTestUserRssKiB": 233348,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 12.54,
+      "final": {
+        "availableKiB": 1679920,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "inspect-native",
+      "initial": {
+        "availableKiB": 1676508,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1380132,
+      "peakTestUserRssKiB": 407492,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 17.55,
+      "final": {
+        "availableKiB": 1677628,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-claude",
+      "initial": {
+        "availableKiB": 1654872,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1476888,
+      "peakTestUserRssKiB": 247632,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 5.02,
+      "final": {
+        "availableKiB": 1684328,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-codebuddy",
+      "initial": {
+        "availableKiB": 1676956,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1477496,
+      "peakTestUserRssKiB": 214940,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 4.52,
+      "final": {
+        "availableKiB": 1678200,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-codex",
+      "initial": {
+        "availableKiB": 1667556,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1405972,
+      "peakTestUserRssKiB": 336572,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 7.03,
+      "final": {
+        "availableKiB": 1684552,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-copilot",
+      "initial": {
+        "availableKiB": 1676396,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1464332,
+      "peakTestUserRssKiB": 266576,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 6.02,
+      "final": {
+        "availableKiB": 1675284,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-cursor",
+      "initial": {
+        "availableKiB": 1663208,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1619400,
+      "peakTestUserRssKiB": 35356,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 6.03,
+      "final": {
+        "availableKiB": 1678676,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-grok",
+      "initial": {
+        "availableKiB": 1679500,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1635752,
+      "peakTestUserRssKiB": 117104,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 2.01,
+      "final": {
+        "availableKiB": 1663044,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-kiro",
+      "initial": {
+        "availableKiB": 1676092,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1667196,
+      "peakTestUserRssKiB": 27908,
+      "maximumSwapUsedKiB": 0,
+      "status": "stopped",
+      "exitCode": -15,
+      "reason": "test_cgroup_memory_pressure",
+      "elapsedSeconds": 14.08,
+      "final": {
+        "availableKiB": 1671372,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-node",
+      "initial": {
+        "availableKiB": 1684952,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1600592,
+      "peakTestUserRssKiB": 105028,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 5.52,
+      "final": {
+        "availableKiB": 1683316,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-opencode",
+      "initial": {
+        "availableKiB": 1674244,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1327448,
+      "peakTestUserRssKiB": 513928,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 13.04,
+      "final": {
+        "availableKiB": 1677000,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-pi",
+      "initial": {
+        "availableKiB": 1637632,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1369384,
+      "peakTestUserRssKiB": 395852,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 14.05,
+      "final": {
+        "availableKiB": 1620676,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-qoder",
+      "initial": {
+        "availableKiB": 1674800,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1270612,
+      "peakTestUserRssKiB": 559732,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 9.53,
+      "final": {
+        "availableKiB": 1677496,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "install-qwen",
+      "initial": {
+        "availableKiB": 1636116,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1536904,
+      "peakTestUserRssKiB": 202276,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 4.52,
+      "final": {
+        "availableKiB": 1676420,
+        "swapUsedKiB": 0
+      }
+    },
+    {
+      "name": "provider",
+      "initial": {
+        "availableKiB": 1678400,
+        "swapUsedKiB": 0
+      },
+      "minimumAvailableKiB": 1668152,
+      "peakTestUserRssKiB": 33504,
+      "maximumSwapUsedKiB": 0,
+      "status": "passed",
+      "exitCode": 0,
+      "reason": null,
+      "elapsedSeconds": 5.02,
+      "final": {
+        "availableKiB": 1667960,
+        "swapUsedKiB": 0
+      }
+    }
+  ],
+  "runtimeQualification": false,
+  "serverOsQualification": false
+}

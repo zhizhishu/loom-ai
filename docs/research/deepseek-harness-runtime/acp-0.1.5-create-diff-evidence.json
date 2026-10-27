@@ -1,0 +1,133 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "deepseek-harness-0.1.5-rc.2-create-diff-2026-09-16",
+  "capturedAt": "2026-09-16",
+  "platform": "macos-arm64",
+  "runtime": {
+    "package": "@deepseek-ai/dsh@0.1.5-rc.2",
+    "reportedVersion": "0.1.5-rc.2",
+    "protocol": "acp-v1",
+    "provider": "MiniMax official Anthropic-compatible endpoint",
+    "model": "MiniMax-M3"
+  },
+  "scope": "Post-qualification correction for DSH write results whose explicit before=null proves a newly created file",
+  "contract": {
+    "write": {
+      "acceptedBefore": [
+        "string",
+        "null"
+      ],
+      "acceptedAfter": "string",
+      "nullProjection": {
+        "type": "diff",
+        "oldText": null,
+        "changeKind": "add"
+      }
+    },
+    "edit": {
+      "acceptedBefore": "string",
+      "acceptedAfter": "string"
+    },
+    "fallback": [
+      "missing before",
+      "missing after",
+      "malformed value",
+      "content over 2097152 bytes",
+      "unchanged string state"
+    ]
+  },
+  "acceptance": {
+    "observerAndIngressFixtures": {
+      "status": "passed",
+      "writeNullPreserved": true,
+      "standardAcpOldTextNullPreserved": true,
+      "missingWriteBeforeFallsBack": true,
+      "missingWriteAfterFallsBack": true,
+      "malformedWriteBeforeFallsBack": true,
+      "nullEditBeforeFallsBack": true,
+      "malformedEditAfterFallsBack": true,
+      "oversizedStateFallsBack": true
+    },
+    "realProviderFileMatrix": {
+      "status": "passed",
+      "contentAssertion": "byte-exact expected UTF-8 content; any mismatch fails the smoke process",
+      "cases": [
+        {
+          "name": "read",
+          "runStatus": "succeeded",
+          "fileEffect": "passed",
+          "diff": null
+        },
+        {
+          "name": "add",
+          "runStatus": "succeeded",
+          "fileEffect": "passed",
+          "diff": {
+            "changeKind": "add",
+            "additions": 1,
+            "deletions": 0
+          },
+          "presentation": "新增"
+        },
+        {
+          "name": "edit",
+          "runStatus": "succeeded",
+          "fileEffect": "passed",
+          "diff": {
+            "changeKind": "update",
+            "additions": 1,
+            "deletions": 1
+          }
+        },
+        {
+          "name": "edit_empty",
+          "runStatus": "succeeded",
+          "fileEffect": "passed",
+          "diff": {
+            "changeKind": "update",
+            "additions": 1,
+            "deletions": 0
+          }
+        }
+      ],
+      "rejectedAttempt": "An earlier run projected the add Diff correctly but failed the independent byte-exact file gate because the model omitted requested trailing newlines; the succeeding rerun passed both gates."
+    },
+    "realDevelopmentCamp": {
+      "status": "passed",
+      "runtimeFileOperation": "write",
+      "changeKind": "add",
+      "additions": 3,
+      "deletions": 0,
+      "oldText": null,
+      "lineDiffExpanded": true,
+      "unifiedHeader": "@@ -0,0 +1,3 @@",
+      "noDshSpecificUi": true,
+      "note": "The model omitted the requested final newline, so the shared Diff truthfully displays a no-newline marker. It also made one unrelated no-side-effect shell call before Write; the recorded file Diff comes from the native Write result."
+    },
+    "regression": {
+      "rustLibrary": "816 passed; 6 existing manual Runtime smokes ignored; 0 failed",
+      "dshRustOwner": "5 passed",
+      "acpNullDiffOwner": "passed",
+      "platformEvidenceRevisionOwner": "passed",
+      "nodeObserver": "2 passed",
+      "rustfmt": "passed",
+      "typecheck": "passed",
+      "documentationGovernance": "10 tests passed; full and merge-base-aware checks passed",
+      "diffCheck": "passed"
+    }
+  },
+  "commands": [
+    "node --test scripts/lib/dsh-host.test.mjs",
+    "cargo test -p rovai-core --lib dsh -- --nocapture",
+    "cargo test -p rovai-core --lib successful_terminal_acp_diff_content_is_kept_for_evidence_projection_only",
+    "ROVAI_ACP_SMOKE_ADAPTER=deepseek-harness ROVAI_ACP_FILE_OPERATION_MATRIX=1 node scripts/smoke-acp-runtime.mjs"
+  ],
+  "limitations": [
+    "This evidence corrects one DSH ingress case and does not replace or mutate the digest-bound v2 qualification artifact.",
+    "No DSH-specific Diff or file-activity UI was added.",
+    "No macOS x64, Windows x64 or Linux x64 qualification is inferred.",
+    "Credentials, raw prompts, local paths, Native Session IDs, Camp IDs and Run IDs are excluded."
+  ],
+  "priorEvidence": "docs/research/deepseek-harness-runtime/acp-0.1.5-convergence-evidence.json",
+  "qualificationArtifact": "qualification/runtime-platform/macos-arm64-deepseek-harness-v2.json"
+}

@@ -1,0 +1,24 @@
+{
+  "status": "passed",
+  "platform": "darwin",
+  "realHost": true,
+  "productionWeb": true,
+  "productionMainAdapter": true,
+  "desktopService": "fixture",
+  "realPlatformPublication": false,
+  "electronProcess": false,
+  "nativeBridgeInBrowser": false,
+  "liveProgressReadback": true,
+  "structuredApproverSubmitted": true,
+  "originalPublicationIdentity": true,
+  "logoutOnlyInRemoteSettings": true,
+  "logoutKeepsHost": true,
+  "standaloneChannelNavigationHidden": true,
+  "standaloneLegacyRouteExplained": true,
+  "screenshots": [
+    "desktop-web-channels-day.png",
+    "desktop-web-channels-night.png",
+    "desktop-web-approver.png",
+    "standalone-legacy-channel.png"
+  ]
+}

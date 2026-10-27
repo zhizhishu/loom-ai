@@ -1,0 +1,19 @@
+{
+  "provider": "rovai-protocol-fixture",
+  "snapshotId": "semantic-judge-fixture-adapter-2.0.0",
+  "snapshotDigest": "sha256:9d2e5b0528c3c4bf91d9931ff3df4bdb014864537ae330ea079dfdc3c4036c50",
+  "configurationId": "semantic-judge-dual-view-protocol-fixture-1",
+  "decodingParameters": {
+    "temperature": 0,
+    "topP": 1,
+    "maxOutputTokens": 8192,
+    "seed": 34
+  },
+  "retrySchedule": {
+    "maximumTransportAttempts": 1,
+    "backoffMilliseconds": [],
+    "retryValidOutput": false
+  },
+  "timeoutMilliseconds": 30000,
+  "forbiddenCanaries": []
+}

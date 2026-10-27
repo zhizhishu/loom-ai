@@ -1,0 +1,1414 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsString,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
+
+const BUILTIN_TOOL_REPLAY_CACHE_CAPACITY: usize = 1_024;
+
+use anyhow::{Context, Result, bail};
+use rovai_core::{
+    builtin_tool_transport::{
+        BUILTIN_TOOL_CONTRACT_VERSION, BUILTIN_TOOL_IPC_PROTOCOL_VERSION, BuiltinToolAuth,
+        BuiltinToolCliContext, BuiltinToolInvocationEnvelope, BuiltinToolLeaseContext,
+        LocalIpcEndpoint, ROVAI_AGENT_CLI_ENV, ROVAI_CLI_CONTEXT_ENV, ROVAI_RUN_TMP_ENV,
+    },
+    command::canonical_json_digest,
+    team_tool::BuiltinToolBindingCredential,
+};
+use serde_json::json;
+use tokio::{
+    process::Command,
+    sync::{Mutex, MutexGuard},
+    time::Instant,
+};
+
+/// Launch inputs only: constructing a factory does not create a process identity
+/// or touch its private directories. Reusable adapters call `create` inside the
+/// Fleet spawn future so only a new process receives a new context.
+#[derive(Clone)]
+pub(crate) struct BuiltinToolProcessConfigFactory {
+    cli_executable: PathBuf,
+    core_endpoint: LocalIpcEndpoint,
+    private_root: PathBuf,
+    context_file: bool,
+}
+
+impl BuiltinToolProcessConfigFactory {
+    pub(crate) fn new(
+        cli_executable: &Path,
+        core_endpoint: &LocalIpcEndpoint,
+        private_root: &Path,
+    ) -> Self {
+        Self {
+            cli_executable: cli_executable.to_path_buf(),
+            core_endpoint: core_endpoint.clone(),
+            private_root: private_root.to_path_buf(),
+            context_file: true,
+        }
+    }
+
+    pub(crate) fn without_context_file(mut self) -> Self {
+        self.context_file = false;
+        self
+    }
+
+    pub(crate) fn create(&self) -> Result<BuiltinToolProcessConfig> {
+        BuiltinToolProcessConfig::create_with_context_file(
+            &self.cli_executable,
+            &self.core_endpoint,
+            &self.private_root,
+            self.context_file,
+        )
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BuiltinToolProcessConfig {
+    inner: Arc<BuiltinToolProcessConfigInner>,
+}
+
+struct BuiltinToolProcessConfigInner {
+    cli_executable: PathBuf,
+    core_endpoint: LocalIpcEndpoint,
+    process_root: PathBuf,
+    context_path: Option<PathBuf>,
+    run_tmp: PathBuf,
+    process_id: String,
+    process_token: String,
+}
+
+impl Drop for BuiltinToolProcessConfigInner {
+    fn drop(&mut self) {
+        let outbox = self.process_root.join("compaction-observation-outbox");
+        let has_uncertain_observation = fs::read_dir(&outbox)
+            .ok()
+            .and_then(|mut entries| entries.next())
+            .is_some();
+        if has_uncertain_observation {
+            // Core owns durable reconciliation. Retain only process roots that
+            // contain a concrete Hook observation with an unknown submission
+            // outcome; ordinary Runtime/Host exit still cleans up normally.
+            return;
+        }
+        let _ =
+            rovai_core::local_attachment_snapshot::remove_local_snapshot_tree(&self.process_root);
+    }
+}
+
+impl BuiltinToolProcessConfig {
+    #[cfg(test)]
+    pub(crate) fn create(
+        cli_executable: &Path,
+        core_endpoint: &LocalIpcEndpoint,
+        private_root: &Path,
+    ) -> Result<Self> {
+        Self::create_with_context_file(cli_executable, core_endpoint, private_root, true)
+    }
+
+    fn create_with_context_file(
+        cli_executable: &Path,
+        core_endpoint: &LocalIpcEndpoint,
+        private_root: &Path,
+        context_file: bool,
+    ) -> Result<Self> {
+        if !cli_executable.is_absolute() || !private_root.is_absolute() {
+            bail!("Built-in Tool process paths must be absolute");
+        }
+        core_endpoint.validate()?;
+        if !cli_executable.is_file() {
+            bail!(
+                "bundled Rovai Agent CLI is unavailable: {}",
+                cli_executable.display()
+            );
+        }
+        let process_id = uuid::Uuid::new_v4().to_string();
+        let process_token = opaque_token();
+        let process_root = private_root.join("builtin-tools").join(&process_id);
+        let run_tmp = process_root.join("run-tmp");
+        fs::create_dir_all(&run_tmp).with_context(|| {
+            format!(
+                "failed to create Built-in Tool process root {}",
+                process_root.display()
+            )
+        })?;
+        restrict_directory(&process_root)?;
+        restrict_directory(&run_tmp)?;
+        let config = Self {
+            inner: Arc::new(BuiltinToolProcessConfigInner {
+                cli_executable: cli_executable.to_path_buf(),
+                core_endpoint: core_endpoint.clone(),
+                context_path: context_file.then(|| process_root.join("context.json")),
+                run_tmp,
+                process_root,
+                process_id,
+                process_token,
+            }),
+        };
+        config.write_context(None)?;
+        Ok(config)
+    }
+
+    pub(crate) fn process_id(&self) -> &str {
+        &self.inner.process_id
+    }
+
+    pub(crate) fn cli_executable(&self) -> &Path {
+        &self.inner.cli_executable
+    }
+
+    pub(crate) fn process_token(&self) -> &str {
+        &self.inner.process_token
+    }
+
+    pub(crate) fn context_path(&self) -> Option<&Path> {
+        self.inner.context_path.as_deref()
+    }
+
+    pub(crate) fn run_tmp(&self) -> &Path {
+        &self.inner.run_tmp
+    }
+
+    pub(crate) fn configure_command(&self, command: &mut Command) -> Result<()> {
+        let context_path = self
+            .context_path()
+            .context("Runtime requires a CLI context file")?;
+        let cli_directory = self
+            .inner
+            .cli_executable
+            .parent()
+            .context("Rovai Agent CLI has no parent directory")?;
+        let current_path = command
+            .as_std()
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == "PATH")
+                    .then(|| value.map(ToOwned::to_owned))
+                    .flatten()
+            })
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_default();
+        let mut paths = vec![cli_directory.to_path_buf()];
+        paths.extend(std::env::split_paths(&current_path));
+        let path = std::env::join_paths(paths).context("failed to construct Runtime CLI PATH")?;
+        command
+            .env("PATH", path)
+            .env(ROVAI_AGENT_CLI_ENV, &self.inner.cli_executable)
+            .env(ROVAI_CLI_CONTEXT_ENV, context_path)
+            .env(ROVAI_RUN_TMP_ENV, &self.inner.run_tmp);
+        Ok(())
+    }
+
+    fn write_context(&self, lease: Option<BuiltinToolLeaseContext>) -> Result<()> {
+        self.write_context_with_tasks(lease, false)
+    }
+
+    fn write_context_with_tasks(
+        &self,
+        lease: Option<BuiltinToolLeaseContext>,
+        tasks_enabled: bool,
+    ) -> Result<()> {
+        let Some(path) = self.context_path() else {
+            return Ok(());
+        };
+        let document = BuiltinToolCliContext {
+            contract_version: BUILTIN_TOOL_CONTRACT_VERSION,
+            ipc_protocol_version: BUILTIN_TOOL_IPC_PROTOCOL_VERSION,
+            core_endpoint: self.inner.core_endpoint.clone(),
+            process_id: self.inner.process_id.clone(),
+            process_token: self.inner.process_token.clone(),
+            lease,
+            tasks_enabled,
+        };
+        atomic_write_private_json(path, &document)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthorizedBuiltinToolInvocation {
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+    pub native_binding: BuiltinToolBindingCredential,
+    pub run_tmp: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BuiltinToolLeaseError {
+    pub code: &'static str,
+    pub message: &'static str,
+}
+
+#[derive(Clone)]
+struct ActiveLease {
+    lease_id: String,
+    lease_generation: u64,
+    lease_token: String,
+    agent_run_id: String,
+    execution_epoch: i64,
+    native_binding: BuiltinToolBindingCredential,
+    execution_root: String,
+    run_tmp: PathBuf,
+    replay: HashMap<String, ReplayEntry>,
+    replay_order: VecDeque<String>,
+}
+
+#[derive(Clone)]
+struct ReplayEntry {
+    request_digest: String,
+    envelope: BuiltinToolInvocationEnvelope,
+}
+
+struct RegisteredProcess {
+    process_token: String,
+    config: BuiltinToolProcessConfig,
+    lease_generation: u64,
+    active: Option<ActiveLease>,
+}
+
+#[derive(Default)]
+pub(crate) struct BuiltinToolLeaseRegistry {
+    processes: Mutex<HashMap<String, RegisteredProcess>>,
+    invocation_gate: Mutex<()>,
+}
+
+impl BuiltinToolLeaseRegistry {
+    pub(crate) async fn invocation_guard(&self) -> MutexGuard<'_, ()> {
+        self.invocation_gate.lock().await
+    }
+
+    pub(crate) async fn bind(
+        &self,
+        config: &BuiltinToolProcessConfig,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        native_binding: &BuiltinToolBindingCredential,
+        execution_root: &Path,
+    ) -> Result<BuiltinToolAuth> {
+        if !execution_root.is_absolute() || !execution_root.is_dir() {
+            bail!("Built-in Tool lease requires an absolute execution workspace");
+        }
+        let execution_root = execution_root
+            .to_str()
+            .context("AgentRun workspace is not UTF-8")?;
+        let (binding, retired_run_tmp) = {
+            let _gate = self.invocation_gate.lock().await;
+            if agent_run_id.trim().is_empty() || execution_epoch <= 0 {
+                bail!("Built-in Tool lease requires one current AgentRun");
+            }
+            let mut processes = self.processes.lock().await;
+            let process = processes
+                .entry(config.process_id().to_string())
+                .or_insert_with(|| RegisteredProcess {
+                    process_token: config.process_token().to_string(),
+                    config: config.clone(),
+                    lease_generation: 0,
+                    active: None,
+                });
+            if process.process_token != config.process_token() {
+                bail!("Built-in Tool process identity conflict");
+            }
+            if let Some(active) = &process.active {
+                if active.agent_run_id != agent_run_id || active.execution_epoch != execution_epoch
+                {
+                    bail!("Built-in Tool process is already bound to another AgentRun");
+                }
+                process.active = None;
+                process.config.write_context(None)?;
+            }
+            let (run_tmp, retired_run_tmp) = process.config.reset_run_tmp()?;
+            process.lease_generation = process.lease_generation.saturating_add(1).max(1);
+            let active = ActiveLease {
+                lease_id: uuid::Uuid::new_v4().to_string(),
+                lease_generation: process.lease_generation,
+                lease_token: opaque_token(),
+                agent_run_id: agent_run_id.to_string(),
+                execution_epoch,
+                native_binding: native_binding.clone(),
+                execution_root: execution_root.to_string(),
+                run_tmp,
+                replay: HashMap::new(),
+                replay_order: VecDeque::new(),
+            };
+            let auth = BuiltinToolAuth {
+                process_id: config.process_id().to_string(),
+                process_token: config.process_token().to_string(),
+                lease_id: active.lease_id.clone(),
+                lease_generation: active.lease_generation,
+                lease_token: active.lease_token.clone(),
+            };
+            let binding = process
+                .config
+                .write_context(Some(BuiltinToolLeaseContext {
+                    execution_root: execution_root.to_string(),
+                    run_tmp: active
+                        .run_tmp
+                        .to_str()
+                        .context("Run tmp is not UTF-8")?
+                        .to_string(),
+                    lease_id: active.lease_id.clone(),
+                    lease_generation: active.lease_generation,
+                    lease_token: active.lease_token.clone(),
+                }))
+                .map(|()| {
+                    process.active = Some(active);
+                    auth
+                });
+            (binding, retired_run_tmp)
+        };
+        schedule_retired_run_tmp_cleanup(retired_run_tmp.into_iter().collect());
+        binding
+    }
+
+    /// Called under the invocation gate after reading the current instance state.
+    /// A failed projection refresh cannot revoke a lease or cancel execution.
+    /// A binding refresh targets (process, Run, epoch); None refreshes all active leases.
+    pub(crate) async fn refresh_tasks(
+        &self,
+        enabled_runs: &std::collections::HashSet<String>,
+        target: Option<(&str, &str, i64)>,
+    ) -> bool {
+        let processes = self.processes.lock().await;
+        let mut refreshed = true;
+        for process in processes.values() {
+            if process.config.context_path().is_none() {
+                continue;
+            }
+            let Some(active) = &process.active else {
+                continue;
+            };
+            if let Some((process_id, agent_run_id, execution_epoch)) = target {
+                if process.config.process_id() != process_id
+                    || active.agent_run_id != agent_run_id
+                    || active.execution_epoch != execution_epoch
+                {
+                    continue;
+                }
+            }
+            let context = BuiltinToolLeaseContext {
+                execution_root: active.execution_root.clone(),
+                run_tmp: active.run_tmp.to_string_lossy().into_owned(),
+                lease_id: active.lease_id.clone(),
+                lease_generation: active.lease_generation,
+                lease_token: active.lease_token.clone(),
+            };
+            if let Err(error) = process.config.write_context_with_tasks(
+                Some(context),
+                enabled_runs.contains(&active.agent_run_id),
+            ) {
+                eprintln!("Task CLI discovery refresh failed: {error:#}");
+                refreshed = false;
+            }
+        }
+        refreshed
+    }
+
+    pub(crate) async fn unbind(&self, process_id: &str, agent_run_id: &str, execution_epoch: i64) {
+        let retired_run_tmp = {
+            let _gate = self.invocation_gate.lock().await;
+            let mut processes = self.processes.lock().await;
+            let Some(process) = processes.get_mut(process_id) else {
+                return;
+            };
+            let matches = process.active.as_ref().is_some_and(|active| {
+                active.agent_run_id == agent_run_id && active.execution_epoch == execution_epoch
+            });
+            if !matches {
+                return;
+            }
+            process.active = None;
+            if let Err(error) = process.config.write_context(None) {
+                eprintln!("failed to fence Built-in Tool context: {error:#}");
+            }
+            match process.config.retire_run_tmp() {
+                Ok(retired) => retired,
+                Err(error) => {
+                    eprintln!("failed to retire Built-in Tool Run tmp: {error:#}");
+                    None
+                }
+            }
+        };
+        schedule_retired_run_tmp_cleanup(retired_run_tmp.into_iter().collect());
+    }
+
+    pub(crate) async fn unregister(&self, process_id: &str) {
+        let (process, retired_run_tmp) = {
+            let _gate = self.invocation_gate.lock().await;
+            let process = self.processes.lock().await.remove(process_id);
+            let Some(process) = process else {
+                return;
+            };
+            let _ = process.config.write_context(None);
+            let retired = match process.config.retire_run_tmp() {
+                Ok(retired) => retired,
+                Err(error) => {
+                    eprintln!("failed to retire Built-in Tool Run tmp: {error:#}");
+                    None
+                }
+            };
+            (process, retired)
+        };
+        // The last config owner may recursively remove its process root. Keep
+        // that Drop outside the global invocation/process guards as well.
+        drop(process);
+        schedule_retired_run_tmp_cleanup(retired_run_tmp.into_iter().collect());
+    }
+
+    pub(crate) async fn fence_all(&self) -> usize {
+        let (fenced, retired_run_tmps) = {
+            let _gate = self.invocation_gate.lock().await;
+            let mut processes = self.processes.lock().await;
+            let mut fenced = 0;
+            let mut retired_run_tmps = Vec::with_capacity(processes.len());
+            for process in processes.values_mut() {
+                if process.active.take().is_some() {
+                    fenced += 1;
+                }
+                if let Err(error) = process.config.write_context(None) {
+                    eprintln!("failed to fence Built-in Tool context: {error:#}");
+                }
+                match process.config.retire_run_tmp() {
+                    Ok(Some(retired)) => retired_run_tmps.push(retired),
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("failed to retire Built-in Tool Run tmp: {error:#}");
+                    }
+                }
+            }
+            (fenced, retired_run_tmps)
+        };
+        schedule_retired_run_tmp_cleanup(retired_run_tmps);
+        fenced
+    }
+
+    pub(crate) async fn fence_all_until(&self, deadline: Instant) -> Option<usize> {
+        tokio::time::timeout_at(deadline, self.fence_all())
+            .await
+            .ok()
+    }
+
+    pub(crate) async fn authenticate(
+        &self,
+        auth: &BuiltinToolAuth,
+    ) -> std::result::Result<AuthorizedBuiltinToolInvocation, BuiltinToolLeaseError> {
+        let processes = self.processes.lock().await;
+        let Some(process) = processes.get(&auth.process_id) else {
+            return Err(run_not_bound());
+        };
+        if process.process_token != auth.process_token {
+            return Err(run_not_bound());
+        }
+        let Some(active) = &process.active else {
+            return Err(run_not_bound());
+        };
+        if active.lease_id != auth.lease_id
+            || active.lease_generation != auth.lease_generation
+            || active.lease_token != auth.lease_token
+        {
+            return Err(run_not_bound());
+        }
+        Ok(AuthorizedBuiltinToolInvocation {
+            agent_run_id: active.agent_run_id.clone(),
+            execution_epoch: active.execution_epoch,
+            native_binding: active.native_binding.clone(),
+            run_tmp: active.run_tmp.clone(),
+        })
+    }
+
+    /// Caller holds invocation_gate and has resolved a unique current Hermes
+    /// Conversation/Run from Core data. Credentials never leave this process.
+    pub(crate) async fn auth_for_execution(
+        &self,
+        run: &str,
+        epoch: i64,
+        binding: &str,
+        generation: i64,
+    ) -> std::result::Result<BuiltinToolAuth, BuiltinToolLeaseError> {
+        let processes = self.processes.lock().await;
+        let mut matches = processes.iter().filter_map(|(id, process)| {
+            let active = process.active.as_ref()?;
+            (active.agent_run_id == run
+                && active.execution_epoch == epoch
+                && active.native_binding.native_binding_id == binding
+                && active.native_binding.native_binding_generation == generation)
+                .then(|| BuiltinToolAuth {
+                    process_id: id.clone(),
+                    process_token: process.process_token.clone(),
+                    lease_id: active.lease_id.clone(),
+                    lease_generation: active.lease_generation,
+                    lease_token: active.lease_token.clone(),
+                })
+        });
+        let auth = matches.next().ok_or_else(run_not_bound)?;
+        if matches.next().is_some() {
+            return Err(run_not_bound());
+        }
+        Ok(auth)
+    }
+
+    pub(crate) async fn authenticate_process(&self, process_id: &str, process_token: &str) -> bool {
+        self.processes
+            .lock()
+            .await
+            .get(process_id)
+            .is_some_and(|process| process.process_token == process_token)
+    }
+
+    pub(crate) async fn replay(
+        &self,
+        auth: &BuiltinToolAuth,
+        request_id: &str,
+        request_digest: &str,
+    ) -> std::result::Result<Option<BuiltinToolInvocationEnvelope>, BuiltinToolLeaseError> {
+        let processes = self.processes.lock().await;
+        let process = processes.get(&auth.process_id).ok_or_else(run_not_bound)?;
+        if process.process_token != auth.process_token {
+            return Err(run_not_bound());
+        }
+        let active = process.active.as_ref().ok_or_else(run_not_bound)?;
+        if active.lease_id != auth.lease_id
+            || active.lease_generation != auth.lease_generation
+            || active.lease_token != auth.lease_token
+        {
+            return Err(run_not_bound());
+        }
+        match active.replay.get(request_id) {
+            Some(entry) if entry.request_digest == request_digest => {
+                Ok(Some(entry.envelope.clone()))
+            }
+            Some(_) => Err(BuiltinToolLeaseError {
+                code: "builtin_tool.idempotency_conflict",
+                message: "requestId was reused with a different operation or input",
+            }),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn record(
+        &self,
+        auth: &BuiltinToolAuth,
+        request_id: &str,
+        request_digest: &str,
+        envelope: &BuiltinToolInvocationEnvelope,
+    ) -> std::result::Result<(), BuiltinToolLeaseError> {
+        let mut processes = self.processes.lock().await;
+        let process = processes
+            .get_mut(&auth.process_id)
+            .ok_or_else(run_not_bound)?;
+        if process.process_token != auth.process_token {
+            return Err(run_not_bound());
+        }
+        let active = process.active.as_mut().ok_or_else(run_not_bound)?;
+        if active.lease_id != auth.lease_id
+            || active.lease_generation != auth.lease_generation
+            || active.lease_token != auth.lease_token
+        {
+            return Err(run_not_bound());
+        }
+        if let Some(existing) = active.replay.get(request_id) {
+            if existing.request_digest != request_digest {
+                return Err(BuiltinToolLeaseError {
+                    code: "builtin_tool.idempotency_conflict",
+                    message: "requestId was reused with a different operation or input",
+                });
+            }
+            return Ok(());
+        }
+        active.replay.insert(
+            request_id.to_string(),
+            ReplayEntry {
+                request_digest: request_digest.to_string(),
+                envelope: envelope.clone(),
+            },
+        );
+        active.replay_order.push_back(request_id.to_string());
+        while active.replay_order.len() > BUILTIN_TOOL_REPLAY_CACHE_CAPACITY {
+            if let Some(expired_request_id) = active.replay_order.pop_front() {
+                active.replay.remove(&expired_request_id);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_count(&self) -> usize {
+        self.processes
+            .lock()
+            .await
+            .values()
+            .filter(|process| process.active.is_some())
+            .count()
+    }
+}
+
+impl BuiltinToolProcessConfig {
+    fn reset_run_tmp(&self) -> Result<(PathBuf, Option<PathBuf>)> {
+        let retired = self.retire_run_tmp()?;
+        let recreate = (|| -> Result<()> {
+            fs::create_dir(&self.inner.run_tmp).with_context(|| {
+                format!(
+                    "failed to recreate Built-in Tool Run tmp {}",
+                    self.inner.run_tmp.display()
+                )
+            })?;
+            restrict_directory(&self.inner.run_tmp)?;
+            validate_exact_run_tmp_root(&self.inner.process_root, &self.inner.run_tmp)?;
+            Ok(())
+        })();
+        if let Err(error) = recreate {
+            let _ = fs::remove_dir(&self.inner.run_tmp);
+            if let Some(retired) = &retired
+                && !self.inner.run_tmp.exists()
+            {
+                let _ = fs::rename(retired, &self.inner.run_tmp);
+            }
+            return Err(error);
+        }
+        Ok((self.inner.run_tmp.clone(), retired))
+    }
+
+    fn retire_run_tmp(&self) -> Result<Option<PathBuf>> {
+        validate_configured_run_tmp_path(&self.inner.process_root, &self.inner.run_tmp)?;
+        match fs::symlink_metadata(&self.inner.run_tmp) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let retired = self.inner.process_root.join(format!(
+            ".run-tmp-retired-{}",
+            uuid::Uuid::new_v4().as_hyphenated()
+        ));
+        fs::rename(&self.inner.run_tmp, &retired).with_context(|| {
+            format!(
+                "failed to retire Built-in Tool Run tmp {}",
+                self.inner.run_tmp.display(),
+            )
+        })?;
+        Ok(Some(retired))
+    }
+}
+
+fn schedule_retired_run_tmp_cleanup(paths: Vec<PathBuf>) {
+    for path in paths {
+        let _cleanup = tokio::task::spawn_blocking(move || {
+            if let Err(error) = remove_retired_run_tmp(&path) {
+                eprintln!(
+                    "failed to remove retired Built-in Tool Run tmp {}: {error:#}",
+                    path.display()
+                );
+            }
+        });
+    }
+}
+
+fn remove_retired_run_tmp(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    pause_run_tmp_cleanup_for_test(path);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to remove unsafe Run tmp {}", path.display()))?;
+    } else {
+        rovai_core::local_attachment_snapshot::remove_local_snapshot_tree(path)
+            .with_context(|| format!("failed to remove Run tmp tree {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn bundled_cli_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe().context("failed to locate rovai-core executable")?;
+    let directory = current
+        .parent()
+        .context("rovai-core executable has no parent directory")?;
+    let name: OsString = if cfg!(windows) {
+        "rovai.exe".into()
+    } else {
+        "rovai".into()
+    };
+    Ok(directory.join(name))
+}
+
+pub(crate) struct BuiltinToolDiscovery {
+    path: PathBuf,
+    endpoint: LocalIpcEndpoint,
+}
+
+impl BuiltinToolDiscovery {
+    pub(crate) fn publish(endpoint: LocalIpcEndpoint) -> Result<Self> {
+        let path = rovai_core::builtin_tool_transport::builtin_tool_discovery_path()?;
+        crate::platform::private_storage::prepare_private_directory(path.parent().unwrap())?;
+        atomic_write_private_json(&path, &endpoint)?;
+        Ok(Self { path, endpoint })
+    }
+}
+
+impl Drop for BuiltinToolDiscovery {
+    fn drop(&mut self) {
+        // A different Core may have published its own endpoint meanwhile.
+        if fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LocalIpcEndpoint>(&bytes).ok())
+            .as_ref()
+            == Some(&self.endpoint)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub(crate) fn builtin_tool_endpoint() -> LocalIpcEndpoint {
+    static ENDPOINT: OnceLock<LocalIpcEndpoint> = OnceLock::new();
+    ENDPOINT
+        .get_or_init(|| {
+            #[cfg(windows)]
+            {
+                LocalIpcEndpoint::WindowsNamedPipe {
+                    name: format!(
+                        r"\\.\pipe\rovai-ai-{}-{}",
+                        std::process::id(),
+                        uuid::Uuid::new_v4()
+                    ),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                LocalIpcEndpoint::UnixSocket {
+                    path: PathBuf::from("/tmp")
+                        .join(format!("rovai-builtin-{}", std::process::id()))
+                        .join("core.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                }
+            }
+        })
+        .clone()
+}
+
+pub(crate) fn request_digest(
+    operation: &str,
+    input: &serde_json::Value,
+    send_input_file_path: Option<&str>,
+) -> Result<String> {
+    let mut request = json!({
+        "domain": "rovai.builtin-tool-request.v1",
+        "operation": crate::thread_compat::stored_operation(operation),
+        "input": crate::thread_compat::stored_builtin_input(operation, input)?,
+    });
+    // Preserve existing digests when metadata is absent; a replay cannot switch
+    // the file whose changes will be excluded while retaining the same request.
+    if let Some(path) = send_input_file_path {
+        request["sendInputFilePath"] = json!(path);
+    }
+    canonical_json_digest(&request)
+}
+
+fn run_not_bound() -> BuiltinToolLeaseError {
+    BuiltinToolLeaseError {
+        code: "builtin_tool.run_not_bound",
+        message: "Built-in Tool CLI is not bound to the current AgentRun",
+    }
+}
+
+fn opaque_token() -> String {
+    format!(
+        "{}.{}",
+        uuid::Uuid::new_v4().as_hyphenated(),
+        uuid::Uuid::new_v4().as_hyphenated()
+    )
+}
+
+fn atomic_write_private_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let parent = path.parent().context("private JSON path has no parent")?;
+    fs::create_dir_all(parent)?;
+    restrict_directory(parent)?;
+    let temporary = parent.join(format!(".context-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    serde_json::to_writer(&mut file, value)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn restrict_directory(_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn validate_configured_run_tmp_path(process_root: &Path, run_tmp: &Path) -> Result<()> {
+    if run_tmp.parent() != Some(process_root) || run_tmp.file_name() != Some("run-tmp".as_ref()) {
+        bail!("Built-in Tool Run tmp is outside its exact process root");
+    }
+    Ok(())
+}
+
+fn validate_exact_run_tmp_root(process_root: &Path, run_tmp: &Path) -> Result<()> {
+    validate_configured_run_tmp_path(process_root, run_tmp)?;
+    let canonical_process_root =
+        fs::canonicalize(process_root).context("failed to resolve Built-in Tool process root")?;
+    let canonical_run_tmp =
+        fs::canonicalize(run_tmp).context("failed to resolve Built-in Tool Run tmp")?;
+    if canonical_run_tmp.parent() != Some(canonical_process_root.as_path()) {
+        bail!("Built-in Tool Run tmp escaped its exact process root");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+struct RunTmpCleanupTestPause {
+    started: std::sync::atomic::AtomicBool,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl RunTmpCleanupTestPause {
+    fn new() -> Self {
+        Self {
+            started: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn run_tmp_cleanup_test_pauses()
+-> &'static std::sync::Mutex<HashMap<String, Arc<RunTmpCleanupTestPause>>> {
+    static PAUSES: OnceLock<std::sync::Mutex<HashMap<String, Arc<RunTmpCleanupTestPause>>>> =
+        OnceLock::new();
+    PAUSES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn pause_run_tmp_cleanup_for_test(path: &Path) {
+    let Some(process_id) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+    else {
+        return;
+    };
+    let pause = run_tmp_cleanup_test_pauses()
+        .lock()
+        .unwrap()
+        .get(process_id)
+        .cloned();
+    let Some(pause) = pause else {
+        return;
+    };
+    pause
+        .started
+        .store(true, std::sync::atomic::Ordering::Release);
+    let mut released = pause.released.lock().unwrap();
+    while !*released {
+        released = pause.release.wait(released).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executable() -> PathBuf {
+        std::env::current_exe().unwrap()
+    }
+
+    fn binding() -> BuiltinToolBindingCredential {
+        BuiltinToolBindingCredential {
+            previous_adapter_installation_id: None,
+            previous_native_session_id: None,
+            previous_binding_compatibility_digest: None,
+            native_binding_id: uuid::Uuid::new_v4().to_string(),
+            native_binding_generation: 1,
+            binding_credential: "binding-secret".to_string(),
+            conversation_version: 1,
+            adapter_installation_id: "installation".to_string(),
+            native_session_id: None,
+            binding_compatibility_digest: Some("digest".to_string()),
+            binding_replaced: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_rotates_fences_and_replays_exact_request() {
+        let legacy = json!({"campId":"same-id", "thread":"same-message", "limit":20});
+        let current = json!({"threadId":"same-id", "replyChain":"same-message", "limit":20});
+        let expected = canonical_json_digest(&json!({"domain":"rovai.builtin-tool-request.v1", "operation":"camp.read", "input":legacy})).unwrap();
+        assert_eq!(
+            request_digest("camp.read", &legacy, None).unwrap(),
+            expected
+        );
+        assert_eq!(
+            request_digest("thread.read", &current, None).unwrap(),
+            expected
+        );
+        assert!(
+            request_digest("thread.read", &json!({"campId":"a","threadId":"a"}), None).is_err()
+        );
+        let root =
+            std::env::temp_dir().join(format!("rovai-builtin-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let endpoint = LocalIpcEndpoint::UnixSocket {
+            path: root.join("core.sock").to_string_lossy().into_owned(),
+        };
+        let config = BuiltinToolProcessConfig::create(&executable(), &endpoint, &root).unwrap();
+        let registry = BuiltinToolLeaseRegistry::default();
+        let first_binding = binding();
+        let first = registry
+            .bind(&config, "run-1", 1, &first_binding, &root)
+            .await
+            .unwrap();
+        assert_eq!(registry.active_count().await, 1);
+        for (run, epoch, generation, valid) in [
+            ("run-1", 1, 1, true),
+            ("run-1", 2, 1, false),
+            ("run-2", 1, 1, false),
+            ("run-1", 1, 2, false),
+        ] {
+            let resolved = registry
+                .auth_for_execution(run, epoch, &first_binding.native_binding_id, generation)
+                .await;
+            assert_eq!(resolved.is_ok(), valid);
+            if let Ok(auth) = resolved {
+                assert_eq!(auth.lease_id, first.lease_id);
+            }
+        }
+        let context: BuiltinToolCliContext =
+            serde_json::from_slice(&fs::read(config.context_path().unwrap()).unwrap()).unwrap();
+        let lease = context.lease.unwrap();
+        assert_eq!(Path::new(&lease.execution_root), root);
+        assert_eq!(Path::new(&lease.run_tmp), config.run_tmp());
+        // A projection write can fail while the original Run/lease stays usable.
+        // Retrying the same desired state repairs that process without rebinding.
+        let saved_context = config.context_path().unwrap().with_extension("saved");
+        fs::rename(config.context_path().unwrap(), &saved_context).unwrap();
+        fs::create_dir(config.context_path().unwrap()).unwrap();
+        let enabled_runs = std::collections::HashSet::from(["run-1".to_string()]);
+        for target in [None, Some((config.process_id(), "run-1", 1))] {
+            let _gate = registry.invocation_guard().await;
+            assert!(!registry.refresh_tasks(&enabled_runs, target).await);
+        }
+        assert!(registry.authenticate(&first).await.is_ok());
+        fs::remove_dir(config.context_path().unwrap()).unwrap();
+        fs::rename(saved_context, config.context_path().unwrap()).unwrap();
+        {
+            let _gate = registry.invocation_guard().await;
+            assert!(registry.refresh_tasks(&enabled_runs, None).await);
+        }
+        let repaired: BuiltinToolCliContext =
+            serde_json::from_slice(&fs::read(config.context_path().unwrap()).unwrap()).unwrap();
+        assert!(repaired.tasks_enabled);
+        assert_eq!(repaired.lease.unwrap().lease_id, first.lease_id);
+        {
+            let _gate = registry.invocation_guard().await;
+            assert!(registry.refresh_tasks(&Default::default(), None).await);
+        }
+        let disabled: BuiltinToolCliContext =
+            serde_json::from_slice(&fs::read(config.context_path().unwrap()).unwrap()).unwrap();
+        assert!(!disabled.tasks_enabled);
+        assert!(registry.authenticate(&first).await.is_ok());
+        // Preserve a valid, noncanonical encoding to detect even an identical
+        // projection rewrite without depending on timestamps or inode behavior.
+        fn preserve_context_bytes(config: &BuiltinToolProcessConfig) -> Vec<u8> {
+            let mut bytes = fs::read(config.context_path().unwrap()).unwrap();
+            bytes.push(b'\n');
+            fs::write(config.context_path().unwrap(), &bytes).unwrap();
+            bytes
+        }
+        let unchanged = preserve_context_bytes(&config);
+        let other_config =
+            BuiltinToolProcessConfig::create(&executable(), &endpoint, &root).unwrap();
+        let other = registry
+            .bind(&other_config, "other-run", 1, &binding(), &root)
+            .await
+            .unwrap();
+        let both_enabled =
+            std::collections::HashSet::from(["run-1".to_string(), "other-run".to_string()]);
+        {
+            let _gate = registry.invocation_guard().await;
+            assert!(
+                registry
+                    .refresh_tasks(
+                        &both_enabled,
+                        Some((other_config.process_id(), "other-run", 1))
+                    )
+                    .await
+            );
+        }
+        assert_eq!(fs::read(config.context_path().unwrap()).unwrap(), unchanged);
+        let other_context: BuiltinToolCliContext =
+            serde_json::from_slice(&fs::read(other_config.context_path().unwrap()).unwrap())
+                .unwrap();
+        assert!(other_context.tasks_enabled);
+        assert_eq!(other_context.lease.unwrap().lease_id, other.lease_id);
+        // Global settings still project every active process, including same-value repair.
+        for enabled in [&both_enabled, &Default::default()] {
+            let _gate = registry.invocation_guard().await;
+            assert!(registry.refresh_tasks(enabled, None).await);
+            for process in [&config, &other_config] {
+                let context: BuiltinToolCliContext =
+                    serde_json::from_slice(&fs::read(process.context_path().unwrap()).unwrap())
+                        .unwrap();
+                assert_eq!(context.tasks_enabled, !enabled.is_empty());
+            }
+        }
+        registry
+            .unbind(other_config.process_id(), "other-run", 1)
+            .await;
+        let other_unbound = preserve_context_bytes(&other_config);
+        {
+            let _gate = registry.invocation_guard().await;
+            assert!(
+                registry
+                    .refresh_tasks(
+                        &both_enabled,
+                        Some((other_config.process_id(), "other-run", 1))
+                    )
+                    .await
+            );
+        }
+        assert_eq!(
+            fs::read(other_config.context_path().unwrap()).unwrap(),
+            other_unbound
+        );
+        drop(other_config);
+
+        let member_image = rovai_core::member_avatar::materialize_member_avatar(
+            &root,
+            config.run_tmp(),
+            rovai_core::member_avatar::LUOKE_AVATAR_REF,
+        )
+        .unwrap();
+        assert!(Path::new(&member_image.path).is_file());
+        let frozen_source = root.join("frozen-source");
+        fs::create_dir(&frozen_source).unwrap();
+        fs::write(frozen_source.join("file.txt"), b"frozen").unwrap();
+        rovai_core::local_attachment_snapshot::snapshot_local_attachment(
+            &frozen_source,
+            &config.run_tmp().join("snapshot"),
+        )
+        .unwrap();
+        fs::write(
+            config.run_tmp().join("stale-from-first-lease.txt"),
+            b"stale",
+        )
+        .unwrap();
+        let rotated = registry
+            .bind(&config, "run-1", 1, &binding(), &root)
+            .await
+            .unwrap();
+        assert!(rotated.lease_generation > first.lease_generation);
+        assert_ne!(rotated.lease_id, first.lease_id);
+        {
+            let _gate = registry.invocation_guard().await;
+            assert!(
+                registry
+                    .refresh_tasks(&enabled_runs, Some((config.process_id(), "run-1", 1)))
+                    .await
+            );
+        }
+        let current: BuiltinToolCliContext =
+            serde_json::from_slice(&fs::read(config.context_path().unwrap()).unwrap()).unwrap();
+        assert_eq!(current.lease.unwrap().lease_id, rotated.lease_id);
+        assert!(current.tasks_enabled);
+        assert!(registry.authenticate(&first).await.is_err());
+        assert!(config.run_tmp().is_dir());
+        assert!(!config.run_tmp().join("stale-from-first-lease.txt").exists());
+        assert!(!Path::new(&member_image.path).exists());
+        let reacquired = rovai_core::member_avatar::materialize_member_avatar(
+            &root,
+            config.run_tmp(),
+            rovai_core::member_avatar::LUOKE_AVATAR_REF,
+        )
+        .unwrap();
+        assert!(Path::new(&reacquired.path).is_file());
+
+        fs::write(
+            config.run_tmp().join("stale-from-rotated-lease.txt"),
+            b"stale",
+        )
+        .unwrap();
+        let envelope = BuiltinToolInvocationEnvelope::success(
+            "camp.list",
+            "7b5db24c-4a43-4cab-9217-d982b08f7691",
+            json!({"camps": [], "truncated": false}),
+        )
+        .unwrap();
+        registry
+            .record(
+                &rotated,
+                "7b5db24c-4a43-4cab-9217-d982b08f7691",
+                "digest-1",
+                &envelope,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .replay(&rotated, "7b5db24c-4a43-4cab-9217-d982b08f7691", "digest-1",)
+                .await
+                .unwrap(),
+            Some(envelope)
+        );
+        // Retired Send association remains part of the raw transport identity.
+        // It never changes business routing, but cannot reuse a different request's receipt.
+        let send_id = "7b5db24c-4a43-4cab-9217-d982b08f7692";
+        let send_input = json!({"body": "Same message", "taskId": "retained-task"});
+        let send_digest = request_digest("camp.message.send", &send_input, None).unwrap();
+        let source_digest =
+            request_digest("camp.message.send", &send_input, Some("/tmp/reply.md")).unwrap();
+        assert_ne!(send_digest, source_digest);
+        assert_ne!(
+            source_digest,
+            request_digest("camp.message.send", &send_input, Some("/tmp/other.md")).unwrap()
+        );
+        let send_receipt = BuiltinToolInvocationEnvelope::success(
+            "camp.message.send",
+            send_id,
+            json!({"messageId": "committed-message"}),
+        )
+        .unwrap();
+        registry
+            .record(&rotated, send_id, &send_digest, &send_receipt)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .replay(&rotated, send_id, &send_digest)
+                .await
+                .unwrap(),
+            Some(send_receipt)
+        );
+        for changed in [
+            json!({"body": "Same message", "taskId": "another-task"}),
+            json!({"body": "Same message", "taskId": null}),
+            json!({"body": "Same message"}),
+        ] {
+            let changed_digest = request_digest("camp.message.send", &changed, None).unwrap();
+            assert_eq!(
+                registry
+                    .replay(&rotated, send_id, &changed_digest)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "builtin_tool.idempotency_conflict"
+            );
+        }
+        registry.unbind(config.process_id(), "run-1", 1).await;
+        assert!(registry.authenticate(&rotated).await.is_err());
+        assert!(
+            registry
+                .auth_for_execution("run-1", 1, &first_binding.native_binding_id, 1)
+                .await
+                .is_err()
+        );
+        assert!(!config.run_tmp().exists());
+        let second = registry
+            .bind(&config, "run-2", 2, &binding(), &root)
+            .await
+            .unwrap();
+        assert!(second.lease_generation > rotated.lease_generation);
+        assert_ne!(second.lease_id, rotated.lease_id);
+        assert!(registry.authenticate(&first).await.is_err());
+        assert!(config.run_tmp().is_dir());
+        assert!(
+            !config
+                .run_tmp()
+                .join("stale-from-rotated-lease.txt")
+                .exists()
+        );
+        let unchanged = preserve_context_bytes(&config);
+        for (run, epoch) in [("run-1", 1), ("run-2", 1), ("run-1", 2)] {
+            let _gate = registry.invocation_guard().await;
+            assert!(
+                registry
+                    .refresh_tasks(&both_enabled, Some((config.process_id(), run, epoch)))
+                    .await
+            );
+            assert_eq!(fs::read(config.context_path().unwrap()).unwrap(), unchanged);
+        }
+        assert!(registry.authenticate(&second).await.is_ok());
+        registry.unbind(config.process_id(), "run-2", 2).await;
+        drop(config);
+
+        // Native Session CLI calls use this same registry without a file
+        // consumer. Even an unwritable projection destination cannot block a
+        // bind, refresh or revocation; Run tmp and lease fencing still apply.
+        let native = BuiltinToolProcessConfigFactory::new(&executable(), &endpoint, &root)
+            .without_context_file()
+            .create()
+            .unwrap();
+        assert!(native.context_path().is_none());
+        let unused_path = native.inner.process_root.join("context.json");
+        assert!(!unused_path.exists());
+        fs::create_dir(&unused_path).unwrap();
+        let native_binding = binding();
+        let auth = registry
+            .bind(&native, "native-run", 1, &native_binding, &root)
+            .await
+            .unwrap();
+        assert!(native.run_tmp().is_dir());
+        assert_eq!(
+            registry
+                .auth_for_execution("native-run", 1, &native_binding.native_binding_id, 1)
+                .await
+                .unwrap()
+                .lease_id,
+            auth.lease_id
+        );
+        for target in [None, Some((native.process_id(), "native-run", 1))] {
+            let _gate = registry.invocation_guard().await;
+            assert!(registry.refresh_tasks(&Default::default(), target).await);
+        }
+        let rotated = registry
+            .bind(&native, "native-run", 1, &native_binding, &root)
+            .await
+            .unwrap();
+        assert!(registry.authenticate(&auth).await.is_err());
+        assert!(registry.authenticate(&rotated).await.is_ok());
+        registry.unbind(native.process_id(), "native-run", 1).await;
+        assert!(registry.authenticate(&rotated).await.is_err());
+        assert!(!native.run_tmp().exists());
+        let next = registry
+            .bind(&native, "native-next", 2, &native_binding, &root)
+            .await
+            .unwrap();
+        assert_eq!(registry.fence_all().await, 1);
+        assert!(registry.authenticate(&next).await.is_err());
+        registry.unregister(native.process_id()).await;
+        assert!(unused_path.is_dir());
+        assert!(fs::read_dir(&unused_path).unwrap().next().is_none());
+        drop(native);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn run_tmp_cleanup_does_not_hold_the_global_invocation_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "rovai-builtin-cleanup-lock-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let endpoint = LocalIpcEndpoint::UnixSocket {
+            path: root.join("core.sock").to_string_lossy().into_owned(),
+        };
+        let first_config =
+            BuiltinToolProcessConfig::create(&executable(), &endpoint, &root).unwrap();
+        let second_config =
+            BuiltinToolProcessConfig::create(&executable(), &endpoint, &root).unwrap();
+        let registry = Arc::new(BuiltinToolLeaseRegistry::default());
+        registry
+            .bind(&first_config, "run-1", 1, &binding(), &root)
+            .await
+            .unwrap();
+        fs::create_dir(first_config.run_tmp().join("nested")).unwrap();
+        fs::write(
+            first_config.run_tmp().join("nested/generated.txt"),
+            b"generated",
+        )
+        .unwrap();
+
+        let pause = Arc::new(RunTmpCleanupTestPause::new());
+        run_tmp_cleanup_test_pauses()
+            .lock()
+            .unwrap()
+            .insert(first_config.process_id().to_string(), Arc::clone(&pause));
+        let unbind_registry = Arc::clone(&registry);
+        let first_process_id = first_config.process_id().to_string();
+        let unbind = tokio::spawn(async move {
+            unbind_registry.unbind(&first_process_id, "run-1", 1).await;
+        });
+
+        let cleanup_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !pause.started.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let second_bind = if cleanup_started {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                registry.bind(&second_config, "run-2", 2, &binding(), &root),
+            )
+            .await
+            {
+                Ok(Ok(auth)) => Some(auth),
+                Ok(Err(_)) | Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        pause.release();
+        unbind.await.unwrap();
+        let first_process_root = first_config.inner.process_root.clone();
+        let retired_removed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let has_retired = fs::read_dir(&first_process_root)
+                    .unwrap()
+                    .filter_map(std::result::Result::ok)
+                    .any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".run-tmp-retired-")
+                    });
+                if !has_retired {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        run_tmp_cleanup_test_pauses()
+            .lock()
+            .unwrap()
+            .remove(first_config.process_id());
+        if second_bind.is_some() {
+            registry
+                .unbind(second_config.process_id(), "run-2", 2)
+                .await;
+        }
+        assert!(cleanup_started, "the retired Run tmp cleanup did not start");
+        assert!(retired_removed, "the retired Run tmp was not cleaned");
+        assert!(
+            second_bind.is_some(),
+            "recursive cleanup for one Process must not block another Process lease"
+        );
+
+        drop(registry);
+        drop(first_config);
+        drop(second_config);
+        let _ = fs::remove_dir_all(root);
+    }
+}

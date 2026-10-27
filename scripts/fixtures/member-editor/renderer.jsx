@@ -1,0 +1,367 @@
+import { languageTestApi } from '../../../apps/desktop/src/renderer/src/interface-language-test-api'
+import { CurrentUserProfileProvider } from '../../../apps/desktop/src/renderer/src/CurrentUserProfile'
+import '../../../apps/desktop/src/renderer/src/styles.css'
+import '../../../apps/desktop/src/renderer/src/member-editor.css'
+import React, { useRef, useState } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RuntimeStartupSettings } from '../../../apps/desktop/src/renderer/src/RuntimeStartupSettings'
+import { COMMON_ENVIRONMENT_CHANGED } from '../../../apps/desktop/src/renderer/src/member-environment'
+import { MembersView } from '../../../apps/desktop/src/renderer/src/MemberManagement'
+import { ThreadNavigation } from '../../../apps/desktop/src/renderer/src/ThreadNavigation'
+import { changeInterfaceLanguage, useInterfaceLanguage } from '../../../apps/desktop/src/renderer/src/interface-language'
+import {
+  availability,
+  initialMembers,
+  installations,
+  navigation,
+  clone
+} from './data'
+let members = initialMembers()
+const calls = []
+const commonEnvironments = {}, memberEnvironments = {}
+const common = kind => commonEnvironments[kind] ?? { revision: 0, environment: {} }
+const environment = (id,kind) => memberEnvironments[id+':'+kind] ?? { revision: 0, environment: {}, inheritCommon: true }
+let reload,
+  failMethod = null,
+  failReload = false,
+  openSettings
+const assets = new Map()
+let selectedSource = null
+let releaseSource = null
+let externalAfterUpdate = null
+let delayedReload = false
+let catalogScenario = null
+let removalRunning = false
+let releaseCatalog = null
+let holdEnvironmentRead = false
+let releaseEnvironmentRead = null
+const catalogCalls = []
+const catalogDisplayTimings = []
+const fixtureConsoleInfo = console.info.bind(console)
+console.info = (label, ...values) => {
+  if (label === '[model-catalog] display') catalogDisplayTimings.push(values[0])
+  fixtureConsoleInfo(label, ...values)
+}
+window.rovai = {
+  platform: 'darwin',
+  currentUserProfile: {
+    get: async () => JSON.parse(localStorage.getItem('fixture-current-user-profile') ?? '{"displayName":"","avatarDataUrl":null}'),
+    save: async (draft) => {
+      await new Promise((resolve) => setTimeout(resolve, 70))
+      if (failMethod === 'currentUserProfile.save') {
+        failMethod = null
+        throw new Error('验收模拟资料保存失败')
+      }
+      const profile = { ...draft, displayName: draft.displayName.trim() }
+      localStorage.setItem('fixture-current-user-profile', JSON.stringify(profile))
+      return profile
+    }
+  },
+  memberAvatars: {
+    read: async (ref, rendition) => {
+      const source = assets.get(ref)
+      if (!source) return null
+      if (source.kind === 'image') return { bytes: Array.from(source.source), mediaType: source.source[0] === 71 ? 'image/gif' : 'image/png',
+        width: source.sourceWidth, height: source.sourceHeight, crop: source.crop, displayCrop: source.crop }
+      return { bytes: Array.from(rendition === 'portrait' ? source.sourcePng : source.iconPng),
+        width: rendition === 'portrait' ? source.sourceWidth : 192,
+        height: rendition === 'portrait' ? source.sourceHeight : 192, crop: source.crop }
+    },
+    selectSource: async () => selectedSource,
+    save: async (source) => {
+      if (failMethod === 'memberAvatars.save') { failMethod = null; throw new Error('验收模拟头像文件保存失败') }
+      const avatarRef = `rovai://member-avatar/managed/${crypto.randomUUID()}`
+      assets.set(avatarRef, source)
+      return { avatarRef, crop: source.crop }
+    }
+  },
+  request: async (method, payload) => {
+    if (method === 'member.runtimeEnvironment.get') {
+      const own = environment(payload.memberId,payload.adapterKind), shared = common(payload.adapterKind)
+      const snapshot = { ...clone(own), common: clone(shared) }
+      if (holdEnvironmentRead) await new Promise(resolve => { releaseEnvironmentRead = resolve })
+      return snapshot
+    }
+    if (method === 'runtime.environment.get') return clone(common(payload.runtimeKind))
+    if (method.startsWith('runtime.startup.')) {
+      calls.push({ method, command: clone(payload) })
+      if (failMethod === method) { failMethod = null; throw new Error('验收模拟保存失败，修改仍保留。') }
+      if (method === 'runtime.startup.save' && payload.commonEnvironment) {
+        const saved = common(payload.runtimeKind), edit = payload.commonEnvironment
+        if (saved.revision !== edit.expectedRevision) throw new Error('Common environment changed; reload the saved configuration')
+        const values = JSON.parse(edit.json || '{}')
+        if (Object.values(values).some(value => typeof value !== 'string')) throw new Error('Core requires string environment values')
+        commonEnvironments[payload.runtimeKind] = { revision: saved.revision + 1, environment: values }
+      }
+      if ((method === 'runtime.startup.check' || method === 'runtime.startup.inspect') && payload.commonEnvironment && common(payload.runtimeKind).revision !== payload.commonEnvironment.expectedRevision) throw new Error('Common environment changed; reload the saved configuration')
+      if (method === 'runtime.startup.check' || method === 'runtime.startup.inspect') return { status: 'ready', executablePath: '/fixture/codex', reportedVersion: 'fixture' }
+      const saved = common(payload.runtimeKind)
+      return { runtimeKind: payload.runtimeKind, revision: 1, configuration: { programPath: '/fixture/codex', environment: [] }, reconnectRequired: false, commonEnvironment: clone(saved) }
+    }
+    if (method === 'runtime.modelCatalog.open') {
+      catalogCalls.push(clone(payload))
+      const installation = installations.find(
+        (item) => item.adapterKind === payload.runtimeKind
+      )
+      if (catalogScenario?.hold) await new Promise(resolve => { releaseCatalog = resolve })
+      const refreshStatus = catalogScenario?.refreshStatus ?? 'completed'
+      return {
+        runtimeKind: payload.runtimeKind,
+        cache: { ...installation.modelCatalog, status: refreshStatus === 'completed' ? 'fresh' : installation.modelCatalog.status, observedAt: new Date().toISOString() },
+        models: installation.snapshot.models,
+        refreshStatus,
+        diagnosticCode: null
+      }
+    }
+    if (method === 'members.list') return clone(members)
+    const command = payload.command ?? payload
+    calls.push({ method, command: clone(command), commandId: payload.commandId })
+    await new Promise((resolve) => setTimeout(resolve, 70))
+    if (failMethod === method) {
+      failMethod = null
+      throw new Error('验收模拟保存失败，修改仍保留。')
+    }
+    const member = members.find((item) => item.agentId === command.agentId)
+    if (method === 'members.runtime.set' && catalogScenario?.rejectCodes?.length) {
+      return { status: 'rejected', code: catalogScenario.rejectCodes.shift(), payload: { option: 'reasoning_effort' } }
+    }
+    if (method === 'members.removalPreview')
+      return {
+        agentId: member.agentId,
+        displayName: member.displayName,
+        version: member.version,
+        removable: !removalRunning,
+        currentThreadMembershipCount: 2,
+        openAssignedTaskCount: 1,
+        defaultLeadThreadCount: 2,
+        soleMemberThreadCount: 1,
+        affectedThreads: [
+          { threadId: 'empty-after-removal', title: '研究资料整理', remainingMemberCount: 0, wasDefaultLead: true, nextDefaultLeadAgentId: null, nextDefaultLeadDisplayName: null },
+          { threadId: 'lead-after-removal', title: '资料归档', remainingMemberCount: 1, wasDefaultLead: true, nextDefaultLeadAgentId: 'successor', nextDefaultLeadDisplayName: '爱丽丝' }
+        ],
+        nonTerminalAgentRunCount: removalRunning ? 1 : 0
+      }
+    if (method === 'members.reorder') {
+      members = command.orderedAgentIds.map((id) =>
+        members.find((item) => item.agentId === id)
+      )
+      return { status: 'applied', payload: {}, resultEntity: null }
+    }
+    if (member && member.version !== command.expectedVersion)
+      return {
+        status: 'rejected',
+        code: 'agent_profile.version_conflict',
+        payload: { version: member.version }
+      }
+    let next
+    if (method === 'members.create') {
+      next = {
+        ...initialMembers()[0],
+        ...command,
+        agentId: `agent_${members.length + 1}`,
+        runtimeConfiguration: null,
+        runtimeReadiness: { status: 'runtime_not_configured', blockers: [] },
+        version: 1
+      }
+      members.push(next)
+    } else {
+      next = { ...member, version: member.version + 1 }
+      if (method === 'members.update') {
+        const { agentId, expectedVersion, ...identity } = command
+        Object.assign(next, identity)
+      }
+      if (method === 'members.avatar.set') next.avatarRef = command.avatarRef
+      if (method === 'members.runtime.set') {
+        const { adapterKind, model, permissions } = command
+        next.runtimeConfiguration = { adapterKind, model, permissions }
+        if (command.environment) {
+          const previous = environment(command.agentId,adapterKind), edit = command.environment
+          const values = JSON.parse(edit.json || '{}')
+          if (Object.values(values).some(value => typeof value !== 'string')) throw new Error('Core requires string environment values')
+          memberEnvironments[command.agentId+':'+adapterKind] = { revision: previous.revision+1, environment: values, inheritCommon: edit.inheritCommon ?? previous.inheritCommon }
+        }
+      }
+      if (method === 'members.runtime.clear') next.runtimeConfiguration = null
+      if (method === 'members.presence.set') next.presence = command.presence
+      if (method === 'members.remove') {
+        next.presence = 'removed'
+        next.removedAt = new Date().toISOString()
+      }
+      members = members.map((item) =>
+        item.agentId === next.agentId ? next : item
+      )
+    }
+    if (method === 'members.update' && externalAfterUpdate) {
+      members = members.map((member) =>
+        member.agentId === next.agentId
+          ? { ...member, ...externalAfterUpdate, version: member.version + 1 }
+          : member
+      )
+      externalAfterUpdate = null
+      delayedReload = true
+    }
+    return {
+      status: 'applied',
+      code: method,
+      payload: { agentId: next.agentId, version: next.version },
+      resultEntity: { entityId: next.agentId }
+    }
+  }
+}
+window.memberFixture = {
+  environment: (id,kind) => clone(environment(id,kind)),
+  holdEnvironmentRead: () => { holdEnvironmentRead = true },
+  environmentReadPending: () => releaseEnvironmentRead !== null,
+  releaseEnvironmentRead: () => { holdEnvironmentRead = false; releaseEnvironmentRead?.(); releaseEnvironmentRead = null },
+  common: (kind,values) => {
+    commonEnvironments[kind] = { revision: common(kind).revision+1, environment: values }
+    window.dispatchEvent(new CustomEvent(COMMON_ENVIRONMENT_CHANGED,{ detail: kind }))
+  },
+  removalRunning: (value) => { removalRunning = value },
+  calls,
+  catalogCalls,
+  catalogDisplayTimings,
+  catalogScenario: (scenario) => {
+    catalogScenario = scenario
+    const installation = installations.find(item => item.adapterKind === 'codex-cli')
+    installation.modelCatalog.status = scenario ? 'expired' : 'fresh'
+    reload()
+  },
+  releaseCatalog: () => { if (catalogScenario) catalogScenario.hold = false; releaseCatalog?.(); releaseCatalog = null },
+  roster: (away = 0) => {
+    const base = initialMembers()
+    members = Array.from({ length: 16 }, (_, index) => ({
+      ...clone(base[index % base.length]),
+      ...(index >= base.length ? { agentId: `fixture-roster-${index}`, displayName: `队员 ${index + 1}`, teamRole: index === 4 ? '产品设计与用户研究' : '协作队员' } : {}),
+      ...(index === 4 ? { runtimeConfiguration: null, runtimeReadiness: { status: 'runtime_not_configured', blockers: [] } } : {}),
+      memberOrder: index,
+      presence: index >= 16 - away ? 'away' : 'present'
+    }))
+    reload()
+  },
+  afterUpdate: (patch) => {
+    externalAfterUpdate = patch
+  },
+  profiles: () => clone(members),
+  installations,
+  fail: (method) => {
+    failMethod = method
+  },
+  failReload: (value) => {
+    failReload = value
+  },
+  change: (id, patch) => {
+    members = members.map((member) =>
+      member.agentId === id
+        ? { ...member, ...patch, version: member.version + 1 }
+        : member
+    )
+    reload()
+  },
+  holdSource: () => { selectedSource = new Promise(resolve => { releaseSource = resolve }) },
+  releaseSource: value => { releaseSource?.(value); releaseSource = null },
+  source: (value) => {
+    selectedSource = value
+  },
+  theme: (theme) => {
+    document.documentElement.dataset.theme = theme
+  },
+  language: language => changeInterfaceLanguage(languageTestApi, language),
+  leave: () => openSettings(),
+  reset: () => {
+    members = initialMembers()
+    reload()
+    calls.splice(0)
+  }
+}
+function Fixture() {
+  useInterfaceLanguage()
+  const [agents, setAgents] = useState(members)
+  const [selected, setSelected] = useState(members[0].agentId)
+  const [tab, setTab] = useState('identity')
+  const [view, setView] = useState('members')
+  const [commonReturn, setCommonReturn] = useState(null)
+  const ref = useRef(null)
+  reload = () => {
+    if (failReload) return Promise.reject(new Error('验收模拟读取失败'))
+    setAgents(clone(members))
+    if (delayedReload) {
+      delayedReload = false
+      return new Promise((resolve) => setTimeout(resolve, 120))
+    }
+    return Promise.resolve()
+  }
+  openSettings = () => ref.current.requestTransition(() => setView('settings'))
+  const noop = () => {}
+  const navigationAction = async (method) => {
+    calls.push({ method })
+    if (failMethod === method) {
+      failMethod = null
+      throw new Error('验收模拟操作失败')
+    }
+  }
+  return (
+    <div className="app-shell">
+      <ThreadNavigation
+        view="members"
+        state="ready"
+        navigation={navigation}
+        activeThreadId={null}
+        currentProjectKey="prototype-project"
+        pendingMemoryCount={0}
+        onNewConversation={noop}
+        onMembers={() => setView('members')}
+        onAutomations={noop}
+        onMemory={noop}
+        onSettings={openSettings}
+        onOpenProject={noop}
+        onThread={noop}
+        onCreateInProject={noop}
+        onRemoveProject={async () => {}}
+        onRename={() => navigationAction('navigation.rename')}
+        onDelete={() => navigationAction('navigation.delete')}
+        onError={noop}
+      />
+      <div
+        className="window-drag-strip window-drag-strip-members"
+        aria-hidden="true"
+      />
+      <main className={`content ${view === 'settings' ? 'settings-content' : 'members-content'}`}>
+        {(view === 'members' || commonReturn) && (
+          <div className="members-workspace" hidden={view !== 'members'} style={view !== 'members' ? { display:'none' } : undefined}>
+            <MembersView
+              ref={ref}
+              onEditCommonEnvironment={(kind,member) => { setCommonReturn({ kind, name: member.displayName }); setView('settings') }}
+              agents={agents}
+              installations={installations}
+              runtimeAvailability={availability}
+              runtimeDiscoveryPending={false}
+              selectedAgentId={selected}
+              activeTab={tab}
+              runtimeFocusRequest={0}
+              onSelectedAgentChange={(id, tab) => {
+                setSelected(id)
+                setTab(tab)
+              }}
+              onTabChange={setTab}
+              onReload={reload}
+              onProfileCommitted={(profile) =>
+                setAgents((current) =>
+                  current.some((member) => member.agentId === profile.agentId)
+                    ? current.map((member) =>
+                        member.agentId === profile.agentId ? profile : member
+                      )
+                    : [...current, profile]
+                )
+              }
+              onOpenRuntimeSettings={openSettings}
+            />
+          </div>
+        )}
+        {view === 'settings' && (commonReturn ? <div className="settings-workbench"><div className="settings-panel settings-panel-runtime"><RuntimeStartupSettings runtimeKind={commonReturn.kind} health={{ runtimeAvailability: availability.map(item => ({ ...item, discovery: { executablePath: '/fixture/codex', discoveryStatus: 'found' } })), hostPlatform: 'macos-arm64' }}
+          backLabel={`返回 ${commonReturn.name} 的队员配置`} onBack={() => { setView('members'); setCommonReturn(null) }}/></div></div> : <button onClick={() => setView('members')}>返回队员</button>)}
+      </main>
+    </div>
+  )
+}
+createRoot(document.getElementById('root')).render(<CurrentUserProfileProvider><Fixture /></CurrentUserProfileProvider>)

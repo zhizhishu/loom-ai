@@ -1,0 +1,1323 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-14",
+  "sourceMessageId": "bb7d8c40-1c3e-4980-b959-4777fd527f4b",
+  "baselineCommit": "44ca038df8591f8207f48f821053db01620b6f1e",
+  "scope": "Only Rovai current transports and current installed engines; provider adapters exercised directly, no Core/product suite rerun. Real LLM authorized; Claude uses sub2api.",
+  "excluded": [
+    "Cursor",
+    "Cline",
+    "Command Code"
+  ],
+  "productEnabled": [
+    "codex",
+    "claude",
+    "pi",
+    "codebuddy",
+    "qwen",
+    "grok"
+  ],
+  "currentTransportPositive": [
+    "codex",
+    "claude",
+    "pi",
+    "codebuddy",
+    "qwen",
+    "grok",
+    "kiro",
+    "zcode"
+  ],
+  "sameTransportNotYetIntegrated": [
+    "kiro",
+    "zcode"
+  ],
+  "cases": [
+    {
+      "startedAt": "2026-10-14T13:28:12.603497+00:00",
+      "finishedAt": "2026-10-14T13:29:50.949598+00:00",
+      "version": "1.3.5",
+      "nativeStoreNote": "Native platform store/keychain used; unique fixture cwd and returned test session only. Product currently closes stdin after first input.",
+      "case": "antigravity-current-01",
+      "runtime": "antigravity",
+      "transport": "stream-json open stdin",
+      "result": "next_turn_queue",
+      "productSteerEnabled": false,
+      "reportSha256": "df5cdd40f9448f051ed35e2d02ac318969d78471c229d4622a0719313d5546bb",
+      "wireSha256": "3c69328bb03cd01346b28580796357c5a268d8f631c8f73adc482ffa73167a9b",
+      "actualToolBoundary": true,
+      "probeScript": "antigravity_probe_v1.py",
+      "probeScriptSha256": "a39c5f0ba9494f0bef9cbcbec5c3f90a81b18c0245f84c214f307e5775badfe4",
+      "results": [
+        {
+          "status": "SUCCESS",
+          "response": "ORIGINAL_028\n",
+          "num_turns": 1
+        },
+        {
+          "status": "SUCCESS",
+          "response": "STEER_028_成功\n",
+          "num_turns": 2
+        }
+      ],
+      "incorrectProbeMetadataVersion": "1.3.3",
+      "versionSource": {
+        "source": "native server log",
+        "line": "I1014 21:28:12.692823      36 server.go:1684] Language server version: 1.3.5",
+        "sha256": "0a21d2f3476f9d647e281ae55bbedf445de8bebfd4f1e129438940d44215acfc"
+      }
+    },
+    {
+      "startedAt": "2026-10-14T13:35:40.330255+00:00",
+      "finishedAt": "2026-10-14T13:36:17.872862+00:00",
+      "version": "1.3.5",
+      "nativeStoreNote": "Native platform store/keychain used; unique fixture cwd and returned test session only. Product currently closes stdin after first input.",
+      "case": "antigravity-current-02",
+      "runtime": "antigravity",
+      "transport": "stream-json open stdin",
+      "result": "next_turn_queue",
+      "productSteerEnabled": false,
+      "reportSha256": "05e71c710a43cbfaf09a51e5125bcfa7233773848916c682d8b6066ca8c6953a",
+      "wireSha256": "b3d69886ff171535b11b51b76ad8f9280981a4cbd129e19904a37ba0363c2b43",
+      "actualToolBoundary": true,
+      "probeScript": "antigravity_probe.py",
+      "probeScriptSha256": "ddef47a40c4877401b49c551f0caf6fb691cb336493fe650cdb78f302b2d2bdb",
+      "results": [
+        {
+          "status": "SUCCESS",
+          "response": "ORIGINAL_028\n",
+          "num_turns": 1
+        },
+        {
+          "status": "SUCCESS",
+          "response": "STEER_028_成功\n",
+          "num_turns": 2
+        }
+      ],
+      "executableSha256Before": "ebd71c4db14f79fca3fd0160332a38d9037146737422dcfc1f1d21ba01a13fff",
+      "executableSha256After": "ebd71c4db14f79fca3fd0160332a38d9037146737422dcfc1f1d21ba01a13fff"
+    },
+    {
+      "startedAt": "2026-10-14T13:27:20.208244+00:00",
+      "finishedAt": "2026-10-14T13:27:58.578069+00:00",
+      "version": "2.1.287 (Claude Code)",
+      "arguments": [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--replay-user-messages",
+        "--safe-mode",
+        "--strict-mcp-config",
+        "--tools",
+        "Bash,Read",
+        "--allowed-tools",
+        "Bash(python3 *)",
+        "Read",
+        "--no-session-persistence"
+      ],
+      "connection": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:18080",
+        "ANTHROPIC_MODEL": "gpt-6.1-sol"
+      },
+      "case": "claude-current-01",
+      "runtime": "claude",
+      "transport": "stream-json stdin",
+      "result": "same_active_execution",
+      "productSteerEnabled": true,
+      "reportSha256": "1da000133dc42806e568ff3936da0ca763297b7b2e3f71cd5d7b2bf8ec414673",
+      "wireSha256": "6efb52a9b3725ef9c52fb17145195295fea189ea2a3bf4fcf50da667ba0de1c3",
+      "actualToolBoundary": true,
+      "probeScript": "native_probe.py",
+      "probeScriptSha256": "3bcf00d740708ab874601f1f8d814131011f29be9659dc7cc96c40e2374df12c",
+      "resultsBeforeSupplement": 0,
+      "steerReplayMatched": true,
+      "finalResponse": "STEER_028_成功",
+      "resultIsError": false
+    },
+    {
+      "startedAt": "2026-10-14T13:22:21.278660+00:00",
+      "finishedAt": "2026-10-14T13:23:00.204426+00:00",
+      "version": "2.133.1",
+      "arguments": [
+        "--acp"
+      ],
+      "failure": {
+        "type": "RuntimeError",
+        "message": "Initial prompt ended without executing controlled tool"
+      },
+      "case": "codebuddy-acp-01",
+      "runtime": "codebuddy",
+      "transport": "ACP",
+      "result": "inconclusive_harness",
+      "productSteerEnabled": true,
+      "reportSha256": "1ac6b13a118cfb7a083b9706c7a277bba1d3743ddc709a38079eb9ba9fa56a34",
+      "wireSha256": "3244e4112c9d871023634566211af86f1251f46f57a18cdebc96ccbd5611634d",
+      "actualToolBoundary": false,
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "d45526f8c68ab841527e611da2bb7b3c0a6826d78a2f64fea96bf7451857489e",
+      "protocolVersion": 1,
+      "agentInfo": {},
+      "initialPromptStillPendingAtSupplement": null,
+      "supplementMethod": null,
+      "responseTimeline": [],
+      "assistantTextSegments": []
+    },
+    {
+      "startedAt": "2026-10-14T13:25:57.049286+00:00",
+      "finishedAt": "2026-10-14T13:26:24.646796+00:00",
+      "version": "2.133.1",
+      "arguments": [
+        "--acp"
+      ],
+      "case": "codebuddy-acp-02",
+      "runtime": "codebuddy",
+      "transport": "ACP",
+      "result": "same_active_execution",
+      "productSteerEnabled": true,
+      "reportSha256": "41b71cfbf0f05f748efa56e8542ca3216c3fa57f6c736e6caa23f4d3c9ca3089",
+      "wireSha256": "197bd8852db0d59c9682cbe651e014291bf2d8579c7bb80085343d1f24db8275",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {},
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "session/prompt",
+      "responseTimeline": [
+        {
+          "eventIndex": 103,
+          "requestId": 4,
+          "stopReason": "end_turn"
+        },
+        {
+          "eventIndex": 119,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "STEER_028_成功"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:27:20.208248+00:00",
+      "finishedAt": "2026-10-14T13:28:30.330817+00:00",
+      "version": "codex-cli 0.162.1",
+      "arguments": [
+        "app-server"
+      ],
+      "model": "gpt-6.1-sol",
+      "case": "codex-current-01",
+      "runtime": "codex",
+      "transport": "app-server JSON-RPC",
+      "result": "same_active_execution",
+      "productSteerEnabled": true,
+      "reportSha256": "9dddba843d3bdbb1181ef4c732a46abc40f87af907e7f22b001fd670fd70085a",
+      "wireSha256": "96fffed41981875eafe125fe04f59d22a1a57e425b706dcf3299f56dacb65c70",
+      "actualToolBoundary": true,
+      "probeScript": "native_probe.py",
+      "probeScriptSha256": "3bcf00d740708ab874601f1f8d814131011f29be9659dc7cc96c40e2374df12c",
+      "turnStartedCount": 1,
+      "steerResponse": {
+        "id": 5,
+        "result": {
+          "turnId": "01a13a98-9dcf-7bd2-b471-d3e829e53d8b"
+        }
+      },
+      "wrongTargetResponse": {
+        "error": {
+          "code": -32600,
+          "message": "expected active turn id `wrong-turn-028` but found `01a13a98-9dcf-7bd2-b471-d3e829e53d8b`"
+        },
+        "id": 4
+      },
+      "assistantMessages": [
+        "我会先检查 `hold.py`，再运行它验证等待逻辑，最长等待 100 秒，不修改脚本。",
+        "STEER_028_成功"
+      ],
+      "terminalStatus": "completed"
+    },
+    {
+      "startedAt": "2026-10-14T13:26:22.355878+00:00",
+      "finishedAt": "2026-10-14T13:26:29.890073+00:00",
+      "version": "GitHub Copilot CLI 1.0.91.\nRun 'copilot update' to check for updates.",
+      "arguments": [
+        "--acp",
+        "--stdio",
+        "--no-auto-update",
+        "--no-remote",
+        "--no-remote-export",
+        "--no-color",
+        "--log-level",
+        "error",
+        "--disable-builtin-mcps",
+        "--no-custom-instructions",
+        "--no-ask-user"
+      ],
+      "failure": {
+        "type": "RuntimeError",
+        "message": "Initial prompt ended without executing controlled tool"
+      },
+      "case": "copilot-acp-01",
+      "runtime": "copilot",
+      "transport": "ACP",
+      "result": "inconclusive_harness",
+      "productSteerEnabled": false,
+      "reportSha256": "01f1c21f3d15d0816c4759b98d3091f95f9965d88110b984fd6cb3d2298d36a0",
+      "wireSha256": "b716693f82cfb29b4313c80db7b640556d0ecec54d17dff60afc90cdf8c519c3",
+      "actualToolBoundary": false,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "Copilot",
+        "title": "Copilot",
+        "version": "1.0.83"
+      },
+      "initialPromptStillPendingAtSupplement": null,
+      "supplementMethod": null,
+      "responseTimeline": [],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "I'll check the script first."
+        }
+      ],
+      "nativeJournal": [
+        {
+          "sha256": "74e9649290efc44364eeaf77534c37a514611568266c853663cdd50d61b52199",
+          "events": [
+            {
+              "index": 0,
+              "type": "session.start",
+              "copilotVersion": "1.0.83"
+            },
+            {
+              "index": 2,
+              "type": "user.message",
+              "interactionId": "02f68f6f-698d-4c18-b8c7-07eee264844d",
+              "delivery": "idle",
+              "turnId": "0"
+            },
+            {
+              "index": 4,
+              "type": "assistant.turn_start",
+              "interactionId": "02f68f6f-698d-4c18-b8c7-07eee264844d",
+              "turnId": "0"
+            },
+            {
+              "index": 10,
+              "type": "assistant.turn_end",
+              "turnId": "0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:28:12.598519+00:00",
+      "finishedAt": "2026-10-14T13:28:22.967421+00:00",
+      "version": "GitHub Copilot CLI 1.0.91.\nRun 'copilot update' to check for updates.",
+      "arguments": [
+        "--acp",
+        "--stdio",
+        "--no-auto-update",
+        "--no-remote",
+        "--no-remote-export",
+        "--no-color",
+        "--log-level",
+        "error",
+        "--disable-builtin-mcps",
+        "--no-custom-instructions",
+        "--no-ask-user"
+      ],
+      "failure": {
+        "type": "RuntimeError",
+        "message": "Initial prompt ended without executing controlled tool"
+      },
+      "case": "copilot-acp-02",
+      "runtime": "copilot",
+      "transport": "ACP",
+      "result": "inconclusive_harness",
+      "productSteerEnabled": false,
+      "reportSha256": "f814aef7f58269139bef4086e19891df320955c0479862600947cf59bb11f41e",
+      "wireSha256": "a587a9d6b918fde7e4430c0e94dc73a0093a806442a8bb4fbfd4cc652da50582",
+      "actualToolBoundary": false,
+      "probeScript": "acp_probe_v3.py",
+      "probeScriptSha256": "f07ece5e6d28d41370a9bd9979837cb47eacd1fb32a47854f40bc07324880217",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "Copilot",
+        "title": "Copilot",
+        "version": "1.0.83"
+      },
+      "initialPromptStillPendingAtSupplement": null,
+      "supplementMethod": null,
+      "responseTimeline": [],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "I'll start by reading the script.The script writes a `ready` marker, then polls up to 100s for a `release` file. I'll run it in the background and create `release` to verify it exits early."
+        }
+      ],
+      "nativeJournal": [
+        {
+          "sha256": "27815b3cf19afbfcb7b48afa20318a93b31c0d1ec8de7b8bc29d435790c14761",
+          "events": [
+            {
+              "index": 0,
+              "type": "session.start",
+              "copilotVersion": "1.0.83"
+            },
+            {
+              "index": 2,
+              "type": "user.message",
+              "interactionId": "8a7b9af5-49e4-4ba9-bdd0-138be33c34dc",
+              "delivery": "idle",
+              "turnId": "0"
+            },
+            {
+              "index": 4,
+              "type": "assistant.turn_start",
+              "interactionId": "8a7b9af5-49e4-4ba9-bdd0-138be33c34dc",
+              "turnId": "0"
+            },
+            {
+              "index": 8,
+              "type": "assistant.turn_end",
+              "turnId": "0"
+            },
+            {
+              "index": 9,
+              "type": "assistant.turn_start",
+              "interactionId": "8a7b9af5-49e4-4ba9-bdd0-138be33c34dc",
+              "turnId": "1"
+            },
+            {
+              "index": 15,
+              "type": "assistant.turn_end",
+              "turnId": "1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:29:23.179689+00:00",
+      "finishedAt": "2026-10-14T13:29:33.807454+00:00",
+      "version": "GitHub Copilot CLI 1.0.91.\nRun 'copilot update' to check for updates.",
+      "arguments": [
+        "--acp",
+        "--stdio",
+        "--no-auto-update",
+        "--no-remote",
+        "--no-remote-export",
+        "--no-color",
+        "--log-level",
+        "error",
+        "--disable-builtin-mcps",
+        "--no-custom-instructions",
+        "--no-ask-user"
+      ],
+      "case": "copilot-acp-03",
+      "runtime": "copilot",
+      "transport": "ACP",
+      "result": "cancel_then_replace",
+      "productSteerEnabled": false,
+      "reportSha256": "fb7d5112b3d5e7924b120c391d46fffa83817565cb58703276433457fde962e3",
+      "wireSha256": "7a5feb7ba140ee1f9f2cc2f4811a5eaefa13711f52dccd83b8c3a0a043ef1423",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe.py",
+      "probeScriptSha256": "97b55ff9f682305c1c1d3eb27036665ebdf3ac2ecc3f3ec12b1cfa378d96c640",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "Copilot",
+        "title": "Copilot",
+        "version": "1.0.83"
+      },
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "session/prompt",
+      "responseTimeline": [
+        {
+          "eventIndex": 23,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        },
+        {
+          "eventIndex": 27,
+          "requestId": 4,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "I'll read the script first.Running it now (blocks until the external tester creates `release`, or 100s)."
+        },
+        {
+          "beforeResponseTo": 4,
+          "text": "STEER_028_成功"
+        }
+      ],
+      "nativeJournal": [
+        {
+          "sha256": "420d19630a4d18d3ff69092daf9aed684ad6ae6a13187c48ded6339243a53c66",
+          "events": [
+            {
+              "index": 0,
+              "type": "session.start",
+              "copilotVersion": "1.0.83"
+            },
+            {
+              "index": 2,
+              "type": "user.message",
+              "interactionId": "276955a1-4437-41af-9845-a3d124954162",
+              "delivery": "idle",
+              "turnId": "0"
+            },
+            {
+              "index": 4,
+              "type": "assistant.turn_start",
+              "interactionId": "276955a1-4437-41af-9845-a3d124954162",
+              "turnId": "0"
+            },
+            {
+              "index": 8,
+              "type": "assistant.turn_end",
+              "turnId": "0"
+            },
+            {
+              "index": 9,
+              "type": "assistant.turn_start",
+              "interactionId": "276955a1-4437-41af-9845-a3d124954162",
+              "turnId": "1"
+            },
+            {
+              "index": 14,
+              "type": "abort",
+              "reason": "user_initiated"
+            },
+            {
+              "index": 15,
+              "type": "assistant.turn_end",
+              "turnId": "1"
+            },
+            {
+              "index": 17,
+              "type": "user.message",
+              "interactionId": "86a02271-e5ad-401c-86e3-7a23bd5f46a7",
+              "delivery": "idle",
+              "turnId": "0"
+            },
+            {
+              "index": 18,
+              "type": "assistant.turn_start",
+              "interactionId": "86a02271-e5ad-401c-86e3-7a23bd5f46a7",
+              "turnId": "0"
+            },
+            {
+              "index": 28,
+              "type": "assistant.turn_end",
+              "turnId": "0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:27:27.868280+00:00",
+      "finishedAt": "2026-10-14T13:27:39.712686+00:00",
+      "version": "0.2.1-alpha.1",
+      "arguments": [
+        "--profile",
+        "acp"
+      ],
+      "case": "dsh-acp-01",
+      "runtime": "dsh",
+      "transport": "ACP",
+      "result": "busy_rejected",
+      "productSteerEnabled": false,
+      "reportSha256": "b1596a5305abe0f7beff76ca226d740ee23eb3ae8347c084cad37ca26e6de0f3",
+      "wireSha256": "c3d4f9edb5c189fbb9fb42ca120daa7a9dd00d822e7e8f4bee5bc4a4bc930418",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "deepseek-harness-acp",
+        "version": "0.0.1"
+      },
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "session/prompt",
+      "responseTimeline": [
+        {
+          "eventIndex": 12,
+          "requestId": 4,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: a prompt is already in flight for this session"
+          }
+        },
+        {
+          "eventIndex": 23,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "已检查并执行验证，脚本未改动。\n\n**代码检查**（`hold.py`，6 行）：\n- 用 `Path(__file__).parent` 锚定脚本所在目录，写入 `ready` 文件表示已启动；\n- `t = time.monotonic() + 100` 设定 100 秒上限；\n- 循环条件 `time.monotonic() < t and not (p/'release').exists()`，每 0.05s 轮询一次：`release` 出现即立即退出，最坏情况到 100 秒超时退出（超时也会打印 `HOLD_COMPLETE`，无法从输出区分是超时还是被释放——这是该脚本唯一的观察盲点）。\n\n**执行验证**：\n- 后台运行 `python3 hold.py`；\n- 检测到 `ready` 文件生成后创建 `release`（仅用约 0.6s）；\n- 任务随即以 exit code 0 结束并输出 `HOLD_COMPLETE`，即脚本在 `release` 出现后立即退出，未触发 100 秒上限，等待逻辑符合预期。\n\n运行产生的 `ready` / `release` 文件仍留在目录中（脚本自身的正常行为，未做清理以免干扰判断）。\n\nORIGINAL_028"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:22:23.533052+00:00",
+      "finishedAt": "2026-10-14T13:22:50.990478+00:00",
+      "version": "grok 1.0.50 (c58f321264ba)",
+      "arguments": [
+        "agent",
+        "--no-leader",
+        "stdio"
+      ],
+      "failure": {
+        "type": "RuntimeError",
+        "message": "Initial prompt ended without executing controlled tool"
+      },
+      "case": "grok-acp-01",
+      "runtime": "grok",
+      "transport": "ACP",
+      "result": "inconclusive_harness",
+      "productSteerEnabled": true,
+      "reportSha256": "914e44248b0b7d83b93b9af6c5cdeed9c860f19f455812e6a337525ce32bd16f",
+      "wireSha256": "4d6ee34127b2976211bbfd169a203c4886f74549ed1f60a96264fa5d443b33e7",
+      "actualToolBoundary": false,
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "d45526f8c68ab841527e611da2bb7b3c0a6826d78a2f64fea96bf7451857489e",
+      "protocolVersion": 1,
+      "agentInfo": {},
+      "initialPromptStillPendingAtSupplement": null,
+      "supplementMethod": null,
+      "responseTimeline": [],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "我先检查 `hold.py`，再运行它验证文件等待逻辑；不会改动脚本。\n已检查 `hold.py`：它先写入 `ready` 文件，再每 0.05 秒检查一次 `release` 文件，最多等待 100 秒，最后输出 `HOLD_COMPLETE`。脚本未改动。\n\n两次执行均因终端工具报错 `IO Error: FileNotFoundError` 而未能启动，因此运行验证未完成。\n\nORIGINAL_028"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:25:57.049175+00:00",
+      "finishedAt": "2026-10-14T13:26:28.321110+00:00",
+      "version": "grok 1.0.50 (c58f321264ba)",
+      "arguments": [
+        "--no-auto-update",
+        "agent",
+        "--no-leader",
+        "stdio"
+      ],
+      "case": "grok-acp-02",
+      "runtime": "grok",
+      "transport": "ACP",
+      "result": "same_active_execution",
+      "productSteerEnabled": true,
+      "reportSha256": "d020e08844e8408080e729788b98cabf7bbc1750fbfb71c97351648c38597acc",
+      "wireSha256": "77b41a5658d7fb01094c1a2c26f2cd632759559c2582ae589dbed53b507e36ed",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {},
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "_x.ai/interject",
+      "responseTimeline": [
+        {
+          "eventIndex": 152,
+          "requestId": 4,
+          "result": {
+            "status": "queued"
+          }
+        },
+        {
+          "eventIndex": 169,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 4,
+          "text": "我会先检查 `hold.py`，再运行脚本验证文件等待逻辑，保持脚本原样。\n"
+        },
+        {
+          "beforeResponseTo": 3,
+          "text": "STEER_028_成功"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:25:57.049916+00:00",
+      "finishedAt": "2026-10-14T13:26:16.474335+00:00",
+      "version": "2.1.1",
+      "arguments": [
+        "acp"
+      ],
+      "case": "kimi-acp-01",
+      "runtime": "kimi",
+      "transport": "ACP",
+      "result": "busy_rejected",
+      "productSteerEnabled": false,
+      "reportSha256": "9e1ef3f75093178e133d68504cad0481a4343210d97878e11eedc26837a7b66d",
+      "wireSha256": "47f8c13175d30bd41690d82a498ed914c447b88a344aee7f5207bb9486d68643",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "Kimi Code CLI",
+        "version": "2.1.1"
+      },
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "session/prompt",
+      "responseTimeline": [
+        {
+          "eventIndex": 30,
+          "requestId": 4,
+          "error": {
+            "code": -32600,
+            "message": "Invalid request: another turn is already in progress",
+            "data": {
+              "code": "turn.agent_busy"
+            }
+          }
+        },
+        {
+          "eventIndex": 40,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "ORIGINAL_028"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:27:27.868292+00:00",
+      "finishedAt": "2026-10-14T13:27:42.129879+00:00",
+      "version": "kiro-cli 2.21.1",
+      "arguments": [
+        "acp",
+        "--trust-all-tools"
+      ],
+      "case": "kiro-acp-01",
+      "runtime": "kiro",
+      "transport": "ACP",
+      "result": "busy_rejected",
+      "productSteerEnabled": false,
+      "reportSha256": "08482fa9287c1c696689d562d0efdd679ff7022af7be1b144d4f476b5a4b4fa5",
+      "wireSha256": "345d3ebcbca1631d3f22e918ce04e2d17d59355bd2852a060676a33b490dc172",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "Kiro CLI Agent",
+        "title": "Kiro CLI Agent",
+        "version": "2.21.1"
+      },
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "session/prompt",
+      "responseTimeline": [
+        {
+          "eventIndex": 40,
+          "requestId": 4,
+          "error": {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "Prompt already in progress"
+          }
+        },
+        {
+          "eventIndex": 64,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 4,
+          "text": "The script:\n1. Creates a `ready` file in its own directory\n2. Waits up to 100 seconds for a `release` file to appear\n3. Prints `HOLD_COMPLETE` when either the `release` file exists or the timeout is reached"
+        },
+        {
+          "beforeResponseTo": 3,
+          "text": "脚本执行成功，输出 `HOLD_COMPLETE`。逻辑验证正常：脚本创建了 `ready` 文件，等待 `release` 文件出现（最多 100 秒），超时后正常退出并打印 `HOLD_COMPLETE`。\n\nORIGINAL_028"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:33:24.946791+00:00",
+      "finishedAt": "2026-10-14T13:33:35.518002+00:00",
+      "version": "kiro-cli 2.21.1",
+      "arguments": [
+        "acp",
+        "--trust-all-tools"
+      ],
+      "case": "kiro-acp-steer-02",
+      "runtime": "kiro",
+      "transport": "ACP",
+      "result": "same_active_execution",
+      "productSteerEnabled": false,
+      "reportSha256": "0ec6dc21ed38d3f2578c9a90e7546b5f55a346a395d4797361add61e58f60819",
+      "wireSha256": "962de595c6a6d148d88cad38c591abb7a519325bc36da715284588ef9381b3b2",
+      "actualToolBoundary": true,
+      "probeScript": "acp_kiro_steer_probe.py",
+      "probeScriptSha256": "14288583e70940f0eb0d969b0fbdb8ac45c37d2614d3f9c883e3006529c5532f",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "Kiro CLI Agent",
+        "title": "Kiro CLI Agent",
+        "version": "2.21.1"
+      },
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "_session/steer",
+      "responseTimeline": [
+        {
+          "eventIndex": 31,
+          "requestId": 4,
+          "queued": true
+        },
+        {
+          "eventIndex": 58,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 4,
+          "text": "The script:\n1. Creates a `ready` file in its own directory\n2. Waits up to 100 seconds for a `release` file to appear\n3. Prints `HOLD_COMPLETE` when either the `release` file exists or the timeout is reached"
+        },
+        {
+          "beforeResponseTo": 3,
+          "text": "STEER_028_成功\n\n[STEERING steer-aa06a14a82fe4430909b2a6e15f4abef: 按用户更正，将原定回复 ORIGINAL_028 替换为 STEER_028_成功，且未运行任何新工具。]"
+        }
+      ],
+      "steeringEvents": [
+        {
+          "eventIndex": 30,
+          "sessionUpdate": "AgentExecutionUserMessageQueued",
+          "messageId": "steer-1d4eadb55a924e8aa062383b42b142f7",
+          "content": "用户更正：当前工具结束后，只回复 STEER_028_成功，替代原先 ORIGINAL_028；不要运行新工具。"
+        },
+        {
+          "eventIndex": 34,
+          "sessionUpdate": "AgentExecutionSteeringInjected",
+          "messageId": "steer-1d4eadb55a924e8aa062383b42b142f7",
+          "content": "用户更正：当前工具结束后，只回复 STEER_028_成功，替代原先 ORIGINAL_028；不要运行新工具。"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:26:22.355863+00:00",
+      "finishedAt": "2026-10-14T13:26:36.521101+00:00",
+      "version": "opencode v2.0.25",
+      "arguments": [
+        "acp",
+        "--log-level",
+        "error"
+      ],
+      "case": "opencode-acp-01",
+      "runtime": "opencode",
+      "transport": "ACP",
+      "result": "busy_rejected",
+      "productSteerEnabled": false,
+      "reportSha256": "855efae2f051ea14bf5c9bb469b2cecd8fc82e25777afb62f2775a073cff1c26",
+      "wireSha256": "72fb6597110cb52637e9b42c5e5b7320a964ca6805fc5c0cf4cb493678df4cd0",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "OpenCode",
+        "version": "2.0.25"
+      },
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "session/prompt",
+      "responseTimeline": [
+        {
+          "eventIndex": 10,
+          "requestId": 4,
+          "error": {
+            "code": -32603,
+            "message": "Internal error: Session already has an active ACP prompt: ses_ec56848abffexl7bCpVVQ223KO",
+            "data": {
+              "service": "session"
+            }
+          }
+        },
+        {
+          "eventIndex": 14,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "ORIGINAL_028"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:27:20.208238+00:00",
+      "finishedAt": "2026-10-14T13:27:33.460287+00:00",
+      "version": "1.1.0",
+      "arguments": [
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-context-files",
+        "--no-mcp",
+        "--tools",
+        "read,bash",
+        "--thinking",
+        "off"
+      ],
+      "model": {
+        "id": "gpt-6.1-sol",
+        "provider": "sub2api"
+      },
+      "case": "pi-current-01",
+      "runtime": "pi",
+      "transport": "RPC stdio",
+      "result": "same_active_execution",
+      "productSteerEnabled": true,
+      "reportSha256": "5b448d539a8c727d119011819e574e9745b29b684528bfab14d3e254507abca5",
+      "wireSha256": "c7510a0bc30717a4e8ec088d96738c29e3b25a8ae3dcc618be983172bbfb8f8b",
+      "actualToolBoundary": true,
+      "probeScript": "native_probe.py",
+      "probeScriptSha256": "3bcf00d740708ab874601f1f8d814131011f29be9659dc7cc96c40e2374df12c",
+      "agentStartCount": 1,
+      "steerResponse": {
+        "id": "3",
+        "type": "response",
+        "command": "steer",
+        "success": true,
+        "data": {
+          "disposition": "queued"
+        }
+      },
+      "remainingQueue": {
+        "steering": [],
+        "followUp": []
+      },
+      "messages": [
+        {
+          "role": "user",
+          "text": [
+            "请检查当前目录 hold.py，再执行它验证等待逻辑（100 秒上限），不修改脚本。工具完成后回复 ORIGINAL_028。"
+          ]
+        },
+        {
+          "role": "assistant",
+          "text": []
+        },
+        {
+          "role": "assistant",
+          "text": []
+        },
+        {
+          "role": "user",
+          "text": [
+            "补充更正：当前工具完成后，只回复 STEER_028_成功，替代 ORIGINAL_028，不再执行其他工具。"
+          ]
+        },
+        {
+          "role": "assistant",
+          "text": [
+            "STEER_028_成功"
+          ]
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:26:22.355888+00:00",
+      "finishedAt": "2026-10-14T13:27:52.790810+00:00",
+      "version": "1.1.65",
+      "arguments": [
+        "--acp"
+      ],
+      "case": "qoder-acp-01",
+      "runtime": "qoder",
+      "transport": "ACP",
+      "result": "next_turn_queue",
+      "productSteerEnabled": false,
+      "reportSha256": "7cae48baf15a98a2d98c3d0cf48530850685468836faa26d9070650918e06984",
+      "wireSha256": "a1508171e9f66cbcf47b8d93b3061ecf42ca37c25c9b87a46443cb72e2b1efb0",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "qoder-cli",
+        "title": "Qoder CLI",
+        "version": "1.1.65"
+      },
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "session/prompt",
+      "responseTimeline": [
+        {
+          "eventIndex": 314,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        },
+        {
+          "eventIndex": 321,
+          "requestId": 4,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "我会先检查当前目录的 `hold.py`，再运行它验证文件等待逻辑，不改动脚本。\n脚本会创建 `ready`，每 50 毫秒检查一次 `release`，最多等待 100 秒；当前目录中没有 `release`，本次运行将验证超时退出路径。\n脚本已输出 `HOLD_COMPLETE`，耗时约 0.31 秒；我会检查 `release` 是否在运行期间出现，确认提前结束的原因。\nORIGINAL_028"
+        },
+        {
+          "beforeResponseTo": 4,
+          "text": "STEER_028_成功"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:22:22.384341+00:00",
+      "finishedAt": "2026-10-14T13:23:07.030570+00:00",
+      "version": "0.25.0",
+      "arguments": [
+        "--acp"
+      ],
+      "case": "qwen-acp-01",
+      "runtime": "qwen",
+      "transport": "ACP",
+      "result": "same_active_execution",
+      "productSteerEnabled": true,
+      "reportSha256": "d5c759fa24c4b99a7d73629d4f012afe24bfb79c20b2bfde20a19f9041080f4f",
+      "wireSha256": "9aba5bd392438c4faf699a0480391bec3e413502381632438be1be2605d0621b",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "d45526f8c68ab841527e611da2bb7b3c0a6826d78a2f64fea96bf7451857489e",
+      "protocolVersion": 1,
+      "agentInfo": {
+        "name": "qwen-code",
+        "title": "Qwen Code",
+        "version": "0.25.0"
+      },
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "craft/drainMidTurnQueue",
+      "responseTimeline": [
+        {
+          "eventIndex": 98,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 3,
+          "text": "我会先检查 `hold.py`，确认其等待逻辑和执行影响，再运行验证；不会修改脚本。\n脚本会在当前目录写入 `ready`，每 0.05 秒检查 `release` 是否存在，最多等待 100 秒，随后输出 `HOLD_COMPLETE`。我现在运行它验证，不修改脚本。\nSTEER_028_成功"
+        }
+      ],
+      "drainSent": true
+    },
+    {
+      "startedAt": "2026-10-14T13:27:27.868080+00:00",
+      "finishedAt": "2026-10-14T13:28:37.674353+00:00",
+      "version": "trae-cli version 0.120.52\nbuild date: 2026-08-12T01:31:30Z\nbuild commit: 6756e52a9238b6d493928e55b05127957dbfefb4\ncommit date: 2026-08-10T08:15:57Z",
+      "arguments": [
+        "--config",
+        "disable_auto_upgrade=true",
+        "--yolo",
+        "acp",
+        "serve"
+      ],
+      "nativeStoreNote": "Platform-owned auth/session store; unique fixture cwd and exact returned test session only.",
+      "case": "trae-acp-01",
+      "runtime": "trae",
+      "transport": "ACP",
+      "result": "busy_rejected",
+      "productSteerEnabled": false,
+      "reportSha256": "b879c18a649f54938cd7f2d8e812f82f6eb40bc951afc547ea215dd8413e91fc",
+      "wireSha256": "e0ddc4bb86258b61b7c423129ff9da49fa98c5874a1e63a5c94666aee88c21a6",
+      "actualToolBoundary": true,
+      "probeScript": "acp_probe_v2.py",
+      "probeScriptSha256": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+      "protocolVersion": 1,
+      "agentInfo": {},
+      "initialPromptStillPendingAtSupplement": true,
+      "supplementMethod": "session/prompt",
+      "responseTimeline": [
+        {
+          "eventIndex": 26,
+          "requestId": 4,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params",
+            "data": "another session is currently executing Prompt"
+          }
+        },
+        {
+          "eventIndex": 150,
+          "requestId": 3,
+          "stopReason": "end_turn"
+        }
+      ],
+      "assistantTextSegments": [
+        {
+          "beforeResponseTo": 4,
+          "text": "脚本逻辑：在脚本目录写入 `ready` 标记文件，然后每 0.05 秒轮询，直到出现 `release` 文件或达到 100 秒上限，最后打印 `HOLD_COMPLETE`。\n\n现在后台启动它来验证等待逻辑。"
+        },
+        {
+          "beforeResponseTo": 3,
+          "text": "等待 2 秒让脚本写入 `ready` 文件，然后检查它是否存在。`ready` 文件已生成，脚本正处于等待状态。现在创建 `release` 文件触发退出。`release` 文件竟然已经存在（可能是先前运行留下的）。这意味着脚本可能已提前退出，检查后台输出。脚本已退出（exit 0，输出 `HOLD_COMPLETE`）。但 `release` 文件在启动前就残留存在，脚本没经历真正的\"等待\"过程，验证不完整。需要清理残留标记文件后重新做一次干净的验证。先确认 `ready` 文件内容和目录状态。`ready` 和 `release` 是脚本的运行时标记文件（残留）。为做干净验证，删除这两个残留标记（不动 hold.py 本身），重新启动脚本验证等待逻辑。残留标记已清理。重新后台启动脚本进行干净验证。`ready` 已生成且 `release` 不存在。确认脚本处于等待状态。脚本仍在运行，等待逻辑生效（无 `release` 时不退出）。现在创建 `release` 文件触发退出。验证完成。\n\n**代码检查**（hold.py:1-7）：\n- 启动时在脚本目录写入 `ready` 标记文件\n- 以 0.05 秒间隔轮询 `release` 文件，100 秒超时上限（`time.monotonic()` 计时，不受系统时钟影响）\n- 结束后打印 `HOLD_COMPLETE`\n\n**执行验证**（两次运行）：\n1. 首次运行：因目录中残留了旧的 `release` 文件，脚本启动后立即退出。已清理残留标记后重新验证。\n2. 干净重跑：\n   - `ready` 文件正常生成\n   - 无 `release` 时脚本保持等待状态不退出（验证通过）\n   - 写入 `release` 后脚本在轮询周期内（<1 秒）正常退出，exit code 0，输出 `HOLD_COMPLETE`\n\n脚本未被改动，文件等待逻辑（写入 ready → 阻塞等待 → release 触发退出）全部符合预期。当前目录留有本次运行生成的 `ready` 和 `release` 标记文件。\n\nORIGINAL_028"
+        }
+      ]
+    },
+    {
+      "startedAt": "2026-10-14T13:28:12.606558+00:00",
+      "finishedAt": "2026-10-14T13:28:34.315334+00:00",
+      "version": "App 3.14.5 (3.14.5.7961); bundled kernel 0.16.9",
+      "model": {
+        "providerId": "new-provider",
+        "modelId": "gpt-6.1-sol",
+        "options": {
+          "reasoningLevel": "enabled"
+        }
+      },
+      "case": "zcode-current-01",
+      "runtime": "zcode",
+      "transport": "Rovai official bundled app-server v4 command (kernel-level probe)",
+      "result": "same_active_execution",
+      "productSteerEnabled": false,
+      "reportSha256": "4cf40b3566a0a83529040735a1f0f6b12333876dd1fca2de45e5ea9942456313",
+      "wireSha256": "7e5a348c35c239119a5f7583e954b0ecbfcb14b34839e570431c5327cd125253",
+      "actualToolBoundary": true,
+      "probeScript": "zcode_probe.py",
+      "probeScriptSha256": "83d0a27be5e5b4392a7d9371161566f24047258516ecf59862e8daafe2e09a2b",
+      "kernelMethod": "v4/command sendText requestedDelivery=guide",
+      "events": [
+        {
+          "type": "turn.started",
+          "seq": 2,
+          "turnId": "turn_0b89e3a9-8b6f-4a5c-b1a7-80cd7e979d10",
+          "inputId": "c9264e8a-e33e-4654-ad2e-887d0f4ba45f"
+        },
+        {
+          "type": "turn.steerQueued",
+          "seq": 31,
+          "turnId": "turn_0b89e3a9-8b6f-4a5c-b1a7-80cd7e979d10",
+          "inputId": "7083ab2d-0485-449b-bee8-164707df3bbd",
+          "targetTurnId": "turn_0b89e3a9-8b6f-4a5c-b1a7-80cd7e979d10"
+        },
+        {
+          "type": "turn.steerDrained",
+          "seq": 36,
+          "turnId": "turn_0b89e3a9-8b6f-4a5c-b1a7-80cd7e979d10",
+          "targetTurnId": "turn_0b89e3a9-8b6f-4a5c-b1a7-80cd7e979d10",
+          "pendingInputIds": [
+            "queue_7083ab2d-0485-449b-bee8-164707df3bbd"
+          ]
+        },
+        {
+          "type": "turn.completed",
+          "seq": 43,
+          "turnId": "turn_0b89e3a9-8b6f-4a5c-b1a7-80cd7e979d10",
+          "inputId": "c9264e8a-e33e-4654-ad2e-887d0f4ba45f",
+          "response": "STEER_028_成功",
+          "resultType": "success"
+        }
+      ],
+      "ownerCleanupReport": {
+        "confirmed": false,
+        "pendingGroups": 0,
+        "signalFailed": true
+      }
+    }
+  ],
+  "sourceReferences": [
+    {
+      "id": "kiro-acp-steer",
+      "url": "https://kiro.dev/docs/cli/v3/acp-migration/",
+      "finding": "Documents _session/steer carried over from v2; installed v2 method schema and real LLM consumption verified without switching engines."
+    },
+    {
+      "id": "kimi-steer-proposal",
+      "url": "https://github.com/MoonshotAI/kimi-code/pull/2514",
+      "finding": "Closed without merge, as verified through GitHub API; proposal is not installed ACP support."
+    },
+    {
+      "id": "qwen-acp-drain",
+      "url": "https://github.com/QwenLM/qwen-code/blob/main/packages/qwen-live/src/adaptor/acp-adaptor.ts",
+      "finding": "ACP steering is pulled via craft/drainMidTurnQueue; concurrent session/prompt preempts."
+    },
+    {
+      "id": "dsh-official-acp",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/acp/acp/src/session.ts",
+      "finding": "Official package enforces one in-flight prompt. Third-party openma-ai ACP adapter excluded."
+    },
+    {
+      "id": "copilot-acp",
+      "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server",
+      "finding": "Correct transport is ACP stdio; SDK immediate not used as support evidence."
+    },
+    {
+      "id": "qoder-acp",
+      "url": "https://docs.qoder.com/cli/acp",
+      "finding": "Official ACP stdio integration; installed ACP prompt implementation queues behind current prompt."
+    },
+    {
+      "id": "opencode-acp",
+      "url": "https://docs.opencode.ai/docs/acp/",
+      "finding": "Correct transport is opencode acp; HTTP steer not used as support evidence."
+    },
+    {
+      "id": "codebuddy-acp",
+      "url": "https://www.codebuddy.ai/docs/cli/acp",
+      "finding": "Official --acp integration verified from indexed official page; direct page fetch failed. Same-turn behavior verified locally."
+    },
+    {
+      "id": "trae-acp",
+      "url": "https://docs.trae.cn/cli_agent-client-protocol",
+      "finding": "Official traecli acp serve entry; real installed version rejects concurrent prompt."
+    },
+    {
+      "id": "grok-acp",
+      "url": "https://docs.x.ai/build/overview",
+      "finding": "Official ACP integration exists; _x.ai/interject behavior established by installed-version real test."
+    },
+    {
+      "id": "pi-rpc",
+      "url": "https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/docs/rpc-commands.md",
+      "finding": "RPC steer consumes during current agent work; follow_up is separate."
+    },
+    {
+      "id": "claude-stream",
+      "url": "https://code.claude.com/docs/en/cli-reference",
+      "finding": "Official stream-json input/output flags; installed version tested through sub2api."
+    },
+    {
+      "id": "antigravity-stream",
+      "url": "https://www.antigravity.google/docs/cli/headless/",
+      "finding": "Stream stdin starts one full turn per prompt with its own result; matches fresh local observations."
+    }
+  ],
+  "sourceCaptures": [
+    {
+      "id": "kimi-pr-2514",
+      "url": "https://api.github.com/repos/MoonshotAI/kimi-code/pulls/2514",
+      "accessedAt": "2026-10-14T13:30:20.004156+00:00",
+      "sha256": "cc0d12886ce454bef3e7f1f5a9c3ba8ece3877a73d71c470cac35bd5b170cb1e",
+      "bytes": 16646
+    },
+    {
+      "id": "qwen-acp-adaptor",
+      "url": "https://raw.githubusercontent.com/QwenLM/qwen-code/main/packages/qwen-live/src/adaptor/acp-adaptor.ts",
+      "accessedAt": "2026-10-14T13:30:21.111456+00:00",
+      "sha256": "8f79c48659b3e0ad461241f0193c7c7f1806e59a3c57951460642fe16409e64d",
+      "bytes": 35924
+    },
+    {
+      "id": "dsh-acp-session",
+      "url": "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/packages/acp/acp/src/session.ts",
+      "accessedAt": "2026-10-14T13:30:22.068612+00:00",
+      "sha256": "6e944674ec48d24d168a9fadde83f979338eb6ebe6e90cb1d5afebadf5a6639e",
+      "bytes": 22633
+    },
+    {
+      "id": "codebuddy-acp-doc",
+      "url": "https://www.codebuddy.ai/docs/cli/acp",
+      "fetchError": "URLError"
+    },
+    {
+      "id": "pi-rpc-commands",
+      "url": "https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/docs/rpc-commands.md",
+      "accessedAt": "2026-10-14T13:30:43.046969+00:00",
+      "sha256": "4deeee367852f4633ef594bc079f9e9fb14640a4e3ba8a69b7c89b6f54740838",
+      "bytes": 21482
+    }
+  ],
+  "productionSourceHashes": {
+    "crates/rovai-core/src/steer.rs": "bcf2be3916cc76453ef686f65833993c9ba71efaa1f4ac46694af2b49e5f41f4",
+    "crates/rovai-core/src/acp.rs": "850d9664dfd17c691b188f596ed4db2900a9ca6fe0dc8d6f878efd5c07dd67f5",
+    "crates/rovai-core/src/health.rs": "8b30e749f73b27e8e760b904c815d2297784be2d27c6f082c75a01f57def0680",
+    "crates/rovai-core/src/zcode/transport.rs": "4a15f31957108ed5312be9427d0aacd02e26f1aa969acb2508602188964e2202",
+    "crates/rovai-core/src/zcode/stdio-owner.cjs": "7287db0da52f685a4416f6a4ec9460d7eb9c1034483900bbaccea8a7332c1b7b",
+    "crates/rovai-core/src/antigravity.rs": "1a383aff438c6a1d11afa86a5a6b266c59480d9bc5c178d8f88d3819153d57cf"
+  },
+  "scriptHashes": {
+    "acp_kiro_discovery.py": "c1c93a0cd728c39cd786da411cff29702cbb02b5b8167137dfcce16fba7c52ea",
+    "acp_kiro_steer_probe.py": "14288583e70940f0eb0d969b0fbdb8ac45c37d2614d3f9c883e3006529c5532f",
+    "acp_probe.py": "97b55ff9f682305c1c1d3eb27036665ebdf3ac2ecc3f3ec12b1cfa378d96c640",
+    "acp_probe_v1.py": "d45526f8c68ab841527e611da2bb7b3c0a6826d78a2f64fea96bf7451857489e",
+    "acp_probe_v2.py": "e51f6b7eb1d88eac92737855469a7dafa050b6da8b92a7cc0df6f8bc62c58549",
+    "acp_probe_v3.py": "f07ece5e6d28d41370a9bd9979837cb47eacd1fb32a47854f40bc07324880217",
+    "antigravity_probe.py": "ddef47a40c4877401b49c551f0caf6fb691cb336493fe650cdb78f302b2d2bdb",
+    "antigravity_probe_v1.py": "a39c5f0ba9494f0bef9cbcbec5c3f90a81b18c0245f84c214f307e5775badfe4",
+    "native_probe.py": "3bcf00d740708ab874601f1f8d814131011f29be9659dc7cc96c40e2374df12c",
+    "zcode_probe.py": "83d0a27be5e5b4392a7d9371161566f24047258516ecf59862e8daafe2e09a2b"
+  },
+  "schemaDiscovery": {
+    "case": "kiro-acp-method-discovery",
+    "method": "_session/steer",
+    "response": {
+      "jsonrpc": "2.0",
+      "error": {
+        "code": -32700,
+        "message": "Parse error",
+        "data": {
+          "error": "missing field `message`",
+          "json": {
+            "sessionId": "nonexistent-schema-probe"
+          },
+          "phase": "deserialization"
+        }
+      },
+      "id": 2
+    },
+    "realModelInvocation": false
+  },
+  "reusedProductEvidence": [
+    "steer-2026-10-14.md",
+    "steer-five-runtimes-2026-10-14.md"
+  ],
+  "limitations": [
+    "Text-only fresh transport probes, not repeat product attachment/multi-recipient/cancellation/race acceptance.",
+    "TRAE and Antigravity keep platform-owned native authentication/session stores; unique fixture workspaces and newly returned test sessions only.",
+    "ZCode owner cleanup confirmation false although pendingGroups zero; not a passed product cleanup gate.",
+    "No daily App installation, restart, configuration rewrite or product code/prompt change."
+  ],
+  "attemptCounts": {
+    "next_turn_queue": 3,
+    "same_active_execution": 8,
+    "inconclusive_harness": 4,
+    "cancel_then_replace": 1,
+    "busy_rejected": 5
+  },
+  "runtimeCount": 15,
+  "attemptCount": 21,
+  "cleanupObservation": {
+    "observedAt": "2026-10-14T13:40:22.046946+00:00",
+    "fixtureCwdProcesses": [],
+    "lsofExitCode": 0
+  }
+}

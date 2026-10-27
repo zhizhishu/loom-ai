@@ -1,0 +1,10 @@
+name: rovai-middleware-probe
+version: 0.1.0
+description: Isolated observation and authority-free terminal injection probe. Not a Run identity bridge.
+manifest_version: 2
+api_version: 1
+kind: standalone
+config_schema:
+  probe_root:
+    type: string
+    required: true

@@ -1,0 +1,686 @@
+import { readFileSync } from 'node:fs'
+import { describe, expect, it } from 'vitest'
+
+const css = [
+  '../../../../../packages/ui/src/theme.css',
+  './styles.css'
+].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8')).join('\n').replace(/\r\n/g, '\n')
+const requiredTokens = [
+  '--canvas',
+  '--surface',
+  '--surface-raised',
+  '--surface-subtle',
+  '--surface-muted',
+  '--surface-selected',
+  '--scrollbar-thumb',
+  '--workspace-surface-subtle',
+  '--workspace-surface-raised',
+  '--workspace-surface-hover',
+  '--workspace-surface-selected',
+  '--workspace-line',
+  '--workspace-line-strong',
+  '--workspace-steel',
+  '--workspace-steel-ink',
+  '--workspace-attention-soft',
+  '--workspace-faint',
+  '--conversation-surface',
+  '--conversation-action',
+  '--conversation-action-ink',
+  '--conversation-action-hover',
+  '--conversation-action-contrast',
+  '--conversation-control-line',
+  '--conversation-focus',
+  '--conversation-focus-soft',
+  '--conversation-route-accent',
+  '--conversation-unread',
+  '--update-progress-fill',
+  '--mission-unread-ink',
+  '--file-update-marker',
+  '--execution-running-surface',
+  '--execution-surface',
+  '--inspector-surface',
+  '--conversation-inspector-line',
+  '--home-surface',
+  '--settings-choice-selected-surface',
+  '--ink',
+  '--muted',
+  '--faint',
+  '--line',
+  '--line-strong',
+  '--control-line',
+  '--dialog-field-label',
+  '--dialog-field-line',
+  '--dialog-field-line-hover',
+  '--new-camp-picker-surface',
+  '--new-camp-picker-soft',
+  '--new-camp-picker-hover',
+  '--new-camp-picker-line-strong',
+  '--brand',
+  '--brand-hover',
+  '--brand-contrast',
+  '--brand-soft',
+  '--brand-ink',
+  '--mention-ink',
+  '--mention-ink-hover',
+  '--rail',
+  '--rail-ink',
+  '--rail-line',
+  '--rail-logo',
+  '--success',
+  '--success-soft',
+  '--attention',
+  '--attention-soft',
+  '--danger',
+  '--danger-soft',
+  '--info',
+  '--info-soft',
+  '--neutral',
+  '--neutral-soft',
+  '--focus',
+  '--overlay',
+  '--inline-code-canvas',
+  '--conversation-inline-code-canvas',
+  '--conversation-code-block-canvas',
+  '--conversation-code-line',
+  '--shell-result-canvas',
+  '--code-block-canvas',
+  '--evidence-canvas',
+  '--evidence-surface',
+  '--evidence-ink',
+  '--evidence-muted',
+  '--evidence-line',
+  '--diff-add',
+  '--diff-add-soft',
+  '--diff-remove',
+  '--diff-remove-soft',
+  '--attachment-web',
+  '--attachment-code',
+  '--attachment-notes',
+  '--attachment-pdf',
+  '--attachment-word',
+  '--attachment-sheet',
+  '--attachment-slide',
+  '--attachment-image',
+  '--attachment-archive',
+  '--attachment-generic'
+] as const
+
+function tokenBlock(selector: string): Record<string, string> {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = css.match(new RegExp(`${escaped}\\s*\\{([\\s\\S]*?)\\n\\}`))
+  if (!match?.[1]) throw new Error(`Missing CSS block: ${selector}`)
+  return Object.fromEntries(
+    [...match[1].matchAll(/(--[a-z0-9-]+):\s*([^;]+);/gi)]
+      .map((entry) => [entry[1], entry[2].trim()])
+  )
+}
+
+function luminance(hex: string): number {
+  const channels = [1, 3, 5].map((start) => Number.parseInt(hex.slice(start, start + 2), 16) / 255)
+  const [red, green, blue] = channels.map((channel) =>
+    channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4
+  )
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+}
+
+function contrast(left: string, right: string): number {
+  const leftLuminance = luminance(left)
+  const rightLuminance = luminance(right)
+  return (Math.max(leftLuminance, rightLuminance) + 0.05)
+    / (Math.min(leftLuminance, rightLuminance) + 0.05)
+}
+
+function mixHex(foreground: string, background: string, foregroundWeight: number): string {
+  const channels = [1, 3, 5].map((start) => {
+    const front = Number.parseInt(foreground.slice(start, start + 2), 16)
+    const back = Number.parseInt(background.slice(start, start + 2), 16)
+    return Math.round(front * foregroundWeight + back * (1 - foregroundWeight))
+  })
+  return `#${channels.map((channel) => channel.toString(16).padStart(2, '0')).join('')}`
+}
+
+function expectTextContrast(tokens: Record<string, string>): void {
+  const pairs = [
+    ['--ink', '--surface'],
+    ['--muted', '--surface'],
+    ['--faint', '--surface'],
+    ['--ink', '--settings-choice-selected-surface'],
+    ['--muted', '--settings-choice-selected-surface'],
+    ['--dialog-field-label', '--surface-raised'],
+    ['--ink', '--new-camp-picker-surface'],
+    ['--faint', '--new-camp-picker-surface'],
+    ['--muted', '--new-camp-picker-soft'],
+    ['--ink', '--execution-running-surface'],
+    ['--muted', '--execution-running-surface'],
+    ['--info', '--execution-running-surface'],
+    ['--ink', '--execution-surface'],
+    ['--muted', '--execution-surface'],
+    ['--brand-contrast', '--brand'],
+    ['--conversation-action-contrast', '--conversation-action'],
+    ['--conversation-action-contrast', '--conversation-action-hover'],
+    ['--conversation-action-ink', '--surface-selected'],
+    ['--mission-unread-ink', '--home-surface'],
+    ['--success', '--success-soft'],
+    ['--attention', '--attention-soft'],
+    ['--danger', '--danger-soft'],
+    ['--info', '--info-soft'],
+    ['--neutral', '--neutral-soft'],
+    ['--evidence-ink', '--inline-code-canvas'],
+    ['--evidence-ink', '--conversation-inline-code-canvas'],
+    ['--evidence-ink', '--conversation-code-block-canvas'],
+    ['--evidence-muted', '--shell-result-canvas'],
+    ['--evidence-ink', '--code-block-canvas'],
+    ['--evidence-ink', '--evidence-surface'],
+    ['--evidence-muted', '--evidence-surface'],
+    ['--diff-add', '--diff-add-soft'],
+    ['--diff-remove', '--diff-remove-soft']
+  ] as const
+  for (const [foreground, background] of pairs) {
+    expect(
+      contrast(tokens[foreground], tokens[background]),
+      `${foreground} on ${background}`
+    ).toBeGreaterThanOrEqual(4.5)
+  }
+  for (let index = 1; index <= 8; index += 1) {
+    const token = `--identity-${index}`
+    expect(
+      contrast(tokens[token], tokens['--surface']),
+      `${token} on --surface`
+    ).toBeGreaterThanOrEqual(4.5)
+  }
+}
+
+describe('Porcelain Day + Steel Night theme tokens', () => {
+  const day = tokenBlock(':root')
+  const night = tokenBlock(':root[data-theme="night"]')
+
+  it('defines the complete canonical Day token contract', () => {
+    for (const token of requiredTokens) {
+      expect(day[token], `Day ${token}`).toBeTruthy()
+    }
+    for (let index = 1; index <= 8; index += 1) {
+      expect(day[`--identity-${index}`]).toBeTruthy()
+      expect(day[`--mission-label-${index}`]).toBeTruthy()
+    }
+  })
+
+  it('defines the complete canonical Night token contract', () => {
+    for (const token of requiredTokens) {
+      expect(night[token], `Night ${token}`).toBeTruthy()
+    }
+    for (let index = 1; index <= 8; index += 1) {
+      expect(night[`--identity-${index}`]).toBeTruthy()
+      expect(night[`--mission-label-${index}`]).toBeTruthy()
+    }
+  })
+
+  it('keeps normal text and semantic labels at WCAG AA contrast', () => {
+    expectTextContrast(day)
+    expectTextContrast(night)
+  })
+
+  it('keeps conversation controls, focus and unread markers distinguishable in both themes', () => {
+    for (const tokens of [day, night]) {
+      for (const [foreground, background] of [
+        ['--conversation-control-line', '--input'],
+        ['--conversation-focus', '--input'],
+        ['--conversation-focus', '--rail'],
+        ['--conversation-unread', '--rail'],
+        ['--conversation-unread', '--surface-selected'],
+        ['--update-progress-fill', '--surface-muted'],
+        ['--file-update-marker', '--conversation-surface'],
+        ['--file-update-marker', '--surface-muted']
+      ]) {
+        expect(contrast(tokens[foreground], tokens[background]), `${foreground} on ${background}`).toBeGreaterThanOrEqual(3)
+      }
+    }
+    expect(day['--file-update-marker']).toBe('#b7791f')
+    expect(night['--file-update-marker']).toBe('#d2ac70')
+    expect(day['--update-progress-fill']).toBe('#2879e8')
+    expect(night['--update-progress-fill']).toBe('#60a5fa')
+    expect(day['--mission-unread-ink']).toBe('#0967d2')
+    expect(night['--mission-unread-ink']).toBe('#79b8ff')
+  })
+
+  it('scopes the approved porcelain surfaces and Steel emphasis', () => {
+    expect(day['--canvas']).toBe('#eceeef')
+    expect(day['--conversation-surface']).toBe('#ffffff')
+    expect(day['--execution-running-surface']).toBe('#fafafa')
+    expect(day['--inspector-surface']).toBe('#ffffff')
+    expect(day['--conversation-inspector-line']).toBe('#c7cfd6')
+    expect(day['--home-surface']).toBe('#ffffff')
+    expect(day['--surface']).toBe('#fbfbfa')
+    expect(day['--surface-subtle']).toBe('#f0f2f4')
+    expect(day['--workspace-surface-subtle']).toBe('#f4f5f4')
+    expect(day['--workspace-surface-raised']).toBe('#ffffff')
+    expect(day['--workspace-surface-selected']).toBe('#e4eaee')
+    expect(day['--workspace-line']).toBe('#d5dadd')
+    expect(day['--workspace-steel']).toBe('#476b85')
+    expect(day['--line']).toBe('#dfe4e8')
+    expect(day['--new-camp-picker-surface']).toBe('#ffffff')
+    expect(day['--new-camp-picker-soft']).toBe('#e9eef3')
+    expect(day['--new-camp-picker-hover']).toBe('#edf2f5')
+    expect(day['--new-camp-picker-line-strong']).toBe('#8296a4')
+    expect(day['--brand']).toBe('#526f88')
+    expect(day['--brand-soft']).toBe('#e9eef3')
+    expect(day['--brand-ink']).toBe('#405f7e')
+    expect(day['--rail']).toBe('#f3f4f4')
+    expect(day['--rail-line']).toBe('#dadde0')
+    expect(day['--rail-logo']).toBe('#526f88')
+    expect(day['--mention-ink']).toBe('#2f61c8')
+    expect(day['--inline-code-canvas']).toBe('#e9eceb')
+    expect(day['--conversation-inline-code-canvas']).toBe('#eef0f1')
+    expect(day['--conversation-code-block-canvas']).toBe('#f4f5f5')
+    expect(day['--conversation-code-line']).toBe('#d9dee1')
+    expect(day['--shell-result-canvas']).toBe('#f3f4f3')
+    expect(day['--code-block-canvas']).toBe('#eef2f5')
+    expect(day['--diff-add-soft']).toBe('#d9f1e2')
+    expect(day['--diff-remove-soft']).toBe('#f5dede')
+    expect(contrast(day['--mention-ink'], day['--surface'])).toBeGreaterThanOrEqual(4.5)
+    expect(css).toMatch(/\.camp-workspace\s*\{[^}]*background: var\(--conversation-surface\)[^}]*\}/)
+    expect(css).toContain('border-left: 1px solid var(--conversation-inspector-line)')
+    expect(css).toContain('background: var(--inspector-surface)')
+    expect(css).toContain('.new-conversation-workspace { background: var(--home-surface); }')
+    expect(css).toContain('background: var(--brand-soft)')
+    expect(css).toMatch(/\.final-copy\s*\{[^}]*color: var\(--ink\)[^}]*\}/)
+    expect(css).not.toMatch(/\.final-copy\s*\{[^}]*background:/)
+  })
+
+  it('uses the independently designed Steel Night palette without collapsing semantic colors', () => {
+    expect(night['--canvas']).toBe('#0d1114')
+    expect(night['--conversation-surface']).toBe('#181d21')
+    expect(night['--execution-running-surface']).toBe('#1b2024')
+    expect(night['--inspector-surface']).toBe('#171d21')
+    expect(night['--surface']).toBe('#151a1e')
+    expect(night['--surface-raised']).toBe('#1b2227')
+    expect(night['--workspace-surface-subtle']).toBe('#11171b')
+    expect(night['--workspace-surface-raised']).toBe('#1c2328')
+    expect(night['--workspace-surface-selected']).toBe('#22303a')
+    expect(night['--workspace-line']).toBe('#2b353b')
+    expect(night['--workspace-steel']).toBe('#8fadc0')
+    expect(night['--new-camp-picker-surface']).toBe('#1b2227')
+    expect(night['--new-camp-picker-soft']).toBe('#22303a')
+    expect(night['--new-camp-picker-hover']).toBe('#24323b')
+    expect(night['--new-camp-picker-line-strong']).toBe('#6a8190')
+    expect(night['--brand']).toBe('#7897ae')
+    expect(night['--brand-soft']).toBe('#22303a')
+    expect(night['--mention-ink']).toBe('#9cc7e2')
+    expect(night['--inline-code-canvas']).toBe('#353b3f')
+    expect(night['--conversation-inline-code-canvas']).toBe('#343536')
+    expect(night['--conversation-code-block-canvas']).toBe('#28292a')
+    expect(night['--conversation-code-line']).toBe('#3d3f41')
+    expect(night['--shell-result-canvas']).toBe('#373f43')
+    expect(night['--code-block-canvas']).toBe('#1d252b')
+    expect(night['--diff-add-soft']).toBe('#21412e')
+    expect(night['--diff-remove-soft']).toBe('#4c2221')
+    expect(night['--success']).not.toBe(night['--brand'])
+    expect(night['--attention']).not.toBe(night['--brand'])
+    expect(night['--danger']).not.toBe(night['--brand'])
+    expect(night['--info']).not.toBe(night['--brand'])
+    expect(contrast(night['--mention-ink'], night['--surface'])).toBeGreaterThanOrEqual(4.5)
+  })
+
+  it('keeps the selected New Conversation picker boundaries and text accessible', () => {
+    for (const tokens of [day, night]) {
+      expect(contrast(tokens['--ink'], tokens['--new-camp-picker-surface'])).toBeGreaterThanOrEqual(4.5)
+      expect(contrast(tokens['--faint'], tokens['--new-camp-picker-surface'])).toBeGreaterThanOrEqual(4.5)
+      expect(contrast(tokens['--muted'], tokens['--new-camp-picker-soft'])).toBeGreaterThanOrEqual(4.5)
+      expect(contrast(tokens['--new-camp-picker-line-strong'], tokens['--new-camp-picker-surface'])).toBeGreaterThanOrEqual(3)
+    }
+  })
+
+  it('preserves stable identity colors for Skill, MCP, and member marks in both themes', () => {
+    expect(new Set(Array.from({ length: 8 }, (_, index) => day[`--identity-${index + 1}`])).size).toBe(8)
+    expect(new Set(Array.from({ length: 8 }, (_, index) => night[`--identity-${index + 1}`])).size).toBe(8)
+    expect(css).toMatch(/\.skill-identity-mark\s*\{[^}]*color:\s*var\(--skill-identity\)/)
+    expect(css).toMatch(/\.mcp-assignment-option-mark, \.mcp-server-mark\s*\{[^}]*color:\s*var\(--mcp-identity\)/)
+  })
+
+  it('keeps Mission labels on their dedicated readable eight-color palette', () => {
+    const expectedDay = ['#ae4e3e', '#27777b', '#71579a', '#95610f', '#3f6fa7', '#914f78', '#4d752f', '#98542e']
+    const expectedNight = ['#e28f7b', '#72c5c1', '#b7a6e0', '#deb26b', '#81b8e8', '#d18cac', '#93bb77', '#d79b6c']
+    for (const [tokens, expected] of [[day, expectedDay], [night, expectedNight]] as const) {
+      const actual = Array.from({ length: 8 }, (_, index) => tokens[`--mission-label-${index + 1}`])
+      expect(actual).toEqual(expected)
+      expect(new Set(actual).size).toBe(8)
+      for (const color of actual) {
+        const background = mixHex(color, tokens['--home-surface'], 0.09)
+        expect(contrast(color, background), `${color} on ${background}`).toBeGreaterThanOrEqual(4.5)
+      }
+    }
+  })
+
+  it('keeps every Agent artifact icon family distinguishable in both themes', () => {
+    const attachmentTokens = requiredTokens.filter((token) => token.startsWith('--attachment-'))
+    for (const tokens of [day, night]) {
+      for (const token of attachmentTokens) {
+        expect(contrast(tokens[token], tokens['--surface-raised']), token).toBeGreaterThanOrEqual(3)
+      }
+    }
+    expect(css).toMatch(/\.agent-artifact-icon\.type-generic\s*\{[^}]*color: var\(--attachment-generic\)/)
+    expect(css).toMatch(/\.agent-output-file-grid\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\)/)
+  })
+
+  it('keeps file references underline-free and shared resource glyphs at one stroke weight', () => {
+    expect(css).toMatch(/\.safe-markdown \.markdown-file-reference,[\s\S]*?\.message-file-reference\s*\{[^}]*text-decoration: none/)
+    expect(css).toMatch(/\.safe-markdown \.markdown-file-reference:hover,[\s\S]*?\.message-file-reference:active\s*\{[^}]*text-decoration: none/)
+    expect(css).not.toMatch(/\.inline-code-file-reference:hover \.file-reference-label\s*\{[^}]*text-decoration-(?:line|style): underline/)
+    expect(css).toMatch(/\.file-preview-tab-icon\s*\{[^}]*stroke-width: 1\.7[^}]*opacity: \.9/)
+    expect(css).toMatch(/\.resource-reference-icon\s*\{[^}]*stroke-width: 1\.7/)
+  })
+
+  it('uses conditional logical margins for file references beside body text', () => {
+    expect(css).toMatch(/\.markdown-file-reference\.has-adjacent-text-before,[\s\S]*?\.message-file-reference\.has-adjacent-text-before\s*\{[^}]*margin-inline-start: 2px/)
+    expect(css).toMatch(/\.markdown-file-reference\.has-adjacent-text-after,[\s\S]*?\.message-file-reference\.has-adjacent-text-after\s*\{[^}]*margin-inline-end: 2px/)
+    expect(css).not.toMatch(/has-adjacent-text-(?:before|after)\s*\{[^}]*(?:margin-left|margin-right):/)
+  })
+
+  it('uses quiet selected backgrounds for the active Thread and current Project', () => {
+    expect(css).toMatch(/\.camp-nav-row\.selected\s*\{[^}]*background: var\(--surface-selected\)/)
+    expect(css).toMatch(/\.project-heading-row\.current-project\s*\{[^}]*background: var\(--surface-selected\)/)
+  })
+
+  it('aligns sidebar titles independently from the fixed status and action lane', () => {
+    expect(css).toMatch(/\.unified-sidebar\s*\{[^}]*--nav-child-indent: 24px[^}]*--nav-status-slot: 12px[^}]*--nav-unread-size: 7px/)
+    expect(css).toMatch(/\.camp-group-children\s*\{[^}]*padding-left: var\(--nav-child-indent\)/)
+    expect(css).toMatch(/\.camp-nav-open\s*\{[^}]*gap: 7px[^}]*padding: 2px 44px 2px 8px/)
+    expect(css).toMatch(/\.pinned-navigation > \.camp-nav-row > \.camp-nav-open > \.pinned-camp-icon\s*\{[^}]*width: 17px[^}]*height: 17px[^}]*flex: 0 0 17px/)
+    expect(css).toMatch(/\.camp-status-slot\s*\{[^}]*width: var\(--nav-status-slot\)[^}]*height: var\(--nav-status-slot\)[^}]*flex: 0 0 var\(--nav-status-slot\)[^}]*place-items: center[^}]*margin-left: auto/)
+    expect(css).toMatch(/\.camp-status-slot > \.camp-unread-dot\s*\{[^}]*width: var\(--nav-unread-size\)[^}]*height: var\(--nav-unread-size\)[^}]*background: var\(--conversation-unread\)/)
+    expect(css).not.toContain('.pinned-navigation .camp-marker-slot')
+  })
+
+  it('uses one transparent-gutter 8px scrollbar thumb across visible scrollers', () => {
+    const gutterSize = Number.parseFloat(day['--scrollbar-gutter-size'])
+    const thumbInset = Number.parseFloat(day['--scrollbar-thumb-inset'])
+
+    expect(gutterSize - (thumbInset * 2)).toBe(8)
+    expect(css).toMatch(/\*::-webkit-scrollbar\s*\{[^}]*width: var\(--scrollbar-gutter-size\)[^}]*height: var\(--scrollbar-gutter-size\)[^}]*background: transparent/)
+    expect(css).toMatch(/\*::-webkit-scrollbar-track,\s*\*::-webkit-scrollbar-corner\s*\{[^}]*background: transparent/)
+    expect(css).toMatch(/\*::-webkit-scrollbar-thumb\s*\{[^}]*border: var\(--scrollbar-thumb-inset\) solid transparent[^}]*border-radius: 999px[^}]*background: var\(--scrollbar-thumb\)/)
+    expect(css).not.toContain('scrollbar-width: thin')
+    expect(css).toContain('.file-preview-tab-strip::-webkit-scrollbar { display: none; }')
+    expect(css).toContain('.run-pulse-inspector .run-pulse-list::-webkit-scrollbar { display: none; }')
+  })
+
+  it('gives every page a controlled drag region and compacts only the Windows sidebar inset', () => {
+    expect(css).toContain(`.content.compose-content,
+.content.settings-content,
+.content.members-content,
+.content.memory-content { grid-row: 1 / -1; }`)
+    expect(css).toMatch(/\.window-drag-strip\s*\{[^}]*width: 100%[^}]*height: 50px[^}]*-webkit-app-region: drag/)
+    expect(css).toMatch(/\.memory-library\s*\{[^}]*padding: 34px 28px 24px/)
+    expect(css).toMatch(/\.memory-library-header\s*\{[^}]*align-items: flex-end[^}]*padding: 0 0 17px[^}]*border-bottom: 0(?![^}]*-webkit-app-region: drag)/)
+    expect(css).toMatch(/\.memory-header-actions\s*\{[^}]*position: relative[^}]*z-index: 3/)
+    expect(css).toMatch(/\.content\.memory-content\s*\{[^}]*border-top: 0[^}]*background: var\(--memory-canvas\)/)
+    expect(css).toContain('.memory-library-header .eyebrow')
+    expect(css).toContain('.memory-page-notices')
+    expect(css).not.toContain('.memory-page-kicker')
+    expect(css).toMatch(/\.member-detail-scroll\s*\{[^}]*padding: 30px 26px 48px/)
+    expect(css).toMatch(/\.member-detail-header\s*\{(?![^}]*-webkit-app-region: drag)[^}]*\}/)
+    expect(css).toMatch(/\.member-sidebar-actions\s*\{[^}]*position: relative[^}]*z-index: 3[^}]*-webkit-app-region: no-drag/)
+    expect(css).toMatch(/\.member-detail-actions\s*\{[^}]*position: relative[^}]*z-index: 3/)
+    expect(css).toMatch(/\.unified-sidebar-drag\s*\{[^}]*flex: 0 0 38px[^}]*-webkit-app-region: drag/)
+    expect(css).toMatch(/html\[data-rovai-platform="win32"\] \.unified-sidebar-drag\s*\{[^}]*flex: 0 0 8px/)
+    expect(css).not.toContain('html[data-rovai-platform="win32"] *')
+  })
+
+  it('keeps the Windows menu projection on the rail token outside page layout', () => {
+    expect(css).toMatch(/html\[data-rovai-platform="win32"\] #root\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\)[^}]*grid-template-rows: env\(titlebar-area-height, 32px\) minmax\(0, 1fr\)[^}]*overflow: hidden[^}]*background: var\(--rail\)/)
+    expect(css).toMatch(/html\[data-rovai-platform="win32"\] \.windows-application-menu\s*\{[^}]*width: env\(titlebar-area-width, calc\(100% - 138px\)\)[^}]*max-width: calc\(100vw - 138px\)[^}]*background: var\(--rail\)[^}]*-webkit-app-region: drag/)
+    expect(css).toMatch(/\.windows-application-menu-item\s*\{[^}]*font: 400 12px\/1 "Segoe UI", sans-serif[^}]*-webkit-app-region: no-drag/)
+    expect(css).toMatch(/html\[data-rovai-platform="win32"\] \.app-shell\s*\{[^}]*grid-row: 2[^}]*width: 100%[^}]*min-width: 0[^}]*height: auto/)
+  })
+
+  it('keeps selection and unread state visible in Windows Forced Colors', () => {
+    expect(css).toMatch(/@media \(forced-colors: active\)[\s\S]*\.camp-nav-row\.selected[\s\S]*outline: 2px solid Highlight/)
+    expect(css).toMatch(/@media \(forced-colors: active\)[\s\S]*\.rail-badge-dot[\s\S]*background: Highlight/)
+    expect(css).toMatch(/@media \(forced-colors: active\)[\s\S]*\.camp-unread-dot[\s\S]*background: Highlight/)
+  })
+
+  it('uses solid, rule-free headers for the approved Memory, Appearance, and Reminder pages', () => {
+    expect(css).toMatch(/\.settings-content \.settings-panel:is\([^}]+\)\s*\{[^}]*border-top: 0[^}]*background: var\(--home-surface\)/)
+    expect(css).toMatch(/\.settings-panel-appearance > \.appearance-settings-page > \.settings-page-heading,[^{]+\{[^}]*border-bottom: 0/)
+    expect(css).toMatch(/\.settings-panel-notifications > \.settings-page-heading\s*\{[^}]*border-bottom: 0/)
+    expect(css).toMatch(/\.memory-scope-tabs\s*\{[^}]*border: 0[^}]*background: var\(--workspace-surface-subtle\)/)
+    expect(css).toMatch(/\.memory-catalog\s*\{[^}]*background: var\(--workspace-surface-subtle\)/)
+    expect(css).toMatch(/\.memory-detail\s*\{[^}]*background: var\(--workspace-surface-subtle\)/)
+    expect(css).toMatch(/\.memory-search\s*\{[^}]*min-height: 38px[^}]*grid-template-columns: 18px minmax\(0, 1fr\)[^}]*border: 1px solid var\(--workspace-line\)[^}]*border-radius: 9px/)
+    expect(css).toMatch(/\.settings-panel-notifications \.notification-master-panel\s*\{[^}]*background: var\(--workspace-surface-subtle\)/)
+    expect(css).toMatch(/\.settings-panel-notifications \.notification-scenario\s*\{[^}]*background: var\(--workspace-surface-subtle\)/)
+    expect(css).toMatch(/\.settings-panel-notifications \.notification-scenario \.notification-switch\s*\{[^}]*background: var\(--workspace-surface-raised\)/)
+    expect(css).toMatch(/\.settings-panel-notifications \.notification-scenario-heading\s*\{[^}]*border-bottom: 0/)
+  })
+
+  it('uses the member workspace plane in Settings and a neutral Memory canvas', () => {
+    expect(css).toMatch(/\.content\.members-content\s*\{[^}]*background: var\(--home-surface\)/)
+    expect(css).toMatch(/\.content\.memory-content\s*\{[^}]*background: var\(--memory-canvas\)/)
+    expect(css).toMatch(/\.content\.settings-content\s*\{[^}]*background: var\(--home-surface\)/)
+    expect(css).toMatch(/\.settings-workbench\s*\{[^}]*background: var\(--home-surface\)/)
+    expect(css).toMatch(/\.settings-content \.settings-panel\s*\{[^}]*background: var\(--home-surface\)/)
+  })
+
+  it('keeps Agent narrative open while giving right-aligned user messages a fully rounded Porcelain surface', () => {
+    expect(css).toMatch(/\.conversation-bubble\.agent\s*\{[^}]*--agent-accent: var\(--identity-1\)/)
+    expect(css).not.toMatch(/\.conversation-bubble\.agent\s*\{[^}]*background:/)
+    expect(css).not.toMatch(/\.conversation-bubble\.agent\s+\.final-copy\s*\{[^}]*background:/)
+    expect(css).toMatch(/\.final-copy\s*\{[^}]*color: var\(--ink\)[^}]*\}/)
+    expect(css).toMatch(/\.message-bubble\s*\{[^}]*max-width: min\(var\(--conversation-prose-width\), 100%\)[^}]*background: transparent/)
+    expect(css).not.toMatch(/\.message-bubble\s*\{[^}]*background: var\(--brand-soft\)/)
+    expect(css).not.toContain('.conversation-bubble:is(.user, .agent):hover::before')
+    expect(css).toMatch(/\.conversation-bubble:is\(\.user, \.external_principal\)\s*\{[^}]*margin-left: auto[^}]*grid-template-columns: minmax\(0, 1fr\) 32px/)
+    expect(css).toMatch(/\.conversation-bubble:is\(\.user, \.external_principal\) > :is\(\.local-message-avatar, \.current-user-profile-trigger\)\s*\{[^}]*grid-column: 2/)
+    expect(css).toMatch(/\.conversation-bubble:is\(\.user, \.external_principal\) \.message-bubble\s*\{[^}]*border-radius: 12px;[^}]*background: var\(--conversation-user-message-surface\)/)
+    expect(css).toMatch(/\.conversation-bubble:is\(\.user, \.external_principal\) \.message-surface\s*\{[^}]*width: fit-content[^}]*max-width: min\([^}]*var\(--conversation-user-message-max-width\)[^}]*66\.667cqw[^}]*align-items: flex-end/)
+    expect(css).toMatch(/\.conversation-bubble:is\(\.user, \.external_principal\) \.message-bubble\s*\{[^}]*width: fit-content[^}]*max-width: 100%/)
+    expect(css).toMatch(/\.message-body\s*\{[^}]*position: relative[^}]*display: flex/)
+    expect(css).not.toMatch(/\.message-body\s*\{[^}]*padding-right:/)
+    expect(css).toMatch(/\.message-surface\s*\{[^}]*position: relative[^}]*display: flex/)
+    expect(css).toMatch(/\.safe-markdown code\s*\{[^}]*padding:\s*0 2px[^}]*border-radius:\s*3px[^}]*background:\s*var\(--inline-code-canvas\)/)
+    expect(css).not.toMatch(/\.safe-markdown code\s*\{[^}]*\bborder\s*:/)
+    expect(css).toMatch(/\.safe-markdown\s*\{[^}]*--markdown-code-canvas:\s*var\(--code-block-canvas\)/)
+    expect(css).toMatch(/\.safe-markdown pre\s*\{[^}]*background:\s*var\(--markdown-code-canvas\)/)
+    expect(css).toMatch(/\.safe-markdown pre code\s*\{[^}]*padding:\s*0[^}]*background:\s*transparent/)
+    expect(css).toContain('.conversation-bubble:hover .message-actions')
+    expect(css).toMatch(/\.message-actions\s*\{[^}]*align-self: flex-end[^}]*gap: 0[^}]*margin-top: 3px/)
+    expect(css).toMatch(/\.conversation-bubble\.agent \.message-actions\s*\{[^}]*width: fit-content[^}]*align-self: flex-start[^}]*justify-content: flex-start[^}]*margin-left: -5px/)
+    expect(css).toMatch(/\.copy-feedback\s*\{[^}]*position: absolute[^}]*clip-path: inset\(50%\)/)
+    expect(css).toMatch(/\.agent-message-output > \.agent-message-output-actions\s*\{[^}]*width: fit-content[^}]*justify-content: flex-start[^}]*margin: 3px 0 0 37px/)
+    expect(css).toContain('.agent-message-output:hover > .message-actions')
+    expect(css).toContain('.message-actions.is-persistent')
+    expect(css).toMatch(/\.message-copy-button,\s*\.message-reply-button,\s*\.message-withdraw-button\s*\{[^}]*width: 28px[^}]*height: 28px/)
+    expect(css).toMatch(/\.message-copy-button svg,\s*\.message-reply-button svg,\s*\.message-withdraw-button svg\s*\{[^}]*width: 17px[^}]*height: 17px/)
+    expect(css).toMatch(/\.message-actions > button \+ button\s*\{[^}]*margin-left: 1px/)
+    expect(css).toMatch(/\.message-long-toggle\s*\{[^}]*min-height: 28px[^}]*margin: 3px 0 -4px -5px[^}]*color: var\(--muted\)/)
+    expect(css).toContain('.message-long-toggle[aria-expanded="true"] svg')
+    expect(css).not.toContain('.message-long-ellipsis')
+    expect(css).toMatch(
+      /\.conversation-bubble:is\(\.user, \.external_principal\):has\(\.message-attachments\) \.message-surface\s*\{[^}]*width: 100%[^}]*max-width: none/
+    )
+    expect(css).toMatch(/\.user-message-files\s*\{[^}]*justify-content: flex-end/)
+    expect(css).toMatch(/\.attachment-card\s*\{[^}]*--user-file-card-max-width:\s*224px/)
+    expect(css).toMatch(/\.single-chat-message-attachments \.user-timeline\s*\{[^}]*width: fit-content[^}]*max-width: min\(var\(--user-file-card-max-width\), 100%\)/)
+    expect(css).toMatch(/\.agent-timeline\s*\{[^}]*width: 100%[^}]*min-height: 56px/)
+    expect(css).toMatch(/\.agent-output-files\s*\{[^}]*width: min\(620px, 100%\)/)
+    expect(css).toMatch(/\.user-timeline\s*\{[^}]*max-width:\s*min\(var\(--user-file-card-max-width\), 100%\)/)
+    expect(css).toMatch(/\.composer-attachment-card\s*\{[^}]*max-width:\s*min\(var\(--user-composer-max-width\), var\(--user-file-card-max-width\)\)/)
+    expect(css).toMatch(
+      /\.image-gallery-user-attachment \.image-gallery-grid\s*\{[^}]*justify-content: flex-end/
+    )
+    expect(css).toMatch(/\.structured-mention-placeholder\s*\{[^}]*position:\s*absolute[^}]*pointer-events:\s*none/)
+    expect(css).not.toContain('.composer.suppress-reply-focus-ring')
+    expect(css).toMatch(/\.composer-continuation\s*\{[^}]*background:\s*transparent|\.composer-continuation\s*\{[^}]*color:/)
+    expect(css).toContain('--conversation-wide-width: 1040px;')
+    expect(css).toContain('--conversation-composer-width: 1040px;')
+    expect(css).toContain('--conversation-user-message-surface: #f5f5f4;')
+    expect(css).toContain('--conversation-user-message-surface: #24282b;')
+    expect(css).toMatch(/\.composer-route-rail\s*\{[^}]*width:\s*min\(var\(--conversation-composer-width\), 100%\)[^}]*min-height:\s*34px/)
+    expect(css).not.toContain('.message-surface.has-delivery .message-copy-button')
+    expect(css).toMatch(
+      /@media\s*\(min-width:\s*1800px\)[\s\S]*?\.timeline-track\s*\{[^}]*width:\s*min\(var\(--conversation-wide-width\), 100%\)/
+    )
+    expect(css).toMatch(
+      /@media\s*\(min-width:\s*1800px\)\s*\{\s*:root\s*\{[^}]*--conversation-composer-width:\s*1440px/
+    )
+    expect(css).toMatch(
+      /\.conversation-bubble\.agent \.safe-markdown > :where\(pre, \.markdown-code-frame, table\)\s*\{[^}]*width:\s*min\(var\(--conversation-artifact-width\), 100%\)/
+    )
+    expect(css).toMatch(
+      /@media\s*\(min-width:\s*1800px\)[\s\S]*?\.timeline-event-card:not\(\.task-event-card\)\s*\{[^}]*width:\s*min\(var\(--conversation-artifact-width\), 100%\)/
+    )
+    expect(css).toMatch(
+      /@media\s*\(min-width:\s*1800px\)[\s\S]*?\.runtime-recovery-dock\s*\{[^}]*width:\s*min\(var\(--conversation-wide-width\), calc\(100% - 54px\)\)/
+    )
+  })
+
+  it('shares Mist Gray Markdown code layers across Thread reading surfaces', () => {
+    expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown code,\s*\.execution-drawer \.safe-markdown code,\s*\.file-preview-markdown \.safe-markdown code\s*\{[^}]*padding:\s*1px 4px[^}]*border-radius:\s*6px[^}]*background:\s*var\(--conversation-inline-code-canvas\)[^}]*box-decoration-break:\s*clone/)
+    expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown pre,\s*\.execution-drawer \.safe-markdown pre,\s*\.file-preview-markdown \.safe-markdown pre\s*\{[^}]*padding:\s*11px 12px/)
+    expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown,\s*\.execution-drawer \.safe-markdown,\s*\.file-preview-markdown \.safe-markdown\s*\{[^}]*--markdown-code-line:\s*var\(--conversation-code-line\)[^}]*--markdown-code-canvas:\s*var\(--conversation-code-block-canvas\)[^}]*--markdown-code-radius:\s*8px/)
+    expect(css).toMatch(/\.markdown-code-frame\s*\{[^}]*border:\s*1px solid var\(--markdown-code-line\)[^}]*border-radius:\s*var\(--markdown-code-radius\)[^}]*background:\s*var\(--markdown-code-canvas\)/)
+    expect(css).toMatch(/\.safe-markdown \.markdown-code-frame > pre\s*\{[^}]*border:\s*0[^}]*background:\s*transparent/)
+    expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown pre code,\s*\.execution-drawer \.safe-markdown pre code,\s*\.file-preview-markdown \.safe-markdown pre code\s*\{[^}]*padding:\s*0[^}]*border-radius:\s*0[^}]*background:\s*transparent/)
+    expect(css).toMatch(/\.file-preview-metadata\s*\{[^}]*border:\s*1px solid var\(--conversation-code-line\)[^}]*border-radius:\s*8px[^}]*color:\s*var\(--evidence-ink\)[^}]*background:\s*var\(--conversation-code-block-canvas\)/)
+    expect(css).toMatch(/@container file-preview-pane \(max-width:\s*330px\)[\s\S]*?\.file-preview-metadata-row\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/)
+  })
+
+  it('keeps AgentRun disclosure in a fixed trailing SVG track', () => {
+    expect(css).toMatch(/\.execution-disclosure\.worked > summary\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 24px/)
+    expect(css).toMatch(/\.process-disclosure-slot\s*\{[^}]*width:\s*24px[^}]*height:\s*24px/)
+    expect(css).toMatch(/\.process-disclosure-slot svg\s*\{[^}]*width:\s*14px[^}]*height:\s*14px[^}]*stroke-width:\s*1\.55/)
+    expect(css).toMatch(/\.execution-disclosure\.worked:not\(\[open\]\) \.process-disclosure-slot svg\s*\{[^}]*transform:\s*rotate\(-90deg\)/)
+  })
+
+  it('keeps complete Tool results in the full-width, keyboard-scrollable surface', () => {
+    expect(css).toMatch(/\.tool-call-summary\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*16px minmax\(0, 1fr\) 20px/)
+    expect(css).toMatch(/\.tool-call-icon svg\s*\{[^}]*width:\s*16px[^}]*height:\s*16px[^}]*fill:\s*none/)
+    expect(css).toMatch(/\.tool-call-disclosure-slot\s*\{[^}]*width:\s*20px[^}]*height:\s*20px/)
+    expect(css).toMatch(/\.tool-call-disclosure-slot\.is-placeholder\s*\{[^}]*visibility:\s*hidden/)
+    expect(css).toMatch(/\.tool-call-detail\s*\{[^}]*position:\s*relative[^}]*margin:\s*5px 0 8px 2px[^}]*\}/)
+    expect(css).toMatch(/\.tool-call-result-scroll\s*\{[^}]*background:\s*var\(--shell-result-canvas\)/)
+    expect(css).toMatch(/\.tool-call-result-scroll\s*\{[^}]*max-height:\s*min\(220px, 30vh\)[^}]*overflow:\s*auto[^}]*scrollbar-gutter:\s*stable/)
+    expect(css).toMatch(/\.tool-call-result-scroll\s*\{[^}]*white-space:\s*pre-wrap[^}]*overflow-wrap:\s*anywhere/)
+    expect(css).not.toMatch(/\.tool-call-detail\s*\{[^}]*padding-right:/)
+    expect(css).not.toContain('.tool-output-copy-button')
+    expect(css).not.toContain('.tool-call-detail.is-truncated')
+  })
+
+  it('keeps the Composer on its responsive centered track with split tool and send actions', () => {
+    expect(css).toMatch(
+      /\.composer-box\s*\{[^}]*width:\s*min\(var\(--conversation-composer-width\),\s*100%\)/
+    )
+    expect(css).toMatch(/\.composer-action-row\s*\{[^}]*justify-content:\s*space-between/)
+    expect(css).toMatch(/\.composer-tools, \.composer-actions\s*\{[^}]*gap:\s*5px/)
+    expect(css).toMatch(/\.composer-attachment-button\s*\{[^}]*width:\s*28px[^}]*height:\s*28px/)
+    expect(css).toMatch(/\.composer-hint\s*\{[^}]*display:\s*inline-flex[^}]*white-space:\s*nowrap/)
+    expect(css).toMatch(/\.composer-hint-visual\s*\{[^}]*display:\s*inline-flex[^}]*gap:\s*4px/)
+    expect(css).toMatch(/\.composer-hint kbd\s*\{[^}]*min-width:\s*20px[^}]*height:\s*18px[^}]*border:\s*1px solid var\(--line\)/)
+    expect(css).toMatch(/@media\s*\(max-width:\s*760px\)\s*\{[^}]*\.composer-hint\s*\{[^}]*display:\s*none/)
+    expect(css).toMatch(/\.composer-send\s*\{[^}]*min-height:\s*28px/)
+    expect(css).toMatch(/\.composer-primary-action\s*\{[^}]*width:\s*32px[^}]*height:\s*32px/)
+    expect(css).toMatch(/\.composer-primary-action\.is-stop\s*\{[^}]*border-color:\s*var\(--conversation-control-line\)[^}]*background:\s*var\(--surface-subtle\)/)
+    expect(css).toMatch(/\.composer-primary-action-spinner\s*\{[^}]*animation:\s*composer-primary-action-spin/)
+  })
+
+  it('keeps long Composer input internally scrollable without covering its actions', () => {
+    expect(css).toMatch(/\.composer-box\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*auto\) auto/)
+    expect(css).toMatch(/\.composer-input\s*\{[^}]*min-height:\s*0/)
+    expect(css).toMatch(/\.structured-mention-composer\s*\{[^}]*min-height:\s*0/)
+    expect(css).toMatch(
+      /\.structured-mention-editor\s*\{[^}]*max-height:\s*min\(180px,\s*26vh\)[^}]*overflow-y:\s*auto[^}]*overscroll-behavior:\s*contain/
+    )
+    expect(css).toMatch(/\.composer-action-row\s*\{[^}]*z-index:\s*1[^}]*justify-content:\s*space-between[^}]*background:\s*var\(--input\)/)
+  })
+
+  it('keeps Thread details on a themed popover with row-level member menus', () => {
+    expect(css).toMatch(/\.camp-detail-popover\s*\{[^}]*position:\s*absolute[^}]*background:\s*var\(--inspector-surface\)/)
+    expect(css).toMatch(/\.task-action-row\s*\{[^}]*position:\s*sticky/)
+    expect(css).toMatch(/\.task-state-dot\.state-in_progress\s*\{[^}]*border-color:\s*var\(--brand\)/)
+    expect(css).toMatch(/\.camp-members-summary\s*\{[^}]*position:\s*sticky/)
+    expect(css).toMatch(/\.camp-member-menu-item\[data-disabled\]\s*\{[^}]*cursor:\s*not-allowed/)
+    expect(css).not.toContain('.camp-lead-picker {')
+    expect(css).not.toContain('.context-card {')
+    expect(css).not.toContain('.approval-card {')
+  })
+
+  it('keeps the Single Chat popover on the shared neutral overlay border', () => {
+    const block = css.match(/\.single-chat-popover\s*\{[^}]*\}/)?.[0] ?? ''
+
+    expect(block).toContain('border: 1px solid var(--line-strong)')
+    expect(block).not.toContain('border-top')
+    expect(block).not.toContain('var(--workspace-steel)')
+  })
+
+  it('keeps the Composer Skill picker in the accepted native Steel dropdown', () => {
+    expect(css).toMatch(/\.skill-picker-menu\s*\{[^}]*max-height:\s*310px/)
+    expect(css).toMatch(/\.skill-picker-menu button\s*\{[^}]*min-height:\s*46px[^}]*grid-template-columns:\s*28px minmax\(0, 1fr\) auto/)
+    expect(css).toMatch(/\.skill-identity-mark\.is-compact\s*\{[^}]*width:\s*28px[^}]*height:\s*28px[^}]*border-radius:\s*7px/)
+    expect(css).toMatch(/\.skill-picker-enter\s*\{[^}]*color:\s*var\(--faint\)/)
+  })
+
+  it('keeps the LAN execution disclosure centered in a stable SVG slot', () => {
+    expect(css).toMatch(
+      /\.execution-web-settings > summary\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\) max-content 28px[^}]*align-items:\s*center/
+    )
+    expect(css).toMatch(
+      /\.execution-web-disclosure\s*\{[^}]*width:\s*28px[^}]*height:\s*28px[^}]*place-items:\s*center/
+    )
+    expect(css).toMatch(
+      /\.execution-web-disclosure svg\s*\{[^}]*width:\s*14px[^}]*height:\s*14px/
+    )
+    expect(css).not.toContain('.execution-web-settings > summary::after')
+    expect(css).not.toContain('.channel-binding-diagnostics')
+  })
+
+  it('renders A2A recipients as blue interactive mentions', () => {
+    expect(css).toMatch(/\.message-delivery-recipient-name\s*\{[^}]*color: var\(--mention-ink\)/)
+    expect(css).toMatch(/\.message-mention-token\.is-interactive\s*\{[^}]*cursor:\s*pointer/)
+  })
+
+  it('shows General question-mark help only while the mark is hovered', () => {
+    expect(css).toContain('.general-help-mark:hover + .general-help-popover')
+    expect(css).not.toContain('.general-help-mark:focus')
+    expect(css).not.toContain('.skill-import-help')
+  })
+
+  it('keeps raw color literals inside the canonical token block', () => {
+    const componentCss = css.replace(/:root(?:\[data-theme(?:-id)?="[a-z-]+"\])?\s*\{[\s\S]*?\n\}/g, '')
+
+    expect(componentCss).not.toMatch(/#[0-9a-f]{3,8}\b/i)
+    expect(componentCss).not.toMatch(/\brgba?\(/i)
+  })
+
+  it('ships Night as a token-only theme override rather than component color branches', () => {
+    expect(css).toContain(':root[data-theme="night"]')
+    expect(css).not.toMatch(/\[data-theme="night"\][^{]*\.(?:skill|mcp|member|camp|memory|settings)-/)
+  })
+
+  it('does not reference undeclared custom properties', () => {
+    const declared = new Set([...css.matchAll(/(--[a-z0-9-]+)\s*:/gi)].map((match) => match[1]))
+    const used = new Set([...css.matchAll(/var\((--[a-z0-9-]+)/gi)].map((match) => match[1]))
+    const runtimeOwned = new Set([
+      '--radix-dropdown-menu-content-transform-origin',
+      '--radix-dropdown-menu-content-available-height',
+      '--radix-dropdown-menu-trigger-width',
+      '--radix-popover-trigger-width',
+      '--radix-popover-content-available-height'
+    ])
+    expect([...used].filter((token) => !declared.has(token) && !runtimeOwned.has(token))).toEqual([])
+  })
+})
+
+
+describe.each(['horizon', 'classic-red', 'ember'])('%s palette', theme => {
+  const tokens = tokenBlock(`:root[data-theme-id="${theme}"]`)
+  it('covers the existing semantic token contract and uses production message surfaces', () => {
+    for (const name of requiredTokens) expect(tokens[name], name).toBeTruthy()
+    expect(tokens['--conversation-user-message-line']).toBe(tokens['--conversation-user-message-surface'])
+  })
+  it('keeps text, identity and semantic labels readable', () => {
+    expectTextContrast(tokens)
+    expect(contrast(tokens['--ink'], tokens['--conversation-user-message-surface'])).toBeGreaterThanOrEqual(4.5)
+    for (const [line, surface] of [['--conversation-control-line', '--input'], ['--new-camp-picker-line-strong', '--new-camp-picker-surface']]) {
+      expect(contrast(tokens[line], tokens[surface]), `${line} on ${surface}`).toBeGreaterThanOrEqual(3)
+    }
+  })
+})

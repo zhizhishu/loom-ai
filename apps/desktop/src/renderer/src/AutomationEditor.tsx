@@ -1,0 +1,204 @@
+import { useThreadClient } from './camp-client'
+import { useCallback, useEffect, useId, useRef, useState, type Dispatch, type SetStateAction } from 'react'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
+import type { AgentProfile, AutomationRunListPage, AutomationRunSummary, AutomationView, ChannelSettingsSnapshot, ProjectNavigationGroup } from '@contracts'
+import { MemberAvatar } from './MemberAvatar'
+import { AutomationGlyph, type AutomationIcon } from './AutomationControls'
+import { dateTimeLabel, projectValue, projectFromValue, runStatus, scheduleKinds, scheduleWithKind, weekdays, type AutomationDraft } from './automation-workspace-model'
+import { readErrorMessage } from './error-message'
+import { automationScheduleError } from './automation-schedule-validation'
+import { AutomationDatePicker, AutomationTimePicker } from './AutomationSchedulePickers'
+import { AutomationNamingControls } from './AutomationNamingControls'
+import { runtimeAdapterDisplayLabel } from '../../shared/execution-presentation'
+import { UiText, uiAttribute } from './interface-language'
+import { CHANNEL_KINDS, CHANNEL_PROVIDER_BRANDS } from './channel-provider-brand'
+
+function Picker({ label, value, options, onChange, children, disabled = false }: {
+  label: string
+  value: string
+  options: Array<{ value: string; label: React.ReactNode; disabled?: boolean }>
+  onChange(value: string): void
+  children: React.ReactNode
+  disabled?: boolean
+}): React.JSX.Element {
+  return <DropdownMenu.Root>
+    <DropdownMenu.Trigger asChild><button className="automation-picker" type="button" aria-label={label} disabled={disabled}>{children}<AutomationGlyph name="chevron" /></button></DropdownMenu.Trigger>
+    <DropdownMenu.Portal><DropdownMenu.Content onCloseAutoFocus={(event) => event.preventDefault()} className="automation-menu automation-picker-menu" align="end" sideOffset={5} collisionPadding={12} aria-label={label} loop>
+      <DropdownMenu.RadioGroup value={value} onValueChange={onChange}>
+        {options.map((option) => <DropdownMenu.RadioItem key={option.value} className="automation-menu-item automation-picker-option" value={option.value} disabled={option.disabled}>
+          {option.label}<DropdownMenu.ItemIndicator><AutomationGlyph name="check" /></DropdownMenu.ItemIndicator>
+        </DropdownMenu.RadioItem>)}
+      </DropdownMenu.RadioGroup>
+    </DropdownMenu.Content></DropdownMenu.Portal>
+  </DropdownMenu.Root>
+}
+
+function MemberCopy({ member }: { member: AgentProfile }): React.JSX.Element {
+  const runtime = member.runtimeConfiguration
+  return <><MemberAvatar agentId={member.agentId} avatarRef={member.avatarRef} displayName={member.displayName} size="mention" decorative />
+    <span className="automation-picker-copy"><span><strong>{member.displayName}</strong><em>{member.teamRole}</em></span><small>{runtime ? `${runtimeAdapterDisplayLabel(runtime.adapterKind)}${runtime.model.mode === 'explicit' ? ` · ${runtime.model.modelId}` : ''}` : uiAttribute("尚未配置智能体")}</small></span></>
+}
+
+function RunHistory({ automation, onOpenThread }: { automation: AutomationView; onOpenThread(threadId: string): void }): React.JSX.Element {
+  const client = useThreadClient()
+  const [runs, setRuns] = useState<AutomationRunSummary[]>([])
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const generation = useRef(0)
+  const runsRef = useRef(runs)
+  const loadingRef = useRef(false)
+  runsRef.current = runs
+  const load = useCallback(async (nextCursor: string | null = null): Promise<void> => {
+    if (loadingRef.current) return
+    loadingRef.current = true
+    const request = ++generation.current
+    setLoading(true)
+    setError(null)
+    try {
+      // Refresh every visible page: a newer skipped run can hide an older active run in lastRun.
+      const targetCount = nextCursor ? 20 : Math.max(20, runsRef.current.length)
+      const loaded: AutomationRunSummary[] = []
+      const seen = new Set<string>()
+      let pageCursor = nextCursor
+      do {
+        const page = await client.request<AutomationRunListPage>('automations.runs.list', { automationId: automation.automationId, limit: 20, ...(pageCursor ? { cursor: pageCursor } : {}) })
+        if (request !== generation.current) return
+        if (page.truncated && (!page.nextCursor || page.nextCursor === pageCursor || seen.has(page.nextCursor))) throw new Error(uiAttribute('执行历史分页状态无效，请重试。'))
+        loaded.push(...page.runs)
+        pageCursor = page.truncated ? page.nextCursor : null
+        if (pageCursor) seen.add(pageCursor)
+      } while (pageCursor && loaded.length < targetCount)
+      if (request !== generation.current) return
+      setRuns((current) => nextCursor ? [...current, ...loaded.filter((run) => !current.some((item) => item.runId === run.runId))] : loaded)
+      setCursor(pageCursor)
+    } catch (nextError) {
+      if (request === generation.current) setError(readErrorMessage(nextError))
+    } finally {
+      if (request === generation.current) { loadingRef.current = false; setLoading(false) }
+    }
+  }, [client, automation.automationId])
+  useEffect(() => {
+    void load()
+    const interval = window.setInterval(() => void load(), 5_000)
+    const unsubscribe = client.onEvent?.((event) => {
+      if (event.method === 'automations.updated') void load()
+    })
+    const unsubscribeInvalidated = client.onInvalidated?.(() => void load())
+    return () => { generation.current += 1; loadingRef.current = false; window.clearInterval(interval); unsubscribe?.(); unsubscribeInvalidated?.() }
+  }, [client, load])
+  // The definition refresh supplies current terminal/notification facts without resetting older pages.
+  useEffect(() => {
+    const latest = automation.lastRun
+    if (latest) setRuns((current) => [latest, ...current.filter((run) => run.runId !== latest.runId)])
+  }, [automation.lastRun])
+
+  return <section className="automation-history" aria-labelledby="automation-history-heading">
+    <h2 id="automation-history-heading"><UiText zh={"执行历史"} /></h2>
+    {runs.length === 0 && <p className="automation-history-empty">{loading ? uiAttribute("正在读取执行记录…") : error ? uiAttribute("执行历史暂时不可用") : uiAttribute("还没有执行记录")}</p>}
+    <div aria-busy={loading}>
+      {runs.map((run) => {
+        const state = runStatus(run)
+        const icon: AutomationIcon = run.status === 'completed' ? 'check' : run.status === 'failed' ? 'failed' : run.status === 'skipped' ? 'skip' : 'clock'
+        return <button key={run.runId} className={`automation-history-row ${state.tone}`} type="button" disabled={!run.threadId} onClick={() => { if (run.threadId) onOpenThread(run.threadId) }} title={state.detail ?? state.label} aria-label={`${state.label}${uiAttribute('，')}${dateTimeLabel(run.createdAt)}${run.threadId ? uiAttribute("，打开执行对话") : ''}`}>
+          <AutomationGlyph name={icon} /><span><time dateTime={run.createdAt}>{dateTimeLabel(run.createdAt)}</time><small>{state.detail ?? state.label}</small></span><span className="automation-history-state">{state.label}</span>{run.threadId && <span className="automation-history-open"><AutomationGlyph name="chat" /></span>}
+        </button>
+      })}
+    </div>
+    {error && <div className="automation-history-error" role="alert"><span>{error}</span><button type="button" className="quiet-button compact" onClick={() => void load()}><UiText zh={"重试读取"} /></button></div>}
+    {cursor && !error && <button type="button" className="quiet-button compact" disabled={loading} onClick={() => void load(cursor)}>{loading ? uiAttribute("正在读取…") : uiAttribute("更早的执行记录")}</button>}
+  </section>
+}
+
+export function AutomationEditor({ draft, onChange, agents, projects, automation, busy, onOpenThread, onCreate }: {
+  draft: AutomationDraft
+  onChange: Dispatch<SetStateAction<AutomationDraft>>
+  agents: AgentProfile[]
+  projects: ProjectNavigationGroup[]
+  automation: AutomationView | null
+  busy: boolean
+  onOpenThread(threadId: string): void
+  onCreate(): void
+}): React.JSX.Element {
+  const client = useThreadClient()
+  const [channels, setChannels] = useState<ChannelSettingsSnapshot | null>(null)
+  const [channelError, setChannelError] = useState(false)
+  const [channelsOpen, setChannelsOpen] = useState(false)
+  const loadChannels = useCallback(async (): Promise<void> => {
+    if (!client.channels) return
+    setChannelError(false)
+    try { setChannels(await client.channels.get()) } catch { setChannelError(true) }
+  }, [client])
+  useEffect(() => {
+    if (!channelsOpen) return
+    void loadChannels()
+    return client.channels?.onChanged(setChannels)
+  }, [client, channelsOpen, loadChannels])
+  const member = agents.find((agent) => agent.agentId === draft.memberId)
+  const selectableMembers = agents.filter((agent) => agent.presence === 'present')
+  const project = draft.projectRef.kind === 'directory' ? projects.find((item) => item.projectPath === projectValue(draft.projectRef)) : null
+  const projectName = draft.projectRef.kind === 'quick_chat' ? uiAttribute('快速对话') : project?.name ?? draft.projectRef.path.split(/[\\/]/).filter(Boolean).at(-1) ?? draft.projectRef.path
+  const projectDetail = draft.projectRef.kind === 'quick_chat' ? uiAttribute('Rovai AI 管理的快速对话目录') : draft.projectRef.path
+  const schedule = draft.schedule
+  const scheduleError = automationScheduleError(schedule)
+  const cronId = useId()
+
+  return <div className="automation-editor-scroll"><form className="automation-form" onSubmit={(event) => { event.preventDefault(); if (!automation && !busy && !scheduleError && draft.prompt.trim() && member?.presence === 'present') onCreate() }}>
+    <input className="automation-name-input" aria-label={uiAttribute("定时任务名称")} value={draft.name} maxLength={80} placeholder={uiAttribute("定时任务名称")} disabled={busy} onChange={(event) => onChange((current) => ({ ...current, name: event.target.value }))} />
+    <textarea className="automation-prompt-input" aria-label={uiAttribute("执行内容")} rows={3} value={draft.prompt} placeholder={uiAttribute("告诉队员需要按时完成什么…")} disabled={busy} onChange={(event) => onChange((current) => ({ ...current, prompt: event.target.value }))} />
+    <div className="automation-context" aria-label={uiAttribute("执行上下文")}>
+      <div className="automation-context-field"><span><UiText zh={"队员"} /></span>
+        <Picker label={uiAttribute("执行队员：{0}", String(member?.displayName ?? uiAttribute("选择队员")))} value={draft.memberId} disabled={busy || selectableMembers.length === 0} onChange={(memberId) => onChange((current) => ({ ...current, memberId }))} options={selectableMembers.map((agent) => ({ value: agent.agentId, label: <MemberCopy member={agent} /> }))}>
+          {member ? <MemberCopy member={member} /> : <span className="automation-picker-copy"><strong>{selectableMembers.length ? uiAttribute("选择队员") : uiAttribute("暂无可用队员")}</strong></span>}
+        </Picker>
+      </div>
+      {member?.presence !== 'present' && <p className="automation-field-note" role="status">{selectableMembers.length ? uiAttribute("原队员不可用，请重新选择。") : uiAttribute("请先在队员页添加一位队员。")}</p>}
+      <div className="automation-context-field"><span><UiText zh={"运行项目"} /></span>
+        <Picker label={uiAttribute("运行项目：{0}", String(projectName))} value={projectValue(draft.projectRef)} disabled={busy} onChange={(value) => onChange((current) => ({ ...current, projectRef: projectFromValue(value) }))} options={[
+          { value: 'quick-chat', label: <><AutomationGlyph name="chat" /><span className="automation-picker-copy"><strong><UiText zh={"使用快速对话"} /></strong><small><UiText zh={"Rovai AI 管理的快速对话目录"} /></small></span></> },
+          ...projects.map((item) => ({ value: item.projectPath, label: <><AutomationGlyph name="folder" /><span className="automation-picker-copy"><strong>{item.name}</strong><small>{item.projectPath}</small></span></> }))
+        ]}>
+          <span className="automation-project-icon"><AutomationGlyph name={draft.projectRef.kind === 'quick_chat' ? 'chat' : 'folder'} /></span><span className="automation-picker-copy" title={projectDetail}><strong>{projectName}</strong><small>{projectDetail}</small></span>
+        </Picker>
+      </div>
+    </div>
+    <section className="automation-schedule" aria-labelledby="automation-schedule-heading">
+      <h2 id="automation-schedule-heading"><UiText zh={"运行时间"} /></h2>
+      <div className="automation-schedule-panel">
+        <div className="automation-schedule-row"><span><UiText zh={"重复"} /></span><Picker label={uiAttribute("重复频率")} value={schedule.kind} disabled={busy} options={scheduleKinds.map((item) => ({ value: item.value, label: uiAttribute(item.label) }))} onChange={(value) => onChange((current) => ({ ...current, schedule: scheduleWithKind(value as AutomationDraft['schedule']['kind']) }))}>{uiAttribute(scheduleKinds.find((item) => item.value === schedule.kind)?.label ?? '')}</Picker></div>
+        {schedule.kind === 'weekly' && <div className="automation-schedule-row"><span><UiText zh={"星期"} /></span><Picker label={uiAttribute("星期")} value={schedule.weekday} disabled={busy} options={weekdays.map((item) => ({ value: item.value, label: uiAttribute(item.label) }))} onChange={(value) => onChange((current) => ({ ...current, schedule: { ...schedule, weekday: value as typeof schedule.weekday } }))}>{uiAttribute(weekdays.find((day) => day.value === schedule.weekday)?.label ?? '')}</Picker></div>}
+        {schedule.kind === 'once' && <div className="automation-schedule-row"><span><UiText zh={"日期"} /></span><AutomationDatePicker value={schedule.date} disabled={busy} onChange={(date) => onChange((current) => ({ ...current, schedule: { ...schedule, date } }))} /></div>}
+        {'at' in schedule && <div className="automation-schedule-row"><span><UiText zh={"时间"} /></span><AutomationTimePicker value={schedule.at} disabled={busy} onChange={(at) => onChange((current) => ({ ...current, schedule: { ...schedule, at } }))} /></div>}
+        {schedule.kind === 'cron' && <div className="automation-schedule-row automation-cron-row"><label htmlFor={cronId}>Cron</label><div className="automation-cron-editor">
+          <input id={cronId} aria-label={uiAttribute("5 段 Cron 表达式")} aria-invalid={Boolean(scheduleError)} aria-describedby={`${cronId}-hint ${cronId}-error`} placeholder="0 9 * * 1-5" value={schedule.expression} disabled={busy} spellCheck={false} autoComplete="off" onChange={(event) => onChange((current) => ({ ...current, schedule: { ...schedule, expression: event.target.value } }))} />
+          <p className="automation-cron-hint" id={`${cronId}-hint`}><UiText zh={"分钟 · 小时 · 日期 · 月份 · 星期"} /></p>
+          <p className="automation-schedule-error" id={`${cronId}-error`} aria-live="polite" hidden={!scheduleError}>{scheduleError}{scheduleError && automation ? uiAttribute(" 修改尚未保存。") : ''}</p>
+        </div></div>}
+      </div>
+      {schedule.kind !== 'cron' && scheduleError && <p className="automation-schedule-error" role="alert">{scheduleError}</p>}
+      {automation?.nextRunAt && <p className="automation-next-run"><UiText zh={"下次 "} /><time dateTime={automation.nextRunAt}>{dateTimeLabel(automation.nextRunAt)}</time><span><UiText zh={"本地时间"} /></span></p>}
+      {automation && !automation.enabled && <p className="automation-next-run"><UiText zh={"已关闭，可在任务操作中运行一次。"} /></p>}
+    </section>
+    <AutomationNamingControls name={draft.name} prompt={draft.prompt} value={draft.threadNaming} disabled={busy} onChange={(threadNaming) => onChange((current) => ({ ...current, threadNaming }))} />
+    <details className="automation-channel-disclosure" onToggle={(event) => setChannelsOpen(event.currentTarget.open)}>
+      <summary><span className="automation-channel-symbol"><AutomationGlyph name="channel" /></span><span><strong><UiText zh={"通知到渠道"} /></strong><small><UiText zh={"由当前队员的渠道 Bot 发送结果"} /></small></span><span className="automation-channel-count">{draft.notifyChannels.length ? draft.notifyChannels.map((channel) => uiAttribute(CHANNEL_PROVIDER_BRANDS[channel].name)).join('、') : uiAttribute("未选择")}</span><AutomationGlyph name="chevron" /></summary>
+      <fieldset className="automation-channel-options"><legend className="sr-only"><UiText zh={"完成后通知"} /></legend>
+        {CHANNEL_KINDS.map((channel) => {
+          const provider = channels?.channels.find((item) => item.kind === channel)
+          const bot = provider?.memberBots.find((item) => item.agentId === draft.memberId)
+          const available = bot?.publicationStatus === 'published'
+          const checked = draft.notifyChannels.includes(channel)
+          return <label key={channel} className={`automation-channel-option ${!available ? 'unavailable' : ''}`}>
+            <input type="checkbox" checked={checked} disabled={busy || (!available && !checked)} onChange={(event) => onChange((current) => ({ ...current, notifyChannels: event.target.checked ? [...new Set([...current.notifyChannels, channel])] : current.notifyChannels.filter((item) => item !== channel) }))} />
+            <img src={CHANNEL_PROVIDER_BRANDS[channel].logo} alt="" /><span><strong>{uiAttribute(CHANNEL_PROVIDER_BRANDS[channel].name)}</strong><small>{available ? bot.botDisplayName ?? `${member?.displayName ?? uiAttribute('队员')} Bot` : !client.channels ? uiAttribute("此 Host 未提供渠道通知") : channelError ? uiAttribute("暂时无法读取") : !channels ? uiAttribute("正在读取…") : uiAttribute("队员尚未发布 Bot")}</small></span>
+          </label>
+        })}
+      </fieldset>
+      {channelError && <button type="button" className="quiet-button compact" onClick={() => void loadChannels()}><UiText zh={"重试读取渠道"} /></button>}
+      <p className="automation-channel-note"><UiText zh={"发送到你的 Bot 私聊。通知失败只重试通知，不重新运行任务。"} /></p>
+    </details>
+    {!automation && <div className="automation-create-actions"><button className="primary-button" type="submit" disabled={busy || Boolean(scheduleError) || !draft.prompt.trim() || member?.presence !== 'present'}>{busy ? uiAttribute("正在保存…") : uiAttribute("保存")}</button></div>}
+  </form>
+    {automation && <RunHistory automation={automation} onOpenThread={onOpenThread} />}
+  </div>
+}

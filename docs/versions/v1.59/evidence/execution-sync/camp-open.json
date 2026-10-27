@@ -1,0 +1,498 @@
+{
+  "scope": "isolated Electron fixtures without Core or Runtime",
+  "passed": 9,
+  "reports": [
+    {
+      "ok": true,
+      "messages": 61,
+      "refreshAnchorDelta": 0,
+      "appendAnchorDelta": 0,
+      "historyLoadAnchorDelta": -0.25,
+      "userAttachmentLayout": {
+        "attachmentWidth": 748,
+        "attachmentLeft": 334,
+        "attachmentRight": 1082,
+        "messageWidth": 78,
+        "messageLeft": 1004,
+        "messageRight": 1082,
+        "userAvatarLeft": 1092,
+        "agentAvatarLeft": 334,
+        "agentMessageBodyLeft": 376
+      },
+      "cards": {
+        "task": 1,
+        "stop": 1,
+        "files": 1
+      }
+    },
+    {
+      "ok": true,
+      "verified": [
+        "camp-new-reply-position",
+        "pressed-target-stability",
+        "failed-run-click-isolation",
+        "bottom-and-inspector"
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "--text-evidence",
+      "text": {
+        "bodies": [
+          {
+            "length": 35023,
+            "start": "BODY_A \u5b8c\u6574\u6b63\u6587\ud83d",
+            "tail": "LONG_BODY_A_END"
+          },
+          {
+            "length": 19,
+            "start": "BODY_B inter",
+            "tail": "_B intermediate"
+          },
+          {
+            "length": 18,
+            "start": "BODY_C inter",
+            "tail": "Y_C interrupted"
+          }
+        ],
+        "hasFailure": false,
+        "tools": 2,
+        "privateReasoningVisible": false
+      }
+    },
+    {
+      "ok": true,
+      "mode": "--execution-window",
+      "report": [
+        {
+          "placement": "bottom",
+          "background": "rgb(255, 255, 255)",
+          "changes": [],
+          "through": 1000,
+          "requests": [
+            {
+              "beforeSequence": null,
+              "limit": 19
+            },
+            {
+              "beforeSequence": 982,
+              "limit": 64
+            },
+            {
+              "beforeSequence": 918,
+              "limit": 64
+            },
+            {
+              "beforeSequence": 854,
+              "limit": 64
+            },
+            {
+              "beforeSequence": 790,
+              "limit": 64
+            },
+            {
+              "beforeSequence": 726,
+              "limit": 64
+            }
+          ],
+          "contentReads": [
+            "window-999",
+            "window-993"
+          ],
+          "dom": 217,
+          "toolRows": 7,
+          "diffLines": 3,
+          "overflow": false
+        },
+        {
+          "placement": "inspector",
+          "background": "rgb(24, 29, 33)",
+          "changes": [],
+          "through": 1000,
+          "requests": [
+            {
+              "beforeSequence": null,
+              "limit": 19
+            },
+            {
+              "beforeSequence": 982,
+              "limit": 64
+            },
+            {
+              "beforeSequence": 918,
+              "limit": 64
+            },
+            {
+              "beforeSequence": 854,
+              "limit": 64
+            },
+            {
+              "beforeSequence": 790,
+              "limit": 64
+            },
+            {
+              "beforeSequence": 726,
+              "limit": 64
+            }
+          ],
+          "contentReads": [
+            "window-999",
+            "window-993"
+          ],
+          "dom": 203,
+          "toolRows": 7,
+          "diffLines": 3,
+          "overflow": false
+        }
+      ],
+      "initialPositions": [
+        {
+          "placement": "bottom",
+          "sample": 0,
+          "top": 371,
+          "gap": 0,
+          "following": "true"
+        },
+        {
+          "placement": "bottom",
+          "sample": 1,
+          "top": 371,
+          "gap": 0,
+          "following": "true"
+        },
+        {
+          "placement": "bottom",
+          "sample": 2,
+          "top": 371,
+          "gap": 0,
+          "following": "true"
+        },
+        {
+          "placement": "inspector",
+          "sample": 0,
+          "top": 566,
+          "gap": 0,
+          "following": "true"
+        },
+        {
+          "placement": "inspector",
+          "sample": 1,
+          "top": 566,
+          "gap": 0,
+          "following": "true"
+        },
+        {
+          "placement": "inspector",
+          "sample": 2,
+          "top": 566,
+          "gap": 0,
+          "following": "true"
+        }
+      ],
+      "initialFeedback": [
+        {
+          "placement": "bottom",
+          "text": "\u601d\u8003\u4e2d",
+          "gap": 0
+        },
+        {
+          "placement": "inspector",
+          "text": "\u601d\u8003\u4e2d",
+          "gap": 0
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "--run-artifacts",
+      "layouts": [
+        {
+          "theme": "day",
+          "width": 1440,
+          "overflow": false,
+          "outputs": [
+            {
+              "id": "artifact-run-0",
+              "name": "\u7231\u4e3d\u4e1d",
+              "avatars": 1,
+              "files": 1,
+              "images": 1,
+              "imageWidth": 557.984375,
+              "actions": 0,
+              "authorLeft": 454,
+              "bodyLeft": 496,
+              "fileLeft": 496,
+              "fileTop": 403.1875,
+              "bodyBottom": 389.1875
+            },
+            {
+              "id": "artifact-run-1",
+              "name": "\u5965\u9edb\u4e3d",
+              "avatars": 1,
+              "files": 1,
+              "images": 0,
+              "imageWidth": 0,
+              "actions": 0,
+              "authorLeft": 454,
+              "bodyLeft": 496,
+              "fileLeft": 496,
+              "fileTop": 564.1875,
+              "bodyBottom": 541.1875
+            }
+          ]
+        },
+        {
+          "theme": "day",
+          "width": 1040,
+          "overflow": false,
+          "outputs": [
+            {
+              "id": "artifact-run-0",
+              "name": "\u7231\u4e3d\u4e1d",
+              "avatars": 1,
+              "files": 1,
+              "images": 1,
+              "imageWidth": 557.984375,
+              "actions": 0,
+              "authorLeft": 284,
+              "bodyLeft": 326,
+              "fileLeft": 326,
+              "fileTop": 403.1875,
+              "bodyBottom": 389.1875
+            },
+            {
+              "id": "artifact-run-1",
+              "name": "\u5965\u9edb\u4e3d",
+              "avatars": 1,
+              "files": 1,
+              "images": 0,
+              "imageWidth": 0,
+              "actions": 0,
+              "authorLeft": 284,
+              "bodyLeft": 326,
+              "fileLeft": 326,
+              "fileTop": 564.1875,
+              "bodyBottom": 541.1875
+            }
+          ]
+        },
+        {
+          "theme": "night",
+          "width": 1440,
+          "overflow": false,
+          "outputs": [
+            {
+              "id": "artifact-run-0",
+              "name": "\u7231\u4e3d\u4e1d",
+              "avatars": 1,
+              "files": 1,
+              "images": 1,
+              "imageWidth": 557.984375,
+              "actions": 0,
+              "authorLeft": 454,
+              "bodyLeft": 496,
+              "fileLeft": 496,
+              "fileTop": 403.1875,
+              "bodyBottom": 389.1875
+            },
+            {
+              "id": "artifact-run-1",
+              "name": "\u5965\u9edb\u4e3d",
+              "avatars": 1,
+              "files": 1,
+              "images": 0,
+              "imageWidth": 0,
+              "actions": 0,
+              "authorLeft": 454,
+              "bodyLeft": 496,
+              "fileLeft": 496,
+              "fileTop": 564.1875,
+              "bodyBottom": 541.1875
+            }
+          ]
+        },
+        {
+          "theme": "night",
+          "width": 1040,
+          "overflow": false,
+          "outputs": [
+            {
+              "id": "artifact-run-0",
+              "name": "\u7231\u4e3d\u4e1d",
+              "avatars": 1,
+              "files": 1,
+              "images": 1,
+              "imageWidth": 557.984375,
+              "actions": 0,
+              "authorLeft": 284,
+              "bodyLeft": 326,
+              "fileLeft": 326,
+              "fileTop": 403.1875,
+              "bodyBottom": 389.1875
+            },
+            {
+              "id": "artifact-run-1",
+              "name": "\u5965\u9edb\u4e3d",
+              "avatars": 1,
+              "files": 1,
+              "images": 0,
+              "imageWidth": 0,
+              "actions": 0,
+              "authorLeft": 284,
+              "bodyLeft": 326,
+              "fileLeft": 326,
+              "fileTop": 564.1875,
+              "bodyBottom": 541.1875
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "--message-groups",
+      "layouts": [
+        {
+          "theme": "day",
+          "width": 1440,
+          "heads": [
+            "group-1",
+            "group-3",
+            "group-5",
+            "group-6"
+          ]
+        },
+        {
+          "theme": "day",
+          "width": 1040,
+          "heads": [
+            "group-1",
+            "group-3",
+            "group-5",
+            "group-6"
+          ]
+        },
+        {
+          "theme": "night",
+          "width": 1440,
+          "heads": [
+            "group-1",
+            "group-3",
+            "group-5",
+            "group-6"
+          ]
+        },
+        {
+          "theme": "night",
+          "width": 1040,
+          "heads": [
+            "group-1",
+            "group-3",
+            "group-5",
+            "group-6"
+          ]
+        }
+      ],
+      "fileHeights": [
+        42.4375,
+        42.4375,
+        412,
+        42.4375,
+        42.4375,
+        42.4375
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "--current-user-profile",
+      "layouts": [
+        {
+          "theme": "day",
+          "width": 1440,
+          "zoom": 1,
+          "bounded": true
+        },
+        {
+          "theme": "day",
+          "width": 1040,
+          "zoom": 1,
+          "bounded": true
+        },
+        {
+          "theme": "day",
+          "width": 2560,
+          "zoom": 1,
+          "bounded": true
+        },
+        {
+          "theme": "day",
+          "width": 1440,
+          "zoom": 2,
+          "bounded": true
+        },
+        {
+          "theme": "night",
+          "width": 1440,
+          "zoom": 1,
+          "bounded": true
+        },
+        {
+          "theme": "night",
+          "width": 1040,
+          "zoom": 1,
+          "bounded": true
+        },
+        {
+          "theme": "night",
+          "width": 2560,
+          "zoom": 1,
+          "bounded": true
+        },
+        {
+          "theme": "night",
+          "width": 1440,
+          "zoom": 2,
+          "bounded": true
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "--command-interaction",
+      "report": [
+        {
+          "placement": "bottom",
+          "compactTop": 539,
+          "commandTop": 499,
+          "width": {
+            "row": 831,
+            "detail": 829
+          },
+          "cachedReads": 3
+        },
+        {
+          "placement": "inspector",
+          "compactTop": 377.40625,
+          "commandTop": 463.40625,
+          "width": {
+            "row": 363,
+            "detail": 361
+          },
+          "cachedReads": 3
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "--pending-return",
+      "checks": [
+        "overwrite",
+        "focus",
+        "no-edit-mode",
+        "preflight-failure-preserves-dirty-input",
+        "rejected-preserves-input",
+        "uncertain-reload-fence"
+      ]
+    }
+  ]
+}

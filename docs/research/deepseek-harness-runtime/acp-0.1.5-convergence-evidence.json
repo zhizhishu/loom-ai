@@ -1,0 +1,159 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "deepseek-harness-0.1.5-rc.2-convergence-2026-09-16",
+  "capturedAt": "2026-09-16",
+  "platform": "macos-arm64",
+  "runtime": {
+    "package": "@deepseek-ai/dsh@0.1.5-rc.2",
+    "reportedVersion": "0.1.5-rc.2",
+    "minimumVersion": ">=0.1.5-rc.2",
+    "protocol": "acp-v1"
+  },
+  "scope": [
+    "shared Fleet replacement ordering for the native Session lock",
+    "native sandbox_mode and approval_policy authority",
+    "generic Runtime Activity and Diff projection",
+    "shared Desktop and Mobile permission/version presentation"
+  ],
+  "acceptance": {
+    "hostReplacement": {
+      "status": "passed",
+      "owner": "runtime_fleet::tests::warm_hosts_never_cross_camp_compatibility_keys",
+      "idleHostReapedBeforeReplacement": true,
+      "busyRunInterrupted": false,
+      "busyHostReapedBeforeReplacement": true,
+      "failedReapBlocksReplacement": true,
+      "privateDshPoolCreated": false
+    },
+    "nativePermissionAuthority": {
+      "status": "passed",
+      "nativeFields": {
+        "sandbox_mode": [
+          "read-only",
+          "workspace-write",
+          "danger-full-access"
+        ],
+        "approval_policy": [
+          "ask",
+          "never"
+        ]
+      },
+      "workspaceAccessOverridesNativeValues": false,
+      "coreToolNameSafetyInference": false,
+      "coreSyntheticMcpApprovalCount": 0,
+      "scriptedNativeMcpEffectCount": 3,
+      "scriptedCases": [
+        "danger-full-access/ask",
+        "read-only/ask",
+        "read-only/never"
+      ],
+      "note": "The scripted provider controls only model selection. MCP registration, execution, Session resume and Core projection use the real DSH/Core paths; DSH 0.1.5-rc.2 did not request an Approval for these ordinary MCP calls."
+    },
+    "mcpLifecycle": {
+      "status": "passed",
+      "hostUpdated": true,
+      "obsoleteHostFenced": true,
+      "exactNativeSessionRestored": true,
+      "adjacentAssignmentIsolated": true,
+      "unassignRestoredNativeDefinition": true,
+      "reassignReplacedNativeDefinition": true,
+      "deleteRestoredNativeDefinition": true
+    },
+    "nativeMcpStartup": {
+      "status": "passed",
+      "rootCause": "DSH 0.1.5-rc.2 can expose ACP stdio while a sibling native MCP Loader entry is still completing connect, tools/list and registration",
+      "readinessSignal": "official Cordis Loader entry lifecycle",
+      "fixedDelayMilliseconds": null,
+      "promptRetryUsed": false,
+      "preFixImmediateFailures": 5,
+      "preFixIterations": 30,
+      "postFixImmediatePasses": 30,
+      "postFixIterations": 30,
+      "fullMcpLifecycleSmokePassed": true,
+      "toolRegistryEvent": "tools/change"
+    },
+    "realProviderFileMatrix": {
+      "status": "passed",
+      "provider": "MiniMax official Anthropic-compatible endpoint",
+      "model": "MiniMax-M3",
+      "modelId": "[\"minimax-smoke\",\"MiniMax-M3\"]",
+      "credentialUse": "User-authorized acceptance only; injected into an isolated DSH child environment and excluded from argv, repository and logs",
+      "contentAssertion": "byte-exact expected UTF-8 content; any mismatch fails the smoke process",
+      "cases": [
+        {
+          "name": "read",
+          "runStatus": "succeeded",
+          "fileEffect": "passed",
+          "typedOperation": "file.read",
+          "diff": null
+        },
+        {
+          "name": "add",
+          "runStatus": "succeeded",
+          "fileEffect": "passed",
+          "typedOperation": "file.write",
+          "diff": null,
+          "fallback": "path-only because the official result did not provide complete Before/After"
+        },
+        {
+          "name": "edit",
+          "runStatus": "succeeded",
+          "fileEffect": "passed",
+          "typedOperation": "file.write",
+          "diff": {
+            "changeKind": "update",
+            "additions": 1,
+            "deletions": 1
+          }
+        },
+        {
+          "name": "edit_empty",
+          "runStatus": "succeeded",
+          "fileEffect": "passed",
+          "typedOperation": "file.write",
+          "diff": {
+            "changeKind": "update",
+            "additions": 1,
+            "deletions": 0
+          }
+        }
+      ],
+      "inventedEmptyDiffCount": 0
+    },
+    "observerBoundary": {
+      "status": "passed",
+      "exactSessionAndCall": true,
+      "shellTerminalMetadataOnly": true,
+      "canonicalPathOnly": true,
+      "completeBeforeAfterMaximumBytes": 2097152,
+      "fullToolOutputPersisted": false,
+      "missingOrOversizedStateFallsBack": true
+    },
+    "sharedPresentation": {
+      "status": "passed",
+      "nativeNamesArePrimary": true,
+      "chineseDescriptionsAreSecondary": true,
+      "minimumVersionMessage": "DeepSeek Harness 需要 0.1.5-rc.2 或更高版本。",
+      "desktopAndMobileUseSharedProjection": true,
+      "dshSpecificCommandOrDiffUiCreated": false
+    }
+  },
+  "commands": [
+    "cargo test -p rovai-core --lib dsh -- --nocapture",
+    "cargo test -p rovai-core --lib warm_hosts_never_cross_camp_compatibility_keys",
+    "cargo test -p rovai-core --lib successful_terminal_acp_diff_content_is_kept_for_evidence_projection_only",
+    "cargo test -p rovai-core --lib external_mcp_projection_capability_matches_the_verified_matrix",
+    "node --test scripts/lib/dsh-host.test.mjs",
+    "ROVAI_DSH_SCRIPTED_MCP=1 ROVAI_MCP_PROJECTION_SMOKE_ADAPTERS=deepseek-harness node scripts/smoke-mcp-projection.mjs",
+    "ROVAI_ACP_SMOKE_ADAPTER=deepseek-harness ROVAI_ACP_FILE_OPERATION_MATRIX=1 node scripts/smoke-acp-runtime.mjs",
+    "pnpm exec vitest run apps/desktop/src/renderer/src/MemberRuntimeParameters.test.ts apps/desktop/src/renderer/src/runtime-status.test.ts"
+  ],
+  "limitations": [
+    "The scripted MCP provider is deterministic protocol evidence, not provider-generation qualification.",
+    "A missing, unchanged or oversized native Before/After remains path-only and does not claim line counts.",
+    "No macOS x64, Windows x64 or Linux x64 qualification is inferred.",
+    "Secrets, raw prompts, local paths, Native Session IDs, Run IDs and full tool output are excluded."
+  ],
+  "priorEvidence": "docs/research/deepseek-harness-runtime/acp-0.1.5-evidence.json",
+  "qualificationArtifact": "qualification/runtime-platform/macos-arm64-deepseek-harness-v2.json"
+}

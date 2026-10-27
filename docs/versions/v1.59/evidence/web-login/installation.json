@@ -1,0 +1,83 @@
+{
+  "sourceCommit": "831092a069c7389640e05fcdb6965899989b2d88",
+  "source": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-web-recovery/dist/mac-arm64/Rovai AI.app",
+  "installed": "/Applications/Rovai AI.app",
+  "backup": "/Applications/Rovai AI.backup-before-web-login-831092a0.app",
+  "version": "0.2.6",
+  "architecture": "arm64",
+  "hashes": [
+    {
+      "file": "Contents/Resources/app.asar",
+      "sha256": "34f02fc9fbbe04441bccb3bcd8ff7a66c64deae9b48b528e0ad1922daf3c6ad7"
+    },
+    {
+      "file": "Contents/Resources/bin/rovai-core",
+      "sha256": "27f313b5bb93026dc9e89467100805cd6b20de6f4de1485e07f9cb9c95ea6549"
+    },
+    {
+      "file": "Contents/Resources/bin/rovai-host",
+      "sha256": "af80e6ed711795e4b4108f0981c1f3bfe797bce6bc75d1c28f46889281378fc0"
+    },
+    {
+      "file": "Contents/Resources/bin/rovai",
+      "sha256": "acabda226432e733dae4e7ac6ddcc05112230d961daea67382aaa411e9d7462b"
+    }
+  ],
+  "webFilesVerified": 138,
+  "processes": [
+    {
+      "pid": 15496,
+      "ppid": 1,
+      "executable": "/Applications/Rovai AI.app/Contents/MacOS/Rovai AI",
+      "alive": true
+    },
+    {
+      "pid": 15504,
+      "ppid": 15496,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper",
+      "alive": true
+    },
+    {
+      "pid": 15505,
+      "ppid": 15496,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper",
+      "alive": true
+    },
+    {
+      "pid": 15506,
+      "ppid": 15496,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper (Renderer).app/Contents/MacOS/Rovai AI Helper (Renderer)",
+      "alive": true
+    },
+    {
+      "pid": 15509,
+      "ppid": 15496,
+      "executable": "/Applications/Rovai AI.app/Contents/Resources/bin/rovai-host",
+      "alive": true
+    }
+  ],
+  "currentProcessesUpgraded": false,
+  "launchNewDailyInstance": false,
+  "realRuntime": false,
+  "validation": {
+    "passed": true,
+    "actualRustHost": true,
+    "productionWebUI": true,
+    "layouts": [
+      "day/night 1440x920",
+      "day/night 390x844",
+      "day 844x390"
+    ],
+    "invalidToken": true,
+    "networkFailure": true,
+    "revealKeyboard": true,
+    "busy": true,
+    "refresh": true,
+    "reauthSameComposer": true,
+    "reauthSameEditor": true,
+    "scan": true,
+    "separateBrowserDrafts": true,
+    "reducedMotion": true,
+    "realRuntime": false
+  }
+}

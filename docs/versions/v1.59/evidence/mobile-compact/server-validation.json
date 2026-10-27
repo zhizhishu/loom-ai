@@ -1,0 +1,11 @@
+{
+  "realServer": true,
+  "actualUpdateInstall": false,
+  "runtime": false,
+  "checks": [
+    "server-hides-channels",
+    "server-only-native-update-entry",
+    "real-version"
+  ],
+  "sourceCommit": "85c7519c5736c5cc06afd5518dd5c3e4e30d6eb6"
+}

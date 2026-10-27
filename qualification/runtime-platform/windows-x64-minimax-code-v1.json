@@ -1,0 +1,480 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "windows-x64-minimax-code-v1",
+  "capturedAt": "2026-10-18T10:29:40.022Z",
+  "platform": "windows-x64",
+  "qualifiedRuntimeKinds": [
+    "minimax-code-cli"
+  ],
+  "baseRevision": "7cf1abb1c2b5525c7064e055f39f2886eb725fb7",
+  "executionCoreBaseRevision": "102b24f12a66af8151cb5b43cc4bb8e5feaafa69",
+  "earlierEvidenceBaseRevision": "92736d707c9162133a93b7720ae826e7dad90e8a",
+  "baseIntegrationNote": "7cf1abb changes only UI/documentation/fixtures relative to the execution Core base; final packaging rebuilds those desktop assets.",
+  "qualificationBasis": {
+    "type": "target-host-runtime-acceptance",
+    "request": "User requested complete verification after discussing the Windows admission gate and authorized sub2api.",
+    "report": "docs/research/minimax-code-runtime/windows-qualification-2026-10-18.md"
+  },
+  "targetHost": {
+    "os": "Windows 10 Pro",
+    "version": "10.0.19045",
+    "architecture": "x64",
+    "filesystem": "NTFS"
+  },
+  "runtimeEvidence": {
+    "package": "@minimax-ai/code",
+    "version": "0.6.12",
+    "protocol": "acp-v1",
+    "launch": "mcode acp",
+    "npmIntegrity": "sha512-aA4XPl9tYHTrtIS5DLB5DBSdxlcokZJ5BGUT/vSiDWei/tlVV5hIEVTgFhnSB6WM4evfNwOJtfi2fJVPNpJveg==",
+    "authentication": "official native BYOK Provider configuration",
+    "provider": "user-authorized local sub2api",
+    "apiFormat": "openai-responses",
+    "model": "gpt-6.1-sol"
+  },
+  "testedImplementationSha256": {
+    "crates/rovai-core/src/acp.rs": "3bf7a1ad39aec403be8c834709d9bfb35727ac0fdb26479258e7d4a8c53f41e4",
+    "crates/rovai-core/src/native_usage.rs": "72514aef7759fbb94110155d0d9b15611f93df57053b6c6f26b4223aaeb848ba",
+    "crates/rovai-core/src/current_input_skill.rs": "3da87850b4ebfa36b6a7cf39dd9051610fd957a74c748029d0f6de8f0c48c2a9",
+    "crates/rovai-core/src/managed_skills.rs": "568aacb6f77f557375a264b864f267e90087a472b9bf59702fc13e820ffcd994",
+    "crates/rovai-core/src/native_skills.rs": "f4f4a49c3903d51317652b1ec03e12bcdf16af603b5fe10807543579ab23e781"
+  },
+  "fixes": [
+    "Protected Windows private Bootstrap directory via canonical private_storage preparation",
+    "Equivalent Win32/verbatim workspace comparison for exact native Usage attribution",
+    "Model-facing Skill paths omit unnecessary Windows verbatim prefixes while canonical identity evidence remains unchanged"
+  ],
+  "strategies": {
+    "host": "resident_single_session",
+    "session": "exact_native_session_resume",
+    "bootstrap": "private_append_system_prompt_file",
+    "compaction": "native_system_prompt_preserved",
+    "skills": "current_v2_explicit_identity_and_native_readonly_discovery",
+    "mcp": "acp_session_additive_projection",
+    "usage": "readonly_exact_native_message_identity_with_partial_observation"
+  },
+  "parityMatrix": [
+    {
+      "axis": "Identity / configuration",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "native-model-modes",
+        "native-config-refresh"
+      ]
+    },
+    {
+      "axis": "Host / Fleet / LRU",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "fleet",
+        "idle-30m"
+      ]
+    },
+    {
+      "axis": "Native Session",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "fleet",
+        "controlled-full"
+      ]
+    },
+    {
+      "axis": "Bootstrap / Context",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "capabilities",
+        "compaction-manual-overflow",
+        "compaction-threshold-failure-cancel"
+      ]
+    },
+    {
+      "axis": "Compaction",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "compaction-manual-overflow",
+        "compaction-threshold-failure-cancel",
+        "context-capabilities"
+      ]
+    },
+    {
+      "axis": "Skills",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "capabilities",
+        "context-capabilities"
+      ]
+    },
+    {
+      "axis": "External MCP",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "capabilities",
+        "context-capabilities",
+        "controlled-full"
+      ]
+    },
+    {
+      "axis": "Tool / Action / output",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "controlled-full",
+        "controlled-files"
+      ]
+    },
+    {
+      "axis": "Narration / final",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "controlled-final",
+        "controlled-full",
+        "controlled-questionnaires"
+      ]
+    },
+    {
+      "axis": "Permissions / workspace",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "native-model-modes",
+        "controlled-full",
+        "context-capabilities"
+      ]
+    },
+    {
+      "axis": "Built-in CLI",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "builtin-cli-29"
+      ]
+    },
+    {
+      "axis": "Usage / cache / cost",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "controlled-full",
+        "controlled-final",
+        "compaction-manual-overflow"
+      ]
+    },
+    {
+      "axis": "Retry / queue / cancel",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "image-steer",
+        "context-capabilities",
+        "controlled-full"
+      ]
+    },
+    {
+      "axis": "Ready / version / platform",
+      "result": "passed-with-stated-capability-boundaries",
+      "evidenceIds": [
+        "packaged-app",
+        "native-config-refresh"
+      ]
+    }
+  ],
+  "goldenFlows": [
+    {
+      "name": "First Run",
+      "result": "passed-with-stated-capability-boundaries"
+    },
+    {
+      "name": "Warm Host",
+      "result": "passed-with-stated-capability-boundaries"
+    },
+    {
+      "name": "Multi-Session / Concurrency",
+      "result": "passed-with-stated-capability-boundaries"
+    },
+    {
+      "name": "Cold Resume",
+      "result": "passed-with-stated-capability-boundaries"
+    },
+    {
+      "name": "Context / Compaction",
+      "result": "passed-with-stated-capability-boundaries"
+    },
+    {
+      "name": "Skill / MCP Projection",
+      "result": "passed-with-stated-capability-boundaries"
+    },
+    {
+      "name": "Safety / Output",
+      "result": "passed-with-stated-capability-boundaries"
+    },
+    {
+      "name": "Monitoring",
+      "result": "passed-with-stated-capability-boundaries"
+    },
+    {
+      "name": "Failure / Cleanup",
+      "result": "passed-with-stated-capability-boundaries"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "fleet",
+      "kind": "real-model",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 7,
+      "reportSha256": "a1b57cd463acb1acc578505fdde0286e9435c5c6591750da75a592af7d7dee1c",
+      "helperCoreSha256": "69a064d5b206d85f47854b80cf315996c39d4e59e01cf0f2d8438bda175df4ba",
+      "files": {
+        "report.json": "a1b57cd463acb1acc578505fdde0286e9435c5c6591750da75a592af7d7dee1c",
+        "events.json": "5d6cfc904246775e19b6008a0f3545d3bf03aca5d1ee68fb289a77a649bcc47c"
+      }
+    },
+    {
+      "id": "idle-30m",
+      "kind": "real-model",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 5,
+      "reportSha256": "904eba92fd2baafd6c409ceb70bf882a366747143001f501927b911d402f5f80",
+      "helperCoreSha256": "69a064d5b206d85f47854b80cf315996c39d4e59e01cf0f2d8438bda175df4ba",
+      "files": {
+        "report.json": "904eba92fd2baafd6c409ceb70bf882a366747143001f501927b911d402f5f80",
+        "events.json": "b2e3f41753decc10801644400507c4cb66a2d50390e0e23a4d824d2ada1300e3",
+        "original-process-exit-audit.json": "ae863a8e0f1a8be62563ad41d369cbe8a0dc8c30d89437f4c826bf96f3ca78ff"
+      }
+    },
+    {
+      "id": "builtin-cli-29",
+      "kind": "real-model",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 1,
+      "reportSha256": "cc63d29807f8e91ea458239f32fc79da57ef4c7faa5314761e86deec2388abf7",
+      "helperCoreSha256": "1b120573bb951dd9e50880ad785f67a4bce13af9b4e79fec1e7772d2ce3fd94b",
+      "files": {
+        "report.json": "cc63d29807f8e91ea458239f32fc79da57ef4c7faa5314761e86deec2388abf7",
+        "events.json": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+    },
+    {
+      "id": "compaction-manual-overflow",
+      "kind": "real-model-with-one-http-overflow-injection",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 6,
+      "reportSha256": "df591bec654714ab86031a2948c7d7ef25ec037b53899bac999ee0bcf0899fac",
+      "helperCoreSha256": "712fed9e6cce79619c119188ead808358d40aa037230e81474603f5c9586d527",
+      "files": {
+        "report.json": "df591bec654714ab86031a2948c7d7ef25ec037b53899bac999ee0bcf0899fac",
+        "events.json": "8051d9960d7e6f50fc273196e3e012c2d3e1a66188d495ec8f3dd30bb9973750",
+        "model-requests.json": "0b81389454a09c92c54377903e25cdf8bbc66ef6a680ca13ceda1e74a67bcf3c"
+      }
+    },
+    {
+      "id": "compaction-threshold-failure-cancel",
+      "kind": "real-model-with-summary-fault-injection",
+      "result": "passed-after-capture-audit",
+      "originalReportStatus": "failed",
+      "recordedCaseCount": 7,
+      "reportSha256": "fabd961821762460b292568ab3952190b62a80b3bbbeb076896123decec7c87e",
+      "helperCoreSha256": "712fed9e6cce79619c119188ead808358d40aa037230e81474603f5c9586d527",
+      "files": {
+        "report.json": "fabd961821762460b292568ab3952190b62a80b3bbbeb076896123decec7c87e",
+        "events.json": "01c715ce1f02b961af39a877f76384d7b41c62fbaef3cbb7a9c409d41d51bae2",
+        "model-requests.json": "1ad7cdb11b0c7a787372eb6c46d5a6fe6a3e5871584d9e0ceb574712e88e9dda",
+        "post-capture-audit.json": "6063ea717e934f91a716ed77ab4cf22c96acc49115cfaaacf891babbf67c0b14"
+      }
+    },
+    {
+      "id": "capabilities",
+      "kind": "real-model",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 10,
+      "reportSha256": "370508e7933691b2389317e6eaa3d41df06d11308fcfaf98019e97f0e481573e",
+      "helperCoreSha256": "2426d5cdb7ed9b4a0f60b045b41a15925ba554809851d21119ebb994ac1c14ad",
+      "files": {
+        "report.json": "370508e7933691b2389317e6eaa3d41df06d11308fcfaf98019e97f0e481573e",
+        "events.json": "ef99b405149980a237143eb5149bffd6664559bb1e136c39bf2ee3e5f3b93fda",
+        "model-requests.json": "313a66c67204e13f1d07085fecf9951d145b15918e799711c385e5b4ab01995f"
+      }
+    },
+    {
+      "id": "image-steer",
+      "kind": "real-model-case-only",
+      "result": "passed-case-only",
+      "originalReportStatus": "failed",
+      "recordedCaseCount": 3,
+      "reportSha256": "5c841696e899bfd57fdabab32da12a4baba826a63adf2235219166686fa14b0c",
+      "helperCoreSha256": "712fed9e6cce79619c119188ead808358d40aa037230e81474603f5c9586d527",
+      "files": {
+        "report.json": "5c841696e899bfd57fdabab32da12a4baba826a63adf2235219166686fa14b0c",
+        "events.json": "87e36c85623d9b00726d9d7bec0d70d15225fdd4ec9e17ec076c12a839077542",
+        "model-requests.json": "a4f6b26d32eaa0eff4807fb112fd7ec647492ff5591a47f84ba32bf7466cd72c",
+        "image-case-audit.json": "8a594c415583b3b36ccc663661976c9d06560b8e43a4f77c2adaffdac0ebfa3d"
+      }
+    },
+    {
+      "id": "native-model-modes",
+      "kind": "real-model",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 5,
+      "reportSha256": "a94cf3290a1dea7d5b04d623153c913662d9950f31c7125b54e4a3ce0918cfec",
+      "helperCoreSha256": "1b120573bb951dd9e50880ad785f67a4bce13af9b4e79fec1e7772d2ce3fd94b",
+      "files": {
+        "report.json": "a94cf3290a1dea7d5b04d623153c913662d9950f31c7125b54e4a3ce0918cfec",
+        "events.json": "835e3a543e1f30b7f8df3a8152fe955be12d46d701b0d82a33b5a129efcc4941",
+        "model-requests.json": "969321195e32d3e58a96c080583e82acc4542ba3d585cd7d7389125b4cc4a89a"
+      }
+    },
+    {
+      "id": "native-config-refresh",
+      "kind": "real-model",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 5,
+      "reportSha256": "f1e000a8a901ea59aabc8e07bc6e3c4b43a3963fc94922bba1c614e4dd07bfa2",
+      "helperCoreSha256": "1b120573bb951dd9e50880ad785f67a4bce13af9b4e79fec1e7772d2ce3fd94b",
+      "files": {
+        "report.json": "f1e000a8a901ea59aabc8e07bc6e3c4b43a3963fc94922bba1c614e4dd07bfa2",
+        "events.json": "d241c6361d5c08dc1e8845dc6210f076d43052deb2c969f0176bafa09028f5ab",
+        "model-requests.json": "d7309b1dd6a2d2ce679890c6d4d7ea2ea3efe1493a77acccd4a937927d2e0719"
+      }
+    },
+    {
+      "id": "context-capabilities",
+      "kind": "real-model",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 4,
+      "reportSha256": "378fc124aaea6331bab709e87c6cb698d09f8842fc31a862bc0cc6bf9bb7b4f0",
+      "helperCoreSha256": "2426d5cdb7ed9b4a0f60b045b41a15925ba554809851d21119ebb994ac1c14ad",
+      "files": {
+        "report.json": "378fc124aaea6331bab709e87c6cb698d09f8842fc31a862bc0cc6bf9bb7b4f0",
+        "events.json": "7cc20ee68084318c4fa56b30b29bbc8b9aae793052dd84cf567f2a1a345af78e",
+        "model-requests.json": "37e3d42b1938aa0264568834a73158b362356fda3e6b1fa3d3e22a03c7966432"
+      }
+    },
+    {
+      "id": "packaged-app",
+      "kind": "real-model-packaged-app",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 1,
+      "reportSha256": "abc513168ec7d6d8d9cf83dc4fdcee010d15d1971761e23148d686253b65e0b6",
+      "helperCoreSha256": "2426d5cdb7ed9b4a0f60b045b41a15925ba554809851d21119ebb994ac1c14ad",
+      "executedAppCoreSha256": "79f0be47dcd334bbba87a28da80e20489b80eb46a0385de00d0532531e113954",
+      "appAsarSha256": "65d53af4f182e65ee177505d72f75da50547e7c2509dbf52a29b3f69d43aede1",
+      "files": {
+        "report.json": "abc513168ec7d6d8d9cf83dc4fdcee010d15d1971761e23148d686253b65e0b6",
+        "events.json": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "captures/planned-shutdown-acceptance.json": "c004971238c4176cc0a66330887f2ddf5cf6b08cfbaeeb2d4316b5df205f748e",
+        "captures/planned-shutdown-fenced-terminal.png": "bb8e4b7ea77c26dc4cdfd6d3b52e8407ffa5662ddccd9c26fe255cee33f80e3b"
+      }
+    },
+    {
+      "id": "controlled-full",
+      "kind": "official-runtime-scripted-provider",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 23,
+      "reportSha256": "e6e67c341ea0d10e9fbccf001a6d0ff0daa4c0e78f33f13f6bd44d50321f484a",
+      "files": {
+        "report.json": "e6e67c341ea0d10e9fbccf001a6d0ff0daa4c0e78f33f13f6bd44d50321f484a",
+        "events.json": "21cfac69b190641ac0a1d1ec8d099b5fbbf54a6e31dab306c4df0c796593ddea"
+      }
+    },
+    {
+      "id": "controlled-files",
+      "kind": "official-runtime-scripted-provider",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 11,
+      "reportSha256": "338fb76fe17eb6cf0e2d0fb158c07eb815af7adf1f76207a9b93243547a78aaf",
+      "files": {
+        "report.json": "338fb76fe17eb6cf0e2d0fb158c07eb815af7adf1f76207a9b93243547a78aaf",
+        "events.json": "74bee19a95c6a7c0252943682c3e6c04372089a4271fcab10303363d8dc26e65"
+      }
+    },
+    {
+      "id": "controlled-final",
+      "kind": "official-runtime-scripted-provider",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 5,
+      "reportSha256": "b0095f327cd5d39365c6f7b8f60ad9b2aba4956993b2ed9bc46e5ff9dbf19f03",
+      "files": {
+        "report.json": "b0095f327cd5d39365c6f7b8f60ad9b2aba4956993b2ed9bc46e5ff9dbf19f03",
+        "events.json": "49db03069ae44e3c90a5a13b6e9c4b46d950fde362f64a80b73e8ca8cb941793"
+      }
+    },
+    {
+      "id": "controlled-questionnaires",
+      "kind": "official-runtime-scripted-provider",
+      "result": "passed",
+      "originalReportStatus": "passed",
+      "recordedCaseCount": 12,
+      "reportSha256": "f2a1036a84765323e4b1a66bcb14b31e3621b64c75bc3c0b826834cae884a54b",
+      "files": {
+        "report.json": "f2a1036a84765323e4b1a66bcb14b31e3621b64c75bc3c0b826834cae884a54b",
+        "events.json": "cd09720ede4eece79d050cbaf33c4c8147a7ef3e4374d9bb1601d14351e47298"
+      }
+    }
+  ],
+  "usageAudit": {
+    "sha256": "fb6e9aa2f9becff1ba3fc4c22a51d547d59db5e9c0519ae5cbbba56fdb6e634a",
+    "status": "passed",
+    "basis": "Persisted native-call identity checkpoints reduce exactly to Run totals; missing observations stay null, including after compaction history replacement.",
+    "result": [
+      {
+        "name": "rovai-minimax-control-KOWnid",
+        "observed": 14,
+        "unknown": 1,
+        "duplicateIdentities": 0,
+        "reasoningAndCost": "unknown"
+      },
+      {
+        "name": "rovai-minimax-control-FpQ6NK",
+        "observed": 3,
+        "unknown": 1,
+        "duplicateIdentities": 0,
+        "reasoningAndCost": "unknown"
+      },
+      {
+        "name": "rovai-minimax-win-compaction-CWy0xZ",
+        "observed": 1,
+        "unknown": 2,
+        "duplicateIdentities": 0,
+        "reasoningAndCost": "unknown"
+      }
+    ]
+  },
+  "regressionTests": {
+    "existingOwnersExtended": true,
+    "newRustTestFunctions": 0,
+    "redGreen": [
+      "private_host_config_is_scoped_to_profiles_that_require_it",
+      "native_cursor_excludes_history_replays_partial_lines_and_file_resets",
+      "same_name_sources_keep_separate_identities_and_bad_entries_are_reported",
+      "frontmatter_preserves_yaml_scalar_value_in_model_index"
+    ],
+    "targetedRustOwnersPassed": 25,
+    "runtimeFleetTestsPassed": 23,
+    "nodeHarnessTestsPassed": 11,
+    "documentationGovernanceTestsPassed": 10
+  },
+  "acceptance": {
+    "status": "qualified",
+    "scope": "minimax-code-cli 0.6.12 on Windows x64 through the Rovai product path",
+    "admissionMetadata": "The execution candidates used temporary Windows preview admission; the final Qualified row binds this frozen record. Machine authentication, model, installation and readiness checks remain independent."
+  },
+  "limitations": [
+    "No qualification is inherited by another Runtime or platform; target host filesystem was NTFS.",
+    "Official MiniMax account requests failed for insufficient balance. Real model evidence uses the explicitly authorized native BYOK sub2api Provider.",
+    "Scripted Provider responses exercise the actual official CLI deterministically and are separately labeled; they do not replace the recorded real model flows.",
+    "Direct upstream ACP /compact session/cancel did not settle in ten seconds. Rovai does not expose that direct manual command; cancellation of a product Run during native automatic summary settled in 235 ms and exact cold resume passed.",
+    "Native Usage is partially observed. Short turns and journal replacement during compaction may remain NULL; no cost, reasoning or missing token estimate is substituted.",
+    "Native questionnaire forms are dismissed without fabricated answers under the accepted product policy, with runtime_questionnaire_unsupported and no automatic replay. Already published messages remain.",
+    "No Fast or ACP additionalDirectories support is claimed. Native plan mode acceptance is not a claim of an additional read-only filesystem sandbox.",
+    "Failed original reports remain preserved. Compaction Bootstrap audit excludes native conversation-title requests; the image case is accepted separately from a later harness approval timeout.",
+    "The 32K combined Skill/MCP fixture triggered summary before completing its initial tools; the preserved attempt is not counted as passing. The final combination uses 64K and still requires an observed native threshold summary.",
+    "The local Windows build is unsigned. Runtime qualification is separate from Authenticode release signing."
+  ]
+}

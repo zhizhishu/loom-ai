@@ -1,0 +1,310 @@
+import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { createInterface } from 'node:readline'
+import { access } from 'node:fs/promises'
+import { basename, join, resolve } from 'node:path'
+import { windowsProcessTable } from './windows-process-table.mjs'
+import { canonicalJson, runCaptured } from './qualification-common.mjs'
+import { coreDataDirectoryArguments } from './runtime-camp-files-root.mjs'
+
+/** Only compare public Runtime configuration, never native auth/environment. */
+export function frozenMemberRuntimeDifferences(member, profile) {
+  const differences = []
+  function compare(field, expected, actual) {
+    if (expected === undefined || actual === undefined) {
+      if (expected !== actual) differences.push({ field, expected: expected === undefined ? '<missing>' : expected, actual: actual === undefined ? '<missing>' : actual })
+      return
+    }
+    if (expected && actual && typeof expected === 'object' && typeof actual === 'object'
+      && !Array.isArray(expected) && !Array.isArray(actual)) {
+      for (const key of [...new Set([...Object.keys(expected), ...Object.keys(actual)])].sort()) {
+        compare(`${field}.${key}`, expected[key], actual[key])
+      }
+    } else if (canonicalJson(expected) !== canonicalJson(actual)) {
+      differences.push({ field, expected, actual })
+    }
+  }
+  // Member reads are static, even after runtime.product.check succeeds. The
+  // Runner checks the real installation separately; this is not model drift.
+  if (!['ready', 'installed_unverified'].includes(profile?.runtimeReadiness?.status)) {
+    compare('runtimeReadiness.status', 'ready', profile?.runtimeReadiness?.status)
+  }
+  compare('runtimeReadiness.blockers', [], profile?.runtimeReadiness?.blockers)
+  for (const field of ['adapterKind', 'model', 'permissions']) {
+    compare(`runtimeConfiguration.${field}`, member[field], profile?.runtimeConfiguration?.[field])
+  }
+  return differences
+}
+
+export async function findCompetingRovaiProcesses() {
+  return (await processTable()).filter((process) => {
+    const executable = process.executable?.replaceAll('\\', '/') ?? ''
+    const command = process.command
+    return /\/rovai-core\.exe$/iu.test(executable)
+      || /\/Rovai-ai\.exe$/iu.test(executable)
+      || /^(?:\S*\/)rovai-core(?:\s|$)/.test(command)
+      || /^rovai-core(?:\s|$)/.test(command)
+      || /^\S*Rovai(?:-ai| AI)\.app\/Contents\/MacOS\/Rovai(?:-ai| AI)(?:\s|$)/.test(command)
+  })
+}
+
+export async function processTable() {
+  if (process.platform === 'win32') return windowsProcessTable()
+  const result = await runCaptured('/bin/ps', ['-axo', 'pid=,ppid=,command='], { timeoutMs: 10_000 })
+  if (result.code !== 0) throw new Error(`could not inspect running processes: ${result.stderr}`)
+  return parseProcessTable(result.stdout)
+}
+
+export function descendantsOf(table, rootPid) {
+  const descendants = new Set()
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const process of table) {
+      if ((process.ppid === rootPid || descendants.has(process.ppid)) && !descendants.has(process.pid)) {
+        descendants.add(process.pid)
+        changed = true
+      }
+    }
+  }
+  return [...descendants]
+}
+
+export async function waitForProcessesToExit(pids, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
+  let remaining = [...new Set(pids)]
+  while (remaining.length > 0 && Date.now() < deadline) {
+    const table = await processTable()
+    const live = new Set(table.map((process) => process.pid))
+    remaining = remaining.filter((pid) => live.has(pid))
+    if (remaining.length > 0) await new Promise((resolveWait) => setTimeout(resolveWait, 250))
+  }
+  return remaining
+}
+
+export async function waitForProcessIdentitiesToExit(processes, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
+  let remaining = [...processes]
+  while (remaining.length > 0 && Date.now() < deadline) {
+    const table = await processTable()
+    const byPid = new Map(table.map((process) => [process.pid, process]))
+    remaining = remaining.filter((expected) => {
+      const current = byPid.get(expected.pid)
+      return current ? sameProcessIdentity(expected, current) : false
+    })
+    if (remaining.length > 0) await new Promise((resolveWait) => setTimeout(resolveWait, 2_000))
+  }
+  return remaining
+}
+
+export function sameProcessIdentity(expected, current) {
+  if (expected.pid !== current.pid) return false
+  if (expected.startedAt && current.startedAt) return expected.startedAt === current.startedAt
+  return true
+}
+
+export function startQualificationCore({
+  coreExecutable,
+  dataDirectory,
+  workingDirectory,
+  runtimeCacheDirectory,
+  mcpConfigPath = null,
+  onNotification = null,
+  environmentOverrides = {}
+}) {
+  const executable = resolve(coreExecutable)
+  const dataArguments = coreDataDirectoryArguments(dataDirectory, {homeDirectory: environmentOverrides.HOME})
+  const resolvedDataDirectory = dataArguments[1]
+  const args = [
+    ...dataArguments,
+    '--skill-library-root', join(resolvedDataDirectory, 'managed-skill-library')
+  ]
+  if (mcpConfigPath) args.push('--mcp-config-path', resolve(mcpConfigPath))
+  const environment = { ...process.env, ...environmentOverrides }
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith('ROVAI_QUALIFICATION_')) delete environment[key]
+  }
+  environment.CARGO_TARGET_DIR = resolve(runtimeCacheDirectory, 'cargo-target')
+  environment.npm_config_cache = resolve(runtimeCacheDirectory, 'npm-cache')
+  environment.PNPM_HOME = environment.PNPM_HOME ?? ''
+  const child = spawn(executable, args, {
+    cwd: workingDirectory,
+    env: environment,
+    stdio: ['pipe', 'pipe', 'pipe']
+  })
+  const pending = new Map()
+  const stderrHash = createHash('sha256')
+  let stderrBytes = 0
+  let stderrTail = ''
+  let nextId = 1
+  let stopping = false
+  let closeResult = null
+  const closePromise = new Promise((resolveClose) => {
+    child.once('close', (code, signal) => {
+      closeResult = { code, signal }
+      resolveClose(closeResult)
+      if (!stopping) rejectPending(new Error(`rovai-core exited early (code=${code}, signal=${signal})`))
+    })
+  })
+  child.stderr.on('data', (chunk) => {
+    stderrHash.update(chunk)
+    stderrBytes += chunk.length
+    stderrTail = `${stderrTail}${chunk.toString('utf8')}`.slice(-16_384)
+  })
+  child.once('error', (error) => rejectPending(error))
+  createInterface({ input: child.stdout }).on('line', (line) => {
+    let message
+    try {
+      message = JSON.parse(line)
+    } catch (error) {
+      rejectPending(new Error(`rovai-core emitted invalid JSON: ${error.message}`))
+      return
+    }
+    if (message.kind === 'core_startup') {
+      if (onNotification) onNotification({ method: 'core.startup', params: { status: message.status, phase: message.phase ?? null, error: message.error ?? null } })
+      if (['failed', 'blocked'].includes(message.status)) rejectPending(new Error(`Core startup ${message.status}: ${message.error?.code ?? message.phase ?? 'unknown'}: ${message.error?.message ?? ''}`))
+      return
+    }
+    if (message.method) {
+      if (onNotification) {
+        try {
+          onNotification(message)
+        } catch {
+          // Runtime diagnostics are supplemental private evidence. A diagnostic
+          // sink must never interfere with the authoritative Core request path.
+        }
+      }
+      return
+    }
+    const request = pending.get(message.id)
+    if (!request) return
+    clearTimeout(request.timer)
+    pending.delete(message.id)
+    if (message.error) request.reject(new Error(message.error.message))
+    else request.resolve(message.result)
+  })
+
+  function rejectPending(error) {
+    for (const request of pending.values()) {
+      clearTimeout(request.timer)
+      request.reject(error)
+    }
+    pending.clear()
+  }
+
+  return {
+    pid: child.pid,
+    get stderrTail() { return stderrTail },
+    executable,
+    request(method, params = {}, timeoutMs = 60_000) {
+      if (child.exitCode !== null) return Promise.reject(new Error(`rovai-core is not running: ${method}`))
+      const id = nextId++
+      return new Promise((resolveRequest, rejectRequest) => {
+        const timer = setTimeout(() => {
+          pending.delete(id)
+          rejectRequest(new Error(`timed out waiting for ${method}`))
+        }, timeoutMs)
+        pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer })
+        child.stdin.write(`${JSON.stringify({ id, method, params })}\n`)
+      })
+    },
+    async stop(timeoutMs = 30_000) {
+      stopping = true
+      if (child.exitCode === null) child.stdin.end()
+      await Promise.race([
+        closePromise,
+        unrefTimeout(timeoutMs)
+      ])
+      if (child.exitCode === null) child.kill('SIGTERM')
+      await Promise.race([
+        closePromise,
+        unrefTimeout(5_000)
+      ])
+      if (child.exitCode === null) child.kill('SIGKILL')
+      await closePromise
+      rejectPending(new Error('rovai-core stopped'))
+      return {
+        ...closeResult,
+        stderrDigest: stderrHash.digest('hex'),
+        stderrBytes,
+        stderrTail
+      }
+    }
+  }
+}
+
+export function qualificationRuntimePrivateDiagnostic(message, observedAt = new Date().toISOString()) {
+  if (!message || typeof message.method !== 'string' || !isPlainObject(message.params)) return null
+  const { method, params } = message
+  const base = {
+    schemaVersion: 1,
+    observedAt,
+    method,
+    agentRunId: stringOrNull(params.agentRunId),
+    executionEpoch: Number.isSafeInteger(params.executionEpoch) ? params.executionEpoch : null
+  }
+  if (method === 'core.startup') return { ...base, status: stringOrNull(params.status), phase: stringOrNull(params.phase), error: cloneJson(params.error ?? null) }
+  if (method === 'agent_run.log') {
+    const text = typeof params.text === 'string' ? params.text : ''
+    const retainedText = text.slice(-16_384)
+    return {
+      ...base,
+      stream: stringOrNull(params.stream),
+      text: retainedText,
+      textBytes: Buffer.byteLength(text),
+      truncated: retainedText.length !== text.length
+    }
+  }
+  if (method === 'error') {
+    return { ...base, detail: cloneJson(params.payload ?? params) }
+  }
+  if (method === 'turn.state') {
+    const nativeTurn = params.payload?.native?.turn
+    if (!isPlainObject(nativeTurn)
+        || ['completed', 'inProgress', 'running', 'started'].includes(nativeTurn.status)) return null
+    return {
+      ...base,
+      nativeTurnId: stringOrNull(nativeTurn.id),
+      nativeTurnStatus: stringOrNull(nativeTurn.status),
+      error: cloneJson(nativeTurn.error ?? null)
+    }
+  }
+  if (method === 'agent_run.recovering' || method === 'agent_run.terminal_deferred') {
+    return { ...base, detail: cloneJson(params) }
+  }
+  if (method === 'agent_run.terminal' && params.result?.code === 'agent_run.failed') {
+    return { ...base, detail: cloneJson(params.result) }
+  }
+  return null
+}
+
+function unrefTimeout(milliseconds) {
+  return new Promise((resolveTimeout) => {
+    const timer = setTimeout(resolveTimeout, milliseconds)
+    timer.unref()
+  })
+}
+
+function parseProcessTable(output) {
+  return output.split('\n').flatMap((line) => {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/)
+    return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] }] : []
+  })
+}
+
+function stringOrNull(value) {
+  return typeof value === 'string' ? value : null
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function cloneJson(value) {
+  return value === undefined ? null : JSON.parse(JSON.stringify(value))
+}
+
+export async function assertExecutable(path) {
+  await access(path)
+  return { path: resolve(path), basename: basename(path) }
+}

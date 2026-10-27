@@ -1,0 +1,78 @@
+{
+  "sourceCommit": "d24a624a",
+  "installedPath": "/Applications/Rovai AI.app",
+  "backupPath": "/Applications/Rovai AI.backup-before-web-recovery-20260913T125721Z.app",
+  "runningBefore": [
+    {
+      "pid": 93797,
+      "parentPid": 1,
+      "executable": "/Applications/Rovai AI.app/Contents/MacOS/Rovai AI"
+    },
+    {
+      "pid": 93854,
+      "parentPid": 93797,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper"
+    },
+    {
+      "pid": 93856,
+      "parentPid": 93797,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper"
+    },
+    {
+      "pid": 93867,
+      "parentPid": 93797,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper (Renderer).app/Contents/MacOS/Rovai AI Helper (Renderer)"
+    },
+    {
+      "pid": 93872,
+      "parentPid": 93797,
+      "executable": "/Applications/Rovai AI.app/Contents/Resources/bin/rovai-host"
+    }
+  ],
+  "runningAfter": [
+    {
+      "pid": 93797,
+      "alive": true
+    },
+    {
+      "pid": 93854,
+      "alive": true
+    },
+    {
+      "pid": 93856,
+      "alive": true
+    },
+    {
+      "pid": 93867,
+      "alive": true
+    },
+    {
+      "pid": 93872,
+      "alive": true
+    }
+  ],
+  "installedFiles": [
+    {
+      "path": "Contents/Resources/app.asar",
+      "sha256": "288f04f096dfb3414ede07067ebefefa49a2ba1e0a2a01980f2dfbf3109c366b"
+    },
+    {
+      "path": "Contents/Resources/bin/rovai-core",
+      "sha256": "1d4b1a8f3579f653513b516f0f0d00a27850143c6d886c8c1d6701cf89b257e8"
+    },
+    {
+      "path": "Contents/Resources/bin/rovai-host",
+      "sha256": "6a21a1e8959a4a4be83cd175f1d0918a48251190764dca3b07e3e1b81c498258"
+    },
+    {
+      "path": "Contents/Resources/bin/rovai",
+      "sha256": "135f6742a43b8f0f2089fe12a0cc1930829448268061b5af9d3b9b8b5f644e36"
+    }
+  ],
+  "version": "0.2.5",
+  "status": "passed",
+  "signature": "ad-hoc",
+  "architecture": "arm64",
+  "runningProcessUpgraded": false,
+  "backupRetained": true
+}

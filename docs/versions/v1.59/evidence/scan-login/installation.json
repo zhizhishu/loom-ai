@@ -1,0 +1,76 @@
+{
+  "sourceCommit": "4c92c500129be3e2c5bf2850bf196383ecbfb65c",
+  "source": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-web-recovery/dist/mac-arm64/Rovai AI.app",
+  "target": "/Applications/Rovai AI.app",
+  "backup": "/Applications/Rovai AI.backup-before-scan-login-20260913T132121Z.app",
+  "beforeProcesses": [
+    {
+      "pid": 12732,
+      "executable": "/Applications/Rovai AI.app/Contents/MacOS/Rovai AI"
+    },
+    {
+      "pid": 12754,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper"
+    },
+    {
+      "pid": 12757,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper.app/Contents/MacOS/Rovai AI Helper"
+    },
+    {
+      "pid": 12766,
+      "executable": "/Applications/Rovai AI.app/Contents/Frameworks/Rovai AI Helper (Renderer).app/Contents/MacOS/Rovai AI Helper (Renderer)"
+    },
+    {
+      "pid": 12767,
+      "executable": "/Applications/Rovai AI.app/Contents/Resources/bin/rovai-host"
+    }
+  ],
+  "startedAt": "20260913T132121Z",
+  "afterProcesses": [
+    {
+      "pid": 12732,
+      "alive": true
+    },
+    {
+      "pid": 12754,
+      "alive": true
+    },
+    {
+      "pid": 12757,
+      "alive": true
+    },
+    {
+      "pid": 12766,
+      "alive": true
+    },
+    {
+      "pid": 12767,
+      "alive": true
+    }
+  ],
+  "installedFiles": [
+    {
+      "path": "Contents/Resources/app.asar",
+      "sha256": "51e16baf6aefe6eac5e9f180ba1d5bcee6668f5287eaeff7157c8096e701aa55"
+    },
+    {
+      "path": "Contents/Resources/bin/rovai-core",
+      "sha256": "e4278b788ed3ec64648d65826a61fc3ac972bb42abb5c8619d2ce56762aae7f2"
+    },
+    {
+      "path": "Contents/Resources/bin/rovai-host",
+      "sha256": "0bb947418b60638646c5c63fd8de5735048f2851084670c9c79ba9a1713bc917"
+    },
+    {
+      "path": "Contents/Resources/bin/rovai",
+      "sha256": "45f1843ba898620a1e8047eea557cf9b1b60e74d4e965f2f1928c588bbc0dc01"
+    }
+  ],
+  "version": "0.2.5",
+  "status": "passed",
+  "signature": "ad-hoc",
+  "architecture": "arm64",
+  "runningProcessUpgraded": false,
+  "backupRetained": true,
+  "completedAt": "2026-09-13T13:21:51.213623+00:00"
+}

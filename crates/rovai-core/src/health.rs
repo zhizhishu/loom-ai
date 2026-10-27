@@ -1,0 +1,5275 @@
+use std::{
+    collections::BTreeSet,
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+
+use anyhow::{Context, Result, bail};
+use rovai_core::{
+    agent_profile::{AdapterKind, ModelDescriptor},
+    agent_runtime_adapter::{
+        CLAUDE_MODEL_CATALOG_CAPABILITY, GROK_BUILD_MINIMUM_VERSION_LABEL,
+        KIRO_ADDITIVE_AGENT_NAME, PI_MINIMUM_VERSION_LABEL, claude_code_models,
+        executable_fingerprint, grok_build_minimum_version_satisfied,
+        pi_machine_ready_requirements, pi_minimum_version_satisfied,
+        trae_machine_ready_capabilities, trae_machine_ready_requirements,
+        write_kiro_additive_agent_config,
+    },
+    managed_process::{ManagedChildStdin, ManagedChildStdout},
+    runtime_discovery::{
+        RuntimeLaunchPurpose, configure_active_runtime_command, configure_runtime_command,
+        discover_static_runtime_version, is_cursor_agent_version, is_executable_file,
+        runtime_launch_allowed,
+    },
+    runtime_failure::{
+        RuntimeFailureOrigin, RuntimeFailurePhase, RuntimeFailureView,
+        public_runtime_failure_from_output,
+    },
+    runtime_probe_process::{
+        BoundedCommandOutput, BoundedLineReader, DEFAULT_CAPTURE_LIMIT, DEFAULT_CLEANUP_TIMEOUT,
+        ProbeCommandLimits, RuntimeProbeProcess, run_bounded_command,
+    },
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+
+const CODEX_RUNTIME_KIND: &str = "codex-cli";
+
+struct ProbeRootCleanup(PathBuf);
+
+impl Drop for ProbeRootCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn runtime_command(executable: impl AsRef<std::ffi::OsStr>, kind: Option<AdapterKind>) -> Command {
+    let mut command = Command::new(executable);
+    if let Some(kind) = kind {
+        configure_runtime_command(kind, &mut command);
+    } else {
+        configure_active_runtime_command(&mut command);
+    }
+    command
+}
+
+async fn bounded_output(command: &mut Command, deadline: Duration) -> Result<BoundedCommandOutput> {
+    run_bounded_command(
+        command,
+        ProbeCommandLimits {
+            deadline,
+            stdout_bytes: DEFAULT_CAPTURE_LIMIT,
+            stderr_bytes: DEFAULT_CAPTURE_LIMIT,
+            cleanup_timeout: DEFAULT_CLEANUP_TIMEOUT,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn read_opencode_version(path: &Path) -> Result<String> {
+    let mut command = runtime_command(path, Some(AdapterKind::OpencodeCli));
+    command.arg("--version");
+    let output = bounded_output(&mut command, Duration::from_secs(15))
+        .await
+        .context("OpenCode initialization could not read the selected executable's version")?;
+    if !output.status.success() {
+        bail!(
+            "OpenCode version read failed: {}",
+            command_detail(
+                &output.stdout.bytes,
+                &output.stderr.bytes,
+                "selected executable returned an error"
+            )
+        );
+    }
+    let version = first_nonempty_line(&output.stdout.bytes, &output.stderr.bytes)
+        .context("OpenCode version read returned no identity")?;
+    crate::opencode_compat::Generation::require(Some(&version))?;
+    Ok(version)
+}
+
+const REQUIRED_CODEX_CAPABILITIES: &[(&str, &str, &str)] = &[
+    ("model.list", "ClientRequest.json", "\"model/list\""),
+    ("thread.start", "ClientRequest.json", "\"thread/start\""),
+    ("thread.resume", "ClientRequest.json", "\"thread/resume\""),
+    (
+        "workspace.additional_roots",
+        "ClientRequest.json",
+        "\"runtimeWorkspaceRoots\"",
+    ),
+    ("turn.start", "ClientRequest.json", "\"turn/start\""),
+    ("turn.interrupt", "ClientRequest.json", "\"turn/interrupt\""),
+    (
+        "event.agent_message",
+        "ServerNotification.json",
+        "\"item/agentMessage/delta\"",
+    ),
+    (
+        "event.turn_terminal",
+        "ServerNotification.json",
+        "\"turn/completed\"",
+    ),
+    (
+        "approval.command_request",
+        "ServerRequest.json",
+        "\"item/commandExecution/requestApproval\"",
+    ),
+    (
+        "approval.file_request",
+        "ServerRequest.json",
+        "\"item/fileChange/requestApproval\"",
+    ),
+];
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandHealth {
+    installed: bool,
+    version: Option<String>,
+    authenticated: Option<bool>,
+    detail: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntimeProbeStatus {
+    Ready,
+    NotInstalled,
+    AuthenticationRequired,
+    MissingCapabilities,
+    ProbeFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRuntimeProbeResult {
+    pub runtime_kind: String,
+    pub executable_path: Option<String>,
+    pub reported_version: Option<String>,
+    pub executable_fingerprint: Option<String>,
+    pub status: AgentRuntimeProbeStatus,
+    pub capabilities: Vec<String>,
+    pub missing_capabilities: Vec<String>,
+    pub detail: Option<String>,
+    pub failure: Option<RuntimeFailureView>,
+    pub probed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcpCapabilityProbe {
+    pub result: AgentRuntimeProbeResult,
+    pub initialize_result: Option<Value>,
+    pub session_result: Option<Value>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct TraeBehavioralProbeEvidence {
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeCapabilityProbe {
+    pub result: AgentRuntimeProbeResult,
+    pub models: Vec<ModelDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PiCapabilityProbe {
+    pub result: AgentRuntimeProbeResult,
+    pub raw_model_catalog: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AntigravityCapabilityProbe {
+    pub result: AgentRuntimeProbeResult,
+    pub models: Vec<String>,
+}
+
+pub async fn git_health(path: Option<PathBuf>) -> CommandHealth {
+    let Some(path) = path else {
+        return CommandHealth {
+            installed: false,
+            version: None,
+            authenticated: None,
+            detail: Some("git executable was not found in the Runtime search environment".into()),
+            path: None,
+        };
+    };
+    command_health("git", &["--version"], Some(path)).await
+}
+
+pub struct CodexCapabilityProbe {
+    pub result: AgentRuntimeProbeResult,
+    pub raw_model_catalog: Option<Value>,
+}
+
+pub async fn codex_capability_probe_at(
+    path: &Path,
+    fingerprint: Option<&str>,
+    version: Option<&str>,
+    known_capabilities: &[String],
+) -> CodexCapabilityProbe {
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    let path_text = path.to_string_lossy().to_string();
+    if !path.is_file() {
+        return CodexCapabilityProbe {
+            raw_model_catalog: None,
+            result: probe_result(
+                Some(path_text),
+                None,
+                None,
+                AgentRuntimeProbeStatus::NotInstalled,
+                Vec::new(),
+                required_capability_names(),
+                Some("Configured Codex executable does not exist.".into()),
+                probed_at,
+            ),
+        };
+    }
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let fingerprint = match fingerprint {
+        Some(value) => Some(value.to_owned()),
+        None => executable_fingerprint_async(path.clone()).await,
+    };
+    let mut result = codex_runtime_probe_uncached(
+        path,
+        path_text,
+        fingerprint,
+        version,
+        probed_at,
+        known_capabilities,
+    )
+    .await;
+    redact_probe(AdapterKind::CodexCli, &mut result.result);
+    result
+}
+
+pub async fn acp_capability_probe_at_for_purpose(
+    path: &Path,
+    kind: AdapterKind,
+    purpose: RuntimeLaunchPurpose,
+    fingerprint: Option<&str>,
+    known_version: Option<&str>,
+    catalog_requested: bool,
+) -> AcpCapabilityProbe {
+    let mut probe = acp_probe_at(
+        path,
+        kind,
+        acp_deep_session_probe_enabled(kind),
+        purpose,
+        fingerprint,
+        known_version,
+        catalog_requested,
+    )
+    .await;
+    redact_probe(kind, &mut probe.result);
+    // Capability/session results remain protocol data for catalog and compatibility
+    // consumers. Only the diagnostic view above is scrubbed.
+    probe
+}
+
+fn probe_redactor(kind: AdapterKind) -> Option<rovai_core::runtime_custom_api::CredentialRedactor> {
+    let environment = rovai_core::member_environment::LaunchEnvironment {
+        values: Some(rovai_core::runtime_discovery::runtime_environment(kind)),
+        overlay: None,
+    }
+    .redactor();
+    let native = rovai_core::runtime_discovery::custom_api_snapshot(kind)
+        .ok()
+        .flatten()
+        .and_then(|api| api.redactor().ok());
+    Some(match native {
+        Some(native) => environment.extend(native),
+        None => environment,
+    })
+}
+
+fn redact_probe(kind: AdapterKind, result: &mut AgentRuntimeProbeResult) {
+    if let Some(redactor) = probe_redactor(kind) {
+        result.detail = result.detail.as_deref().map(|text| redactor.text(text));
+        if let Some(failure) = &mut result.failure {
+            failure.summary = redactor.text(&failure.summary);
+            failure.detail = failure.detail.as_deref().map(|text| redactor.text(text));
+        }
+    }
+}
+
+fn runtime_launch_disallowed_detail(purpose: RuntimeLaunchPurpose) -> String {
+    let purpose = match purpose {
+        RuntimeLaunchPurpose::DiscoveryVersion => "discovery_version",
+        RuntimeLaunchPurpose::AvailabilityCheck => "availability_check",
+        RuntimeLaunchPurpose::InstallationRefresh => "installation_refresh",
+        RuntimeLaunchPurpose::HealthProbe => "health_probe",
+        RuntimeLaunchPurpose::DispatchPreflight => "dispatch_preflight",
+        RuntimeLaunchPurpose::AgentExecution => "agent_execution",
+    };
+    format!("runtime_launch_disallowed_for_{purpose}")
+}
+
+pub async fn claude_code_capability_probe_at(
+    path: &Path,
+    fingerprint: Option<&str>,
+    known_version: Option<&str>,
+    known_capabilities: &[String],
+) -> ClaudeCodeCapabilityProbe {
+    let mut probe =
+        claude_code_probe_at(path, fingerprint, known_version, known_capabilities).await;
+    redact_probe(AdapterKind::ClaudeCodeCli, &mut probe.result);
+    probe
+}
+
+pub async fn antigravity_capability_probe_at(
+    path: &Path,
+    fingerprint: Option<&str>,
+    known_version: Option<&str>,
+    known_capabilities: &[String],
+) -> AntigravityCapabilityProbe {
+    antigravity_probe_at(path, true, fingerprint, known_version, known_capabilities).await
+}
+
+/// Only the existing verified snapshot authorizes omitting full checks. Session
+/// authentication/handshakes required to read a native catalog still run.
+pub fn catalog_refresh_evidence_current(
+    kind: AdapterKind,
+    snapshot: &rovai_core::agent_profile::AdapterCapabilitySnapshot,
+) -> bool {
+    let required = match kind {
+        AdapterKind::CodexCli => vec!["model.list".into(), "app_server.initialize".into()],
+        AdapterKind::ClaudeCodeCli => vec![CLAUDE_MODEL_CATALOG_CAPABILITY.into()],
+        AdapterKind::AntigravityApp => vec!["model.list".into()],
+        AdapterKind::Pi => pi_machine_ready_requirements(),
+        _ => acp_required_capabilities(kind),
+    };
+    snapshot.probe_status == "ready"
+        && snapshot.authentication_status == "authenticated"
+        && snapshot.stale_at.is_none()
+        && snapshot.last_successful_probe_at.is_some()
+        && rovai_core::agent_runtime_adapter::validate_machine_ready_snapshot(kind, snapshot)
+            .is_ok()
+        && (kind != AdapterKind::ZcodeApp
+            || rovai_core::zcode::supported_version(snapshot.reported_version.as_deref()))
+        && required
+            .iter()
+            .all(|capability| snapshot.capabilities.contains(capability))
+}
+
+/// Catalog-only branch of the same check task. Returns models, never Ready evidence.
+#[derive(Debug)]
+pub struct RefreshedModelCatalog {
+    pub models: Vec<ModelDescriptor>,
+    pub dsh_preparation: Option<Value>,
+}
+
+pub async fn refresh_model_catalog(
+    path: &Path,
+    kind: AdapterKind,
+) -> Result<RefreshedModelCatalog> {
+    refresh_model_catalog_for_selection(path, kind, None).await
+}
+
+pub async fn refresh_model_catalog_for_selection(
+    path: &Path,
+    kind: AdapterKind,
+    target: Option<(&str, Option<crate::agent_profile::DshModelSource>)>,
+) -> Result<RefreshedModelCatalog> {
+    let purpose = RuntimeLaunchPurpose::AvailabilityCheck;
+    if !runtime_launch_allowed(kind, purpose) {
+        bail!(runtime_launch_disallowed_detail(purpose));
+    }
+    let mut dsh_preparation = None;
+    let models = match kind {
+        AdapterKind::CodexCli => {
+            rovai_core::agent_runtime_adapter::codex_models(&codex_model_catalog(path).await?)
+        }
+        AdapterKind::ClaudeCodeCli => {
+            claude_code_model_catalog(path, Duration::from_secs(30)).await
+        }
+        AdapterKind::Pi => rovai_core::agent_runtime_adapter::pi_models(Some(
+            &crate::pi::model_catalog_probe(path).await?,
+        )),
+        AdapterKind::AntigravityApp => {
+            let output = antigravity_model_output(path).await?;
+            if !output.status.success() {
+                bail!("Antigravity model discovery failed ({})", output.status);
+            }
+            let ids = antigravity_model_ids(&output.stdout.bytes);
+            if ids.is_empty() {
+                bail!("Antigravity model catalog is empty or malformed");
+            }
+            Ok(rovai_core::agent_runtime_adapter::antigravity_models(ids))
+        }
+        _ => {
+            let (_, session) =
+                run_acp_probe_with_scope(path, kind, true, purpose, true, target, None).await?;
+            if kind == AdapterKind::DeepseekHarness {
+                dsh_preparation = session
+                    .as_ref()
+                    .and_then(|session| session.pointer("/_meta/rovaiDshModels"))
+                    .cloned();
+            }
+            let mut models = rovai_core::agent_runtime_adapter::acp_model_catalog_for_adapter(
+                kind,
+                session
+                    .as_ref()
+                    .context("ACP catalog did not create a Session")?,
+            )?;
+            // The same native Kiro mapping as full checks; reasoning is not configurable.
+            if kind == AdapterKind::KiroCli {
+                for model in &mut models {
+                    model.options.clear();
+                }
+            }
+            Ok(models)
+        }
+    }?;
+    Ok(RefreshedModelCatalog {
+        models,
+        dsh_preparation,
+    })
+}
+
+pub async fn pi_capability_probe_at(
+    path: &Path,
+    fingerprint: Option<&str>,
+    known_version: Option<&str>,
+) -> PiCapabilityProbe {
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    let path_text = path.to_string_lossy().to_string();
+    if !path.is_file() {
+        return PiCapabilityProbe {
+            result: agent_probe_result(
+                AdapterKind::Pi.as_str(),
+                Some(path_text),
+                None,
+                None,
+                AgentRuntimeProbeStatus::NotInstalled,
+                Vec::new(),
+                pi_machine_ready_requirements(),
+                Some("Configured Pi executable does not exist.".to_string()),
+                probed_at,
+            ),
+            raw_model_catalog: None,
+        };
+    }
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let fingerprint = match fingerprint {
+        Some(value) => Some(value.to_owned()),
+        None => executable_fingerprint_async(path.clone()).await,
+    };
+    let version = if let Some(version) = known_version {
+        Some(version.to_owned())
+    } else {
+        let mut version_command = runtime_command(&path, Some(AdapterKind::Pi));
+        version_command.arg("--version").stdin(Stdio::null());
+        bounded_output(&mut version_command, Duration::from_secs(5))
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout.bytes)
+                    .trim()
+                    .to_string()
+            })
+            .filter(|value| !value.is_empty())
+    };
+    if !pi_minimum_version_satisfied(version.as_deref()) {
+        return PiCapabilityProbe {
+            result: agent_probe_result(
+                AdapterKind::Pi.as_str(),
+                Some(path_text),
+                version,
+                fingerprint,
+                AgentRuntimeProbeStatus::ProbeFailed,
+                Vec::new(),
+                vec![format!("pi.version>={PI_MINIMUM_VERSION_LABEL}")],
+                Some(format!(
+                    "runtime_version_below_minimum: Pi >= {PI_MINIMUM_VERSION_LABEL} is required."
+                )),
+                probed_at,
+            ),
+            raw_model_catalog: None,
+        };
+    }
+    match crate::pi::machine_ready_probe(&path).await {
+        Ok(observation) => PiCapabilityProbe {
+            result: agent_probe_result(
+                AdapterKind::Pi.as_str(),
+                Some(path_text),
+                version,
+                fingerprint,
+                AgentRuntimeProbeStatus::Ready,
+                observation.capabilities,
+                Vec::new(),
+                Some(format!(
+                    "Pi JSONL RPC Host, managed extension, model catalog, and exact Session identity verified without a model Prompt (model {})",
+                    observation.model_fingerprint
+                )),
+                probed_at,
+            ),
+            raw_model_catalog: Some(observation.raw_model_catalog),
+        },
+        Err(error) => {
+            let (status, detail) = classify_pi_probe_failure(&format!("{error:#}"));
+            PiCapabilityProbe {
+                result: agent_probe_result(
+                    AdapterKind::Pi.as_str(),
+                    Some(path_text),
+                    version,
+                    fingerprint,
+                    status,
+                    Vec::new(),
+                    pi_machine_ready_requirements(),
+                    Some(detail.to_string()),
+                    probed_at,
+                ),
+                raw_model_catalog: None,
+            }
+        }
+    }
+}
+
+fn classify_pi_probe_failure(detail: &str) -> (AgentRuntimeProbeStatus, &'static str) {
+    let lower = detail.to_ascii_lowercase();
+    if [
+        "authentication_required",
+        "authentication required",
+        "not authenticated",
+        "unauthorized",
+        "not logged in",
+        "log in",
+        "login required",
+        "api key",
+        "credential",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return (
+            AgentRuntimeProbeStatus::AuthenticationRequired,
+            "authentication_required: Pi native authentication is unavailable.",
+        );
+    }
+    if [
+        "model_required",
+        "no selected provider/model",
+        "no model configured",
+        "model is not configured",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return (
+            AgentRuntimeProbeStatus::ProbeFailed,
+            "model_required: Pi has no native model configured.",
+        );
+    }
+    (
+        AgentRuntimeProbeStatus::ProbeFailed,
+        "Pi could not verify the no-Prompt JSONL RPC Machine Ready contract.",
+    )
+}
+
+async fn claude_code_probe_at(
+    path: &Path,
+    fingerprint: Option<&str>,
+    known_version: Option<&str>,
+    known_capabilities: &[String],
+) -> ClaudeCodeCapabilityProbe {
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    let path_text = path.to_string_lossy().to_string();
+    if !path.is_file() {
+        let failure = public_probe_failure(
+            AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Environment,
+            RuntimeFailurePhase::Spawn,
+            "runtime_executable_unavailable",
+            "Claude Code 可执行文件不可用",
+            "Configured Claude Code executable does not exist.",
+            path,
+            false,
+        );
+        return claude_code_probe_failure(
+            path_text,
+            None,
+            None,
+            AgentRuntimeProbeStatus::NotInstalled,
+            "Configured Claude Code executable does not exist.".to_string(),
+            failure,
+            probed_at,
+        );
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let fingerprint = match fingerprint {
+        Some(value) => Some(value.to_owned()),
+        None => executable_fingerprint_async(canonical.clone()).await,
+    };
+    let reported_version = if let Some(version) = known_version {
+        Some(version.to_owned())
+    } else {
+        let mut version_command = runtime_command(&canonical, Some(AdapterKind::ClaudeCodeCli));
+        version_command.arg("--version");
+        let version = bounded_output(&mut version_command, Duration::from_secs(15)).await;
+        match version {
+            Ok(output) if output.status.success() => {
+                first_nonempty_line(&output.stdout.bytes, &output.stderr.bytes)
+            }
+            Ok(output) => {
+                let raw_detail = bounded_probe_text(&output.stdout.bytes, &output.stderr.bytes);
+                let failure = public_probe_failure(
+                    AdapterKind::ClaudeCodeCli,
+                    RuntimeFailureOrigin::Runtime,
+                    RuntimeFailurePhase::Execution,
+                    "runtime_process_failed",
+                    "Claude Code 版本检查失败",
+                    &raw_detail,
+                    &canonical,
+                    true,
+                );
+                return claude_code_probe_failure(
+                    path_text,
+                    fingerprint,
+                    None,
+                    AgentRuntimeProbeStatus::ProbeFailed,
+                    format!(
+                        "Claude Code version check failed with {} (outputDigest={})",
+                        output.status,
+                        probe_output_digest(&output.stdout.bytes, &output.stderr.bytes)
+                    ),
+                    failure,
+                    probed_at,
+                );
+            }
+            Err(error) => {
+                let raw_detail = error.to_string();
+                let failure = public_probe_failure(
+                    AdapterKind::ClaudeCodeCli,
+                    RuntimeFailureOrigin::Environment,
+                    RuntimeFailurePhase::Spawn,
+                    "runtime_spawn_failed",
+                    "无法启动 Claude Code 检查",
+                    &raw_detail,
+                    &canonical,
+                    true,
+                );
+                return claude_code_probe_failure(
+                    path_text,
+                    fingerprint,
+                    None,
+                    AgentRuntimeProbeStatus::ProbeFailed,
+                    format!("failed to inspect Claude Code: {error}"),
+                    failure,
+                    probed_at,
+                );
+            }
+        }
+    };
+
+    let required = [
+        ("cli.print", "--print"),
+        ("output.json", "--output-format"),
+        ("input.stream_json", "--input-format"),
+        ("session.no_persistence", "--no-session-persistence"),
+        ("conversation.resume", "--resume"),
+        ("conversation.create", "--session-id"),
+        ("context.charter.native_append", "--append-system-prompt"),
+        ("team_tool.mcp_config", "--mcp-config"),
+        ("team_tool.allow", "--allowedTools"),
+        ("workspace.additional_roots", "--add-dir"),
+        ("permission.mode", "--permission-mode"),
+        ("model.select", "--model"),
+    ];
+    let reuse_help = required
+        .iter()
+        .all(|(capability, _)| known_capabilities.iter().any(|known| known == capability));
+    let help = if reuse_help {
+        None
+    } else {
+        Some({
+            let mut help_command = runtime_command(&canonical, Some(AdapterKind::ClaudeCodeCli));
+            help_command.arg("--help");
+            let help = bounded_output(&mut help_command, Duration::from_secs(15)).await;
+            match help {
+                Ok(output) if output.status.success() => {
+                    bounded_probe_text(&output.stdout.bytes, &output.stderr.bytes)
+                }
+                Ok(output) => {
+                    let raw_detail = bounded_probe_text(&output.stdout.bytes, &output.stderr.bytes);
+                    let failure = public_probe_failure(
+                        AdapterKind::ClaudeCodeCli,
+                        RuntimeFailureOrigin::Runtime,
+                        RuntimeFailurePhase::Execution,
+                        "runtime_process_failed",
+                        "Claude Code 能力检查失败",
+                        &raw_detail,
+                        &canonical,
+                        true,
+                    );
+                    return claude_code_probe_failure(
+                        path_text,
+                        fingerprint,
+                        reported_version,
+                        AgentRuntimeProbeStatus::ProbeFailed,
+                        format!(
+                            "Claude Code help check failed with {} (outputDigest={})",
+                            output.status,
+                            probe_output_digest(&output.stdout.bytes, &output.stderr.bytes)
+                        ),
+                        failure,
+                        probed_at,
+                    );
+                }
+                Err(error) => {
+                    let raw_detail = error.to_string();
+                    let failure = public_probe_failure(
+                        AdapterKind::ClaudeCodeCli,
+                        RuntimeFailureOrigin::Environment,
+                        RuntimeFailurePhase::Spawn,
+                        "runtime_spawn_failed",
+                        "无法启动 Claude Code 能力检查",
+                        &raw_detail,
+                        &canonical,
+                        true,
+                    );
+                    return claude_code_probe_failure(
+                        path_text,
+                        fingerprint,
+                        reported_version,
+                        AgentRuntimeProbeStatus::ProbeFailed,
+                        format!("failed to inspect Claude Code capabilities: {error}"),
+                        failure,
+                        probed_at,
+                    );
+                }
+            }
+        })
+    };
+    let mut capabilities = Vec::new();
+    let mut missing = Vec::new();
+    for (capability, flag) in required {
+        if reuse_help || help.as_ref().is_some_and(|help| help.contains(flag)) {
+            capabilities.push(capability.to_string());
+        } else {
+            missing.push(capability.to_string());
+        }
+    }
+    if !missing.is_empty() {
+        let raw_detail = format!("Missing required options: {}", missing.join(", "));
+        let failure = public_probe_failure(
+            AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Compatibility,
+            RuntimeFailurePhase::Execution,
+            "runtime_capability_incompatible",
+            "当前 Claude Code 版本缺少 Rovai 所需能力",
+            &raw_detail,
+            &canonical,
+            false,
+        );
+        let mut result = agent_probe_result(
+            AdapterKind::ClaudeCodeCli.as_str(),
+            Some(path_text),
+            reported_version,
+            fingerprint,
+            AgentRuntimeProbeStatus::MissingCapabilities,
+            capabilities,
+            missing,
+            Some(
+                "Claude Code is missing flags required by Rovai-ai's print-mode integration."
+                    .to_string(),
+            ),
+            probed_at,
+        );
+        result.failure = Some(failure);
+        return ClaudeCodeCapabilityProbe {
+            result,
+            models: Vec::new(),
+        };
+    }
+
+    let mut auth_command = runtime_command(&canonical, Some(AdapterKind::ClaudeCodeCli));
+    let auth: Result<BoundedCommandOutput> = async {
+        auth_command.args(["auth", "status"]);
+        let output = bounded_output(&mut auth_command, Duration::from_secs(15)).await?;
+        Ok(output)
+    }
+    .await;
+    let authenticated = match auth {
+        Ok(output) if output.status.success() => {
+            serde_json::from_slice::<Value>(&output.stdout.bytes)
+                .ok()
+                .and_then(|value| value.get("loggedIn").and_then(Value::as_bool))
+                // Older/newer Claude Code releases may render a successful
+                // human-readable status instead of JSON. A zero exit code is
+                // still the installed CLI's authoritative auth result.
+                .unwrap_or(true)
+        }
+        Ok(output) => {
+            let raw_detail = bounded_probe_text(&output.stdout.bytes, &output.stderr.bytes);
+            let failure = public_probe_failure(
+                AdapterKind::ClaudeCodeCli,
+                RuntimeFailureOrigin::Runtime,
+                RuntimeFailurePhase::Authentication,
+                "runtime_authentication_required",
+                "需要登录 Claude Code",
+                &raw_detail,
+                &canonical,
+                true,
+            );
+            return claude_code_probe_failure(
+                path_text,
+                fingerprint,
+                reported_version,
+                AgentRuntimeProbeStatus::AuthenticationRequired,
+                format!(
+                    "Claude Code authentication check failed with {} (outputDigest={})",
+                    output.status,
+                    probe_output_digest(&output.stdout.bytes, &output.stderr.bytes)
+                ),
+                failure,
+                probed_at,
+            );
+        }
+        Err(error) => {
+            let raw_detail = error.to_string();
+            let failure = public_probe_failure(
+                AdapterKind::ClaudeCodeCli,
+                RuntimeFailureOrigin::Environment,
+                RuntimeFailurePhase::Spawn,
+                "runtime_spawn_failed",
+                "无法启动 Claude Code 认证检查",
+                &raw_detail,
+                &canonical,
+                true,
+            );
+            return claude_code_probe_failure(
+                path_text,
+                fingerprint,
+                reported_version,
+                AgentRuntimeProbeStatus::ProbeFailed,
+                format!("failed to inspect Claude Code authentication: {error}"),
+                failure,
+                probed_at,
+            );
+        }
+    };
+    if !authenticated {
+        let failure = public_probe_failure(
+            AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Runtime,
+            RuntimeFailurePhase::Authentication,
+            "runtime_authentication_required",
+            "需要登录 Claude Code",
+            "Claude Code is not logged in.",
+            &canonical,
+            true,
+        );
+        return claude_code_probe_failure(
+            path_text,
+            fingerprint,
+            reported_version,
+            AgentRuntimeProbeStatus::AuthenticationRequired,
+            "Claude Code is not logged in.".to_string(),
+            failure,
+            probed_at,
+        );
+    }
+    capabilities.push("process.interrupt".to_string());
+    let models = match claude_code_model_catalog(&canonical, Duration::from_secs(30)).await {
+        Ok(models) => models,
+        Err(error) => {
+            let detail = format!("{error:#}");
+            let failure = model_catalog_failure(AdapterKind::ClaudeCodeCli, &error, &canonical);
+            return claude_code_probe_failure(
+                path_text,
+                fingerprint,
+                reported_version,
+                AgentRuntimeProbeStatus::ProbeFailed,
+                detail,
+                failure,
+                probed_at,
+            );
+        }
+    };
+    capabilities.push(CLAUDE_MODEL_CATALOG_CAPABILITY.to_string());
+    ClaudeCodeCapabilityProbe {
+        result: agent_probe_result(
+            AdapterKind::ClaudeCodeCli.as_str(),
+            Some(path_text),
+            reported_version,
+            fingerprint,
+            AgentRuntimeProbeStatus::Ready,
+            capabilities,
+            Vec::new(),
+            None,
+            probed_at,
+        ),
+        models,
+    }
+}
+
+/// Antigravity sends input in argv and cannot initialize without it. Its launch
+/// exception checks CLI flags and account/model access, never the display version.
+pub async fn antigravity_launch_preflight_at(path: &Path) -> AntigravityCapabilityProbe {
+    antigravity_probe_at(path, false, None, None, &[]).await
+}
+
+async fn antigravity_probe_at(
+    path: &Path,
+    include_version: bool,
+    fingerprint: Option<&str>,
+    known_version: Option<&str>,
+    known_capabilities: &[String],
+) -> AntigravityCapabilityProbe {
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    let path_text = path.to_string_lossy().to_string();
+    if !path.is_file() {
+        let failure = public_probe_failure(
+            AdapterKind::AntigravityApp,
+            RuntimeFailureOrigin::Environment,
+            RuntimeFailurePhase::Spawn,
+            "runtime_executable_unavailable",
+            "Antigravity 可执行文件不可用",
+            "Configured Antigravity companion executable does not exist.",
+            path,
+            false,
+        );
+        return antigravity_probe_failure(
+            path_text,
+            None,
+            None,
+            AgentRuntimeProbeStatus::NotInstalled,
+            "Configured Antigravity companion executable does not exist.".to_string(),
+            failure,
+            probed_at,
+        );
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let fingerprint = match fingerprint {
+        Some(value) => Some(value.to_owned()),
+        None => executable_fingerprint_async(canonical.clone()).await,
+    };
+    let reported_version = if let Some(version) = known_version {
+        Some(version.to_owned())
+    } else if include_version {
+        let mut version_command = runtime_command(&canonical, Some(AdapterKind::AntigravityApp));
+        version_command.arg("--version");
+        let version = bounded_output(&mut version_command, Duration::from_secs(15)).await;
+        match version {
+            Ok(output) if output.status.success() => {
+                first_nonempty_line(&output.stdout.bytes, &output.stderr.bytes)
+            }
+            Ok(output) => {
+                let raw_detail = bounded_probe_text(&output.stdout.bytes, &output.stderr.bytes);
+                let failure = public_probe_failure(
+                    AdapterKind::AntigravityApp,
+                    RuntimeFailureOrigin::Runtime,
+                    RuntimeFailurePhase::Execution,
+                    "runtime_process_failed",
+                    "Antigravity 版本检查失败",
+                    &raw_detail,
+                    &canonical,
+                    true,
+                );
+                return antigravity_probe_failure(
+                    path_text,
+                    fingerprint,
+                    None,
+                    AgentRuntimeProbeStatus::ProbeFailed,
+                    format!(
+                        "Antigravity companion version check failed with {} (outputDigest={})",
+                        output.status,
+                        probe_output_digest(&output.stdout.bytes, &output.stderr.bytes)
+                    ),
+                    failure,
+                    probed_at,
+                );
+            }
+            Err(error) => {
+                let raw_detail = error.to_string();
+                let failure = public_probe_failure(
+                    AdapterKind::AntigravityApp,
+                    RuntimeFailureOrigin::Environment,
+                    RuntimeFailurePhase::Spawn,
+                    "runtime_spawn_failed",
+                    "无法启动 Antigravity 检查",
+                    &raw_detail,
+                    &canonical,
+                    true,
+                );
+                return antigravity_probe_failure(
+                    path_text,
+                    fingerprint,
+                    None,
+                    AgentRuntimeProbeStatus::ProbeFailed,
+                    format!("failed to inspect Antigravity companion CLI: {error}"),
+                    failure,
+                    probed_at,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let required = [
+        ("cli.print", "--print"),
+        ("conversation.resume", "--conversation"),
+        ("model.select", "--model"),
+        ("execution.mode", "--mode"),
+        ("workspace.sandbox", "--sandbox"),
+        ("workspace.additional_roots", "--add-dir"),
+        ("session.log_file", "--log-file"),
+        ("print.timeout", "--print-timeout"),
+    ];
+    let reuse_help = required
+        .iter()
+        .all(|(capability, _)| known_capabilities.iter().any(|known| known == capability));
+    let help = if reuse_help {
+        None
+    } else {
+        Some({
+            let mut help_command = runtime_command(&canonical, Some(AdapterKind::AntigravityApp));
+            help_command.arg("--help");
+            let help = bounded_output(&mut help_command, Duration::from_secs(15)).await;
+            match help {
+                Ok(output) if output.status.success() => {
+                    bounded_probe_text(&output.stdout.bytes, &output.stderr.bytes)
+                }
+                Ok(output) => {
+                    let raw_detail = bounded_probe_text(&output.stdout.bytes, &output.stderr.bytes);
+                    let failure = public_probe_failure(
+                        AdapterKind::AntigravityApp,
+                        RuntimeFailureOrigin::Runtime,
+                        RuntimeFailurePhase::Execution,
+                        "runtime_process_failed",
+                        "Antigravity 能力检查失败",
+                        &raw_detail,
+                        &canonical,
+                        true,
+                    );
+                    return antigravity_probe_failure(
+                        path_text,
+                        fingerprint,
+                        reported_version,
+                        AgentRuntimeProbeStatus::ProbeFailed,
+                        format!(
+                            "Antigravity help check failed with {} (outputDigest={})",
+                            output.status,
+                            probe_output_digest(&output.stdout.bytes, &output.stderr.bytes)
+                        ),
+                        failure,
+                        probed_at,
+                    );
+                }
+                Err(error) => {
+                    let raw_detail = error.to_string();
+                    let failure = public_probe_failure(
+                        AdapterKind::AntigravityApp,
+                        RuntimeFailureOrigin::Environment,
+                        RuntimeFailurePhase::Spawn,
+                        "runtime_spawn_failed",
+                        "无法启动 Antigravity 能力检查",
+                        &raw_detail,
+                        &canonical,
+                        true,
+                    );
+                    return antigravity_probe_failure(
+                        path_text,
+                        fingerprint,
+                        reported_version,
+                        AgentRuntimeProbeStatus::ProbeFailed,
+                        format!("failed to inspect Antigravity companion capabilities: {error}"),
+                        failure,
+                        probed_at,
+                    );
+                }
+            }
+        })
+    };
+    let mut capabilities = Vec::new();
+
+    let mut missing = Vec::new();
+    for (capability, flag) in required {
+        if reuse_help || help.as_ref().is_some_and(|help| help.contains(flag)) {
+            capabilities.push(capability.to_string());
+        } else {
+            missing.push(capability.to_string());
+        }
+    }
+    if !missing.is_empty() {
+        let raw_detail = format!("Missing required options: {}", missing.join(", "));
+        let failure = public_probe_failure(
+            AdapterKind::AntigravityApp,
+            RuntimeFailureOrigin::Compatibility,
+            RuntimeFailurePhase::Execution,
+            "runtime_capability_incompatible",
+            "当前 Antigravity 版本缺少 Rovai 所需能力",
+            &raw_detail,
+            &canonical,
+            false,
+        );
+        let mut result = agent_probe_result(
+            AdapterKind::AntigravityApp.as_str(),
+            Some(path_text),
+            reported_version,
+            fingerprint,
+            AgentRuntimeProbeStatus::MissingCapabilities,
+            capabilities,
+            missing,
+            Some(
+                "Antigravity App's companion CLI is missing flags required by Rovai-ai."
+                    .to_string(),
+            ),
+            probed_at,
+        );
+        result.failure = Some(failure);
+        return AntigravityCapabilityProbe {
+            result,
+            models: Vec::new(),
+        };
+    }
+    if (reuse_help
+        && known_capabilities
+            .iter()
+            .any(|value| value == "output.stream_json"))
+        || help
+            .as_deref()
+            .is_some_and(antigravity_stream_json_supported)
+    {
+        capabilities.push("output.stream_json".to_string());
+        if known_capabilities
+            .iter()
+            .any(|value| value == "input.stream_json")
+            || help
+                .as_ref()
+                .is_some_and(|help| help.contains("--input-format"))
+        {
+            capabilities.push("input.stream_json".to_string());
+        }
+    }
+
+    let model_output = antigravity_model_output(&canonical).await;
+    match model_output {
+        Ok(output) if output.status.success() => {
+            let models = antigravity_model_ids(&output.stdout.bytes);
+            if models.is_empty() {
+                let failure = public_probe_failure(
+                    AdapterKind::AntigravityApp,
+                    RuntimeFailureOrigin::Compatibility,
+                    RuntimeFailurePhase::ModelCatalog,
+                    "runtime_model_catalog_incompatible",
+                    "Antigravity 未返回可识别的模型列表",
+                    "Antigravity model discovery returned no model identifiers.",
+                    &canonical,
+                    false,
+                );
+                return antigravity_probe_failure(
+                    path_text,
+                    fingerprint,
+                    reported_version,
+                    AgentRuntimeProbeStatus::ProbeFailed,
+                    "Antigravity model discovery returned no model identifiers".to_string(),
+                    failure,
+                    probed_at,
+                );
+            }
+            capabilities.push("model.list".to_string());
+            capabilities.push("process.interrupt".to_string());
+            AntigravityCapabilityProbe {
+                result: agent_probe_result(
+                    AdapterKind::AntigravityApp.as_str(),
+                    Some(path_text),
+                    reported_version,
+                    fingerprint,
+                    AgentRuntimeProbeStatus::Ready,
+                    capabilities,
+                    Vec::new(),
+                    None,
+                    probed_at,
+                ),
+                models,
+            }
+        }
+        Ok(output) => {
+            let raw_detail = bounded_probe_text(&output.stdout.bytes, &output.stderr.bytes);
+            let lower = raw_detail.to_ascii_lowercase();
+            let authentication_required =
+                lower.contains("auth") || lower.contains("login") || lower.contains("credential");
+            let status = if authentication_required {
+                AgentRuntimeProbeStatus::AuthenticationRequired
+            } else {
+                AgentRuntimeProbeStatus::ProbeFailed
+            };
+            let detail = format!(
+                "Antigravity model discovery failed with {} (outputDigest={})",
+                output.status,
+                probe_output_digest(&output.stdout.bytes, &output.stderr.bytes)
+            );
+            let failure = public_probe_failure(
+                AdapterKind::AntigravityApp,
+                RuntimeFailureOrigin::Runtime,
+                if authentication_required {
+                    RuntimeFailurePhase::Authentication
+                } else {
+                    RuntimeFailurePhase::ModelCatalog
+                },
+                if authentication_required {
+                    "runtime_authentication_required"
+                } else {
+                    "runtime_process_failed"
+                },
+                if authentication_required {
+                    "需要登录 Antigravity"
+                } else {
+                    "Antigravity 模型检查失败"
+                },
+                &raw_detail,
+                &canonical,
+                true,
+            );
+            antigravity_probe_failure(
+                path_text,
+                fingerprint,
+                reported_version,
+                status,
+                detail,
+                failure,
+                probed_at,
+            )
+        }
+        Err(error) => {
+            let raw_detail = error.to_string();
+            let failure = public_probe_failure(
+                AdapterKind::AntigravityApp,
+                RuntimeFailureOrigin::Environment,
+                RuntimeFailurePhase::Spawn,
+                "runtime_spawn_failed",
+                "无法启动 Antigravity 模型检查",
+                &raw_detail,
+                &canonical,
+                true,
+            );
+            antigravity_probe_failure(
+                path_text,
+                fingerprint,
+                reported_version,
+                AgentRuntimeProbeStatus::ProbeFailed,
+                format!("failed to discover Antigravity models: {error}"),
+                failure,
+                probed_at,
+            )
+        }
+    }
+}
+
+async fn antigravity_model_output(path: &Path) -> Result<BoundedCommandOutput> {
+    let mut command = runtime_command(path, Some(AdapterKind::AntigravityApp));
+    command.arg("models");
+    bounded_output(&mut command, Duration::from_secs(60)).await
+}
+
+fn antigravity_model_ids(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(antigravity_model_identifier_from_line)
+        .collect()
+}
+
+fn antigravity_stream_json_supported(help: &str) -> bool {
+    help.contains("--output-format") && help.contains("stream-json")
+}
+
+fn is_antigravity_model_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':' | b'+')
+        })
+}
+
+fn antigravity_model_identifier_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let candidate = match line.split_once('\t') {
+        Some((identifier, _display_name)) => identifier.trim(),
+        None if !line.chars().any(char::is_whitespace) => line,
+        None => return None,
+    };
+    is_antigravity_model_identifier(candidate).then(|| candidate.to_string())
+}
+
+fn probe_output_digest(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(stdout);
+    digest.update([0]);
+    digest.update(stderr);
+    format!("sha256:{:x}", digest.finalize())
+}
+
+pub(crate) fn model_catalog_failure(
+    kind: AdapterKind,
+    error: &anyhow::Error,
+    path: &Path,
+) -> RuntimeFailureView {
+    let detail = format!("{error:#}");
+    let incompatible = detail.contains("claude_model_catalog_incompatible");
+    let origin = if incompatible {
+        RuntimeFailureOrigin::Compatibility
+    } else if detail.contains("Claude Code list_models rejected:")
+        || detail.contains("Claude Code initialize rejected:")
+    {
+        RuntimeFailureOrigin::Runtime
+    } else {
+        RuntimeFailureOrigin::Unknown
+    };
+    public_probe_failure(
+        kind,
+        origin,
+        RuntimeFailurePhase::ModelCatalog,
+        if incompatible {
+            "runtime_model_catalog_incompatible"
+        } else {
+            "runtime_model_catalog_unavailable"
+        },
+        "暂时无法获取模型目录",
+        &detail,
+        path,
+        true,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the probed Runtime and closed public failure fields stay explicit at this boundary"
+)]
+fn public_probe_failure(
+    runtime_kind: AdapterKind,
+    default_origin: RuntimeFailureOrigin,
+    phase: RuntimeFailurePhase,
+    default_code: &str,
+    default_summary: &str,
+    raw_detail: &str,
+    executable_path: &Path,
+    retryable: bool,
+) -> RuntimeFailureView {
+    let lower = raw_detail.to_ascii_lowercase();
+    let option_incompatible = [
+        "unknown option",
+        "unrecognized option",
+        "unsupported option",
+        "unknown command",
+        "unrecognized command",
+        "unsupported command",
+        "unknown argument",
+        "unrecognized argument",
+        "unsupported argument",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let local_capacity = [
+        "runtime_probe_frame_capacity_exceeded",
+        "runtime_probe_frame_capacity_invalid",
+        "runtime_probe_frame_allocation_failed",
+    ]
+    .into_iter()
+    .find(|code| raw_detail.contains(code));
+    let (origin, code, summary) = if let Some(code) = local_capacity {
+        (
+            RuntimeFailureOrigin::Rovai,
+            code,
+            "Rovai 探测读取容量不足或配置无效",
+        )
+    } else if option_incompatible {
+        (
+            RuntimeFailureOrigin::Compatibility,
+            "runtime_capability_incompatible",
+            match runtime_kind {
+                AdapterKind::ClaudeCodeCli => "当前 Claude Code 版本不支持所需命令",
+                AdapterKind::AntigravityApp => "当前 Antigravity 版本不支持所需命令",
+                _ => default_summary,
+            },
+        )
+    } else {
+        (default_origin, default_code, default_summary)
+    };
+    public_runtime_failure_from_output(
+        runtime_kind,
+        origin,
+        phase,
+        code,
+        summary,
+        Some(raw_detail),
+        &[(executable_path, "<runtime-executable>")],
+        retryable,
+    )
+}
+
+fn bounded_probe_text(stdout: &[u8], stderr: &[u8]) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    )
+}
+
+fn antigravity_probe_failure(
+    path: String,
+    fingerprint: Option<String>,
+    reported_version: Option<String>,
+    status: AgentRuntimeProbeStatus,
+    detail: String,
+    failure: RuntimeFailureView,
+    probed_at: String,
+) -> AntigravityCapabilityProbe {
+    let status = public_probe_status(status, &failure);
+    let mut result = agent_probe_result(
+        AdapterKind::AntigravityApp.as_str(),
+        Some(path),
+        reported_version,
+        fingerprint,
+        status,
+        Vec::new(),
+        antigravity_required_capabilities(),
+        Some(detail),
+        probed_at,
+    );
+    result.failure = Some(failure);
+    AntigravityCapabilityProbe {
+        result,
+        models: Vec::new(),
+    }
+}
+
+fn claude_code_probe_failure(
+    path: String,
+    fingerprint: Option<String>,
+    reported_version: Option<String>,
+    status: AgentRuntimeProbeStatus,
+    detail: String,
+    failure: RuntimeFailureView,
+    probed_at: String,
+) -> ClaudeCodeCapabilityProbe {
+    let status = public_probe_status(status, &failure);
+    let mut result = agent_probe_result(
+        AdapterKind::ClaudeCodeCli.as_str(),
+        Some(path),
+        reported_version,
+        fingerprint,
+        status,
+        Vec::new(),
+        claude_code_required_capabilities(),
+        Some(detail),
+        probed_at,
+    );
+    result.failure = Some(failure);
+    ClaudeCodeCapabilityProbe {
+        result,
+        models: Vec::new(),
+    }
+}
+
+fn public_probe_status(
+    default_status: AgentRuntimeProbeStatus,
+    failure: &RuntimeFailureView,
+) -> AgentRuntimeProbeStatus {
+    if failure.origin == RuntimeFailureOrigin::Compatibility {
+        AgentRuntimeProbeStatus::MissingCapabilities
+    } else if failure.phase == RuntimeFailurePhase::Authentication
+        && failure.code == "runtime_authentication_required"
+    {
+        AgentRuntimeProbeStatus::AuthenticationRequired
+    } else {
+        default_status
+    }
+}
+
+/// Uses the same inherited environment and active PATH overlay as an AgentRun.
+/// The same effective custom connection is used by checks and execution.
+async fn claude_code_model_catalog(
+    path: &Path,
+    deadline: Duration,
+) -> Result<Vec<ModelDescriptor>> {
+    let mut command = runtime_command(path, Some(AdapterKind::ClaudeCodeCli));
+    command.args([
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+    ]);
+    let mut process =
+        RuntimeProbeProcess::spawn(&mut command, DEFAULT_CAPTURE_LIMIT, DEFAULT_CLEANUP_TIMEOUT)
+            .context("failed to start Claude Code model query")?;
+    let result = {
+        let (stdin, lines) = process.split_io()?;
+        let query = async {
+            let mut method = "list_models";
+            let mut request_id = uuid::Uuid::new_v4().to_string();
+            write_claude_catalog_request(stdin, &request_id, method).await?;
+            while let Some(line) = lines.next_line().await? {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Borrow routing metadata and skip unrelated initialization fields. A large
+                // commands/agents inventory must not become a second retained JSON tree.
+                let message: ClaudeCatalogMessage<'_> = serde_json::from_str(&line)
+                    .context("claude_model_catalog_incompatible: invalid control frame")?;
+                if message.kind == "control_request" {
+                    bail!(
+                        "claude_model_catalog_incompatible: model query requires interactive control"
+                    );
+                }
+                if message.kind != "control_response" {
+                    continue;
+                }
+                let Some(response) = message.response else {
+                    continue;
+                };
+                if response.request_id != request_id {
+                    continue;
+                }
+                if response.subtype != "success" {
+                    let error = response.error.as_deref().unwrap_or("unknown control error");
+                    if method == "list_models" && claude_list_models_unsupported(error) {
+                        method = "initialize";
+                        request_id = uuid::Uuid::new_v4().to_string();
+                        write_claude_catalog_request(stdin, &request_id, method).await?;
+                        continue;
+                    }
+                    bail!("Claude Code {method} rejected: {error}");
+                }
+                let payload = response
+                    .response
+                    .context("claude_model_catalog_incompatible: missing model query response")?;
+                let payload: ClaudeCatalogModels = serde_json::from_str(payload.get())
+                    .context("claude_model_catalog_incompatible: invalid model query response")?;
+                drop(line);
+                return claude_code_models(&json!({"models": payload.models}));
+            }
+            bail!("Claude Code exited before returning the model catalog")
+        };
+        timeout(deadline, query)
+            .await
+            .context("Claude Code model query timed out")
+            .and_then(std::convert::identity)
+    };
+    // Reap on success, protocol failure and deadline expiry before publishing a result.
+    let stderr = process.finish().await?;
+    match result {
+        Ok(models) => Ok(models),
+        Err(error) if !stderr.bytes.is_empty() => Err(error.context(format!(
+            "Claude Code model query stderr: {}",
+            String::from_utf8_lossy(&stderr.bytes)
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ClaudeCatalogMessage<'a> {
+    #[serde(rename = "type")]
+    #[serde(borrow)]
+    kind: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    response: Option<ClaudeCatalogResponse<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeCatalogResponse<'a> {
+    #[serde(borrow)]
+    subtype: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    request_id: std::borrow::Cow<'a, str>,
+    error: Option<String>,
+    #[serde(borrow)]
+    response: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeCatalogModels {
+    models: Option<Vec<Value>>,
+}
+
+async fn write_claude_catalog_request(
+    stdin: &mut ManagedChildStdin,
+    request_id: &str,
+    method: &str,
+) -> Result<()> {
+    write_json_line(
+        stdin,
+        &json!({
+            "type": "control_request", "request_id": request_id,
+            "request": {"subtype": method},
+        }),
+    )
+    .await
+}
+
+fn claude_list_models_unsupported(error: &str) -> bool {
+    let error = error.trim();
+    [
+        "Unknown control request subtype: ",
+        "Unsupported control request subtype: ",
+        "Unknown control request type: ",
+        "Unsupported control request type: ",
+        "Unknown request type: ",
+        "Unsupported request type: ",
+    ]
+    .iter()
+    .any(|prefix| error.strip_prefix(prefix) == Some("list_models"))
+}
+
+fn claude_code_required_capabilities() -> Vec<String> {
+    [
+        "cli.print",
+        "output.json",
+        "input.stream_json",
+        "session.no_persistence",
+        CLAUDE_MODEL_CATALOG_CAPABILITY,
+        "conversation.resume",
+        "conversation.create",
+        "context.charter.native_append",
+        "team_tool.mcp_config",
+        "team_tool.allow",
+        "workspace.additional_roots",
+        "permission.mode",
+        "model.select",
+        "process.interrupt",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn first_nonempty_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(stderr).lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn antigravity_required_capabilities() -> Vec<String> {
+    [
+        "cli.print",
+        "conversation.resume",
+        "model.select",
+        "execution.mode",
+        "workspace.sandbox",
+        "workspace.additional_roots",
+        "session.log_file",
+        "print.timeout",
+        "model.list",
+        "process.interrupt",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+async fn acp_probe_at(
+    path: &Path,
+    kind: AdapterKind,
+    include_session: bool,
+    purpose: RuntimeLaunchPurpose,
+    fingerprint: Option<&str>,
+    known_version: Option<&str>,
+    catalog_requested: bool,
+) -> AcpCapabilityProbe {
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    let path_text = path.to_string_lossy().to_string();
+    let required_capabilities = acp_required_capabilities(kind);
+    if !matches!(
+        kind,
+        AdapterKind::OpencodeCli
+            | AdapterKind::CopilotCli
+            | AdapterKind::KiroCli
+            | AdapterKind::QoderCli
+            | AdapterKind::CodebuddyCli
+            | AdapterKind::QwenCode
+            | AdapterKind::TraeCnCli
+            | AdapterKind::GrokBuild
+            | AdapterKind::DeepseekHarness
+            | AdapterKind::CommandCodeCli
+            | AdapterKind::ClineCli
+            | AdapterKind::CursorAgent
+            | AdapterKind::KimiCodeCli
+            | AdapterKind::MinimaxCodeCli
+            | AdapterKind::HermesCli
+            | AdapterKind::ZcodeApp
+    ) {
+        return AcpCapabilityProbe {
+            result: agent_probe_result(
+                kind.as_str(),
+                Some(path_text),
+                None,
+                None,
+                AgentRuntimeProbeStatus::MissingCapabilities,
+                Vec::new(),
+                required_capabilities.clone(),
+                Some("This Adapter has no ACP integration in this release.".to_string()),
+                probed_at,
+            ),
+            initialize_result: None,
+            session_result: None,
+        };
+    }
+    if !path.is_file() {
+        return AcpCapabilityProbe {
+            result: agent_probe_result(
+                kind.as_str(),
+                Some(path_text),
+                None,
+                None,
+                AgentRuntimeProbeStatus::NotInstalled,
+                Vec::new(),
+                required_capabilities.clone(),
+                Some("Configured Runtime executable does not exist.".to_string()),
+                probed_at,
+            ),
+            initialize_result: None,
+            session_result: None,
+        };
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let fingerprint = match fingerprint {
+        Some(value) => Some(value.to_owned()),
+        None => executable_fingerprint_async(canonical.clone()).await,
+    };
+    if !runtime_launch_allowed(kind, purpose) {
+        return AcpCapabilityProbe {
+            result: agent_probe_result(
+                kind.as_str(),
+                Some(path_text),
+                discover_static_runtime_version(kind, &canonical),
+                fingerprint,
+                AgentRuntimeProbeStatus::ProbeFailed,
+                Vec::new(),
+                required_capabilities.clone(),
+                Some(runtime_launch_disallowed_detail(purpose)),
+                probed_at,
+            ),
+            initialize_result: None,
+            session_result: None,
+        };
+    }
+    let reported_version = if let Some(version) = known_version {
+        Some(version.to_owned())
+    } else {
+        let mut version_command = runtime_command(&canonical, Some(kind));
+        if kind == AdapterKind::ZcodeApp {
+            // Discovery already validated the bundle; do not execute its UI entrypoint.
+            match rovai_core::zcode::command(&canonical) {
+                Ok(command) => version_command = command,
+                Err(error) => {
+                    return AcpCapabilityProbe {
+                        result: agent_probe_result(
+                            kind.as_str(),
+                            Some(path_text),
+                            None,
+                            fingerprint,
+                            AgentRuntimeProbeStatus::ProbeFailed,
+                            Vec::new(),
+                            required_capabilities,
+                            Some(error.to_string()),
+                            probed_at,
+                        ),
+                        initialize_result: None,
+                        session_result: None,
+                    };
+                }
+            }
+        }
+        version_command.arg("--version");
+        let version_output =
+            match bounded_output(&mut version_command, Duration::from_secs(15)).await {
+                Ok(output) if output.status.success() => output,
+                Ok(output) => {
+                    return AcpCapabilityProbe {
+                        result: agent_probe_result(
+                            kind.as_str(),
+                            Some(path_text),
+                            None,
+                            fingerprint,
+                            AgentRuntimeProbeStatus::ProbeFailed,
+                            Vec::new(),
+                            required_capabilities.clone(),
+                            Some(command_detail(
+                                &output.stdout.bytes,
+                                &output.stderr.bytes,
+                                "Runtime version check failed",
+                            )),
+                            probed_at,
+                        ),
+                        initialize_result: None,
+                        session_result: None,
+                    };
+                }
+                Err(error) => {
+                    return AcpCapabilityProbe {
+                        result: agent_probe_result(
+                            kind.as_str(),
+                            Some(path_text),
+                            None,
+                            fingerprint,
+                            AgentRuntimeProbeStatus::ProbeFailed,
+                            Vec::new(),
+                            required_capabilities.clone(),
+                            Some(format!("failed to inspect Runtime CLI: {error}")),
+                            probed_at,
+                        ),
+                        initialize_result: None,
+                        session_result: None,
+                    };
+                }
+            };
+        first_nonempty_line(&version_output.stdout.bytes, &version_output.stderr.bytes)
+    };
+    if kind == AdapterKind::ZcodeApp
+        && !rovai_core::zcode::supported_version(reported_version.as_deref())
+    {
+        return AcpCapabilityProbe {
+            result: agent_probe_result(
+                kind.as_str(),
+                Some(path_text),
+                reported_version,
+                fingerprint,
+                AgentRuntimeProbeStatus::MissingCapabilities,
+                Vec::new(),
+                vec![format!(
+                    "runtime.version>={}",
+                    rovai_core::zcode::MINIMUM_VERSION
+                )],
+                Some("Official ZCode kernel 0.16.5 or later is required.".to_string()),
+                probed_at,
+            ),
+            initialize_result: None,
+            session_result: None,
+        };
+    }
+    if kind == AdapterKind::CursorAgent
+        && reported_version
+            .as_deref()
+            .is_none_or(|version| !is_cursor_agent_version(version))
+    {
+        return AcpCapabilityProbe {
+            result: agent_probe_result(
+                kind.as_str(),
+                Some(path_text),
+                reported_version,
+                fingerprint,
+                AgentRuntimeProbeStatus::MissingCapabilities,
+                Vec::new(),
+                required_capabilities.clone(),
+                Some("The executable did not report a Cursor Agent build identity.".to_string()),
+                probed_at,
+            ),
+            initialize_result: None,
+            session_result: None,
+        };
+    }
+    if (kind == AdapterKind::GrokBuild
+        && !grok_build_minimum_version_satisfied(reported_version.as_deref()))
+        || (kind == AdapterKind::DeepseekHarness
+            && !crate::dsh::supported_version(reported_version.as_deref()))
+        || (kind == AdapterKind::CommandCodeCli
+            && !crate::command_code_acp::supported_version(reported_version.as_deref()))
+    {
+        return AcpCapabilityProbe {
+            result: agent_probe_result(
+                kind.as_str(),
+                Some(path_text),
+                reported_version,
+                fingerprint,
+                AgentRuntimeProbeStatus::MissingCapabilities,
+                Vec::new(),
+                vec![format!(
+                    "runtime.version>={}",
+                    if kind == AdapterKind::CommandCodeCli {
+                        crate::command_code_acp::MINIMUM_VERSION
+                    } else if kind == AdapterKind::DeepseekHarness {
+                        crate::dsh::MINIMUM_VERSION
+                    } else {
+                        GROK_BUILD_MINIMUM_VERSION_LABEL
+                    }
+                )],
+                Some(format!(
+                    "{} >= {} is required.",
+                    kind.display_name(),
+                    if kind == AdapterKind::CommandCodeCli {
+                        crate::command_code_acp::MINIMUM_VERSION
+                    } else if kind == AdapterKind::DeepseekHarness {
+                        crate::dsh::MINIMUM_VERSION
+                    } else {
+                        GROK_BUILD_MINIMUM_VERSION_LABEL
+                    }
+                )),
+                probed_at,
+            ),
+            initialize_result: None,
+            session_result: None,
+        };
+    }
+    let probe = run_acp_probe_with_scope(
+        &canonical,
+        kind,
+        include_session,
+        purpose,
+        catalog_requested && kind == AdapterKind::MinimaxCodeCli,
+        None,
+        reported_version.as_deref(),
+    )
+    .await;
+    match probe {
+        Ok((initialize_result, session_result)) => {
+            let mut capabilities = acp_observed_capabilities(
+                kind,
+                reported_version.as_deref(),
+                fingerprint.as_deref(),
+                &initialize_result,
+                session_result.as_ref(),
+            );
+            let additive_mcp = additive_acp_mcp_verified(kind);
+            if additive_mcp && kind != AdapterKind::ZcodeApp {
+                capabilities.push("mcp.additive_per_run".to_string());
+            }
+            capabilities.sort();
+            capabilities.dedup();
+            let required = required_capabilities;
+            let missing = required
+                .iter()
+                .filter(|required| !capabilities.contains(required))
+                .cloned()
+                .collect::<Vec<_>>();
+            let status = if missing.is_empty() {
+                AgentRuntimeProbeStatus::Ready
+            } else {
+                AgentRuntimeProbeStatus::MissingCapabilities
+            };
+            let mut detail = if matches!(
+                kind,
+                AdapterKind::ZcodeApp | AdapterKind::DeepseekHarness | AdapterKind::CommandCodeCli
+            ) && missing.is_empty()
+            {
+                Some("Native configuration and basic connection checked in a temporary workspace; no prompt sent. Model generation, balance and advanced capabilities were not tested. Native initialization may access the network and write state.".to_string())
+            } else {
+                (!missing.is_empty()).then(|| {
+                    format!(
+                        "ACP handshake succeeded, but required capabilities are missing: {}",
+                        missing.join(", ")
+                    )
+                })
+            };
+            if kind == AdapterKind::DeepseekHarness
+                && let Some(diagnostic) = initialize_result
+                    .pointer("/_meta/rovaiDshModels")
+                    .and_then(crate::dsh::preparation_diagnostic)
+            {
+                detail = Some(format!("{} {diagnostic}", detail.unwrap_or_default()));
+            }
+            AcpCapabilityProbe {
+                result: agent_probe_result(
+                    kind.as_str(),
+                    Some(path_text),
+                    reported_version,
+                    fingerprint,
+                    status,
+                    capabilities,
+                    missing,
+                    detail,
+                    probed_at,
+                ),
+                initialize_result: Some(initialize_result),
+                session_result,
+            }
+        }
+        Err(error) => {
+            let detail = format!("ACP probe failed: {error:#}");
+            let status = classify_acp_probe_failure(&detail);
+            AcpCapabilityProbe {
+                result: agent_probe_result(
+                    kind.as_str(),
+                    Some(path_text),
+                    reported_version,
+                    fingerprint,
+                    status,
+                    Vec::new(),
+                    required_capabilities,
+                    Some(detail),
+                    probed_at,
+                ),
+                initialize_result: None,
+                session_result: None,
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "extended-tests"))]
+async fn run_acp_probe(
+    path: &Path,
+    kind: AdapterKind,
+    include_session: bool,
+    purpose: RuntimeLaunchPurpose,
+) -> Result<(Value, Option<Value>)> {
+    let version = if kind == AdapterKind::OpencodeCli {
+        Some(read_opencode_version(path).await?)
+    } else {
+        None
+    };
+    run_acp_probe_with_scope(
+        path,
+        kind,
+        include_session,
+        purpose,
+        false,
+        None,
+        version.as_deref(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_acp_probe_with_scope(
+    path: &Path,
+    kind: AdapterKind,
+    include_session: bool,
+    purpose: RuntimeLaunchPurpose,
+    catalog_only: bool,
+    target: Option<(&str, Option<crate::agent_profile::DshModelSource>)>,
+    reported_version: Option<&str>,
+) -> Result<(Value, Option<Value>)> {
+    if !runtime_launch_allowed(kind, purpose) {
+        bail!(runtime_launch_disallowed_detail(purpose));
+    }
+    if kind == AdapterKind::ZcodeApp {
+        return rovai_core::zcode::transport::probe(path, include_session).await;
+    }
+    let probe_root = env::temp_dir().join(format!("rovai-acp-probe-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&probe_root)?;
+    let _probe_root_cleanup = ProbeRootCleanup(probe_root.clone());
+    if kind == AdapterKind::KiroCli {
+        write_kiro_additive_agent_config(&probe_root, &Default::default())?;
+    }
+    let mut command = runtime_command(path, Some(kind));
+    if kind == AdapterKind::TraeCnCli {
+        // Global options precede `acp serve` in TRAE CLI 2.0.
+        command.args(["--permission-mode", "default"]);
+    }
+    if kind == AdapterKind::DeepseekHarness {
+        crate::dsh::configure_probe(&mut command, &probe_root)?;
+    } else if kind == AdapterKind::OpencodeCli && catalog_only {
+        crate::opencode_compat::configure_catalog_command(&mut command);
+    } else {
+        // The full check already read (or reused) its version. An empty OpenCode
+        // version must fail its existing generation gate, not run --version again.
+        configure_acp_command(&mut command, kind, false, reported_version)?;
+    }
+    if kind == AdapterKind::ClineCli {
+        crate::cline::configure_native_environment(&mut command)?;
+    }
+    if kind == AdapterKind::CodebuddyCli
+        && let Ok(model) = env::var("ROVAI_CODEBUDDY_MODEL")
+    {
+        let model = model.trim();
+        if !model.is_empty() {
+            command.arg("--model").arg(model);
+        }
+    }
+    let grok_byok_configured =
+        kind == AdapterKind::GrokBuild && crate::acp::grok_native_byok_configured()?;
+    if kind == AdapterKind::GrokBuild {
+        crate::acp::configure_grok_native_environment(&mut command)?;
+    }
+    // Probe the same native Home/configuration as a formal AgentRun. Only the
+    // working directory and its additive configuration belong to this probe;
+    // native initialization may persist state, which is not ours to remove.
+    command.current_dir(&probe_root).stdin(Stdio::piped());
+    let mut process = RuntimeProbeProcess::spawn_with_purpose(
+        &mut command,
+        DEFAULT_CAPTURE_LIMIT,
+        DEFAULT_CLEANUP_TIMEOUT,
+        if kind == AdapterKind::HermesCli {
+            crate::managed_process::ManagedProcessPurpose::RuntimeConnection
+        } else {
+            crate::managed_process::ManagedProcessPurpose::RuntimeProbe
+        },
+    )
+    .with_context(|| format!("failed to start {} as an ACP server", path.display()))?;
+    let deadline = Duration::from_secs(if kind == AdapterKind::HermesCli {
+        90
+    } else {
+        30
+    });
+    let result = {
+        let (stdin, lines) = process.split_io()?;
+        let exchange = async {
+            let model_preparation = if kind == AdapterKind::DeepseekHarness {
+                let prepared = crate::dsh::await_model_preparation(&probe_root).await?;
+                if !crate::dsh::model_inputs_unchanged(&prepared) {
+                    bail!("dsh_model_configuration_changed_during_preparation");
+                }
+                Some(prepared)
+            } else {
+                None
+            };
+            let dsh_options_context = (kind == AdapterKind::DeepseekHarness)
+                .then(|| crate::dsh::model_options_context(path))
+                .transpose()?;
+            write_json_line(
+                stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": 1,
+                        "clientCapabilities": {
+                            "fs": {"readTextFile": true, "writeTextFile": true},
+                            "terminal": false
+                        },
+                        "clientInfo": {
+                            "name": "rovai_probe",
+                            "title": "Rovai-ai Runtime Probe",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
+                    }
+                }),
+            )
+            .await?;
+            let mut initialize = read_rpc_result(lines, 1).await?;
+            if kind == AdapterKind::HermesCli {
+                anyhow::ensure!(
+                    crate::hermes::supported_version(
+                        initialize
+                            .pointer("/agentInfo/version")
+                            .and_then(Value::as_str)
+                    ),
+                    "Unsupported Hermes ACP version"
+                );
+            }
+            if let Some(preparation) = &model_preparation {
+                crate::dsh::annotate_session(&mut initialize, preparation);
+            }
+            if initialize.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+                bail!("Runtime did not negotiate ACP v1");
+            }
+            if !include_session {
+                return Ok::<_, anyhow::Error>((initialize, None));
+            }
+            let auth_method = match kind {
+                AdapterKind::CursorAgent => Some(("cursor_login", "Cursor")),
+                AdapterKind::GrokBuild => Some((
+                    select_grok_noninteractive_auth_method(&initialize, grok_byok_configured)?,
+                    "Grok Build",
+                )),
+                _ => None,
+            };
+            let session_request_id = if let Some((method_id, runtime_name)) = auth_method {
+                let advertised = initialize
+                    .get("authMethods")
+                    .and_then(Value::as_array)
+                    .is_some_and(|methods| {
+                        methods.iter().any(|method| {
+                            method.get("id").and_then(Value::as_str) == Some(method_id)
+                        })
+                    });
+                if !advertised {
+                    bail!(
+                        "{runtime_name} ACP did not advertise required authentication method {method_id}"
+                    );
+                }
+                write_json_line(
+                    stdin,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "authenticate",
+                        "params": {"methodId": method_id, "_meta": {"headless": true}}
+                    }),
+                )
+                .await?;
+                timeout(Duration::from_secs(15), read_rpc_result(lines, 2))
+                    .await
+                    .with_context(|| {
+                        format!("{runtime_name} authentication required or did not complete")
+                    })??;
+                3
+            } else {
+                2
+            };
+            let session_params = if kind == AdapterKind::GrokBuild {
+                let attachment_root = probe_root.join("attachments");
+                let run_tmp = probe_root.join("run-tmp");
+                std::fs::create_dir_all(&attachment_root)?;
+                std::fs::create_dir_all(&run_tmp)?;
+                crate::acp::build_acp_new_session_params(
+                    kind,
+                    &probe_root.to_string_lossy(),
+                    &[],
+                    &[
+                        attachment_root.to_string_lossy().into_owned(),
+                        run_tmp.to_string_lossy().into_owned(),
+                    ],
+                    Some("Rovai Grok Deep Probe native rules marker"),
+                )
+            } else {
+                json!({"cwd": probe_root, "mcpServers": []})
+            };
+            write_json_line(
+                stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": session_request_id,
+                    "method": "session/new",
+                    "params": session_params
+                }),
+            )
+            .await?;
+            let mut session = read_rpc_result(lines, session_request_id).await?;
+            if let Some(preparation) = &model_preparation {
+                if !crate::dsh::model_inputs_unchanged(preparation) {
+                    bail!("dsh_model_configuration_changed_during_preparation");
+                }
+                crate::dsh::annotate_session(&mut session, preparation);
+            }
+            if let Some((model_id, source)) = target {
+                if kind != AdapterKind::DeepseekHarness {
+                    bail!("Target-model option discovery is only supported for DSH");
+                }
+                let preparation = model_preparation
+                    .as_ref()
+                    .context("DSH model preparation missing")?;
+                if !crate::dsh::selected_route_available(preparation, model_id, source) {
+                    bail!("所选 DSH 模型来源不可用；未切换到同名的其他来源");
+                }
+                let models =
+                    crate::agent_runtime_adapter::acp_model_catalog_for_adapter(kind, &session)?;
+                crate::agent_runtime_adapter::validate_live_model_selection(
+                    &models,
+                    model_id,
+                    &json!({}),
+                )?;
+                let default_model =
+                    crate::agent_runtime_adapter::acp_runtime_model_id_from_session(&session);
+                write_json_line(stdin, &json!({
+                    "jsonrpc": "2.0", "id": session_request_id + 1,
+                    "method": "session/set_config_option",
+                    "params": {"sessionId": session["sessionId"], "configId": "model", "value": model_id}
+                })).await?;
+                let selected = read_rpc_result(lines, session_request_id + 1).await?;
+                session = crate::agent_runtime_adapter::dsh_model_config_after_selection(
+                    &session, &selected, model_id,
+                )?;
+                if let Some(default_model) = default_model {
+                    session["_meta"]["rovaiDshDefaultModel"] = json!(default_model);
+                }
+                if !crate::dsh::model_inputs_unchanged(preparation) {
+                    bail!("dsh_model_configuration_changed_during_preparation");
+                }
+            }
+            if let Some(context) = dsh_options_context {
+                anyhow::ensure!(
+                    crate::dsh::model_options_context(path)? == context,
+                    "dsh_model_configuration_changed_during_preparation"
+                );
+                session["_meta"]["rovaiDshOptionsContext"] = json!(context);
+                session["_meta"]["rovaiDshOptionsObservedAt"] =
+                    json!(chrono::Utc::now().to_rfc3339());
+            }
+            if kind == AdapterKind::MinimaxCodeCli && catalog_only {
+                // Only a complete catalog request traverses model-specific options.
+                // ACP advertises thinking effort only for the selected model. Probe
+                // each native ID in this disposable Session; no inference or global
+                // provider change is involved. Restore its initial selection afterward.
+                let models =
+                    crate::agent_runtime_adapter::acp_model_catalog_for_adapter(kind, &session)?;
+                anyhow::ensure!(
+                    models.len() <= 256,
+                    "MiniMax model catalog exceeds probe bound"
+                );
+                let original =
+                    crate::agent_runtime_adapter::acp_runtime_model_id_from_session(&session)
+                        .context("MiniMax default model missing")?;
+                let mut options = serde_json::Map::new();
+                for (index, model) in models.iter().enumerate() {
+                    let id = 1000 + index as u64;
+                    write_json_line(stdin, &json!({"jsonrpc":"2.0", "id":id, "method":"session/set_config_option",
+                        "params":{"sessionId":session["sessionId"], "configId":"model", "value":model.id}})).await?;
+                    // Native catalogs may include an unconfigured Provider or a
+                    // variant that this release cannot select. Its unavailable
+                    // options must not hide the working native default/catalog.
+                    let Ok(selected) = read_rpc_result(lines, id).await else {
+                        continue;
+                    };
+                    anyhow::ensure!(
+                        crate::agent_runtime_adapter::acp_runtime_model_id_from_session(&selected)
+                            .as_deref()
+                            == Some(model.id.as_str()),
+                        "MiniMax did not confirm model selection"
+                    );
+                    let chosen = crate::agent_runtime_adapter::acp_model_catalog_for_adapter(
+                        kind, &selected,
+                    )?
+                    .into_iter()
+                    .find(|entry| entry.id == model.id)
+                    .context("MiniMax selected model missing")?;
+                    options.insert(model.id.clone(), serde_json::to_value(chosen.options)?);
+                }
+                write_json_line(stdin, &json!({"jsonrpc":"2.0", "id":2000, "method":"session/set_config_option",
+                    "params":{"sessionId":session["sessionId"], "configId":"model", "value":original}})).await?;
+                let restored = read_rpc_result(lines, 2000).await?;
+                anyhow::ensure!(
+                    crate::agent_runtime_adapter::acp_runtime_model_id_from_session(&restored)
+                        .as_deref()
+                        == Some(original.as_str()),
+                    "MiniMax did not restore probe selection"
+                );
+                session["configOptions"] = restored["configOptions"].clone();
+                session["_meta"]["rovaiMinimaxModelOptions"] = Value::Object(options);
+            }
+            let _session_id = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .context("ACP session/new did not return sessionId")?;
+            if matches!(
+                kind,
+                AdapterKind::KiroCli | AdapterKind::GrokBuild | AdapterKind::MinimaxCodeCli
+            ) {
+                let current_model =
+                    crate::agent_runtime_adapter::acp_runtime_model_id_from_session(&session)
+                        .context("ACP Session did not report its current model")?;
+                let models =
+                    crate::agent_runtime_adapter::acp_model_catalog_for_adapter(kind, &session)?;
+                anyhow::ensure!(
+                    models.iter().any(|model| model.id == current_model),
+                    "ACP current model is absent from the available model catalog"
+                );
+            }
+            Ok((initialize, Some(session)))
+        };
+        match timeout(deadline, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("ACP probe timed out")),
+        }
+    };
+    let stderr = match process.finish().await {
+        Ok(stderr) => stderr,
+        Err(cleanup_error) => {
+            return match result {
+                Ok(_) => Err(cleanup_error.context("ACP probe cleanup failed")),
+                Err(error) => {
+                    Err(error.context(format!("ACP probe cleanup failed: {cleanup_error:#}")))
+                }
+            };
+        }
+    };
+    match result {
+        Ok(result) => Ok(result),
+        Err(error) if stderr.bytes.iter().any(|byte| !byte.is_ascii_whitespace()) => {
+            let detail = String::from_utf8_lossy(&stderr.bytes);
+            let bounded = detail.chars().take(4096).collect::<String>();
+            let truncation = if stderr.truncated { " [truncated]" } else { "" };
+            Err(error.context(format!("ACP stderr{truncation}: {bounded}")))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn select_grok_noninteractive_auth_method(
+    initialize: &Value,
+    prefer_api_key: bool,
+) -> Result<&'static str> {
+    const SUPPORTED: [&str; 2] = ["cached_token", "xai.api_key"];
+    let advertised = initialize
+        .get("authMethods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|method| method.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let default_method = initialize
+        .pointer("/_meta/defaultAuthMethodId")
+        .and_then(Value::as_str);
+    if prefer_api_key && advertised.contains(&"xai.api_key") {
+        return Ok("xai.api_key");
+    }
+    if let Some(default_method) = default_method
+        && advertised.contains(&default_method)
+        && let Some(method) = SUPPORTED.iter().find(|method| **method == default_method)
+    {
+        return Ok(*method);
+    }
+    for method in SUPPORTED {
+        if advertised.contains(&method) {
+            return Ok(method);
+        }
+    }
+    let advertised = if advertised.is_empty() {
+        "none".to_string()
+    } else {
+        advertised.join(", ")
+    };
+    bail!(
+        "Grok Build ACP did not advertise a non-interactive authentication method \
+         (expected cached_token or xai.api_key; advertised: {advertised}). \
+         Run `grok login` or `grok login --device-auth` before retrying account authentication"
+    )
+}
+
+pub(crate) async fn inspect_grok_native_mcp_server_names(
+    executable: &Path,
+    cwd: &Path,
+) -> Result<BTreeSet<String>> {
+    if !runtime_launch_allowed(
+        AdapterKind::GrokBuild,
+        RuntimeLaunchPurpose::DispatchPreflight,
+    ) {
+        bail!("runtime_launch_disallowed:dispatch_preflight");
+    }
+    let mut command = runtime_command(executable, Some(AdapterKind::GrokBuild));
+    command
+        .args(["--no-auto-update", "inspect", "--json"])
+        .current_dir(cwd);
+    let output = bounded_output(&mut command, Duration::from_secs(15))
+        .await
+        .context("Grok native MCP inspection failed")?;
+    if !output.status.success() {
+        bail!(
+            "Grok native MCP inspection exited unsuccessfully (status={})",
+            output.status
+        );
+    }
+    let document = serde_json::from_slice::<Value>(&output.stdout.bytes)
+        .context("Grok native MCP inspection returned invalid JSON")?;
+    grok_native_mcp_server_names_from_inspect(&document)
+}
+
+fn grok_native_mcp_server_names_from_inspect(document: &Value) -> Result<BTreeSet<String>> {
+    // Reserve every discovered native name, including disabled or untrusted
+    // project definitions. Grok resolves same-name precedence before applying
+    // those gates, so such a definition can still shadow a process plugin and
+    // must not leave a Rovai exposure falsely marked Ready.
+    let servers = document
+        .get("mcpServers")
+        .context("Grok inspect JSON omitted mcpServers")?;
+    let mut names = BTreeSet::new();
+    match servers {
+        Value::Array(servers) => {
+            for server in servers {
+                let name = server
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .context("Grok inspect JSON contains an MCP server without a name")?;
+                names.insert(name.to_string());
+            }
+        }
+        Value::Object(servers) => {
+            names.extend(
+                servers
+                    .keys()
+                    .filter(|name| !name.trim().is_empty())
+                    .cloned(),
+            );
+        }
+        _ => bail!("Grok inspect JSON mcpServers has an unsupported shape"),
+    }
+    Ok(names)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraePromptProbeMode {
+    NoPermission,
+    RejectPermission,
+    AllowThenCancel,
+}
+
+#[derive(Debug, Default)]
+struct TraePromptProbeObservation {
+    assistant_text: String,
+    saw_session_update: bool,
+    tool_call_ids: BTreeSet<String>,
+    terminal_tool_call_ids: BTreeSet<String>,
+    permission_request_count: usize,
+    cancel_sent: bool,
+    stop_reason: String,
+}
+
+#[allow(dead_code)]
+async fn run_trae_behavioral_probe(
+    stdin: &mut ManagedChildStdin,
+    lines: &mut BoundedLineReader<ManagedChildStdout>,
+    session_id: &str,
+    session: &Value,
+    probe_root: &Path,
+    native_append_marker: &str,
+) -> Result<TraeBehavioralProbeEvidence> {
+    let current_model = session
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
+        })
+        .and_then(|option| option.get("currentValue"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("TRAE behavioral capability missing: model config has no current value")?;
+    write_json_line(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/set_config_option",
+            "params": {
+                "sessionId": session_id,
+                "configId": "model",
+                "type": "select",
+                "value": current_model
+            }
+        }),
+    )
+    .await?;
+    read_rpc_result(lines, 3).await?;
+
+    let basic = run_trae_prompt_probe(
+        stdin,
+        lines,
+        session_id,
+        4,
+        "Do not call tools or inspect files. What is the opaque Rovai Runtime marker defined in your system instructions? Reply with the marker only.",
+        TraePromptProbeMode::NoPermission,
+    )
+    .await?;
+    if basic.stop_reason != "end_turn" {
+        bail!(
+            "TRAE behavioral capability missing: ordinary prompt ended with {:?}",
+            basic.stop_reason
+        );
+    }
+    if !basic.assistant_text.contains(native_append_marker) {
+        bail!(
+            "TRAE behavioral capability missing: native appended system prompt was not observable"
+        );
+    }
+    if !basic.saw_session_update {
+        bail!("TRAE behavioral capability missing: ordinary prompt emitted no session/update");
+    }
+
+    let denied_path = probe_root.join("permission-denied.txt");
+    let denied = run_trae_prompt_probe(
+        stdin,
+        lines,
+        session_id,
+        5,
+        &format!(
+            "Use the file editing tool exactly once to create {} with exactly DENIED_PROBE and a trailing newline. Do not use shell, read, list, or verification tools. After the tool result, reply exactly DENIED_PROBE_DONE.",
+            denied_path.display()
+        ),
+        TraePromptProbeMode::RejectPermission,
+    )
+    .await?;
+    if denied.stop_reason != "end_turn" {
+        bail!(
+            "TRAE behavioral capability missing: denied prompt ended with {:?}",
+            denied.stop_reason
+        );
+    }
+    if denied.permission_request_count == 0 {
+        bail!("TRAE behavioral capability missing: risky tool emitted no permission request");
+    }
+    if denied.tool_call_ids.len() != 1 || denied.terminal_tool_call_ids != denied.tool_call_ids {
+        bail!("TRAE behavioral capability missing: tool lifecycle did not retain one stable ID");
+    }
+    if denied_path.exists() {
+        bail!("TRAE behavioral capability missing: rejected write produced a file");
+    }
+
+    let cancel_marker = probe_root.join("cancel-marker.txt");
+    let cancelled = run_trae_prompt_probe(
+        stdin,
+        lines,
+        session_id,
+        6,
+        &format!(
+            "Use the Bash tool exactly once to run this command and do not use any other tool: sleep 20; printf CANCEL_PROBE > '{}'. Wait for the command before replying.",
+            cancel_marker.display()
+        ),
+        TraePromptProbeMode::AllowThenCancel,
+    )
+    .await?;
+    if !cancelled.cancel_sent || cancelled.stop_reason != "cancelled" {
+        bail!(
+            "TRAE behavioral capability missing: cancel did not produce a cancelled prompt terminal"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    if cancel_marker.exists() {
+        bail!("TRAE behavioral capability missing: cancelled tool produced its delayed marker");
+    }
+
+    Ok(TraeBehavioralProbeEvidence {
+        capabilities: [
+            "session.prompt",
+            "session.cancel",
+            "session.update",
+            "structured_permission_request",
+            "session.set_config_option",
+            "tool_call.stable_id",
+            "stdout.json_rpc_only",
+            "context.charter.native_append",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    })
+}
+
+async fn run_trae_prompt_probe(
+    stdin: &mut ManagedChildStdin,
+    lines: &mut BoundedLineReader<ManagedChildStdout>,
+    session_id: &str,
+    request_id: u64,
+    prompt: &str,
+    mode: TraePromptProbeMode,
+) -> Result<TraePromptProbeObservation> {
+    write_json_line(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}]
+            }
+        }),
+    )
+    .await?;
+    let mut observation = TraePromptProbeObservation::default();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: Value = serde_json::from_str(&line).context("invalid RPC response")?;
+        let method = message.get("method").and_then(Value::as_str);
+        if method.is_none() && message.get("id").and_then(Value::as_u64) == Some(request_id) {
+            if let Some(error) = message.get("error") {
+                bail!("TRAE behavioral prompt was rejected: {error}");
+            }
+            observation.stop_reason = message
+                .pointer("/result/stopReason")
+                .and_then(Value::as_str)
+                .context("TRAE behavioral capability missing: prompt result has no stopReason")?
+                .to_string();
+            return Ok(observation);
+        }
+        match method {
+            Some("session/update") => {
+                observation.saw_session_update = true;
+                let update = message
+                    .pointer("/params/update")
+                    .context("TRAE behavioral capability missing: session/update has no update")?;
+                if update.get("sessionUpdate").and_then(Value::as_str)
+                    == Some("agent_message_chunk")
+                    && let Some(text) = update.pointer("/content/text").and_then(Value::as_str)
+                {
+                    observation.assistant_text.push_str(text);
+                }
+                if matches!(
+                    update.get("sessionUpdate").and_then(Value::as_str),
+                    Some("tool_call" | "tool_call_update")
+                ) {
+                    let tool_call_id = update
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .context(
+                            "TRAE behavioral capability missing: tool update has no stable toolCallId",
+                        )?
+                        .to_string();
+                    observation.tool_call_ids.insert(tool_call_id.clone());
+                    if matches!(
+                        update.get("status").and_then(Value::as_str),
+                        Some("completed" | "failed")
+                    ) {
+                        observation.terminal_tool_call_ids.insert(tool_call_id);
+                    }
+                }
+            }
+            Some("session/request_permission") => {
+                if mode == TraePromptProbeMode::NoPermission {
+                    bail!(
+                        "TRAE behavioral capability missing: no-tool prompt requested permission"
+                    );
+                }
+                let server_request_id = message
+                    .get("id")
+                    .cloned()
+                    .context("TRAE behavioral capability missing: permission request has no id")?;
+                let params = message.get("params").context(
+                    "TRAE behavioral capability missing: permission request has no params",
+                )?;
+                validate_trae_permission_request(params, session_id, &mut observation)?;
+                let result =
+                    if mode == TraePromptProbeMode::AllowThenCancel && !observation.cancel_sent {
+                        crate::acp::legacy_approval_result(AdapterKind::TraeCnCli, params, true)?
+                    } else {
+                        crate::acp::rejection_result(params)?
+                    };
+                write_json_line(
+                    stdin,
+                    &json!({"jsonrpc": "2.0", "id": server_request_id, "result": result}),
+                )
+                .await?;
+                observation.permission_request_count += 1;
+                if mode == TraePromptProbeMode::AllowThenCancel && !observation.cancel_sent {
+                    write_json_line(
+                        stdin,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/cancel",
+                            "params": {"sessionId": session_id}
+                        }),
+                    )
+                    .await?;
+                    observation.cancel_sent = true;
+                }
+            }
+            Some(_) if message.get("id").is_some() => {
+                let server_request_id = message.get("id").cloned().unwrap_or(Value::Null);
+                write_json_line(
+                    stdin,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": server_request_id,
+                        "error": {"code": -32601, "message": "Unsupported during Rovai TRAE probe"}
+                    }),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+    bail!("TRAE ACP server exited before behavioral prompt completed")
+}
+
+fn validate_trae_permission_request(
+    params: &Value,
+    expected_session_id: &str,
+    observation: &mut TraePromptProbeObservation,
+) -> Result<()> {
+    if params.get("sessionId").and_then(Value::as_str) != Some(expected_session_id) {
+        bail!("TRAE behavioral capability missing: permission request crossed Session identity");
+    }
+    let tool_call_id = params
+        .pointer("/toolCall/toolCallId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("TRAE behavioral capability missing: permission request has no stable toolCallId")?
+        .to_string();
+    observation.tool_call_ids.insert(tool_call_id);
+    let options = params
+        .get("options")
+        .and_then(Value::as_array)
+        .filter(|options| !options.is_empty())
+        .context("TRAE behavioral capability missing: permission request has no options")?;
+    let mut option_ids = BTreeSet::new();
+    for option in options {
+        let option_id = option
+            .get("optionId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .context(
+                "TRAE behavioral capability missing: permission option has no stable optionId",
+            )?;
+        if !option_ids.insert(option_id) {
+            bail!("TRAE behavioral capability missing: permission option IDs are not unique");
+        }
+    }
+    Ok(())
+}
+
+pub fn configure_acp_command(
+    command: &mut Command,
+    kind: AdapterKind,
+    allow_all: bool,
+    version: Option<&str>,
+) -> Result<()> {
+    match kind {
+        AdapterKind::OpencodeCli => {
+            crate::opencode_compat::Generation::require(version)?.configure_command(command);
+        }
+        AdapterKind::CopilotCli => {
+            // ACP uses the child process's stdio; interactive remote/session-sync
+            // flags are unnecessary here and were removed in Copilot 1.0.103.
+            command.args([
+                "--acp",
+                "--stdio",
+                "--no-auto-update",
+                "--no-color",
+                "--log-level",
+                "error",
+            ]);
+            if allow_all {
+                command.arg("--allow-all");
+            }
+        }
+        AdapterKind::KiroCli => {
+            command.args(["acp", "--agent", KIRO_ADDITIVE_AGENT_NAME]);
+            if allow_all {
+                command.arg("--trust-all-tools");
+            }
+        }
+        AdapterKind::QoderCli | AdapterKind::CodebuddyCli => {
+            command.arg("--acp");
+        }
+        AdapterKind::QwenCode => {
+            command.arg("--acp");
+        }
+        AdapterKind::TraeCnCli => {
+            command.args(["acp", "serve"]);
+        }
+        AdapterKind::CursorAgent => {
+            command.arg("acp");
+        }
+        AdapterKind::HermesCli => crate::hermes::configure_command(command)?,
+        AdapterKind::KimiCodeCli | AdapterKind::MinimaxCodeCli => {
+            command.arg("acp");
+        }
+        AdapterKind::CommandCodeCli => {
+            command.arg("acp").env("COMMANDCODE_SKIP_UPDATES", "1");
+        }
+        AdapterKind::DeepseekHarness => {
+            command.args(["--profile", "acp"]);
+        }
+        AdapterKind::GrokBuild => {
+            configure_grok_acp_command(command, None);
+        }
+        AdapterKind::ClineCli => {
+            command
+                .arg("--acp")
+                .env("CLINE_SESSION_BACKEND_MODE", "local");
+        }
+        AdapterKind::CodexCli
+        | AdapterKind::Pi
+        | AdapterKind::ClaudeCodeCli
+        | AdapterKind::AntigravityApp
+        | AdapterKind::ZcodeApp => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn configure_grok_acp_command(command: &mut Command, plugin_dir: Option<&Path>) {
+    command.args(["--no-auto-update", "agent", "--no-leader"]);
+    if let Some(plugin_dir) = plugin_dir {
+        command.arg("--plugin-dir").arg(plugin_dir);
+    }
+    command.arg("stdio");
+}
+
+fn acp_observed_capabilities(
+    kind: AdapterKind,
+    reported_version: Option<&str>,
+    executable_fingerprint: Option<&str>,
+    initialize: &Value,
+    session: Option<&Value>,
+) -> Vec<String> {
+    if kind == AdapterKind::ZcodeApp {
+        return if session.is_some() {
+            vec![
+                "acp.initialize".to_string(),
+                "zcode.native_configuration".to_string(),
+                "session.new".to_string(),
+            ]
+        } else {
+            vec!["acp.initialize".to_string()]
+        };
+    }
+    let mut capabilities = if kind == AdapterKind::TraeCnCli {
+        session.map_or_else(Vec::new, |session| {
+            trae_machine_ready_capabilities(
+                reported_version,
+                executable_fingerprint,
+                initialize,
+                session,
+            )
+        })
+    } else {
+        vec!["acp.initialize".to_string()]
+    };
+    if kind == AdapterKind::CursorAgent && session.is_some() {
+        capabilities.push("cursor.authenticate".to_string());
+        capabilities.push("session.new".to_string());
+    }
+    if kind == AdapterKind::GrokBuild && session.is_some() {
+        capabilities.push("grok.authenticate".to_string());
+    }
+    if !matches!(kind, AdapterKind::KimiCodeCli | AdapterKind::GrokBuild)
+        && initialize
+            .pointer("/agentCapabilities/loadSession")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        capabilities.push("session.load".to_string());
+    }
+    // Resume support is declared by initialize; ordinary checks do not exercise it.
+    if kind != AdapterKind::KimiCodeCli
+        && initialize
+            .pointer("/agentCapabilities/sessionCapabilities/resume")
+            .is_some_and(Value::is_object)
+    {
+        capabilities.push("session.resume".to_string());
+    }
+    if session.is_some() && !matches!(kind, AdapterKind::TraeCnCli | AdapterKind::CursorAgent) {
+        capabilities.push("session.new".to_string());
+        capabilities.extend(
+            [
+                "session.prompt",
+                "session.cancel",
+                "session.update",
+                "structured_permission_request",
+                "workspace.additional_roots",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        if !matches!(
+            kind,
+            AdapterKind::KiroCli | AdapterKind::GrokBuild | AdapterKind::HermesCli
+        ) {
+            capabilities.push("session.set_config_option".to_string());
+        }
+    }
+    if matches!(
+        kind,
+        AdapterKind::DeepseekHarness
+            | AdapterKind::CommandCodeCli
+            | AdapterKind::MinimaxCodeCli
+            | AdapterKind::HermesCli
+    ) {
+        capabilities.retain(|capability| capability != "workspace.additional_roots");
+    }
+    if kind == AdapterKind::HermesCli && session.is_some() {
+        capabilities.extend([
+            "session.set_model".to_string(),
+            "session.set_mode".to_string(),
+        ]);
+    }
+    if kind == AdapterKind::DeepseekHarness {
+        if let Some(session) = session
+            && crate::agent_runtime_adapter::acp_model_catalog_from_session(session).is_ok()
+        {
+            capabilities.push("dsh.model_catalog".to_string());
+        }
+    }
+    capabilities
+}
+
+fn acp_required_capabilities(kind: AdapterKind) -> Vec<String> {
+    if kind == AdapterKind::HermesCli {
+        return [
+            "acp.initialize",
+            "session.new",
+            "session.prompt",
+            "session.cancel",
+            "session.update",
+            "session.load",
+            "session.set_model",
+            "session.set_mode",
+            "structured_permission_request",
+            "mcp.additive_per_run",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    }
+    if matches!(
+        kind,
+        AdapterKind::CommandCodeCli | AdapterKind::MinimaxCodeCli
+    ) {
+        return [
+            "acp.initialize",
+            "session.new",
+            "session.prompt",
+            "session.cancel",
+            "session.update",
+            "session.load",
+            "session.set_config_option",
+            "structured_permission_request",
+            "mcp.additive_per_run",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    }
+    if kind == AdapterKind::DeepseekHarness {
+        return [
+            "acp.initialize",
+            "session.new",
+            "session.resume",
+            "dsh.model_catalog",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    }
+
+    if kind == AdapterKind::ZcodeApp {
+        // Probe observations, distinct from AdapterCapabilitySnapshot support.
+        return [
+            "acp.initialize",
+            "zcode.native_configuration",
+            "session.new",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    }
+    if kind == AdapterKind::TraeCnCli {
+        return trae_machine_ready_requirements();
+    }
+    if kind == AdapterKind::CursorAgent {
+        return ["acp.initialize", "cursor.authenticate", "session.new"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+    if kind == AdapterKind::KimiCodeCli {
+        return [
+            "acp.initialize",
+            "session.new",
+            "session.prompt",
+            "session.cancel",
+            "session.update",
+            "structured_permission_request",
+            "workspace.additional_roots",
+            "session.set_config_option",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    }
+    if kind == AdapterKind::GrokBuild {
+        return [
+            "acp.initialize",
+            "grok.authenticate",
+            "session.new",
+            "session.prompt",
+            "session.cancel",
+            "session.update",
+            "structured_permission_request",
+            "workspace.additional_roots",
+            "mcp.additive_per_run",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    }
+    let mut capabilities = [
+        "acp.initialize",
+        "session.new",
+        "session.prompt",
+        "session.cancel",
+        "session.update",
+        "structured_permission_request",
+        "workspace.additional_roots",
+        "mcp.additive_per_run",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if !matches!(
+        kind,
+        AdapterKind::KiroCli | AdapterKind::GrokBuild | AdapterKind::HermesCli
+    ) {
+        capabilities.push("session.set_config_option".to_string());
+    }
+    capabilities
+}
+
+fn acp_deep_session_probe_enabled(kind: AdapterKind) -> bool {
+    kind.uses_acp()
+}
+
+fn additive_acp_mcp_verified(kind: AdapterKind) -> bool {
+    matches!(
+        kind,
+        AdapterKind::OpencodeCli
+            | AdapterKind::CopilotCli
+            | AdapterKind::KiroCli
+            | AdapterKind::QoderCli
+            | AdapterKind::CodebuddyCli
+            | AdapterKind::QwenCode
+            | AdapterKind::TraeCnCli
+            | AdapterKind::GrokBuild
+            | AdapterKind::DeepseekHarness
+            | AdapterKind::CommandCodeCli
+            | AdapterKind::ClineCli
+            | AdapterKind::MinimaxCodeCli
+            | AdapterKind::HermesCli
+    )
+}
+
+fn classify_acp_probe_failure(detail: &str) -> AgentRuntimeProbeStatus {
+    let lower = detail.to_ascii_lowercase();
+    if [
+        "login",
+        "log in",
+        "auth",
+        "credential",
+        "unauthorized",
+        "not signed in",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return AgentRuntimeProbeStatus::AuthenticationRequired;
+    }
+    if [
+        "trae behavioral capability missing",
+        "did not negotiate acp v1",
+        "session/new did not return sessionid",
+        "invalid rpc response",
+        "rpc result was missing",
+        "method not found",
+        "unsupported protocol",
+        "enterprise policy denied",
+        "policy restriction",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return AgentRuntimeProbeStatus::MissingCapabilities;
+    }
+    AgentRuntimeProbeStatus::ProbeFailed
+}
+
+pub async fn codex_model_catalog(path: &Path) -> Result<Value> {
+    let mut command = runtime_command(path, Some(AdapterKind::CodexCli));
+    command.args(["app-server", "--listen", "stdio://"]);
+    let mut process =
+        RuntimeProbeProcess::spawn(&mut command, DEFAULT_CAPTURE_LIMIT, DEFAULT_CLEANUP_TIMEOUT)
+            .with_context(|| format!("failed to start {} app-server", path.display()))?;
+    let result = {
+        let (stdin, lines) = process.split_io()?;
+        let query = async {
+            write_json_line(
+                stdin,
+                &json!({
+                    "method": "initialize",
+                    "id": 1,
+                    "params": {
+                        "clientInfo": {
+                            "name": "rovai_probe",
+                            "title": "Rovai-ai Runtime Probe",
+                            "version": env!("CARGO_PKG_VERSION")
+                        },
+                        "capabilities": { "experimentalApi": true }
+                    }
+                }),
+            )
+            .await?;
+            let initialized = read_rpc_result(lines, 1).await?;
+            anyhow::ensure!(
+                initialized
+                    .get("userAgent")
+                    .and_then(Value::as_str)
+                    .is_some(),
+                "initialize result did not include userAgent"
+            );
+            write_json_line(stdin, &json!({"method": "initialized", "params": {}})).await?;
+
+            write_json_line(
+                stdin,
+                &json!({
+                    "method": "account/read", "id": 2,
+                    "params": { "refreshToken": false }
+                }),
+            )
+            .await?;
+            let account = read_rpc_result(lines, 2).await?;
+            anyhow::ensure!(
+                crate::codex::authentication_available_from_account(&account),
+                "Codex authentication is required"
+            );
+
+            let mut models = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut request_id = 3_u64;
+            loop {
+                write_json_line(
+                    stdin,
+                    &json!({
+                        "method": "model/list",
+                        "id": request_id,
+                        "params": {
+                            "cursor": cursor,
+                            "includeHidden": true,
+                            "limit": 100
+                        }
+                    }),
+                )
+                .await?;
+                let result = read_rpc_result(lines, request_id).await?;
+                let page = result
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .context("model/list result did not include data")?;
+                models.extend(page.iter().cloned());
+                cursor = result
+                    .get("nextCursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if cursor.is_none() {
+                    break;
+                }
+                request_id += 1;
+                if request_id > 102 {
+                    bail!("model/list exceeded the pagination safety limit");
+                }
+            }
+            Ok::<_, anyhow::Error>(json!({"data": models}))
+        };
+        timeout(Duration::from_secs(30), query)
+            .await
+            .context("Codex app-server query timed out")
+            .and_then(|result| result)
+    };
+    let stderr = process.finish().await?;
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if stderr.bytes.iter().any(|byte| !byte.is_ascii_whitespace()) => {
+            Err(error.context(format!("app-server stderr: {}", stderr.lossy_text())))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn write_json_line(stdin: &mut ManagedChildStdin, value: &Value) -> Result<()> {
+    stdin
+        .write_all(serde_json::to_string(value)?.as_bytes())
+        .await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn read_rpc_result(
+    lines: &mut BoundedLineReader<ManagedChildStdout>,
+    request_id: u64,
+) -> Result<Value> {
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: Value = serde_json::from_str(&line).context("invalid RPC response")?;
+        if message.get("id").and_then(Value::as_u64) != Some(request_id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            bail!("RPC request {request_id} was rejected: {error}");
+        }
+        return message
+            .get("result")
+            .cloned()
+            .context("RPC result was missing");
+    }
+    bail!("app-server exited before RPC request {request_id} completed")
+}
+
+async fn executable_fingerprint_async(path: PathBuf) -> Option<String> {
+    tokio::task::spawn_blocking(move || executable_fingerprint(&path))
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
+async fn codex_runtime_probe_uncached(
+    path: PathBuf,
+    path_text: String,
+    fingerprint: Option<String>,
+    known_version: Option<&str>,
+    probed_at: String,
+    known_capabilities: &[String],
+) -> CodexCapabilityProbe {
+    let reported_version = if let Some(version) = known_version {
+        Some(version.to_owned())
+    } else {
+        let mut version_command = runtime_command(&path, Some(AdapterKind::CodexCli));
+        version_command.arg("--version");
+        let version_output =
+            match bounded_output(&mut version_command, Duration::from_secs(15)).await {
+                Ok(output) if output.status.success() => output,
+                Ok(output) => {
+                    return CodexCapabilityProbe {
+                        raw_model_catalog: None,
+                        result: probe_result(
+                            Some(path_text),
+                            None,
+                            fingerprint,
+                            AgentRuntimeProbeStatus::ProbeFailed,
+                            Vec::new(),
+                            required_capability_names(),
+                            Some(command_detail(
+                                &output.stdout.bytes,
+                                &output.stderr.bytes,
+                                "Codex version check failed",
+                            )),
+                            probed_at,
+                        ),
+                    };
+                }
+                Err(error) => {
+                    return CodexCapabilityProbe {
+                        raw_model_catalog: None,
+                        result: probe_result(
+                            Some(path_text),
+                            None,
+                            fingerprint,
+                            AgentRuntimeProbeStatus::ProbeFailed,
+                            Vec::new(),
+                            required_capability_names(),
+                            Some(format!("failed to inspect Codex CLI: {error}")),
+                            probed_at,
+                        ),
+                    };
+                }
+            };
+        Some(
+            String::from_utf8_lossy(&version_output.stdout.bytes)
+                .trim()
+                .to_string(),
+        )
+    };
+
+    let raw_model_catalog = match codex_model_catalog(&path).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let detail = format!("Codex app-server check failed: {error:#}");
+            let status = if detail.contains("Codex authentication is required") {
+                AgentRuntimeProbeStatus::AuthenticationRequired
+            } else {
+                AgentRuntimeProbeStatus::ProbeFailed
+            };
+            return CodexCapabilityProbe {
+                raw_model_catalog: None,
+                result: probe_result(
+                    Some(path_text),
+                    reported_version,
+                    fingerprint,
+                    status,
+                    Vec::new(),
+                    required_capability_names(),
+                    Some(detail),
+                    probed_at,
+                ),
+            };
+        }
+    };
+
+    let (mut capabilities, missing_capabilities) =
+        match probe_schema_capabilities(&path, known_capabilities).await {
+            Ok(result) => result,
+            Err(error) => {
+                return CodexCapabilityProbe {
+                    raw_model_catalog: None,
+                    result: probe_result(
+                        Some(path_text),
+                        reported_version,
+                        fingerprint,
+                        AgentRuntimeProbeStatus::ProbeFailed,
+                        vec!["app_server.initialize".into()],
+                        required_capability_names(),
+                        Some(format!("Codex capability schema probe failed: {error:#}")),
+                        probed_at,
+                    ),
+                };
+            }
+        };
+    capabilities.insert(0, "app_server.initialize".into());
+
+    let status = if missing_capabilities.is_empty() {
+        AgentRuntimeProbeStatus::Ready
+    } else {
+        AgentRuntimeProbeStatus::MissingCapabilities
+    };
+    let detail = (!missing_capabilities.is_empty()).then(|| {
+        format!(
+            "Codex app-server is missing required capabilities: {}",
+            missing_capabilities.join(", ")
+        )
+    });
+    CodexCapabilityProbe {
+        raw_model_catalog: Some(raw_model_catalog),
+        result: probe_result(
+            Some(path_text),
+            reported_version,
+            fingerprint,
+            status,
+            capabilities,
+            missing_capabilities,
+            detail,
+            probed_at,
+        ),
+    }
+}
+
+async fn probe_schema_capabilities(
+    path: &Path,
+    known_capabilities: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let schema_dir =
+        env::temp_dir().join(format!("rovai-codex-schema-probe-{}", uuid::Uuid::new_v4()));
+    let _cleanup = ProbeRootCleanup(schema_dir.clone());
+    let required = REQUIRED_CODEX_CAPABILITIES
+        .iter()
+        .map(|(capability, _, _)| *capability)
+        .chain(std::iter::once("correlation.thread_turn_item"))
+        .collect::<Vec<_>>();
+    let reuse_schema = required
+        .iter()
+        .all(|capability| known_capabilities.iter().any(|known| known == capability));
+    let (mut capabilities, missing, supports_fast_turn) = if reuse_schema {
+        (
+            required
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect::<Vec<_>>(),
+            Vec::new(),
+            known_capabilities
+                .iter()
+                .any(|capability| capability == rovai_core::camp_fast::CODEX_FAST_TURN_CAPABILITY),
+        )
+    } else {
+        let mut command = runtime_command(path, Some(AdapterKind::CodexCli));
+        command
+            .args(["app-server", "generate-json-schema", "--out"])
+            .arg(&schema_dir);
+        let output = bounded_output(&mut command, Duration::from_secs(20)).await?;
+        if !output.status.success() {
+            let detail = command_detail(
+                &output.stdout.bytes,
+                &output.stderr.bytes,
+                "generate-json-schema failed",
+            );
+            let _ = std::fs::remove_dir_all(&schema_dir);
+            bail!(detail);
+        }
+        let (mut capabilities, mut missing) = detect_schema_capabilities(&schema_dir)?;
+        let correlation_present = [
+            "v2/ThreadStartResponse.json",
+            "v2/TurnStartResponse.json",
+            "v2/ItemStartedNotification.json",
+        ]
+        .iter()
+        .all(|relative| schema_dir.join(relative).is_file());
+        if correlation_present {
+            capabilities.push("correlation.thread_turn_item".into());
+        } else {
+            missing.push("correlation.thread_turn_item".into());
+        }
+        (
+            capabilities,
+            missing,
+            schema_supports_codex_fast_turn(&schema_dir),
+        )
+    };
+    // Fast preferences are applied by the real Host. Record evidence already
+    // available for this program without launching a Fast-only schema export.
+    if supports_fast_turn
+        || known_capabilities
+            .iter()
+            .any(|capability| capability == rovai_core::camp_fast::CODEX_FAST_TURN_CAPABILITY)
+    {
+        capabilities.push(rovai_core::camp_fast::CODEX_FAST_TURN_CAPABILITY.into());
+    }
+    Ok((capabilities, missing))
+}
+
+fn schema_supports_codex_fast_turn(schema_dir: &Path) -> bool {
+    std::fs::read(schema_dir.join("v2/TurnStartParams.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|schema| schema.pointer("/properties/serviceTierForTurn").is_some())
+}
+
+fn detect_schema_capabilities(schema_dir: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    let mut documents = std::collections::HashMap::new();
+    for (_, file_name, _) in REQUIRED_CODEX_CAPABILITIES {
+        if documents.contains_key(*file_name) {
+            continue;
+        }
+        let body = std::fs::read_to_string(schema_dir.join(file_name))
+            .with_context(|| format!("missing generated schema {file_name}"))?;
+        documents.insert(*file_name, body);
+    }
+    let mut capabilities = Vec::new();
+    let mut missing = Vec::new();
+    for (capability, file_name, token) in REQUIRED_CODEX_CAPABILITIES {
+        if documents
+            .get(file_name)
+            .is_some_and(|document| document.contains(token))
+        {
+            capabilities.push((*capability).to_string());
+        } else {
+            missing.push((*capability).to_string());
+        }
+    }
+    Ok((capabilities, missing))
+}
+
+fn command_detail(stdout: &[u8], stderr: &[u8], fallback: &str) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if !stdout.is_empty() {
+        stdout
+    } else if !stderr.is_empty() {
+        stderr
+    } else {
+        fallback.to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_result(
+    executable_path: Option<String>,
+    reported_version: Option<String>,
+    executable_fingerprint: Option<String>,
+    status: AgentRuntimeProbeStatus,
+    capabilities: Vec<String>,
+    missing_capabilities: Vec<String>,
+    detail: Option<String>,
+    probed_at: String,
+) -> AgentRuntimeProbeResult {
+    AgentRuntimeProbeResult {
+        runtime_kind: CODEX_RUNTIME_KIND.into(),
+        executable_path,
+        reported_version,
+        executable_fingerprint,
+        status,
+        capabilities,
+        missing_capabilities,
+        detail,
+        failure: None,
+        probed_at,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_probe_result(
+    runtime_kind: &str,
+    executable_path: Option<String>,
+    reported_version: Option<String>,
+    executable_fingerprint: Option<String>,
+    status: AgentRuntimeProbeStatus,
+    capabilities: Vec<String>,
+    missing_capabilities: Vec<String>,
+    detail: Option<String>,
+    probed_at: String,
+) -> AgentRuntimeProbeResult {
+    AgentRuntimeProbeResult {
+        runtime_kind: runtime_kind.to_string(),
+        executable_path,
+        reported_version,
+        executable_fingerprint,
+        status,
+        capabilities,
+        missing_capabilities,
+        detail,
+        failure: None,
+        probed_at,
+    }
+}
+
+fn required_capability_names() -> Vec<String> {
+    let mut result = vec!["app_server.initialize".into()];
+    result.extend(
+        REQUIRED_CODEX_CAPABILITIES
+            .iter()
+            .map(|(capability, _, _)| (*capability).to_string()),
+    );
+    result.push("correlation.thread_turn_item".into());
+    result
+}
+
+async fn command_health(command: &str, args: &[&str], path: Option<PathBuf>) -> CommandHealth {
+    let Some(executable) = path.or_else(|| resolve_command_path(command)) else {
+        return CommandHealth {
+            installed: false,
+            version: None,
+            authenticated: None,
+            detail: Some(format!("command is unavailable: {command}")),
+            path: None,
+        };
+    };
+    let mut command = runtime_command(&executable, None);
+    command.args(args);
+    match bounded_output(&mut command, Duration::from_secs(15)).await {
+        Ok(output) if output.status.success() => CommandHealth {
+            installed: true,
+            version: Some(
+                String::from_utf8_lossy(&output.stdout.bytes)
+                    .trim()
+                    .to_string(),
+            ),
+            authenticated: None,
+            detail: None,
+            path: Some(executable.to_string_lossy().to_string()),
+        },
+        Ok(output) => CommandHealth {
+            installed: false,
+            version: None,
+            authenticated: None,
+            detail: Some(command_detail(
+                &output.stdout.bytes,
+                &output.stderr.bytes,
+                "command failed",
+            )),
+            path: None,
+        },
+        Err(error) => CommandHealth {
+            installed: false,
+            version: None,
+            authenticated: None,
+            detail: Some(error.to_string()),
+            path: None,
+        },
+    }
+}
+
+fn resolve_command_path(command: &str) -> Option<PathBuf> {
+    let command_path = PathBuf::from(command);
+    if command_path.is_absolute() {
+        return is_executable_file(&command_path)
+            .then(|| command_path.canonicalize().unwrap_or(command_path));
+    }
+    let path = env::var_os("PATH")?;
+    for directory in env::split_paths(&path) {
+        for name in command_candidate_names(command) {
+            let candidate = directory.join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate.canonicalize().unwrap_or(candidate));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn command_candidate_names(command: &str) -> Vec<OsString> {
+    let command = OsString::from(command);
+    if Path::new(&command).extension().is_some() {
+        vec![command]
+    } else {
+        let mut executable = command;
+        executable.push(".exe");
+        vec![executable]
+    }
+}
+
+#[cfg(not(windows))]
+fn command_candidate_names(command: &str) -> Vec<OsString> {
+    vec![OsString::from(command)]
+}
+
+#[cfg(test)]
+pub fn find_codex() -> Option<PathBuf> {
+    for environment_key in [
+        "ROVAI_CODEX_BIN",
+        "HORIZONWARD_CODEX_BIN",
+        "LUMEN_CODEX_BIN",
+    ] {
+        if let Some(path) = env::var_os(environment_key).map(PathBuf::from)
+            && path.is_file()
+        {
+            return Some(path);
+        }
+    }
+
+    if let Some(paths) = env::var_os("PATH") {
+        for directory in env::split_paths(&paths) {
+            let candidate = directory.join("codex");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin/codex"));
+        candidates.push(home.join(".npm-global/bin/codex"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(test)]
+pub fn find_adapter(kind: AdapterKind) -> Option<PathBuf> {
+    if kind == AdapterKind::CodexCli {
+        return find_codex();
+    }
+    let (environment_keys, executable_name) = match kind {
+        AdapterKind::OpencodeCli => (
+            &[
+                "ROVAI_OPENCODE_BIN",
+                "HORIZONWARD_OPENCODE_BIN",
+                "LUMEN_OPENCODE_BIN",
+            ][..],
+            "opencode",
+        ),
+        AdapterKind::Pi => (&["ROVAI_PI_BIN"][..], "pi"),
+        AdapterKind::CopilotCli => (
+            &[
+                "ROVAI_COPILOT_BIN",
+                "HORIZONWARD_COPILOT_BIN",
+                "LUMEN_COPILOT_BIN",
+            ][..],
+            "copilot",
+        ),
+        AdapterKind::ClaudeCodeCli => (
+            &[
+                "ROVAI_CLAUDE_CODE_BIN",
+                "HORIZONWARD_CLAUDE_CODE_BIN",
+                "LUMEN_CLAUDE_CODE_BIN",
+            ][..],
+            "claude",
+        ),
+        AdapterKind::KiroCli => (
+            &["ROVAI_KIRO_BIN", "HORIZONWARD_KIRO_BIN", "LUMEN_KIRO_BIN"][..],
+            "kiro-cli",
+        ),
+        AdapterKind::QoderCli => (
+            &[
+                "ROVAI_QODER_BIN",
+                "HORIZONWARD_QODER_BIN",
+                "LUMEN_QODER_BIN",
+            ][..],
+            "qodercli",
+        ),
+        AdapterKind::CodebuddyCli => (
+            &[
+                "ROVAI_CODEBUDDY_BIN",
+                "HORIZONWARD_CODEBUDDY_BIN",
+                "LUMEN_CODEBUDDY_BIN",
+            ][..],
+            "codebuddy",
+        ),
+        AdapterKind::QwenCode => (
+            &["ROVAI_QWEN_BIN", "HORIZONWARD_QWEN_BIN", "LUMEN_QWEN_BIN"][..],
+            "qwen",
+        ),
+        AdapterKind::TraeCnCli => (
+            &[
+                "ROVAI_TRAE_CN_BIN",
+                "ROVAI_TRAE_BIN",
+                "HORIZONWARD_TRAE_BIN",
+                "LUMEN_TRAE_BIN",
+            ][..],
+            "traecli",
+        ),
+        AdapterKind::CursorAgent => (&["ROVAI_CURSOR_BIN"][..], "cursor-agent"),
+        AdapterKind::KimiCodeCli => (&["ROVAI_KIMI_BIN"][..], "kimi"),
+        AdapterKind::MinimaxCodeCli => (&["ROVAI_MINIMAX_CODE_BIN"][..], "mcode"),
+        AdapterKind::HermesCli => (&["ROVAI_HERMES_BIN"][..], "hermes"),
+        AdapterKind::GrokBuild => (&["ROVAI_GROK_BIN"][..], "grok"),
+        AdapterKind::DeepseekHarness => (&["ROVAI_DEEPSEEK_HARNESS_BIN"][..], "dsh"),
+        AdapterKind::ClineCli => (&["ROVAI_CLINE_BIN"][..], "cline"),
+        AdapterKind::CommandCodeCli => (&["ROVAI_COMMAND_CODE_BIN"][..], "command-code"),
+        AdapterKind::ZcodeApp => {
+            return rovai_core::zcode::default_executables()
+                .into_iter()
+                .find(|p| rovai_core::zcode::runtime_script(p).is_ok());
+        }
+        AdapterKind::AntigravityApp => (
+            &[
+                "ROVAI_ANTIGRAVITY_BIN",
+                "ROVAI_AGY_BIN",
+                "HORIZONWARD_ANTIGRAVITY_BIN",
+                "HORIZONWARD_AGY_BIN",
+                "LUMEN_ANTIGRAVITY_BIN",
+                "LUMEN_AGY_BIN",
+            ][..],
+            "agy",
+        ),
+        AdapterKind::CodexCli => unreachable!(),
+    };
+    for environment_key in environment_keys {
+        if let Some(path) = env::var_os(environment_key).map(PathBuf::from)
+            && path.is_file()
+        {
+            return Some(path);
+        }
+    }
+    if let Some(paths) = env::var_os("PATH") {
+        for directory in env::split_paths(&paths) {
+            let candidate = directory.join(executable_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin").join(executable_name),
+        PathBuf::from("/usr/local/bin").join(executable_name),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin").join(executable_name));
+        candidates.push(home.join(".npm-global/bin").join(executable_name));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(all(test, unix, feature = "extended-tests"))]
+mod native_home_probe_tests;
+
+#[cfg(all(test, unix, feature = "extended-tests"))]
+mod claude_catalog_tests;
+
+#[cfg(all(test, unix, feature = "extended-tests"))]
+mod tests {
+    use super::*;
+    use rovai_core::agent_runtime_adapter::{AcpProbeObservation, AgentRuntimeAdapterRegistry};
+    use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+
+    // Owns Codex's combined no-input process boundary, native authentication,
+    // pagination and cleanup; the ACP fixtures cannot establish account/read semantics.
+    #[tokio::test]
+    async fn codex_probe_requires_login_unless_native_provider_explicitly_waives_it() {
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        assert!(python.status.success());
+        let python = String::from_utf8(python.stdout).unwrap();
+        for (account, expected) in [
+            (
+                json!({"result":{"account":{"type":"chatgpt"}}}),
+                AgentRuntimeProbeStatus::Ready,
+            ),
+            (
+                json!({"result":{"account":null,"requiresOpenaiAuth":false}}),
+                AgentRuntimeProbeStatus::Ready,
+            ),
+            (
+                json!({"result":{"account":null,"requiresOpenaiAuth":true}}),
+                AgentRuntimeProbeStatus::AuthenticationRequired,
+            ),
+            (
+                json!({"result":{"account":null}}),
+                AgentRuntimeProbeStatus::AuthenticationRequired,
+            ),
+            (
+                json!({"result":{"requiresOpenaiAuth":"false"}}),
+                AgentRuntimeProbeStatus::AuthenticationRequired,
+            ),
+            (
+                json!({"error":{"code":-32601},"result":{"requiresOpenaiAuth":false}}),
+                AgentRuntimeProbeStatus::ProbeFailed,
+            ),
+        ] {
+            for schema_has_fast in [false, true] {
+                let root =
+                    env::temp_dir().join(format!("rovai-codex-auth-{}", uuid::Uuid::new_v4()));
+                let _cleanup = ProbeRootCleanup(root.clone());
+                fs::create_dir_all(&root).unwrap();
+                let mut schemas = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+                for (_, file, token) in REQUIRED_CODEX_CAPABILITIES {
+                    schemas
+                        .entry(file)
+                        .or_default()
+                        .push(token.trim_matches('"'));
+                }
+                fs::write(
+                    root.join("case.json"),
+                    json!({"account":account,"schemas":schemas,"schema_has_fast":schema_has_fast})
+                        .to_string(),
+                )
+                .unwrap();
+                let binary = root.join("codex");
+                fs::write(&binary, format!("#!{}\n{}", python.trim(), r#"
+import json, os, pathlib, sys
+root = pathlib.Path(__file__).parent
+case = json.loads((root / 'case.json').read_text())
+with (root / 'launches').open('a') as log: log.write(json.dumps(sys.argv[1:]) + '\n')
+if sys.argv[1:] == ['--version']:
+    print('codex-cli fixture'); sys.exit(0)
+assert sys.argv[1] == 'app-server', 'no standalone login status'
+if 'generate-json-schema' in sys.argv:
+    assert '--experimental' not in sys.argv, 'Fast must not trigger a dedicated schema export'
+    out = pathlib.Path(sys.argv[sys.argv.index('--out') + 1]); out.mkdir(parents=True, exist_ok=True)
+    for name, tokens in case['schemas'].items(): (out / name).write_text(json.dumps(tokens))
+    (out / 'v2').mkdir()
+    for name in ['ThreadStartResponse.json', 'TurnStartResponse.json', 'ItemStartedNotification.json']:
+        (out / 'v2' / name).write_text('{}')
+    if case['schema_has_fast']:
+        (out / 'v2' / 'TurnStartParams.json').write_text('{"properties":{"serviceTierForTurn":{}}}')
+    sys.exit(0)
+(root / 'server-pid').write_text(str(os.getpid()))
+initialized = False
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    with (root / 'methods').open('a') as log: log.write(method + '\n')
+    if method == 'initialize':
+        assert request['params']['capabilities']['experimentalApi'] is True
+        print(json.dumps({'id':request['id'], 'result':{'userAgent':'fixture'}}), flush=True)
+    elif method == 'initialized':
+        assert 'id' not in request
+        initialized = True # Notification: deliberately no response.
+    elif method == 'account/read':
+        assert initialized and request['params'] == {'refreshToken':False}
+        print(json.dumps({'id':request['id'], **case['account']}), flush=True)
+    elif method == 'model/list':
+        assert initialized and request['params']['includeHidden'] is True
+        cursor = request['params']['cursor']
+        print(json.dumps({'id':request['id'], 'result':{'data':[{'id': 'second' if cursor else 'first'}], 'nextCursor':None if cursor else 'next'}}), flush=True)
+"#)).unwrap();
+                fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+                let checked = codex_capability_probe_at(&binary, None, None, &[]).await;
+                assert_eq!(
+                    checked.result.status, expected,
+                    "{account}: {:?}",
+                    checked.result
+                );
+                let mut methods = vec!["initialize", "initialized", "account/read"];
+                if expected == AgentRuntimeProbeStatus::Ready {
+                    methods.extend(["model/list", "model/list"]);
+                    assert_eq!(
+                        checked.raw_model_catalog.unwrap()["data"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        2
+                    );
+                } else {
+                    assert!(checked.raw_model_catalog.is_none());
+                }
+                assert_eq!(
+                    fs::read_to_string(root.join("methods"))
+                        .unwrap()
+                        .lines()
+                        .collect::<Vec<_>>(),
+                    methods
+                );
+                let launches = fs::read_to_string(root.join("launches")).unwrap();
+                assert_eq!(
+                    launches.lines().count(),
+                    if expected == AgentRuntimeProbeStatus::Ready {
+                        3
+                    } else {
+                        2
+                    }
+                );
+                assert!(!launches.contains("--experimental"));
+                assert_eq!(
+                    checked.result.capabilities.iter().any(|capability| {
+                        capability == rovai_core::camp_fast::CODEX_FAST_TURN_CAPABILITY
+                    }),
+                    expected == AgentRuntimeProbeStatus::Ready && schema_has_fast
+                );
+                let pid: i32 = fs::read_to_string(root.join("server-pid"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_ne!(
+                    unsafe { libc::kill(pid, 0) },
+                    0,
+                    "temporary app-server must be reaped"
+                );
+                // A trustworthy version belongs to this stable selected program.
+                fs::write(root.join("launches"), "").unwrap();
+                let repeated = codex_capability_probe_at(
+                    &binary,
+                    None,
+                    Some("codex-cli fixture"),
+                    &checked.result.capabilities,
+                )
+                .await;
+                assert_eq!(repeated.result.status, expected);
+                let launches = fs::read_to_string(root.join("launches")).unwrap();
+                assert!(!launches.contains("--version"));
+                assert!(!launches.contains("generate-json-schema"));
+                assert_eq!(launches.lines().count(), 1);
+                assert_eq!(repeated.result.capabilities, checked.result.capabilities);
+                if expected == AgentRuntimeProbeStatus::Ready && !schema_has_fast {
+                    // Existing positive evidence remains valid for the same program,
+                    // even when required ordinary schema evidence needs replenishing.
+                    fs::write(root.join("launches"), "").unwrap();
+                    let known = vec![rovai_core::camp_fast::CODEX_FAST_TURN_CAPABILITY.into()];
+                    let (capabilities, missing) =
+                        probe_schema_capabilities(&binary, &known).await.unwrap();
+                    assert!(missing.is_empty());
+                    assert!(capabilities.contains(&known[0]));
+                    let launches = fs::read_to_string(root.join("launches")).unwrap();
+                    assert_eq!(launches.lines().count(), 1);
+                    assert!(!launches.contains("--experimental"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_refresh_requires_current_full_acp_evidence() {
+        for kind in [
+            AdapterKind::HermesCli,
+            AdapterKind::OpencodeCli,
+            AdapterKind::CopilotCli,
+            AdapterKind::KiroCli,
+            AdapterKind::QoderCli,
+            AdapterKind::CodebuddyCli,
+            AdapterKind::QwenCode,
+            AdapterKind::TraeCnCli,
+            AdapterKind::CursorAgent,
+            AdapterKind::KimiCodeCli,
+            AdapterKind::GrokBuild,
+            AdapterKind::ZcodeApp,
+        ] {
+            let snapshot = AgentRuntimeAdapterRegistry::default().acp_capability_snapshot(AcpProbeObservation {
+                adapter_kind: kind,
+                reported_version: Some(if kind == AdapterKind::ZcodeApp { "0.17.0" } else { "1.0.0" }.into()),
+                executable_fingerprint: Some("sha256:fixture".into()),
+                authentication_status: "authenticated".into(), probe_status: "ready".into(),
+                capabilities: acp_required_capabilities(kind),
+                initialize_result: Some(json!({"protocolVersion":1})),
+                session_result: Some(json!({"sessionId":"fixture-session", "models":{
+                    "currentModelId":"fixture", "availableModels":[{"modelId":"fixture", "name":"Fixture"}]},
+                    "modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"}]}})),
+                attempted_at: "2000-01-01T00:00:00Z".into(), last_error: None,
+            }).unwrap();
+            assert!(
+                catalog_refresh_evidence_current(kind, &snapshot),
+                "{kind:?}: expired directory alone must not require full verification"
+            );
+            for invalidation in ["status", "auth", "capability", "stale", "success"] {
+                let mut invalid = snapshot.clone();
+                match invalidation {
+                    "status" => invalid.probe_status = "installed_unverified".into(),
+                    "auth" => invalid.authentication_status = "unknown".into(),
+                    "capability" => invalid.capabilities.clear(),
+                    "stale" => invalid.stale_at = Some("2000-01-02T00:00:00Z".into()),
+                    "success" => invalid.last_successful_probe_at = None,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !catalog_refresh_evidence_current(kind, &invalid),
+                    "{kind:?}: {invalidation}"
+                );
+            }
+            if kind == AdapterKind::HermesCli {
+                let mut legacy = snapshot;
+                legacy
+                    .capabilities
+                    .push("context.charter.managed_system_prompt".into());
+                assert!(!catalog_refresh_evidence_current(kind, &legacy));
+            }
+        }
+    }
+
+    // Owns command/process omission, not the model-row parser. The retained
+    // full path is the baseline, and malformed refreshes must not fabricate success.
+    #[tokio::test]
+    async fn catalog_refresh_skips_version_and_help() {
+        let root = env::temp_dir().join(format!("rovai-agy-catalog-{}", uuid::Uuid::new_v4()));
+        let _cleanup = ProbeRootCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("agy");
+        std::fs::write(&executable, r#"#!/bin/sh
+root=$(/usr/bin/dirname "$0")
+printf '%s\n' "$*" >> "$root/calls"
+case "$1" in
+  --version) printf '%s\n' 'Antigravity 1.0.0' ;;
+  --help) printf '%s\n' '--print --conversation --model --mode --sandbox --add-dir --log-file --print-timeout' ;;
+  models) /bin/cat "$root/models" ;;
+  *) exit 91 ;;
+esac
+"#).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(root.join("models"), "claude-sonnet-4-6\n").unwrap();
+        let full_started = std::time::Instant::now();
+        let full = antigravity_capability_probe_at(&executable, None, None, &[]).await;
+        let full_ms = full_started.elapsed().as_millis();
+        assert_eq!(full.result.status, AgentRuntimeProbeStatus::Ready);
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls")).unwrap(),
+            "--version\n--help\nmodels\n"
+        );
+        let light_started = std::time::Instant::now();
+        let models = refresh_model_catalog(&executable, AdapterKind::AntigravityApp)
+            .await
+            .unwrap();
+        let light_ms = light_started.elapsed().as_millis();
+        assert_eq!(
+            models.models,
+            rovai_core::agent_runtime_adapter::antigravity_models(full.models)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls")).unwrap(),
+            "--version\n--help\nmodels\nmodels\n"
+        );
+        eprintln!(
+            "[model-catalog-test] runtime=antigravity-app synthetic_full_ms={full_ms} synthetic_light_ms={light_ms} old_processes=3 new_processes=1"
+        );
+        std::fs::write(root.join("calls"), "").unwrap();
+        let reused = antigravity_capability_probe_at(
+            &executable,
+            None,
+            full.result.reported_version.as_deref(),
+            &full.result.capabilities,
+        )
+        .await;
+        assert_eq!(reused.result.status, AgentRuntimeProbeStatus::Ready);
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls")).unwrap(),
+            "models\n"
+        );
+        std::fs::write(root.join("models"), "Fetching available models...\n").unwrap();
+        let unavailable = antigravity_capability_probe_at(
+            &executable,
+            None,
+            full.result.reported_version.as_deref(),
+            &full.result.capabilities,
+        )
+        .await;
+        assert_ne!(unavailable.result.status, AgentRuntimeProbeStatus::Ready);
+        assert!(
+            refresh_model_catalog(&executable, AdapterKind::AntigravityApp)
+                .await
+                .is_err()
+        );
+        let executable = root.join("opencode");
+        std::fs::write(&executable, r#"#!/bin/sh
+root=$(/usr/bin/dirname "$0")
+printf '%s\n' "$*" >> "$root/opencode-calls"
+[ "$*" = "acp" ] || exit 91
+IFS= read -r initialize || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+IFS= read -r session || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture","models":{"currentModelId":"fixture/model","availableModels":[{"modelId":"fixture/model","name":"Fixture"}]}}}'
+while IFS= read -r ignored; do :; done
+"#).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let models = refresh_model_catalog(&executable, AdapterKind::OpencodeCli)
+            .await
+            .unwrap();
+        assert!(
+            models
+                .models
+                .iter()
+                .any(|model| model.id == "fixture/model")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("opencode-calls")).unwrap(),
+            "acp\n"
+        );
+        std::fs::write(root.join("opencode-calls"), "").unwrap();
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1\" = '--version' ]\n",
+                root.join("opencode-calls").display()
+            ),
+        )
+        .unwrap();
+        let unknown = acp_capability_probe_at_for_purpose(
+            &executable,
+            AdapterKind::OpencodeCli,
+            RuntimeLaunchPurpose::AvailabilityCheck,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_ne!(unknown.result.status, AgentRuntimeProbeStatus::Ready);
+        assert_eq!(
+            std::fs::read_to_string(root.join("opencode-calls")).unwrap(),
+            "--version\n"
+        );
+    }
+    #[tokio::test]
+    async fn git_health_uses_only_a_resolved_absolute_executable() {
+        let directory = env::temp_dir().join(format!("rovai-git-health-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("git");
+        fs::write(&executable, "#!/bin/sh\nprintf 'git version fixture\\n'\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let available = git_health(Some(executable.canonicalize().unwrap())).await;
+        assert!(available.installed);
+        assert_eq!(available.version.as_deref(), Some("git version fixture"));
+        assert!(
+            available
+                .path
+                .as_deref()
+                .is_some_and(|path| path.starts_with('/'))
+        );
+
+        let missing = git_health(None).await;
+        assert!(!missing.installed);
+        assert_eq!(
+            missing.detail.as_deref(),
+            Some("git executable was not found in the Runtime search environment")
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn antigravity_stream_json_is_optional_and_help_gated() {
+        assert!(antigravity_stream_json_supported(
+            "--output-format Output format (text, json, stream-json)"
+        ));
+        assert!(!antigravity_stream_json_supported(
+            "--output-format Output format (text, json)"
+        ));
+        assert!(!antigravity_stream_json_supported(
+            "legacy print mode without structured output"
+        ));
+        assert!(
+            !antigravity_required_capabilities()
+                .iter()
+                .any(|capability| capability == "output.stream_json")
+        );
+    }
+
+    #[test]
+    fn additive_acp_launch_shapes_match_the_verified_cli_contracts() {
+        for version in [
+            None,
+            Some("GitHub Copilot CLI 1.0.102."),
+            Some("GitHub Copilot CLI 1.0.103."),
+        ] {
+            for allow_all in [false, true] {
+                let mut command = Command::new("/selected/copilot");
+                configure_acp_command(&mut command, AdapterKind::CopilotCli, allow_all, version)
+                    .unwrap();
+                let args = command
+                    .as_std()
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().to_string())
+                    .collect::<Vec<_>>();
+                let mut expected = vec![
+                    "--acp",
+                    "--stdio",
+                    "--no-auto-update",
+                    "--no-color",
+                    "--log-level",
+                    "error",
+                ];
+                if allow_all {
+                    expected.push("--allow-all");
+                }
+                assert_eq!(args, expected, "Copilot version={version:?}");
+            }
+        }
+        for (version, v1) in [
+            ("1.18.32", true),
+            ("opencode v1.99.1", true),
+            ("2.0.26", false),
+            ("opencode v2.99.1-preview.2", false),
+        ] {
+            let mut command = Command::new("/selected/opencode");
+            configure_acp_command(&mut command, AdapterKind::OpencodeCli, false, Some(version))
+                .unwrap();
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            if v1 {
+                assert_eq!(args, ["acp", "--log-level", "ERROR"]);
+            } else {
+                assert_eq!(args, ["acp", "--log-level", "error"]);
+            }
+        }
+        for pure in ["0", "1"] {
+            let mut command = Command::new("/selected/opencode");
+            command.env("OPENCODE_PURE", pure);
+            configure_acp_command(
+                &mut command,
+                AdapterKind::OpencodeCli,
+                false,
+                Some("1.18.32"),
+            )
+            .unwrap();
+            assert!(!command.as_std().get_args().any(|arg| arg == "--pure"));
+            assert_eq!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == "OPENCODE_PURE")
+                    .and_then(|(_, value)| value),
+                Some(std::ffi::OsStr::new(pure))
+            );
+        }
+        for version in [
+            None,
+            Some("unknown"),
+            Some("0.0.0-next"),
+            Some("3.0.0"),
+            Some("2.0.bad"),
+        ] {
+            let mut command = Command::new("/selected/opencode");
+            assert!(
+                configure_acp_command(&mut command, AdapterKind::OpencodeCli, false, version)
+                    .is_err()
+            );
+            assert_eq!(command.as_std().get_args().count(), 0);
+        }
+        let arguments = |kind| {
+            let mut command = Command::new("/usr/bin/true");
+            configure_acp_command(&mut command, kind, false, None).unwrap();
+            command
+                .as_std()
+                .get_args()
+                .map(|value| value.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(arguments(AdapterKind::QoderCli), ["--acp"]);
+        assert_eq!(arguments(AdapterKind::CodebuddyCli), ["--acp"]);
+        assert_eq!(arguments(AdapterKind::QwenCode), ["--acp"]);
+        assert_eq!(arguments(AdapterKind::TraeCnCli), ["acp", "serve"]);
+        assert_eq!(arguments(AdapterKind::CursorAgent), ["acp"]);
+        assert_eq!(arguments(AdapterKind::KimiCodeCli), ["acp"]);
+        assert_eq!(arguments(AdapterKind::CommandCodeCli), ["acp"]);
+        assert_eq!(arguments(AdapterKind::ClineCli), ["--acp"]);
+        assert_eq!(
+            arguments(AdapterKind::GrokBuild),
+            ["--no-auto-update", "agent", "--no-leader", "stdio"]
+        );
+        assert_eq!(
+            arguments(AdapterKind::KiroCli),
+            ["acp", "--agent", KIRO_ADDITIVE_AGENT_NAME]
+        );
+        let mut trusted_kiro = Command::new("/usr/bin/true");
+        configure_acp_command(&mut trusted_kiro, AdapterKind::KiroCli, true, None).unwrap();
+        assert_eq!(
+            trusted_kiro
+                .as_std()
+                .get_args()
+                .map(|value| value.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            [
+                "acp",
+                "--agent",
+                KIRO_ADDITIVE_AGENT_NAME,
+                "--trust-all-tools"
+            ]
+        );
+    }
+
+    #[test]
+    fn locally_verified_acp_adapters_claim_additive_mcp() {
+        for kind in [
+            AdapterKind::OpencodeCli,
+            AdapterKind::CopilotCli,
+            AdapterKind::KiroCli,
+            AdapterKind::QoderCli,
+            AdapterKind::CodebuddyCli,
+            AdapterKind::QwenCode,
+            AdapterKind::TraeCnCli,
+            AdapterKind::GrokBuild,
+        ] {
+            assert!(additive_acp_mcp_verified(kind));
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_probe_failure_classification_separates_auth_protocol_and_transient_errors() {
+        for detail in [
+            "ACP probe failed: authentication required",
+            "ACP probe failed: not signed in",
+            "ACP probe failed: invalid credential",
+        ] {
+            assert_eq!(
+                classify_acp_probe_failure(detail),
+                AgentRuntimeProbeStatus::AuthenticationRequired
+            );
+        }
+        for detail in [
+            "Runtime did not negotiate ACP v1",
+            "ACP session/new did not return sessionId",
+            "invalid RPC response: diagnostic text",
+        ] {
+            assert_eq!(
+                classify_acp_probe_failure(detail),
+                AgentRuntimeProbeStatus::MissingCapabilities
+            );
+        }
+        assert_eq!(
+            classify_acp_probe_failure("ACP probe timed out"),
+            AgentRuntimeProbeStatus::ProbeFailed
+        );
+
+        // Exercise the real probe boundary: Command must preserve errors just
+        // like other ACP adapters before the common classifier/redactor runs.
+        let directory = env::temp_dir().join(format!("rovai-acp-errors-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let _cleanup = ProbeRootCleanup(directory.clone());
+        let runtime = directory.join("runtime");
+        for (detail, expected) in [
+            (
+                "Not authenticated",
+                AgentRuntimeProbeStatus::AuthenticationRequired,
+            ),
+            (
+                "Method not found",
+                AgentRuntimeProbeStatus::MissingCapabilities,
+            ),
+            ("request timed out", AgentRuntimeProbeStatus::ProbeFailed),
+        ] {
+            fs::write(
+                &runtime,
+                format!(
+                    r#"#!/bin/sh
+IFS= read -r initialize || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1}}}}'
+IFS= read -r session || exit 1
+printf '%s\n' 'fixture diagnostic' >&2
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32000,"message":"{detail}"}}}}'
+while IFS= read -r ignored; do :; done
+"#
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            for kind in [AdapterKind::CommandCodeCli, AdapterKind::KimiCodeCli] {
+                let probe = acp_capability_probe_at_for_purpose(
+                    &runtime,
+                    kind,
+                    RuntimeLaunchPurpose::HealthProbe,
+                    None,
+                    Some("1.88.0"),
+                    false,
+                )
+                .await;
+                assert_eq!(probe.result.status, expected, "{kind:?}: {probe:?}");
+                let diagnostic = probe.result.detail.unwrap();
+                assert!(diagnostic.contains(detail), "{diagnostic}");
+                assert!(diagnostic.contains("fixture diagnostic"), "{diagnostic}");
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_model_discovery_accepts_identifier_and_display_name_rows() {
+        assert_eq!(
+            antigravity_model_identifier_from_line(
+                "gemini-3.6-flash-high\tGemini 3.6 Flash (High)"
+            )
+            .as_deref(),
+            Some("gemini-3.6-flash-high")
+        );
+        assert_eq!(
+            antigravity_model_identifier_from_line("claude-sonnet-4-6").as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert!(antigravity_model_identifier_from_line("Fetching available models...").is_none());
+    }
+
+    #[test]
+    fn public_probe_failures_classify_auth_and_cli_incompatibility_without_paths() {
+        let executable = Path::new("/Users/example/private/bin/agy");
+        let incompatible = public_probe_failure(
+            AdapterKind::AntigravityApp,
+            RuntimeFailureOrigin::Runtime,
+            RuntimeFailurePhase::ModelCatalog,
+            "runtime_process_failed",
+            "Antigravity 模型检查失败",
+            "unknown command models at /Users/example/private/bin/agy",
+            executable,
+            true,
+        );
+        assert_eq!(incompatible.origin, RuntimeFailureOrigin::Compatibility);
+        assert_eq!(incompatible.code, "runtime_capability_incompatible");
+        assert_eq!(
+            public_probe_status(AgentRuntimeProbeStatus::ProbeFailed, &incompatible),
+            AgentRuntimeProbeStatus::MissingCapabilities
+        );
+        assert_eq!(
+            incompatible.detail.as_deref(),
+            Some("unknown command models at <runtime-executable>")
+        );
+
+        let authentication = public_probe_failure(
+            AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Runtime,
+            RuntimeFailurePhase::Authentication,
+            "runtime_process_failed",
+            "Claude Code 认证检查失败",
+            "authentication required: token expired",
+            Path::new("/usr/local/bin/claude"),
+            true,
+        );
+        assert_eq!(authentication.code, "runtime_authentication_required");
+        assert_eq!(authentication.phase, RuntimeFailurePhase::Authentication);
+        assert_eq!(
+            public_probe_status(AgentRuntimeProbeStatus::ProbeFailed, &authentication),
+            AgentRuntimeProbeStatus::AuthenticationRequired
+        );
+        for code in [
+            "runtime_probe_frame_capacity_exceeded",
+            "runtime_probe_frame_capacity_invalid",
+            "runtime_probe_frame_allocation_failed",
+        ] {
+            let failure = model_catalog_failure(
+                AdapterKind::ClaudeCodeCli,
+                &anyhow::anyhow!(code),
+                executable,
+            );
+            assert_eq!(failure.origin, RuntimeFailureOrigin::Rovai);
+            assert_eq!(failure.phase, RuntimeFailurePhase::ModelCatalog);
+            assert_eq!(failure.code, code);
+        }
+        let failure = model_catalog_failure(
+            AdapterKind::ClaudeCodeCli,
+            &anyhow::anyhow!("Claude Code model query timed out"),
+            executable,
+        );
+        assert_eq!(failure.origin, RuntimeFailureOrigin::Unknown);
+        assert_eq!(failure.phase, RuntimeFailurePhase::ModelCatalog);
+        let failure = model_catalog_failure(
+            AdapterKind::ClaudeCodeCli,
+            &anyhow::anyhow!("Claude Code list_models rejected: authentication required"),
+            executable,
+        );
+        assert_eq!(failure.origin, RuntimeFailureOrigin::Runtime);
+        assert_eq!(failure.code, "runtime_authentication_required");
+        assert!(claude_list_models_unsupported(
+            "Unsupported control request subtype: list_models"
+        ));
+        for native_error in [
+            "authentication required",
+            "Policy denied list_models",
+            "list_models timed out",
+            "Unsupported control request subtype: initialize",
+            "Unsupported control request subtype: list_models; authentication required",
+        ] {
+            assert!(!claude_list_models_unsupported(native_error));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "manual local Runtime smoke"]
+    async fn kiro_private_agent_session_real_runtime_smoke() {
+        let path = find_adapter(AdapterKind::KiroCli).expect("Kiro CLI must be installed");
+        let probe = acp_probe_at(
+            &path,
+            AdapterKind::KiroCli,
+            true,
+            RuntimeLaunchPurpose::HealthProbe,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            probe.result.status,
+            AgentRuntimeProbeStatus::Ready,
+            "{:?}",
+            probe.result.detail
+        );
+        assert!(
+            probe
+                .result
+                .capabilities
+                .contains(&"mcp.additive_per_run".to_string())
+        );
+        assert!(
+            probe
+                .session_result
+                .as_ref()
+                .and_then(|session| session.get("sessionId"))
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        let snapshot = AgentRuntimeAdapterRegistry::default()
+            .acp_capability_snapshot(AcpProbeObservation {
+                adapter_kind: AdapterKind::KiroCli,
+                reported_version: probe.result.reported_version.clone(),
+                executable_fingerprint: probe.result.executable_fingerprint.clone(),
+                authentication_status: "authenticated".to_string(),
+                probe_status: "ready".to_string(),
+                capabilities: probe.result.capabilities.clone(),
+                initialize_result: probe.initialize_result.clone(),
+                session_result: probe.session_result.clone(),
+                attempted_at: chrono::Utc::now().to_rfc3339(),
+                last_error: None,
+            })
+            .expect("Kiro Session should produce a freezeable capability snapshot");
+        assert!(!snapshot.models.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "manual local Runtime smoke"]
+    async fn trae_user_authorized_availability_check_real_runtime_smoke() {
+        let path = find_adapter(AdapterKind::TraeCnCli).expect("TRAE CLI must be installed");
+        let probe = acp_capability_probe_at_for_purpose(
+            &path,
+            AdapterKind::TraeCnCli,
+            RuntimeLaunchPurpose::AvailabilityCheck,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            probe.result.status,
+            AgentRuntimeProbeStatus::Ready,
+            "{:?}",
+            probe.result.detail
+        );
+        assert!(probe.initialize_result.is_some());
+        assert!(probe.session_result.is_some());
+        let snapshot = AgentRuntimeAdapterRegistry::default()
+            .acp_capability_snapshot(AcpProbeObservation {
+                adapter_kind: AdapterKind::TraeCnCli,
+                reported_version: probe.result.reported_version,
+                executable_fingerprint: probe.result.executable_fingerprint,
+                authentication_status: "authenticated".to_string(),
+                probe_status: "ready".to_string(),
+                capabilities: probe.result.capabilities,
+                initialize_result: probe.initialize_result,
+                session_result: probe.session_result,
+                attempted_at: chrono::Utc::now().to_rfc3339(),
+                last_error: None,
+            })
+            .expect("TRAE availability evidence should map to a Ready snapshot");
+        assert_eq!(snapshot.probe_status, "ready");
+        assert!(!snapshot.models.is_empty());
+        assert!(!snapshot.permission_options.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trae_health_probe_uses_the_uniform_runtime_launch_lifecycle() {
+        let directory =
+            env::temp_dir().join(format!("rovai-trae-health-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("executed");
+        let runtime = directory.join("traecli");
+        std::fs::write(
+            &runtime,
+            format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let probe = acp_capability_probe_at_for_purpose(
+            &runtime,
+            AdapterKind::TraeCnCli,
+            RuntimeLaunchPurpose::HealthProbe,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(probe.result.status, AgentRuntimeProbeStatus::ProbeFailed);
+        assert!(
+            probe
+                .result
+                .detail
+                .as_deref()
+                .is_some_and(|detail| !detail.contains("runtime_launch_disallowed"))
+        );
+        assert!(
+            marker.exists(),
+            "health probe must execute TRAE like every Runtime"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn trae_availability_and_dispatch_share_one_machine_ready_contract() {
+        let directory = env::temp_dir().join(format!(
+            "rovai-trae-ready-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let protocol_log = directory.join("protocol.jsonl");
+        let runtime = directory.join("traecli");
+        std::fs::write(
+            &runtime,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'trae-cli version 0.120.52'
+  exit 0
+fi
+[ "$*" = "--permission-mode default acp serve" ] || exit 2
+IFS= read -r initialize || exit 1
+printf '%s\n' "$initialize" >> '{}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true}}}}}}'
+IFS= read -r session || exit 1
+printf '%s\n' "$session" >> '{}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"session-ready-contract","configOptions":[{{"id":"model","currentValue":"GLM-5.2","options":[{{"value":"GLM-5.2","name":"GLM-5.2"}}]}}],"modes":{{"currentModeId":"default","availableModes":[{{"id":"default","name":"Default"}},{{"id":"bypass_permissions","name":"Bypass permissions"}}]}}}}}}'
+if IFS= read -r unexpected; then
+  printf '%s\n' "$unexpected" >> '{}'
+  printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32601,"message":"machine Ready probe sent a behavioral request"}}}}'
+fi
+while IFS= read -r ignored; do :; done
+"#,
+                protocol_log.display(),
+                protocol_log.display(),
+                protocol_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let availability = acp_capability_probe_at_for_purpose(
+            &runtime,
+            AdapterKind::TraeCnCli,
+            RuntimeLaunchPurpose::AvailabilityCheck,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let dispatch = acp_capability_probe_at_for_purpose(
+            &runtime,
+            AdapterKind::TraeCnCli,
+            RuntimeLaunchPurpose::DispatchPreflight,
+            None,
+            None,
+            false,
+        )
+        .await;
+
+        assert_eq!(availability.result.status, AgentRuntimeProbeStatus::Ready);
+        assert_eq!(dispatch.result.status, AgentRuntimeProbeStatus::Ready);
+        assert_eq!(
+            availability.result.capabilities,
+            dispatch.result.capabilities
+        );
+        let protocol = std::fs::read_to_string(&protocol_log).unwrap();
+        assert_eq!(protocol.matches("\"method\":\"initialize\"").count(), 2);
+        assert_eq!(protocol.matches("\"method\":\"session/new\"").count(), 2);
+        assert!(!protocol.contains("\"method\":\"session/prompt\""));
+        assert!(!protocol.contains("\"method\":\"session/cancel\""));
+        assert!(!protocol.contains("\"method\":\"session/set_config_option\""));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_probe_terminates_descendants_that_keep_stdio_open() {
+        let directory =
+            env::temp_dir().join(format!("rovai-acp-process-group-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let descendant_pid_path = directory.join("descendant.pid");
+        let runtime = directory.join("qwen");
+        std::fs::write(
+            &runtime,
+            format!(
+                r#"#!/bin/sh
+sleep 10 &
+printf '%s' "$!" > '{}'
+IFS= read -r _request
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1}}}}'
+exit 0
+"#,
+                descendant_pid_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let started = Instant::now();
+        let (initialize, session) = timeout(
+            Duration::from_secs(3),
+            run_acp_probe(
+                &runtime,
+                AdapterKind::QwenCode,
+                false,
+                RuntimeLaunchPurpose::HealthProbe,
+            ),
+        )
+        .await
+        .expect("probe cleanup must remain bounded")
+        .expect("the fixture must complete the ACP initialize handshake");
+        assert_eq!(initialize["protocolVersion"], 1);
+        assert!(session.is_none());
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let descendant_gone = timeout(Duration::from_secs(2), async {
+            loop {
+                // SAFETY: signal 0 only checks the exact PID written by this test fixture.
+                if unsafe { libc::kill(descendant_pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !descendant_gone {
+            // SAFETY: cleanup is limited to the exact PID created by the fixture.
+            unsafe {
+                libc::kill(descendant_pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            descendant_gone,
+            "the inherited ACP descendant must be reaped"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_deep_probe_rejects_pre_1_0_without_starting_acp() {
+        let directory = env::temp_dir().join(format!(
+            "rovai-grok-minimum-version-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("acp-started");
+        let runtime = directory.join("grok");
+        std::fs::write(
+            &runtime,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'grok 0.2.118'
+  exit 0
+fi
+touch '{}'
+exit 1
+"#,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let probe = acp_capability_probe_at_for_purpose(
+            &runtime,
+            AdapterKind::GrokBuild,
+            RuntimeLaunchPurpose::HealthProbe,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            probe.result.status,
+            AgentRuntimeProbeStatus::MissingCapabilities
+        );
+        assert_eq!(
+            probe.result.missing_capabilities,
+            vec!["runtime.version>=1.0.0".to_string()]
+        );
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_deep_probe_does_not_require_advertised_resume() {
+        let directory = env::temp_dir().join(format!(
+            "rovai-grok-resume-capability-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let runtime = directory.join("grok");
+        std::fs::write(
+            &runtime,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'grok 1.0.0'
+  exit 0
+fi
+IFS= read -r initialize || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[{"id":"cached_token"},{"id":"xai.api_key"}],"_meta":{"defaultAuthMethodId":"cached_token"}}}'
+IFS= read -r authenticate || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+IFS= read -r session || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"grok-session","models":{"currentModelId":"minimax-m3","availableModels":[{"modelId":"minimax-m3","name":"MiniMax M3"}]}}}'
+while IFS= read -r ignored; do :; done
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let probe = acp_capability_probe_at_for_purpose(
+            &runtime,
+            AdapterKind::GrokBuild,
+            RuntimeLaunchPurpose::HealthProbe,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(probe.result.status, AgentRuntimeProbeStatus::Ready);
+        assert!(probe.result.missing_capabilities.is_empty());
+        assert!(
+            !probe
+                .result
+                .capabilities
+                .contains(&"session.load".to_string())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_checks_keep_native_model_catalog_boundaries_without_lifecycle_rehearsals() {
+        for kind in [
+            AdapterKind::GrokBuild,
+            AdapterKind::KiroCli,
+            AdapterKind::HermesCli,
+        ] {
+            for case in [
+                "listed",
+                "unlisted",
+                "missing",
+                "empty",
+                "malformed",
+                "missing_current",
+                "session_error",
+            ] {
+                if kind != AdapterKind::HermesCli && !matches!(case, "listed" | "unlisted") {
+                    continue;
+                }
+                let mut result = json!({"sessionId":"s1","models":{"currentModelId":"native-model","availableModels":[{"modelId":"native-model","name":"Native"}]}});
+                match case {
+                    "unlisted" => result["models"]["currentModelId"] = json!("missing"),
+                    "missing" => result
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("models")
+                        .map(|_| ())
+                        .unwrap(),
+                    "empty" => result["models"]["availableModels"] = json!([]),
+                    "malformed" => result["models"]["availableModels"] = json!([{}]),
+                    "missing_current" => result["models"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("currentModelId")
+                        .map(|_| ())
+                        .unwrap(),
+                    _ => (),
+                }
+                let root =
+                    env::temp_dir().join(format!("rovai-current-model-{}", uuid::Uuid::new_v4()));
+                let _cleanup = ProbeRootCleanup(root.clone());
+                std::fs::create_dir_all(&root).unwrap();
+                let runtime = root.join("runtime");
+                let log = root.join("requests");
+                let session_id = if kind == AdapterKind::GrokBuild { 3 } else { 2 };
+                let auth = if kind == AdapterKind::GrokBuild {
+                    "IFS= read -r auth; printf '%s\\n' \"$auth\" >> \"$log\"; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}'"
+                } else {
+                    ""
+                };
+                let response = if case == "session_error" {
+                    json!({"jsonrpc":"2.0","id":session_id,"error":{"code":-32603,"message":"native session rejected"}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":session_id,"result":result})
+                };
+                std::fs::write(&runtime, format!(r#"#!/bin/sh
+if [ "$1" = "--version" ]; then exit 42; fi
+log='{}'
+IFS= read -r init; printf '%s\n' "$init" >> "$log"
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentInfo":{{"version":"0.22.4"}},"agentCapabilities":{{"loadSession":true,"sessionCapabilities":{{"resume":{{}}}}}},"authMethods":[{{"id":"cached_token"}}],"_meta":{{"defaultAuthMethodId":"cached_token"}}}}}}'
+{}
+IFS= read -r session; printf '%s\n' "$session" >> "$log"
+printf '%s\n' '{}'
+while IFS= read -r extra; do printf '%s\n' "$extra" >> "$log"; exit 43; done
+"#, log.display(), auth, response)).unwrap();
+                std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let probe = acp_capability_probe_at_for_purpose(
+                    &runtime,
+                    kind,
+                    RuntimeLaunchPurpose::HealthProbe,
+                    None,
+                    Some("1.0.0"),
+                    false,
+                )
+                .await;
+                if case == "listed" || (kind == AdapterKind::HermesCli && case != "session_error") {
+                    assert_eq!(
+                        probe.result.status,
+                        AgentRuntimeProbeStatus::Ready,
+                        "{:?}",
+                        probe.result
+                    );
+                } else {
+                    assert_ne!(probe.result.status, AgentRuntimeProbeStatus::Ready);
+                }
+                let methods = std::fs::read_to_string(log)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str::<Value>(line).unwrap()["method"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    methods,
+                    if kind == AdapterKind::GrokBuild {
+                        vec!["initialize", "authenticate", "session/new"]
+                    } else {
+                        vec!["initialize", "session/new"]
+                    }
+                );
+                if kind != AdapterKind::HermesCli {
+                    assert!(
+                        !probe
+                            .result
+                            .capabilities
+                            .contains(&"session.set_model".to_string())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grok_auth_prefers_the_advertised_noninteractive_default() {
+        let initialize = json!({
+            "authMethods": [
+                {"id": "xai.api_key"},
+                {"id": "cached_token"},
+                {"id": "grok.com"}
+            ],
+            "_meta": {"defaultAuthMethodId": "cached_token"}
+        });
+        assert_eq!(
+            select_grok_noninteractive_auth_method(&initialize, false).unwrap(),
+            "cached_token"
+        );
+        assert_eq!(
+            select_grok_noninteractive_auth_method(&initialize, true).unwrap(),
+            "xai.api_key"
+        );
+
+        let byok = json!({
+            "authMethods": [{"id": "xai.api_key"}, {"id": "grok.com"}],
+            "_meta": {"defaultAuthMethodId": "xai.api_key"}
+        });
+        assert_eq!(
+            select_grok_noninteractive_auth_method(&byok, true).unwrap(),
+            "xai.api_key"
+        );
+    }
+
+    #[test]
+    fn grok_auth_falls_back_without_starting_an_interactive_login() {
+        let fallback = json!({
+            "authMethods": [{"id": "grok.com"}, {"id": "xai.api_key"}],
+            "_meta": {"defaultAuthMethodId": "grok.com"}
+        });
+        assert_eq!(
+            select_grok_noninteractive_auth_method(&fallback, false).unwrap(),
+            "xai.api_key"
+        );
+
+        let interactive_only = json!({
+            "authMethods": [{"id": "grok.com"}],
+            "_meta": {"defaultAuthMethodId": "grok.com"}
+        });
+        let error = select_grok_noninteractive_auth_method(&interactive_only, false).unwrap_err();
+        assert!(error.to_string().contains("grok login --device-auth"));
+    }
+
+    #[test]
+    fn zcode_probe_reports_only_basic_observations() {
+        // ZCode's no-generation Probe has its own evidence boundary; the
+        // advertised Adapter mappings cannot promote observations to tests.
+        let initialize = json!({"agentCapabilities":{"loadSession":true}});
+        let session = json!({"sessionId":"zcode-session"});
+        let observed = acp_observed_capabilities(
+            AdapterKind::ZcodeApp,
+            Some("0.17.0"),
+            Some("sha256:new-kernel"),
+            &initialize,
+            Some(&session),
+        );
+        assert_eq!(observed, acp_required_capabilities(AdapterKind::ZcodeApp));
+        assert_eq!(
+            observed,
+            [
+                "acp.initialize",
+                "zcode.native_configuration",
+                "session.new"
+            ]
+        );
+        assert_eq!(
+            acp_observed_capabilities(
+                AdapterKind::ZcodeApp,
+                Some("0.16.5"),
+                None,
+                &initialize,
+                None,
+            ),
+            ["acp.initialize"]
+        );
+    }
+
+    #[test]
+    fn grok_check_does_not_require_model_setting_or_resume_evidence() {
+        let initialize = json!({
+            "agentCapabilities": {
+                "loadSession": true,
+                "sessionCapabilities": {"resume": {}}
+            }
+        });
+        let session = json!({
+            "sessionId": "grok-session",
+            "models": {
+                "currentModelId": "MiniMax-M3",
+                "availableModels": [{"modelId": "MiniMax-M3", "name": "MiniMax-M3"}]
+            }
+        });
+        let observed = acp_observed_capabilities(
+            AdapterKind::GrokBuild,
+            Some("1.0.0"),
+            Some("sha256:grok"),
+            &initialize,
+            Some(&session),
+        );
+        let required = acp_required_capabilities(AdapterKind::GrokBuild);
+        assert!(!observed.contains(&"session.set_model".to_string()));
+        assert!(observed.contains(&"session.resume".to_string()));
+        assert!(!observed.contains(&"session.load".to_string()));
+        assert!(!observed.contains(&"session.set_config_option".to_string()));
+        assert!(!required.contains(&"session.set_model".to_string()));
+        assert!(!required.contains(&"session.resume".to_string()));
+        assert!(!required.contains(&"session.set_config_option".to_string()));
+
+        let unverified = acp_observed_capabilities(
+            AdapterKind::GrokBuild,
+            Some("1.0.0"),
+            Some("sha256:grok"),
+            &json!({"agentCapabilities":{}}),
+            Some(&session),
+        );
+        assert!(!unverified.contains(&"session.resume".to_string()));
+    }
+
+    #[test]
+    fn grok_inspect_names_reserve_current_and_legacy_native_definitions() {
+        let current = json!({
+            "projectTrusted": true,
+            "projectRoot": "/workspace",
+            "mcpServers": [
+                {"name": "native-one", "source": {"type": "configToml"}},
+                {"name": "Native-Two", "source": {"type": "mcpJson"}},
+                {"name": "disabled", "disabled": true},
+                {"name": "blocked", "disabledReason": "managed policy"}
+            ]
+        });
+        assert_eq!(
+            grok_native_mcp_server_names_from_inspect(&current).unwrap(),
+            BTreeSet::from([
+                "Native-Two".to_string(),
+                "blocked".to_string(),
+                "disabled".to_string(),
+                "native-one".to_string(),
+            ])
+        );
+
+        let untrusted = json!({
+            "projectTrusted": false,
+            "projectRoot": "/workspace",
+            "mcpServers": [
+                {"name": "project", "source": {"type": "mcpJson", "path": "/workspace/.mcp.json"}},
+                {"name": "user", "source": {"type": "mcpJson", "path": "/home/user/.cursor/mcp.json"}}
+            ]
+        });
+        assert_eq!(
+            grok_native_mcp_server_names_from_inspect(&untrusted).unwrap(),
+            BTreeSet::from(["project".to_string(), "user".to_string()])
+        );
+
+        let legacy = json!({"mcpServers": {"docs": {}, "search": {}}});
+        assert_eq!(
+            grok_native_mcp_server_names_from_inspect(&legacy).unwrap(),
+            BTreeSet::from(["docs".to_string(), "search".to_string()])
+        );
+    }
+
+    #[test]
+    fn generated_schema_is_used_as_a_capability_contract() {
+        let directory = env::temp_dir().join(format!(
+            "rovai-health-capability-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("temporary schema directory should exist");
+        std::fs::write(
+            directory.join("ClientRequest.json"),
+            r#"["thread/start","thread/resume","turn/start","turn/interrupt","runtimeWorkspaceRoots"]"#,
+        )
+        .expect("request schema should be written");
+        std::fs::write(
+            directory.join("ServerNotification.json"),
+            r#"["item/agentMessage/delta","turn/completed"]"#,
+        )
+        .expect("notification schema should be written");
+        std::fs::write(
+            directory.join("ServerRequest.json"),
+            r#"["item/commandExecution/requestApproval"]"#,
+        )
+        .expect("server request schema should be written");
+
+        let (capabilities, missing) =
+            detect_schema_capabilities(&directory).expect("schema should be inspected");
+        assert!(capabilities.contains(&"thread.start".to_string()));
+        assert!(capabilities.contains(&"workspace.additional_roots".to_string()));
+        assert!(missing.contains(&"approval.file_request".to_string()));
+        assert!(!missing.contains(&"approval.command_request".to_string()));
+        fs::create_dir_all(directory.join("v2")).unwrap();
+        for (fields, expected) in [
+            (json!({"serviceTier": {"type": "string"}}), false),
+            (json!({"serviceTierForTurn": {"type": "string"}}), true),
+        ] {
+            fs::write(
+                directory.join("v2/TurnStartParams.json"),
+                json!({"properties": fields}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(schema_supports_codex_fast_turn(&directory), expected);
+        }
+        std::fs::remove_dir_all(directory).expect("temporary schema directory should be removed");
+    }
+}

@@ -1,0 +1,2098 @@
+//! In-process translation of the official NDJSON protocol into Core's existing
+//! session transport. The child is the official App kernel, never an ACP package.
+
+use super::{
+    NativeConfig, NativeProtocol,
+    events::{NativeTurnFailure, RUNTIME_HEADERS_UNAVAILABLE, SessionEvents},
+};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader,
+        DuplexStream,
+    },
+    sync::{Mutex, Notify, mpsc, oneshot},
+    task::JoinSet,
+};
+
+type Writer = Box<dyn AsyncWrite + Unpin + Send>;
+type Reply = oneshot::Sender<Result<Value>>;
+const FRAME_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Basic native-environment connection check, without model generation.
+/// Only cwd and socket/TMPDIR are private; native initialization may write normal
+/// state under the user's existing HOME/storage. Credentials remain in memory.
+pub async fn probe(
+    executable: &std::path::Path,
+    include_session: bool,
+) -> Result<(Value, Option<Value>)> {
+    use crate::managed_process::{
+        ManagedProcess, ManagedProcessLaunchSpec, ManagedProcessPurpose, ManagedStdinPolicy,
+        ManagedWindowsArgvDialect,
+    };
+    struct Root(PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Root(super::private_runtime_root("rvzp")?);
+    let mut config = NativeConfig::load_for_executable(&std::env::current_dir()?, executable)?;
+    // Native login and BYOK both resolve here. Report setup guidance before spawning.
+    config.runtime_model(None)?;
+    config.value["mcp"] = json!({"enabled":false,"servers":{}});
+    config.value["memory"] = json!({"use":false});
+    let mut command = super::command(executable)?;
+    command
+        .arg("app-server")
+        .current_dir(&root.0)
+        .env("TMPDIR", &root.0)
+        .env_remove("ROVAI_ZCODE_CLI_CONTEXT_DIR")
+        .env(
+            "ROVAI_ZCODE_OWNER_REPORT",
+            root.0.join("owner-cleanup.json"),
+        );
+    let spec = ManagedProcessLaunchSpec::capture(
+        &command,
+        ManagedProcessPurpose::RuntimeProbe,
+        ManagedStdinPolicy::Piped,
+        ManagedWindowsArgvDialect::MicrosoftCrt,
+        "zcode-capability-probe",
+    )?;
+    let mut child = ManagedProcess::spawn(spec)?;
+    let stderr = child.take_stderr().context("ZCode probe stderr missing")?;
+    let drain = tokio::spawn(async move {
+        tokio::io::copy(&mut BufReader::new(stderr), &mut tokio::io::sink()).await
+    });
+    let stream = start_bridge(
+        child.take_stdin().context("ZCode probe stdin missing")?,
+        child.take_stdout().context("ZCode probe stdout missing")?,
+        config,
+        root.0.clone(),
+        "plan".to_string(),
+        true,
+    );
+    let (read, write) = tokio::io::split(stream);
+    let writer: Mutex<Writer> = Mutex::new(Box::new(write));
+    let mut reader = BufReader::new(read);
+    let mut frame = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(45), async {
+        write_frame(
+            &writer,
+            &json!({"id":1,"method":"initialize","params":{"protocolVersion":1}}),
+        )
+        .await?;
+        let initialize = read_frame(&mut reader, &mut frame)
+            .await?
+            .context("ZCode probe closed")?;
+        if initialize.get("error").is_some() {
+            bail!("ZCode native configuration and connection check failed");
+        }
+        let session = if include_session {
+            write_frame(
+                &writer,
+                &json!({"id":2,"method":"session/new","params":{"cwd":root.0,"mcpServers":[]}}),
+            )
+            .await?;
+            let response = read_frame(&mut reader, &mut frame)
+                .await?
+                .context("ZCode Session probe closed")?;
+            if response.get("error").is_some() {
+                bail!("ZCode Session capability probe failed");
+            }
+            Some(response["result"].clone())
+        } else {
+            None
+        };
+        Ok((initialize["result"].clone(), session))
+    })
+    .await
+    .context("ZCode capability probe timed out")
+    .and_then(|result| result);
+    drop(reader);
+    drop(writer);
+    let terminated = child.force_terminate_tree().is_ok();
+    let reaped = matches!(
+        tokio::time::timeout(Duration::from_secs(3), child.wait()).await,
+        Ok(Ok(_))
+    );
+    let cleanup = confirm_owner_cleanup(
+        &child,
+        &root.0,
+        tokio::time::Instant::now() + Duration::from_millis(2500),
+    )
+    .await;
+    drain.abort();
+    if !terminated || !reaped || !cleanup {
+        bail!("ZCode probe process-group cleanup unconfirmed");
+    }
+    result
+}
+
+pub async fn confirm_owner_cleanup(
+    _child: &crate::managed_process::ManagedProcess,
+    _root: &std::path::Path,
+    deadline: tokio::time::Instant,
+) -> bool {
+    loop {
+        // These platforms capture every descendant before terminating the tree,
+        // including the Node watcher. A killed watcher cannot write its report;
+        // use the same owned-tree proof as an execution Host's cleanup instead.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        match _child.captured_tree_is_empty() {
+            Ok(true) => return true,
+            Err(_) => return false,
+            Ok(false) => {}
+        }
+        #[cfg(windows)]
+        match _child.tree_is_empty() {
+            Ok(true) => return true,
+            Err(_) => return false,
+            Ok(false) => {}
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        if let Ok(bytes) = tokio::fs::read(_root.join("owner-cleanup.json")).await
+            && let Ok(report) = serde_json::from_slice::<Value>(&bytes)
+        {
+            return report["confirmed"] == true && report["pendingGroups"] == 0;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+struct Session {
+    events: SessionEvents,
+    model_reasoning_defaults: HashMap<String, String>,
+    terminal: Option<Reply>,
+    cancelled: bool,
+    cancel_input: Option<String>,
+    cancel_requests: std::collections::HashSet<String>,
+    acceptance_compaction: Option<oneshot::Sender<()>>,
+    context_refresh_pending: Option<u64>,
+    steering: HashMap<String, Reply>,
+}
+
+struct PendingPermission {
+    session_id: String,
+    native_id: Value,
+    options: Vec<Value>,
+}
+
+struct Bridge {
+    native: Mutex<Writer>,
+    core: Mutex<Writer>,
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, Reply>>,
+    permissions: Mutex<HashMap<String, PendingPermission>>,
+    sessions: Mutex<HashMap<String, Session>>,
+    finished: mpsc::Sender<(String, Result<Value>)>,
+    background_settle: mpsc::Sender<String>,
+    context_refresh: Notify,
+    snapshot_read: Mutex<()>,
+    input_fence: Mutex<()>,
+    config: NativeConfig,
+    cwd: PathBuf,
+    mode: String,
+    probe: bool,
+    acceptance_compacted: AtomicBool,
+}
+
+/// Dropping the returned stream aborts every bridge task. ManagedProcess still
+/// owns process-tree termination and its bounded wait/reap contract.
+pub fn start<R, W>(
+    stdin: W,
+    stdout: R,
+    config: NativeConfig,
+    cwd: PathBuf,
+    mode: String,
+) -> DuplexStream
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    start_bridge(stdin, stdout, config, cwd, mode, false)
+}
+
+fn start_bridge<R, W>(
+    stdin: W,
+    stdout: R,
+    config: NativeConfig,
+    cwd: PathBuf,
+    mode: String,
+    probe: bool,
+) -> DuplexStream
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let (core, bridge) = tokio::io::duplex(256 * 1024);
+    let (core_read, core_write) = tokio::io::split(bridge);
+    let (finished, mut finished_rx) = mpsc::channel::<(String, Result<Value>)>(8);
+    let (background_settle, mut background_rx) = mpsc::channel::<String>(256);
+    let bridge = Arc::new(Bridge {
+        native: Mutex::new(Box::new(stdin)),
+        core: Mutex::new(Box::new(core_write)),
+        next_id: AtomicU64::new(1),
+        pending: Mutex::new(HashMap::new()),
+        permissions: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(HashMap::new()),
+        config,
+        cwd,
+        mode,
+        probe,
+        finished,
+        background_settle,
+        context_refresh: Notify::new(),
+        snapshot_read: Mutex::new(()),
+        input_fence: Mutex::new(()),
+        acceptance_compacted: AtomicBool::new(false),
+    });
+    tokio::spawn(async move {
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let mut workers = JoinSet::<Result<()>>::new();
+        let native_bridge = bridge.clone();
+        workers.spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut frame = Vec::new();
+            while let Some(message) = read_frame(&mut reader, &mut frame).await? {
+                if message.get("method").is_none() {
+                    if let Some(id) = message.get("id").and_then(Value::as_u64)
+                        && let Some(reply) = native_bridge.pending.lock().await.remove(&id)
+                    {
+                        let result = if message.get("error").is_some() {
+                            // Native errors can echo a model configuration containing secrets.
+                            let native_message = message["error"]["message"]
+                                .as_str()
+                                .unwrap_or_default();
+                            let diagnostic = if message["error"]["code"] == -32601 {
+                                "Official ZCode method not found; bundled protocol is incompatible"
+                            } else if native_message.contains("Provider Registry")
+                                && native_message.contains("Model")
+                            {
+                                "ZCode Provider Registry has no usable model; configure a personal BYOK provider in official ZCode"
+                            } else {
+                                "Official ZCode rejected the protocol request"
+                            };
+                            Err(anyhow::Error::new(crate::acp::AcpRpcError::from_response(
+                                &json!({"code":message["error"]["code"],"message":diagnostic})
+                            )))
+                        } else {
+                            Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                        };
+                        let _ = reply.send(result);
+                    }
+                } else {
+                    events_tx
+                        .send(message)
+                        .await
+                        .context("ZCode event reader closed")?;
+                }
+            }
+            Ok(())
+        });
+        let event_bridge = bridge.clone();
+        workers.spawn(async move {
+            while let Some(message) = events_rx.recv().await {
+                event_bridge.receive(message).await?;
+            }
+            Ok(())
+        });
+        let context_bridge = bridge.clone();
+        workers.spawn(async move {
+            loop {
+                context_bridge.context_refresh.notified().await;
+                let requested = {
+                    let mut sessions = context_bridge.sessions.lock().await;
+                    sessions
+                        .iter_mut()
+                        .filter_map(|(id, session)| {
+                            session.context_refresh_pending.take()?;
+                            Some((id.clone(), session.events.input_id()?.to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (session_id, input_id) in requested {
+                    // The reader task continues servicing RPC responses while
+                    // this worker waits. No prompt-final or UI visibility gate.
+                    let Ok(snapshot) = context_bridge.read_snapshot(&session_id, true).await else {
+                        continue;
+                    };
+                    let mut sessions = context_bridge.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&session_id)
+                        && session.events.input_id() == Some(input_id.as_str())
+                    {
+                        // The snapshot can already cover events received while
+                        // its RPC was in flight. Keep only newer pending work.
+                        if let Some(covered) = snapshot
+                            .pointer("/runtime/eventSeq")
+                            .and_then(Value::as_u64)
+                        {
+                            session.context_refresh_pending =
+                                session.context_refresh_pending.filter(|seq| *seq > covered);
+                        }
+                        // Keep the owner stable through forwarding. The next Run
+                        // must not inherit an earlier read's numeric receipt.
+                        if let Some(context) = native_context_update(&session_id, &snapshot) {
+                            write_frame(&context_bridge.core, &context).await?;
+                        }
+                    }
+                }
+            }
+        });
+        let finish_bridge = bridge.clone();
+        let background_bridge = bridge.clone();
+        workers.spawn(async move {
+            while let Some(session_id) = background_rx.recv().await {
+                if background_bridge.settle_foreground(&session_id, true).await.is_ok() {
+                    write_frame(&background_bridge.core, &json!({"method":"_zcode/backgroundIdle","params":{"sessionId":session_id}})).await?;
+                }
+                // If still busy, retain the Host pin. The next native terminal
+                // retries this bounded observation; no foreground Run waits here.
+            }
+            Ok(())
+        });
+        workers.spawn(async move {
+            while let Some((session_id,terminal)) = finished_rx.recv().await {
+                let snapshot = finish_bridge.settle_foreground(&session_id, terminal.is_err()).await?;
+                let jobs = snapshot.pointer("/projection/backgroundJobs").and_then(Value::as_array)
+                    .context("ZCode background state unavailable")?;
+                let (messages,reply,cancel_tasks) = {
+                    let mut sessions = finish_bridge.sessions.lock().await;
+                    let session = sessions.get_mut(&session_id).context("ZCode finishing Session missing")?;
+                    let mut messages = Vec::new();
+                    if session.events.input_id().is_some()
+                        && let Some(context) = native_context_update(&session_id, &snapshot) {
+                        messages.push(context);
+                    }
+                    messages.extend(session.events.finish(&session_id,jobs)?);
+                    let cancel_tasks = if session.cancelled {
+                        session.events.background_tasks_for_input(session.cancel_input.as_deref())
+                    } else { Vec::new() };
+                    (messages,session.terminal.take(),cancel_tasks)
+                };
+                for mut message in messages {
+                    recover_command_output(&mut message,&finish_bridge.config.output_root()?).await;
+                    write_frame(&finish_bridge.core,&message).await?;
+                }
+                // A task can be backgrounded while stop is in flight. The final
+                // snapshot must join that task to the cancelled input as well.
+                for task_id in cancel_tasks {
+                    finish_bridge.cancel_background_task(&session_id,&task_id).await?;
+                }
+                if terminal.is_ok() && std::env::var("ROVAI_INTERNAL_ZCODE_COMPACTION_ACCEPTANCE").as_deref()==Ok("1")
+                    && !finish_bridge.acceptance_compacted.swap(true,Ordering::AcqRel) {
+                    // Explicit isolated smoke seam, analogous to Grok's native
+                    // compaction acceptance hook. It invokes the real official
+                    // operation; the normal event observer must prove redelivery.
+                    let (tx,rx) = oneshot::channel();
+                    finish_bridge.sessions.lock().await.get_mut(&session_id).context("ZCode acceptance Session missing")?.acceptance_compaction = Some(tx);
+                    finish_bridge.call("session/compact",json!({"sessionId":session_id,"inputId":format!("rovai-compact-{}",uuid::Uuid::new_v4()),"instructions":"Preserve the session charter, member identity and current task facts."})).await?;
+                    tokio::time::timeout(Duration::from_secs(90),rx).await.context("ZCode acceptance compaction timed out")?.context("ZCode acceptance compaction closed")?;
+                }
+                if let Some(reply) = reply { let _ = reply.send(terminal); }
+            }
+            Ok(())
+        });
+        let request_bridge = bridge.clone();
+        workers.spawn(async move {
+            let mut reader = BufReader::new(core_read);
+            let mut frame = Vec::new();
+            let mut requests = JoinSet::new();
+            loop {
+                tokio::select! {
+                    message = read_frame(&mut reader, &mut frame) => {
+                        let Some(message) = message? else { return Ok(()); };
+                        let request_bridge = request_bridge.clone();
+                        requests.spawn(async move { request_bridge.request(message).await });
+                    }
+                    result = requests.join_next(), if !requests.is_empty() => {
+                        let _ = result.context("ZCode request task unavailable")???;
+                    }
+                }
+            }
+        });
+        // Any transport failure poisons this Host; no partially live bridge can
+        // be recycled under a new owner. Close the facade to wake all RPCs.
+        let _ = workers.join_next().await;
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+        let _ = bridge.core.lock().await.shutdown().await;
+    });
+    core
+}
+
+async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    bytes: &mut Vec<u8>,
+) -> Result<Option<Value>> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            bail!("ZCode truncated protocol frame");
+        }
+        let end = available.iter().position(|b| *b == b'\n').map(|i| i + 1);
+        let length = end.unwrap_or(available.len());
+        if bytes.len() + length > FRAME_LIMIT {
+            bail!("ZCode protocol frame exceeds limit");
+        }
+        bytes.extend_from_slice(&available[..length]);
+        reader.consume(length);
+        if end.is_some() {
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                bytes.clear();
+                continue;
+            }
+            let message = serde_json::from_slice(bytes).context("Invalid ZCode protocol frame")?;
+            bytes.clear();
+            return Ok(Some(message));
+        }
+    }
+}
+
+async fn write_frame(writer: &Mutex<Writer>, message: &Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec(message)?;
+    if bytes.len() > FRAME_LIMIT {
+        bail!("ZCode outbound frame exceeds limit");
+    }
+    bytes.push(b'\n');
+    let mut writer = writer.lock().await;
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+impl Bridge {
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        let result = async {
+            write_frame(
+                &self.native,
+                &json!({"id":id,"method":method,"params":params}),
+            )
+            .await?;
+            tokio::time::timeout(Duration::from_secs(30), rx)
+                .await
+                .context("ZCode protocol request timed out")?
+                .context("ZCode protocol closed")?
+        }
+        .await;
+        self.pending.lock().await.remove(&id);
+        result
+    }
+
+    async fn command(
+        &self,
+        session: Option<&str>,
+        kind: &str,
+        command_id: &str,
+        payload: Value,
+    ) -> Result<Value> {
+        let result = self
+            .call(
+                "v4/command",
+                json!({
+                    "commandId":command_id,"clientId":"rovai","sessionId":session,
+                    "type":kind,"payload":payload,"issuedAt":chrono::Utc::now().timestamp_millis()
+                }),
+            )
+            .await?;
+        if !matches!(
+            result.get("status").and_then(Value::as_str),
+            Some("accepted" | "duplicate")
+        ) {
+            bail!("ZCode did not accept the command");
+        }
+        Ok(result)
+    }
+
+    fn workspace(&self) -> Value {
+        json!({"workspacePath":self.cwd,"workspaceKey":self.cwd})
+    }
+
+    async fn request(&self, message: Value) -> Result<bool> {
+        let id = message.get("id").cloned();
+        if message.get("method").is_none() {
+            if let Some(key) = id.as_ref().and_then(Value::as_str)
+                && let Some(PendingPermission {
+                    session_id,
+                    native_id,
+                    options,
+                }) = self.permissions.lock().await.remove(key)
+            {
+                let selected = message
+                    .pointer("/result/outcome/optionId")
+                    .and_then(Value::as_str);
+                let still_active = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .is_some_and(|s| s.terminal.is_some());
+                let result = if still_active {
+                    selected
+                        .and_then(|id| {
+                            options
+                                .iter()
+                                .find(|o| o.get("optionId").and_then(Value::as_str) == Some(id))
+                        })
+                        .and_then(|o| o.get("response"))
+                        .cloned()
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| json!({"decision":"deny","reason":"Cancelled"}));
+                write_frame(&self.native, &json!({"id":native_id,"result":result})).await?;
+            }
+            return Ok(true);
+        }
+        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = &message["params"];
+        let result = self.dispatch(method, params).await;
+        let failed = result.as_ref().err().is_some_and(|error| {
+            error.downcast_ref::<NativeTurnFailure>().is_none()
+                && !error.is::<rovai_core::steer::ActiveInputNotAccepted>()
+        });
+        if let Some(id) = id {
+            let response = match result {
+                Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+                Err(error) => {
+                    // Only dispatch's exact native resume rejection can escape as
+                    // a recoverability code. A later subscribe/model failure cannot.
+                    let code = if error.is::<rovai_core::steer::ActiveInputNotAccepted>() {
+                        -32015 // Internal facade only: exact pre-write rejection.
+                    } else if error.downcast_ref::<crate::runtime::NativeSessionResumeFailure>()
+                        == Some(&crate::runtime::NativeSessionResumeFailure::Incompatible)
+                    {
+                        error
+                            .downcast_ref::<crate::acp::AcpRpcError>()
+                            .and_then(|e| e.code)
+                            .unwrap_or(-32000)
+                    } else {
+                        -32000
+                    };
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":format!("Official ZCode request failed: {error}")}})
+                }
+            };
+            write_frame(&self.core, &response).await?;
+        } else {
+            result?;
+        }
+        if failed {
+            bail!("ZCode Host is no longer reusable after protocol failure");
+        }
+        Ok(true)
+    }
+
+    async fn dispatch(&self, method: &str, params: &Value) -> Result<Value> {
+        match method {
+            "initialize" => {
+                if self.config.protocol() == NativeProtocol::ProviderRegistry {
+                    let presentation = self
+                        .call(
+                            "workspace/readPresentation",
+                            json!({"workspace":self.workspace()}),
+                        )
+                        .await?;
+                    if presentation["workspace"] != self.workspace() {
+                        bail!("ZCode workspace presentation identity mismatch");
+                    }
+                } else {
+                    if let Some(registry) = self.config.app_provider_registry()? {
+                        let applied = self.call("workspace/updateProviderRegistry", json!({"workspace":self.workspace(),"registry":registry,"includeWorkspaceState":false})).await?;
+                        if applied["appliedProviderRevision"] != self.config.digest
+                            || !matches!(applied["status"].as_str(), Some("applied" | "unchanged"))
+                            || applied["providerCount"].as_u64()
+                                != registry["providers"]
+                                    .as_array()
+                                    .map(|providers| providers.len() as u64)
+                        {
+                            bail!("ZCode App provider registry was not confirmed");
+                        }
+                    }
+                    self.call("workspace/readState", json!({"workspace":self.workspace(),"runtimeModel":self.config.runtime_model(None)?})).await?;
+                }
+                Ok(json!({"protocolVersion":1,"agentInfo":{"name":"ZCode"},
+                    "agentCapabilities":{"loadSession":false,"sessionCapabilities":{"resume":{}},"mcpCapabilities":{"http":true,"sse":true}},"authMethods":[]}))
+            }
+            "session/new" | "session/resume" => {
+                if params.get("cwd").and_then(Value::as_str) != self.cwd.to_str() {
+                    bail!("ZCode workspace mismatch");
+                }
+                let runtime_model = self.config.runtime_model(None)?;
+                let servers = self.config.mcp_servers(params.get("mcpServers"))?;
+                // Deferred native creation does not generate a title or run the
+                // model. The first input remains the Core-owned Bootstrap.
+                let snapshot = if method == "session/new" {
+                    let mut create = json!({"workspace":self.workspace(),"persistence":"deferred",
+                        "mode":self.mode,"mcpServers":servers,"titleGenerationEnabled":false,
+                        "toolDenylist":["AskUserQuestion"]});
+                    if self.config.protocol() == NativeProtocol::ProviderRegistry {
+                        if !runtime_model["model"].is_null() {
+                            create["model"] = runtime_model["model"].clone();
+                            if let Some(level) =
+                                runtime_model["model"]["options"]["reasoningLevel"].as_str()
+                            {
+                                // 0.16.9's create path converts ModelSelection to a
+                                // provider/model string; thoughtLevel is its separate
+                                // initial reasoning setting.
+                                create["thoughtLevel"] = json!(level);
+                            }
+                        }
+                    } else {
+                        create["runtimeModel"] = runtime_model;
+                    }
+                    self.call("session/create", create).await?
+                } else {
+                    let mut resume = json!({"sessionId":params["sessionId"],"workspace":self.workspace(),
+                        "mcpServers":servers,"toolDenylist":["AskUserQuestion"]});
+                    if self.config.protocol() == NativeProtocol::Legacy {
+                        resume["runtimeModel"] = runtime_model;
+                    }
+                    self.call("session/resume", resume).await.map_err(|error| {
+                        if error
+                            .downcast_ref::<crate::acp::AcpRpcError>()
+                            .is_some_and(|e| matches!(e.code, Some(-32004 | -32601)))
+                        {
+                            error.context(crate::runtime::NativeSessionResumeFailure::Incompatible)
+                        } else {
+                            error
+                        }
+                    })?
+                };
+                let session_id = snapshot
+                    .pointer("/session/sessionId")
+                    .or_else(|| snapshot.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .context("ZCode native Session ID missing")?;
+                if method == "session/resume" && params["sessionId"].as_str() != Some(session_id) {
+                    bail!("ZCode exact resume mismatch");
+                }
+                // Only the explicit no-input probe consumes the create snapshot alone.
+                // Formal new/resume sessions still subscribe and apply their mode.
+                if self.probe {
+                    return self.config.session_catalog(session_id, &snapshot);
+                }
+                let subscription = self.call("session/subscribe", json!({"sessionId":session_id,"deliveryKind":"desktop-continuous","includeSnapshot":false})).await?;
+                let model_reasoning_defaults = snapshot
+                    .pointer("/settings/model/available")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|choice| {
+                        let provider = choice.pointer("/ref/providerId")?.as_str()?;
+                        let model = choice.pointer("/ref/modelId")?.as_str()?;
+                        let level = choice.pointer("/reasoning/defaultLevel")?.as_str()?;
+                        Some((format!("{provider}/{model}"), level.to_string()))
+                    })
+                    .collect();
+                self.sessions.lock().await.insert(
+                    session_id.to_string(),
+                    Session {
+                        events: SessionEvents::new(
+                            subscription
+                                .get("eventSeq")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                        ),
+                        model_reasoning_defaults,
+                        terminal: None,
+                        steering: HashMap::new(),
+                        cancelled: false,
+                        cancel_input: None,
+                        cancel_requests: Default::default(),
+                        acceptance_compaction: None,
+                        context_refresh_pending: None,
+                    },
+                );
+                self.call(
+                    "session/setMode",
+                    json!({"sessionId":session_id,"mode":self.mode}),
+                )
+                .await?;
+                self.config.session_catalog(session_id, &snapshot)
+            }
+            "session/set_model" | "session/set_config_option" => {
+                let session_id = params["sessionId"]
+                    .as_str()
+                    .context("ZCode Session ID missing")?;
+                let key = params
+                    .get("configId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("model");
+                let selected = params
+                    .get("modelId")
+                    .or_else(|| params.get("value"))
+                    .and_then(Value::as_str)
+                    .context("ZCode model missing")?;
+                if key != "model" {
+                    bail!("Unsupported ZCode model option");
+                }
+                let mut runtime_model = self.config.runtime_model(Some(selected))?;
+                let applied = if self.config.protocol() == NativeProtocol::ProviderRegistry {
+                    let level = self
+                        .sessions
+                        .lock()
+                        .await
+                        .get(session_id)
+                        .and_then(|session| session.model_reasoning_defaults.get(selected))
+                        .cloned();
+                    if runtime_model["model"]["options"]["reasoningLevel"].is_null()
+                        && let Some(level) = level
+                    {
+                        runtime_model["model"]["options"] = json!({"reasoningLevel":level});
+                    }
+                    self.call(
+                        "session/setModel",
+                        json!({"sessionId":session_id,"model":runtime_model["model"]}),
+                    )
+                    .await?
+                } else {
+                    self.call("session/setModel", json!({"sessionId":session_id,"model":runtime_model["model"],"runtimeModel":runtime_model})).await?
+                };
+                let current = applied
+                    .pointer("/model/current")
+                    .or_else(|| applied.pointer("/settings/model/current"));
+                let confirmed = if self.config.protocol() == NativeProtocol::ProviderRegistry {
+                    current.is_some_and(|current| {
+                        current["providerId"] == runtime_model["model"]["providerId"]
+                            && current["modelId"] == runtime_model["model"]["modelId"]
+                    })
+                } else {
+                    current == Some(&runtime_model["model"])
+                };
+                if !confirmed {
+                    bail!("ZCode model selection was not confirmed");
+                }
+                Ok(json!({}))
+            }
+            "session/prompt" => {
+                let session_id = params["sessionId"]
+                    .as_str()
+                    .context("ZCode Session ID missing")?;
+                let prompt = params["prompt"]
+                    .as_array()
+                    .context("ZCode prompt missing")?;
+                let mut text = Vec::new();
+                for block in prompt {
+                    if block.get("type").and_then(Value::as_str) != Some("text") {
+                        bail!("ZCode supports text prompts only");
+                    }
+                    text.push(block["text"].as_str().context("Invalid ZCode text block")?);
+                }
+                let input_id = format!("rovai-{}", uuid::Uuid::new_v4());
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut sessions = self.sessions.lock().await;
+                    let session = sessions
+                        .get_mut(session_id)
+                        .context("Unknown ZCode Session")?;
+                    if session.terminal.is_some() {
+                        bail!("ZCode Session is busy");
+                    }
+                    session.events.begin(&input_id)?;
+                    session.cancelled = false;
+                    session.cancel_input = None;
+                    session.cancel_requests.clear();
+                    session.terminal = Some(tx);
+                }
+                let ack = self
+                    .command(
+                        Some(session_id),
+                        "sendText",
+                        &input_id,
+                        json!({"text":text.join("\n"),"requestedDelivery":"startNow"}),
+                    )
+                    .await;
+                match ack {
+                    Ok(ack)
+                        if ack.pointer("/result/inputId").and_then(Value::as_str)
+                            == Some(input_id.as_str()) =>
+                    {
+                        write_frame(&self.core, &json!({"method":"_zcode/inputAccepted","params":{"sessionId":session_id,"inputId":input_id}})).await?;
+                    }
+                    _ => {
+                        // Acceptance is ambiguous: do not retry a model input.
+                        self.stop(session_id).await?;
+                        bail!("ZCode input acceptance unavailable");
+                    }
+                }
+                rx.await.context("ZCode turn closed without terminal")?
+            }
+            "_zcode/steer" => {
+                let session_id = params["sessionId"]
+                    .as_str()
+                    .context("ZCode Session missing")?;
+                let expected = params["expectedInputId"]
+                    .as_str()
+                    .context("ZCode target input missing")?;
+                let input = params["inputId"]
+                    .as_str()
+                    .context("ZCode steering input missing")?;
+                let text = params["text"]
+                    .as_str()
+                    .context("ZCode steering text missing")?;
+                let fence = self.input_fence.lock().await;
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut sessions = self.sessions.lock().await;
+                    let session = sessions
+                        .get_mut(session_id)
+                        .context("Unknown ZCode Session")?;
+                    if session.cancelled || session.terminal.is_none() {
+                        return Err(rovai_core::steer::ActiveInputNotAccepted.into());
+                    }
+                    session.events.begin_steer(expected, input, text)?;
+                    session.steering.insert(input.to_string(), tx);
+                }
+                let ack = self
+                    .command(
+                        Some(session_id),
+                        "sendText",
+                        input,
+                        json!({"text":text,"requestedDelivery":"guide"}),
+                    )
+                    .await;
+                drop(fence);
+                match ack {
+                    Ok(ack)
+                        if ack.pointer("/result/inputId").and_then(Value::as_str)
+                            == Some(input)
+                            && ack.pointer("/result/delivery").and_then(Value::as_str)
+                                == Some("queue") => {}
+                    _ => {
+                        self.stop(session_id).await?;
+                        bail!("ZCode guide admission unavailable");
+                    }
+                }
+                // Confirm the target Turn's exact queued event, without waiting
+                // for model consumption or a running tool to finish.
+                tokio::time::timeout(Duration::from_secs(30), rx)
+                    .await
+                    .context("ZCode guide queue receipt timed out")?
+                    .context("ZCode guide receipt disconnected")?
+            }
+            "session/cancel" | "_zcode/cancelFence" => {
+                self.stop(
+                    params["sessionId"]
+                        .as_str()
+                        .context("ZCode Session ID missing")?,
+                )
+                .await?;
+                if method == "_zcode/cancelFence" {
+                    self.settle_foreground(params["sessionId"].as_str().unwrap(), true)
+                        .await?;
+                }
+                Ok(json!({}))
+            }
+            _ => bail!("Unsupported internal ZCode operation"),
+        }
+    }
+
+    async fn stop(&self, session_id: &str) -> Result<()> {
+        let _fence = self.input_fence.lock().await;
+        if let Some(session) = self.sessions.lock().await.get_mut(session_id) {
+            if !session.cancelled {
+                session.cancel_input = session.events.input_id().map(str::to_string);
+            }
+            session.cancelled = true;
+            for (_, receipt) in session.steering.drain() {
+                let _ = receipt.send(Err(anyhow::anyhow!(
+                    "ZCode steering cancelled before consumption"
+                )));
+            }
+        }
+        self.command(
+            Some(session_id),
+            "stop",
+            &format!("rovai-stop-{}", uuid::Uuid::new_v4()),
+            json!({}),
+        )
+        .await?;
+        // Cancel only background work launched by this input. Older Session
+        // services do not acquire the successor Run's cancellation scope.
+        let tasks = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|s| {
+                s.events
+                    .background_tasks_for_input(s.cancel_input.as_deref())
+            })
+            .unwrap_or_default();
+        for task_id in tasks {
+            self.cancel_background_task(session_id, &task_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_background_task(&self, session_id: &str, task_id: &str) -> Result<()> {
+        let first = self
+            .sessions
+            .lock()
+            .await
+            .get_mut(session_id)
+            .context("ZCode cancelled Session missing")?
+            .cancel_requests
+            .insert(task_id.to_string());
+        if first {
+            self.call(
+                "session/cancelBackgroundTask",
+                json!({"sessionId":session_id,"taskId":task_id}),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn read_snapshot(&self, session_id: &str, bounded_messages: bool) -> Result<Value> {
+        // Also serialize with terminal/background reads. The official protocol
+        // accepts a positive messageLimit; 1 avoids transferring chat history.
+        let _guard = self.snapshot_read.lock().await;
+        let mut params = json!({"sessionId":session_id});
+        if bounded_messages {
+            params["messageLimit"] = json!(1);
+        }
+        // Older native shapes may reject the optional limit. A live metrics
+        // failure must not break the pre-existing terminal settlement request.
+        let started = std::time::Instant::now();
+        let result = self.call("session/read", params).await;
+        crate::monitoring::context_acceptance_trace(|| {
+            let snapshot = result.as_ref().ok();
+            json!({"kind":"zcode_context_read", "sessionId":session_id,
+                "returnedAt":chrono::Utc::now().to_rfc3339(), "durationMs":started.elapsed().as_millis(),
+                "boundedMessages":bounded_messages, "succeeded":result.is_ok(),
+                "eventSeq":snapshot.and_then(|s|s.pointer("/runtime/eventSeq")).and_then(Value::as_u64),
+                "stateRevision":snapshot.and_then(|s|s.pointer("/runtime/stateRevision")).and_then(Value::as_u64),
+                "used":snapshot.and_then(|s|s.pointer("/runtime/contextUsage/used")).and_then(Value::as_u64),
+                "size":snapshot.and_then(|s|s.pointer("/runtime/contextUsage/size")).and_then(Value::as_u64)
+            })
+        });
+        result
+    }
+
+    async fn settle_foreground(&self, session_id: &str, allow_failed: bool) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = self.read_snapshot(session_id, false).await?;
+            snapshot
+                .pointer("/projection/backgroundJobs")
+                .and_then(Value::as_array)
+                .context("ZCode background state unavailable")?;
+            let quiescent = foreground_quiescent(&snapshot, allow_failed);
+            if quiescent {
+                return Ok(snapshot);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("ZCode foreground Tool or permission did not settle");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn receive(&self, message: Value) -> Result<()> {
+        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = &message["params"];
+        if let Some(id) = message.get("id") {
+            if method == "session/requestRuntimePreferences" {
+                return write_frame(
+                    &self.native,
+                    &json!({"id":id,"result":self.config.preferences()}),
+                )
+                .await;
+            }
+            if method == "interaction/requestProviderRuntimeHeaders" {
+                // The official App obtains fresh verification headers in its
+                // Renderer. Config Authorization alone cannot confirm that step.
+                // Native preparation replaces this cause with a generic error.
+                if params["workspace"] == self.workspace()
+                    && let Some(session) = self
+                        .sessions
+                        .lock()
+                        .await
+                        .get_mut(params["sessionId"].as_str().unwrap_or(""))
+                {
+                    session
+                        .events
+                        .reject_runtime_headers(params["turnId"].as_str());
+                }
+                return write_frame(
+                    &self.native,
+                    &json!({"id":id,"result":{
+                        "headersApplied":false,"errorMessage":RUNTIME_HEADERS_UNAVAILABLE
+                    }}),
+                )
+                .await;
+            }
+            if method == "interaction/requestPermission" {
+                let session_id = params["sessionId"]
+                    .as_str()
+                    .context("ZCode permission Session missing")?;
+                let active = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(session_id)
+                    .is_some_and(|s| s.events.owns_turn(params["turnId"].as_str()));
+                let options = params["options"]
+                    .as_array()
+                    .context("ZCode permission options missing")?;
+                if active
+                    && !options.is_empty()
+                    && options
+                        .iter()
+                        .all(|o| o.get("response").is_some() && o.get("optionId").is_some())
+                {
+                    let key = format!("zcode-permission-{}", uuid::Uuid::new_v4());
+                    self.permissions.lock().await.insert(
+                        key.clone(),
+                        PendingPermission {
+                            session_id: session_id.to_string(),
+                            native_id: id.clone(),
+                            options: options.clone(),
+                        },
+                    );
+                    let options = options.iter().map(|o| json!({"optionId":o["optionId"],"name":o["name"],"kind":if o["kind"] == "deny" { json!("reject_once") } else { o["kind"].clone() }})).collect::<Vec<_>>();
+                    return write_frame(&self.core, &json!({"id":key,"method":"session/request_permission","params":{
+                        "sessionId":session_id,"options":options,"toolCall":{"toolCallId":params["toolCallId"],"title":params["toolName"],"rawInput":params["input"]}}})).await;
+                }
+                return write_frame(
+                    &self.native,
+                    &json!({"id":id,"result":{"decision":"deny","reason":"No active Rovai owner"}}),
+                )
+                .await;
+            }
+            return write_frame(&self.native, &json!({"id":id,"error":{"code":-32601,"message":"Unsupported Rovai host interaction"}})).await;
+        }
+        if method != "session/event" {
+            return Ok(());
+        }
+        let Some(session_id) = params["sessionId"].as_str() else {
+            return Ok(());
+        };
+        let translated = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id) else {
+                return Ok(());
+            };
+            let translated = session.events.receive(params)?;
+            for input in &translated.steering_received {
+                if !session.cancelled
+                    && let Some(receipt) = session.steering.remove(input)
+                {
+                    let _ = receipt.send(Ok(json!({"inputId":input,"accepted":true})));
+                }
+            }
+            translated
+        };
+        if params["type"] == "turn.started"
+            && params
+                .pointer("/payload/inputSource")
+                .and_then(Value::as_str)
+                == Some("background_task")
+        {
+            // Native completion notifications start an extra model Turn without
+            // a Rovai Input. Stop only that exact native foreground execution;
+            // the background service and its real result keep their own scope.
+            let foreground = params
+                .pointer("/payload/foregroundExecutionId")
+                .and_then(Value::as_str)
+                .context("ZCode background notification execution ID missing")?;
+            let result = self.call("v4/command", json!({"commandId":format!("rovai-notification-stop-{}",uuid::Uuid::new_v4()),
+                "clientId":"rovai","sessionId":session_id,"type":"stop", "payload":{"expectedForegroundExecutionId":foreground},
+                "issuedAt":chrono::Utc::now().timestamp_millis()})).await?;
+            write_frame(&self.core, &json!({"method":"_zcode/backgroundNotificationStop","params":{
+                "sessionId":session_id,"nativeTurnId":params["turnId"],"foregroundExecutionId":foreground,"commandStatus":result["status"]}})).await?;
+        }
+        let mut background_finished = false;
+        for mut event in translated.messages {
+            recover_command_output(&mut event, &self.config.output_root()?).await;
+            write_frame(&self.core, &event).await?;
+            background_finished |= event["method"] == "_zcode/background"
+                && matches!(
+                    event
+                        .pointer("/params/background/status")
+                        .and_then(Value::as_str),
+                    Some("completed" | "failed" | "cancelled")
+                );
+            if event["method"] == "_zcode/compaction"
+                && let Some(session) = self.sessions.lock().await.get_mut(session_id)
+                && let Some(reply) = session.acceptance_compaction.take()
+            {
+                let _ = reply.send(());
+            }
+        }
+        if background_finished
+            || matches!(
+                params["type"].as_str(),
+                Some("turn.completed" | "turn.failed")
+            )
+        {
+            self.background_settle
+                .try_send(session_id.to_string())
+                .context("ZCode background observer queue unavailable")?;
+        }
+        if translated.context_refresh {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(session_id)
+                && session.events.input_id().is_some()
+            {
+                session.context_refresh_pending = params.get("seq").and_then(Value::as_u64);
+                self.context_refresh.notify_one();
+            }
+        }
+        if let Some(terminal) = translated.terminal {
+            let pending_steer = self
+                .sessions
+                .lock()
+                .await
+                .get(session_id)
+                .is_some_and(|s| s.events.has_pending_steering());
+            if pending_steer {
+                // A native guide may fall back to its ordinary queue. Stop the
+                // exact Host's foreground before any successor can inherit it.
+                self.stop(session_id).await?;
+            }
+            crate::monitoring::context_acceptance_trace(|| {
+                json!({
+                    "kind":"zcode_native_final", "sessionId":session_id,
+                    "receivedAt":chrono::Utc::now().to_rfc3339()
+                })
+            });
+            // Foreground closure is independent of managed background jobs.
+            self.finished
+                .send((session_id.to_string(), terminal))
+                .await
+                .context("ZCode terminal collector closed")?;
+        }
+        Ok(())
+    }
+}
+
+// Read the native root Session's own observation from a bounded live/terminal
+// snapshot. Its runtime contextUsage owns occupancy/window pairing, including
+// native compaction; turn Usage and projection.totalTokenCount are not Context.
+// Keep only numeric fields and native revision identities on the Core channel.
+fn native_context_update(session_id: &str, snapshot: &Value) -> Option<Value> {
+    if snapshot.pointer("/session/sessionId")?.as_str()? != session_id {
+        return None;
+    }
+    let runtime = snapshot.get("runtime")?;
+    let seq = runtime.get("eventSeq")?.as_u64()?;
+    let revision = runtime.get("stateRevision")?.as_u64()?;
+    let context = runtime.get("contextUsage")?;
+    let used = context
+        .get("used")
+        .and_then(Value::as_i64)
+        .filter(|n| (0..=9_007_199_254_740_991).contains(n));
+    let size = context
+        .get("size")
+        .and_then(Value::as_i64)
+        .filter(|n| (0..=9_007_199_254_740_991).contains(n));
+    if used.is_none() && size.is_none() {
+        return None;
+    }
+    let model = snapshot
+        .pointer("/settings/model/current/providerId")
+        .and_then(Value::as_str)
+        .zip(
+            snapshot
+                .pointer("/settings/model/current/modelId")
+                .and_then(Value::as_str),
+        )
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        .map(|(provider, model)| format!("{provider}/{model}"));
+    Some(
+        json!({"method":"session/update","params":{"sessionId":session_id,"update":{
+            "sessionUpdate":"usage_update","used":used,"size":size,
+            "_meta":{"zcodeContext":{"eventSeq":seq,"stateRevision":revision,"modelId":model}}
+        }}}),
+    )
+}
+
+// A provider failure leaves the native projection in error, not idle. It can
+// settle only a failed/cancelled path; successful Final retains the idle gate.
+fn foreground_quiescent(snapshot: &Value, allow_failed: bool) -> bool {
+    let status = snapshot
+        .pointer("/projection/status")
+        .and_then(Value::as_str);
+    (status == Some("idle") || (allow_failed && status == Some("error")))
+        && snapshot
+            .pointer("/runtime/activeTurnId")
+            .is_none_or(Value::is_null)
+        && [
+            "/projection/activeToolCalls",
+            "/projection/pendingPermissions",
+            "/runtime/pendingRequestIds",
+        ]
+        .iter()
+        .all(|path| {
+            snapshot
+                .pointer(path)
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        })
+}
+
+/// Only a correlated native Bash result may identify an output artifact. Never
+/// follow a path scraped from text, another Session, a symlink, or a device.
+async fn recover_command_output(event: &mut Value, output_root: &std::path::Path) {
+    use tokio::io::AsyncReadExt;
+    const OUTPUT_LIMIT: u64 = 256 * 1024;
+    let params = &event["params"];
+    let update = &params["update"];
+    if update["sessionUpdate"] != "tool_call_update"
+        || update["toolName"] != "Bash"
+        || update
+            .pointer("/rawOutput/budgetStrategy")
+            .and_then(Value::as_str)
+            != Some("artifact")
+        || update
+            .pointer("/rawOutput/artifactPath")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return;
+    }
+    let result = async {
+        let session = params["sessionId"].as_str().context("missing Session")?;
+        let tool = update["toolCallId"].as_str().context("missing Tool")?;
+        let safe = |id: &str| {
+            id.bytes()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || b"._-".contains(&c) {
+                        c as char
+                    } else {
+                        '_'
+                    }
+                })
+                .take(120)
+                .collect::<String>()
+        };
+        let root = tokio::fs::canonicalize(output_root).await?;
+        let parent = root.join(safe(session));
+        if tokio::fs::canonicalize(&parent).await? != parent {
+            bail!("artifact Session directory is a link");
+        }
+        let expected = parent.join(format!("{}-stdout.log", safe(tool)));
+        let reported = update
+            .pointer("/rawOutput/artifactPath")
+            .and_then(Value::as_str)
+            .context("missing artifact")?;
+        if tokio::fs::canonicalize(reported).await? != expected {
+            bail!("artifact identity mismatch");
+        }
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options.open(expected).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() {
+            bail!("artifact is not a regular file");
+        }
+        let mut bytes = Vec::new();
+        file.take(OUTPUT_LIMIT + 1).read_to_end(&mut bytes).await?;
+        let truncated = bytes.len() as u64 > OUTPUT_LIMIT
+            || update
+                .pointer("/rawOutput/outputBytes")
+                .and_then(Value::as_u64)
+                .is_some_and(|size| size > metadata.len());
+        bytes.truncate(OUTPUT_LIMIT as usize);
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if truncated {
+            text.push_str("\n[ZCode command output truncated; native artifact retained]");
+        }
+        Ok::<_, anyhow::Error>((text, truncated))
+    }
+    .await;
+    let update = &mut event["params"]["update"];
+    match result {
+        Ok((text, truncated)) => {
+            update["rawOutput"]["output"] = json!(text);
+            update["rawOutput"]["truncated"] = json!(truncated);
+            update["content"] = json!([{"type":"content","content":{"type":"text","text":text}}]);
+        }
+        Err(_) => {
+            update["rawOutput"]["truncated"] = json!(true);
+            if let Some(text) = update.pointer_mut("/content/0/content/text") {
+                *text = json!(format!(
+                    "{}\n[ZCode command output is a preview; native artifact unavailable]",
+                    text.as_str().unwrap_or("")
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Owns terminal delivery across the facade's concurrent reader/settler/request
+    // workers. Pure event mapping cannot catch a failed projection closing the
+    // facade before Core receives the provider failure. No process, disk or DB.
+    #[tokio::test]
+    async fn provider_failure_reaches_core_without_poisoning_the_host() {
+        let context_snapshot = json!({"session":{"sessionId":"s1"},"runtime":{
+            "eventSeq":9,"stateRevision":4,"contextUsage":{"used":450,"size":1000,"breakdown":"PRIVATE_TEST_KEY"}},
+            "projection":{"totalTokenCount":99999}});
+        let context = native_context_update("s1", &context_snapshot).unwrap();
+        assert!(!context.to_string().contains("PRIVATE_TEST_KEY"));
+        let parsed = crate::monitoring::parse_acp_usage_message(
+            crate::agent_profile::AdapterKind::ZcodeApp,
+            None,
+            "session/update",
+            &context["params"],
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].fields.context_used_tokens, Some(450));
+        assert_eq!(parsed[0].fields.context_size_tokens, Some(1000));
+        assert_eq!(parsed[0].fields.input_tokens, None);
+        assert!(native_context_update("old-session", &context_snapshot).is_none());
+        let mut invalid = context_snapshot.clone();
+        invalid["runtime"]["eventSeq"] = json!(-1);
+        assert!(native_context_update("s1", &invalid).is_none());
+        for (field, value, remaining) in [
+            ("used", json!(-1), "size"),
+            ("used", json!("450"), "size"),
+            ("size", Value::Null, "used"),
+        ] {
+            let mut partial = context_snapshot.clone();
+            partial["runtime"]["contextUsage"][field] = value;
+            let mapped = native_context_update("s1", &partial).unwrap();
+            assert!(mapped["params"]["update"][field].is_null());
+            assert_eq!(
+                mapped["params"]["update"][remaining],
+                context["params"]["update"][remaining]
+            );
+        }
+        for (field, remaining) in [("used", "size"), ("size", "used")] {
+            let mut partial = context_snapshot.clone();
+            partial["runtime"]["contextUsage"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let mapped = native_context_update("s1", &partial).unwrap();
+            assert_eq!(mapped["params"]["update"][field], Value::Null);
+            assert_eq!(
+                mapped["params"]["update"][remaining],
+                context["params"]["update"][remaining]
+            );
+        }
+        let mut compacted = context_snapshot.clone();
+        compacted["runtime"]["stateRevision"] = json!(5);
+        compacted["runtime"]["contextUsage"]["used"] = json!(100);
+        let decreased = native_context_update("s1", &compacted).unwrap();
+        assert_eq!(decreased["params"]["update"]["used"], 100);
+        assert_ne!(
+            decreased["params"]["update"]["_meta"],
+            context["params"]["update"]["_meta"]
+        );
+        let snapshot = json!({"projection":{"status":"error","activeToolCalls":[],"pendingPermissions":[]},
+            "runtime":{"pendingRequestIds":[]}});
+        assert!(foreground_quiescent(&snapshot, true));
+        assert!(!foreground_quiescent(&snapshot, false));
+        for path in [
+            "/projection/activeToolCalls",
+            "/projection/pendingPermissions",
+            "/runtime/pendingRequestIds",
+        ] {
+            let mut busy = snapshot.clone();
+            *busy.pointer_mut(path).unwrap() = json!([{"id":"pending"}]);
+            assert!(!foreground_quiescent(&busy, true));
+        }
+        let mut active = snapshot;
+        active["runtime"]["activeTurnId"] = json!("t1");
+        assert!(!foreground_quiescent(&active, true));
+        let config = NativeConfig {
+            value: json!({"model":{"main":"fixture/model"},"provider":{"fixture":{"kind":"anthropic",
+                "options":{"apiKey":"PRIVATE_TEST_KEY","baseURL":"https://example.invalid"},
+                "models":{"model":{}}}}}),
+            digest: "fixture".into(),
+            app_config: false,
+            protocol: NativeProtocol::Legacy,
+            default_selection: None,
+        };
+        let (native, adapter) = tokio::io::duplex(64 * 1024);
+        let (native_read, native_write) = tokio::io::split(native);
+        let (adapter_read, adapter_write) = tokio::io::split(adapter);
+        let (live_tx, live_rx) = oneshot::channel();
+        let mut live_tx = Some(live_tx);
+        let peer = tokio::spawn(async move {
+            let mut live_rx = Some(live_rx);
+            let mut reader = BufReader::new(native_read);
+            let writer: Mutex<Writer> = Mutex::new(Box::new(native_write));
+            let mut frame = Vec::new();
+            while let Some(request) = read_frame(&mut reader, &mut frame).await.unwrap() {
+                let result = match request["method"].as_str().unwrap() {
+                    "session/create" => json!({"session":{"sessionId":"s1"},"settings":{"model":{
+                        "current":{"providerId":"fixture","modelId":"model"},
+                        "available":[{"ref":{"providerId":"fixture","modelId":"model"}}]}}}),
+                    "session/subscribe" => json!({"eventSeq":0}),
+                    "v4/command" => {
+                        let input = request["params"]["commandId"].clone();
+                        write_frame(
+                            &writer,
+                            &json!({"method":"session/event","params":{"sessionId":"s1","seq":1,
+                            "turnId":"t1","type":"turn.started","payload":{"inputId":input}}}),
+                        )
+                        .await
+                        .unwrap();
+                        let completed = |seq| {
+                            json!({"method":"session/event","params":{
+                            "sessionId":"s1","seq":seq,"turnId":"t1","type":"session.updated",
+                            "payload":{"usage":{"inputTokens":40},"querySource":"main_turn"}}})
+                        };
+                        write_frame(&writer, &completed(2)).await.unwrap();
+                        let first = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                        assert_eq!(first["method"], "session/read");
+                        assert_eq!(first["params"]["messageLimit"], 1);
+                        for seq in 3..23 {
+                            write_frame(&writer, &completed(seq)).await.unwrap();
+                        }
+                        // This callback is processed after the burst, while the
+                        // first read is still held: proves one in-flight request.
+                        write_frame(
+                            &writer,
+                            &json!({"id":"barrier","method":"session/requestRuntimePreferences"}),
+                        )
+                        .await
+                        .unwrap();
+                        let barrier = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                        assert_eq!(barrier["id"], "barrier");
+                        let live_snapshot = |used, revision, seq| {
+                            json!({"session":{"sessionId":"s1"},
+                            "runtime":{"eventSeq":seq,"stateRevision":revision,"activeTurnId":"t1",
+                                "contextUsage":{"used":used,"size":1000}}})
+                        };
+                        write_frame(
+                            &writer,
+                            &json!({"id":first["id"],"result":live_snapshot(450,5,2)}),
+                        )
+                        .await
+                        .unwrap();
+                        let second = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                        assert_eq!(second["method"], "session/read");
+                        // These arrive while the second read is pending; its
+                        // snapshot already covers them, so no third read.
+                        for seq in 23..26 {
+                            write_frame(&writer, &completed(seq)).await.unwrap();
+                        }
+                        write_frame(
+                            &writer,
+                            &json!({"id":"covered","method":"session/requestRuntimePreferences"}),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            read_frame(&mut reader, &mut frame).await.unwrap().unwrap()["id"],
+                            "covered"
+                        );
+                        write_frame(
+                            &writer,
+                            &json!({"id":second["id"],"result":live_snapshot(400,6,25)}),
+                        )
+                        .await
+                        .unwrap();
+                        // Do not issue the final/error until Core received both
+                        // numeric observations. No completed prompt can mask this.
+                        live_rx.take().unwrap().await.unwrap();
+                        write_frame(&writer,&json!({"id":"headers","method":"interaction/requestProviderRuntimeHeaders",
+                            "params":{"sessionId":"s1","turnId":"t1","reason":"model-request",
+                                "workspace":{"workspacePath":"/fixture","workspaceKey":"/fixture"}}})).await.unwrap();
+                        let callback = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                        assert_eq!(callback["id"], "headers");
+                        assert_eq!(callback["result"]["headersApplied"], false);
+                        write_frame(&writer,&json!({"method":"session/event","params":{
+                            "sessionId":"s1","seq":26,"turnId":"t1","type":"turn.failed",
+                            "payload":{"inputId":input,"turnPhase":"model","error":{
+                                "type":"model_request_failed","code":"model_request_failed",
+                                "message":"Model request failed.","stack":"PRIVATE_TEST_KEY",
+                                "attribution":{"source":"runtime","reason":"unknown"},"retryable":false}}
+                        }})).await.unwrap();
+                        json!({"status":"accepted","result":{"inputId":input}})
+                    }
+                    "session/read" => {
+                        json!({"session":{"sessionId":"s1"},"projection":{"status":"error","backgroundJobs":[],
+                        "activeToolCalls":[],"pendingPermissions":[]},"runtime":{"pendingRequestIds":[],
+                        "eventSeq":26,"stateRevision":7,"contextUsage":{"used":450,"size":1000,"breakdown":"PRIVATE_TEST_KEY"}}})
+                    }
+                    "workspace/readState" | "session/setMode" => json!({}),
+                    method => panic!("unexpected native method {method}"),
+                };
+                write_frame(&writer, &json!({"id":request["id"],"result":result}))
+                    .await
+                    .unwrap();
+            }
+        });
+        let stream = start(
+            adapter_write,
+            adapter_read,
+            config,
+            PathBuf::from("/fixture"),
+            "build".into(),
+        );
+        let (read, write) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read);
+        let writer: Mutex<Writer> = Mutex::new(Box::new(write));
+        let mut frame = Vec::new();
+        let mut observed_context = false;
+        let mut live_values = Vec::new();
+        for (id, method, params) in [
+            (1, "session/new", json!({"cwd":"/fixture"})),
+            (
+                2,
+                "session/prompt",
+                json!({"sessionId":"s1","prompt":[{"type":"text","text":"fixture"}]}),
+            ),
+            (3, "initialize", json!({})),
+        ] {
+            write_frame(&writer, &json!({"id":id,"method":method,"params":params}))
+                .await
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let message = read_frame(&mut reader, &mut frame)
+                        .await
+                        .unwrap()
+                        .expect("provider failure must reach Core before any transport close");
+                    assert!(!message.to_string().contains("PRIVATE_TEST_KEY"));
+                    if message["params"]["update"]["_meta"]
+                        .get("zcodeContext")
+                        .is_some()
+                    {
+                        observed_context = true;
+                        if live_values.len() < 2 {
+                            live_values.push(message["params"]["update"]["used"].as_i64().unwrap());
+                            if live_values.len() == 2 {
+                                assert_eq!(live_values, [450, 400]);
+                                live_tx.take().unwrap().send(()).unwrap();
+                            }
+                        }
+                    }
+                    if message["id"] == id {
+                        break message;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            if id == 2 {
+                assert!(
+                    observed_context,
+                    "native Context must precede the prompt terminal"
+                );
+                assert!(
+                    response["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("authentication failed")
+                );
+                assert!(
+                    response["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("captcha")
+                );
+            } else {
+                assert!(response.get("error").is_none(), "{response}");
+            }
+        }
+        assert_eq!(live_values, [450, 400]);
+        peer.abort();
+    }
+
+    // Owns the queue-receipt/terminal-cleanup seam across the facade workers.
+    // No model, process, disk or timer is needed to withhold consumption.
+    #[cfg(feature = "extended-tests")]
+    #[tokio::test]
+    async fn guide_receipts_precede_consumption_and_terminal_clears_the_queue() {
+        let config = NativeConfig {
+            value: json!({}),
+            digest: "guide-fixture".into(),
+            app_config: false,
+            protocol: NativeProtocol::ProviderRegistry,
+            default_selection: Some(json!({"providerId":"fixture","modelId":"model"})),
+        };
+        let (native, adapter) = tokio::io::duplex(64 * 1024);
+        let (native_read, native_write) = tokio::io::split(native);
+        let (adapter_read, adapter_write) = tokio::io::split(adapter);
+        let (finish_tx, mut finish_rx) = oneshot::channel::<()>();
+        let cleared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let native_cleared = cleared.clone();
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(native_read);
+            let writer: Mutex<Writer> = Mutex::new(Box::new(native_write));
+            let mut frame = Vec::new();
+            let mut original = Value::Null;
+            let mut sequence = 0;
+            let mut guides = 0;
+            let mut finished = false;
+            loop {
+                let request = tokio::select! {
+                    request = read_frame(&mut reader, &mut frame) => request.unwrap(),
+                    _ = &mut finish_rx, if !finished => {
+                        assert_eq!(guides, 2);
+                        finished = true;
+                        sequence += 1;
+                        write_frame(&writer, &json!({"method":"session/event","params":{
+                            "sessionId":"s1","seq":sequence,"turnId":"t1","type":"turn.completed",
+                            "payload":{"inputId":original,"resultType":"success","response":""}
+                        }})).await.unwrap();
+                        continue;
+                    }
+                };
+                let Some(request) = request else {
+                    break;
+                };
+                let p = &request["params"];
+                let result = match request["method"].as_str().unwrap() {
+                    "session/create" => json!({"session":{"sessionId":"s1"},"settings":{"model":{
+                        "current":{"providerId":"fixture","modelId":"model"},
+                        "available":[{"ref":{"providerId":"fixture","modelId":"model"}}]}}}),
+                    "session/subscribe" => json!({"eventSeq":0}),
+                    "session/setMode" => json!({}),
+                    "v4/command" if p["type"] == "sendText" => {
+                        sequence += 1;
+                        let input = p["commandId"].clone();
+                        let (kind, payload, delivery) = if p["payload"]["requestedDelivery"]
+                            == "guide"
+                        {
+                            guides += 1;
+                            (
+                                "turn.steerQueued",
+                                json!({"inputId":input,"pendingInputId":format!("q{guides}"),
+                                "input":p["payload"]["text"],"targetTurnId":"t1","delivery":"guide"}),
+                                "queue",
+                            )
+                        } else {
+                            original = input.clone();
+                            ("turn.started", json!({"inputId":input}), "startNow")
+                        };
+                        write_frame(&writer,&json!({"method":"session/event","params":{
+                            "sessionId":"s1","seq":sequence,"turnId":"t1","type":kind,"payload":payload
+                        }})).await.unwrap();
+                        // No steerDrained is emitted, including for the first guide.
+                        json!({"status":"accepted","result":{"inputId":input,"delivery":delivery}})
+                    }
+                    "v4/command" if p["type"] == "stop" => {
+                        assert!(finished, "queue cleanup must not interrupt an active turn");
+                        assert_eq!(guides, 2);
+                        native_cleared.store(true, std::sync::atomic::Ordering::Release);
+                        json!({"status":"accepted","result":{}})
+                    }
+                    "session/read" => json!({"session":{"sessionId":"s1"},
+                        "projection":{"status":"idle","backgroundJobs":[],"activeToolCalls":[],"pendingPermissions":[]},
+                        "runtime":{"pendingRequestIds":[]}}),
+                    method => panic!("unexpected guide fixture operation {method}"),
+                };
+                write_frame(&writer, &json!({"id":request["id"],"result":result}))
+                    .await
+                    .unwrap();
+            }
+        });
+        let stream = start(
+            adapter_write,
+            adapter_read,
+            config,
+            PathBuf::from("/fixture"),
+            "build".into(),
+        );
+        let (read, write) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read);
+        let writer: Mutex<Writer> = Mutex::new(Box::new(write));
+        let mut frame = Vec::new();
+        write_frame(
+            &writer,
+            &json!({"id":1,"method":"session/new","params":{"cwd":"/fixture"}}),
+        )
+        .await
+        .unwrap();
+        let created = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+        assert_eq!(created["result"]["sessionId"], "s1", "{created}");
+        write_frame(
+            &writer,
+            &json!({"id":2,"method":"session/prompt","params":{
+            "sessionId":"s1","prompt":[{"type":"text","text":"ORIGINAL"}]}}),
+        )
+        .await
+        .unwrap();
+        let original = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let m = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                if m["method"] == "_zcode/inputAccepted" {
+                    break m["params"]["inputId"].clone();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        for id in [3, 4] {
+            let input = format!("guide-{id}");
+            write_frame(&writer,&json!({"id":id,"method":"_zcode/steer","params":{
+                "sessionId":"s1","expectedInputId":original,"inputId":input,"text":format!("TEXT {id}")
+            }})).await.unwrap();
+            let receipt = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let m = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                    assert_ne!(m["id"], 2, "receipt cannot depend on the original terminal");
+                    if m["id"] == id {
+                        break m;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(receipt["result"], json!({"inputId":input,"accepted":true}));
+            assert!(!cleared.load(std::sync::atomic::Ordering::Acquire));
+        }
+        finish_tx.send(()).unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let m = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                if m["id"] == 2 {
+                    break m;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal["result"]["stopReason"], "end_turn");
+        assert!(
+            cleared.load(std::sync::atomic::Ordering::Acquire),
+            "accepted-but-undrained guides still require cleanup"
+        );
+        peer.abort();
+    }
+
+    // The 0.16.9 worker rejects the old registry/readState and runtimeModel
+    // fields. This facade test owns that wire boundary; the real kernel Probe
+    // separately verifies its model catalog and process startup.
+    #[tokio::test]
+    async fn provider_registry_protocol_uses_native_model_selection() {
+        // The questionnaire restriction is independent of permission mode and
+        // must be sent again when the native Session is resumed.
+        for (probe, mode) in [
+            (false, "build"),
+            (false, "plan"),
+            (false, "yolo"),
+            (true, "build"),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let config = NativeConfig {
+                value: json!({}),
+                digest: "modern-fixture".into(),
+                app_config: false,
+                protocol: NativeProtocol::ProviderRegistry,
+                default_selection: Some(json!({"providerId":"fixture","modelId":"model",
+                "options":{"reasoningLevel":"disabled"}})),
+            };
+            let (native, adapter) = tokio::io::duplex(64 * 1024);
+            let (native_read, native_write) = tokio::io::split(native);
+            let (adapter_read, adapter_write) = tokio::io::split(adapter);
+            let peer = tokio::spawn(async move {
+                let mut reader = BufReader::new(native_read);
+                let writer: Mutex<Writer> = Mutex::new(Box::new(native_write));
+                let mut frame = Vec::new();
+                let model = json!({"providerId":"fixture","modelId":"model"});
+                let snapshot = json!({"session":{"sessionId":"s1"},"settings":{"model":{
+                "current":model,"available":[{"ref":model,"label":"Fixture model",
+                    "reasoning":{"defaultLevel":"enabled","levels":[{"value":"enabled","label":"Enabled"}]}}]}}});
+                while let Some(request) = read_frame(&mut reader, &mut frame).await.unwrap() {
+                    observed
+                        .lock()
+                        .await
+                        .push(request["method"].as_str().unwrap().to_string());
+                    let params = &request["params"];
+                    let result = match request["method"].as_str().unwrap() {
+                        "workspace/readPresentation" => {
+                            json!({"workspace":params["workspace"],"mode":"build","slashCommands":[]})
+                        }
+                        "session/create" => {
+                            assert_eq!(params["toolDenylist"], json!(["AskUserQuestion"]));
+                            assert_eq!(params["mode"], mode);
+                            assert!(params.get("runtimeModel").is_none());
+                            assert_eq!(params["model"]["options"]["reasoningLevel"], "disabled");
+                            assert_eq!(params["thoughtLevel"], "disabled");
+                            snapshot.clone()
+                        }
+                        "session/resume" => {
+                            assert_eq!(params["toolDenylist"], json!(["AskUserQuestion"]));
+                            assert!(params.get("runtimeModel").is_none());
+                            assert_eq!(params["sessionId"], "s1");
+                            snapshot.clone()
+                        }
+                        "session/setModel" => {
+                            assert!(params.get("runtimeModel").is_none());
+                            assert_eq!(params["model"]["options"]["reasoningLevel"], "disabled");
+                            json!({"settings":{"model":{"current":model}}})
+                        }
+                        "session/subscribe" => json!({"eventSeq":0}),
+                        "session/setMode" => {
+                            assert_eq!(params["mode"], mode);
+                            json!({})
+                        }
+                        method => panic!("unexpected modern native method {method}"),
+                    };
+                    write_frame(&writer, &json!({"id":request["id"],"result":result}))
+                        .await
+                        .unwrap();
+                }
+            });
+            let stream = start_bridge(
+                adapter_write,
+                adapter_read,
+                config,
+                PathBuf::from("/fixture"),
+                mode.into(),
+                probe,
+            );
+            let (read, write) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let writer: Mutex<Writer> = Mutex::new(Box::new(write));
+            let mut frame = Vec::new();
+            for (id, method, params) in [
+                (1, "initialize", json!({})),
+                (2, "session/new", json!({"cwd":"/fixture"})),
+                (
+                    3,
+                    "session/set_model",
+                    json!({"sessionId":"s1","modelId":"fixture/model"}),
+                ),
+                (
+                    4,
+                    "session/resume",
+                    json!({"cwd":"/fixture","sessionId":"s1"}),
+                ),
+            ] {
+                if probe && id > 2 {
+                    continue;
+                }
+                write_frame(&writer, &json!({"id":id,"method":method,"params":params}))
+                    .await
+                    .unwrap();
+                let response = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    read_frame(&mut reader, &mut frame),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                assert_eq!(response["id"], id);
+                assert!(response.get("error").is_none(), "{response}");
+                if id == 2 || id == 4 {
+                    assert_eq!(
+                        response["result"]["models"]["currentModelId"],
+                        "fixture/model"
+                    );
+                }
+            }
+            let calls = calls.lock().await;
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|method| method.as_str() == "session/subscribe")
+                    .count(),
+                if probe { 0 } else { 2 }
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|method| method.as_str() == "session/setMode")
+                    .count(),
+                if probe { 0 } else { 2 }
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|method| method.as_str() == "session/create")
+                    .count(),
+                1
+            );
+            peer.abort();
+        }
+    }
+
+    // Owns native-to-ACP error provenance. The model-selection happy path and
+    // Core fallback fixtures cannot detect a facade laundering unrelated errors
+    // into restore rejection. No real process, credentials or native history.
+    #[cfg(feature = "extended-tests")]
+    #[tokio::test]
+    async fn only_the_native_resume_rejection_authorizes_session_replacement() {
+        for (failed_method, native_code, expected_code) in [
+            ("session/resume", -32004, -32004),
+            ("session/resume", -32601, -32601),
+            ("session/resume", -32602, -32000),
+            ("session/resume", -32603, -32000),
+            ("workspace/readPresentation", -32004, -32000),
+            ("workspace/readPresentation", -32601, -32000),
+            ("session/subscribe", -32004, -32000),
+            ("session/subscribe", -32601, -32000),
+            ("session/setMode", -32004, -32000),
+            ("session/setModel", -32601, -32000),
+        ] {
+            let config = NativeConfig {
+                value: json!({}),
+                digest: "resume-errors-fixture".into(),
+                app_config: false,
+                protocol: NativeProtocol::ProviderRegistry,
+                default_selection: Some(json!({"providerId":"fixture","modelId":"model"})),
+            };
+            let (native, adapter) = tokio::io::duplex(64 * 1024);
+            let (native_read, native_write) = tokio::io::split(native);
+            let (adapter_read, adapter_write) = tokio::io::split(adapter);
+            let peer = tokio::spawn(async move {
+                let mut reader = BufReader::new(native_read);
+                let writer: Mutex<Writer> = Mutex::new(Box::new(native_write));
+                let mut frame = Vec::new();
+                while let Some(request) = read_frame(&mut reader, &mut frame).await.unwrap() {
+                    let method = request["method"].as_str().unwrap();
+                    let response = if method == failed_method {
+                        json!({"id":request["id"],"error":{"code":native_code,
+                            "message":"incompatible method not found PRIVATE_NATIVE_ERROR"}})
+                    } else {
+                        let result = match method {
+                            "workspace/readPresentation" => {
+                                json!({"workspace":request["params"]["workspace"],"mode":"build","slashCommands":[]})
+                            }
+                            "session/resume" => {
+                                assert_eq!(request["params"]["sessionId"], "s1");
+                                json!({"session":{"sessionId":"s1"},"settings":{"model":{
+                                    "current":{"providerId":"fixture","modelId":"model"}}}})
+                            }
+                            "session/subscribe" => json!({"eventSeq":0}),
+                            "session/setMode" => json!({}),
+                            other => panic!(
+                                "unexpected native request, including any business input: {other}"
+                            ),
+                        };
+                        json!({"id":request["id"],"result":result})
+                    };
+                    write_frame(&writer, &response).await.unwrap();
+                }
+            });
+            let stream = start(
+                adapter_write,
+                adapter_read,
+                config,
+                PathBuf::from("/fixture"),
+                "build".into(),
+            );
+            let (read, write) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let writer: Mutex<Writer> = Mutex::new(Box::new(write));
+            let mut frame = Vec::new();
+            let mut rejected = false;
+            for (id, method, params) in [
+                (1, "initialize", json!({})),
+                (
+                    2,
+                    "session/resume",
+                    json!({"cwd":"/fixture","sessionId":"s1"}),
+                ),
+                (
+                    3,
+                    "session/set_model",
+                    json!({"sessionId":"s1","modelId":"fixture/model"}),
+                ),
+            ] {
+                write_frame(&writer, &json!({"id":id,"method":method,"params":params}))
+                    .await
+                    .unwrap();
+                let response = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    read_frame(&mut reader, &mut frame),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                assert_eq!(response["id"], id);
+                assert!(!response.to_string().contains("PRIVATE_NATIVE_ERROR"));
+                if response.get("error").is_some() {
+                    assert_eq!(
+                        response["error"]["code"], expected_code,
+                        "{failed_method}: {response}"
+                    );
+                    rejected = true;
+                    break;
+                }
+            }
+            assert!(rejected, "{failed_method}");
+            peer.abort();
+        }
+    }
+
+    // Owns the artifact filesystem boundary, which existing ACP output tests
+    // cannot cover because they never read native ZCode artifact paths.
+    #[tokio::test]
+    async fn artifact_output_is_bounded_and_bound_to_the_native_session_and_tool() {
+        let root =
+            std::env::temp_dir().join(format!("rovai-zcode-output-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(root.join("session"))
+            .await
+            .unwrap();
+        let path = root.join("session/tool-stdout.log");
+        let output = "x".repeat(300_000);
+        tokio::fs::write(&path, &output).await.unwrap();
+        let event = json!({"params":{"sessionId":"session","update":{"sessionUpdate":"tool_call_update",
+            "toolName":"Bash","toolCallId":"tool","rawOutput":{"budgetStrategy":"artifact","artifactPath":path,"outputBytes":300_000},
+            "content":[{"type":"content","content":{"type":"text","text":"preview"}}]}}});
+        let mut recovered = event.clone();
+        recover_command_output(&mut recovered, &root).await;
+        let text = recovered
+            .pointer("/params/update/content/0/content/text")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(text.starts_with(&"x".repeat(256 * 1024)));
+        assert!(text.len() < 263_000);
+        assert_eq!(
+            recovered.pointer("/params/update/rawOutput/truncated"),
+            Some(&json!(true))
+        );
+        let mut foreign = event.clone();
+        foreign["params"]["sessionId"] = json!("other");
+        recover_command_output(&mut foreign, &root).await;
+        assert!(
+            foreign
+                .pointer("/params/update/content/0/content/text")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("preview")
+        );
+        #[cfg(unix)]
+        {
+            tokio::fs::remove_file(&path).await.unwrap();
+            let secret = root.join("private.txt");
+            tokio::fs::write(&secret, "MUST_NOT_READ").await.unwrap();
+            std::os::unix::fs::symlink(secret, &path).unwrap();
+            let mut linked = event;
+            recover_command_output(&mut linked, &root).await;
+            assert!(!linked.to_string().contains("MUST_NOT_READ"));
+        }
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+}

@@ -1,0 +1,218 @@
+---
+document_type: architecture
+architecture: runtime-file-change-observation
+authority: command-and-agent-run-file-change-boundaries
+status: accepted
+last_updated: 2026-10-26
+---
+
+# Runtime File Change Observation 架构
+
+字段、归约与授权接口见 [Runtime File Change Observation v9](../contracts/runtime-file-change-observation-v9.md)。
+本架构只消费 Runtime 明确报告的文件变化，不读取当前文件、不扫描工作区，也不依赖 Git。
+
+## 产品模型
+
+```text
+Runtime terminal file event
+  -> Adapter-specific public normalizer
+  -> exact managed-output-root exclusion
+  -> versioned Operation Evidence / independent snapshot Evidence
+       -> Canonical Activity projector
+            -> Command View `阅读 | 新增 | 编辑 <file>`
+            -> optional inline Command Diff
+       -> AgentRun file-change projector
+            -> one versioned projection per agentRunId + executionEpoch
+            -> one timeline card `Files Changed`
+            -> inline file detail
+```
+
+`Command Diff` 回答一次 Operation 明确报告了什么；`AgentRun File Changes` 汇总一个 Run 在本次 execution epoch
+中已经成功报告的文件变化。两者读取同一份已准入 Evidence 当前 revision 与独立 snapshot，但分别投影，不互相依赖，也不创建第二套
+Canonical Activity。
+
+工作区当前状态不属于这条观测链。产品没有 baseline、final、Window、participant、coordinator、Git tree、
+checkpoint ref 或 filesystem capture；Git 与非 Git execution root 使用相同能力。
+
+## 组件职责
+
+### Runtime Adapter normalizer
+
+- Adapter 只接纳它能从协议结构化字段证明的成功 read/write 文件操作、完整 before/after、完整 unified diff snapshot 或 exact
+  mutation，以及当前合同明确准入的 reported mutation；失败、取消、字段不完整和自由文本保持普通 Tool Evidence；
+- Pi 只把成功 `edit` 终态的 `result.details.patch` 作为内容来源，并要求 patch 文件头与同 ToolCall 的结构化 path
+  完全一致且包含 hunk；`write` 保持 operation-only，不从当前磁盘或 input 反推内容；
+- Command 关联同 ToolCall 的输入与成功终态：普通单次 `edit_file` 保留 reported mutation 片段；
+  空 `old_string` 且终态精确匹配原生 `Created <同路径> (<行数> line[s])` 才将完整 `new_string`
+  作为 add。该回执仅在 1.88 的不存在分支产生；`write_file` 的精确同路径 created 成功回执也用于已有
+  空文件，因此非空 content 按空正文到新正文作为完整 update，提供行数和 Diff，不宣称 add。
+  空 content、非空覆盖及不明确的多处替换仍为 operation-only；失败、提案不产生已发生 Diff；
+- 路径按 Run 冻结的 execution root 做纯词法规范化，该 root 也是 display root。root 内转换为相对路径；root 外
+  保留规范化绝对路径。相对 `..` 可解析到 root 外，但不能越过文件系统根；其他 URI scheme、Git metadata 路径和
+  不明确多路径 fail closed；
+- Core 同时向 normalizer 传入当前 Built-in Tool Process 的 typed `run_tmp`。解析后的 path 等于该 root 或位于其下
+  时只写安全 unavailable 诊断，不形成文件 path 或 Diff；这是逐 component 的精确排除，不扩大到 data dir、
+  process root、其他进程目录或 `run-tmp-copy`；
+- mixed Diff 逐 entry 保留普通文件；Codex whole-turn snapshot 在 durable ingress 前逐 `diff --git` section 执行
+  同一过滤。全部 section 被排除时保存权威空 snapshot，startup recovery 不会从更早 operation 重新引入；
+- 规范化不打开文件、不解析 shell 命令，也不从 Tool 显示名、stdout/stderr 或当前磁盘补全缺失事实；
+  Command 的上述精确原生工具回执仅确认同调用的新建分支，不是通用自由文本推断；
+- Evidence 保留来源语义和原始 old/new 或 diff 内容。Renderer 所需 unified diff 是 projection，不反向改写
+  Evidence。
+
+### Canonical Activity projector
+
+- 成功的可靠单文件 read/write operation 可在原 Canonical Activity 上形成阅读／编辑 presentation row；明确
+  `changeKind=add` 的 operation 或 Diff 行可显示新增，只有 write path 时保守显示编辑；
+- 有可靠内容时，同一行再获得 `diffProjection`、增删计数与 inline disclosure；只有 path 时仍显示文件行，但不
+  伪造计数或空 diff；
+- Activity identity、phase、outcome、排序和 operation count 继续由既有 Canonical Activity 拥有。逐文件行只是
+  presentation rows；
+- `apply_patch` 等原始 Tool 名本身不构成 Diff 数据源，也不形成父级聚合行；Cline 只将同 ToolCall 确认成功的规范补丁按 `reported_mutation` 准入，明确保留模糊匹配的不确定性；
+- managed output 的 unavailable projection 只保留内部诊断，不形成带 path 的文件行或 inline Diff；原 Tool
+  Activity 仍可按可靠 Runtime kind 保持普通 file/tool 分类与通用 presentation。
+
+### AgentRun file-change projector
+
+- 投影 key 是 `agentRunId + executionEpoch`。Core 在 Run terminal ingress 已落库后执行；成功、失败或取消 Run
+  都可以包含 terminal 前已经确认成功的文件操作；
+- exact epoch 另有 `fileFactsChangeSequence`，直接复用每次文件事实有效变化取得的 Run change sequence；
+  operation lifecycle、独立文件 Evidence 与 Run snapshot 都推进同一水位，无关正文和 phase 不推进；
+- schema 2 `operationKind=read` 永远不进入本投影；schema 1 历史 write/changeKind 和 schema 2 write 继续按既有
+  规则归约；
+- 正常 terminal callback 本身位于顺序消费的 Runtime ingress queue 中；取消路径则由 Host 级 ingress fence 将
+  `route + enqueue` 与 `unbind + barrier` 串行化。Core 只在 barrier 被 consumer 确认后投影，不能让已选中 owner
+  但尚未入队的终态文件事件落到 `no_changes` 之后；
+- projector 按 Evidence sequence 读取完整受管 payload。最新权威 Run snapshot 优先覆盖 display root 内文件；
+  root 外不属于该 snapshot 的范围，显式 terminal file evidence 仍补入同一张卡。没有权威 snapshot 时使用同 Run
+  的全部 terminal file evidence；
+- 同一 terminal Evidence 只有一条 admitted Diff entry 且同时有一个可靠单文件 operation path 时，后者是该文件
+  的 presentation identity，Diff 内容直接绑定到同一文件；多 entry Diff 不进行该重标，且不跨事件做 basename
+  或 suffix 猜测；
+- terminal Evidence 已用 `runtime_diff_no_changes` 明确确认没有内容变化时，projector 不再把同事件的 path-only
+  operation 回退成卡片文件；
+- 每个文件按语义归约：连续 `FullBeforeAfter` 链可合成为首态到末态的净差异，回到首态则移除；链断裂只让该
+  文件降级为 operation history，不影响其他文件；`ExactMutation` 和 `ReportedMutation` 保留时序；后者统计为补丁报告值，不参与完整状态净差异合并；`OperationOnly` 保留成功操作、
+  原序号和 operation count，但不参与 Diff 统计；
+- 移除 `runtime_diff_no_changes` 后，同文件只要仍有可靠 Diff，就按其语义计算逐文件 `+A −D`：连续完整状态链
+  使用净统计，其余可靠块累计统计。只有所有文件都有可靠统计时卡片才显示总 `+A −D`；任一文件只有
+  operation-only 时，整张卡片回退为 `N 个文件 · M 次修改`；
+- 投影状态为 `complete | no_changes`，同时保存已消费的 `sourceChangeSequence` 与 projection revision；两种状态
+  都只在来源水位相等时可复用，合法迟到文件事实会使其 stale。`complete` 的 detail 进入 sensitive Managed Blob；
+  `no_changes` 是可失效的内部 checkpoint，不进入会话；
+- projector 读取来源快照后复用既有归约，发布前在 Immediate transaction 内复核 exact-epoch 水位，并原子切换
+  摘要、detail 引用、来源水位、revision 与错误状态。来源已变化时旧计算不发布；同 path 重算复用已有
+  `evidenceFileId`，新文件才分配新 ID；
+- startup/maintenance recovery 对尚未投影或来源水位更高的 terminal Run 重放同一 projector。唯一键保证每个
+  execution epoch 至多一张当前卡片；取消 barrier 无法在期限内证明完成时保留缺失 projection，不提前写
+  `no_changes`。重算失败保留上一份可读结果并标 stale，由后续维护或读取重试。
+
+### Send 输入文件用途过滤
+
+CLI 按 [Transport v43](../contracts/builtin-tool-transport-v43.md) 将实际 `--input-file` 的规范化绝对路径
+保存到本次 Send 已有的输入 Evidence。成功终态和成功 Envelope 共同证明该来源可用于本轮排除。
+AgentRun projector 在既有 Evidence 遍历中收集同 Run/epoch 来源，归约完成后精确过滤最终文件列表，
+再计算 summary/detail/counts；全部排除保存 `no_changes`。不存在额外数据库查询、文件读取或 Run 路径表。
+
+这是用途规则：正文文件和完整请求文件都可被排除，包括已有项目文档；`--file` 附件没有这种隐含语义。
+当前磁盘是否仍存在不影响过滤，symlink 别名和名称相似不推断。原始操作与 Command Diff 继续保留。
+成功来源推进既有 file-facts 水位，迟到结果、replay、重启与投影恢复沿用当前机制；旧无来源记录不回填。
+
+### Read Side 与 Renderer
+
+- Camp open 投影每个 Run 的卡片摘要；Renderer 将卡片锚定到来源 Run 的最后一条公开消息，没有公开消息时才按
+  `completedAt` 排序。并行 Run 不合并，后完成的 Run 不覆盖先前卡片，也不会被摆到其他 Run 的消息之后；
+- detail RPC 必须同时匹配 `campId + agentRunId + executionEpoch`，不能仅凭 Run ID 或 Managed Blob ID 读取；
+- Renderer 卡片默认只显示三行；header 的 `View` 与文件行进入同一独立 Review，文件行预选对应路径。Review
+  完整净差异显示 unified diff；exact mutation 显示没有虚假 hunk/行号的片段块；operation history 保留全部
+  operation 的时序、计数和原始序号，但不为 operation-only 记录渲染空白占位块；operation-only 文件显示诚实空态；
+- 卡片和 Review 都只消费 typed projection 与受管 detail blob，不读取当前 workspace 或执行 Git；
+- 卡片与 detail 携带相同 projection source water/revision。Renderer 拒绝较旧异步响应；已打开 Review 原位失效
+  detail，并保留 Tab、文件选择、展开和滚动，不通过卸载卡片刷新；
+- 没有可靠文件 Evidence 时不显示卡片，不显示 unavailable 占位，也不读取当前 workspace 重建；
+- 历史 v1-v3 Evidence、Canonical activity 与既有 projection 不 backfill、不重写；exclusion 和 Pi edit patch 映射只作用于
+  新 ingress，Renderer/read wire 不变。
+
+## Runtime 边界
+
+### Codex app-server
+
+- Command View 只使用 terminal `item/completed`、`item.type=fileChange`、`item.status=completed`；
+- Run card 优先使用当前 turn 最新 `turn/diff/updated`，但只在匹配的 `turn/completed` 后以
+  `runtime.file_changes.snapshot` Evidence 发布。空 snapshot 是 display root 内的权威 no-change；显式 root 外
+  terminal file evidence 不被它吞掉；
+- snapshot 发布前过滤当前 exact `ROVAI_RUN_TMP` sections；普通 root 外用户文件仍保留，全部过滤后保持权威空值；
+- 没有可解析 snapshot 时使用 terminal fileChange Evidence fallback。`item/fileChange/patchUpdated` 和
+  `apply_patch` input 不接入。
+
+### ACP
+
+- 同一 ToolCall 累计 opening/progress/terminal 的标准 locations、Diff content、`rawInput` 与 `_meta/meta`；只有
+  terminal completed 才可发布；
+- 标准 ACP Diff 形成完整 before/after。可靠单路径但没有 Diff 时形成 `OperationOnly`；
+- `rawInput` 的 `file_path | filePath | filepath` 只用于稳定路径，`old_string | oldString` 与
+  `new_string | newString` 字段完整且 `replace_all != true` 时形成 FullBeforeAfter；
+- OpenCode 的成功 write 终态只有在 `rawOutput.metadata.exists` 是 Boolean、metadata `filepath` 与同 ToolCall
+  location 或 rawInput 的唯一非空路径完全一致时，才把 `false | true` 投影为 `changeKind=add | update`。该规则不
+  泛化到其他 ACP adapter；缺字段、类型错误、路径冲突或仅靠 metadata 给出路径时仍是普通 write；
+- failed/cancelled terminal 不发布。Kiro 的 `file:` URI、绝对路径、相对路径与已知 rooted-relative Diff 只按
+  同 ToolCall 的唯一 location 做严格对齐，不做 suffix 猜测；合法 root 外绝对路径仍可作为展示路径；
+- ToolCall 的唯一 location 命中当前 managed output root 时，path-only 与绑定的单 entry Diff 都 fail closed；
+  其他 ToolCall 和普通 root 外路径不受影响。
+
+### MiniMax Code ACP
+
+MiniMax 的 `content.type=diff` 是带行号、省略号的预览，不能走 ACP 完整状态路径，replacement input 也不作
+完整状态回退。同一成功 write/edit 的 `rawOutput.details.patch` 经双侧路径、hunk 与预算校验后复用既有
+unified diff 投影；write 的 Index 前缀同样必须对齐。已省略、失败或不完整的 patch 保持 path-only。
+成功 write 的 Boolean `details.created` 与同调用输入路径共同证明 add/update；新建没有 patch 时只显示新增行。
+read/write/edit 的唯一原生路径可补齐相对 location；共享 normalizer 继续拥有 root 和 managed output 排除。
+这些映射不读取磁盘、不改变其他 Runtime、不新增 Renderer 分支，详细准入见 v8。
+
+### Pi JSONL RPC
+
+- 同一 `toolCallId` 累计 start/update 的 `toolName + args.path`，只有成功 `tool_execution_end` 才发布 typed
+  read/write operation；终态缺参只复用本 ToolCall 已观察参数；
+- toolName 精确为 `edit` 且 `result.details.patch` 非空时，patch 的 `---`／`+++` 文件头必须与 reported path
+  完全一致并至少包含一个 `@@ ` hunk，才形成单 entry `unified_diff_snapshot`；规范化后文件头改用展示路径；
+- hunk-aware 统计忽略文件头，只计算 hunk 内的内容变化。`write`、失败 edit、缺 patch、路径冲突、缺 hunk 和零变化
+  都不形成 Diff；不读取 `details.diff`，不从 Edit replacement input 或当前磁盘补全；
+- normalized path 命中 managed output root 时，operation 与绑定 Diff 一并 fail closed；其他 root 外绝对路径仍可展示。
+
+### Claude Code 与 Antigravity
+
+- Claude Code 只配对 `assistant.tool_use(name=Edit)` 与相同 `tool_use_id` 的非错误 `user.tool_result`，保存
+  `file_path + old_string + new_string` 的 ExactMutation；`replace_all=true`、Write、NotebookEdit、ApplyPatch、
+  缺失或失败 result 均不准入；
+- Claude Write 仍不形成内容 Diff；同一 `tool_use_id` 的成功结构化结果只有在 `type=update` 且 `filePath` 与 tool
+  input 完全一致时，才在 typed write operation 上增加 `changeKind=update`。2.1.236 对不存在文件和已有空文件都
+  实际报告 `type=create + originalFile=null`，所以 create 不能作为 add 证据；字段缺失、create、未知类型、路径
+  冲突和 Edit 继续保守显示编辑；
+- 同一文件连续 Edit 保留多个时序块，不合并为虚假的完整文件净差异；
+- Antigravity 当前没有等价可靠终态内容，因此不生成文件变化卡片或 Command Diff。
+
+## 故障边界
+
+- 文件变化是附加观察能力；Evidence 归一化、投影或 detail blob 失败不能反向改变 Run 终态；
+- 失败只记录安全诊断并允许启动恢复重试，不扫描文件系统补偿；
+- 当前 detail Managed Blob 由 projection row 作为 GC root。重算替换的旧 detail 按解除引用时间进入封闭
+  `file_change_projection` GC candidate；宽限后复核全部 Managed Blob 外键和在途读取再删除。Camp 删除仍遵循
+  既有 Run/Evidence/Blob 引用闭包，历史无标记 Blob 不因本增量扫描；
+- `ROVAI_RUN_TMP` 是可重置的临时交付区；通过 `rovai send --file` 成功发布后的 Managed Attachment 属于独立资源
+  合同，临时源路径不因此成为文件变化；
+- 文件变化 Evidence 不进入模型上下文、Runtime Bootstrap、Camp public message 或 Agent built-in 读取面。
+
+## 相关规范
+
+- [Runtime File Change Observation v9](../contracts/runtime-file-change-observation-v9.md)
+- [Execution Evidence 与 Canonical Activity 不变量](foundational-invariants.md#evidence-canonical-activity)
+- [Camp 会话工作区](../ui/components/conversation-workspace.md)
+- [v1.29 决定](../versions/v1.29/decisions.md#v1-29-d08)
+- [V1.29-D13 managed output exclusion](../versions/v1.29/decisions.md#v1-29-d13)
+
+### ZCode 原生 NDJSON
+
+`zcode-app` 的 normalizer 只用相同 ToolCall ID 的完整 tool_call 参数与 tool.updated result。Read/Write/Edit 的
+结构化路径产生 typed operation；只有 Edit 原生 display 中完整、路径一致且 hunk/counter 校验通过的 patch 产生
+unified Diff。Write 参数与 Shell git diff 不能证明已应用的文件 Diff。Native success=true 仍须检查 Shell exitCode
+和 timeout。后续文件汇总、managed output 排除与不可变 Review 读取复用现有 projector，来源保持 ZCode 协议。

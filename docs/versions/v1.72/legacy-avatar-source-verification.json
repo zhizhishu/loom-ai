@@ -1,0 +1,527 @@
+{
+  "schemaVersion": 1,
+  "changeId": "legacy-avatar-source",
+  "date": "2026-10-15",
+  "baselineCommit": "50cbfdf98e2e387633677b4e1033c0181e1ceb45",
+  "productDigests": {
+    "baseline": {
+      "coreDigest": "d96125a795ac0cd7bcd4d3ab7cf36353f2b278392c424a18e27916713d8b4db0",
+      "cliDigest": "0495e98e506778d6e8fd01e6b1161bd0758963cca3852e35f13d2a268f246873"
+    },
+    "candidate": {
+      "coreDigest": "29d5501d4734b63aa95c897ce407af6d31d3590552d9dc8b86622c84a3d1893e",
+      "cliDigest": "52d331351768b065c80e34687a2cd1daad07646e7eabb75aca23ab4f88079a0b"
+    }
+  },
+  "localChecks": {
+    "workspace": {
+      "passed": 471,
+      "failed": 0,
+      "ignored": 1
+    },
+    "memberAvatarOwner": {
+      "passed": 14,
+      "failed": 0
+    },
+    "memberReadWriteOwner": {
+      "passed": 1,
+      "failed": 0
+    },
+    "builtinCliOwners": {
+      "passed": 29,
+      "failed": 0
+    },
+    "documentationTests": {
+      "passed": 10,
+      "failed": 0
+    },
+    "format": "passed",
+    "documentationGovernance": "passed"
+  },
+  "realModel": {
+    "runtime": "Claude Code 2.1.287",
+    "provider": "local sub2api",
+    "observedModel": "gpt-6.1-sol",
+    "scenarioCount": 4,
+    "baselineRuns": 4,
+    "candidateRuns": 4,
+    "allRunsSucceeded": true,
+    "candidateExpectations": "4/4 satisfied",
+    "cases": [
+      {
+        "arm": "baseline",
+        "case": "legacy-static",
+        "runId": "74e6d702-93ac-479a-9833-d746dfe9c747",
+        "runStatus": "succeeded",
+        "observedModel": "gpt-6.1-sol",
+        "executionEvidenceCoverage": {
+          "state": "complete",
+          "reason": null
+        },
+        "toolCounts": {
+          "member.get": 1,
+          "thread.message.send": 1
+        },
+        "operations": [
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "dac324833bd5f5f41d470aa8a2a95f7a85938f1ca450a23a7505453d6f46074a",
+            "avatar": {
+              "status": "available",
+              "displayCrop": null
+            },
+            "version": 1
+          },
+          {
+            "operation": "thread.message.send",
+            "status": "completed",
+            "outputDigest": "e1416f0254d3980ffb60ee09b458382db4b5fceb8b522b4a37fb593730cb6a91"
+          }
+        ],
+        "sourceDigestBefore": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "sourceDigestAfter": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "savedCropAfter": {
+          "centerX": 0.25,
+          "centerY": 0.2,
+          "size": 0.5
+        },
+        "publicAnswers": [
+          "已只读核验 agent_5（验收legacy-static，证据研究员；资料版本 1）：返回的头像文件实际宽 192 像素、高 192 像素，为静态 PNG（单帧，无动画）。已保存裁切位置字段 avatar.displayCrop 为 null，表示没有已保存的裁切参数，不能据此断言为居中裁切。未修改任何资料或图片。"
+        ],
+        "evidenceFile": "baseline/legacy-static.json",
+        "sourceBytesUnchanged": true
+      },
+      {
+        "arm": "baseline",
+        "case": "legacy-gif",
+        "runId": "438586be-ebb1-42d8-9a63-d3841d8e534b",
+        "runStatus": "succeeded",
+        "observedModel": "gpt-6.1-sol",
+        "executionEvidenceCoverage": {
+          "state": "complete",
+          "reason": null
+        },
+        "toolCounts": {
+          "member.get": 1,
+          "thread.message.send": 1
+        },
+        "operations": [
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "16e22174c2fcaefd277d5c0e2aa1a5b22b2451182f4e253d625c7780988dd59a",
+            "avatar": {
+              "status": "available",
+              "displayCrop": null
+            },
+            "version": 1
+          },
+          {
+            "operation": "thread.message.send",
+            "status": "completed",
+            "outputDigest": "20d3f9f8de4a49df9afb94da4376b74bf9c122fcf19d778477474bb2ef47cc53"
+          }
+        ],
+        "sourceDigestBefore": "a0abd11ddc7a0337015f688cac25e75c8820b3399ab34165ec5ff065951a7e52",
+        "sourceDigestAfter": "a0abd11ddc7a0337015f688cac25e75c8820b3399ab34165ec5ff065951a7e52",
+        "savedCropAfter": {
+          "centerX": 0.25,
+          "centerY": 0.2,
+          "size": 0.5
+        },
+        "publicAnswers": [
+          "已只读核验 agent_5（验收legacy-gif，证据研究员，资料版本 1）：返回头像为 GIF89a，实际宽 192 像素、高 192 像素；是动画，共 2 帧；已保存的裁切位置字段 avatar.displayCrop 为 null，即未返回已保存的裁切坐标。尺寸和帧数由直接解析本次返回的头像文件得到，裁切字段来自成员资料。未修改资料或图片。"
+        ],
+        "evidenceFile": "baseline-rest/legacy-gif.json",
+        "sourceBytesUnchanged": true
+      },
+      {
+        "arm": "baseline",
+        "case": "legacy-adjust",
+        "runId": "86cb8864-b7c3-4463-a4ed-79d9aff6748b",
+        "runStatus": "succeeded",
+        "observedModel": "gpt-6.1-sol",
+        "executionEvidenceCoverage": {
+          "state": "complete",
+          "reason": null
+        },
+        "toolCounts": {
+          "member.get": 3,
+          "member.update": 2,
+          "thread.message.send": 1
+        },
+        "operations": [
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "a3b579e5182abcd4f6f563c6a14ca56ca85006c4fa756ebbb95493352a876976",
+            "avatar": {
+              "status": "available",
+              "displayCrop": null
+            },
+            "version": 1
+          },
+          {
+            "operation": "member.update",
+            "status": "completed",
+            "outputDigest": "39ffb3c3efbacb2cf129e15a77a40f1997bb958d084781282db938c9dc921828"
+          },
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "a41b54f04e3c938bae9c23f1171b037e4bf877721842d377fa56df0a314984b9",
+            "avatar": {
+              "status": "available",
+              "displayCrop": {
+                "centerX": 0.5,
+                "centerY": 0.5,
+                "size": 1.0
+              }
+            },
+            "version": 2
+          },
+          {
+            "operation": "member.update",
+            "status": "completed",
+            "outputDigest": "183aaa184d9bb67a70d94d2acaa292129acaee97529eddd8d261fbc96ffaaf77"
+          },
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "f48f8fd7944ab35e405d0eb42b1bbfabc56be9948918267263c80c61bdb4507d",
+            "avatar": {
+              "status": "available",
+              "displayCrop": {
+                "centerX": 0.75,
+                "centerY": 0.8,
+                "size": 0.5
+              }
+            },
+            "version": 3
+          },
+          {
+            "operation": "thread.message.send",
+            "status": "completed",
+            "outputDigest": "68b689a1f997d63e3258ce05366046449f09105584362d0542c73d8bb60d4f2d"
+          }
+        ],
+        "sourceDigestBefore": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "sourceDigestAfter": "8c73209c38b9af2c662b794395339a8abb3fac4e6124fc48d3a4ac9271c306cf",
+        "savedCropAfter": {
+          "centerX": 0.75,
+          "centerY": 0.8,
+          "size": 0.5
+        },
+        "publicAnswers": [
+          "已完成并读回确认 agent_6 的头像取景：从旧版保存记录核实原取景为 centerX=0.25、centerY=0.2、size=0.5（源图 400×500，方框 200×200），现为 centerX=0.75、centerY=0.8、size=0.5，正好贴齐源图右边与下边。首次读取因旧版兼容返回预览图且取景为空，期间的一次全幅误设已纠正，最终版本为 3。仅提交取景参数；未上传文件、未生成图片，其他资料与原头像源图内容均保持不变。"
+        ],
+        "evidenceFile": "baseline-rest/legacy-adjust.json",
+        "sourceBytesUnchanged": false,
+        "sourcePixelsUnchanged": true
+      },
+      {
+        "arm": "baseline",
+        "case": "legacy-missing",
+        "runId": "96eb5eda-cf37-435a-8d7b-ca3637cee20a",
+        "runStatus": "succeeded",
+        "observedModel": "gpt-6.1-sol",
+        "executionEvidenceCoverage": {
+          "state": "complete",
+          "reason": null
+        },
+        "toolCounts": {
+          "member.get": 1,
+          "thread.message.send": 1
+        },
+        "operations": [
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "f43031f061b18e69b9ee70d567b4a849552c9c7c9cfa25fff8c04526a0238dd0",
+            "avatar": {
+              "status": "available",
+              "displayCrop": null
+            },
+            "version": 1
+          },
+          {
+            "operation": "thread.message.send",
+            "status": "completed",
+            "outputDigest": "5e910568e9919e9bac50fd6fd6570e81eb7ed7e1b9dfabfb41682d1fd67a0a62"
+          }
+        ],
+        "sourceDigestBefore": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "sourceDigestAfter": null,
+        "savedCropAfter": {
+          "centerX": 0.25,
+          "centerY": 0.2,
+          "size": 0.5
+        },
+        "publicAnswers": [
+          "已只读读取 agent_7 的完整资料：显示名「验收legacy-missing」；角色「证据研究员」；职责：收集原始资料，核对关键事实，交付包含出处和不确定性的简洁研究报告。性格：细致、平和；工作原则：先核实，再表达；成长主题：练习把复杂概念写成短句；资料版本：1。头像当前可用：接口返回 status=available，已实际打开返回的 PNG，内容为纯红色方块；displayCrop=null（未设置裁剪）。这里确认的是当前返回图片可读取，不代表其为原始人物头像。未修改或修复任何文件。"
+        ],
+        "evidenceFile": "baseline-rest/legacy-missing.json"
+      },
+      {
+        "arm": "candidate",
+        "case": "legacy-static",
+        "runId": "155e802d-a0a9-4a7c-aee9-bf575a2b2ab4",
+        "runStatus": "succeeded",
+        "observedModel": "gpt-6.1-sol",
+        "executionEvidenceCoverage": {
+          "state": "complete",
+          "reason": null
+        },
+        "toolCounts": {
+          "member.get": 1,
+          "thread.message.send": 1
+        },
+        "operations": [
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "6abb4dec4716ccdc750e770cde3c75d42812dbb1c8b6d8c5836b10d2d00b5d1b",
+            "avatar": {
+              "status": "available",
+              "displayCrop": {
+                "centerX": 0.25,
+                "centerY": 0.2,
+                "size": 0.5
+              }
+            },
+            "version": 1
+          },
+          {
+            "operation": "thread.message.send",
+            "status": "completed",
+            "outputDigest": "500f155e8fe587fbe608b5da65f177ffcc66a8cc8c48c2097f047763b696f74a"
+          }
+        ],
+        "sourceDigestBefore": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "sourceDigestAfter": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "savedCropAfter": {
+          "centerX": 0.25,
+          "centerY": 0.2,
+          "size": 0.5
+        },
+        "publicAnswers": [
+          "已只读核验 agent_5（验收legacy-static，证据研究员，资料版本 1）：返回头像文件为 PNG，实际宽 400 px、高 500 px；不是动画（静态单帧，文件中没有 APNG 动画块）。已保存的裁切位置 avatar.displayCrop 为 {\"centerX\":0.25,\"centerY\":0.2,\"size\":0.5}。尺寸和动画状态来自对返回文件本身的检查，裁切值来自资料接口；未修改任何资料或图片。"
+        ],
+        "evidenceFile": "candidate/legacy-static.json",
+        "sourceBytesUnchanged": true
+      },
+      {
+        "arm": "candidate",
+        "case": "legacy-gif",
+        "runId": "f209d7c0-ff89-44c7-8b6e-153f6e9c7291",
+        "runStatus": "succeeded",
+        "observedModel": "gpt-6.1-sol",
+        "executionEvidenceCoverage": {
+          "state": "complete",
+          "reason": null
+        },
+        "toolCounts": {
+          "member.get": 1,
+          "thread.message.send": 1
+        },
+        "operations": [
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "df1117befc8e47fe86272d09eec72e4bd31399a9d5d99deb965b84a62f5ef933",
+            "avatar": {
+              "status": "available",
+              "displayCrop": {
+                "centerX": 0.25,
+                "centerY": 0.2,
+                "size": 0.5
+              }
+            },
+            "version": 1
+          },
+          {
+            "operation": "thread.message.send",
+            "status": "completed",
+            "outputDigest": "3fa41a4e639ef10a24614e8904cb7999386e888436b7c28eeda62c640f1d9ed0"
+          }
+        ],
+        "sourceDigestBefore": "a0abd11ddc7a0337015f688cac25e75c8820b3399ab34165ec5ff065951a7e52",
+        "sourceDigestAfter": "a0abd11ddc7a0337015f688cac25e75c8820b3399ab34165ec5ff065951a7e52",
+        "savedCropAfter": {
+          "centerX": 0.25,
+          "centerY": 0.2,
+          "size": 0.5
+        },
+        "publicAnswers": [
+          "已只读核验 agent_5（验收legacy-gif，证据研究员，资料版本 1）的资料及返回的头像文件。头像实际尺寸为宽 400 × 高 500 像素；格式为 GIF89a，共 2 帧，属于动画 GIF。已保存的裁切位置 avatar.displayCrop 为 {\"centerX\":0.25,\"centerY\":0.2,\"size\":0.5}。尺寸与动画结论来自对返回文件内容的解析；未修改资料、头像文件或裁切设置。"
+        ],
+        "evidenceFile": "candidate-rest/legacy-gif.json",
+        "sourceBytesUnchanged": true
+      },
+      {
+        "arm": "candidate",
+        "case": "legacy-adjust",
+        "runId": "a22782c7-3640-4e84-9afe-cf4d14adef19",
+        "runStatus": "succeeded",
+        "observedModel": "gpt-6.1-sol",
+        "executionEvidenceCoverage": {
+          "state": "complete",
+          "reason": null
+        },
+        "toolCounts": {
+          "member.get": 2,
+          "member.update": 1,
+          "thread.message.send": 1
+        },
+        "operations": [
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "637ecda70d16198cb666c52e8ab0d6b6c065c291dd7aafb159b98fa442381849",
+            "avatar": {
+              "status": "available",
+              "displayCrop": {
+                "centerX": 0.25,
+                "centerY": 0.2,
+                "size": 0.5
+              }
+            },
+            "version": 1
+          },
+          {
+            "operation": "member.update",
+            "status": "completed",
+            "outputDigest": "39ffb3c3efbacb2cf129e15a77a40f1997bb958d084781282db938c9dc921828"
+          },
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "5088c1b5555abc86d031638ef92176fcf6a57c27d763722c18e4389fe88a4a47",
+            "avatar": {
+              "status": "available",
+              "displayCrop": {
+                "centerX": 0.75,
+                "centerY": 0.8,
+                "size": 0.5
+              }
+            },
+            "version": 2
+          },
+          {
+            "operation": "thread.message.send",
+            "status": "completed",
+            "outputDigest": "d8aa743c9f40d0b091cd00c15cbd83dd419d29d7cbf98c468cd05c3562242f96"
+          }
+        ],
+        "sourceDigestBefore": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "sourceDigestAfter": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "savedCropAfter": {
+          "centerX": 0.75,
+          "centerY": 0.8,
+          "size": 0.5
+        },
+        "publicAnswers": [
+          "已先读取 agent_6 的现有头像和已保存取景，再仅修改取景参数，并已读回确认：中心由 (0.25, 0.20) 移至 (0.75, 0.80)，size 保持 0.50。源图为 400×500，方形取景仍为 200×200，现贴齐源图右边和下边。源图文件内容核对一致；未上传新文件、未生成图片，其他资料均未修改。"
+        ],
+        "evidenceFile": "candidate-rest/legacy-adjust.json",
+        "sourceBytesUnchanged": true
+      },
+      {
+        "arm": "candidate",
+        "case": "legacy-missing",
+        "runId": "7d71ff96-53e9-4c81-8d8e-c7ec85f34932",
+        "runStatus": "succeeded",
+        "observedModel": "gpt-6.1-sol",
+        "executionEvidenceCoverage": {
+          "state": "complete",
+          "reason": null
+        },
+        "toolCounts": {
+          "member.get": 1,
+          "thread.message.send": 1
+        },
+        "operations": [
+          {
+            "operation": "member.get",
+            "status": "completed",
+            "outputDigest": "0970f7a19588db1e0b498929366da13e0b5766f4fd3b06ac5e0310b47b67f391",
+            "avatar": {
+              "status": "unavailable",
+              "displayCrop": null
+            },
+            "version": 1
+          },
+          {
+            "operation": "thread.message.send",
+            "status": "completed",
+            "outputDigest": "3e486395b4b243c0ab739a7e2c307e324b029055933328c76ae2686b609c070a"
+          }
+        ],
+        "sourceDigestBefore": "a2a9ea49b71da9ced69790239f18842ee38dde084b1d721de7af2985ad495b19",
+        "sourceDigestAfter": null,
+        "savedCropAfter": {
+          "centerX": 0.25,
+          "centerY": 0.2,
+          "size": 0.5
+        },
+        "publicAnswers": [
+          "已只读查询 agent_7 的完整资料：姓名：验收legacy-missing；角色：证据研究员；职责：收集原始资料，核对关键事实，交付包含出处和不确定性的简洁研究报告。性格：细致、平和；工作原则：先核实，再表达。成长主题：练习把复杂概念写成短句。资料版本：1。头像不可用：avatar.status 为 unavailable，avatar.path 和 avatar.displayCrop 均为 null，当前没有可读取的头像文件路径。未修改或修复任何文件。"
+        ],
+        "evidenceFile": "candidate-rest/legacy-missing.json"
+      }
+    ],
+    "fixtureNotes": [
+      "Each of 4 scenarios ran once per product; 8 successful model Runs with complete paginated evidence.",
+      "The first baseline static model Run completed; its post-Run evidence collector used the wrong source-file property. Original results and error logs retained, no model rerun.",
+      "Legacy GIF setup initially used sourceBase64 instead of sourceGifBase64. Only unstarted scenarios continued after fixing the fixture.",
+      "Missing-source fixture deliberately deletes its content-addressed seed source, which can be shared by earlier static scenarios. Source hashes were captured per Run, before this negative setup.",
+      "Baseline adjustment first used size=1, then recovered the saved crop and updated again. Its second update used the existing schema-3 PNG normalization path: bytes changed but pixels were verified identical. Candidate required one crop-only update with source bytes unchanged."
+    ],
+    "scope": "Paired diagnostics, not the generic Gate; no overall token/latency quality claim."
+  },
+  "genericGate": {
+    "status": "degraded",
+    "planDigest": "8830441ef92bee6a9f9e84d0f6160ecf17272e7a3fa3fc3d5027f7ca959d28fd",
+    "regressions": [
+      {
+        "code": "candidate_contract_failure",
+        "newRegression": false
+      }
+    ],
+    "evidenceGapCount": 56,
+    "evaluationFailures": [],
+    "resourceChanges": [],
+    "modelSlots": 24,
+    "notRunSlots": 24,
+    "contracts": {
+      "baseline": {
+        "testCommands": 25,
+        "passed": 23,
+        "failedOwners": [
+          "db::tests::v172_preserves_historical_context_rows_and_gates_new_writes",
+          "db::tests::current_schema_contains_required_contract_objects"
+        ]
+      },
+      "candidate": {
+        "testCommands": 25,
+        "passed": 23,
+        "failedOwners": [
+          "db::tests::v172_preserves_historical_context_rows_and_gates_new_writes",
+          "db::tests::current_schema_contains_required_contract_objects"
+        ]
+      }
+    },
+    "judgeConfigured": false,
+    "review": "Reviewed JSON and static text of index.html/report.html. Browser rejected file URLs; no browser-policy workaround used."
+  },
+  "isolation": {
+    "dailyDataMutated": false,
+    "privateCoreDirectories": true,
+    "privateSkillLibrary": true,
+    "privateMcp": true,
+    "nativeConfigCopiesRemoved": true
+  },
+  "evidenceArchive": "LegacyAvatarSource-ClaudeCode-sub2api-20261015.zip",
+  "evidenceArchiveSha256": "92d6666e3c53504ab342ed6522bd3f50aabcfdf0836ae3cf4bf2fc6aa859b24c"
+}

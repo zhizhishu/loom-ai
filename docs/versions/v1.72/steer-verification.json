@@ -1,0 +1,854 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-14",
+  "task": "Steer R3",
+  "implementationBaseline": "6a2e34844701751e53a14095fa843490da99cb9a",
+  "reviewBaseline": "41c8ca19238de8465c23ff0c030f5c7620dd2c02",
+  "branch": "rovai/mission/064",
+  "platform": {
+    "os": "macOS",
+    "version": "26.6",
+    "architecture": "arm64"
+  },
+  "implementation": {
+    "supportedAdapter": "codex-cli",
+    "publicUserMessagesOnly": true,
+    "multiRecipient": true,
+    "attachmentOnly": true,
+    "manifest": 37,
+    "profile": 14,
+    "runFacts": 10,
+    "migration": 199,
+    "schema": 149
+  },
+  "nativeResearch": {
+    "report": "../../research/runtime-monitoring/steer-2026-10-14.md",
+    "evidence": "../../research/runtime-monitoring/steer-native-2026-10-14.evidence.json",
+    "startedRuntimes": 12,
+    "reviewedRuntimes": 15,
+    "excluded": [
+      "Cursor",
+      "Cline",
+      "Command Code"
+    ],
+    "rawArchivePath": "/Users/murray.xue/.rovai/instances/v1-ea1b0333b2d3194639a0b5a284275214dc868bf6ebe8bea219653f7c2cd7a4b3/attachments/rvcamp_01m4whsgcaef89ck2t7w89ztna/steer-native-probes-2026-10-14.zip",
+    "rawArchiveSha256": "fc7672e064d1bb080ee9490681a08adea8bfe0353fe8ad6462a2a6e9eb7faaca"
+  },
+  "productAttempts": [
+    {
+      "attempt": 1,
+      "reportPath": "/tmp/rovai-steer-acceptance-20261014-01/report.json",
+      "reportSha256": "3d02ef0c6138aae16a2a68a720e41bdf2f1e9e87f78a9fb79b597ad95be23270",
+      "classification": "用例附件含有不要处理 ordinary.txt 的矛盾要求；插话已接受，普通下一轮没有写文件，超时。修正测试指令。",
+      "report": {
+        "startedAt": "2026-10-14T10:14:53.757Z",
+        "coreExecutable": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-mission-064/target/debug/rovai-core",
+        "fixture": "/tmp/rovai-steer-acceptance-20261014-01",
+        "cases": [],
+        "runtimes": [
+          {
+            "agentId": "agent_1",
+            "adapter": "codex-cli",
+            "version": 2,
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_2",
+            "adapter": "opencode-cli",
+            "version": 2,
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_3",
+            "adapter": "codex-cli",
+            "version": 2,
+            "model": {
+              "mode": "runtime_default"
+            }
+          }
+        ],
+        "status": "failed",
+        "error": "Error: Timed out: ordinary queue later executed\n    at wait (file:///Users/murray.xue/VSCodeProjects/opensource/rovai-ai-mission-064/scripts/smoke-steer.mjs:21:9)\n    at async file:///Users/murray.xue/VSCodeProjects/opensource/rovai-ai-mission-064/scripts/smoke-steer.mjs:69:3",
+        "coreExit": {
+          "code": 0,
+          "signal": null,
+          "stderrDigest": "1e7e0bbc99bdfeb2e5b0f8fa170a03650e6f0f470a7c955c17421ca008b55c6c",
+          "stderrBytes": 1583,
+          "stderrTail": "[startup] stage=runtime_search_ready duration_ms=28 elapsed_ms=28\n[startup] {\"elapsedMs\":0,\"sourceContract\":null,\"stage\":\"authority_assessment\",\"targetContract\":\"v1.72\"}\n[startup] stage=database_ready duration_ms=4745 elapsed_ms=4796\n[startup] stage=core_ready elapsed_ms=4827\n[startup] {\"elapsedMs\":4827,\"sourceContract\":null,\"stage\":\"core_ready\",\"targetContract\":\"v1.72\"}\nrovai-core 0.4.10 ready\n[startup] stage=managed_skills_ready duration_ms=392\n[model-catalog] probe runtime=codex-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=codex-cli total_ms=2335 outcome=Ok(Ready)\n[model-catalog] probe runtime=opencode-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=opencode-cli total_ms=1900 outcome=Ok(Ready)\nCodex acquire run=0d9eb6ac-b1ec-4787-89d6-77a0b7f109e9 epoch=1 host=352286e1-2269-4398-b8dc-3142413240dc path=cold\nCodex terminal run=0d9eb6ac-b1ec-4787-89d6-77a0b7f109e9 epoch=1 host=352286e1-2269-4398-b8dc-3142413240dc native=completed disposition=Reusable\nCodex release run=0d9eb6ac-b1ec-4787-89d6-77a0b7f109e9 epoch=1 host=352286e1-2269-4398-b8dc-3142413240dc native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=8b1b9bcf-440d-4417-a0f4-5206c7b7d6e5 epoch=1 host=352286e1-2269-4398-b8dc-3142413240dc path=reused\nCodex terminal run=8b1b9bcf-440d-4417-a0f4-5206c7b7d6e5 epoch=1 host=352286e1-2269-4398-b8dc-3142413240dc native=completed disposition=Reusable\nCodex release run=8b1b9bcf-440d-4417-a0f4-5206c7b7d6e5 epoch=1 host=352286e1-2269-4398-b8dc-3142413240dc native=completed disposition=Reusable outcome=Reusable\n"
+        },
+        "finishedAt": "2026-10-14T10:21:01.796Z"
+      },
+      "versionFieldNote": "旧 Smoke 的 runtimes.version 是 installation 行版本，不是 CLI 版本；CLI 实际版本以原生探针及尝试 4–6 的 reportedVersion 为准。"
+    },
+    {
+      "attempt": 2,
+      "reportPath": "/tmp/rovai-steer-acceptance-20261014-02/report.json",
+      "reportSha256": "f357d089cc918162f7ec3c9a45476a180f2d928916b290712110c081167ad2f2",
+      "classification": "两个产品场景均通过。此时尚未增加最后的执行目标代次与数据库 guard 检查；不替代最终候选验收。",
+      "report": {
+        "startedAt": "2026-10-14T10:20:42.368Z",
+        "coreExecutable": "/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-mission-064/target/debug/rovai-core",
+        "fixture": "/tmp/rovai-steer-acceptance-20261014-02",
+        "cases": [
+          {
+            "name": "same-turn text + attachment-only + ordinary queue separation",
+            "status": "passed",
+            "inputs": [
+              {
+                "id": "fc20d72f-7d96-4aa6-8f38-7418c8545336",
+                "status": "accepted",
+                "native_input_id": "01a139ee-07bd-7580-8558-53d4ee806901",
+                "input_kind": "start",
+                "input_sequence": 0,
+                "manifest_id": "e1c1daf3-2bd3-41c1-8775-30752ccd8a81",
+                "source_delivery_id": null,
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"39d70e9f-d862-4018-9d79-599b790d9010\"}]",
+                "attachment_refs_json": "[]",
+                "run_fact_payload_json": null
+              },
+              {
+                "id": "42a9b168-085e-45df-b96e-d969ff30a815",
+                "status": "accepted",
+                "native_input_id": "01a139ee-07bd-7580-8558-53d4ee806901",
+                "input_kind": "steer",
+                "input_sequence": 1,
+                "manifest_id": "8f3f9bde-65e8-4454-830d-fe5e0a0daf4d",
+                "source_delivery_id": "dccf90b6-7619-4f2d-abd4-930549b44e20",
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"25d6220c-acc0-4be8-85d7-9059119d3db7\"}]",
+                "attachment_refs_json": "[]",
+                "run_fact_payload_json": null
+              },
+              {
+                "id": "f1b6656b-22d8-4fd1-8f77-96dd47d2e6f5",
+                "status": "accepted",
+                "native_input_id": "01a139ee-07bd-7580-8558-53d4ee806901",
+                "input_kind": "steer",
+                "input_sequence": 2,
+                "manifest_id": "77010653-1f55-4e14-8b17-90f467204ac1",
+                "source_delivery_id": "b372d70c-4530-4c43-93f7-41da1d4fadc7",
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"47e64875-cb82-4f0a-a50d-264f2dd647f9\"}]",
+                "attachment_refs_json": "[{\"attachmentId\":\"8bfc0414-a611-43f8-a3b9-363bc6001378\",\"path\":\"/tmp/rovai-steer-acceptance-20261014-02/project/steer-attachment.txt\"}]",
+                "run_fact_payload_json": null
+              }
+            ]
+          },
+          {
+            "name": "one public multi-mention: capable busy / unsupported busy / idle",
+            "status": "passed",
+            "routes": [
+              {
+                "id": "b1c5d318-73c3-42b2-8ad9-55e0ed6d2e74",
+                "recipient_agent_id": "agent_1",
+                "status": "settled",
+                "requested_mode": "steer",
+                "claimed_agent_run_id": "4c6c821f-c3fe-4912-b9b7-d137a5186fa6",
+                "failure_code": null
+              },
+              {
+                "id": "dbf8503b-b62b-4b0d-b4ff-38c771f34b27",
+                "recipient_agent_id": "agent_2",
+                "status": "waiting",
+                "requested_mode": "start",
+                "claimed_agent_run_id": null,
+                "failure_code": null
+              },
+              {
+                "id": "72bb896d-f2e0-4b4e-84bb-338a84397f0b",
+                "recipient_agent_id": "agent_3",
+                "status": "claimed",
+                "requested_mode": "start",
+                "claimed_agent_run_id": "997ff551-fb1c-4830-9bc7-4ac4fb1554c8",
+                "failure_code": null
+              }
+            ]
+          }
+        ],
+        "runtimes": [
+          {
+            "agentId": "agent_1",
+            "adapter": "codex-cli",
+            "version": 2,
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_2",
+            "adapter": "opencode-cli",
+            "version": 2,
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_3",
+            "adapter": "codex-cli",
+            "version": 2,
+            "model": {
+              "mode": "runtime_default"
+            }
+          }
+        ],
+        "runs": [
+          {
+            "id": "f5c58031-ed8f-4e80-8972-09aaf050ca4f",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "last_error_code": null
+          },
+          {
+            "id": "51878c72-b32b-4a4d-9e0d-f8e26bc77645",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "last_error_code": null
+          },
+          {
+            "id": "4c6c821f-c3fe-4912-b9b7-d137a5186fa6",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "last_error_code": null
+          },
+          {
+            "id": "ffdc93ac-32e6-4021-952c-fbecf4a95381",
+            "agent_id": "agent_2",
+            "status": "failed",
+            "last_error_code": "runtime_missing_final_output"
+          },
+          {
+            "id": "997ff551-fb1c-4830-9bc7-4ac4fb1554c8",
+            "agent_id": "agent_3",
+            "status": "succeeded",
+            "last_error_code": null
+          },
+          {
+            "id": "602b7eb6-c80f-4790-870a-cc2f5a6f557a",
+            "agent_id": "agent_2",
+            "status": "failed",
+            "last_error_code": "runtime_missing_final_output"
+          }
+        ],
+        "status": "passed",
+        "coreExit": {
+          "code": 0,
+          "signal": null,
+          "stderrDigest": "d310dae248097734fb7ff93159415271276c7ab2324164196b1bf99af9da4ba3",
+          "stderrBytes": 2422,
+          "stderrTail": "[startup] stage=runtime_search_ready duration_ms=30 elapsed_ms=30\n[startup] {\"elapsedMs\":0,\"sourceContract\":null,\"stage\":\"authority_assessment\",\"targetContract\":\"v1.72\"}\n[startup] stage=database_ready duration_ms=5658 elapsed_ms=5723\n[startup] stage=core_ready elapsed_ms=5747\n[startup] {\"elapsedMs\":5747,\"sourceContract\":null,\"stage\":\"core_ready\",\"targetContract\":\"v1.72\"}\nrovai-core 0.4.10 ready\n[startup] stage=managed_skills_ready duration_ms=45\n[model-catalog] probe runtime=codex-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=codex-cli total_ms=5539 outcome=Ok(Ready)\n[model-catalog] probe runtime=opencode-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=opencode-cli total_ms=2427 outcome=Ok(Ready)\nCodex acquire run=f5c58031-ed8f-4e80-8972-09aaf050ca4f epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 path=cold\nCodex terminal run=f5c58031-ed8f-4e80-8972-09aaf050ca4f epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 native=completed disposition=Reusable\nCodex release run=f5c58031-ed8f-4e80-8972-09aaf050ca4f epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=51878c72-b32b-4a4d-9e0d-f8e26bc77645 epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 path=reused\nCodex terminal run=51878c72-b32b-4a4d-9e0d-f8e26bc77645 epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 native=completed disposition=Reusable\nCodex release run=51878c72-b32b-4a4d-9e0d-f8e26bc77645 epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=4c6c821f-c3fe-4912-b9b7-d137a5186fa6 epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 path=reused\nCodex acquire run=997ff551-fb1c-4830-9bc7-4ac4fb1554c8 epoch=1 host=e634da6c-a887-4379-a127-3e9bf16d4082 path=cold\nCodex terminal run=997ff551-fb1c-4830-9bc7-4ac4fb1554c8 epoch=1 host=e634da6c-a887-4379-a127-3e9bf16d4082 native=completed disposition=Reusable\nCodex release run=997ff551-fb1c-4830-9bc7-4ac4fb1554c8 epoch=1 host=e634da6c-a887-4379-a127-3e9bf16d4082 native=completed disposition=Reusable outcome=Reusable\nCodex terminal run=4c6c821f-c3fe-4912-b9b7-d137a5186fa6 epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 native=completed disposition=Reusable\nCodex release run=4c6c821f-c3fe-4912-b9b7-d137a5186fa6 epoch=1 host=9c99f5e0-f3ce-4b31-8f5c-af57faef86d1 native=completed disposition=Reusable outcome=Reusable\n"
+        },
+        "finishedAt": "2026-10-14T10:23:06.453Z"
+      },
+      "versionFieldNote": "旧 Smoke 的 runtimes.version 是 installation 行版本，不是 CLI 版本；CLI 实际版本以原生探针及尝试 4–6 的 reportedVersion 为准。"
+    },
+    {
+      "attempt": 3,
+      "reportPath": "/tmp/rovai-steer-acceptance-20261014-03/report.json",
+      "reportSha256": "23a4603507520a65dbd81699f706e31b218e05433974da47387f0d1922ee1f2f",
+      "classification": "冻结产品时只复制 Core，遗漏同目录 rovai CLI。启动失败，未实际提交模型输入。补齐产品目录并增加 preflight。",
+      "report": {
+        "startedAt": "2026-10-14T10:34:58.179Z",
+        "coreExecutable": "/tmp/rovai-steer-core-candidate",
+        "coreSha256": "a05535a94f2bd3ac1c7166fa249d23ffb15c137587a034da8055cfca8a4aab9d",
+        "fixture": "/tmp/rovai-steer-acceptance-20261014-03",
+        "cases": [],
+        "runtimes": [
+          {
+            "agentId": "agent_1",
+            "adapter": "codex-cli",
+            "version": "codex-cli 0.162.1",
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_2",
+            "adapter": "opencode-cli",
+            "version": "opencode v2.0.25",
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_3",
+            "adapter": "codex-cli",
+            "version": "codex-cli 0.162.1",
+            "model": {
+              "mode": "runtime_default"
+            }
+          }
+        ],
+        "status": "failed",
+        "error": "Error: Timed out: Codex tool boundary\n    at wait (file:///Users/murray.xue/VSCodeProjects/opensource/rovai-ai-mission-064/scripts/smoke-steer.mjs:21:9)\n    at async file:///Users/murray.xue/VSCodeProjects/opensource/rovai-ai-mission-064/scripts/smoke-steer.mjs:50:3",
+        "coreExit": {
+          "code": 0,
+          "signal": null,
+          "stderrDigest": "b5dd62c08feaeb2dea404e6994c9b201904b6a4cd0039dac634bc4c5e190f3dd",
+          "stderrBytes": 857,
+          "stderrTail": "[startup] stage=runtime_search_ready duration_ms=24 elapsed_ms=24\n[startup] {\"elapsedMs\":0,\"sourceContract\":null,\"stage\":\"authority_assessment\",\"targetContract\":\"v1.72\"}\n[startup] stage=database_ready duration_ms=4270 elapsed_ms=4321\n[startup] stage=core_ready elapsed_ms=4343\n[startup] {\"elapsedMs\":4343,\"sourceContract\":null,\"stage\":\"core_ready\",\"targetContract\":\"v1.72\"}\nrovai-core 0.4.10 ready\n[startup] stage=managed_skills_ready duration_ms=36\n[model-catalog] probe runtime=codex-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=codex-cli total_ms=3960 outcome=Ok(Ready)\n[model-catalog] probe runtime=opencode-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=opencode-cli total_ms=1814 outcome=Ok(Ready)\nfailed to launch AgentRun f665d16c-1ad6-4a04-995f-15c9a179c142: bundled Rovai Agent CLI is unavailable: /tmp/rovai\n"
+        },
+        "finishedAt": "2026-10-14T10:40:14.458Z"
+      }
+    },
+    {
+      "attempt": 4,
+      "reportPath": "/tmp/rovai-steer-acceptance-20261014-04/report.json",
+      "reportSha256": "170ff64459b2b1108a1f07c03086d927f3cf0ea6a7582a310cacd5e199d026e6",
+      "classification": "文本和纯附件场景通过；OpenCode 首轮只发布工具消息，end_turn 无最终正文，被原有 Core 规则判为 runtime_missing_final_output。保留失败。",
+      "report": {
+        "startedAt": "2026-10-14T10:37:46.777Z",
+        "coreExecutable": "/tmp/rovai-steer-product-20261014/bin/rovai-core",
+        "coreSha256": "a05535a94f2bd3ac1c7166fa249d23ffb15c137587a034da8055cfca8a4aab9d",
+        "fixture": "/tmp/rovai-steer-acceptance-20261014-04",
+        "cases": [
+          {
+            "name": "same-turn text + attachment-only + ordinary queue separation",
+            "status": "passed",
+            "inputs": [
+              {
+                "id": "6a5c4586-a4c8-4a8d-8db1-6bfc05e379e9",
+                "status": "accepted",
+                "native_input_id": "01a139fd-9352-7cd0-8a88-4ce41ba186e1",
+                "input_kind": "start",
+                "input_sequence": 0,
+                "manifest_id": "8be8d8f4-eae8-4949-89ab-eae80b7a3a70",
+                "source_delivery_id": null,
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"dc72e8e1-a45c-4427-822e-c6ed1e2db979\"}]",
+                "attachment_refs_json": "[]",
+                "run_fact_payload_json": null
+              },
+              {
+                "id": "efc1af64-e49b-4062-b91d-2cc0b03b3c5b",
+                "status": "accepted",
+                "native_input_id": "01a139fd-9352-7cd0-8a88-4ce41ba186e1",
+                "input_kind": "steer",
+                "input_sequence": 1,
+                "manifest_id": "824fb088-d8f6-40b9-8c57-aa0d16f00a2c",
+                "source_delivery_id": "9f9b647f-cf96-4f73-a29c-1bb29292c454",
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"cd048f34-c225-4348-bc94-d287a59f8f55\"}]",
+                "attachment_refs_json": "[]",
+                "run_fact_payload_json": null
+              },
+              {
+                "id": "55e4eb8c-2932-4c06-a3f1-7a49fb034c22",
+                "status": "accepted",
+                "native_input_id": "01a139fd-9352-7cd0-8a88-4ce41ba186e1",
+                "input_kind": "steer",
+                "input_sequence": 2,
+                "manifest_id": "4c77b243-22de-4656-8d1f-deb4f46d828c",
+                "source_delivery_id": "d4d5872a-d259-4a98-affe-2a5824c0c43d",
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"e0e5b3e8-8547-4eec-90cd-674e891628cf\"}]",
+                "attachment_refs_json": "[{\"attachmentId\":\"6ca5a039-48f5-435c-af51-76a5b14f9bd9\",\"path\":\"/tmp/rovai-steer-acceptance-20261014-04/project/steer-attachment.txt\"}]",
+                "run_fact_payload_json": null
+              }
+            ]
+          }
+        ],
+        "runtimes": [
+          {
+            "agentId": "agent_1",
+            "adapter": "codex-cli",
+            "version": "codex-cli 0.162.1",
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_2",
+            "adapter": "opencode-cli",
+            "version": "opencode v2.0.25",
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_3",
+            "adapter": "codex-cli",
+            "version": "codex-cli 0.162.1",
+            "model": {
+              "mode": "runtime_default"
+            }
+          }
+        ],
+        "status": "failed",
+        "error": "Error: Execution failed while waiting for mixed-codex.txt: {\"id\":\"62e508e5-f4b1-4b48-949e-8727e3c46c30\",\"status\":\"failed\",\"last_error_code\":\"runtime_missing_final_output\",\"public_runtime_failure_json\":\"{\\\"runtimeKind\\\":\\\"opencode-cli\\\",\\\"origin\\\":\\\"runtime\\\",\\\"phase\\\":\\\"execution\\\",\\\"code\\\":\\\"runtime_missing_final_output\\\",\\\"summary\\\":\\\"OpenCode 未能完成运行\\\",\\\"detail\\\":\\\"ACP prompt ended as end_turn\\\",\\\"retryable\\\":false}\"}\n    at wait (file:///Users/murray.xue/VSCodeProjects/opensource/rovai-ai-mission-064/scripts/smoke-steer.mjs:21:129)\n    at async file:///Users/murray.xue/VSCodeProjects/opensource/rovai-ai-mission-064/scripts/smoke-steer.mjs:84:62",
+        "coreExit": {
+          "code": 0,
+          "signal": null,
+          "stderrDigest": "e742771818b130edab59d182c3efc1971d29be8d969f2147cf8bfec6f5150495",
+          "stderrBytes": 2249,
+          "stderrTail": "[startup] stage=runtime_search_ready duration_ms=28 elapsed_ms=28\n[startup] {\"elapsedMs\":0,\"sourceContract\":null,\"stage\":\"authority_assessment\",\"targetContract\":\"v1.72\"}\n[startup] stage=database_ready duration_ms=4302 elapsed_ms=4353\n[startup] stage=core_ready elapsed_ms=4381\n[startup] {\"elapsedMs\":4381,\"sourceContract\":null,\"stage\":\"core_ready\",\"targetContract\":\"v1.72\"}\nrovai-core 0.4.10 ready\n[startup] stage=managed_skills_ready duration_ms=34\n[model-catalog] probe runtime=codex-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=codex-cli total_ms=2127 outcome=Ok(Ready)\n[model-catalog] probe runtime=opencode-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=opencode-cli total_ms=1806 outcome=Ok(Ready)\nCodex acquire run=0356733c-028f-4c7a-bb65-ef12ec7c3a00 epoch=1 host=ee286304-886d-41da-80bb-373b8e88eb80 path=cold\nCodex terminal run=0356733c-028f-4c7a-bb65-ef12ec7c3a00 epoch=1 host=ee286304-886d-41da-80bb-373b8e88eb80 native=completed disposition=Reusable\nCodex release run=0356733c-028f-4c7a-bb65-ef12ec7c3a00 epoch=1 host=ee286304-886d-41da-80bb-373b8e88eb80 native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=29f87956-725f-450a-bae1-50684ab6b464 epoch=1 host=ee286304-886d-41da-80bb-373b8e88eb80 path=reused\nCodex terminal run=29f87956-725f-450a-bae1-50684ab6b464 epoch=1 host=ee286304-886d-41da-80bb-373b8e88eb80 native=completed disposition=Reusable\nCodex release run=29f87956-725f-450a-bae1-50684ab6b464 epoch=1 host=ee286304-886d-41da-80bb-373b8e88eb80 native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=0b307d09-ee81-4d57-b1b3-e961baf97c35 epoch=1 host=ee286304-886d-41da-80bb-373b8e88eb80 path=reused\nCodex acquire run=6786c1b6-1ea6-49c3-b01c-740fe944d528 epoch=1 host=b2f63a43-a18c-40e0-bc31-bc0256a6753d path=cold\nCodex terminal run=6786c1b6-1ea6-49c3-b01c-740fe944d528 epoch=1 host=b2f63a43-a18c-40e0-bc31-bc0256a6753d native=completed disposition=Reusable\nCodex release run=6786c1b6-1ea6-49c3-b01c-740fe944d528 epoch=1 host=b2f63a43-a18c-40e0-bc31-bc0256a6753d native=completed disposition=Reusable outcome=Reusable\nCodex stop run=0b307d09-ee81-4d57-b1b3-e961baf97c35 epoch=1 host=ee286304-886d-41da-80bb-373b8e88eb80 disposition=Stop reaped=true\n"
+        },
+        "finishedAt": "2026-10-14T10:39:51.728Z"
+      }
+    },
+    {
+      "attempt": 5,
+      "reportPath": "/tmp/rovai-steer-acceptance-20261014-05/report.json",
+      "reportSha256": "727e644cbd0841e3231140ee0fa29eb58f5185e3b582995ac1d51715ba09a9cd",
+      "classification": "明确要求最终正文后两场景通过，6 个 Run 全部成功；此后又收紧了传输错误分类，最终二进制另见尝试 6。",
+      "report": {
+        "startedAt": "2026-10-14T10:40:41.959Z",
+        "coreExecutable": "/tmp/rovai-steer-product-20261014/bin/rovai-core",
+        "coreSha256": "a05535a94f2bd3ac1c7166fa249d23ffb15c137587a034da8055cfca8a4aab9d",
+        "fixture": "/tmp/rovai-steer-acceptance-20261014-05",
+        "cases": [
+          {
+            "name": "same-turn text + attachment-only + ordinary queue separation",
+            "status": "passed",
+            "inputs": [
+              {
+                "id": "e5f010bd-553c-449a-865a-3dc490a35d9c",
+                "status": "accepted",
+                "native_input_id": "01a13a00-4671-7831-8c04-655831c13d96",
+                "input_kind": "start",
+                "input_sequence": 0,
+                "manifest_id": "ca7833d0-7fe2-4c96-b660-9b64657a583a",
+                "source_delivery_id": null,
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"13863a6d-595b-495d-80d7-40416545b1f9\"}]",
+                "attachment_refs_json": "[]",
+                "run_fact_payload_json": null
+              },
+              {
+                "id": "e8403338-bfa9-45a0-aa8b-0a1266bcd670",
+                "status": "accepted",
+                "native_input_id": "01a13a00-4671-7831-8c04-655831c13d96",
+                "input_kind": "steer",
+                "input_sequence": 1,
+                "manifest_id": "4b3a69b7-33ad-484f-9bc1-856611f7a44a",
+                "source_delivery_id": "be98dbce-1dd4-4558-bd04-328eb87fe306",
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"099a7832-bca1-43ff-af0c-b8567c77d9ee\"}]",
+                "attachment_refs_json": "[]",
+                "run_fact_payload_json": null
+              },
+              {
+                "id": "782cf186-ae5b-4f99-9d10-235c84150a79",
+                "status": "accepted",
+                "native_input_id": "01a13a00-4671-7831-8c04-655831c13d96",
+                "input_kind": "steer",
+                "input_sequence": 2,
+                "manifest_id": "45494da7-b783-42ab-9c2d-317bee0f443d",
+                "source_delivery_id": "497308ee-d218-4214-9229-e2c829145065",
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"b25864b9-7643-4d77-8ed9-37c18148cd5a\"}]",
+                "attachment_refs_json": "[{\"attachmentId\":\"e315ebdf-1f03-4540-8615-8e90b34685dd\",\"path\":\"/tmp/rovai-steer-acceptance-20261014-05/project/steer-attachment.txt\"}]",
+                "run_fact_payload_json": null
+              }
+            ]
+          },
+          {
+            "name": "one public multi-mention: capable busy / unsupported busy / idle",
+            "status": "passed",
+            "routes": [
+              {
+                "id": "f0b97ec1-77f4-449d-b5f4-dcb7bb8fb18f",
+                "recipient_agent_id": "agent_1",
+                "status": "settled",
+                "requested_mode": "steer",
+                "claimed_agent_run_id": "eb53c91b-b00c-4c33-8726-7fc91d6370b9",
+                "failure_code": null
+              },
+              {
+                "id": "61608395-b80a-40f6-80c5-4061e7a1a8a5",
+                "recipient_agent_id": "agent_2",
+                "status": "waiting",
+                "requested_mode": "start",
+                "claimed_agent_run_id": null,
+                "failure_code": null
+              },
+              {
+                "id": "3ead3df4-fc5a-48c1-8b96-7f36ab8202d5",
+                "recipient_agent_id": "agent_3",
+                "status": "claimed",
+                "requested_mode": "start",
+                "claimed_agent_run_id": "f18586c3-8bc3-4444-8684-61d6a2534644",
+                "failure_code": null
+              }
+            ]
+          }
+        ],
+        "runtimes": [
+          {
+            "agentId": "agent_1",
+            "adapter": "codex-cli",
+            "version": "codex-cli 0.162.1",
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_2",
+            "adapter": "opencode-cli",
+            "version": "opencode v2.0.25",
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_3",
+            "adapter": "codex-cli",
+            "version": "codex-cli 0.162.1",
+            "model": {
+              "mode": "runtime_default"
+            }
+          }
+        ],
+        "runs": [
+          {
+            "id": "1bbd1feb-62fe-43cf-9113-8ed3f84358da",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "9c07fe12-9378-4dfe-8ee7-cdc8fd8495aa",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "eb53c91b-b00c-4c33-8726-7fc91d6370b9",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "1243e7bb-fb8f-40ec-9af5-06a09b00c971",
+            "agent_id": "agent_2",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "f18586c3-8bc3-4444-8684-61d6a2534644",
+            "agent_id": "agent_3",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "0a2b3b56-5048-4a65-8aea-ae46ba62ca4c",
+            "agent_id": "agent_2",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          }
+        ],
+        "status": "passed",
+        "coreExit": {
+          "code": 0,
+          "signal": null,
+          "stderrDigest": "fe7f912b5a40485d91646e3e28d1340d855e82ec0ed0c0cfd4210ff809a39400",
+          "stderrBytes": 2423,
+          "stderrTail": "[startup] stage=runtime_search_ready duration_ms=25 elapsed_ms=25\n[startup] {\"elapsedMs\":0,\"sourceContract\":null,\"stage\":\"authority_assessment\",\"targetContract\":\"v1.72\"}\n[startup] stage=database_ready duration_ms=5063 elapsed_ms=5130\n[startup] stage=core_ready elapsed_ms=5156\n[startup] {\"elapsedMs\":5156,\"sourceContract\":null,\"stage\":\"core_ready\",\"targetContract\":\"v1.72\"}\nrovai-core 0.4.10 ready\n[startup] stage=managed_skills_ready duration_ms=589\n[model-catalog] probe runtime=codex-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=codex-cli total_ms=2659 outcome=Ok(Ready)\n[model-catalog] probe runtime=opencode-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=opencode-cli total_ms=2425 outcome=Ok(Ready)\nCodex acquire run=1bbd1feb-62fe-43cf-9113-8ed3f84358da epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c path=cold\nCodex terminal run=1bbd1feb-62fe-43cf-9113-8ed3f84358da epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c native=completed disposition=Reusable\nCodex release run=1bbd1feb-62fe-43cf-9113-8ed3f84358da epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=9c07fe12-9378-4dfe-8ee7-cdc8fd8495aa epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c path=reused\nCodex terminal run=9c07fe12-9378-4dfe-8ee7-cdc8fd8495aa epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c native=completed disposition=Reusable\nCodex release run=9c07fe12-9378-4dfe-8ee7-cdc8fd8495aa epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=eb53c91b-b00c-4c33-8726-7fc91d6370b9 epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c path=reused\nCodex acquire run=f18586c3-8bc3-4444-8684-61d6a2534644 epoch=1 host=2415fc1e-16f7-4cda-9ff5-c65b6247316f path=cold\nCodex terminal run=f18586c3-8bc3-4444-8684-61d6a2534644 epoch=1 host=2415fc1e-16f7-4cda-9ff5-c65b6247316f native=completed disposition=Reusable\nCodex release run=f18586c3-8bc3-4444-8684-61d6a2534644 epoch=1 host=2415fc1e-16f7-4cda-9ff5-c65b6247316f native=completed disposition=Reusable outcome=Reusable\nCodex terminal run=eb53c91b-b00c-4c33-8726-7fc91d6370b9 epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c native=completed disposition=Reusable\nCodex release run=eb53c91b-b00c-4c33-8726-7fc91d6370b9 epoch=1 host=72e34b4c-15e1-4b6c-8f54-129c952b0b9c native=completed disposition=Reusable outcome=Reusable\n"
+        },
+        "finishedAt": "2026-10-14T10:42:50.387Z"
+      }
+    },
+    {
+      "attempt": 6,
+      "reportPath": "/tmp/rovai-steer-acceptance-20261014-06/report.json",
+      "reportSha256": "391d89d18e3fc6980daa6b176f5a886c2733f17fa4949e41e862d5f07df16489",
+      "classification": "最终候选（包含 Host 退出及内部错误保持未知的修正）两场景通过，6 个 Run 全部成功。",
+      "report": {
+        "startedAt": "2026-10-14T10:49:44.756Z",
+        "coreExecutable": "/tmp/rovai-steer-product-final-20261014/bin/rovai-core",
+        "coreSha256": "2bcd3ef243291656af978502486ae9eece1b3216cd301f2b96f0c0eaea58d509",
+        "fixture": "/tmp/rovai-steer-acceptance-20261014-06",
+        "cases": [
+          {
+            "name": "same-turn text + attachment-only + ordinary queue separation",
+            "status": "passed",
+            "inputs": [
+              {
+                "id": "7528690b-eac2-4665-9ecf-cb1bc8c11b10",
+                "status": "accepted",
+                "native_input_id": "01a13a08-891c-7211-b4a8-aa2cf2f0a1b1",
+                "input_kind": "start",
+                "input_sequence": 0,
+                "manifest_id": "f1978834-fe3b-4fa3-9603-95face3596bb",
+                "source_delivery_id": null,
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"46214b83-3748-4972-96bc-b00f0a12b892\"}]",
+                "attachment_refs_json": "[]",
+                "run_fact_payload_json": null
+              },
+              {
+                "id": "1825d4e3-2d23-415f-b214-f228bb63d701",
+                "status": "accepted",
+                "native_input_id": "01a13a08-891c-7211-b4a8-aa2cf2f0a1b1",
+                "input_kind": "steer",
+                "input_sequence": 1,
+                "manifest_id": "45d63978-2d8d-431b-820d-643d4e629578",
+                "source_delivery_id": "1c4fdd2e-7bdd-4e3b-86df-3c884e1084df",
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"7d65fa2f-3671-42e1-bb84-948d6be36cf6\"}]",
+                "attachment_refs_json": "[]",
+                "run_fact_payload_json": null
+              },
+              {
+                "id": "da20e25a-2e58-4baa-8ee2-cd037990242d",
+                "status": "accepted",
+                "native_input_id": "01a13a08-891c-7211-b4a8-aa2cf2f0a1b1",
+                "input_kind": "steer",
+                "input_sequence": 2,
+                "manifest_id": "a9af90ac-3488-4777-afda-1443d54ba0d2",
+                "source_delivery_id": "124027f0-4ee0-4b1b-8330-c45c90565a64",
+                "raw_message_refs_json": "[{\"entityType\":\"camp_message\",\"entityId\":\"cba0be04-fa5d-4315-b7ed-82efcc72aac0\"}]",
+                "attachment_refs_json": "[{\"attachmentId\":\"ffb1aaf8-14bb-4089-b4c3-d9c5bea6fdae\",\"path\":\"/tmp/rovai-steer-acceptance-20261014-06/project/steer-attachment.txt\"}]",
+                "run_fact_payload_json": null
+              }
+            ]
+          },
+          {
+            "name": "one public multi-mention: capable busy / unsupported busy / idle",
+            "status": "passed",
+            "routes": [
+              {
+                "id": "8b4d5d0e-7bef-4a8d-a019-8b133bb74963",
+                "recipient_agent_id": "agent_1",
+                "status": "settled",
+                "requested_mode": "steer",
+                "claimed_agent_run_id": "2114a919-ade7-40c1-a861-d1bebd259a31",
+                "failure_code": null
+              },
+              {
+                "id": "2e6bd7ea-703d-40d7-adc8-a941b7de6c97",
+                "recipient_agent_id": "agent_2",
+                "status": "waiting",
+                "requested_mode": "start",
+                "claimed_agent_run_id": null,
+                "failure_code": null
+              },
+              {
+                "id": "1478223e-0c9b-4583-b963-599031f0bafb",
+                "recipient_agent_id": "agent_3",
+                "status": "claimed",
+                "requested_mode": "start",
+                "claimed_agent_run_id": "85d78d27-dab5-4747-bddf-345f5d778579",
+                "failure_code": null
+              }
+            ]
+          }
+        ],
+        "runtimes": [
+          {
+            "agentId": "agent_1",
+            "adapter": "codex-cli",
+            "version": "codex-cli 0.162.1",
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_2",
+            "adapter": "opencode-cli",
+            "version": "opencode v2.0.25",
+            "model": {
+              "mode": "runtime_default"
+            }
+          },
+          {
+            "agentId": "agent_3",
+            "adapter": "codex-cli",
+            "version": "codex-cli 0.162.1",
+            "model": {
+              "mode": "runtime_default"
+            }
+          }
+        ],
+        "runs": [
+          {
+            "id": "a7473643-f40a-47a6-a36b-c938cee63f86",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "32f15b98-1b7c-4032-8a38-93726823580a",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "2114a919-ade7-40c1-a861-d1bebd259a31",
+            "agent_id": "agent_1",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "84d77444-1d05-4497-b9f9-6d9541d1b8bf",
+            "agent_id": "agent_2",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "85d78d27-dab5-4747-bddf-345f5d778579",
+            "agent_id": "agent_3",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          },
+          {
+            "id": "4e8fd5af-6ea9-4795-893a-6eb4bc9d0aec",
+            "agent_id": "agent_2",
+            "status": "succeeded",
+            "execution_epoch": 1,
+            "last_error_code": null
+          }
+        ],
+        "status": "passed",
+        "coreExit": {
+          "code": 0,
+          "signal": null,
+          "stderrDigest": "8e4582a218dfbe59c3224d12387af6b141bd71f484639c75f79000ce555ef06c",
+          "stderrBytes": 2422,
+          "stderrTail": "[startup] stage=runtime_search_ready duration_ms=31 elapsed_ms=31\n[startup] {\"elapsedMs\":0,\"sourceContract\":null,\"stage\":\"authority_assessment\",\"targetContract\":\"v1.72\"}\n[startup] stage=database_ready duration_ms=4247 elapsed_ms=4305\n[startup] stage=core_ready elapsed_ms=4327\n[startup] {\"elapsedMs\":4327,\"sourceContract\":null,\"stage\":\"core_ready\",\"targetContract\":\"v1.72\"}\nrovai-core 0.4.10 ready\n[startup] stage=managed_skills_ready duration_ms=30\n[model-catalog] probe runtime=codex-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=codex-cli total_ms=2170 outcome=Ok(Ready)\n[model-catalog] probe runtime=opencode-cli mode=full full_probe_count=1\n[model-catalog] refresh runtime=opencode-cli total_ms=1886 outcome=Ok(Ready)\nCodex acquire run=a7473643-f40a-47a6-a36b-c938cee63f86 epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 path=cold\nCodex terminal run=a7473643-f40a-47a6-a36b-c938cee63f86 epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 native=completed disposition=Reusable\nCodex release run=a7473643-f40a-47a6-a36b-c938cee63f86 epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=32f15b98-1b7c-4032-8a38-93726823580a epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 path=reused\nCodex terminal run=32f15b98-1b7c-4032-8a38-93726823580a epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 native=completed disposition=Reusable\nCodex release run=32f15b98-1b7c-4032-8a38-93726823580a epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 native=completed disposition=Reusable outcome=Reusable\nCodex acquire run=2114a919-ade7-40c1-a861-d1bebd259a31 epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 path=reused\nCodex acquire run=85d78d27-dab5-4747-bddf-345f5d778579 epoch=1 host=763e6d9f-49b0-4463-8c98-c5c05e86493d path=cold\nCodex terminal run=85d78d27-dab5-4747-bddf-345f5d778579 epoch=1 host=763e6d9f-49b0-4463-8c98-c5c05e86493d native=completed disposition=Reusable\nCodex release run=85d78d27-dab5-4747-bddf-345f5d778579 epoch=1 host=763e6d9f-49b0-4463-8c98-c5c05e86493d native=completed disposition=Reusable outcome=Reusable\nCodex terminal run=2114a919-ade7-40c1-a861-d1bebd259a31 epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 native=completed disposition=Reusable\nCodex release run=2114a919-ade7-40c1-a861-d1bebd259a31 epoch=1 host=927d6998-8e4e-47cd-9eb4-50bd49cf1cd2 native=completed disposition=Reusable outcome=Reusable\n"
+        },
+        "finishedAt": "2026-10-14T10:52:02.443Z"
+      }
+    }
+  ],
+  "validation": {
+    "targetedRust": {
+      "status": "passed",
+      "passed": 39,
+      "log": "/tmp/rovai-steer-targeted-regressions-v5.log"
+    },
+    "contextSlow": {
+      "status": "passed",
+      "passed": 53,
+      "log": "/tmp/rovai-steer-context-slow-final.log"
+    },
+    "vitest": {
+      "status": "passed",
+      "files": 12,
+      "tests": 123,
+      "log": "/tmp/rovai-steer-vitest.log"
+    },
+    "productionUi": {
+      "status": "passed",
+      "themes": [
+        "day",
+        "night"
+      ],
+      "scenarios": [
+        "single",
+        "multiple-recipients",
+        "attachment-only",
+        "unsupported",
+        "execution-ended",
+        "keyboard-menu",
+        "queued-send",
+        "target-binding",
+        "900px-width",
+        "200-percent-zoom"
+      ],
+      "log": "/tmp/rovai-steer-ui-layout-final.log",
+      "cases": 12
+    },
+    "composerIntegration": {
+      "status": "passed",
+      "tests": 2,
+      "log": "/tmp/rovai-steer-composer.log"
+    },
+    "rustExtendedFirstRun": {
+      "status": "failed",
+      "passed": 992,
+      "failed": 16,
+      "ignored": 8,
+      "log": "/tmp/rovai-steer-rust-extended.log",
+      "note": "初次完整扩展运行 16 项失败。15 项版本/fixture 问题修复后，定向 owner 均通过；剩余 macOS provenance 在未修改基线上同样失败。未重跑完整扩展集，不宣称整套全绿。"
+    },
+    "baselineProvenanceRegression": {
+      "status": "reproduced_on_unchanged_baseline",
+      "sourceCommit": "6a2e34844701751e53a14095fa843490da99cb9a",
+      "sourceDirectory": "/tmp/rovai-steer-baseline-regression-20261014",
+      "test": "authority_migration::tests::macos_provenance_added_after_ticket_is_readmitted_without_losing_business_data",
+      "error": "authority_contract_changed / IdentityChanged / Revalidation",
+      "log": "/tmp/rovai-steer-baseline-authority.log"
+    },
+    "typecheck": {
+      "status": "passed",
+      "log": "/tmp/rovai-steer-typecheck-verified.log"
+    },
+    "nativeErrorOwner": {
+      "status": "passed",
+      "test": "codex::tests::real_host_validates_before_input_and_executes_in_the_same_process",
+      "log": "/tmp/rovai-steer-native-error-owner.log",
+      "cases": [
+        "same-turn acknowledgement",
+        "exact-turn evidence",
+        "native rejection",
+        "internal error remains unknown",
+        "Host exit remains unknown"
+      ]
+    },
+    "targetedFinalRegressions": {
+      "status": "passed_after_fixture_completion",
+      "passed": 19,
+      "logs": [
+        "/tmp/rovai-steer-targeted-regressions-final.log",
+        "/tmp/rovai-steer-monitoring-verified.log"
+      ],
+      "note": "前一个日志为18通过1失败；剩余 monitoring mini fixture 补齐所有显式列后，同一 owner 的后一日志通过。未删除断言。"
+    },
+    "documentation": {
+      "status": "passed",
+      "tests": 10,
+      "base": "41c8ca19238de8465c23ff0c030f5c7620dd2c02",
+      "logs": [
+        "/tmp/rovai-steer-docs-tests-final.log",
+        "/tmp/rovai-steer-docs-check-verified.log",
+        "/tmp/rovai-steer-docs-ci-verified.log"
+      ]
+    },
+    "workspaceRust": {
+      "status": "passed",
+      "passed": 471,
+      "failed": 0,
+      "ignored": 1,
+      "log": "/tmp/rovai-steer-workspace-verified.log"
+    },
+    "localization": {
+      "status": "passed",
+      "log": "/tmp/rovai-steer-locale.log",
+      "tests": 2,
+      "catalogLog": "/tmp/rovai-steer-locale-catalog.log",
+      "catalogTests": 2
+    },
+    "sourceAndFormat": {
+      "status": "passed",
+      "checks": [
+        "git diff --check",
+        "cargo fmt --all -- --check"
+      ]
+    }
+  },
+  "semanticGate": {
+    "status": "evidence_insufficient",
+    "plannedCases": "DEMO-101–112",
+    "executedCases": 0,
+    "reason": "没有可追溯的固定 Judge 配置；真实 Steer Smoke 不替代完整基线/候选语义评测。"
+  },
+  "limitations": [
+    "Runtime 默认模型用于功能验收，没有固定模型质量 A/B。",
+    "仅本机 macOS arm64，未声明最低支持版本或跨平台资格。",
+    "只有 Codex 当前开放产品 Steer，其他原生正向样本的结束/取消/崩溃竞态尚未全部验证。",
+    "Unknown 核对需要仍存活的 Host 和原 turn 正向记录；Host 退出后无充分证据则维持未知。"
+  ],
+  "finalProduct": {
+    "coreSha256": "2bcd3ef243291656af978502486ae9eece1b3216cd301f2b96f0c0eaea58d509",
+    "coreExecutable": "/tmp/rovai-steer-product-final-20261014/bin/rovai-core",
+    "agentCliSha256": "ca160a19df3fbd3212e9db32366bff6de5590dadcf2166253dc1adf3115b6422",
+    "smokeScriptSha256": "2313b404fcc12e5dffa11aa447da3873d28c7fb9139d2e70481c3b8a00a02a21",
+    "attempt": 6,
+    "status": "passed"
+  }
+}

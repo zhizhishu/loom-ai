@@ -1,0 +1,209 @@
+{
+  "date": "2026-10-25",
+  "scope": "Official ACP, one native user Home, shared Gateway, call-time Session-to-Run CLI attribution; macOS arm64 Preview",
+  "native": {
+    "version": "0.22.4",
+    "sourceCommit": "4d04303818b61bf3aa09278af48356315515965b",
+    "sourceModified": false,
+    "terminalBackend": "local"
+  },
+  "controlled": {
+    "fixture": "rovai-hermes-native-session-VmUwPI",
+    "command": "node scripts/smoke-hermes-native-session.mjs <official-source> <prepared-python>",
+    "provider": "loopback scripted Responses; no paid model",
+    "isolation": [
+      "one disposable user Home for both members",
+      "independent Core data and Runtime Files Root",
+      "Skill Library",
+      "MCP config",
+      "Gateway launched before Core; its PATH does not include the later installed ~/.local/bin"
+    ],
+    "checks": {
+      "concurrentMembers": true,
+      "backgroundUsesRunAtCallTime": true,
+      "noActiveOrUnknownSessionRejected": true,
+      "gatewaySurvivesCoreShutdown": true,
+      "nativeCompactionNoRulesRedelivery": true,
+      "nativeSystemPromptPreserved": true,
+      "nativeConfigUnchanged": true,
+      "mcpNewAndColdResumeWithPartialFailure": true,
+      "fixedCliWithoutAcpPathInjection": true,
+      "cancelDoesNotStopOtherSession": true,
+      "mcpRebindAfterNativeGatewayRestart": true,
+      "coreKillDoesNotKillGatewayOrReplay": true,
+      "actualModelInputsMatchRulesDelivery": true,
+      "originalSessionColdResume": true,
+      "obsoleteMcpSameNameCapabilityAbsent": true,
+      "failedMcpWarningObserved": true
+    },
+    "runStatusCounts": {
+      "cancelled": 1,
+      "failed": 1,
+      "succeeded": 10
+    },
+    "successfulInputs": [
+      {
+        "label": "B0",
+        "member": "B",
+        "rules": "initial",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A0",
+        "member": "A",
+        "rules": "initial",
+        "executionEpoch": 1
+      },
+      {
+        "label": "B1",
+        "member": "B",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A1",
+        "member": "A",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A2",
+        "member": "A",
+        "rules": "update",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A3",
+        "member": "A",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A4",
+        "member": "A",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "B3",
+        "member": "B",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "A6",
+        "member": "A",
+        "rules": "none",
+        "executionEpoch": 1
+      },
+      {
+        "label": "B4",
+        "member": "B",
+        "rules": "none",
+        "executionEpoch": 1
+      }
+    ],
+    "compression": {
+      "committedSummaries": 2,
+      "protectFirstN": 0,
+      "protectLastN": 2,
+      "contextLength": 65536,
+      "syntheticInputTokens": 60000,
+      "physicalSessionRotationRequired": false
+    },
+    "wireSha256": "476aaafeae68f1ef43ad97397fc58e03fc4188bc5fdf8202b09cf379859b1d20",
+    "previousSuccessfulFixture": "rovai-hermes-native-session-bFJWnN"
+  },
+  "interpretation": [
+    "Two distinct members execute plain rovai send with no ROVAI_CLI_CONTEXT; Core determines their exact current Run.",
+    "A0 background invocation first made during A1 belongs to A1 by the approved call-time policy.",
+    "No-active and unknown Sessions are rejected without creating a message.",
+    "One cancelled Run does not stop the other Session or shared Gateway.",
+    "Core SIGKILL preserves the native Gateway; the original accepted task is not replayed, and the subsequent task resumes the original Session.",
+    "Gateway restart is performed by the fixture only; normal ACP resume restores assigned MCP credentials.",
+    "Actual model requests contain initial/updated rules only when required. Two committed native summaries create no Hermes redelivery requirement.",
+    "Native config and .env hashes remain unchanged; native system prompt is visible in model requests."
+  ],
+  "limits": [
+    "Only local terminal front/background execution and one official native version on macOS arm64 were exercised.",
+    "execute_code, subagents, remote/container terminal backends, other platforms and paid model quality were not qualified.",
+    "No general cancellation rollback or immediate MCP revocation guarantee; native resume with empty MCP is not confirmation of removal.",
+    "Shared native long-term memory is not isolated by member; compressed rules have no permanent-preservation guarantee.",
+    "The daily user installation, App and Hermes data were not changed."
+  ],
+  "diagnosticAttempts": [
+    {
+      "fixture": "rovai-hermes-native-session-gMCYDQ",
+      "result": "Retired compaction_recovery envelope still used for input budget reservation; both production reservation sites corrected."
+    },
+    {
+      "fixture": "rovai-hermes-native-session-l0Ft88",
+      "result": "MCP execution succeeded; fixture attempted to search a non-model request without input. Fixture now distinguishes these requests."
+    },
+    {
+      "fixture": "rovai-hermes-native-session-VmaWcl",
+      "result": "Cancellation succeeded; fixture selected the previous cancelled Run before the successor was scheduled. Query now starts after the submission boundary."
+    },
+    {
+      "fixture": "rovai-hermes-native-session-s53Gti",
+      "result": "No-active request was rejected, but CLI flattened the IPC error. Native Session failures now use the existing safe business rejection envelope."
+    }
+  ],
+  "regression": {
+    "workspace": {
+      "command": "cargo test --workspace -- --test-threads=1",
+      "passed": 477,
+      "failed": 0,
+      "ignored": 1
+    },
+    "hermesExtended": {
+      "passed": 3,
+      "failed": 0
+    },
+    "acpFilteredExtended": {
+      "passed": 77,
+      "failed": 0,
+      "ignored": 2
+    },
+    "adapterCatalogExtended": {
+      "passed": 25,
+      "failed": 0
+    },
+    "cliBins": {
+      "passed": 31,
+      "failed": 0,
+      "includedInWorkspace": true
+    },
+    "desktopUserAutomation": {
+      "passed": 10,
+      "failed": 0
+    },
+    "qualificationHelpers": {
+      "passed": 8,
+      "failed": 0
+    },
+    "documentationTests": {
+      "passed": 10,
+      "failed": 0
+    },
+    "checks": [
+      "Core/CLI build",
+      "workspace check",
+      "cargo fmt",
+      "TypeScript",
+      "script syntax",
+      "git diff --check",
+      "current documentation gate",
+      "diff-aware documentation gate"
+    ],
+    "overlap": "Filtered owners overlap with workspace; counts are not additive.",
+    "priorParallelWorkspaceFailures": {
+      "attempts": 2,
+      "passed": 430,
+      "failed": 1,
+      "ignored": 1,
+      "test": "runtime_discovery::tests::cursor_agent_alias_rejects_an_unrelated_agent_binary",
+      "reason": "Existing 2-second version probe timed out before identity-mismatch assertion. Focused rerun passed in 0.14 s and the complete serial workspace passed; Cursor implementation, budget and assertion unchanged."
+    }
+  }
+}

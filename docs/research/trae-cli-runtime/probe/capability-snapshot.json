@@ -1,0 +1,118 @@
+{
+  "schemaVersion": 1,
+  "runtimeKind": "trae-cn-cli",
+  "observedBuild": {
+    "version": "0.120.52",
+    "commit": "6756e52a9238b6d493928e55b05127957dbfefb4",
+    "buildDate": "2026-08-12T01:31:30Z"
+  },
+  "launch": {
+    "executable": "traecli",
+    "args": ["acp", "serve"],
+    "protocol": "acp-v1"
+  },
+  "initialize": {
+    "protocolVersion": 1,
+    "authMethods": [],
+    "agentCapabilities": {
+      "loadSession": true,
+      "sessionListAdvertised": true,
+      "mcpHttpAdvertised": true,
+      "mcpSseAdvertised": true
+    }
+  },
+  "sessionNew": {
+    "sessionId": "<redacted-non-empty>",
+    "modelConfigOption": {
+      "id": "model",
+      "type": "select",
+      "currentValue": "GLM-5.2",
+      "availableValueCount": 19
+    },
+    "modes": ["default", "bypass_permissions", "plan"],
+    "asyncMetadata": {
+      "boundedObservation": true,
+      "sessionNewResponseAtMs": 1215,
+      "availableCommandsUpdateAtMs": 1727,
+      "delayAfterSessionNewMs": 512,
+      "availableCommandCount": 17,
+      "entryShape": ["name", "description", "input.hint"],
+      "builtinSlashCommands": ["agent-new", "init", "loop", "compact"],
+      "skillBackedCommandCount": 13,
+      "skillBackedCommandNamesRedacted": true,
+      "skillBackedCommands": [
+        "user-skill-01",
+        "user-skill-02",
+        "user-skill-03",
+        "user-skill-04",
+        "user-skill-05",
+        "user-skill-06",
+        "user-skill-07",
+        "user-skill-08",
+        "user-skill-09",
+        "user-skill-10",
+        "user-skill-11",
+        "user-skill-12",
+        "user-skill-13"
+      ]
+    }
+  },
+  "verifiedBehavior": {
+    "promptTerminalStopReasons": ["end_turn", "cancelled"],
+    "stableToolCallId": true,
+    "structuredPermissionRequest": true,
+    "permissionOptionIds": ["allow", "session_level_allow", "always_allow", "reject"],
+    "sessionLoadAcrossHosts": true,
+    "modelConfigRoundTrip": true,
+    "appendSystemPromptRoleSystem": true,
+    "nativeAppendMarkerObserved": true,
+    "additiveMcpPerSession": true,
+    "mcpAbsentFromUnconfiguredSiblingSession": true,
+    "jsonRpcOnlyStdout": true,
+    "managedProjectSkillPath": ".trae/skills",
+    "managedProjectSkillAdvertised": true,
+    "managedProjectSkillInvoked": true,
+    "projectSkillOverridesUserSkill": true,
+    "skillScanAtSessionNew": true,
+    "skillScanAtSessionLoad": true,
+    "existingIdleSessionDynamicSkillRefreshObserved": false
+  },
+  "skillDiscovery": {
+    "project": {
+      ".trae/skills": "verified_advertised_and_invoked",
+      ".agents/skills": "verified_advertised_and_invoked_runtime_only",
+      ".traecli/skills": "verified_advertised_and_invoked_runtime_only",
+      ".coco/skills": "not_observed"
+    },
+    "user": {
+      "~/.trae/skills": "verified_advertised_invocation_unverified",
+      "~/.trae-cn/skills": "verified_advertised_invocation_unverified",
+      "~/.traecli/skills": "verified_advertised_invocation_unverified",
+      "~/.agents/skills": "verified_advertised_invocation_unverified",
+      "~/.coco/skills": "not_observed"
+    }
+  },
+  "compaction": {
+    "advertisedCommand": "compact",
+    "manualAttempted": true,
+    "automaticThresholdAttempted": true,
+    "structuredCompletedSignal": "not_observed",
+    "runtimeOccurrenceId": "not_observed",
+    "projectHooksUnderAcpServe": "not_observed",
+    "detectorPolicy": "disabled",
+    "capabilityStatus": "unverified_not_observed"
+  },
+  "rovaiPolicy": {
+    "publicOutputMode": "explicit_send_only",
+    "charterDelivery": "first_payload",
+    "nativeSystemPromptCapability": "observed",
+    "charterCorrectnessDependsOnNativeSystemPrompt": false,
+    "missingSendRecovery": "if_no_accepted_send",
+    "hostWarmReuse": "enabled_when_compatible",
+    "externalMcpProjection": "additive_per_run",
+    "runtimeAdvertisedCommands": "observed_session_metadata",
+    "managedSkillDelivery": "verified_project_dot_trae_skills",
+    "defaultPermissionMode": "default",
+    "defaultYolo": false
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "target": "linux-x64",
+  "maximumRequiredGlibc": "2.35",
+  "files": {
+    "rovai": {
+      "requiredSymbolVersions": {
+        "GLIBC": "2.34",
+        "GLIBCXX": null,
+        "CXXABI": null
+      },
+      "neededLibraries": [
+        "ld-linux-x86-64.so.2",
+        "libc.so.6",
+        "libgcc_s.so.1",
+        "libm.so.6"
+      ],
+      "interpreter": "/lib64/ld-linux-x86-64.so.2"
+    },
+    "rovai-host": {
+      "requiredSymbolVersions": {
+        "GLIBC": "2.34",
+        "GLIBCXX": null,
+        "CXXABI": null
+      },
+      "neededLibraries": [
+        "ld-linux-x86-64.so.2",
+        "libc.so.6",
+        "libgcc_s.so.1",
+        "libm.so.6"
+      ],
+      "interpreter": "/lib64/ld-linux-x86-64.so.2"
+    },
+    "rovai-server": {
+      "requiredSymbolVersions": {
+        "GLIBC": "2.34",
+        "GLIBCXX": null,
+        "CXXABI": null
+      },
+      "neededLibraries": [
+        "ld-linux-x86-64.so.2",
+        "libc.so.6",
+        "libgcc_s.so.1",
+        "libm.so.6"
+      ],
+      "interpreter": "/lib64/ld-linux-x86-64.so.2"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "sourceCommit": "4ffb689217171521e0f1696953cb330f33b7b3dc",
+  "mergedMain": "0bfc35b0dc68d99eeb483f59406e3beca84a2840",
+  "version": "0.2.6",
+  "platform": "darwin",
+  "arch": "arm64",
+  "buildCommand": "pnpm package:mac:daily",
+  "buildLog": "/tmp/rovai-main-install-package-20260914.log",
+  "acceptanceCommand": "node /tmp/rovai-main-install-acceptance-20260914.mjs",
+  "acceptanceScriptSha256": "a951955c7121792d46f06491f699d159b51c4a9913519efafeef8f024eae29e7",
+  "acceptanceLog": "/tmp/rovai-main-install-acceptance-20260914.log",
+  "packageSha256": {
+    "Contents/Resources/app.asar": "57cb12df2e22ba7e7af44b48ad6ae56c32ee62d0353d1987c4a4f81d2e7d10ea",
+    "Contents/Resources/bin/rovai-host": "288180ad096f64212fa30f9827b0a34cfd1517621e4d3da66c12148b233885e8",
+    "Contents/Resources/bin/rovai-core": "27f313b5bb93026dc9e89467100805cd6b20de6f4de1485e07f9cb9c95ea6549",
+    "Contents/Resources/bin/rovai": "acabda226432e733dae4e7ac6ddcc05112230d961daea67382aaa411e9d7462b"
+  },
+  "webFileCount": 138
+}

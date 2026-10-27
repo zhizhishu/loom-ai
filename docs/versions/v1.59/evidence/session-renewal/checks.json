@@ -1,0 +1,43 @@
+{
+  "status": "passed",
+  "baseCommit": "42f144dcd6777e226e7734061b84a06d71b5da29",
+  "platform": "macos-arm64",
+  "sources": {
+    "apps/web/src/auth-storage.ts": "b8f4f0d80b97351cd64287e8d74b5350ea6cf4b27edda12d56ebf7c4670f2567",
+    "apps/web/src/client.ts": "6ef15f7fbc94091e38c4bacaf46e27f6819bdd9a5143d9e5030cda7799190623",
+    "apps/web/src/main.tsx": "25dc8a37b0f862ad4f1b7cf613486d2c0e81f522c193677edb2230feccd2b167",
+    "crates/rovai-web/src/auth.rs": "cc386c28fedd06773b9c107732bf0e2910483d02d0d54bb98502375794653515",
+    "crates/rovai-web/src/lib.rs": "f3d0d31a1d1f94f315b8447de215373f15727db3e55824869f34cb43f82d81a1",
+    "crates/rovai-host/src/web_control.rs": "246b8d37db3f9324885ef717fba122886b8534f5fefeb9c551d4afb3ef0d2baa",
+    "crates/rovai-host/src/lib.rs": "c5a8684874342ed43622f0a27a3bef102a8cd9f0a30348f8ebf87ebafd9810a8",
+    "scripts/lib/host-web.test.mjs": "834a1cddaa7d5a2aba0dcaaa8cac287c6451d2c5e7be2aa3a8e471f835b72d63",
+    "scripts/lib/server-entry.test.mjs": "9e7cc24245cab6cb0111d4aaa0f0096be711ee3fb98ab340edaffd18bc5d674b",
+    "scripts/smoke-web-recovery.mjs": "41c899c12c132d7246d74c047bbac0d6256f0a542b914a1c757e2f5e3d8638ce"
+  },
+  "timeTests": "Injected clocks for thirty-day Session lifetime, seven-day renewal window, true expiry and concurrent renewal; existing QR browser smoke also checks real 120-second expiry.",
+  "checks": {
+    "client": "22 passed, including legacy migration before offline validation and browser storage failure on logout",
+    "hostAuth": "6 Rust unit tests passed, including controlled-clock lifecycle and private-file persistence",
+    "hostHttp": "passed: repeatable login Token, timing, normal restart, explicit revocation and stop-before-first-listener",
+    "serverEntry": "3 passed; 1 Windows native-console case skipped on macOS",
+    "hostLifecycleAndChannels": "3 passed",
+    "browserRecovery": "passed: real Host and Chrome process restart, QR, copied tab, own drafts",
+    "javascript": "pnpm test passed: 198 Vitest files / 2022 tests; Node 317 passed / 2 platform skips. Added legacy migration case subsequently passed in client suite.",
+    "webBuild": "passed",
+    "typecheck": "passed",
+    "clippy": "passed, workspace all-targets -D warnings",
+    "format": "passed",
+    "docs": "docs:test/docs:check and diff-aware docs:check:ci passed with base 42f144dcd6777e226e7734061b84a06d71b5da29",
+    "rustWorkspace": "pnpm test:rust:staged routed to cargo test --workspace: Core 805 passed / 6 existing manual ignores, CLI 35 passed, Web 6 passed; total 846 passed",
+    "rustFinalTargets": "Final rovai-host/rovai-web targets and doc-tests passed after lazy explicit-disable fix"
+  },
+  "limitations": [
+    "No iOS/Android or Windows/Linux native qualification in this increment.",
+    "No real model invocation, App installation, release or PR creation.",
+    "Old memory-only Host Sessions cannot survive the first upgrade; legacy standalone login Token imports, process-only Desktop Token cannot be recovered after exit."
+  ],
+  "verificationNotes": [
+    "Final browser storage-error cleanup was checked by the 22-case client suite, TypeScript and Web build; the full production-browser smoke proves the ordinary restart/fork/draft paths.",
+    "HTTP timing asserts a bounded elapsed persistence interval; exact time-boundary assertions belong to the injected-clock tests."
+  ]
+}

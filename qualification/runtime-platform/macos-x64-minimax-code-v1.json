@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "macos-x64-minimax-code-v1",
+  "capturedAt": "2026-10-18",
+  "platform": "macos-x64",
+  "baseRevision": "63a4d25affc57c308ea8b8b5da4e0f927185b98f",
+  "qualifiedRuntimeKinds": [
+    "minimax-code-cli"
+  ],
+  "qualificationBasis": {
+    "type": "maintainer-acceptance-confirmation",
+    "decision": "The maintainer explicitly instructed that MiniMax Code on macOS Intel be marked as having passed acceptance.",
+    "source": {
+      "threadId": "rvcamp_01m51xakpdeq0vvbddakjca0pv",
+      "messageId": "09da3a7b-a817-4fb4-befb-ebc32ce9207b",
+      "sequence": 43,
+      "text": "macOS intel也标记验收通过；"
+    },
+    "repositoryEvidence": [
+      "docs/development/runtime-integration-checklist.md",
+      "docs/research/minimax-code-runtime/README.md",
+      "docs/research/minimax-code-runtime/questionnaire-policy-2026-10-17.md"
+    ]
+  },
+  "runtimeEvidence": {
+    "package": "@minimax-ai/code",
+    "protocol": "acp-v1",
+    "launch": "mcode acp",
+    "targetHostRuntimeVersion": null,
+    "repositoryTestedVersion": "0.6.12",
+    "repositoryTestedPlatform": "macos-arm64"
+  },
+  "acceptance": {
+    "status": "qualified",
+    "basis": "maintainer-confirmed",
+    "releaseApproval": "approved",
+    "platformScope": "macos-x64 only",
+    "machineAndExecutionBoundary": "Platform admission permits discovery, checks, member selection and execution. Installation, authentication, model selection and live protocol checks retain their existing semantics."
+  },
+  "limitations": [
+    "This artifact records the maintainer's acceptance confirmation. This change does not claim to have run an Intel target-host session or received its detailed checklist, OS build, CLI version, executable fingerprint or raw logs.",
+    "The repository's macOS arm64 observations remain separately attributed and do not serve as Intel target-host execution evidence.",
+    "Platform admission does not change documented questionnaire cancellation, partial Usage, optional model-probe limitations, unsupported Fast or other capability boundaries.",
+    "Windows x64 and Linux x64 remain not qualified; macOS arm64 remains preview."
+  ]
+}

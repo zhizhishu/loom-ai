@@ -1,0 +1,136 @@
+{
+  "recordedAt": "2026-09-14T07:47:28.903644+00:00",
+  "baseCommit": "c89872046b71c88b4120a96e4a067fa40cbd3710",
+  "branch": "rovai/unified-rust-host",
+  "sourceSha256": {
+    "apps/desktop/src/renderer/src/AppHeader.tsx": "7c5cbd0055332caa7f86bd506e323370f10c7e084adf8187934687fa360f2428",
+    "apps/desktop/src/renderer/src/AppearanceSettings.tsx": "e972a8d968656e6700032bfffa877dc5b493f1525ac3081ce33376c91e5f0fc1",
+    "apps/desktop/src/renderer/src/AutomationSchedulePickers.tsx": "3829b9a67705f67727d0c316e4f20f0a884f6788ec3aa73334d86b5fe857bb21",
+    "apps/desktop/src/renderer/src/BusinessApp.tsx": "f3a3c724d8da7faa4ae4765cebae32b494855a8ec05025694d9172889b6c1656",
+    "apps/desktop/src/renderer/src/CampDetailPopover.tsx": "1f2d504eee6055797a74d986d23d74d5ac684200046ae5030019d60f3ad0ecad",
+    "apps/desktop/src/renderer/src/CampNavigation.tsx": "3926e3c6e47766dd169598ee03edf4ef1bc236dd27fe6fa61e90c98e055f4998",
+    "apps/desktop/src/renderer/src/CampWorkspace.tsx": "6bb2ec66a0ddd7f95c80e79c7a039dec0ef6670addab990e574f97840bfbe2ca",
+    "apps/desktop/src/renderer/src/MemberManagement.tsx": "d0a22859e595d6fc21c8b6ce54e5491aee3a482dac659184221d1b0afb924881",
+    "apps/desktop/src/renderer/src/MemberRosterLayout.tsx": "69da81f96a32d0285460390cbd0a7d48587e835be563686bbee5832db249272b",
+    "apps/desktop/src/renderer/src/MemoryLibrary.tsx": "2a422ec97153449099ff5e9429e50331a1f630e5f0d4b2c4ddf84c2d437756fa",
+    "apps/desktop/src/renderer/src/MobileLayout.tsx": "8b9026095ef536b2635144e8f8d5712c0812afed09a917edce84b47c2e50086f",
+    "apps/desktop/src/renderer/src/NavigationIcon.tsx": "47f123ac1b96dac1d6ad0b1496ba88ac8de1be59c7f21f90904bf9058ad17af5",
+    "apps/desktop/src/renderer/src/NavigationShell.tsx": "32d2e8f8a838addc0c11b0fa4f5282645a12d501d29742a96a7f671b2a532a06",
+    "apps/desktop/src/renderer/src/RemoteAboutSettings.tsx": "d2fb74e9f3e44dc31d5b170503ed04952d9c9a68a8c336e5934604274847f588",
+    "apps/desktop/src/renderer/src/RovaiComposerExtension.ts": "c400616278ab48c36d81d70e4b5ca0ccee07f8e8a8d060430155e526521f7c56",
+    "apps/desktop/src/renderer/src/SingleChatPanel.tsx": "d2b2ba99d1e3e4ff3280c767c42dcb121b669fcbf369c17d40d775a9db3a2d5b",
+    "apps/desktop/src/renderer/src/StructuredMentionComposer.tsx": "d7c440484ddea8bb0b8699f9593b15edef3246e87db2b30d2e8d8eaa9b55a987",
+    "apps/desktop/src/renderer/src/useExecutionDisclosureAnchor.ts": "a24deda54fb26484940356a8a42564ced027f74e8243f6623c04cc446d28b62d",
+    "apps/web/index.html": "6b1c36f2fdc1cec2c09238e5b96607ed40f817af0506d0d9fbd79a63d2cb70a7",
+    "apps/web/src/main.tsx": "ea0e3c4c186888ab66ee1e0c5b0a2d582ac8e08e764df6985a1b8d79433f49df",
+    "apps/web/src/mobile.css": "b6b4b2465d478df8a1a03aed78d4107d344f55668721177ba0b38ce825dcdd82",
+    "apps/web/src/styles.css": "694a3ff564ce038ce2857e69aa08fc68dcea051c420fe3a8b6c158543eb7c243",
+    "package.json": "75213692f966d75520bc48ca1a771cec9c6a7438292f9ca94adc311a2b031f3e",
+    "scripts/fixtures/host-web-parity/model.ts": "95019be9f3fc354de976e0861ba8d7cd3362a124659731ecdfb93a323faa61c1",
+    "scripts/fixtures/host-web-parity/renderer.tsx": "72e647dc6ec40c79f8d2b8cbc81f9d0dd5ce30e1c7f36ebefc69a15fedf27e28",
+    "scripts/lib/host-web-mobile.test.mjs": "2a00ac2077559b4de04926e010d14db489ff2272933aa5e7bf1e980daf49dd43"
+  },
+  "results": [
+    {
+      "command": "pnpm typecheck",
+      "result": "passed"
+    },
+    {
+      "command": "pnpm exec tsc --noEmit -p scripts/fixtures/host-web-parity/tsconfig.json",
+      "result": "passed"
+    },
+    {
+      "command": "pnpm build:desktop",
+      "result": "passed",
+      "includes": [
+        "Web",
+        "Main",
+        "Preload",
+        "Renderer"
+      ]
+    },
+    {
+      "command": "pnpm build:web",
+      "result": "passed",
+      "note": "Final mobile CSS refinement rebuilt after Desktop build; existing large-chunk warning retained."
+    },
+    {
+      "command": "pnpm test",
+      "result": "passed",
+      "vitest": {
+        "files": 198,
+        "tests": 2009
+      },
+      "node": {
+        "passed": 317,
+        "skipped": 2
+      },
+      "includes": [
+        "documentation tests and checks",
+        "skill gates",
+        "Electron sandbox capability checks"
+      ]
+    },
+    {
+      "command": "pnpm docs:check:ci",
+      "result": "passed",
+      "base": "c89872046b71c88b4120a96e4a067fa40cbd3710"
+    },
+    {
+      "command": "pnpm test:host-web-mobile",
+      "result": "passed",
+      "tests": 3,
+      "record": "validation.json; execution-validation.json; server-validation.json"
+    },
+    {
+      "command": "node --test --test-name-pattern='phone execution' scripts/lib/host-web-mobile.test.mjs",
+      "result": "passed",
+      "note": "Rechecked final CSS with execution and approval scenes in both themes."
+    },
+    {
+      "command": "pnpm test:host-web-parity",
+      "result": "passed",
+      "scenarios": 24,
+      "record": "wide-parity.json"
+    },
+    {
+      "command": "pnpm test:navigation-shell; pnpm test:startup-presentation; pnpm test:composer-input",
+      "result": "passed",
+      "tests": 3,
+      "note": "Ran serially through existing Node test owners with isolated Electron profiles."
+    },
+    {
+      "command": "pnpm test:file-preview-layout",
+      "result": "passed",
+      "tests": 1
+    },
+    {
+      "command": "pnpm exec vitest run apps/desktop/src/renderer/src/App.test.ts apps/desktop/src/renderer/src/CampNavigationPagination.test.ts",
+      "result": "passed",
+      "tests": 176,
+      "note": "Final native/remote About label capability condition."
+    }
+  ],
+  "provenance": {
+    "host": "Real Rust Host through parent-pipe protocol, isolated Core/Skills/MCP; Desktop-capability mode without starting Electron Main.",
+    "server": "Real standalone debug rovai-server with isolated --data-dir and production out/web; native update installation not exercised.",
+    "execution": "Shared production components with fixture Run/command/approval evidence; no real Runtime or platform approval.",
+    "browser": "macOS Chrome device emulation 360/390/430px and 844px touch landscape; no physical iOS/Android device.",
+    "nativeRegression": "Existing isolated Electron fixtures; no daily userData, Core or model."
+  },
+  "notVerified": [
+    "physical iOS Safari / Android Chrome",
+    "real soft keyboard and camera/gallery",
+    "background recovery and mobile network switching",
+    "second physical device",
+    "Windows/Linux native qualification in this change",
+    "Server Web download/install/restart API",
+    "new packaged daily App installation"
+  ],
+  "resolvedFindings": [
+    "Compact file preview hid the mobile Back control: fixed CSS scope and verified return preserves draft.",
+    "Private Composer is a native textarea: test now sends a text-bearing Return event; both Composers preserve a newline without sending.",
+    "Execution fixture stylesheet order now matches production; dark main plane is black.",
+    "Native Run focus decoration and header clipping/approval overlap removed for mobile."
+  ]
+}

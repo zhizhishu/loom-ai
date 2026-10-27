@@ -1,0 +1,59 @@
+{
+  "sourceBase": "d53f8ca917d34ac33c23f445d2a53df2bfd832d9",
+  "macOS": "26.3",
+  "architecture": "arm64",
+  "runtime": "codex-cli 0.153.4",
+  "typecheck": "passed",
+  "vitest": {
+    "files": 189,
+    "passed": 1960
+  },
+  "node": {
+    "passed": 317,
+    "skipped": 2,
+    "failed": 0
+  },
+  "rustWorkspaceDefault": {
+    "corePassed": 803,
+    "coreIgnored": 6,
+    "cliPassed": 35,
+    "webPassed": 5
+  },
+  "rustSlow": {
+    "passed": 310,
+    "failed": 0
+  },
+  "clippyWorkspaceAllTargets": "passed",
+  "fmt": "passed",
+  "packagedHostProcessTests": {
+    "passed": 4,
+    "failed": 0,
+    "skipped": 0
+  },
+  "nativeBinaries": {
+    "architectures": [
+      "arm64"
+    ],
+    "declaredMinimumMacOS": "11.0",
+    "SDK": "26.2",
+    "signatureVerification": "ad-hoc strict verification passed; not Developer ID or notarization",
+    "dynamicDependencies": [
+      "CoreFoundation.framework",
+      "/usr/lib/libiconv.2.dylib",
+      "/usr/lib/libSystem.B.dylib"
+    ]
+  },
+  "notVerified": [
+    "second physical LAN device",
+    "physical sleep/wake",
+    "Intel Mac",
+    "other operating systems",
+    "minimum macOS 11 runtime",
+    "Developer ID/notarization"
+  ],
+  "newTestOwners": {
+    "automation_clock": "Pure monotonic/wall-clock state transitions; no database or real sleep fixture.",
+    "Host process clock": "Unique real process seam for scheduling while Web is stopped and Host restarts; no model.",
+    "file reference page boundaries": "Pure UTF-8 and reference grammar; extends resource ownership owner without a SQLite fixture."
+  }
+}

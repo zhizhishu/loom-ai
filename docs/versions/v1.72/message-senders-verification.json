@@ -1,0 +1,252 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-14",
+  "branch": "rovai/message-senders",
+  "baseline": "41c8ca19238de8465c23ff0c030f5c7620dd2c02",
+  "artifactRoot": "/Users/murray.xue/.rovai/instances/v1-ea1b0333b2d3194639a0b5a284275214dc868bf6ebe8bea219653f7c2cd7a4b3/attachments/rvcamp_01m4e3fxdef9ra3cpfasa8gaxk/message-senders-validation-20261014",
+  "versions": {
+    "publicFormatterManifest": 38,
+    "sharedFormatterManifest": 37,
+    "publicProfile": 13,
+    "nonBatchProfile": 12,
+    "agentOutput": 12,
+    "transport": 39,
+    "migration": 199,
+    "databaseSchema": 149
+  },
+  "checks": [
+    {
+      "name": "Rust workspace",
+      "command": "cargo test --workspace",
+      "status": "passed",
+      "passed": 471,
+      "ignoredOrSkipped": 1,
+      "log": "rovai-senders-default-tests-release.log",
+      "sha256": "d0579db0417c69044e76331b53cde07879a57e98bb7eb3f3bcfbc95a24f5abe7"
+    },
+    {
+      "name": "Context materialization",
+      "command": "target/debug/deps/rovai_core-5b5d5d9ed1585ad0 context::slow_tests::",
+      "status": "passed",
+      "passed": 45,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-verified-context__slow_tests__.log",
+      "sha256": "4ba4b7db4228e20c1c847efcfbfcba85aab10fa9f2c90900c48e4632cace4ea1",
+      "reproduceCommand": "cargo test -p rovai-core --features slow-tests context::slow_tests::"
+    },
+    {
+      "name": "FIFO and claim",
+      "command": "target/debug/deps/rovai_core-5b5d5d9ed1585ad0 delivery_queue::tests::",
+      "status": "passed",
+      "passed": 26,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-verified-delivery_queue__tests__.log",
+      "sha256": "2c36aeefc707aa7acfff1d62666962a9cf5e908e28e427d4debdeece04c3a462",
+      "reproduceCommand": "cargo test -p rovai-core --features slow-tests delivery_queue::tests::"
+    },
+    {
+      "name": "History",
+      "command": "target/debug/deps/rovai_core-5b5d5d9ed1585ad0 camp_history::slow_tests::",
+      "status": "passed",
+      "passed": 7,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-verified-camp_history__slow_tests__.log",
+      "sha256": "5167aa1658a549165d4d20cf8a6b7807fbe434e02960a04d0008491e2fb89d0a",
+      "reproduceCommand": "cargo test -p rovai-core --features slow-tests camp_history::slow_tests::"
+    },
+    {
+      "name": "Tool output replay",
+      "command": "target/debug/deps/rovai_core-5b5d5d9ed1585ad0 builtin_tool_cli_output::tests::",
+      "status": "passed",
+      "passed": 8,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-verified-builtin_tool_cli_output__tests__.log",
+      "sha256": "8dcf0cf26ad7dc415a48f189f15586be3a3b7813157061cb77bf61b6d51d9227",
+      "reproduceCommand": "cargo test -p rovai-core builtin_tool_cli_output::tests::"
+    },
+    {
+      "name": "Closed schemas",
+      "command": "target/debug/deps/rovai_core-5b5d5d9ed1585ad0 team_tool_catalog::tests::",
+      "status": "passed",
+      "passed": 9,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-verified-team_tool_catalog__tests__.log",
+      "sha256": "b96be680eef69b02e373d4d5df6698f67378ac469c8e692628bcbbe7b99f33fd",
+      "reproduceCommand": "cargo test -p rovai-core team_tool_catalog::tests::"
+    },
+    {
+      "name": "Adapter bindings",
+      "command": "target/debug/deps/rovai_core-5b5d5d9ed1585ad0 agent_runtime_adapter::tests::",
+      "status": "passed",
+      "passed": 25,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-verified-agent_runtime_adapter__tests__.log",
+      "sha256": "098acf118b565e1415101c29894c63092378d78f46b5338c56cb5d9aac94fcfa",
+      "reproduceCommand": "cargo test -p rovai-core --features extended-tests agent_runtime_adapter::tests::"
+    },
+    {
+      "name": "Channels",
+      "command": "target/debug/deps/rovai_core-5b5d5d9ed1585ad0 channel::tests::",
+      "status": "passed",
+      "passed": 38,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-verified-channel__tests__.log",
+      "sha256": "8b35476ce547f08b26b460d41f6dc3647c309cedecab94ab51e01452e9874d92",
+      "reproduceCommand": "cargo test -p rovai-core --features extended-tests channel::tests::"
+    },
+    {
+      "name": "Migration",
+      "command": "target/debug/deps/rovai_core-5b5d5d9ed1585ad0 routing_upgrade_preserves_frozen_evidence",
+      "status": "passed",
+      "passed": 1,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-verified-routing_upgrade_preserves_frozen_evidence.log",
+      "sha256": "09ea6324e56e7139b3447abced0aab95393bb26818479e279339a089a7447dd9",
+      "reproduceCommand": "cargo test -p rovai-core --features extended-tests routing_upgrade_preserves_frozen_evidence"
+    },
+    {
+      "name": "TypeScript",
+      "command": "pnpm typecheck",
+      "status": "passed",
+      "passed": null,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-typecheck.log",
+      "sha256": "8366207267355d3e3d5bf3bf6e8c94c5f93f6078c34f08973fa2b38cdda6cc92"
+    },
+    {
+      "name": "Vitest and Node",
+      "command": "pnpm test",
+      "status": "passed",
+      "passed": 3028,
+      "ignoredOrSkipped": 2,
+      "log": "rovai-senders-vitest.log",
+      "sha256": "4b8ba2dbfd0a049a0788251e1ce40a846849d45def63515bc7921c601cffcbff"
+    },
+    {
+      "name": "Document tests",
+      "command": "pnpm docs:test",
+      "status": "passed",
+      "passed": 10,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-doc-tests-final.log",
+      "sha256": "128d41cdd4be640bace7796f915d4776a95885929ccde620792e153ca34d6388"
+    },
+    {
+      "name": "Document governance",
+      "command": "DOCS_BASE_REF=41c8ca19238de8465c23ff0c030f5c7620dd2c02 pnpm docs:check:ci",
+      "status": "passed",
+      "passed": null,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-doc-check-handoff.log",
+      "sha256": "289f24954390438e26234c6b9092b70b7ec154146c0618bf1fb8f8c439b5a554"
+    },
+    {
+      "name": "Product contract fingerprint",
+      "command": "node --test scripts/benchmark/protocol/product-contract.test.mjs",
+      "status": "passed",
+      "passed": 1,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-product-contract-final.log",
+      "sha256": "2cbd28a54756ac8cd0fe69e3c71d197d26d1db95a2e5f4b03f238f49a63c321f"
+    },
+    {
+      "name": "Rust check",
+      "command": "cargo check --workspace",
+      "status": "passed",
+      "passed": null,
+      "ignoredOrSkipped": 0,
+      "log": "rovai-senders-check-workspace.log",
+      "sha256": "4f4bc2e9d7072f026a37324bfe2a44e99a8d6d4ac5fc194729633818fb06aa2b"
+    }
+  ],
+  "notes": [
+    "专项命令通过同一次 slow-tests 编译产物执行；数量与默认 Rust 可能重复，不能相加成唯一测试数。",
+    "Vitest 243 文件/2668 项；Node 前置检查 20 项及后续 340 项通过、2 项平台跳过。",
+    "此前失败及修正后的本地日志均保留在 artifactRoot。",
+    "cargo fmt --all --check 与 git diff --check 通过。"
+  ],
+  "realRuntimeGate": {
+    "status": "not_run",
+    "cases": "DEMO-101–112",
+    "reason": "本任务未提供固定 Judge 配置；自动化 Core/Adapter 验证不等同于各真实 Runtime 升级实测。"
+  },
+  "implementationRevision": 1,
+  "followUp": {
+    "revision": 2,
+    "confirmationMessageId": "728a1602-fe39-4a19-b835-2344b1676f77",
+    "baseline": "61972e170e9212a57202a896c1b3448bea5eac67",
+    "artifactRoot": "/Users/murray.xue/.rovai/instances/v1-ea1b0333b2d3194639a0b5a284275214dc868bf6ebe8bea219653f7c2cd7a4b3/attachments/rvcamp_01m4e3fxdef9ra3cpfasa8gaxk/message-senders-simplification-20261014",
+    "checks": [
+      {
+        "name": "Rust workspace",
+        "command": "cargo test --workspace",
+        "status": "passed",
+        "passed": 471,
+        "ignoredOrSkipped": 1,
+        "log": "rovai-senders-r2-workspace.log",
+        "sha256": "ef3d872c30949443a6c8603f7f604ae5b764e3d4c95b62634423de1c5584b1d3"
+      },
+      {
+        "name": "Context materialization and cache",
+        "command": "cargo test -p rovai-core --features slow-tests --lib context::",
+        "status": "passed",
+        "passed": 53,
+        "ignoredOrSkipped": 0,
+        "log": "rovai-senders-r2-context.log",
+        "sha256": "824487fd90dfc70e238c44f1bb6992ee7ffbc27d709776bf028d1d7649cc6093"
+      },
+      {
+        "name": "FIFO and claim",
+        "command": "cargo test -p rovai-core --features slow-tests --lib delivery_queue::tests::",
+        "status": "passed",
+        "passed": 26,
+        "ignoredOrSkipped": 0,
+        "log": "rovai-senders-r2-delivery.log",
+        "sha256": "74a4dbcf7a8c3a701df5f11f59c684c1d07a0e8c16a037e3b4534471750ce4ba"
+      },
+      {
+        "name": "History",
+        "command": "cargo test -p rovai-core --features slow-tests --lib camp_history::slow_tests::",
+        "status": "passed",
+        "passed": 7,
+        "ignoredOrSkipped": 0,
+        "log": "rovai-senders-r2-history.log",
+        "sha256": "4328bb8429d77a3e8fc4d8c7918ba1e32bdf7513e145992ad29b7b1345bb70c6"
+      },
+      {
+        "name": "Tool output replay",
+        "command": "cargo test -p rovai-core --features slow-tests --lib builtin_tool_cli_output::tests::",
+        "status": "passed",
+        "passed": 8,
+        "ignoredOrSkipped": 0,
+        "log": "rovai-senders-r2-output.log",
+        "sha256": "74e74be4e97ba793f3c81a55f9065a7b9561cdc85fecda4d369f2dbec0d0966f"
+      },
+      {
+        "name": "Document tests",
+        "command": "pnpm docs:test",
+        "status": "passed",
+        "passed": 10,
+        "ignoredOrSkipped": 0,
+        "log": "rovai-senders-r2-doc-tests.log",
+        "sha256": "3f9d71a394e6fac8e6c7896244807263ddef8dcf37fc16a6e3f37ac32f46a5e5"
+      },
+      {
+        "name": "Document governance",
+        "command": "DOCS_BASE_REF=41c8ca19238de8465c23ff0c030f5c7620dd2c02 pnpm docs:check:ci",
+        "status": "passed",
+        "passed": null,
+        "ignoredOrSkipped": 0,
+        "log": "rovai-senders-r2-doc-check-final.log",
+        "sha256": "289f24954390438e26234c6b9092b70b7ec154146c0618bf1fb8f8c439b5a554"
+      }
+    ],
+    "notes": [
+      "删除非 batch 领取时的专用名称冻结、快照读写和恢复分支；按需解析实际消息中的 Agent 名称并复用同批查询。",
+      "已有完整输入、预算、上下文及工具回执保存和回放保持；字段、合同版本、Migration、Session/Binding 兼容参数未改。",
+      "Context 专项包含原 serializer 的当前名称、缺失名称与请求内缓存矩阵；单聊 owner 验证领取不创建名称快照，组包取新名称，保存后改名回放字节/摘要不变。",
+      "专项数量与默认 Rust 有重叠；cargo fmt --all --check 与 git diff --check 通过。",
+      "本次没有前端变更，R1 TypeScript/Vitest/Node 证据保留；完整真实 Runtime Gate 未运行。"
+    ]
+  }
+}

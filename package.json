@@ -1,0 +1,390 @@
+{
+  "name": "rovai-ai",
+  "productName": "Rovai AI",
+  "version": "0.5.1",
+  "private": true,
+  "type": "module",
+  "description": "A desktop workspace for long-lived agent teams, shared Threads, visible execution, and collaborative memory.",
+  "author": "murray17",
+  "license": "MIT",
+  "packageManager": "pnpm@11.20.0",
+  "main": "out/main/index.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "docs:check:version": "node scripts/check-doc-version.mjs",
+    "docs:check:decisions": "node scripts/check-doc-decisions.mjs",
+    "docs:check:ci": "node scripts/check-doc-version.mjs && node scripts/check-doc-decisions.mjs --require-base",
+    "docs:test": "node --test scripts/lib/doc-decisions.test.mjs",
+    "docs:check": "pnpm docs:check:version && pnpm docs:check:decisions",
+    "skills:check": "node scripts/check-skills.mjs",
+    "skills:test": "node --test scripts/lib/skill-authoring.test.mjs",
+    "core:build": "node scripts/build-core.mjs --release",
+    "core:build:debug": "node scripts/build-core.mjs",
+    "core:build:macos:arm64": "node scripts/build-core.mjs --release --target-key macos-arm64",
+    "core:build:macos:x64": "node scripts/build-core.mjs --release --target-key macos-x64",
+    "core:build:windows:x64": "node scripts/build-core.mjs --release --target-key windows-x64",
+    "check:rust": "cargo check --workspace --all-targets",
+    "test:rust:lib": "cargo test -p rovai-core --lib",
+    "test:rust:cli": "cargo test -p rovai-core --bin rovai",
+    "test:send-input-file": "cargo build -p rovai-core --bin rovai && node --test scripts/lib/send-file-input.test.mjs",
+    "test:rust:core": "cargo test -p rovai-core --lib",
+    "test:rust:workspace-default": "cargo test --workspace",
+    "test:rust:extended": "cargo test --workspace --features extended-tests",
+    "test:rust:slow": "cargo test -p rovai-core --features slow-tests --lib slow_tests::",
+    "test:rust:pr": "cargo test --workspace",
+    "test:rust:full": "cargo test --workspace --all-features",
+    "test:rust:staged": "node scripts/check-rust-staged.mjs",
+    "dev": "pnpm build:execution-web && pnpm core:build:debug && node scripts/dev-desktop.mjs",
+    "build:execution-web": "node scripts/build-execution-web.mjs",
+    "build:desktop": "node scripts/check-release-source.mjs && pnpm build:web && pnpm build:execution-web && electron-vite build",
+    "build": "pnpm core:build && pnpm build:desktop",
+    "build:macos:arm64": "pnpm core:build:macos:arm64 && pnpm build:desktop",
+    "build:macos:x64": "pnpm core:build:macos:x64 && pnpm build:desktop",
+    "build:windows:x64": "pnpm core:build:windows:x64 && pnpm build:desktop",
+    "typecheck": "tsc --noEmit",
+    "test:electron-sandbox-capability": "node --test scripts/lib/electron-sandbox-capability.test.mjs",
+    "test:desktop-bridge": "node --test scripts/lib/rovai-request-context-bridge.test.mjs",
+    "test:window-close": "node --test scripts/lib/window-close-guard.test.mjs",
+    "test:windows-close": "node --test scripts/lib/windows-window-close.test.mjs",
+    "test:feishu-login": "node --test scripts/lib/feishu-login-integration.test.mjs",
+    "test:dingtalk-login": "node --test scripts/lib/dingtalk-login-presentation.test.mjs",
+    "test:message-quotes": "node --test scripts/lib/message-quotes.test.mjs",
+    "test:message-anchors": "node --test scripts/lib/message-anchors.test.mjs",
+    "test:composer-input": "node --test --test-concurrency=1 scripts/lib/structured-mention-composer.test.mjs scripts/lib/composer-invitations.test.mjs",
+    "test:message-reedit-ui": "tsc --noEmit -p scripts/fixtures/message-reedit/tsconfig.json && node --test scripts/lib/message-reedit-ui.test.mjs",
+    "test:startup-presentation": "node --test scripts/lib/desktop-startup-presentation.test.mjs",
+    "test:shortcut-settings": "tsc --noEmit -p scripts/fixtures/shortcut-settings/tsconfig.json && node --test scripts/lib/shortcut-settings.test.mjs",
+    "test:navigation-shell": "node --test scripts/lib/navigation-shell.test.mjs",
+    "test:camp-fast-layout": "node --test scripts/lib/camp-fast-layout.test.mjs",
+    "test:execution-metrics-ui": "node --test scripts/lib/execution-metrics-ui.test.mjs",
+    "test:command-view": "node --test scripts/lib/command-view.test.mjs",
+    "test:channel-camp-naming": "node --test scripts/lib/channel-camp-naming.test.mjs",
+    "test:camp-open-projection": "node --test scripts/lib/camp-open-projection.test.mjs",
+    "test:single-chat-pending": "node --test --test-name-pattern='Single Chat pending withdrawal' scripts/lib/single-chat-panel.test.mjs",
+    "review:attachments": "node scripts/review-attachment-presentation.mjs",
+    "test:execution-avatar-rail": "node --test --test-concurrency=1 scripts/lib/execution-avatar-rail.test.mjs scripts/lib/execution-state-transition.test.mjs",
+    "test:notification-attention": "node --test scripts/lib/notification-attention.test.mjs",
+    "test:settings-workspace": "node --test scripts/lib/settings-workspace.test.mjs",
+    "test:release-notes-ui": "node --test scripts/lib/release-notes-localization-ui.test.mjs",
+    "test:capability-workspace": "node --test scripts/lib/capability-workspace.test.mjs",
+    "test:approval-dock": "node --test scripts/lib/approval-dock.test.mjs",
+    "test:html-preview": "node --test scripts/lib/html-preview-site.test.mjs scripts/lib/html-preview-browser.test.mjs",
+    "test:automation-splitter": "node --test scripts/lib/automation-splitter.test.mjs",
+    "test:file-preview-layout": "node --test scripts/lib/file-preview-layout.test.mjs",
+    "test:file-reference-navigation": "node --test scripts/lib/file-reference-navigation.test.mjs",
+    "test:runtime-model-picker": "node --test scripts/lib/runtime-model-picker.test.mjs",
+    "test:desktop:integration": "pnpm test:desktop-bridge && pnpm test:window-close && pnpm test:windows-close && pnpm test:composer-input && pnpm test:startup-presentation && pnpm test:navigation-shell && pnpm test:shortcut-settings && pnpm test:file-preview-layout && pnpm test:automation-splitter && pnpm test:html-preview && pnpm test:file-reference-navigation && pnpm test:camp-fast-layout && pnpm test:camp-open-projection && pnpm test:single-chat-pending && pnpm test:execution-avatar-rail && pnpm test:approval-dock && pnpm test:notification-attention && pnpm test:capability-workspace && pnpm test:settings-workspace && pnpm test:release-notes-ui && pnpm test:runtime-model-picker && pnpm test:mission-board && pnpm test:message-anchors && pnpm test:member-runtime-apply && pnpm test:run-presence-ui",
+    "test:zcode-owner": "node --test scripts/test-zcode-owner.mjs",
+    "smoke:zcode-background": "node scripts/smoke-zcode-background.mjs",
+    "test:core-startup": "cargo build -p rovai-core --bins && node --test scripts/lib/core-startup-availability.test.mjs",
+    "test:host-startup": "cargo build -p rovai-host && node --test scripts/lib/host-lifecycle.test.mjs",
+    "test": "pnpm docs:test && pnpm docs:check && pnpm skills:test && pnpm skills:check && pnpm test:electron-sandbox-capability && vitest run && node --test scripts/lib/collapsible-splitter.test.mjs scripts/lib/steer-race-outcome.test.mjs scripts/test-zcode-owner.mjs scripts/lib/dsh-host.test.mjs scripts/lib/command-code-bootstrap.test.mjs scripts/lib/cline-observer.test.mjs scripts/lib/check-rust-staged.test.mjs scripts/lib/create-configured-camp.test.mjs scripts/lib/copilot-native-turn-reconciliation-evidence.test.mjs scripts/lib/native-resume-probe-history.test.mjs scripts/lib/dev-desktop.test.mjs scripts/lib/install-macos-daily.test.mjs scripts/lib/macos-app-verification.test.mjs scripts/lib/macos-signing-policy.test.mjs scripts/lib/macos-update-info.test.mjs scripts/lib/release-notes.test.mjs scripts/lib/release-notes-localization.test.mjs scripts/lib/missing-send-recovery-protocol.test.mjs scripts/lib/planned-shutdown-app-quit.test.mjs scripts/lib/sidecar-targets.test.mjs scripts/lib/windows-installer-shutdown.test.mjs scripts/lib/qualification-acceptance-v034.test.mjs scripts/lib/qualification-acceptance-v036.test.mjs scripts/lib/qualification-artifacts.test.mjs scripts/lib/qualification-bundle.test.mjs scripts/lib/qualification-case-v3.test.mjs scripts/lib/qualification-collaboration.test.mjs scripts/lib/qualification-collaboration-ledger.test.mjs scripts/lib/qualification-core.test.mjs scripts/lib/qualification-demo-cases.test.mjs scripts/lib/qualification-diagnostic-portfolio.test.mjs scripts/lib/qualification-evaluation.test.mjs scripts/lib/qualification-evidence-index.test.mjs scripts/lib/qualification-isolation.test.mjs scripts/lib/qualification-judge-views.test.mjs scripts/lib/qualification-observation.test.mjs scripts/lib/qualification-public-report.test.mjs scripts/lib/qualification-recovery.test.mjs scripts/lib/qualification-schema-validation.test.mjs scripts/lib/qualification-semantic-evidence.test.mjs scripts/lib/qualification-semantic-judge.test.mjs scripts/lib/qualification-tool-evidence.test.mjs scripts/lib/qualification-tool-ledger.test.mjs scripts/lib/qualification-tool-use-judge.test.mjs scripts/lib/qualification-workspace-mutation-ledger.test.mjs scripts/lib/tool-interaction-measurement/index.test.mjs scripts/lib/qualification-tool-measurement-spec.test.mjs scripts/benchmark-paired-collaboration.test.mjs scripts/benchmark/*.test.mjs scripts/benchmark/**/*.test.mjs scripts/lib/context-evaluation.test.mjs scripts/lib/context-quality.test.mjs scripts/lib/context-weekly.test.mjs scripts/lib/qualification-api-judge-adapter.test.mjs scripts/lib/qualification-cli-judge-adapter.test.mjs scripts/lib/qualification-claim-audit.test.mjs scripts/lib/qualification-native-witness.test.mjs scripts/lib/qualification-resource-usage.test.mjs scripts/lib/qualification-evaluation-context.test.mjs",
+    "smoke:core": "pnpm core:build:debug && node scripts/smoke-core.mjs",
+    "smoke:member-config": "pnpm core:build:debug && node scripts/smoke-member-config.mjs",
+    "smoke:intake": "pnpm core:build:debug && node scripts/smoke-intake.mjs",
+    "smoke:acp-runtime": "pnpm core:build:debug && node scripts/smoke-acp-runtime.mjs",
+    "smoke:trae-cold-resume": "pnpm core:build:debug && node scripts/smoke-trae-cold-resume.mjs",
+    "smoke:pi-runtime": "pnpm core:build:debug && node scripts/smoke-pi-runtime.mjs",
+    "smoke:grok-cold-resume": "pnpm core:build:debug && ROVAI_COLD_RESUME_ADAPTER=grok-build node scripts/smoke-trae-cold-resume.mjs",
+    "smoke:claude-runtime": "pnpm core:build:debug && node scripts/smoke-claude-runtime.mjs",
+    "smoke:grok-runtime": "node scripts/probe-grok-runtime.mjs",
+    "smoke:antigravity-runtime": "pnpm core:build:debug && node scripts/smoke-antigravity-runtime.mjs",
+    "smoke:builtin-cli": "pnpm core:build:debug && node scripts/smoke-builtin-cli.mjs",
+    "qualification:demo:check": "node scripts/qualification-demo-cases.mjs check",
+    "qualification:case": "node scripts/qualification-case.mjs",
+    "qualification:run": "node scripts/qualification-runner.mjs",
+    "qualification:evaluate": "node scripts/qualification-evaluate.mjs",
+    "qualification:judge": "node scripts/qualification-semantic-review.mjs",
+    "qualification:tool-measurement-pack": "node scripts/qualification-tool-measurement-pack.mjs",
+    "qualification:tool-use-judge": "node scripts/qualification-tool-use-review.mjs",
+    "qualification:bundle:verify": "node scripts/qualification-verify-bundle.mjs",
+    "qualification:portfolio": "node scripts/qualification-diagnostic-portfolio.mjs",
+    "qualification:acceptance:v0.34": "node scripts/qualification-acceptance-v034.mjs",
+    "qualification:acceptance:v0.36": "node scripts/qualification-acceptance-v036.mjs",
+    "qualification:suite": "node scripts/qualification-suite.mjs",
+    "qualification:project": "node scripts/project-qualification-benchmark.mjs",
+    "benchmark:validate": "node scripts/benchmark-validate.mjs",
+    "benchmark:run:contract": "node scripts/benchmark-current-contract.mjs",
+    "benchmark:compare": "node scripts/benchmark-compare.mjs",
+    "benchmark:paired": "node scripts/benchmark-paired-collaboration.mjs",
+    "benchmark:project": "node scripts/benchmark-project.mjs",
+    "benchmark:check": "node --test scripts/benchmark/*.test.mjs scripts/benchmark/**/*.test.mjs",
+    "smoke:action-approval": "pnpm core:build:debug && node scripts/smoke-action-approval.mjs",
+    "smoke:runtime-permissions": "pnpm smoke:action-approval && pnpm smoke:multi-agent",
+    "accept:v0.16": "cargo test -p rovai-core db::tests::v27_freezes_active_runs_on_legacy_semantics_and_keeps_terminal_history && cargo test -p rovai-core team_tool::tests::call_member_persists_one_input_before_materializing_one_run && cargo test -p rovai-core action::tests::restart_fails_closed_intercepted_approvals_and_authorization_deliveries && pnpm test && pnpm smoke:runtime-permissions && pnpm smoke:acp-runtime",
+    "accept:v0.17": "cargo test -p rovai-core db::tests::v28_adds_execution_evidence_and_structured_camp_presentations && cargo test -p rovai-core execution_evidence::tests::provider_packets_are_reduced_to_public_evidence_fields && cargo test -p rovai-core execution_evidence::tests::evidence_is_durable_blob_backed_agent_inaccessible_and_cancel_fenced && cargo test -p rovai-core runtime::tests::camp_turn_cancellation_is_persisted_and_finalized_from_authoritative_state && cargo test -p rovai-core team_tool::tests::recipient_completion_without_another_call_never_contacts_the_source && cargo test -p rovai-core --lib application::tests::acp_tool_events_expose_digests_not_raw_payloads && pnpm typecheck && pnpm test",
+    "smoke:multi-agent": "pnpm core:build:debug && node scripts/smoke-multi-agent.mjs",
+    "smoke:attachments": "pnpm core:build:debug && node scripts/smoke-camp-attachments.mjs",
+    "smoke:skills": "pnpm core:build:debug && node scripts/smoke-skills.mjs",
+    "smoke:mcp": "node scripts/smoke-mcp.mjs",
+    "smoke:mcp-projection": "pnpm core:build:debug && node scripts/smoke-mcp-projection.mjs",
+    "smoke:memory": "pnpm core:build:debug && node scripts/smoke-memory.mjs",
+    "smoke:memory-runtime": "pnpm core:build:debug && node scripts/smoke-memory-runtime.mjs",
+    "diagnose:memory-camp": "pnpm core:build:debug && node scripts/diagnose-memory-camp-matrix.mjs",
+    "test:memory-web-ui": "node --test scripts/lib/memory-web-ui.test.mjs",
+    "test:memory-workspace-ui": "node --test scripts/lib/memory-workspace.test.mjs",
+    "accept:memory-ui": "node scripts/accept-memory-ui.mjs",
+    "accept:member-avatar-ui": "node scripts/accept-member-avatar-ui.mjs",
+    "accept:member-lifecycle-ui": "node scripts/accept-member-lifecycle-ui.mjs",
+    "accept:notification-ui": "node scripts/accept-notification-ui.mjs",
+    "accept:sidebar-ui": "node scripts/accept-sidebar-ui.mjs",
+    "accept:conversation-find-ui": "node scripts/accept-conversation-find-ui.mjs",
+    "accept:composer-skill-picker-ui": "node scripts/accept-structured-mentions-ui.mjs --skill-picker-only",
+    "accept:composer-skill-context": "node scripts/accept-structured-mentions-ui.mjs --skill-context-smoke",
+    "accept:structured-mentions-ui": "node scripts/accept-structured-mentions-ui.mjs",
+    "accept:task-card-ui": "node scripts/accept-task-card-ui.mjs",
+    "accept:runtime-activity-ui": "node scripts/accept-runtime-activity-ui.mjs",
+    "accept:world-map-ui": "ROVAI_RUNTIME_ACTIVITY_ACCEPT_WORLD_MAP_ONLY=1 node scripts/accept-runtime-activity-ui.mjs",
+    "accept:conversation-drop-zone-ui": "ROVAI_RUNTIME_ACTIVITY_ACCEPT_DROP_ZONE_ONLY=1 node scripts/accept-runtime-activity-ui.mjs",
+    "accept:planned-shutdown": "node scripts/accept-planned-shutdown.mjs",
+    "accept:network-recovery": "pnpm core:build:debug && node scripts/accept-network-interruption-recovery.mjs",
+    "accept:windows:installer-shutdown": "node scripts/accept-windows-installer-shutdown.mjs",
+    "accept:windows:installer": "node scripts/accept-windows-installation.mjs",
+    "accept:diagnostics-ui": "node scripts/accept-diagnostics-ui.mjs",
+    "accept:app-updates-ui": "node scripts/accept-app-updates-ui.mjs",
+    "accept:runtime-monitoring-ui": "node scripts/accept-runtime-monitoring-ui.mjs",
+    "accept:onboarding-ui": "node scripts/accept-onboarding-ui.mjs",
+    "accept:bootstrap-shell-ui": "node scripts/accept-bootstrap-shell-ui.mjs",
+    "smoke:recovery": "pnpm core:build:debug && node scripts/smoke-recovery.mjs",
+    "smoke:missing-send-recovery": "pnpm core:build:debug && node scripts/smoke-missing-send-recovery.mjs",
+    "experiment:p1:copilot-native-turn": "node scripts/experiment-copilot-native-turn-reconciliation.mjs",
+    "test:p1:copilot-native-turn-evidence": "node --test scripts/lib/copilot-native-turn-reconciliation-evidence.test.mjs",
+    "package:mac:unsigned": "pnpm build:macos:arm64 && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --arm64 -c.mac.identity=-",
+    "package:mac": "pnpm build:macos:arm64 && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --arm64 -c.mac.identity=-",
+    "package:mac:daily": "pnpm build:macos:arm64 && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --arm64 --publish never -c.mac.identity=- && node scripts/verify-macos-app.mjs arm64",
+    "install:mac:daily": "node scripts/install-macos-daily.mjs",
+    "dist:mac": "pnpm build:macos:arm64 && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --arm64 --publish never -c.mac.identity=-",
+    "dist:mac:release:arm64": "pnpm build:macos:arm64 && electron-builder --mac dmg zip --arm64 --publish never -c.forceCodeSigning=true -c.mac.notarize=true",
+    "dist:mac:release:x64": "pnpm build:macos:x64 && electron-builder --mac dmg zip --x64 --publish never -c.forceCodeSigning=true -c.mac.notarize=true",
+    "package:windows:x64": "pnpm build:windows:x64 && node scripts/package-windows.mjs dir && node scripts/verify-windows-release.mjs --unpacked-only",
+    "dist:windows:x64": "pnpm build:windows:x64 && node scripts/package-windows.mjs nsis && node scripts/verify-windows-release.mjs",
+    "dist:windows:release:x64": "pnpm build:windows:x64 && node scripts/package-windows.mjs nsis && node scripts/verify-windows-release.mjs --require-signed",
+    "verify:windows": "node scripts/verify-windows-release.mjs",
+    "eval:daily": "node scripts/eval-daily.mjs",
+    "eval:gate": "node scripts/eval-gate.mjs",
+    "build:web": "vite build --config web.vite.config.ts",
+    "build:server": "node scripts/build-server.mjs",
+    "test:server-entry": "cargo build -p rovai-host && node --test scripts/lib/server-entry.test.mjs scripts/lib/server-install.test.mjs",
+    "test:host-web": "node --test scripts/lib/host-web.test.mjs scripts/lib/host-web-channels.test.mjs scripts/lib/host-web-sessions.test.mjs",
+    "test:host-web-html": "node --test scripts/lib/host-web-html.test.mjs",
+    "test:host-web-live": "node --test scripts/lib/host-web-live.test.mjs",
+    "smoke:host-web-runtime": "node scripts/smoke-host-web-runtime.mjs",
+    "review:host-web-parity": "node scripts/review-host-web-parity.mjs",
+    "review:remote-connection": "node scripts/review-remote-connection.mjs",
+    "test:remote-connection-review": "tsc --noEmit -p scripts/fixtures/remote-connection/tsconfig.json && node --test scripts/lib/remote-connection-review.test.mjs",
+    "test:run-continuation-ui": "node --test scripts/lib/run-continuation.test.mjs",
+    "test:host-web-parity": "node --test scripts/lib/host-web-parity.test.mjs",
+    "test:host-web-recovery": "node --test scripts/lib/web-connection-recovery.test.mjs",
+    "test:host-web-recovery-live": "node --test scripts/lib/web-connection-recovery-live.test.mjs",
+    "test:host-web-mobile": "node --test scripts/lib/host-web-mobile.test.mjs",
+    "test:member-creation": "node --test scripts/lib/member-creation.test.mjs",
+    "test:member-avatar-flow": "tsc --noEmit -p scripts/fixtures/member-avatar-flow/tsconfig.json && node --test scripts/lib/member-avatar-flow.test.mjs",
+    "test:mission-board": "node --test scripts/lib/mission-board.test.mjs",
+    "test:loom-workspace": "tsc --noEmit -p scripts/fixtures/loom-workspace/tsconfig.json && node --test scripts/lib/loom-workspace.test.mjs",
+    "test:member-runtime-apply": "node --test scripts/lib/member-runtime-apply.test.mjs",
+    "test:run-presence-ui": "node --test --test-concurrency=1 scripts/lib/run-presence.test.mjs scripts/lib/reply-details.test.mjs",
+    "test:markdown-code-copy": "node --test scripts/lib/markdown-code-copy.test.mjs",
+    "test:steer-ui": "node --test scripts/lib/steer-ui.test.mjs"
+  },
+  "dependencies": {
+    "@codemirror/language": "6.12.4",
+    "@codemirror/language-data": "6.5.2",
+    "@codemirror/search": "6.7.2",
+    "@codemirror/state": "6.7.4",
+    "@codemirror/view": "6.43.11",
+    "@larksuiteoapi/node-sdk": "1.73.0",
+    "@lexical/extension": "0.50.0",
+    "@lexical/history": "0.50.0",
+    "@lexical/plain-text": "0.50.0",
+    "@lexical/react": "0.50.0",
+    "@lezer/highlight": "1.2.3",
+    "@noble/hashes": "2.2.0",
+    "@radix-ui/react-dialog": "1.1.19",
+    "@radix-ui/react-dropdown-menu": "2.1.20",
+    "@radix-ui/react-popover": "1.1.23",
+    "@radix-ui/react-tabs": "1.1.17",
+    "@uiw/react-codemirror": "4.25.11",
+    "acorn": "8.15.0",
+    "cron-parser": "5.10.0",
+    "dingtalk-stream": "2.1.6-beta.1",
+    "electron-updater": "6.8.9",
+    "lexical": "0.50.0",
+    "micromark-util-decode-string": "2.0.1",
+    "parse5": "7.3.0",
+    "pinyin-pro": "3.29.5",
+    "qrcode": "1.5.4",
+    "qrcode.react": "4.2.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-markdown": "^10.1.0",
+    "remark-cjk-friendly": "2.3.2",
+    "remark-cjk-friendly-gfm-strikethrough": "2.3.1",
+    "remark-gfm": "^4.0.1",
+    "remark-stringify": "^11.0.0",
+    "style-mod": "4.1.3",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@types/mdast": "^4.0.4",
+    "@types/node": "26.1.1",
+    "@types/qrcode": "1.5.6",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.2.0",
+    "ajv": "8.20.0",
+    "electron": "43.1.1",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "jsqr": "1.4.0",
+    "rcedit": "5.0.2",
+    "remark-parse": "11.0.0",
+    "typescript": "6.0.3",
+    "unified": "11.0.5",
+    "vite": "7.3.6",
+    "vitest": "4.1.10"
+  },
+  "build": {
+    "appId": "ai.rovai.desktop",
+    "productName": "Rovai AI",
+    "asar": true,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "afterPack": "scripts/after-pack.cjs",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "murray17",
+        "repo": "rovai-ai",
+        "releaseType": "release"
+      }
+    ],
+    "releaseInfo": {
+      "releaseNotesFile": "build/release-notes.md"
+    },
+    "mac": {
+      "icon": "build/icon.png",
+      "extraResources": [
+        {
+          "from": "resources/bin/macos-${arch}/rovai-core",
+          "to": "bin/rovai-core"
+        },
+        {
+          "from": "resources/bin/macos-${arch}/rovai-host",
+          "to": "bin/rovai-host"
+        },
+        {
+          "from": "resources/bin/macos-${arch}/rovai",
+          "to": "bin/rovai"
+        },
+        {
+          "from": "out/web",
+          "to": "web-ui"
+        },
+        {
+          "from": "skills",
+          "to": "skills"
+        }
+      ],
+      "binaries": [
+        "Contents/Resources/bin/rovai-core",
+        "Contents/Resources/bin/rovai-host",
+        "Contents/Resources/bin/rovai"
+      ],
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "CFBundleDisplayName": "Rovai AI",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false,
+          "NSAllowsLocalNetworking": true
+        }
+      },
+      "category": "public.app-category.developer-tools",
+      "minimumSystemVersion": "14.0",
+      "target": [
+        "dir",
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "Rovai-AI-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "executableName": "Rovai-ai",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "requestedExecutionLevel": "asInvoker",
+      "signtoolOptions": {
+        "rfc3161TimeStampServer": "http://timestamp.digicert.com"
+      },
+      "extraResources": [
+        {
+          "from": "resources/bin/windows-x64/rovai-core.exe",
+          "to": "bin/rovai-core.exe"
+        },
+        {
+          "from": "resources/bin/windows-x64/rovai-host.exe",
+          "to": "bin/rovai-host.exe"
+        },
+        {
+          "from": "resources/bin/windows-x64/rovai.exe",
+          "to": "bin/rovai.exe"
+        },
+        {
+          "from": "out/web",
+          "to": "web-ui"
+        },
+        {
+          "from": "skills",
+          "to": "skills"
+        }
+      ],
+      "artifactName": "Rovai-AI-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "packElevateHelper": false,
+      "allowToChangeInstallationDirectory": true,
+      "runAfterFinish": false,
+      "deleteAppDataOnUninstall": false,
+      "include": "build/installer.nsh",
+      "warningsAsErrors": true
+    },
+    "dmg": {
+      "title": "Rovai AI ${version}",
+      "window": {
+        "width": 540,
+        "height": 380
+      },
+      "contents": [
+        {
+          "x": 150,
+          "y": 190
+        },
+        {
+          "x": 390,
+          "y": 190,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,1403 @@
+use anyhow::{Result, ensure};
+use serde_json::{Map, Value, json};
+
+use crate::{
+    automation::{
+        AUTOMATION_CLOSE_TOOL_NAME, AUTOMATION_CREATE_TOOL_NAME, AUTOMATION_DELETE_TOOL_NAME,
+        AUTOMATION_GET_TOOL_NAME, AUTOMATION_LIST_TOOL_NAME, AUTOMATION_RUN_TOOL_NAME,
+        AUTOMATION_UPDATE_TOOL_NAME,
+    },
+    camp_history::{
+        CAMP_LIST_TOOL_NAME, CAMP_READ_TOOL_NAME, CAMP_SEARCH_TOOL_NAME, HISTORY_SEARCH_TOOL_NAME,
+    },
+    command::canonical_json_digest,
+    member_studio::MEMBER_CREATE_TOOL_NAME,
+    member_tool::{MEMBER_GET_TOOL_NAME, MEMBER_LIST_TOOL_NAME, MEMBER_UPDATE_TOOL_NAME},
+    memory_retrieval::{MEMORY_READ_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME, MEMORY_VIEW_TOOL_NAME},
+    memory_tool::MEMORY_WRITE_TOOL_NAME,
+    message_delivery::CAMP_MESSAGE_SEND_TOOL_NAME,
+    single_chat::SINGLE_CHAT_HISTORY_TOOL_NAME,
+    team_tool::{
+        TEAM_CREATE_TASK_TOOL_NAME, TEAM_GET_TASK_TOOL_NAME, TEAM_LIST_TASKS_TOOL_NAME,
+        TEAM_UPDATE_TASK_TOOL_NAME,
+    },
+};
+
+pub const BUILTIN_TOOL_EVIDENCE_PROJECTION_SCHEMA_VERSION: i64 = 4;
+
+const SEMANTIC_TEXT_LIMIT_CHARS: usize = 512;
+const IDENTIFIER_LIMIT_CHARS: usize = 256;
+const STRING_ARRAY_LIMIT: usize = 32;
+const RESULT_ITEM_LIMIT: usize = 64;
+const MEMORY_SEMANTIC_BODY_LIMIT_CHARS: usize = 2_048;
+const MEMORY_VIEW_SEMANTIC_ITEM_LIMIT: usize = 8;
+
+/// Builds the only operation-specific Built-in Tool projection admitted to
+/// Execution Evidence. The interface deliberately accepts the already-computed
+/// raw digests and verifies them before projecting. This keeps the projection
+/// useful for measurement without making it a second raw payload authority.
+pub fn project_builtin_tool_invocation(
+    operation: &str,
+    raw_input: &Value,
+    raw_result: Option<&Value>,
+    raw_input_digest: &str,
+    raw_result_digest: Option<&str>,
+) -> Result<Value> {
+    ensure!(
+        canonical_json_digest(raw_input)? == raw_input_digest,
+        "Built-in Tool Evidence input digest mismatch"
+    );
+    match (raw_result, raw_result_digest) {
+        (Some(result), Some(expected)) => ensure!(
+            canonical_json_digest(result)? == expected,
+            "Built-in Tool Evidence result digest mismatch"
+        ),
+        (None, None) => {}
+        _ => anyhow::bail!("Built-in Tool Evidence result and digest presence mismatch"),
+    }
+
+    let operation = crate::thread_compat::canonical_operation(operation);
+    let input = crate::thread_compat::normalize_builtin_input(operation, raw_input.clone())?;
+    let mut result = raw_result.cloned();
+    if let Some(result) = result.as_mut() {
+        crate::thread_compat::project_builtin_result(operation, result)?;
+    }
+    let raw_result = result.as_ref();
+    let canonical_input = project_input(operation, &input)?;
+    let canonical_result = raw_result
+        .map(|result| project_result(operation, result))
+        .transpose()?;
+    let mut projection = json!({
+        "schemaVersion": BUILTIN_TOOL_EVIDENCE_PROJECTION_SCHEMA_VERSION,
+        "operation": operation,
+        "canonicalInput": canonical_input,
+        "canonicalResult": canonical_result,
+        "digestBinding": {
+            "input": {
+                "evidenceField": "rawInputDigest",
+                "digest": raw_input_digest,
+            },
+            "result": raw_result_digest.map(|digest| json!({
+                "evidenceField": "rawOutputDigest",
+                "digest": digest,
+            })),
+        },
+        "inputDigest": raw_input_digest,
+        "resultDigest": raw_result_digest,
+    });
+    let projection_digest = canonical_json_digest(&projection)?;
+    projection["projectionDigest"] = json!(projection_digest);
+    Ok(projection)
+}
+
+fn project_input(operation: &str, input: &Value) -> Result<Value> {
+    let mut projected = Map::new();
+    match operation {
+        "thread.runs" => {
+            for field in ["threadId", "agentId"] {
+                insert_identifier(&mut projected, field, input.get(field));
+            }
+            insert_bool(&mut projected, "active", input.get("active"));
+            insert_enum(&mut projected, "status", input.get("status"));
+            insert_i64(&mut projected, "limit", input.get("limit"));
+            insert_opaque_cursor(&mut projected, input.get("cursor"));
+        }
+        "mission.list" => {
+            insert_query(&mut projected, input.get("query"));
+            insert_enum(&mut projected, "status", input.get("status"));
+            insert_i64(&mut projected, "limit", input.get("limit"));
+            insert_opaque_cursor(&mut projected, input.get("cursor"));
+        }
+        "mission.get" => {
+            insert_identifier(&mut projected, "missionId", input.get("missionId"));
+        }
+        "mission.update" => {
+            insert_semantic_text(&mut projected, "title", input.get("title"));
+            insert_semantic_text(&mut projected, "description", input.get("description"));
+        }
+        "mission.status" => {
+            insert_identifier(&mut projected, "status", input.get("status"));
+            insert_identifier(
+                &mut projected,
+                "sourceMessageId",
+                input.get("sourceMessageId"),
+            );
+        }
+        CAMP_MESSAGE_SEND_TOOL_NAME => {
+            insert_string_array(&mut projected, "recipientAgentIds", input.get("to"));
+            insert_bool(
+                &mut projected,
+                "mentionsCurrentUser",
+                input.get("mentionUser"),
+            );
+            insert_identifier(&mut projected, "taskId", input.get("taskId"));
+            insert_content_facts(&mut projected, input.get("body"));
+        }
+        MEMBER_LIST_TOOL_NAME => {}
+        MEMBER_GET_TOOL_NAME | MEMBER_UPDATE_TOOL_NAME => {
+            insert_identifier(&mut projected, "agentId", input.get("agentId"));
+            insert_i64(
+                &mut projected,
+                "expectedVersion",
+                input.get("expectedVersion"),
+            );
+            if operation == MEMBER_UPDATE_TOOL_NAME {
+                projected.insert(
+                    "changedFields".into(),
+                    json!(
+                        input
+                            .as_object()
+                            .map(|input| input
+                                .keys()
+                                .filter(|key| !matches!(
+                                    key.as_str(),
+                                    "agentId" | "requestId" | "expectedVersion"
+                                ))
+                                .collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    ),
+                );
+            }
+        }
+        MEMBER_CREATE_TOOL_NAME => {
+            insert_identifier(&mut projected, "creationKey", input.get("creationKey"));
+            insert_semantic_text(&mut projected, "displayName", input.get("displayName"));
+            insert_semantic_text(&mut projected, "teamRole", input.get("teamRole"));
+            insert_semantic_text(
+                &mut projected,
+                "professionalResponsibilities",
+                input.get("professionalResponsibilities"),
+            );
+            insert_bounded_semantic_array(
+                &mut projected,
+                "personalityTraits",
+                input.get("personalityTraits"),
+                80,
+            );
+            insert_semantic_text(
+                &mut projected,
+                "workingPrinciples",
+                input.get("workingPrinciples"),
+            );
+            insert_semantic_text(&mut projected, "growthTopic", input.get("growthTopic"));
+            projected.insert(
+                "avatarFilePresent".to_string(),
+                json!(input.get("avatarFile").and_then(Value::as_str).is_some()),
+            );
+        }
+        TEAM_CREATE_TASK_TOOL_NAME => {
+            insert_semantic_text(&mut projected, "title", input.get("title"));
+            insert_semantic_text(&mut projected, "description", input.get("description"));
+            insert_identifier(
+                &mut projected,
+                "assigneeAgentId",
+                input.get("assigneeAgentId"),
+            );
+        }
+        TEAM_GET_TASK_TOOL_NAME => {
+            insert_identifier(&mut projected, "taskId", input.get("taskId"));
+        }
+        TEAM_UPDATE_TASK_TOOL_NAME => {
+            insert_identifier(&mut projected, "taskId", input.get("taskId"));
+            insert_enum(&mut projected, "requestedStatus", input.get("status"));
+            insert_identifier(
+                &mut projected,
+                "assigneeAgentId",
+                input.get("assigneeAgentId"),
+            );
+            insert_bool(&mut projected, "clearAssignee", input.get("clearAssignee"));
+            let changed_fields = [
+                "title",
+                "description",
+                "status",
+                "assigneeAgentId",
+                "clearAssignee",
+                "blockedReason",
+                "completionSummary",
+                "cancelReason",
+            ]
+            .into_iter()
+            .filter(|field| input.get(*field).is_some())
+            .collect::<Vec<_>>();
+            projected.insert("changedFields".to_string(), json!(changed_fields));
+            for field in [
+                "title",
+                "description",
+                "blockedReason",
+                "completionSummary",
+                "cancelReason",
+            ] {
+                insert_semantic_text(&mut projected, field, input.get(field));
+            }
+        }
+        TEAM_LIST_TASKS_TOOL_NAME => {
+            insert_string_array(&mut projected, "statuses", input.get("statuses"));
+            insert_identifier(
+                &mut projected,
+                "assigneeAgentId",
+                input.get("assigneeAgentId"),
+            );
+            insert_bool(
+                &mut projected,
+                "unassignedOnly",
+                input.get("unassignedOnly"),
+            );
+            insert_i64(&mut projected, "limit", input.get("limit"));
+            insert_opaque_cursor(&mut projected, input.get("cursor"));
+        }
+        CAMP_LIST_TOOL_NAME => {
+            insert_query(&mut projected, input.get("query"));
+            insert_i64(&mut projected, "limit", input.get("limit"));
+        }
+        CAMP_SEARCH_TOOL_NAME | MEMORY_SEARCH_TOOL_NAME => {
+            insert_query(&mut projected, input.get("query"));
+            insert_i64(&mut projected, "limit", input.get("limit"));
+        }
+        HISTORY_SEARCH_TOOL_NAME => {
+            insert_query(&mut projected, input.get("query"));
+            insert_string_array(&mut projected, "threadIds", input.get("threadIds"));
+            insert_bounded_string(&mut projected, "dateFrom", input.get("dateFrom"), 64);
+            insert_bounded_string(&mut projected, "dateTo", input.get("dateTo"), 64);
+            insert_i64(&mut projected, "limit", input.get("limit"));
+        }
+        CAMP_READ_TOOL_NAME => {
+            insert_identifier(&mut projected, "threadId", input.get("threadId"));
+            insert_enum(&mut projected, "mode", input.get("mode"));
+            insert_identifier(&mut projected, "messageId", input.get("messageId"));
+            insert_enum(&mut projected, "direction", input.get("direction"));
+            for field in ["cursor", "limit", "before", "after"] {
+                insert_i64(&mut projected, field, input.get(field));
+            }
+        }
+        SINGLE_CHAT_HISTORY_TOOL_NAME => {
+            insert_i64(
+                &mut projected,
+                "beforeSequence",
+                input.get("beforeSequence"),
+            );
+            insert_i64(&mut projected, "limit", input.get("limit"));
+        }
+        MEMORY_READ_TOOL_NAME => {
+            insert_string_array(&mut projected, "memoryIds", input.get("memoryIds"));
+        }
+        MEMORY_VIEW_TOOL_NAME => {
+            insert_enum(&mut projected, "scope", input.get("scope"));
+            insert_identifier(
+                &mut projected,
+                "counterpartyAgentId",
+                input.get("counterpartyAgentId"),
+            );
+        }
+        MEMORY_WRITE_TOOL_NAME => {
+            project_memory_mutation_input(&mut projected, input);
+        }
+        AUTOMATION_LIST_TOOL_NAME => {
+            insert_enum(&mut projected, "status", input.get("status"));
+            insert_query(&mut projected, input.get("query"));
+            insert_bounded_string(&mut projected, "project", input.get("project"), 512);
+            insert_i64(&mut projected, "limit", input.get("limit"));
+            insert_opaque_cursor(&mut projected, input.get("cursor"));
+        }
+        AUTOMATION_GET_TOOL_NAME
+        | AUTOMATION_RUN_TOOL_NAME
+        | AUTOMATION_CLOSE_TOOL_NAME
+        | AUTOMATION_DELETE_TOOL_NAME => {
+            insert_identifier(&mut projected, "automationId", input.get("automationId"));
+            insert_i64(
+                &mut projected,
+                "expectedVersion",
+                input.get("expectedVersion"),
+            );
+        }
+        AUTOMATION_CREATE_TOOL_NAME | AUTOMATION_UPDATE_TOOL_NAME => {
+            insert_identifier(&mut projected, "automationId", input.get("automationId"));
+            insert_i64(
+                &mut projected,
+                "expectedVersion",
+                input.get("expectedVersion"),
+            );
+            insert_semantic_text(&mut projected, "name", input.get("name"));
+            insert_content_facts(&mut projected, input.get("prompt"));
+            insert_bounded_string(&mut projected, "member", input.get("member"), 256);
+            insert_bounded_string(&mut projected, "project", input.get("project"), 512);
+            insert_enum(&mut projected, "repeat", input.get("repeat"));
+            insert_enum(&mut projected, "weekday", input.get("weekday"));
+            insert_bounded_string(&mut projected, "at", input.get("at"), 16);
+            insert_bounded_string(&mut projected, "date", input.get("date"), 32);
+            insert_bounded_string(&mut projected, "cron", input.get("cron"), 128);
+            insert_string_array(&mut projected, "notify", input.get("notify"));
+            insert_bool(&mut projected, "clearNotify", input.get("clearNotify"));
+            insert_bool(&mut projected, "enabled", input.get("enabled"));
+        }
+        _ => anyhow::bail!("unsupported Built-in Tool Evidence operation: {operation}"),
+    }
+    Ok(Value::Object(projected))
+}
+
+fn project_memory_mutation_input(projected: &mut Map<String, Value>, input: &Value) {
+    insert_enum(projected, "action", input.get("action"));
+    insert_enum(projected, "scope", input.get("scope"));
+    insert_enum(projected, "kind", input.get("kind"));
+    if let Some(target) = input.get("target") {
+        projected.insert("target".to_string(), project_memory_target(target));
+    }
+    insert_memory_semantic_body(projected, input.get("body"));
+    insert_bounded_semantic_array(projected, "retrievalKeys", input.get("retrievalKeys"), 64);
+    insert_identifier(
+        projected,
+        "counterpartyAgentId",
+        input.get("counterpartyAgentId"),
+    );
+    insert_enum(projected, "direction", input.get("direction"));
+}
+
+fn project_result(operation: &str, result: &Value) -> Result<Value> {
+    let mut projected = Map::new();
+    match operation {
+        "thread.runs" => {
+            insert_identifier(&mut projected, "threadId", result.get("threadId"));
+            insert_bounded_string(&mut projected, "observedAt", result.get("observedAt"), 64);
+            let items = project_object_array(result.get("items"), |item| {
+                let mut value = Map::new();
+                for field in ["agentRunId", "agentId"] {
+                    if item.get(field).is_some_and(Value::is_null) {
+                        value.insert(field.into(), Value::Null);
+                    } else {
+                        insert_identifier(&mut value, field, item.get(field));
+                    }
+                }
+                insert_enum(&mut value, "status", item.get("status"));
+                if item.get("messageCount").is_some_and(Value::is_null) {
+                    value.insert("messageCount".into(), Value::Null);
+                } else {
+                    insert_i64(&mut value, "messageCount", item.get("messageCount"));
+                }
+                Value::Object(value)
+            });
+            projected.insert("items".into(), Value::Array(items.values));
+            projected.insert("itemCount".into(), json!(items.total));
+            projected.insert("itemsTruncated".into(), json!(items.truncated));
+            insert_bool(&mut projected, "hasMore", result.get("hasMore"));
+        }
+        "mission.list" => {
+            let missions = project_object_array(result.get("missions"), |item| {
+                let mut value = Map::new();
+                insert_identifier(&mut value, "missionId", item.get("missionId"));
+                insert_identifier(&mut value, "threadId", item.get("threadId"));
+                insert_enum(&mut value, "status", item.get("status"));
+                Value::Object(value)
+            });
+            projected.insert("missions".to_string(), Value::Array(missions.values));
+            projected.insert("missionCount".to_string(), json!(missions.total));
+            projected.insert("missionsTruncated".to_string(), json!(missions.truncated));
+            insert_bool(&mut projected, "hasMore", result.get("hasMore"));
+            insert_cursor_facts(&mut projected, result.get("nextCursor"));
+        }
+        "mission.get" => {
+            insert_identifier(&mut projected, "missionId", result.get("missionId"));
+            insert_semantic_text(&mut projected, "title", result.get("title"));
+            insert_semantic_text(&mut projected, "description", result.get("description"));
+            insert_enum(&mut projected, "status", result.get("status"));
+            insert_identifier(
+                &mut projected,
+                "sourceMessageId",
+                result.get("sourceMessageId"),
+            );
+        }
+        "mission.update" | "mission.status" => {
+            insert_identifier(&mut projected, "missionId", result.get("missionId"));
+            insert_bool(&mut projected, "changed", result.get("changed"));
+        }
+        CAMP_MESSAGE_SEND_TOOL_NAME => {
+            insert_enum(&mut projected, "status", result.get("status"));
+            insert_identifier(&mut projected, "messageId", result.get("messageId"));
+            insert_identifier(
+                &mut projected,
+                "anchorMessageId",
+                result.get("anchorMessageId"),
+            );
+            insert_string_array(
+                &mut projected,
+                "effectiveRecipients",
+                result.get("effectiveRecipients"),
+            );
+            insert_string_array(&mut projected, "deliveryIds", result.get("deliveryIds"));
+        }
+        MEMBER_LIST_TOOL_NAME => {
+            insert_identifier(&mut projected, "threadId", result.get("threadId"));
+            projected.insert(
+                "memberCount".into(),
+                json!(result["items"].as_array().map_or(0, Vec::len)),
+            );
+        }
+        MEMBER_GET_TOOL_NAME | MEMBER_UPDATE_TOOL_NAME => {
+            insert_identifier(&mut projected, "agentId", result.get("agentId"));
+            insert_i64(&mut projected, "version", result.get("version"));
+            insert_bool(&mut projected, "changed", result.get("changed"));
+        }
+        MEMBER_CREATE_TOOL_NAME => {
+            insert_identifier(&mut projected, "agentId", result.get("agentId"));
+            insert_i64(&mut projected, "version", result.get("version"));
+            insert_identifier(&mut projected, "avatarRef", result.get("avatarRef"));
+            insert_enum(&mut projected, "avatarStatus", result.get("avatarStatus"));
+        }
+        TEAM_CREATE_TASK_TOOL_NAME | TEAM_GET_TASK_TOOL_NAME | TEAM_UPDATE_TASK_TOOL_NAME => {
+            project_task_result(&mut projected, result);
+        }
+        TEAM_LIST_TASKS_TOOL_NAME => {
+            let tasks = project_object_array(result.get("tasks"), project_task_item);
+            projected.insert("tasks".to_string(), Value::Array(tasks.values));
+            projected.insert("taskCount".to_string(), json!(tasks.total));
+            projected.insert("tasksTruncated".to_string(), json!(tasks.truncated));
+            insert_bool(&mut projected, "truncated", result.get("truncated"));
+            insert_cursor_facts(&mut projected, result.get("nextCursor"));
+        }
+        CAMP_LIST_TOOL_NAME => {
+            let camps = project_object_array(result.get("threads"), |item| {
+                let mut value = Map::new();
+                insert_identifier(&mut value, "threadId", item.get("threadId"));
+                Value::Object(value)
+            });
+            projected.insert("threads".to_string(), Value::Array(camps.values));
+            projected.insert("threadCount".to_string(), json!(camps.total));
+            projected.insert("threadsTruncated".to_string(), json!(camps.truncated));
+            insert_bool(&mut projected, "truncated", result.get("truncated"));
+        }
+        CAMP_SEARCH_TOOL_NAME | HISTORY_SEARCH_TOOL_NAME => {
+            let messages = project_object_array(result.get("results"), project_search_result);
+            projected.insert("results".to_string(), Value::Array(messages.values));
+            projected.insert("resultCount".to_string(), json!(messages.total));
+            projected.insert("resultsTruncated".to_string(), json!(messages.truncated));
+            insert_bool(&mut projected, "truncated", result.get("truncated"));
+            insert_bool(
+                &mut projected,
+                "searchIncomplete",
+                result.get("searchIncomplete"),
+            );
+        }
+        CAMP_READ_TOOL_NAME => {
+            insert_identifier(&mut projected, "threadId", result.get("threadId"));
+            insert_enum(&mut projected, "mode", result.get("mode"));
+            insert_identifier(
+                &mut projected,
+                "anchorMessageId",
+                result.get("anchorMessageId"),
+            );
+            insert_identifier(
+                &mut projected,
+                "replyChainRootMessageId",
+                result.get("replyChainRootMessageId"),
+            );
+            insert_enum(&mut projected, "direction", result.get("direction"));
+            let items = project_object_array(result.get("items"), project_read_item);
+            projected.insert("items".to_string(), Value::Array(items.values));
+            projected.insert("itemCount".to_string(), json!(items.total));
+            projected.insert("itemsTruncated".to_string(), json!(items.truncated));
+            for field in ["hasMore", "hasMoreBefore", "hasMoreAfter"] {
+                insert_bool(&mut projected, field, result.get(field));
+            }
+            insert_i64(&mut projected, "nextCursor", result.get("nextCursor"));
+        }
+        SINGLE_CHAT_HISTORY_TOOL_NAME => {
+            let messages = project_object_array(result.get("messages"), |item| {
+                let mut value = Map::new();
+                insert_i64(&mut value, "sequence", item.get("sequence"));
+                insert_enum(&mut value, "role", item.get("role"));
+                Value::Object(value)
+            });
+            projected.insert("messages".to_string(), Value::Array(messages.values));
+            projected.insert("messageCount".to_string(), json!(messages.total));
+            projected.insert("messagesTruncated".to_string(), json!(messages.truncated));
+            insert_bool(&mut projected, "hasMore", result.get("hasMore"));
+            insert_i64(
+                &mut projected,
+                "nextBeforeSequence",
+                result.get("nextBeforeSequence"),
+            );
+        }
+        MEMORY_SEARCH_TOOL_NAME => {
+            let memories = project_object_array(result.get("results"), |item| {
+                project_memory_result(item, false)
+            });
+            projected.insert("results".to_string(), Value::Array(memories.values));
+            projected.insert("resultCount".to_string(), json!(memories.total));
+            projected.insert("resultsTruncated".to_string(), json!(memories.truncated));
+        }
+        MEMORY_READ_TOOL_NAME => {
+            let memories = project_object_array(result.get("memories"), |item| {
+                project_memory_result(item, true)
+            });
+            projected.insert("memories".to_string(), Value::Array(memories.values));
+            projected.insert("memoryCount".to_string(), json!(memories.total));
+            projected.insert("memoriesTruncated".to_string(), json!(memories.truncated));
+        }
+        MEMORY_VIEW_TOOL_NAME => {
+            insert_enum(&mut projected, "scope", result.get("scope"));
+            insert_identifier(
+                &mut projected,
+                "counterpartyAgentId",
+                result.get("counterpartyAgentId"),
+            );
+            insert_bool(&mut projected, "complete", result.get("complete"));
+            insert_i64(&mut projected, "itemCount", result.get("itemCount"));
+            insert_i64(
+                &mut projected,
+                "totalBodyBytes",
+                result.get("totalBodyBytes"),
+            );
+            let source = result
+                .get("items")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let values = source
+                .iter()
+                .take(RESULT_ITEM_LIMIT)
+                .enumerate()
+                .map(|(index, item)| {
+                    project_memory_result(item, index < MEMORY_VIEW_SEMANTIC_ITEM_LIMIT)
+                })
+                .collect::<Vec<_>>();
+            projected.insert("items".to_string(), Value::Array(values));
+            projected.insert(
+                "itemsTruncated".to_string(),
+                json!(source.len() > RESULT_ITEM_LIMIT),
+            );
+            projected.insert(
+                "semanticBodiesTruncated".to_string(),
+                json!(source.len() > MEMORY_VIEW_SEMANTIC_ITEM_LIMIT),
+            );
+        }
+        MEMORY_WRITE_TOOL_NAME => {
+            insert_enum(&mut projected, "outcome", result.get("outcome"));
+            insert_identifier(&mut projected, "memoryId", result.get("memoryId"));
+            insert_identifier(&mut projected, "revisionId", result.get("revisionId"));
+            insert_identifier(&mut projected, "reviewItemId", result.get("reviewItemId"));
+        }
+        AUTOMATION_LIST_TOOL_NAME => {
+            let automations = project_object_array(result.get("automations"), |item| {
+                let mut value = Map::new();
+                insert_identifier(&mut value, "automationId", item.get("automationId"));
+                insert_i64(&mut value, "version", item.get("version"));
+                insert_bool(&mut value, "enabled", item.get("enabled"));
+                Value::Object(value)
+            });
+            projected.insert("automationCount".to_string(), json!(automations.total));
+            projected.insert("automations".to_string(), Value::Array(automations.values));
+            insert_bool(&mut projected, "truncated", result.get("truncated"));
+            insert_cursor_facts(&mut projected, result.get("nextCursor"));
+        }
+        AUTOMATION_GET_TOOL_NAME
+        | AUTOMATION_CREATE_TOOL_NAME
+        | AUTOMATION_CLOSE_TOOL_NAME
+        | AUTOMATION_UPDATE_TOOL_NAME => {
+            insert_identifier(&mut projected, "automationId", result.get("automationId"));
+            insert_i64(&mut projected, "version", result.get("version"));
+            insert_bool(&mut projected, "enabled", result.get("enabled"));
+        }
+        AUTOMATION_RUN_TOOL_NAME => {
+            insert_identifier(&mut projected, "runId", result.get("runId"));
+            insert_identifier(&mut projected, "threadId", result.get("threadId"));
+            insert_enum(&mut projected, "status", result.get("status"));
+            insert_enum(&mut projected, "reason", result.get("reason"));
+        }
+        AUTOMATION_DELETE_TOOL_NAME => {
+            insert_identifier(&mut projected, "automationId", result.get("automationId"));
+            insert_bool(&mut projected, "deleted", result.get("deleted"));
+        }
+        _ => anyhow::bail!("unsupported Built-in Tool Evidence operation: {operation}"),
+    }
+    Ok(Value::Object(projected))
+}
+
+fn project_task_result(projected: &mut Map<String, Value>, result: &Value) {
+    insert_identifier(projected, "taskId", result.get("taskId"));
+    insert_enum(projected, "status", result.get("status"));
+    insert_identifier(projected, "assigneeAgentId", result.get("assigneeAgentId"));
+    insert_i64(projected, "version", result.get("version"));
+    insert_bool(projected, "changed", result.get("changed"));
+}
+
+fn project_task_item(item: &Value) -> Value {
+    let mut projected = Map::new();
+    project_task_result(&mut projected, item);
+    Value::Object(projected)
+}
+
+fn project_search_result(item: &Value) -> Value {
+    let mut projected = Map::new();
+    insert_identifier(&mut projected, "threadId", item.get("threadId"));
+    insert_identifier(&mut projected, "messageId", item.get("messageId"));
+    insert_i64(&mut projected, "sequence", item.get("sequence"));
+    insert_identifier(
+        &mut projected,
+        "anchorMessageId",
+        item.get("anchorMessageId"),
+    );
+    Value::Object(projected)
+}
+
+fn project_read_item(item: &Value) -> Value {
+    let mut projected = Map::new();
+    insert_identifier(&mut projected, "messageId", item.get("messageId"));
+    insert_i64(&mut projected, "sequence", item.get("sequence"));
+    insert_identifier(
+        &mut projected,
+        "anchorMessageId",
+        item.get("anchorMessageId"),
+    );
+    if let Some(addressing) = item.get("addressing") {
+        let mut projected_addressing = Map::new();
+        insert_string_array(
+            &mut projected_addressing,
+            "effectiveAgentRecipients",
+            addressing.get("effectiveAgentRecipients"),
+        );
+        insert_bool(
+            &mut projected_addressing,
+            "mentionsCurrentUser",
+            addressing.get("mentionsCurrentUser"),
+        );
+        projected.insert(
+            "addressing".to_string(),
+            Value::Object(projected_addressing),
+        );
+    }
+    Value::Object(projected)
+}
+
+fn project_memory_result(item: &Value, include_body: bool) -> Value {
+    let mut projected = Map::new();
+    insert_identifier(&mut projected, "memoryId", item.get("memoryId"));
+    insert_identifier(&mut projected, "revisionId", item.get("revisionId"));
+    insert_enum(&mut projected, "cacheState", item.get("cacheState"));
+    insert_enum(&mut projected, "kind", item.get("kind"));
+    insert_enum(&mut projected, "scope", item.get("scope"));
+    insert_identifier(
+        &mut projected,
+        "counterpartyAgentId",
+        item.get("counterpartyAgentId"),
+    );
+    insert_enum(&mut projected, "direction", item.get("direction"));
+    insert_bool(&mut projected, "agentCanRevise", item.get("agentCanRevise"));
+    insert_bounded_semantic_array(
+        &mut projected,
+        "retrievalKeys",
+        item.get("retrievalKeys"),
+        64,
+    );
+    if let Some(target) = item.get("target") {
+        projected.insert("target".to_string(), project_memory_target(target));
+    }
+    if include_body {
+        insert_memory_semantic_body(&mut projected, item.get("body"));
+    }
+    Value::Object(projected)
+}
+
+fn project_memory_target(target: &Value) -> Value {
+    let mut projected = Map::new();
+    insert_identifier(&mut projected, "memoryId", target.get("memoryId"));
+    insert_identifier(&mut projected, "revisionId", target.get("revisionId"));
+    insert_enum(&mut projected, "scope", target.get("scope"));
+    insert_identifier(
+        &mut projected,
+        "counterpartyAgentId",
+        target.get("counterpartyAgentId"),
+    );
+    insert_enum(&mut projected, "direction", target.get("direction"));
+    Value::Object(projected)
+}
+
+struct ProjectedArray {
+    values: Vec<Value>,
+    total: usize,
+    truncated: bool,
+}
+
+fn project_object_array(
+    source: Option<&Value>,
+    project: impl Fn(&Value) -> Value,
+) -> ProjectedArray {
+    let source = source
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    ProjectedArray {
+        values: source.iter().take(RESULT_ITEM_LIMIT).map(project).collect(),
+        total: source.len(),
+        truncated: source.len() > RESULT_ITEM_LIMIT,
+    }
+}
+
+fn insert_query(projected: &mut Map<String, Value>, value: Option<&Value>) {
+    insert_bounded_string(projected, "query", value, SEMANTIC_TEXT_LIMIT_CHARS);
+}
+
+fn insert_semantic_text(projected: &mut Map<String, Value>, field: &str, value: Option<&Value>) {
+    insert_bounded_string(projected, field, value, SEMANTIC_TEXT_LIMIT_CHARS);
+}
+
+fn insert_bounded_string(
+    projected: &mut Map<String, Value>,
+    field: &str,
+    value: Option<&Value>,
+    limit: usize,
+) {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return;
+    };
+    projected.insert(format!("{field}CharCount"), json!(value.chars().count()));
+    let (bounded, truncated) = truncate_chars(value, limit);
+    projected.insert(field.to_string(), json!(bounded));
+    projected.insert(format!("{field}Truncated"), json!(truncated));
+}
+
+fn insert_identifier(projected: &mut Map<String, Value>, field: &str, value: Option<&Value>) {
+    insert_bounded_string(projected, field, value, IDENTIFIER_LIMIT_CHARS);
+}
+
+fn insert_enum(projected: &mut Map<String, Value>, field: &str, value: Option<&Value>) {
+    insert_bounded_string(projected, field, value, 64);
+}
+
+fn insert_bool(projected: &mut Map<String, Value>, field: &str, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_bool) {
+        projected.insert(field.to_string(), json!(value));
+    }
+}
+
+fn insert_i64(projected: &mut Map<String, Value>, field: &str, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_i64) {
+        projected.insert(field.to_string(), json!(value));
+    }
+}
+
+fn insert_string_array(projected: &mut Map<String, Value>, field: &str, value: Option<&Value>) {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return;
+    };
+    let mut safe = Vec::new();
+    let mut omitted_count = 0usize;
+    for value in values.iter().take(STRING_ARRAY_LIMIT) {
+        let Some(value) = value.as_str() else {
+            omitted_count += 1;
+            continue;
+        };
+        if value.chars().count() > IDENTIFIER_LIMIT_CHARS {
+            omitted_count += 1;
+        } else {
+            safe.push(Value::String(value.to_string()));
+        }
+    }
+    projected.insert(field.to_string(), Value::Array(safe));
+    projected.insert(format!("{field}Count"), json!(values.len()));
+    projected.insert(
+        format!("{field}OmittedCount"),
+        json!(values.len().saturating_sub(STRING_ARRAY_LIMIT) + omitted_count),
+    );
+}
+
+fn insert_bounded_semantic_array(
+    projected: &mut Map<String, Value>,
+    field: &str,
+    value: Option<&Value>,
+    item_limit: usize,
+) {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return;
+    };
+    let mut safe = Vec::new();
+    let mut omitted_count = 0usize;
+    let mut truncated_count = 0usize;
+    for value in values.iter().take(STRING_ARRAY_LIMIT) {
+        let Some(value) = value.as_str() else {
+            omitted_count += 1;
+            continue;
+        };
+        let (bounded, truncated) = truncate_chars(value, item_limit);
+        truncated_count += usize::from(truncated);
+        safe.push(Value::String(bounded));
+    }
+    projected.insert(field.to_string(), Value::Array(safe));
+    projected.insert(format!("{field}Count"), json!(values.len()));
+    projected.insert(
+        format!("{field}OmittedCount"),
+        json!(values.len().saturating_sub(STRING_ARRAY_LIMIT) + omitted_count),
+    );
+    projected.insert(format!("{field}TruncatedCount"), json!(truncated_count));
+}
+
+fn insert_content_facts(projected: &mut Map<String, Value>, value: Option<&Value>) {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return;
+    };
+    projected.insert("contentCharCount".to_string(), json!(value.chars().count()));
+    projected.insert(
+        "contentDigest".to_string(),
+        json!(canonical_json_digest(&Value::String(value.to_string())).ok()),
+    );
+}
+
+fn insert_memory_semantic_body(projected: &mut Map<String, Value>, value: Option<&Value>) {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return;
+    };
+    projected.insert("bodyCharCount".to_string(), json!(value.chars().count()));
+    let (bounded, truncated) = truncate_chars(value, MEMORY_SEMANTIC_BODY_LIMIT_CHARS);
+    projected.insert("body".to_string(), json!(bounded));
+    projected.insert("bodyTruncated".to_string(), json!(truncated));
+}
+
+fn insert_opaque_cursor(projected: &mut Map<String, Value>, value: Option<&Value>) {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return;
+    };
+    projected.insert("cursorPresent".to_string(), json!(true));
+    projected.insert("cursorCharCount".to_string(), json!(value.chars().count()));
+}
+
+fn insert_cursor_facts(projected: &mut Map<String, Value>, value: Option<&Value>) {
+    let present = value.is_some_and(|value| !value.is_null());
+    projected.insert("nextCursorPresent".to_string(), json!(present));
+}
+
+fn truncate_chars(value: &str, limit: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let bounded = chars.by_ref().take(limit).collect::<String>();
+    (bounded, chars.next().is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::team_tool::TEAM_TOOL_NAMES;
+
+    fn digest(value: &Value) -> String {
+        canonical_json_digest(value).unwrap()
+    }
+
+    fn projection(operation: &str, input: Value, result: Value) -> Value {
+        let input_digest = digest(&input);
+        let result_digest = digest(&result);
+        project_builtin_tool_invocation(
+            operation,
+            &input,
+            Some(&result),
+            &input_digest,
+            Some(&result_digest),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn camp_search_projects_bounded_query_and_result_identities_without_snippets() {
+        let projected = projection(
+            CAMP_SEARCH_TOOL_NAME,
+            json!({"query": "handoff decision", "limit": 4}),
+            json!({
+                "results": [{
+                    "threadId": "rvcamp_01h47kvsy5fk1shh6w1g60eecf",
+                    "messageId": "message-1",
+                    "sequence": 9,
+                    "snippet": "private full search result"
+                }],
+                "truncated": false,
+                "searchIncomplete": false
+            }),
+        );
+        assert_eq!(projected["canonicalInput"]["query"], "handoff decision");
+        assert_eq!(
+            projected["canonicalResult"]["results"][0]["messageId"],
+            "message-1"
+        );
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("private full search result")
+        );
+    }
+
+    #[test]
+    fn mission_get_evidence_omits_attachment_source_paths() {
+        let projected = projection(
+            "mission.get",
+            json!({"missionId": "rvm_example"}),
+            json!({
+                "missionId": "rvm_example",
+                "title": "使命",
+                "description": "读取当前定义",
+                "status": "in_progress",
+                "sourceMessageId": null,
+                "attachments": [{
+                    "attachmentId": "attachment_1",
+                    "name": "requirements.pdf",
+                    "kind": "file",
+                    "fileCount": 1,
+                    "mediaType": "application/pdf",
+                    "byteSize": 42,
+                    "path": "/private/work/requirements.pdf"
+                }]
+            }),
+        );
+        assert_eq!(projected["canonicalInput"]["missionId"], "rvm_example");
+        assert_eq!(projected["canonicalResult"]["missionId"], "rvm_example");
+        assert_eq!(projected["canonicalResult"]["title"], "使命");
+        assert!(projected["canonicalResult"].get("attachments").is_none());
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("/private/work")
+        );
+    }
+
+    #[test]
+    fn memory_read_projects_v3_target_and_secret_filtered_semantic_body() {
+        let projected = projection(
+            MEMORY_READ_TOOL_NAME,
+            json!({"memoryIds": ["memory-1"]}),
+            json!({"memories": [{
+                "memoryId": "memory-1",
+                "cacheState": "revision_changed",
+                "target": {
+                    "memoryId": "memory-1",
+                    "revisionId": "revision-2",
+                    "scope": "companion"
+                },
+                "kind": "lesson",
+                "retrievalKeys": ["qualification", "evidence"],
+                "body": "Always bind qualification evidence to its authoritative receipt."
+            }]}),
+        );
+        let result = &projected["canonicalResult"]["memories"][0];
+        assert_eq!(result["memoryId"], "memory-1");
+        assert_eq!(result["target"]["revisionId"], "revision-2");
+        assert_eq!(result["cacheState"], "revision_changed");
+        assert_eq!(
+            result["body"],
+            "Always bind qualification evidence to its authoritative receipt."
+        );
+        assert_eq!(result["bodyRedacted"], Value::Null);
+    }
+
+    #[test]
+    fn memory_view_is_supported_and_bounds_semantic_content() {
+        let projected = projection(
+            MEMORY_VIEW_TOOL_NAME,
+            json!({"scope": "hearth"}),
+            json!({
+                "scope": "hearth",
+                "complete": true,
+                "itemCount": 9,
+                "totalBodyBytes": 9_000,
+                "items": (0..9).map(|index| json!({
+                    "target": {
+                        "memoryId": format!("memory-{index}"),
+                        "revisionId": format!("revision-{index}"),
+                        "scope": "hearth"
+                    },
+                    "kind": "lesson",
+                    "retrievalKeys": [format!("key-{index}")],
+                    "body": format!("Durable lesson {index}"),
+                    "agentCanRevise": true
+                })).collect::<Vec<_>>()
+            }),
+        );
+        assert_eq!(projected["canonicalInput"]["scope"], "hearth");
+        assert_eq!(projected["canonicalResult"]["complete"], true);
+        assert_eq!(
+            projected["canonicalResult"]["items"][0]["target"]["revisionId"],
+            "revision-0"
+        );
+        assert_eq!(
+            projected["canonicalResult"]["items"][0]["body"],
+            "Durable lesson 0"
+        );
+        assert_eq!(
+            projected["canonicalResult"]["items"][8]["body"],
+            Value::Null
+        );
+        assert_eq!(
+            projected["canonicalResult"]["semanticBodiesTruncated"],
+            true
+        );
+    }
+
+    #[test]
+    fn memory_semantic_content_preserves_display_values() {
+        let projected = projection(
+            MEMORY_WRITE_TOOL_NAME,
+            json!({
+                "action": "add",
+                "scope": "hearth",
+                "kind": "lesson",
+                "body": "api_key = abcdefghijklmnop",
+                "retrievalKeys": ["credential hygiene"]
+            }),
+            json!({
+                "outcome": "applied",
+                "memoryId": "memory-1",
+                "revisionId": "revision-1"
+            }),
+        );
+        assert_eq!(projected["canonicalInput"]["bodyRedacted"], Value::Null);
+        assert_eq!(
+            projected["canonicalInput"]["body"],
+            "api_key = abcdefghijklmnop"
+        );
+    }
+
+    #[test]
+    fn memory_revise_projects_v3_target_and_retention_strategy() {
+        let projected = projection(
+            MEMORY_WRITE_TOOL_NAME,
+            json!({
+                "action": "revise",
+                "target": {
+                    "memoryId": "memory-current",
+                    "revisionId": "revision-current",
+                    "scope": "relationship",
+                    "counterpartyAgentId": "agent-reviewer",
+                    "direction": "directed"
+                },
+                "body": "Use the latest revision before applying a relationship agreement.",
+                "retrievalKeys": ["latest revision", "relationship agreement"]
+            }),
+            json!({
+                "outcome": "applied",
+                "memoryId": "memory-current",
+                "revisionId": "revision-next"
+            }),
+        );
+        let input = &projected["canonicalInput"];
+        assert_eq!(input["target"]["revisionId"], "revision-current");
+        assert_eq!(input["target"]["counterpartyAgentId"], "agent-reviewer");
+        assert_eq!(input["retrievalKeys"][0], "latest revision");
+        assert_eq!(
+            input["body"],
+            "Use the latest revision before applying a relationship agreement."
+        );
+    }
+
+    #[test]
+    fn task_update_projects_semantic_handoff_and_completion_fields() {
+        let projected = projection(
+            TEAM_UPDATE_TASK_TOOL_NAME,
+            json!({
+                "taskId": "task-review",
+                "expectedVersion": 2,
+                "status": "completed",
+                "title": "Review the evidence boundary",
+                "description": "Verify the receipt and exact revision.",
+                "completionSummary": "Receipt and stale revision behavior verified."
+            }),
+            json!({
+                "taskId": "task-review",
+                "status": "completed",
+                "assigneeAgentId": "agent-reviewer",
+                "version": 3,
+                "changed": true
+            }),
+        );
+        let input = &projected["canonicalInput"];
+        assert_eq!(input["requestedStatus"], "completed");
+        assert_eq!(
+            input["completionSummary"],
+            "Receipt and stale revision behavior verified."
+        );
+        assert_eq!(
+            input["description"],
+            "Verify the receipt and exact revision."
+        );
+        assert_eq!(projected["canonicalResult"]["version"], 3);
+    }
+
+    #[test]
+    fn every_current_builtin_catalog_operation_has_start_and_terminal_projections() {
+        for operation in TEAM_TOOL_NAMES {
+            let input = json!({});
+            let result = json!({});
+            let input_digest = digest(&input);
+            let result_digest = digest(&result);
+            project_builtin_tool_invocation(operation, &input, None, &input_digest, None)
+                .unwrap_or_else(|error| {
+                    panic!("missing start projection for {operation}: {error}")
+                });
+            project_builtin_tool_invocation(
+                operation,
+                &input,
+                Some(&result),
+                &input_digest,
+                Some(&result_digest),
+            )
+            .unwrap_or_else(|error| panic!("missing terminal projection for {operation}: {error}"));
+        }
+    }
+
+    #[test]
+    fn a2a_send_projects_current_identity_recipients_and_message_receipt() {
+        let projected = projection(
+            CAMP_MESSAGE_SEND_TOOL_NAME,
+            json!({
+                "body": "Please review the patch",
+                "to": ["agent_5"],
+                "mentionUser": true,
+                "taskId": "task-1"
+            }),
+            json!({
+                "status": "accepted",
+                "messageId": "message-1",
+                "campTurnId": "turn-1",
+                "effectiveRecipients": ["agent_5"],
+                "deliveryIds": ["delivery-1"],
+                "allocatedAgentRunResponsibilities": 2,
+                "recipientPresentation": {"private": "not measurement evidence"}
+            }),
+        );
+        assert_eq!(projected["operation"], "thread.message.send");
+        assert_eq!(
+            projected["canonicalInput"]["recipientAgentIds"][0],
+            "agent_5"
+        );
+        assert_eq!(projected["canonicalInput"]["mentionsCurrentUser"], true);
+        assert_eq!(projected["canonicalResult"]["messageId"], "message-1");
+        assert_eq!(
+            projected["canonicalResult"]["effectiveRecipients"][0],
+            "agent_5"
+        );
+        assert_eq!(projected["canonicalResult"]["deliveryIds"][0], "delivery-1");
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("Please review the patch")
+        );
+    }
+
+    #[test]
+    fn member_create_records_avatar_presence_without_persisting_the_local_path() {
+        let projected = projection(
+            MEMBER_CREATE_TOOL_NAME,
+            json!({
+                "creationKey": "2b945f3f-4b45-4ae5-92b2-739fce600338",
+                "displayName": "Nova",
+                "teamRole": "Researcher",
+                "avatarFile": "/private/run/avatar.png"
+            }),
+            json!({
+                "agentId": "agent_27",
+                "version": 1,
+                "avatarRef": "rovai://member-avatar/managed/2b945f3f-4b45-4ae5-92b2-739fce600338",
+                "avatarStatus": "saved"
+            }),
+        );
+        assert_eq!(projected["canonicalInput"]["avatarFilePresent"], true);
+        assert_eq!(projected["canonicalResult"]["agentId"], "agent_27");
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(!encoded.contains("/private/run/avatar.png"));
+        assert!(!encoded.contains("avatarFile\""));
+        let update = projection(
+            MEMBER_UPDATE_TOOL_NAME,
+            json!({"agentId":"agent_27","expectedVersion":1,"avatarFile":"/private/run/new.png","workingPrinciples":"requested text"}),
+            json!({"agentId":"agent_27","version":2,"changed":true}),
+        );
+        assert_eq!(
+            update["canonicalInput"]["changedFields"],
+            json!(["avatarFile", "workingPrinciples"])
+        );
+        assert!(
+            !serde_json::to_string(&update)
+                .unwrap()
+                .contains("/private/run/new.png")
+        );
+        let get = projection(
+            MEMBER_GET_TOOL_NAME,
+            json!({"agentId":"agent_27"}),
+            json!({"agentId":"agent_27","version":2,"avatar":{"path":"/private/run/managed.png","status":"available","displayCrop":null}}),
+        );
+        assert!(
+            !serde_json::to_string(&get)
+                .unwrap()
+                .contains("/private/run/managed.png")
+        );
+    }
+
+    #[test]
+    fn projection_preserves_semantic_values_without_adding_transport_fields() {
+        for query in [
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+            "requestToken=opaque-value-not-a-known-prefix",
+            "bindingCredential: opaque-value-not-a-known-prefix",
+            "Authorization: <redacted>",
+        ] {
+            let projected = projection(
+                MEMORY_SEARCH_TOOL_NAME,
+                json!({
+                    "query": query,
+                    "limit": 2,
+                    "bindingCredential": "credential-must-never-persist",
+                    "requestToken": "request-token-must-never-persist"
+                }),
+                json!({"results": []}),
+            );
+            let encoded = serde_json::to_string(&projected).unwrap();
+            assert_eq!(
+                projected["canonicalInput"]["query"], query,
+                "query must remain unchanged: {query}"
+            );
+            for forbidden in [
+                "credential-must-never-persist",
+                "request-token-must-never-persist",
+            ] {
+                assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn projection_verifies_source_digests_and_bounds_semantic_text() {
+        let input = json!({"query": "x".repeat(2_000)});
+        let result = json!({"results": []});
+        let input_digest = digest(&input);
+        let result_digest = digest(&result);
+        let projected = project_builtin_tool_invocation(
+            CAMP_SEARCH_TOOL_NAME,
+            &input,
+            Some(&result),
+            &input_digest,
+            Some(&result_digest),
+        )
+        .unwrap();
+        assert_eq!(
+            projected["canonicalInput"]["query"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            SEMANTIC_TEXT_LIMIT_CHARS
+        );
+        assert_eq!(projected["canonicalInput"]["queryTruncated"], true);
+
+        assert!(
+            project_builtin_tool_invocation(
+                CAMP_SEARCH_TOOL_NAME,
+                &input,
+                Some(&result),
+                "wrong-input-digest",
+                Some(&result_digest),
+            )
+            .is_err()
+        );
+        assert!(
+            project_builtin_tool_invocation(
+                CAMP_SEARCH_TOOL_NAME,
+                &input,
+                Some(&result),
+                &input_digest,
+                Some("wrong-result-digest"),
+            )
+            .is_err()
+        );
+
+        let mut digest_document = projected.clone();
+        let persisted_digest = digest_document
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionDigest")
+            .unwrap();
+        assert_eq!(
+            persisted_digest,
+            canonical_json_digest(&digest_document).unwrap()
+        );
+    }
+
+    #[test]
+    fn single_chat_history_evidence_keeps_pagination_facts_without_private_bodies() {
+        let projected = projection(
+            SINGLE_CHAT_HISTORY_TOOL_NAME,
+            json!({"beforeSequence": 12, "limit": 20}),
+            json!({
+                "schemaVersion": 1,
+                "messages": [
+                    {"sequence": 9, "role": "user", "body": "PRIVATE_USER_BODY"},
+                    {"sequence": 10, "role": "assistant", "body": "PRIVATE_ASSISTANT_BODY"}
+                ],
+                "hasMore": true,
+                "nextBeforeSequence": 9
+            }),
+        );
+        assert_eq!(projected["canonicalInput"]["beforeSequence"], 12);
+        assert_eq!(projected["canonicalResult"]["messageCount"], 2);
+        assert_eq!(projected["canonicalResult"]["messages"][0]["sequence"], 9);
+        assert_eq!(
+            projected["canonicalResult"]["messages"][1]["role"],
+            "assistant"
+        );
+        assert_eq!(projected["canonicalResult"]["nextBeforeSequence"], 9);
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(!encoded.contains("PRIVATE_USER_BODY"));
+        assert!(!encoded.contains("PRIVATE_ASSISTANT_BODY"));
+    }
+
+    #[test]
+    fn result_projection_rejects_raw_bodies_snippets_tokens_headers_and_unbounded_items() {
+        let projected = projection(
+            CAMP_SEARCH_TOOL_NAME,
+            json!({"query": "find the review", "limit": 20}),
+            json!({
+                "results": (0..100).map(|index| json!({
+                    "threadId": "rvcamp_01h47kvsy5fk1shh6w1g60eecf",
+                    "messageId": format!("message-{index}"),
+                    "sequence": index,
+                    "body": "RAW_BODY_MUST_NOT_PERSIST",
+                    "snippet": "RAW_SNIPPET_MUST_NOT_PERSIST",
+                    "requestToken": "RAW_REQUEST_TOKEN_MUST_NOT_PERSIST",
+                    "headers": {
+                        "Authorization": "Bearer RAW_AUTHORIZATION_MUST_NOT_PERSIST"
+                    }
+                })).collect::<Vec<_>>(),
+                "truncated": false,
+                "searchIncomplete": false,
+                "body": "TOP_LEVEL_RAW_BODY_MUST_NOT_PERSIST",
+                "snippet": "TOP_LEVEL_RAW_SNIPPET_MUST_NOT_PERSIST",
+                "token": "TOP_LEVEL_RAW_TOKEN_MUST_NOT_PERSIST",
+                "authorization": "TOP_LEVEL_RAW_AUTHORIZATION_MUST_NOT_PERSIST"
+            }),
+        );
+        let encoded = serde_json::to_string(&projected).unwrap();
+        for forbidden in [
+            "RAW_BODY_MUST_NOT_PERSIST",
+            "RAW_SNIPPET_MUST_NOT_PERSIST",
+            "RAW_REQUEST_TOKEN_MUST_NOT_PERSIST",
+            "RAW_AUTHORIZATION_MUST_NOT_PERSIST",
+            "TOP_LEVEL_RAW_BODY_MUST_NOT_PERSIST",
+            "TOP_LEVEL_RAW_SNIPPET_MUST_NOT_PERSIST",
+            "TOP_LEVEL_RAW_TOKEN_MUST_NOT_PERSIST",
+            "TOP_LEVEL_RAW_AUTHORIZATION_MUST_NOT_PERSIST",
+            "Authorization",
+            "requestToken",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+        assert_eq!(
+            projected["canonicalResult"]["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            RESULT_ITEM_LIMIT
+        );
+        assert_eq!(projected["canonicalResult"]["resultCount"], 100);
+        assert_eq!(projected["canonicalResult"]["resultsTruncated"], true);
+        let runs = projection(
+            "thread.runs",
+            json!({"active":true, "agentId":"agent_1"}),
+            json!({
+                "threadId":"thread", "observedAt":"2026-10-03T00:00:00Z", "hasMore":false,
+                "items":[{"agentRunId":null,"agentId":"agent_1","status":"queued","messageCount":2,
+                "messagePreview":{"text":"RAW_PREVIEW_MUST_NOT_PERSIST","messageId":"m","truncated":false}}]
+            }),
+        );
+        assert!(!runs.to_string().contains("RAW_PREVIEW_MUST_NOT_PERSIST"));
+        assert_eq!(runs["canonicalResult"]["items"][0]["messageCount"], 2);
+        assert!(runs["canonicalResult"]["items"][0]["agentRunId"].is_null());
+    }
+}

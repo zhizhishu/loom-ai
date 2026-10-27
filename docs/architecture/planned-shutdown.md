@@ -1,0 +1,156 @@
+---
+document_type: architecture
+architecture: planned-shutdown
+authority: planned-core-lifecycle-and-cancel-all-settlement
+last_updated: 2026-10-12
+---
+
+# Planned Shutdown
+
+本文组合主动退出、重启和更新时的 Core 生命周期结构。当前产品定义是：退出 Rovai 即取消所有非终态
+AgentRun，完成本地收口，再结束进程。精确 wire、字段、幂等和 deadline 由
+[Planned Shutdown v8](../contracts/planned-shutdown-v8.md)拥有；Runtime terminal 与未知外部效果边界由
+[Runtime 恢复与关闭不变量](foundational-invariants.md#runtime-recovery-shutdown)拥有。没有 durable shutdown
+cycle 的异常崩溃、强杀、断电继续由 [AgentRun Recovery](agent-run-recovery.md)处理。
+
+## 1. 单调生命周期与 durable intent
+
+`PlannedShutdownCoordinator` 使用单调 phase 表达一次 generation-local 关闭：
+
+```text
+accepting → closing_launch → draining → terminal_closed
+```
+
+Main 的合法 protocol 3 request 先持久化 planned_shutdown_cycle，并在等待 Runtime 之前调用统一取消事务。
+该事务是业务线性化点；新 input dispatch、binding 与 callback 都按 Run/Turn authority fenced。随后关闭
+Execution Launch Admission，并保留原 barrier，处理已经取得 permit 但尚未完成 handoff 的 launch。
+中断时 pending cycle 在下一次普通 startup recovery 前补偿。
+
+`closing_launch` 拒绝新 launch，并等待已进入 critical section 的 writer 完成 handoff 或安全放弃。只有 barrier
+完成后，active registry 的 route binding 才稳定，coordinator 才进入 `draining`。该 happens-before 是读取
+稳定 active snapshot 和关闭 terminal/route admission 的前提。
+
+## 2. 三个 generation-local admission
+
+- **Execution Launch Admission**：覆盖候选领取、active 注册、Runtime acquire、input prepare/send 与 route
+  handoff。关闭后不再有新的当前代执行。
+- **Terminal Settlement Admission**：为匹配 live route 的 terminal transaction 提供短命 guard。v3 不等待
+  新 terminal；稳定 snapshot 形成后立即关闭，并只排空 cutoff 前已取得的 guard。
+- **Live Runtime Route Admission**：为 Runtime callback、工具结果、公开消息与 input/terminal route 提供短命
+  guard。它与 terminal admission 在同一个 cancel-all cutoff 关闭，迟到回调不能写入领域状态。
+
+普通领域存储不是独立的第四个长期 drain 面。Main request loop 在接受 v3 后停止读取新请求；已进入的后台
+request 只获得与原生 interrupt 相同的短 grace，随后 abort 并在 writer-fence 预算内排空。
+
+## 3. Active registry 与 cancel-all cutoff
+
+Scheduler 在 claim 前取得 launch permit。claim 成功后，它以 Run、execution epoch、Adapter 和 route identity
+注册唯一 active handle；route binding 必须在 permit 释放前完成。launch barrier 结束后，Core 读取一次稳定
+snapshot。
+
+随后 Core 立即同步关闭 Terminal Settlement Admission 与 Live Runtime Route Admission。该 cutoff 关闭后续 Runtime 路由准入；业务终态已由前置事务拥有。已获得 guard 的回调仍须验证
+Run/epoch 及取消状态，不得覆写已提交终态或恢复业务输出。
+
+Core 对 snapshot 中的 active handle 并发发送原生 interrupt/cancel，并记录 `planned_stop_requested`。该动作
+只证明 Rovai 尝试停止对应 Runtime，不移除 handle，也不拥有 AgentRun terminal。控制面只给它 `600ms`
+grace；超时任务被 abort，后续由有界 Runtime reap 收口进程权。
+
+## 4. Writer fence 与取消事务
+
+cutoff 后，Core 依次收口会产生 AgentRun 业务效果的 writer：
+
+```text
+stop new scheduler / recovery / discovery work
+→ stop or abort admitted background requests
+→ stop Built-in Tool listener and fence invocation leases
+→ abort tracked AgentRun and Runtime-event owners
+→ drain terminal and live-route guards admitted before cutoff
+→ drain Runtime usage and remaining execution writers
+→ settle the durable shutdown cycle
+```
+
+前置事务使用统一 Run/Turn abortive settlement，直接结束 queued/running/waiting 及其义务。writer barrier
+完成后再结算期间新增的对象并完成 cycle，累加实际新结算计数；没有新对象时不重复计数。barrier 超时保留
+pending cycle，但不撤销已提交业务终态。
+
+退出事务命中的 Run 一律为 cancelled；未发送 Input 关闭为 not_accepted，accepted/delivery_unknown 与可能发生
+外部效果的 Action 证据继续保留且不自动重发。内部 shutdown report 仍统计这些证据，公共 Run 不显示外部效果
+待确认。原有更具体取消原因保留，否则使用 app_shutdown_cancel_all；历史 protocol 2 cycle 保留其身份和
+planned_shutdown_cancelled 原因，不冒充新 protocol 3 request。业务事务不写 cancel_acknowledged_at。
+
+不为新执行写 CampTurn Stop intent；历史 CampTurn 仅保留原审计与渠道收口事实。
+未知 Action/Input、历史输出和外部效果证据不删除，terminal_resolution_source 不伪造为 Runtime terminal。
+
+普通 batch Scheduler 保留原生命周期。事件／deadline 等待任务与既有低频 housekeeping 由 `run_core` 的
+JoinSet 直接持有，共用退出信号；任一任务意外结束会让 Core 进入退出清理。关闭监督器先停止协调入口，
+launch handoff 超时时 abort，并在 writer fence 前等待整个集合。non-batch preparation、Runtime cleanup
+及其后续投影、Mission/Camp 清理均进入 Core 既有 tracked task set，强制取消协调任务也不会丢失它们的句柄。
+退出报告同时要求协调入口和这些后台工作 quiesced；legacy 500ms maintenance 的独立注册与退出通知已经删除。
+
+## 5. Startup compensation
+
+Core 在普通 AgentRun recovery 前按 request 顺序处理 pending cycle：v3 使用 cancel-all transaction 并补齐
+Run-local 取消审计；历史 protocol 2 身份保留，使用同一当前结算规则。settled cycle 幂等跳过，已终态 Run 不改写，原 input
+不重发、不恢复、不复制。
+
+补偿完成后的 cancelled Run 是普通 terminal。Read Side 不因取消保留的 Input/Action 证据投影
+`hasUnsettledExternalEffects`，也不得把它重新显示为恢复中、投递待确认或结果待确认，或提供自动重试。
+
+## 6. Deadline 与 Runtime reap
+
+Core 仍接受一个 monotonic hard deadline，但 v3 的正常路径不消费大部分预算等待 terminal：
+
+```text
+persist durable cancel-all intent and settle business obligations
+→ close launch and finish handoff barrier
+→ snapshot active handles
+→ close terminal and live-route admission
+→ bounded best-effort native interrupt
+→ abort/drain writers and finish remaining business settlement
+→ bounded Runtime shutdown/reap
+→ flush report and exit
+```
+
+原生 interrupt grace 为 `600ms`；产品事务完成后的 Runtime reap grace 为最多 `2s`；Desktop hard window 仍为
+`10s`。这些常量是一个 hard window 内的控制预算，不是第二个领域结算窗口。reap 超时只能影响
+`deadlineExpired` 与进程强制回收，不能重开 terminal admission 或撤销已提交的 cancel-all transaction。
+
+执行 writer 已停止、最终取消事务结束后，监督器在释放 Database/正文缓冲和返回 report 前，给尚未定稿的
+执行正文一次 best-effort 落盘机会。最多等待 `1s`，且 deadline 不超过当前 hard window 扣除输出 reserve
+后的剩余时间；不额外延长 `10s` 退出窗口。最后一次尝试忽略普通重试退避，逐块检查剩余预算，Blob I/O
+在阻塞工作线程执行，使监督器可以按时停止等待。失败或超时只记诊断，不撤销 Run 取消，也不等待无界重试；
+已进入的系统 I/O 不能强制中断，stdio Runtime 仍沿用既有 `250ms` 有界释放。落盘成功的已接收正文
+在重开后以 interrupted/completed 原有语义可重读。这是退出生命周期的末次机会，普通领域命令继续只通知后台维护。
+
+该等待位于现有 `core.shutdown` 完成之前，复用第 7 节的“正在安全退出”反馈及 `400ms` 防闪烁门槛；
+不增加 Renderer 弹窗、交互或新的取消协议。
+
+若产品事务完成，report 的 `unresolvedExecutions` 为零；未知外部效果不计为非终态执行。若 hard deadline
+或 watchdog 在事务前终止 Core，pending cycle 在下次启动补偿。旧 route 的任何迟到 event 都不能修改 Run。
+
+## 7. Desktop boundary 与 Renderer
+
+Electron Main 是唯一 shutdown caller。第一次可控 quit 在 Renderer 仍存活时由既有 `AppQuitCoordinator` 阻止并冻结
+reason；Windows/Linux 主窗口关闭同样在窗口销毁前进入该入口。Main 先通过私有一次性响应通道请求 Renderer 准备退出，
+Renderer 只复用匹配 active Camp 的本地 preparation，等待已经开始的附件、引用、发送和 Lexical flush 操作完成。
+它不把 public Composer 写入 Core；已完成的本机 Camp-local snapshot 由 Composer 自己拥有。成功后 Main 才停止应用服务、禁止 Core 自动重启、
+发送一次 v3 request，并等待 report 与 child 真实 exit；重复 quit 不创建第二轮准备或 drain。
+
+macOS 独立关闭主窗口（红色关闭 / Cmd+W）也在 Renderer 销毁前等待同一 preparation，成功后只恢复该窗口的原生
+close，不进入服务 drain、Core shutdown 或 App exit；关闭窗口不取消 AgentRun/Runtime。失败保留窗口并允许重试。
+关窗与 Cmd+Q 重叠时共享该窗口正在进行的 preparation，只有 quit caller 执行 Planned Shutdown。具体关窗语义见
+[Camp Composer Draft v16](../contracts/camp-composer-draft-v16.md)。
+
+Renderer 准备失败或响应通道失败时，本次退出终止：不停止服务、不调用 `core.shutdown()`、不执行 `app.exit()`；当前
+Camp、Lexical 内容和交互仍留在本窗口，下一次 quit 可重新尝试。没有存活且已加载的 Renderer 时 preparation 为
+no-op；已持久的 Camp-local snapshot 不依赖该响应继续存在。外层 watchdog
+仍只负责 Core 已开始关闭后完全失去响应的最终强制结束，不能伪造领域 terminal。
+
+Renderer 只在准备成功、Core shutdown 已开始后消费 `runtime.state = shutting_down`。它立即建立覆盖当前页面的交互 guard；若关闭在 400ms 内
+完成则不显示反馈，超过门槛才显示可聚焦、无操作按钮的 busy modal：“正在安全退出”。modal 说明 Rovai
+正在保存本地状态并关闭后台服务，并补充“未完成的任务会取消，未确认的改动保留为待核对记录。”，面向
+用户不暴露 AgentRun 内部术语。进入该状态后 Renderer 停止页面投影刷新，并抑制由关闭拒绝产生的晚到错误横幅与 Toast；
+Renderer 不拥有 shutdown request、deadline、进程信号或取消计数。
+
+应用内更新复用同一个 Main 协调器：只有更新动作已经成功进入可退出阶段后才触发 v3；失败时 App/Core
+保持运行并允许重试。关闭协调器最终只完成一次 child-exit wait，不再次发起 native quit 协商。

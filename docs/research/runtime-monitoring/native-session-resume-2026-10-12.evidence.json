@@ -1,0 +1,1208 @@
+{
+  "date": "2026-10-12",
+  "platform": "macOS arm64",
+  "channel": "automatic-acceptance",
+  "coreCommit": "bc317de1a4480b02bc941041622fd5ced23c84ca",
+  "excluded": [
+    "cursor-agent",
+    "cline-cli",
+    "command-code-cli"
+  ],
+  "scope": "Real Core + installed native CLIs; seed, warm, cold restart, removal of owned test history. No Renderer, cross-version, auth fault injection, or historical-content completeness qualification.",
+  "summary": {
+    "runtimes": 15,
+    "healthyColdOriginalIdSucceeded": 15,
+    "correctReplacement": 1,
+    "falseRestoreSuccess": 1,
+    "failedWithoutInput": 13
+  },
+  "caveats": [
+    "Claude warm and Kimi initial cold were cancelled on the audit timeout; fresh distinct later inputs successfully cold-resumed the original IDs. No accepted input was replayed.",
+    "Codex first cold hit account/read routing timeout before resume; a fresh input later resumed successfully.",
+    "ZCode rollout-only deletion is excluded from the missing-history result; the real isolated sessions.sqlite store and sidecars were subsequently removed.",
+    "ZCode PATH CLI 0.16.9 was not the tested runtime; the official App Node bundle was used.",
+    "Antigravity missing test used the actual antigravity-cli conversation database; only the exact test ID files were removed.",
+    "Healthy success proves a restore call with the original ID and a completed new turn, not equality of every historical message."
+  ],
+  "cases": [
+    {
+      "adapter": "antigravity-app",
+      "version": "1.3.3",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "launch",
+            "resumeFlag": "--conversation",
+            "target": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "launch",
+            "resumeFlag": "--conversation",
+            "target": "original"
+          },
+          {
+            "direction": "out",
+            "method": "init",
+            "session": "other"
+          }
+        ],
+        "removed": [
+          "<native-store>/<original-session>.db",
+          "<native-store>/<original-session>.db-shm",
+          "<native-store>/<original-session>.db-wal"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "claude-code-cli",
+      "version": "2.1.287 (Claude Code)",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "launch",
+            "resumeFlag": "--resume",
+            "target": "original"
+          },
+          {
+            "direction": "in",
+            "method": "user",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "launch",
+            "resumeFlag": "--resume",
+            "target": "original"
+          }
+        ],
+        "removed": [
+          "<fixture>/native/projects/<workspace>/<original-session>.jsonl",
+          "<fixture>/native/session-env/<original-session>"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "cancelled"
+        },
+        {
+          "status": "failed",
+          "code": "runtime_control_initialization_failed",
+          "origin": "compatibility"
+        }
+      ]
+    },
+    {
+      "adapter": "codebuddy-cli",
+      "version": "2.133.1",
+      "classification": "false_restore_success",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/load",
+            "requestMethod": "session/load",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "succeeded",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 1,
+        "persistedInputStates": [
+          "accepted"
+        ],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/load",
+            "requestMethod": "session/load",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ],
+        "removed": [
+          "<fixture>/native/projects/<workspace>/<original-session>.jsonl"
+        ]
+      },
+      "transcriptEvidence": {
+        "originalMessageRows": 6,
+        "replacementMessageRows": 2,
+        "originalMessageIdsRetained": 0,
+        "originalMarkerCounts": {
+          "SEED": 0,
+          "WARM": 0,
+          "COLD": 0
+        }
+      }
+    },
+    {
+      "adapter": "codex-cli",
+      "version": "codex-cli 0.162.1",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "thread/resume",
+            "requestMethod": "thread/resume",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "turn/start",
+            "requestMethod": "turn/start",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "thread/resume",
+            "requestMethod": "thread/resume",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "thread/resume",
+            "error": {
+              "code": -32600,
+              "dataCode": null,
+              "dataKeys": []
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/sessions/2026/10/12/rollout-2026-10-12T19-13-35-<original-session>.jsonl"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        },
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "copilot-cli",
+      "version": "GitHub Copilot CLI 1.0.83.",
+      "classification": "structured_rejection_not_used",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/load",
+            "requestMethod": "session/load",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/load",
+            "requestMethod": "session/load",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/load",
+            "error": {
+              "code": -32002,
+              "dataCode": null,
+              "dataKeys": [
+                "uri"
+              ]
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/session-state/<original-session>"
+        ]
+      },
+      "structuredRejection": {
+        "adapter": "copilot-cli",
+        "method": "session/load",
+        "errorCode": -32002,
+        "dataCode": null,
+        "dataKeys": [
+          "uri"
+        ],
+        "uriNamesExactTarget": true,
+        "dataSessionMatches": false,
+        "dataProjectRootMatches": false,
+        "uri": "Session <native-session> not found"
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "deepseek-harness",
+      "version": "0.2.1-alpha.1",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/resume",
+            "error": {
+              "code": -32602,
+              "dataCode": null,
+              "dataKeys": []
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/sessions/-<workspace>--/<original-session>",
+          "<fixture>/native/storages/session_projcache/sessions/<original-session>.json"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "grok-build",
+      "version": "grok 1.0.50 (c58f321264ba)",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/resume",
+            "error": {
+              "code": -32603,
+              "dataCode": "FS_NOT_FOUND",
+              "dataKeys": [
+                "detail",
+                "code"
+              ]
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/sessions/<workspace>/<original-session>"
+        ]
+      },
+      "structuredRejection": {
+        "adapter": "grok-build",
+        "method": "session/resume",
+        "errorCode": -32603,
+        "dataCode": "FS_NOT_FOUND",
+        "dataKeys": [
+          "detail",
+          "code"
+        ],
+        "detailType": "string",
+        "detailKeys": [],
+        "detailNamesExactTarget": false,
+        "detailNamesFixture": false,
+        "detailSanitized": "No such file or directory (os error 2)"
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "kimi-code-cli",
+      "version": "2.1.1",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/resume",
+            "error": {
+              "code": -32602,
+              "dataCode": null,
+              "dataKeys": [
+                "sessionId"
+              ]
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/sessions/.index-dirty/<original-session>.1791807472010",
+          "<fixture>/native/sessions/.index-dirty/<original-session>.1791807474101",
+          "<fixture>/native/sessions/.index-dirty/<original-session>.1791807474136",
+          "<fixture>/native/sessions/.index-dirty/<original-session>.1791807478762",
+          "<fixture>/native/sessions/wd_project_f43b766b9002/<original-session>"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "cancelled"
+        },
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "kiro-cli",
+      "version": "kiro-cli 2.21.1",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/load",
+            "requestMethod": "session/load",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/load",
+            "requestMethod": "session/load",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/load",
+            "error": {
+              "code": -32603,
+              "dataCode": null,
+              "dataKeys": []
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/sessions/cli/<original-session>.json",
+          "<fixture>/native/sessions/cli/<original-session>.jsonl"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "opencode-cli",
+      "version": "opencode v2.0.25",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/resume",
+            "error": {
+              "code": -32602,
+              "dataCode": null,
+              "dataKeys": [
+                "sessionId"
+              ]
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/data/opencode/opencode.db",
+          "<fixture>/native/data/opencode/opencode.db-wal",
+          "<fixture>/native/data/opencode/opencode.db-shm"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "pi",
+      "version": "1.1.0",
+      "classification": "correct_replacement",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "switch_session",
+            "requestMethod": "switch_session",
+            "pathNamesOriginal": true
+          },
+          {
+            "direction": "in",
+            "method": "prompt",
+            "requestMethod": "prompt"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "succeeded",
+        "originalBindingRetained": false,
+        "businessInputSubmissions": 1,
+        "persistedInputStates": [
+          "accepted"
+        ],
+        "continuityLostNotices": 1,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "new_session",
+            "requestMethod": "new_session"
+          },
+          {
+            "direction": "in",
+            "method": "prompt",
+            "requestMethod": "prompt"
+          }
+        ],
+        "removed": [
+          "<fixture>/native/sessions/-<workspace>--/2026-10-12T11-13-34-107Z_<original-session>.jsonl"
+        ]
+      }
+    },
+    {
+      "adapter": "qoder-cli",
+      "version": "1.1.65",
+      "classification": "structured_rejection_not_used",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/resume",
+            "error": {
+              "code": -32602,
+              "dataCode": "INVALID_SESSION_IDENTIFIER",
+              "dataKeys": [
+                "code",
+                "sessionId",
+                "projectRoot"
+              ]
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/projects/<workspace>/<original-session>",
+          "<fixture>/native/projects/<workspace>/<original-session>.jsonl",
+          "<fixture>/native/session-env/<original-session>"
+        ]
+      },
+      "structuredRejection": {
+        "adapter": "qoder-cli",
+        "method": "session/resume",
+        "errorCode": -32602,
+        "dataCode": "INVALID_SESSION_IDENTIFIER",
+        "dataKeys": [
+          "code",
+          "sessionId",
+          "projectRoot"
+        ],
+        "uriNamesExactTarget": false,
+        "dataSessionMatches": true,
+        "dataProjectRootMatches": true,
+        "uri": null
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "qwen-code",
+      "version": "0.25.0",
+      "classification": "structured_rejection_not_used",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/resume",
+            "error": {
+              "code": -32002,
+              "dataCode": null,
+              "dataKeys": [
+                "uri"
+              ]
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/projects/<workspace>/chats/<original-session>.jsonl"
+        ]
+      },
+      "structuredRejection": {
+        "adapter": "qwen-code",
+        "method": "session/resume",
+        "errorCode": -32002,
+        "dataCode": null,
+        "dataKeys": [
+          "uri"
+        ],
+        "uriNamesExactTarget": true,
+        "dataSessionMatches": false,
+        "dataProjectRootMatches": false,
+        "uri": "session:<native-session>"
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "trae-cn-cli",
+      "version": "trae-cli version 0.120.52",
+      "classification": "conservative_failure_without_sufficient_target_evidence",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/load",
+            "requestMethod": "session/load",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "session/prompt",
+            "requestMethod": "session/prompt",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/load",
+            "requestMethod": "session/load",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/load",
+            "error": {
+              "code": -32602,
+              "dataCode": null,
+              "dataKeys": []
+            }
+          }
+        ],
+        "removed": [
+          "<native-store>/<original-session>"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    },
+    {
+      "adapter": "zcode-app",
+      "version": "official App 3.14.5 (CFBundleShortVersionString)",
+      "classification": "structured_rejection_not_used",
+      "healthyCold": {
+        "status": "succeeded",
+        "originalIdPreserved": true,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "in",
+            "method": "v4/command",
+            "requestMethod": "v4/command",
+            "session": "original"
+          }
+        ]
+      },
+      "missingHistory": {
+        "status": "failed",
+        "originalBindingRetained": true,
+        "businessInputSubmissions": 0,
+        "persistedInputStates": [],
+        "continuityLostNotices": 0,
+        "trace": [
+          {
+            "direction": "in",
+            "method": "session/resume",
+            "requestMethod": "session/resume",
+            "session": "original"
+          },
+          {
+            "direction": "out",
+            "requestMethod": "session/resume",
+            "error": {
+              "code": -32004,
+              "dataCode": null,
+              "dataKeys": []
+            }
+          }
+        ],
+        "removed": [
+          "<fixture>/native/cli/rollout/model-io-<original-session>.jsonl",
+          "<fixture>/native/sessions.sqlite",
+          "<fixture>/native/sessions.sqlite-wal",
+          "<fixture>/native/sessions.sqlite-shm"
+        ]
+      },
+      "nonSuccessfulRuns": [
+        {
+          "status": "failed",
+          "code": "runtime_launch_failed",
+          "origin": "unknown"
+        }
+      ]
+    }
+  ],
+  "fixVerification": {
+    "baseCommit": "d41778bfcc71d0223e70cbbdd442c3e500eb3559",
+    "candidate": "Implementation in this PR on baseCommit; five-runtime acceptance followed by Copilot/Qwen reruns after exact resource URI matching. No immutable candidate commit had been created during these executions.",
+    "channel": "automatic-acceptance",
+    "platform": "macOS arm64",
+    "realRuntimes": 5,
+    "cases": [
+      {
+        "adapter": "codebuddy-cli",
+        "version": "2.133.1",
+        "seedWarmColdAndMissingSucceeded": true,
+        "warmProcessReused": true,
+        "coldRestore": {
+          "method": "session/load",
+          "target": "original",
+          "businessInputSubmissions": 1
+        },
+        "missingHistory": {
+          "newSessionCalls": 1,
+          "businessInputSubmissions": 1,
+          "currentTarget": "replacement",
+          "continuityLostNotices": 1,
+          "persistedInputStates": [
+            "accepted"
+          ],
+          "trace": [
+            {
+              "direction": "in",
+              "method": "session/new"
+            },
+            {
+              "direction": "out",
+              "method": "session/new",
+              "resultTarget": "replacement"
+            },
+            {
+              "direction": "in",
+              "method": "session/prompt",
+              "target": "replacement"
+            },
+            {
+              "direction": "out",
+              "method": "session/prompt"
+            }
+          ]
+        },
+        "exactResourceTargetGuardRetested": false
+      },
+      {
+        "adapter": "copilot-cli",
+        "version": "GitHub Copilot CLI 1.0.83.\nRun 'copilot update' to check for updates.",
+        "seedWarmColdAndMissingSucceeded": true,
+        "warmProcessReused": true,
+        "coldRestore": {
+          "method": "session/load",
+          "target": "original",
+          "businessInputSubmissions": 1
+        },
+        "missingHistory": {
+          "newSessionCalls": 1,
+          "businessInputSubmissions": 1,
+          "currentTarget": "replacement",
+          "continuityLostNotices": 1,
+          "persistedInputStates": [
+            "accepted"
+          ],
+          "trace": [
+            {
+              "direction": "in",
+              "method": "session/load",
+              "target": "original"
+            },
+            {
+              "direction": "out",
+              "method": "session/load",
+              "errorCode": -32002
+            },
+            {
+              "direction": "in",
+              "method": "session/new"
+            },
+            {
+              "direction": "out",
+              "method": "session/new",
+              "resultTarget": "replacement"
+            },
+            {
+              "direction": "in",
+              "method": "session/prompt",
+              "target": "replacement"
+            },
+            {
+              "direction": "out",
+              "method": "session/prompt"
+            }
+          ]
+        },
+        "exactResourceTargetGuardRetested": true
+      },
+      {
+        "adapter": "qoder-cli",
+        "version": "1.1.65",
+        "seedWarmColdAndMissingSucceeded": true,
+        "warmProcessReused": true,
+        "coldRestore": {
+          "method": "session/resume",
+          "target": "original",
+          "businessInputSubmissions": 1
+        },
+        "missingHistory": {
+          "newSessionCalls": 1,
+          "businessInputSubmissions": 1,
+          "currentTarget": "replacement",
+          "continuityLostNotices": 1,
+          "persistedInputStates": [
+            "accepted"
+          ],
+          "trace": [
+            {
+              "direction": "in",
+              "method": "session/resume",
+              "target": "original"
+            },
+            {
+              "direction": "out",
+              "method": "session/resume",
+              "errorCode": -32602,
+              "dataCode": "INVALID_SESSION_IDENTIFIER"
+            },
+            {
+              "direction": "in",
+              "method": "session/new"
+            },
+            {
+              "direction": "out",
+              "method": "session/new",
+              "resultTarget": "replacement"
+            },
+            {
+              "direction": "in",
+              "method": "session/prompt",
+              "target": "replacement"
+            },
+            {
+              "direction": "out",
+              "method": "session/prompt"
+            }
+          ]
+        },
+        "exactResourceTargetGuardRetested": false
+      },
+      {
+        "adapter": "qwen-code",
+        "version": "0.25.0",
+        "seedWarmColdAndMissingSucceeded": true,
+        "warmProcessReused": true,
+        "coldRestore": {
+          "method": "session/resume",
+          "target": "original",
+          "businessInputSubmissions": 1
+        },
+        "missingHistory": {
+          "newSessionCalls": 1,
+          "businessInputSubmissions": 1,
+          "currentTarget": "replacement",
+          "continuityLostNotices": 1,
+          "persistedInputStates": [
+            "accepted"
+          ],
+          "trace": [
+            {
+              "direction": "in",
+              "method": "session/resume",
+              "target": "original"
+            },
+            {
+              "direction": "out",
+              "method": "session/resume",
+              "errorCode": -32002
+            },
+            {
+              "direction": "in",
+              "method": "session/new"
+            },
+            {
+              "direction": "out",
+              "method": "session/new",
+              "resultTarget": "replacement"
+            },
+            {
+              "direction": "in",
+              "method": "session/prompt",
+              "target": "replacement"
+            },
+            {
+              "direction": "out",
+              "method": "session/prompt"
+            }
+          ]
+        },
+        "exactResourceTargetGuardRetested": true
+      },
+      {
+        "adapter": "zcode-app",
+        "version": "3.14.5",
+        "seedWarmColdAndMissingSucceeded": true,
+        "warmProcessReused": true,
+        "coldRestore": {
+          "method": "session/resume",
+          "target": "original",
+          "businessInputSubmissions": 1
+        },
+        "missingHistory": {
+          "newSessionCalls": 1,
+          "businessInputSubmissions": 1,
+          "currentTarget": "replacement",
+          "continuityLostNotices": 1,
+          "persistedInputStates": [
+            "accepted"
+          ],
+          "trace": [
+            {
+              "direction": "in",
+              "method": "session/resume",
+              "target": "original"
+            },
+            {
+              "direction": "out",
+              "method": "session/resume",
+              "errorCode": -32004
+            },
+            {
+              "direction": "in",
+              "method": "session/create"
+            },
+            {
+              "direction": "out",
+              "method": "session/create"
+            },
+            {
+              "direction": "in",
+              "method": "v4/command",
+              "target": "replacement"
+            },
+            {
+              "direction": "out",
+              "method": "v4/command"
+            }
+          ]
+        },
+        "exactResourceTargetGuardRetested": false
+      }
+    ],
+    "limits": [
+      "Other nine conservative missing-history failures were not changed or rerun.",
+      "No daily App installation, Renderer, Windows runtime, or complete historical-content verification.",
+      "The native transcript presence check covers CodeBuddy exact-file absence, not all forms of content corruption."
+    ]
+  }
+}

@@ -1,0 +1,235 @@
+{
+  "kind": "bootstrap-claim-budget-real-runtime-smoke",
+  "date": "2026-10-14",
+  "baselineCommit": "7a40768ccded50af6e4ec062d355f17e6efc3337",
+  "candidateCodeCommit": "2cf6f692",
+  "formalContextGate": {
+    "status": "not_run",
+    "cases": "DEMO-101–112",
+    "reason": "Pinned Judge configuration unavailable; focused real OpenCode before/after smoke is not the complete semantic Gate."
+  },
+  "fixture": {
+    "bootstrapIdentityPaddingUtf8Bytes": 36000,
+    "eachMessagePaddingUtf8Bytes": 120000,
+    "runtimePayloadLimitBytes": 262144,
+    "newMemoryDuringActiveSession": true,
+    "criteria": "Baseline freezes both messages and fails capacity; candidate completes two single-message Runs and both file artifacts while retaining native Session ID/generation."
+  },
+  "reports": [
+    {
+      "baseline": true,
+      "startedAt": "2026-10-14T04:26:42.021Z",
+      "status": "passed",
+      "model": {
+        "mode": "runtime_default"
+      },
+      "reproducedOriginalFailure": true,
+      "runs": [
+        {
+          "id": "ac76f06d-1fd7-43d8-a630-82df099224c6",
+          "status": "succeeded",
+          "last_error_code": null,
+          "inputCount": 1
+        },
+        {
+          "id": "ed480051-a08f-45d3-9b65-fb24e57bc010",
+          "status": "succeeded",
+          "last_error_code": null,
+          "inputCount": 1
+        },
+        {
+          "id": "d92b8e39-0f98-4ead-bb88-f8ffeb385483",
+          "status": "failed",
+          "last_error_code": "context_payload_too_large",
+          "inputCount": 2
+        }
+      ],
+      "coreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "34536c11194e47da0a33dbdfa90c7702314860a2e1955af5a27af6ff68bb8868",
+        "stderrBytes": 786
+      },
+      "finishedAt": "2026-10-14T04:27:22.902Z",
+      "fixtureRoot": "/tmp/rovai-bootstrap-budget-acceptance-20261014/baseline-3",
+      "reportSha256": "efcc29372bf569f24b7c6d4e96c3d7d4720c3249b631490f14b30c4d80b17bc7",
+      "observedRuntime": [
+        {
+          "runtime_adapter_kind": "opencode-cli",
+          "runtime_reported_version": "opencode v2.0.25",
+          "runtime_observed_model_id": "sub2api/gpt-6.1-sol"
+        },
+        {
+          "runtime_adapter_kind": "opencode-cli",
+          "runtime_reported_version": "opencode v2.0.25",
+          "runtime_observed_model_id": null
+        }
+      ],
+      "acceptedInputs": [
+        {
+          "agent_run_id": "ac76f06d-1fd7-43d8-a630-82df099224c6",
+          "status": "accepted",
+          "accepted_at": "2026-10-14T04:27:09.100923+00:00",
+          "dynamicPayloadBytes": 1278
+        },
+        {
+          "agent_run_id": "ed480051-a08f-45d3-9b65-fb24e57bc010",
+          "status": "accepted",
+          "accepted_at": "2026-10-14T04:27:22.617407+00:00",
+          "dynamicPayloadBytes": 1341
+        }
+      ]
+    },
+    {
+      "baseline": false,
+      "startedAt": "2026-10-14T04:27:39.782Z",
+      "status": "passed",
+      "model": {
+        "mode": "runtime_default"
+      },
+      "nativeSessionPreserved": true,
+      "manifests": [
+        {
+          "context_manifest_version": 36,
+          "context_delivery_profile_version": 13
+        },
+        {
+          "context_manifest_version": 36,
+          "context_delivery_profile_version": 13
+        },
+        {
+          "context_manifest_version": 36,
+          "context_delivery_profile_version": 13
+        },
+        {
+          "context_manifest_version": 36,
+          "context_delivery_profile_version": 13
+        }
+      ],
+      "runs": [
+        {
+          "id": "3c387f6b-6a9d-48bb-8f1b-c8b9577122d1",
+          "status": "succeeded",
+          "last_error_code": null,
+          "inputCount": 1
+        },
+        {
+          "id": "f27d1fe1-cec8-471d-87a8-87bb862ed968",
+          "status": "succeeded",
+          "last_error_code": null,
+          "inputCount": 1
+        },
+        {
+          "id": "15f72592-b8f0-49e8-a2ea-e973a81aee68",
+          "status": "succeeded",
+          "last_error_code": null,
+          "inputCount": 1
+        },
+        {
+          "id": "ed0b43b5-61e1-4a65-9b13-48b010c9ad1e",
+          "status": "succeeded",
+          "last_error_code": null,
+          "inputCount": 1
+        }
+      ],
+      "coreExit": {
+        "code": 0,
+        "signal": null,
+        "stderrDigest": "f2e9fedf0c064a255128926bc51e00f16268b94b022efc5c88e56bce377516a9",
+        "stderrBytes": 599
+      },
+      "finishedAt": "2026-10-14T04:28:48.743Z",
+      "fixtureRoot": "/tmp/rovai-bootstrap-budget-acceptance-20261014/candidate-3",
+      "reportSha256": "66edda0c0603218fa70d3f1c1112630d5e78ca1c1d2da95249b69e3d2bbc9bad",
+      "observedRuntime": [
+        {
+          "runtime_adapter_kind": "opencode-cli",
+          "runtime_reported_version": "opencode v2.0.25",
+          "runtime_observed_model_id": "sub2api/gpt-6.1-sol"
+        }
+      ],
+      "acceptedInputs": [
+        {
+          "agent_run_id": "3c387f6b-6a9d-48bb-8f1b-c8b9577122d1",
+          "status": "accepted",
+          "accepted_at": "2026-10-14T04:28:09.571964+00:00",
+          "dynamicPayloadBytes": 1279
+        },
+        {
+          "agent_run_id": "f27d1fe1-cec8-471d-87a8-87bb862ed968",
+          "status": "accepted",
+          "accepted_at": "2026-10-14T04:28:21.298018+00:00",
+          "dynamicPayloadBytes": 1342
+        },
+        {
+          "agent_run_id": "15f72592-b8f0-49e8-a2ea-e973a81aee68",
+          "status": "accepted",
+          "accepted_at": "2026-10-14T04:28:33.836057+00:00",
+          "dynamicPayloadBytes": 121479
+        },
+        {
+          "agent_run_id": "ed0b43b5-61e1-4a65-9b13-48b010c9ad1e",
+          "status": "accepted",
+          "accepted_at": "2026-10-14T04:28:48.573636+00:00",
+          "dynamicPayloadBytes": 121350
+        }
+      ],
+      "bootstrapReserves": [
+        {
+          "agentRunId": "3c387f6b-6a9d-48bb-8f1b-c8b9577122d1",
+          "utf8Bytes": 38919
+        },
+        {
+          "agentRunId": "f27d1fe1-cec8-471d-87a8-87bb862ed968",
+          "utf8Bytes": 38919
+        },
+        {
+          "agentRunId": "15f72592-b8f0-49e8-a2ea-e973a81aee68",
+          "utf8Bytes": 39093
+        },
+        {
+          "agentRunId": "ed0b43b5-61e1-4a65-9b13-48b010c9ad1e",
+          "utf8Bytes": 39093
+        }
+      ]
+    }
+  ],
+  "setupFailuresRetained": [
+    {
+      "fixtureRoot": "/tmp/rovai-bootstrap-budget-acceptance-20261014/baseline",
+      "status": "failed",
+      "error": "The expression evaluated to a falsy value:\n\n  assert.ok(binding.native_session_id && binding.native_charter_digest)\n",
+      "reportSha256": "e2f6ca10775d664027bba132beae5e62cd79e12afab1a5c8dc64f5eaf62c2dcc"
+    },
+    {
+      "fixtureRoot": "/tmp/rovai-bootstrap-budget-acceptance-20261014/candidate",
+      "status": "failed",
+      "error": "The expression evaluated to a falsy value:\n\n  assert.ok(binding.native_session_id && binding.native_charter_digest)\n",
+      "reportSha256": "6e08dd5dad3489a2ea33af22adbd5b169ca4b0ec8fcd5d0f1757286a72e3769b"
+    },
+    {
+      "fixtureRoot": "/tmp/rovai-bootstrap-budget-acceptance-20261014/baseline-2",
+      "status": "failed",
+      "error": "Expected values to be strictly equal:\n+ actual - expected\n\n+ 'rejected'\n- 'applied'\n",
+      "reportSha256": "c16897f6f5d4f65646e9b548998cdbbc976b33c6a0a97272c0ef240672d1a03a"
+    },
+    {
+      "fixtureRoot": "/tmp/rovai-bootstrap-budget-acceptance-20261014/candidate-2",
+      "status": "failed",
+      "error": "Expected values to be strictly equal:\n+ actual - expected\n\n+ 'rejected'\n- 'applied'\n",
+      "reportSha256": "d5ae8515c302217968ba16ebf6bad7ec75e35fd68ef2f863c065c5aa779fe442"
+    }
+  ],
+  "reviews": {
+    "codeCommit": "2cf6f692",
+    "standards": {
+      "codeStatus": "passed",
+      "remainingCodeFindings": 0,
+      "evidenceLimit": "Complete semantic Gate not_run"
+    },
+    "spec": {
+      "status": "passed",
+      "remainingFindings": 0
+    }
+  }
+}

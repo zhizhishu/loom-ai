@@ -1,0 +1,142 @@
+{
+  "platform": "windows-x64",
+  "runtime": "command-code-cli",
+  "runtimeVersion": "1.88.0",
+  "requiredVersion": ">=1.88.0 stable",
+  "admission": "preview",
+  "reasonCode": "runtime_platform.qualification_evidence_missing",
+  "evidenceRevision": null,
+  "sourceCommit": "51da43668fa9b9e50cd94c86a29825db8666f79a",
+  "coreSha256": "2e26d08e2db7263193bd9baa66f82e1c9d964c0c29faf8d7f277bd102cd66489",
+  "channel": "Windows debug qualification Core at identical main source",
+  "qualificationOverride": "command-code-cli",
+  "provider": "local sub2api",
+  "model": "sub2api/gpt-6",
+  "requestedEffort": "xhigh",
+  "checks": [
+    {
+      "name": "真实 Core Skills 与 MCP 工具调用",
+      "status": "passed",
+      "durationMs": 79527,
+      "evidence": {
+        "runId": "2c6eeb4c-b736-4060-b49d-a5f8a6e80bb4",
+        "answer": "CORE_A_3e0b4c19| 我实际观察到两个回执：SKILL_A_71871250-ee8d-42c6-a53a-8e079f34e686；MCP_A_b232f3b6-8fc0-4704-857e-316b0e9fcc21:first。",
+        "binding": {
+          "native_binding_id": "c6d0b08b-ecbd-47eb-8f3a-338e00da3a21",
+          "native_session_id": "3879013f-de69-4f23-a7b9-61ab36d45313"
+        }
+      }
+    },
+    {
+      "name": "修改 Skill 和已分配 MCP：后继 Run 生效并保持 Session",
+      "status": "passed",
+      "durationMs": 72322,
+      "evidence": {
+        "runId": "8e0fc8da-5aca-453d-a475-f86c6d17fba0",
+        "answer": "CORE_A_3e0b4c19| 我本轮实际观察到两个新回执：SKILL_B_ca8dac30-ab9d-4816-b14c-18147ea576d8；MCP_B_3d681a11-4ec1-4cfa-95af-8bf59cf7853f:updated。",
+        "binding": {
+          "native_binding_id": "c6d0b08b-ecbd-47eb-8f3a-338e00da3a21",
+          "native_session_id": "3879013f-de69-4f23-a7b9-61ab36d45313"
+        }
+      }
+    },
+    {
+      "name": "撤销 MCP 分配：后继 Run 无旧工具",
+      "status": "passed",
+      "durationMs": 70135,
+      "evidence": {
+        "runId": "e9cbee20-cf37-40c2-aeca-03b15592da10",
+        "answer": "CORE_A_3e0b4c19| 我用 search_tools 搜索 windows_gap echo，返回 No deferred tool matched，当前未发现可用的该 MCP 工具，本轮未调用 MCP。刚用 read_file 读取的当前技能文件回执为 SKILL_B_ca8dac30-ab9d-4816-b14c-18147ea576d8。",
+        "additionalMcpCalls": 0
+      }
+    },
+    {
+      "name": "Core 关闭回收 Runtime 与 MCP 后继恢复",
+      "status": "passed",
+      "durationMs": 57190,
+      "evidence": {
+        "runId": "0c381a0a-f4ef-4a38-a681-1be2969ab020",
+        "answer": "CORE_A_3e0b4c19| 我本轮重新读取并实际调用后观察到两个当前回执：SKILL_B_ca8dac30-ab9d-4816-b14c-18147ea576d8；MCP_B_3d681a11-4ec1-4cfa-95af-8bf59cf7853f:cold。",
+        "binding": {
+          "native_binding_id": "c6d0b08b-ecbd-47eb-8f3a-338e00da3a21",
+          "native_session_id": "3879013f-de69-4f23-a7b9-61ab36d45313"
+        }
+      }
+    },
+    {
+      "name": "真实模型建立随机记忆",
+      "status": "passed",
+      "durationMs": 11765,
+      "evidence": {
+        "answer": "我会读取指定文件并提取 FILE_RECEIPT_ 回执。\nWIN_CC_A_934fff59| FILE_RECEIPT_32268781-eb8a-444e-aa5f-63aa91c7a79f",
+        "sessionId": "f8ca99e4-1004-40da-a136-0e99d926c47e"
+      }
+    },
+    {
+      "name": "原生手动压缩及压缩后 System/记忆连续",
+      "status": "passed",
+      "durationMs": 54695,
+      "evidence": {
+        "sessionId": "f8ca99e4-1004-40da-a136-0e99d926c47e",
+        "compactionReply": "Compacted 16 messages to 5, freeing about 853 tokens.",
+        "compactionModelRequests": 1,
+        "after": "WIN_CC_A_934fff59|FILE_RECEIPT_32268781-eb8a-444e-aa5f-63aa91c7a79f"
+      }
+    },
+    {
+      "name": "压缩后冷恢复及更新 System",
+      "status": "passed",
+      "durationMs": 12435,
+      "evidence": {
+        "sessionId": "f8ca99e4-1004-40da-a136-0e99d926c47e",
+        "answer": "WIN_CC_B_8b1479f4|FILE_RECEIPT_32268781-eb8a-444e-aa5f-63aa91c7a79f"
+      }
+    },
+    {
+      "name": "模型请求中强杀 Core：Job 回收 Runtime 与 MCP，后继恢复",
+      "status": "passed",
+      "durationMs": 62627,
+      "evidence": {
+        "killedCorePid": 49880,
+        "ownedPids": [
+          60636,
+          12884,
+          68008,
+          59664,
+          17240
+        ],
+        "remaining": [],
+        "nextRunId": "4f15689e-8ab7-427c-b571-05b8592b00d0",
+        "answer": "CORE_A_176ab66e| AFTER_CORE_CRASH_OK"
+      }
+    }
+  ],
+  "permissionDenial": {
+    "status": "passed_safety_branch",
+    "resolutionCode": "user_selected_deny",
+    "fileCreated": false,
+    "nativeDecision": "reject_once",
+    "run": {
+      "id": "edb680ee-b508-4833-a5c3-150c08a6dae5",
+      "status": "failed",
+      "last_error_code": "runtime_missing_final_output"
+    },
+    "observation": "Native ACP ended as end_turn without a public final; Core reports runtime_missing_final_output. This is retained as an observed limitation, not counted as a successful published Run."
+  },
+  "limitations": [
+    "Official Windows ACP fails to start MCP executables whose absolute path contains spaces; complex argv may be split. Plain node and simple arguments work. The same behavior was independently reproduced without Rovai.",
+    "Permission rejection can end the native turn without publishing a final; Core reports the missing final and prevents the rejected write.",
+    "Automatic threshold/overflow compaction, broad native Skills variants and member isolation, Usage/cost completeness and the full qualification matrix have not been established by this focused pass.",
+    "Debug functional evidence does not substitute for the final release admission and installed App smoke."
+  ],
+  "cleanup": {
+    "authCopiesRemoved": true,
+    "mcodeConfigUnchanged": true,
+    "ownedProcessesReaped": true
+  },
+  "attempts": {
+    "permissionHarness": "Initial script assumed native reject_once was the public kind, then assumed an internal allowsAction field. Both assumptions were corrected. The real deny receipt and absent file were independently audited; native missing-final behavior is retained.",
+    "compaction": "Two initial short histories returned Nothing to compact yet. After exceeding the native 30000-token recent tail and five older messages, the real summarizer ran: 16 messages to 5."
+  },
+  "recordedAt": "2026-10-25T14:09:31.458Z"
+}

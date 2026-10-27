@@ -1,0 +1,2809 @@
+import { isInterfaceLanguage } from '../shared/general-preferences-model'
+import { creationPreferences, withHostConversationPreferences } from '../shared/host-general-preferences'
+import { createHostChannelHandler } from './host-channels'
+import { FilePreviewFrameNavigation } from './file-preview/file-preview-navigation'
+import { installWindowNavigation } from './window-navigation'
+import { ShortcutPreferencesStore } from './shortcut-preferences'
+import { installShortcutInput } from './shortcut-input'
+import { installBundledCliEntry } from './bundled-cli-entry'
+import { chmod, lstat, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { webLinkWindowHandler } from './web-link-window-handler'
+import { randomUUID } from 'node:crypto'
+import bundledReleaseNotes from '../../../../build/release-notes.md?raw'
+import bundledReleaseMetadata from '../../../../build/release-metadata.json'
+import { dirname, extname, join } from 'node:path'
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  Menu,
+  MessageChannelMain,
+  nativeTheme,
+  powerMonitor,
+  protocol,
+  screen,
+  systemPreferences,
+  shell
+} from 'electron'
+import { isThreadId } from '@contracts'
+import type {
+  AppearancePreferences,
+  AppearanceSnapshot,
+  CoreMethod,
+  ExecutionWebSettingsSnapshot,
+  ExecutionConsolePlacement,
+  MonitoringFilter,
+  LocalAttachmentAvailability,
+  LocalAttachmentOwnerLocator,
+  LocalAttachmentSourceView,
+  RuntimeUsageSnapshot,
+  NavigationPin,
+  NavigationPreferencesSnapshot,
+  SaveMemberAvatarAssetInput,
+  SettingsSection,
+  StartupLocationMode,
+  StructuredError,
+  SupervisorSnapshot
+} from '@contracts'
+import {
+  CoreClient,
+  RovaiRequestError,
+  desktopSkillLibraryRoot,
+  resolveCoreBinary,
+  resolveDesktopBootstrapBinary
+} from './core-client'
+import {
+  isThemePreference,
+  nativeThemeSource,
+  AppearancePreferencesStore,
+  resolvedTheme,
+  themeBackground
+} from './appearance-preference'
+import { DEFAULT_APPEARANCE, resolveThemeId } from '../shared/appearance'
+import {
+  readWindowStateFile,
+  resetWindowBounds,
+  sanitizeWindowState,
+  windowResetCapability,
+  writeWindowStateFile
+} from './window-state'
+import {
+  inspectMemberAvatarSourceFile,
+  MemberAvatarAssetService
+} from './member-avatar-assets'
+import { legacyUserDataPath } from './user-data-path'
+import { deleteRetiredManagedDirectory } from './quick-chat-cutover'
+import { CurrentUserProfileStore } from './current-user-profile'
+import { NavigationPreferencesStore } from './navigation-preferences'
+import { isNavigationThreadReadState } from '../shared/navigation-preferences-model'
+import { revealProjectDirectory } from './reveal-project-directory'
+import {
+  ProjectAccessTransactionCoordinator,
+  removedProjectRootsFromSnapshot,
+  restoreProjectAccessFailClosed
+} from './project-access-restore'
+import { RUNTIME_RENDERER_CORE_METHODS } from './runtime-core-methods'
+import {
+  GeneralPreferencesStore,
+  isExecutionConsolePlacement,
+  isInterfaceLanguagePreference,
+  isNewConversationDefaults,
+  isSettingsSection,
+  isStartupLocationMode
+} from './general-preferences'
+import { RestorableLocationStore, parseRestorableLocation } from './restorable-location'
+import { DesktopSessionRegistry } from './desktop-session'
+import { parseClipboardWriteRequest } from './clipboard-write'
+import { OnboardingStore } from './onboarding-preferences'
+import { DailyAnalysisService } from './daily-analysis'
+import { EvaluationHostService } from './evaluation-host'
+import { pageZoomFactor, pageZoomPercentage } from './page-zoom'
+import { installPageZoomShortcut } from './page-zoom-shortcut'
+import { applyWindowChromeAppearance, windowChromeOptions } from './window-chrome'
+import {
+  parseWindowsApplicationMenuPopupRequest,
+  prepareWindowsApplicationMenu,
+  windowsApplicationSubmenu
+} from './windows-application-menu'
+import {
+  UserAutomationError,
+  UserAutomationServer,
+  startUserAutomationOptional,
+  userAutomationRoot
+} from './user-automation'
+import {
+  isAttachmentId,
+  openDesktopAttachmentTarget,
+  parseDesktopAttachmentTarget,
+  revealDesktopAttachmentTarget,
+  type DesktopAttachmentTarget
+} from './attachment-desktop'
+import { createPastedTextAttachment, LocalComposerAttachmentRegistry } from './local-composer-attachments'
+import {
+  prepareWindowsBootstrapRoot,
+  prepareWindowsDataRoot,
+  resolveWindowsDataRoot
+} from './windows-data-root'
+import {
+  assessWindowsDesktopBootstrap,
+  windowsBootstrapInstanceKey,
+  type WindowsBootstrapAssessment
+} from './windows-bootstrap'
+import {
+  AppUpdatesService,
+  createAppUpdatesServiceFailOpen,
+  type DesktopAutoUpdater
+} from './app-updates'
+import { AppQuitCoordinator } from './app-quit-coordinator'
+import { requestRendererQuitPreparation } from './renderer-quit-preparation'
+import { createWindowCloseHandler } from './window-close-guard'
+import { WindowsWindowClose, restoreMainWindow } from './windows-window-close'
+import { WindowClosePreferences } from './window-close-preferences'
+import { createWindowsTray } from './windows-tray'
+import { WINDOW_CLOSE_CHANNEL, WINDOW_CLOSE_CHANGED } from '../shared/window-close'
+import { createWindowCloseRequestHandler } from './window-close-ipc'
+import { installCloseTabShortcut } from '../shared/close-tab-shortcut'
+import { ChannelSettingsService } from './channel-settings'
+import { optionalChannelKind } from './channel-kind-input'
+import {
+  FEISHU_PROVIDER_PROFILE,
+  LARK_PROVIDER_PROFILE,
+  type ChannelProviderProfile
+} from './channel-provider-profile'
+import { ExecutionViewService } from './execution-view-service'
+import { createFeishuExecutionPreviewHost } from './feishu-execution-preview'
+import { ChannelSettingsCoordinator, hasPublishedChannelBot } from './channel-settings-coordinator'
+import { parseChannelLoginViewBounds } from './dingtalk-login-view'
+import { ChannelHostLifecycle } from './channel-host-lifecycle'
+import {
+  SqliteChannelCredentialStore,
+  SqliteChannelDeveloperSessionStore
+} from './channel-credential-store'
+import { ElectronFeishuDeveloperSessionService } from './feishu-developer-session'
+import { FeishuWebSessionMemberBotProvisioner } from './feishu-member-bot-provisioner'
+import { ControlledMemberBotAvatarSourceResolver } from './member-bot-avatar-source'
+import {
+  DingTalkDeveloperGateway
+} from './dingtalk-developer-gateway'
+import { ElectronDingTalkDeveloperSessionService } from './dingtalk-developer-session'
+import { DingTalkOpenPlatformMemberBotProvisioner } from './dingtalk-member-bot-provisioner'
+import {
+  DINGTALK_REQUIRED_SCOPE_VALUES,
+  DingTalkChannelSettingsService
+} from './dingtalk-channel-settings'
+import { CoreFilePreviewSourceAuthority } from './file-preview/file-preview-authority'
+import { FilePreviewService } from './file-preview/file-preview-service'
+import {
+  parseChooseRootRequest,
+  parseCopyPathRequest,
+  parseFilePreviewThread,
+  parseGenerationRequest,
+  parseHtmlSiteRequest,
+  parseHandleRequest,
+  parseLineRequest,
+  parseOpenFilePreviewRequest,
+  parseRestoreFilePreviewRequest,
+  parsePageRequest,
+  parseReloadRequest,
+  parseRetentionState,
+  parseReopenRequest
+} from './file-preview/file-preview-ipc-input'
+
+const mainStartupStartedAt = performance.now()
+console.info('[startup] stage=main_module_loaded elapsed_ms=0.0')
+
+const allowedMethods = new Set<CoreMethod>([
+  'health.check',
+  'preferences.tasks.get',
+  'preferences.tasks.set',
+  'diagnostics.check',
+  'monitoring.snapshot',
+  'monitoring.execution',
+  ...RUNTIME_RENDERER_CORE_METHODS,
+  'members.list',
+  'members.get',
+  'members.threads.list',
+  'members.create',
+  'members.update',
+  'members.avatar.set',
+  'members.runtime.set',
+  'members.runtime.clear',
+  'members.presence.set',
+  'members.removalPreview',
+  'members.remove',
+  'members.reorder',
+  'teams.list',
+  'teams.save',
+  'teams.delete',
+  'automations.list',
+  'automations.runs.list',
+  'automations.get',
+  'automations.create',
+  'automations.update',
+  'automations.close',
+  'automations.delete',
+  'automations.run',
+  'memory.list',
+  'memory.get',
+  'memory.create',
+  'memory.revise',
+  'memory.retire',
+  'memory.reactivate',
+  'memory.forget',
+  'memory.supersede',
+  'memory.review.schedule',
+  'memory.hearthReviewItems.list',
+  'memory.hearthReviewItems.accept',
+  'memory.hearthReviewItems.reject',
+  'runtime.installations.list',
+  'runtime.subsystems.get',
+  'runtime.subsystems.retry',
+  'runtime.installations.create',
+  'runtime.installations.update',
+  'runtime.installations.refresh',
+  'skills.list',
+  'skills.get',
+  'toolbox.list',
+  'toolbox.read',
+  'toolbox.setMembers',
+  'nativeSkills.list',
+  'nativeSkills.read',
+  'skills.candidates',
+  'threadReferences.list',
+  'threadReferences.resolve',
+  'skills.content.read',
+  'skills.deliveryGroups.list',
+  'skills.import.inspect',
+  'skills.import.github.inspect',
+  'skills.import.commit',
+  'skills.setEnabled',
+  'skills.setGroupAssignments',
+  'skills.delete',
+  'skills.projections.listIssues',
+  'skills.reconcile',
+  'skills.cleanupLegacyEntries',
+  'skills.revealLocation',
+  'mcp.config.get',
+  'mcp.servers.reveal',
+  'mcp.servers.setMembers',
+  'mcp.config.repairPermissions',
+  'mcp.servers.create',
+  'mcp.servers.update',
+  'mcp.servers.setEnabled',
+  'mcp.assignments.set',
+  'mcp.servers.delete',
+  'mcp.import.scan',
+  'mcp.import.commit',
+  'conversations.memberSession.get',
+  'conversations.restartNativeSession',
+  'app.info',
+  'threads.creationPreflight',
+  'workspaces.inspect',
+  'navigation.snapshot',
+  'navigation.threads',
+  'navigation.groupThreads',
+  'navigation.findThread',
+  'navigation.campViewed',
+  'missions.workspace.cleanup',
+  'missions.cleanup.list',
+  'missions.cleanup.retry',
+  'missions.list',
+  'missions.get',
+  'missions.activity',
+  'missions.delivery',
+  'missions.changes',
+  'missions.fileDiff',
+  'missions.diffSession.release',
+  'missions.create',
+  'missions.update',
+  'missions.status',
+  'missions.start',
+  'missions.linkPr',
+  'threads.create',
+  'threads.discardPending',
+  'threads.pendingDraft.setPresence',
+  'threads.rename',
+  'threads.members.fast.check',
+  'threads.members.fast.set',
+  'threads.members.add',
+  'threads.members.removalPreview',
+  'threads.members.remove',
+  'threads.changeDefaultLead',
+  'threads.reconcileDefaultLead',
+  'threads.exists',
+  'threads.enter',
+  'threads.open',
+  'threads.delete',
+  'threads.deletionIssues',
+  'threads.retryDeletion',
+  'singleChat.list',
+  'singleChat.get',
+  'singleChat.open',
+  'singleChat.send',
+  'singleChat.end',
+  'singleChat.pendingInputs.edit',
+  'agentRuns.cancel',
+  'agentRuns.continue',
+  'threads.snapshot',
+  'agentRunFileChanges.get',
+  'agentRunImages.read',
+  'thread.messages.page',
+  'thread.messages.anchors',
+  'thread.messages.anchorPreview',
+  'thread.messages.replies',
+  'thread.messages.around',
+  'thread.messages.find',
+  'agentRunEvidence.getContent',
+  'agentRunEvidence.list',
+  'agentRunExecution.page',
+  'agentRunExecution.changes',
+  'tasks.create',
+  'tasks.update',
+  'tasks.list',
+  'tasks.get',
+  'thread.attachments.location',
+  'messageQuotes.mutateDraft',
+  'messageQuotes.capture',
+  'thread.messages.send',
+  'thread.messages.withdraw',
+  'userAutomation.thread.send',
+  'action.approvals.resolve',
+  'notifications.inbox',
+  'notifications.threadInterruptions',
+  'notifications.changesSince',
+  'notifications.acknowledge',
+  'notifications.acknowledgeVisibleSources',
+  'notifications.acknowledgeThreadInterruptions',
+  'notifications.markAllRead',
+  'notifications.clear',
+  'notifications.preference.get',
+  'notifications.preference.update',
+  'events.subscribe',
+  'diagnostics.export'
+])
+const APP_NAME = 'Rovai AI'
+app.setName(APP_NAME)
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'rovai-preview',
+  privileges: {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    corsEnabled: true,
+    stream: true
+  }
+}])
+const hasExplicitUserDataDirectory = app.commandLine.hasSwitch('user-data-dir')
+const isolatedAcceptanceInstance =
+  process.env.ROVAI_ALLOW_ISOLATED_INSTANCE === '1'
+  && hasExplicitUserDataDirectory
+let coreDataPath: string | null = null
+let windowsBootstrap: WindowsBootstrapAssessment | null = null
+let primaryInstance: boolean
+if (process.platform === 'win32') {
+  const explicitRoot = hasExplicitUserDataDirectory ? app.commandLine.getSwitchValue('user-data-dir') : null
+  windowsBootstrap = assessWindowsDesktopBootstrap({
+    electronApp: app,
+    isolatedInstance: isolatedAcceptanceInstance,
+    prepareShell: () => prepareWindowsBootstrapRoot(
+      resolveDesktopBootstrapBinary(), windowsBootstrapInstanceKey(explicitRoot)
+    ),
+    prepareAuthority: () => prepareWindowsDataRoot(
+      resolveCoreBinary(), resolveWindowsDataRoot(explicitRoot, process.env.LOCALAPPDATA)
+    )
+  })
+  primaryInstance = windowsBootstrap.kind === 'ready' || windowsBootstrap.kind === 'blocked'
+  if (windowsBootstrap.kind === 'ready') {
+    coreDataPath = windowsBootstrap.layout.core
+    console.info(
+      `[startup] stage=windows_data_root_ready elapsed_ms=${(performance.now() - mainStartupStartedAt).toFixed(1)}`
+    )
+  } else if (windowsBootstrap.kind === 'shell_storage_unavailable') {
+    // No safe Chromium profile exists. Do not silently switch to a broad-ACL
+    // default or write authority into a fallback folder. This is a native dialog,
+    // not a thrown module-load exception or a Full Core crash/restart loop.
+    dialog.showErrorBox('Rovai 无法准备安全的桌面存储',
+      `Core 未启动，也没有创建替代工作区。\n\n${windowsBootstrap.error.message}`)
+  }
+} else {
+  const legacyDataPath = legacyUserDataPath(
+    app.getPath('appData'),
+    APP_NAME,
+    hasExplicitUserDataDirectory
+  )
+  if (legacyDataPath) app.setPath('userData', legacyDataPath)
+  coreDataPath = app.getPath('userData')
+  primaryInstance = isolatedAcceptanceInstance || app.requestSingleInstanceLock()
+}
+if (!primaryInstance) app.quit()
+const core = new CoreClient(coreDataPath)
+if (windowsBootstrap?.kind === 'blocked') {
+  core.blockStartup(windowsBootstrap.error, 'preparing_windows_data_root')
+}
+let appUpdates: AppUpdatesService | null = null
+let mainWindow: BrowserWindow | null = null
+let appearanceStore: AppearancePreferencesStore | null = null
+let appearanceFilePath = ''
+let lastDiagnosticsExportPath: string | null = null
+let lastMonitoringExportPath: string | null = null
+let lastAppearanceSignature = ''
+let generalPreferences: GeneralPreferencesStore | null = null
+let shortcutPreferences: ShortcutPreferencesStore | null = null
+const shortcutInputs = new Map<number, ReturnType<typeof installShortcutInput>>()
+let windowsWindowClose: WindowsWindowClose | null = null
+let currentUserProfile: CurrentUserProfileStore | null = null
+let onboarding: OnboardingStore | null = null
+let restorableLocations: RestorableLocationStore | null = null
+let navigationPreferences: NavigationPreferencesStore | null = null
+let desktopBackgroundTimer: NodeJS.Timeout | null = null
+let dailyAnalysis: DailyAnalysisService | null = null
+let evaluationHost: EvaluationHostService | null = null
+let localStoresReady = false
+let resolveLocalStoresLoaded: () => void
+const localStoresLoaded = new Promise<void>((resolve) => { resolveLocalStoresLoaded = resolve })
+let localDegradations: StructuredError[] = windowsBootstrap?.kind === 'blocked' ? [{
+  code: 'windows_bootstrap_profile_active',
+  message: '当前使用独立的受保护壳层存储，不含 Core 数据。这里的外观设置不会覆盖正式工作区偏好；重新检查会重启桌面壳层。',
+  retryable: true,
+  details: {}
+}] : []
+let onboardingAuthorityKey: string | null = null
+let retiredManagedDirectoryCleanupStarted = false
+const projectAccessTransactions = new ProjectAccessTransactionCoordinator()
+let userAutomation: UserAutomationServer | null = null
+const desktopSessions = new DesktopSessionRegistry()
+const memberAvatars = coreDataPath === null ? null : new MemberAvatarAssetService(coreDataPath)
+
+const wakeNetworkRecoveryAfterSystemResume = (): void => {
+  void core.request('runtime.networkRecovery.wake').catch(() => undefined)
+}
+
+const memberBotAvatarSource = new ControlledMemberBotAvatarSourceResolver({
+  read: async (avatarRef, _rendition, targetEdge) => {
+    const image = await core.request<{
+      base64: string; mediaType: 'image/png'; width: number; height: number; crop: import('@contracts').MemberAvatarCrop
+    } | null>('memberAvatars.read', { avatarRef, rendition: 'icon', staticPng: true, targetEdge })
+    return image ? { ...image, bytes: Uint8Array.from(Buffer.from(image.base64, 'base64')) } : null
+  }
+}, undefined, coreDataPath ? join(coreDataPath, 'member-bot-avatar-exports') : undefined)
+const channelCredentialStore = new SqliteChannelCredentialStore(core)
+const channelDeveloperSessionStore = new SqliteChannelDeveloperSessionStore(core)
+const executionView = new ExecutionViewService({
+  core,
+  settingsFilePath: join(app.getPath('userData'), 'execution-web.json')
+})
+// Feishu and Lark are two instances of one Host; each owns its session, provisioner and profile.
+function openPlatformChannelSettings(
+  profile: ChannelProviderProfile,
+  executionPreview?: ReturnType<typeof createFeishuExecutionPreviewHost>
+): ChannelSettingsService {
+  const developerSession = new ElectronFeishuDeveloperSessionService(
+    channelDeveloperSessionStore,
+    () => mainWindow,
+    { loginProfile: profile.login }
+  )
+  return new ChannelSettingsService({
+    core,
+    profile,
+    credentialStore: channelCredentialStore.forProvider(profile.kind),
+    developerSession,
+    memberBotProvisioner: new FeishuWebSessionMemberBotProvisioner(developerSession, {
+      sdkDomain: profile.sdkDomain
+    }),
+    memberBotAvatarSource,
+    executionPreview,
+    executionView
+  })
+}
+const feishuChannelSettings = openPlatformChannelSettings(
+  FEISHU_PROVIDER_PROFILE,
+  createFeishuExecutionPreviewHost(process.argv, coreDataPath)
+)
+const larkChannelSettings = openPlatformChannelSettings(LARK_PROVIDER_PROFILE)
+const dingtalkDeveloperSession = new ElectronDingTalkDeveloperSessionService({
+  store: channelDeveloperSessionStore,
+  getParentWindow: () => mainWindow
+})
+const dingtalkDeveloperGateway = new DingTalkDeveloperGateway({
+  session: dingtalkDeveloperSession
+})
+const dingtalkChannelSettings = new DingTalkChannelSettingsService({
+  core,
+  credentialStore: channelCredentialStore,
+  developerSession: dingtalkDeveloperSession,
+  provisioner: new DingTalkOpenPlatformMemberBotProvisioner({
+    developerApi: dingtalkDeveloperGateway,
+    developerSession: dingtalkDeveloperSession
+  }),
+  avatarSource: memberBotAvatarSource,
+  executionView,
+  requiredScopeValues: DINGTALK_REQUIRED_SCOPE_VALUES
+})
+const channelSettings = new ChannelSettingsCoordinator({
+  feishu: feishuChannelSettings,
+  lark: larkChannelSettings,
+  dingtalk: dingtalkChannelSettings
+})
+core.setChannelHandler(createHostChannelHandler(channelSettings))
+const channelHostLifecycle = new ChannelHostLifecycle({
+  async start() {
+    await channelSettings.start()
+    await executionView.setPublishedChannelBotAvailable(
+      hasPublishedChannelBot(await channelSettings.get())
+    )
+    if (coreDataPath !== null) {
+      await removeRetiredChannelCredentialFiles(coreDataPath).catch((error) => {
+        console.warn('[rovai] Retired channel credential file cleanup failed; Channel Hosts remain available.', error)
+      })
+    }
+  },
+  stop: () => channelSettings.stop()
+})
+channelSettings.onChanged((snapshot) => {
+  void executionView.setPublishedChannelBotAvailable(hasPublishedChannelBot(snapshot)).catch((error) => {
+    console.warn('[rovai] Execution Web published Bot gate update failed.', error)
+  })
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
+  mainWindow.webContents.send('rovai:channels-changed', snapshot)
+})
+executionView.onChanged((snapshot) => {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
+  mainWindow.webContents.send('rovai:execution-web-settings-changed', snapshot)
+})
+const localComposerAttachments = new LocalComposerAttachmentRegistry(
+  join(app.getPath('userData'), 'local-composer-attachments-v1.json')
+)
+const filePreview = new FilePreviewService(
+  new CoreFilePreviewSourceAuthority(core, async (locator) =>
+    (await localComposerAttachments.resolveTarget(locator))?.target ?? null),
+  {
+    previewProtectedRoots() {
+      return [
+        app.getPath('userData'),
+        ...(coreDataPath === null ? [] : [coreDataPath]),
+        userAutomationRoot(app.getPath('appData'), app.getPath('userData'), hasExplicitUserDataDirectory)
+      ]
+    },
+    previewHostOrigin(webContentsId) {
+      if (mainWindow?.webContents.id !== webContentsId) throw new Error('Preview window is unavailable')
+      return new URL(mainWindow.webContents.getURL()).origin
+    },
+    async selectRoot(webContentsId) {
+      const window = mainWindow?.webContents.id === webContentsId ? mainWindow : null
+      if (!window || window.isDestroyed()) return null
+      const result = await dialog.showOpenDialog(window, {
+        title: '授权文件所在目录',
+        buttonLabel: '选择目录',
+        properties: ['openDirectory']
+      })
+      return result.canceled ? null : result.filePaths[0] ?? null
+    },
+    async confirmOpen(displayName) {
+      const options = {
+        type: 'warning' as const,
+        buttons: ['取消', '仍然打开'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        message: '此文件可能执行程序或安装软件',
+        detail: `只有在你确认来源可信时才继续。\n\n${displayName}`
+      }
+      const result = mainWindow
+        ? await dialog.showMessageBox(mainWindow, options)
+        : await dialog.showMessageBox(options)
+      return result.response === 1
+    },
+    openPath(path) {
+      return shell.openPath(path)
+    },
+    revealPath(path) {
+      shell.showItemInFolder(path)
+    },
+    copyText(text) {
+      clipboard.writeText(text)
+    },
+    publishResourcesReleased(webContentsId, handleIds) {
+      if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents.id === webContentsId)
+        mainWindow.webContents.send('rovai:file-preview-resources-released', { handleIds })
+    },
+    publishExternalUpdate(notification) {
+      if (
+        !mainWindow
+        || mainWindow.isDestroyed()
+        || mainWindow.webContents.id !== notification.webContentsId
+      ) return
+      mainWindow.webContents.send('rovai:file-preview-external-update', {
+        threadId: notification.threadId,
+        previewKeys: notification.previewKeys
+      })
+    }
+  }
+)
+const filePreviewProtocolSessions = new WeakSet<Electron.Session>()
+
+function installFilePreviewProtocol(window: BrowserWindow): void {
+  const targetSession = window.webContents.session
+  if (filePreviewProtocolSessions.has(targetSession)) return
+  targetSession.webRequest.onBeforeRequest(
+    { urls: ['rovai-preview://asset/*'] },
+    (details, callback) => {
+      callback({
+        cancel: !filePreview.authorizeHtmlAsset(
+          details.webContentsId ?? -1,
+          details.method,
+          details.url
+        )
+      })
+    }
+  )
+  targetSession.protocol.handle('rovai-preview', (request) => filePreview.serveHtmlAsset(request))
+  filePreviewProtocolSessions.add(targetSession)
+}
+
+function publishLocalDegradations(next: StructuredError[]): void {
+  localDegradations = [...new Map(next.map((degradation) => [
+    degradation.code,
+    degradation
+  ])).values()]
+  core.setLocalDegradations(localDegradations)
+}
+
+function maybeInitializeOnboarding(snapshot: SupervisorSnapshot): void {
+  if (coreDataPath === null) return
+  if (!localStoresReady || !onboarding) return
+  if (snapshot.fullCoreState !== 'ready' || snapshot.authorityState.kind !== 'current') return
+  const origin = snapshot.authorityState.origin ?? 'existing'
+  const key = `${snapshot.generation}:${origin}`
+  if (onboardingAuthorityKey === key) return
+  onboardingAuthorityKey = key
+  void onboarding.initialize(origin !== 'initialized', {
+    persist: onboarding.loadDegradation === null
+  }).catch((error) => {
+    publishLocalDegradations([
+      ...localDegradations,
+      {
+        code: 'onboarding_authority_initialization_failed',
+        message: error instanceof Error ? error.message : String(error),
+        retryable: true,
+        details: {}
+      }
+    ])
+  })
+  if (!retiredManagedDirectoryCleanupStarted) {
+    retiredManagedDirectoryCleanupStarted = true
+    void deleteRetiredManagedDirectory(coreDataPath).catch((error) => {
+      publishLocalDegradations([
+        ...localDegradations,
+        {
+          code: 'retired_managed_directory_cleanup_failed',
+          message: error instanceof Error ? error.message : String(error),
+          retryable: true,
+          details: {}
+        }
+      ])
+    })
+  }
+}
+
+async function initializeAppUpdates(): Promise<void> {
+  // electron-updater eagerly touches Electron's native autoUpdater while the
+  // module is evaluated. Loading it before app.whenReady() can stall packaged
+  // macOS startup before our main module runs, so keep it on the ready path.
+  let autoUpdater: DesktopAutoUpdater | null = null
+  try {
+    const updaterModule = await import('electron-updater')
+    autoUpdater = (updaterModule.autoUpdater
+      ?? (updaterModule.default as { autoUpdater?: DesktopAutoUpdater } | undefined)?.autoUpdater
+      ?? null) as DesktopAutoUpdater | null
+    if (!autoUpdater) throw new Error('electron-updater did not expose autoUpdater')
+  } catch (error) {
+    console.warn('[rovai] Application updater is unavailable; startup will continue.', error)
+  }
+  const service = createAppUpdatesServiceFailOpen({
+    currentVersion: () => app.getVersion(),
+    bundledReleaseNotes,
+    bundledReleaseMetadata,
+    isPackaged: () => app.isPackaged,
+    updater: autoUpdater as unknown as DesktopAutoUpdater | null,
+    automaticChecksEnabled: !(
+      isolatedAcceptanceInstance
+      && process.env.ROVAI_DISABLE_AUTO_UPDATE_CHECKS === '1'
+    )
+  }, (error) => {
+    console.warn('[rovai] Application updater initialization failed; startup will continue.', error)
+  })
+  service.onChanged((snapshot) => {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
+    mainWindow.webContents.send('rovai:app-updates-changed', snapshot)
+  })
+  appUpdates = service
+}
+
+function requireAppUpdates(): AppUpdatesService {
+  if (!appUpdates) throw new Error('Application updates are not ready')
+  return appUpdates
+}
+
+function removeRetiredLoginItemRegistration(): void {
+  if (process.platform !== 'darwin' || !app.isPackaged) return
+  try {
+    app.setLoginItemSettings({
+      type: 'mainAppService',
+      openAtLogin: false
+    })
+  } catch (error) {
+    console.warn('[rovai] Retired macOS login item cleanup failed; continuing.', error)
+  }
+}
+
+function appearanceSnapshot(): AppearanceSnapshot {
+  return {
+    ...(appearanceStore?.get() ?? DEFAULT_APPEARANCE),
+    resolvedTheme: resolvedTheme(nativeTheme.shouldUseDarkColors),
+    degradation: appearanceStore?.degradation ?? null
+  }
+}
+
+function publishAppearance(): AppearanceSnapshot {
+  const snapshot = appearanceSnapshot()
+  const signature = JSON.stringify(snapshot)
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setBackgroundColor(themeBackground(resolveThemeId(snapshot.preference, snapshot.resolvedTheme)))
+    applyWindowChromeAppearance(mainWindow, process.platform, snapshot)
+  }
+  if (signature !== lastAppearanceSignature) {
+    lastAppearanceSignature = signature
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('rovai:appearance-changed', snapshot)
+    }
+  }
+  return snapshot
+}
+
+async function updateAppearancePreferences(patch: Partial<AppearancePreferences>): Promise<AppearanceSnapshot> {
+  if (!appearanceStore) throw new Error('Appearance preferences are not ready')
+  const preferences = await appearanceStore.update(patch)
+  nativeTheme.themeSource = nativeThemeSource(preferences.preference)
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.setZoomFactor(pageZoomFactor(preferences.zoomPercentage))
+    mainWindow.webContents.send('rovai:page-zoom-changed', preferences.zoomPercentage)
+  }
+  return publishAppearance()
+}
+
+function removedSkillProjectRoots(): string[] {
+  return removedProjectRootsFromSnapshot(requireNavigationPreferences().get())
+}
+
+async function synchronizeCoreProjectAccessFromNavigation(): Promise<void> {
+  const removedExecutionRoots = removedSkillProjectRoots()
+  await core.request('skills.projectAccess.sync', { removedExecutionRoots })
+  core.setRemovedSkillProjectRoots(removedExecutionRoots)
+}
+
+const MIN_WINDOW_WIDTH = 1040
+const MIN_WINDOW_HEIGHT = 700
+
+function createWindow(): void {
+  if (!generalPreferences || !restorableLocations) {
+    throw new Error('Desktop Shell preferences are not ready')
+  }
+  const initialAppearance = appearanceSnapshot()
+  const windowStatePath = join(app.getPath('userData'), 'window-state.json')
+  const displayAreas = screen.getAllDisplays().map((display) => display.workArea)
+  const savedState = sanitizeWindowState(
+    readWindowStateFile(windowStatePath),
+    displayAreas,
+    MIN_WINDOW_WIDTH,
+    MIN_WINDOW_HEIGHT,
+    screen.getPrimaryDisplay().workArea
+  )
+  if (process.platform === 'win32') prepareWindowsApplicationMenu(Menu.getApplicationMenu())
+  const window = new BrowserWindow({
+    width: savedState.width,
+    height: savedState.height,
+    x: savedState.x,
+    y: savedState.y,
+    minWidth: MIN_WINDOW_WIDTH,
+    minHeight: MIN_WINDOW_HEIGHT,
+    show: false,
+    title: APP_NAME,
+    ...windowChromeOptions(process.platform, initialAppearance),
+    backgroundColor: themeBackground(resolveThemeId(initialAppearance.preference, initialAppearance.resolvedTheme)),
+    webPreferences: {
+      preload: join(import.meta.dirname, '../preload/index.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      zoomFactor: pageZoomFactor(appearanceSnapshot().zoomPercentage)
+    }
+  })
+  const webContentsId = window.webContents.id
+  installFilePreviewProtocol(window)
+  if (process.platform === 'win32') window.setMenuBarVisibility(false)
+  mainWindow = window
+  if (localStoresReady) {
+    desktopSessions.create(webContentsId, generalPreferences.get(), restorableLocations.get())
+  } else {
+    desktopSessions.createWhenReady(webContentsId, localStoresLoaded.then(() => ({
+      preferences: requireGeneralPreferences().get(),
+      restorable: restorableLocations!.get()
+    })))
+  }
+
+  let pageZoomFeedbackTimer: ReturnType<typeof setTimeout> | null = null
+  const publishPageZoom = (): void => {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return
+    const percentage = pageZoomPercentage(window.webContents.getZoomFactor())
+    if (percentage !== null) window.webContents.send('rovai:page-zoom-changed', percentage)
+  }
+  const queuePageZoomFeedback = (): void => {
+    if (pageZoomFeedbackTimer !== null) clearTimeout(pageZoomFeedbackTimer)
+    pageZoomFeedbackTimer = setTimeout(() => {
+      pageZoomFeedbackTimer = null
+      publishPageZoom()
+    }, 0)
+  }
+  const shortcutInput = installShortcutInput(window, process.platform, () => requireShortcutPreferences().get().preferences)
+  shortcutInputs.set(window.webContents.id, shortcutInput)
+  const shortcutWindowId = window.webContents.id
+  window.once('closed', () => shortcutInputs.delete(shortcutWindowId))
+  installCloseTabShortcut(window.webContents, process.platform, () => window.close(), shortcutInput.isRecording)
+  installWindowNavigation(window, process.platform)
+  installPageZoomShortcut(window.webContents, process.platform, shortcutInput.isRecording, percentage => {
+    window.webContents.send('rovai:page-zoom-changed', percentage)
+    void updateAppearancePreferences({ zoomPercentage: percentage }).catch((error) => {
+      console.warn('[rovai] Page zoom preference could not be saved.', error)
+      if (!window.isDestroyed()) {
+        window.webContents.setZoomFactor(pageZoomFactor(appearanceSnapshot().zoomPercentage))
+        publishPageZoom()
+      }
+    })
+  })
+  window.webContents.on('zoom-changed', queuePageZoomFeedback)
+  window.webContents.once('did-finish-load', () => {
+    appUpdates?.startAutomaticChecks()
+  })
+
+  let persistBoundsTimer: ReturnType<typeof setTimeout> | null = null
+  const flushBounds = (): void => {
+    if (window.isDestroyed()) return
+    void writeWindowStateFile(windowStatePath, window.getNormalBounds()).catch(() => undefined)
+  }
+  const persistBounds = (): void => {
+    if (persistBoundsTimer) clearTimeout(persistBoundsTimer)
+    persistBoundsTimer = setTimeout(() => {
+      persistBoundsTimer = null
+      flushBounds()
+    }, 400)
+  }
+  window.on('resize', persistBounds)
+  window.on('move', persistBounds)
+  const handleWindowClose = createWindowCloseHandler(
+    window,
+    () => requestRendererQuitPreparation(window, () => new MessageChannelMain()),
+    (error) => {
+      console.error('Rovai Renderer window-close preparation failed; the window remains open', error)
+    }
+  )
+  let sessionEnding = false
+  if (process.platform === 'win32') window.on('session-end', () => {
+    sessionEnding = true
+    windowsWindowClose?.beginQuit()
+  })
+  window.on('close', (event) => {
+    if (persistBoundsTimer) clearTimeout(persistBoundsTimer)
+    persistBoundsTimer = null
+    flushBounds()
+    if (sessionEnding) return
+    if (process.platform === 'darwin') handleWindowClose(event)
+    else if (windowsWindowClose && appUpdates?.get().status !== 'installing') windowsWindowClose.handleClose(event)
+    else {
+      windowsWindowClose?.beginQuit()
+      appQuitCoordinator.handleQuitRequest(event)
+    }
+  })
+  window.on('closed', () => {
+    if (pageZoomFeedbackTimer !== null) clearTimeout(pageZoomFeedbackTimer)
+    pageZoomFeedbackTimer = null
+    desktopSessions.delete(webContentsId)
+    void filePreview.releaseWindow(webContentsId)
+    if (mainWindow === window) mainWindow = null
+  })
+
+  window.once('ready-to-show', () => window.show())
+  window.webContents.setWindowOpenHandler(webLinkWindowHandler(url => shell.openExternal(url), async () => {
+    if (window.isDestroyed()) return
+    const english = requireGeneralPreferences().get().interfaceLanguage === 'en'
+    await dialog.showMessageBox(window, {
+      type: 'error',
+      message: english ? 'Unable to open the link. Try again or copy the address.' : '无法打开链接，请重试或复制地址。',
+      buttons: [english ? 'OK' : '好']
+    })
+  }))
+  window.webContents.on('will-navigate', (event, url) => {
+    const current = window.webContents.getURL()
+    if (current && url !== current) event.preventDefault()
+  })
+  const previewNavigation = new FilePreviewFrameNavigation(url => filePreview.ownsHtmlPreviewOrigin(webContentsId, url))
+  window.webContents.on('will-frame-navigate', details => {
+    if (!details.isMainFrame && !previewNavigation.allows(details.url, details.frame, window.webContents.mainFrame, window.webContents.mainFrame.framesInSubtree)) details.preventDefault()
+  })
+
+  window.webContents.on('will-redirect', details => {
+    if (!details.isMainFrame && !previewNavigation.allows(details.url, details.frame, window.webContents.mainFrame, window.webContents.mainFrame.framesInSubtree)) details.preventDefault()
+  })
+
+  if (process.env.ELECTRON_RENDERER_URL) {
+    void window.loadURL(process.env.ELECTRON_RENDERER_URL)
+  } else {
+    void window.loadFile(join(import.meta.dirname, '../renderer/index.html'))
+  }
+}
+
+async function openThreadFromAutomation(threadId: string): Promise<{ threadId: string; opened: true }> {
+  if (!isThreadId(threadId)) {
+    throw new UserAutomationError('automation_invalid_input', 'threadId is not canonical')
+  }
+  const exists = await core.request<boolean>('threads.exists', { threadId })
+  if (!exists) {
+    throw new UserAutomationError('camp_not_found', 'The requested Thread does not exist.')
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow()
+  const window = mainWindow
+  if (!window || window.isDestroyed()) {
+    throw new UserAutomationError('app_window_unavailable', 'The App window is unavailable.')
+  }
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
+  const publish = (): void => {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+      window.webContents.send('rovai:user-automation-open-camp', { threadId })
+    }
+  }
+  if (window.webContents.isLoadingMainFrame()) {
+    window.webContents.once('did-finish-load', publish)
+  } else {
+    publish()
+  }
+  return { threadId, opened: true }
+}
+
+if (primaryInstance) void app.whenReady().then(async () => {
+  console.info(
+    `[startup] stage=electron_ready elapsed_ms=${(performance.now() - mainStartupStartedAt).toFixed(1)}`
+  )
+  if (process.platform === 'darwin' && app.isPackaged && !hasExplicitUserDataDirectory) {
+    try {
+      await installBundledCliEntry(resolveDesktopBootstrapBinary(), app.getPath('home'))
+    } catch (error) {
+      console.warn('[rovai] Bundled CLI entry installation failed; existing files were preserved.', error)
+    }
+  }
+  powerMonitor.on('suspend', () => {
+    void core.notifyAutomationSystemSuspending().catch((error) => {
+      console.warn('[rovai] Scheduled Automation scheduler was not paused before suspend.', error)
+    })
+  })
+  powerMonitor.on('resume', () => {
+    const resumedAt = new Date().toISOString()
+    void core.notifyAutomationSystemResumed(resumedAt).catch((error) => {
+      console.warn('[rovai] Scheduled Automation resume boundary was not updated.', error)
+    })
+  })
+  desktopBackgroundTimer = setInterval(() => {
+    void dailyAnalysis?.tick().catch(() => undefined)
+    void evaluationHost?.tick().catch((error) => { console.warn('[rovai] Evaluation Host preparation failed:', error.message) })
+  }, 500)
+  desktopBackgroundTimer.unref()
+  const userDataPath = app.getPath('userData')
+  appearanceFilePath = join(userDataPath, 'appearance.json')
+  const generalPreferencesPath = join(userDataPath, 'general-preferences.json')
+  shortcutPreferences = new ShortcutPreferencesStore(join(userDataPath, 'shortcuts.json'), process.platform)
+  const currentUserProfilePath = join(userDataPath, 'current-user-profile.json')
+  const onboardingPath = join(userDataPath, 'onboarding.json')
+  const restorableLocationPath = join(userDataPath, 'restorable-location.json')
+  const navigationPreferencesPath = join(userDataPath, 'navigation.json')
+  await executionView.start().catch((error) => {
+    console.warn('[rovai] Execution Web service did not start; channel execution remains available.', error)
+  })
+  generalPreferences = GeneralPreferencesStore.defaults(generalPreferencesPath, () => app.getPreferredSystemLanguages())
+  if (process.platform === 'win32') {
+    windowsWindowClose = new WindowsWindowClose({
+      preferences: new WindowClosePreferences(join(userDataPath, 'window-close.json')),
+      window: () => mainWindow,
+      createTray: (open, quit) => createWindowsTray(open, quit, requireGeneralPreferences().get().interfaceLanguage === 'en'),
+      quit: () => app.quit(),
+      publish: snapshot => {
+        if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+          mainWindow.webContents.send(WINDOW_CLOSE_CHANGED, snapshot)
+        }
+      }
+    })
+  }
+  onboarding = OnboardingStore.defaults(onboardingPath)
+  restorableLocations = RestorableLocationStore.defaults(restorableLocationPath)
+  navigationPreferences = NavigationPreferencesStore.defaults(navigationPreferencesPath)
+  appearanceStore = new AppearancePreferencesStore(appearanceFilePath)
+  const loadedAppearance = appearanceStore
+  nativeTheme.themeSource = nativeThemeSource(appearanceStore.get().preference)
+  nativeTheme.on('updated', publishAppearance)
+  powerMonitor.on('resume', wakeNetworkRecoveryAfterSystemResume)
+  publishAppearance()
+  core.onEvent((event) => {
+    channelSettings.handleCoreEvent(event)
+    const params = event.params as { reason?: unknown; threadId?: unknown } | null
+    if (event.method === 'navigation.invalidated'
+      && (params?.reason === 'camps.discardPending' || params?.reason === 'camp.deleted')
+      && typeof params.threadId === 'string') {
+      // This notification follows authoritative Thread deletion, including
+      // empty-Pending startup cleanup. No draft recovery responsibility remains.
+      void localComposerAttachments.discard(params.threadId).catch((error) => {
+        console.warn('Deleted Thread attachment registration cleanup failed', error)
+      })
+    }
+    mainWindow?.webContents.send('rovai:event', event)
+  })
+  core.onSnapshot((snapshot) => {
+    mainWindow?.webContents.send('rovai:supervisor-changed', snapshot)
+    maybeInitializeOnboarding(snapshot)
+    void channelHostLifecycle.update(snapshot).catch((error) => {
+      console.warn('[rovai] Channel Host transition failed; the App will remain available.', error)
+    })
+  })
+  createWindow()
+  console.info(
+    `[startup] stage=window_created elapsed_ms=${(performance.now() - mainStartupStartedAt).toFixed(1)}`
+  )
+
+  void initializeAppUpdates().catch((error) => {
+    publishLocalDegradations([
+      ...localDegradations,
+      {
+        code: 'app_updates_initialization_failed',
+        message: error instanceof Error ? error.message : String(error),
+        retryable: true,
+        details: {}
+      }
+    ])
+  })
+  removeRetiredLoginItemRegistration()
+  void memberAvatars?.cleanupStaleTemporaryDirectories().catch(() => undefined)
+  const loadedGeneralPreferences = await GeneralPreferencesStore.load(generalPreferencesPath, () => app.getPreferredSystemLanguages())
+  const [
+    loadedOnboarding,
+    loadedRestorableLocations,
+    loadedNavigationPreferences,
+    loadedCurrentUserProfile
+  ] = await Promise.all([
+    OnboardingStore.load(onboardingPath, loadedGeneralPreferences.get().interfaceLanguage),
+    RestorableLocationStore.load(restorableLocationPath),
+    NavigationPreferencesStore.load(navigationPreferencesPath),
+    CurrentUserProfileStore.load(currentUserProfilePath),
+    shortcutPreferences.load()
+  ])
+  generalPreferences = loadedGeneralPreferences
+  generalPreferences.onInterfaceLanguageChanged(snapshot => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.webContents.isDestroyed()) window.webContents.send('rovai:interface-language-changed', snapshot)
+    }
+  })
+  const refreshLanguage = (): void => generalPreferences?.refreshInterfaceLanguage()
+  app.on('browser-window-focus', refreshLanguage)
+  app.on('activate', refreshLanguage)
+  powerMonitor.on('resume', refreshLanguage)
+  if (process.platform === 'darwin') {
+    const subscription = systemPreferences.subscribeLocalNotification('NSCurrentLocaleDidChangeNotification', refreshLanguage)
+    app.once('will-quit', () => systemPreferences.unsubscribeLocalNotification(subscription))
+  }
+  onboarding = loadedOnboarding
+  restorableLocations = loadedRestorableLocations
+  navigationPreferences = loadedNavigationPreferences
+  currentUserProfile = loadedCurrentUserProfile
+  windowsWindowClose?.initialize()
+  localStoresReady = true
+  resolveLocalStoresLoaded()
+  const restorableDegradation: StructuredError | null =
+    loadedRestorableLocations.get().status === 'invalid'
+      ? {
+          code: 'restorable_location_invalid',
+          message: 'The saved navigation location is invalid; no authority data was changed.',
+          retryable: true,
+          details: {}
+        }
+      : null
+  publishLocalDegradations([
+    ...localDegradations,
+    loadedAppearance.degradation,
+    loadedGeneralPreferences.loadDegradation,
+    loadedOnboarding.loadDegradation,
+    loadedNavigationPreferences.loadDegradation,
+    loadedCurrentUserProfile.loadDegradation,
+    restorableDegradation
+  ].filter((degradation): degradation is StructuredError => degradation !== null))
+  console.info(
+    `[startup] stage=main_session_stores_ready elapsed_ms=${(performance.now() - mainStartupStartedAt).toFixed(1)}`
+  )
+  core.start(coreDataPath === null ? undefined : {
+    removedSkillProjectRoots: removedSkillProjectRoots(),
+    // Isolated development/acceptance must not migrate the daily global MCP file.
+    mcpConfigPath: isolatedAcceptanceInstance ? join(coreDataPath, 'mcp.json') : undefined,
+    skillLibraryRoot: desktopSkillLibraryRoot(
+      coreDataPath,
+      hasExplicitUserDataDirectory,
+      process.platform
+    ) ?? undefined
+  })
+  maybeInitializeOnboarding(core.getSnapshot())
+  dailyAnalysis = coreDataPath === null ? null : new DailyAnalysisService(
+    userAutomationRoot(app.getPath('appData'), userDataPath, hasExplicitUserDataDirectory), core
+  )
+  evaluationHost = coreDataPath === null || process.platform !== 'darwin' ? null : new EvaluationHostService(
+    userAutomationRoot(app.getPath('appData'), userDataPath, hasExplicitUserDataDirectory), core
+  )
+  userAutomation = coreDataPath === null ? null : await startUserAutomationOptional(
+    () => new UserAutomationServer(
+      userAutomationRoot(app.getPath('appData'), userDataPath, hasExplicitUserDataDirectory),
+      { core, openThread: openThreadFromAutomation, appVersion: app.getVersion(), dailyAnalysis: dailyAnalysis ?? undefined, evaluation: evaluationHost ?? undefined }
+    )
+  )
+  if (userAutomation) {
+    console.info('[startup] stage=user_automation_ready contract_version=1')
+  }
+
+  app.on('activate', () => {
+    const windows = BrowserWindow.getAllWindows()
+    if (windows.length === 0) {
+      createWindow()
+      return
+    }
+    const window = mainWindow ?? windows[0]
+    if (window.isMinimized()) window.restore()
+    window.show()
+    window.focus()
+  })
+}).catch((error: unknown) => {
+  console.error('[rovai] Desktop bootstrap initialization failed.', error)
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    publishLocalDegradations([{
+      code: 'desktop_bootstrap_initialization_failed',
+      message: error instanceof Error ? error.message : String(error),
+      retryable: true,
+      details: {}
+    }])
+    core.start()
+    return
+  }
+  app.quit()
+})
+
+async function removeRetiredChannelCredentialFiles(userDataPath: string): Promise<void> {
+  const root = join(userDataPath, 'channel-credentials')
+  const rootStat = await lstat(root).catch(() => null)
+  if (!rootStat?.isDirectory()) return
+  await unlink(join(root, 'feishu-developer-session.bin')).catch(() => undefined)
+  await unlink(join(root, 'dingtalk-developer-session.bin')).catch(() => undefined)
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => [])
+  await Promise.all(entries
+    .filter((entry) => entry.isFile() && (
+      /^feishu-[a-z0-9-]+\.bin$/.test(entry.name)
+      || /^dingtalk-[a-z0-9-]+\.bin$/.test(entry.name)
+    ))
+    .map((entry) => unlink(join(root, entry.name)).catch(() => undefined)))
+}
+
+app.on('second-instance', () => {
+  if (process.platform === 'win32') {
+    restoreMainWindow(mainWindow)
+    return
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.focus()
+})
+
+ipcMain.handle('rovai:request', async (_event, method: CoreMethod, params?: unknown) => {
+  if (!allowedMethods.has(method)) {
+    return {
+      kind: 'failure',
+      failure: {
+        kind: 'domain_rejection',
+        code: 'renderer_core_method_unsupported',
+        message: `Renderer requested an unsupported method: ${method}`,
+        retryable: false,
+        generation: core.getSnapshot().generation,
+        details: { method }
+      }
+    }
+  }
+  try {
+    if (method === 'thread.messages.send' && params && typeof params === 'object') {
+      const input = params as { threadId?: unknown; sourceAttachments?: unknown }
+      if (typeof input.threadId === 'string' && Array.isArray(input.sourceAttachments)) {
+        await localComposerAttachments.protectForSend(input.threadId, input.sourceAttachments.flatMap(source =>
+          source && typeof source.id === 'string' && typeof source.sourcePath === 'string'
+            ? [{ id: source.id, sourcePath: source.sourcePath }]
+            : []
+        ))
+      }
+    }
+    const value = await core.request(method, params)
+    if ((method === 'threads.delete' || method === 'threads.discardPending') && params && typeof params === 'object') {
+      const command = (params as { command?: { threadId?: unknown } }).command
+      const status = value && typeof value === 'object'
+        ? (value as { status?: unknown }).status
+        : undefined
+      if (typeof command?.threadId === 'string' && status !== 'rejected') {
+        void filePreview.releaseThread(command.threadId).catch((error) => {
+          console.warn(`Thread ${command.threadId as string} preview release remains pending`, error)
+        })
+      }
+    }
+    return { kind: 'value', value }
+  } catch (error) {
+    if (error instanceof RovaiRequestError) {
+      return { kind: 'failure', failure: error.toFailure() }
+    }
+    return {
+      kind: 'failure',
+      failure: {
+        kind: 'infrastructure_failure',
+        code: 'desktop_core_request_failed',
+        message: error instanceof Error ? error.message : String(error),
+        retryable: false,
+        generation: core.getSnapshot().generation,
+        details: {}
+      }
+    }
+  }
+})
+
+ipcMain.handle('rovai:supervisor-get-snapshot', () => core.getSnapshot())
+
+ipcMain.handle('rovai:host-web', async (event, operation: unknown, value: unknown) => {
+  try {
+    const result = await (async () => {
+      if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
+        || event.senderFrame !== event.sender.mainFrame) {
+        throw new Error('Host controls require a local Desktop window')
+      }
+      if (operation === 'token' || operation === 'status' || operation === 'stop' || operation === 'rotate' || operation === 'loginTicket') {
+        return core.request(`host.web.${operation}`)
+      }
+      if (operation !== 'start' || !value || typeof value !== 'object') {
+        throw new Error('Unsupported Host Web operation')
+      }
+      const input = value as Record<string, unknown>
+      if (typeof input.listen !== 'string' || typeof input.allowInsecureLan !== 'boolean'
+        || (input.publicOrigin !== undefined && typeof input.publicOrigin !== 'string')
+        || Object.keys(input).some((key) => !['listen', 'publicOrigin', 'allowInsecureLan'].includes(key))) {
+        throw new Error('Invalid Host Web settings')
+      }
+      await hostGeneralPreferences().get()
+      // Assets are selected by Main, never by a renderer-supplied filesystem path.
+      return core.request('host.web.start', {
+        ...input,
+        uiDirectory: app.isPackaged
+          ? join(process.resourcesPath, 'web-ui')
+          : join(app.getAppPath(), 'out', 'web')
+      })
+    })()
+    return { kind: 'value', value: result }
+  } catch (error) {
+    if (error instanceof RovaiRequestError) {
+      return { kind: 'failure', failure: error.toFailure() }
+    }
+    return { kind: 'failure', failure: {
+      kind: 'infrastructure_failure', code: 'desktop_host_web_failed',
+      message: '远程连接操作未完成，请稍后重试。', retryable: false,
+      generation: core.getSnapshot().generation, details: {}
+    } }
+  }
+})
+
+ipcMain.handle('rovai:supervisor-retry', () => {
+  if (windowsBootstrap?.kind === 'blocked' && core.getSnapshot().capabilities.fullCoreRetry) {
+    // sessionData must be bound before ready. Retry the same root in a fresh
+    // Desktop process rather than rebinding Chromium or opening a substitute DB.
+    app.relaunch()
+    app.quit()
+    return core.getSnapshot()
+  }
+  return core.retryFullCore()
+})
+
+ipcMain.handle('rovai:file-preview-retention', (event, value: unknown) =>
+  filePreview.updateRetention(requireFilePreviewSender(event), parseRetentionState(value)))
+
+ipcMain.handle('rovai:file-preview-bind-camp', (event, value: unknown) =>
+  filePreview.bindThread(requireFilePreviewSender(event), parseFilePreviewThread(value)))
+
+ipcMain.handle('rovai:file-preview-open', (event, value: unknown) =>
+  filePreview.open(requireFilePreviewSender(event), parseOpenFilePreviewRequest(value)))
+
+ipcMain.handle('rovai:file-preview-restore', (event, value: unknown) =>
+  filePreview.restore(requireFilePreviewSender(event), parseRestoreFilePreviewRequest(value)))
+
+ipcMain.handle('rovai:file-preview-reopen', (event, value: unknown) =>
+  filePreview.reopen(requireFilePreviewSender(event), parseReopenRequest(value)))
+
+ipcMain.handle('rovai:file-preview-read-text', (event, value: unknown) =>
+  filePreview.readText(requireFilePreviewSender(event), parseGenerationRequest(value)))
+
+ipcMain.handle('rovai:file-preview-read-page', (event, value: unknown) =>
+  filePreview.readPage(requireFilePreviewSender(event), parsePageRequest(value)))
+
+ipcMain.handle('rovai:file-preview-resolve-line', (event, value: unknown) =>
+  filePreview.resolveLine(requireFilePreviewSender(event), parseLineRequest(value)))
+
+ipcMain.handle('rovai:file-preview-read-binary', (event, value: unknown) =>
+  filePreview.readBinary(requireFilePreviewSender(event), parseGenerationRequest(value)))
+
+ipcMain.handle('rovai:file-preview-prepare-html-site', (event, value: unknown) =>
+  filePreview.prepareHtmlSite(requireFilePreviewSender(event), parseGenerationRequest(value)))
+
+ipcMain.handle('rovai:file-preview-release-html-site', (event, value: unknown) =>
+  filePreview.releaseHtmlSite(requireFilePreviewSender(event), parseHtmlSiteRequest(value)))
+
+ipcMain.handle('rovai:file-preview-prepare-html', (event, value: unknown) =>
+  filePreview.prepareHtml(requireFilePreviewSender(event), parseGenerationRequest(value)))
+
+ipcMain.handle('rovai:file-preview-reload', (event, value: unknown) =>
+  filePreview.reload(requireFilePreviewSender(event), parseReloadRequest(value)))
+
+ipcMain.handle('rovai:file-preview-release', (event, value: unknown) =>
+  filePreview.release(requireFilePreviewSender(event), parseHandleRequest(value)))
+
+ipcMain.handle('rovai:file-preview-open-in-system', (event, value: unknown) =>
+  filePreview.openInSystem(requireFilePreviewSender(event), parseHandleRequest(value)))
+
+ipcMain.handle('rovai:file-preview-reveal', (event, value: unknown) =>
+  filePreview.revealInFolder(requireFilePreviewSender(event), parseHandleRequest(value)))
+
+ipcMain.handle('rovai:file-preview-copy-path', (event, value: unknown) =>
+  filePreview.copyPath(requireFilePreviewSender(event), parseCopyPathRequest(value)))
+
+ipcMain.handle('rovai:file-preview-choose-root', (event, value: unknown) =>
+  filePreview.chooseAuthorizedRoot(requireFilePreviewSender(event), parseChooseRootRequest(value)))
+
+ipcMain.handle('rovai:clipboard-write', (_event, input: unknown) => {
+  clipboard.write(parseClipboardWriteRequest(input))
+})
+
+ipcMain.handle('rovai:current-user-profile-get', async (event) => {
+  requireMainWindow(event.sender)
+  await localStoresLoaded
+  if (!currentUserProfile) throw new Error('个人资料尚未加载。')
+  return currentUserProfile.get()
+})
+
+ipcMain.handle('rovai:current-user-profile-save', async (event, input: unknown) => {
+  requireMainWindow(event.sender)
+  await localStoresLoaded
+  if (!currentUserProfile) throw new Error('个人资料尚未加载。')
+  return currentUserProfile.save(input)
+})
+
+ipcMain.handle('rovai:appearance-get', () => appearanceSnapshot())
+
+ipcMain.handle('rovai:appearance-set', async (event, preference: unknown) => {
+  requireMainWindow(event.sender)
+  if (!isThemePreference(preference)) throw new Error('Unsupported theme preference')
+  return updateAppearancePreferences({ preference })
+})
+
+ipcMain.handle('rovai:appearance-update', async (event, patch: unknown) => {
+  requireMainWindow(event.sender)
+  // The store validates the complete allowlisted patch before queueing a write.
+  return updateAppearancePreferences(patch as Partial<AppearancePreferences>)
+})
+
+ipcMain.handle('rovai:app-updates-get', (event) => {
+  requireMainWindow(event.sender)
+  return requireAppUpdates().get()
+})
+
+ipcMain.handle('rovai:app-updates-check', (event) => {
+  requireMainWindow(event.sender)
+  return requireAppUpdates().check('manual')
+})
+
+ipcMain.handle('rovai:app-updates-download', (event) => {
+  requireMainWindow(event.sender)
+  return requireAppUpdates().download()
+})
+
+ipcMain.handle('rovai:app-updates-install', (event) => {
+  requireMainWindow(event.sender)
+  return requireAppUpdates().install()
+})
+
+ipcMain.handle('rovai:app-updates-dismiss-prompt', (event, promptId: unknown) => {
+  requireMainWindow(event.sender)
+  if (typeof promptId !== 'string' || promptId.length === 0 || promptId.length > 200) {
+    throw new Error('Invalid application update prompt id')
+  }
+  return requireAppUpdates().dismissPrompt(promptId)
+})
+
+ipcMain.handle('rovai:window-application-menu-popup', (event, input: unknown) => {
+  if (process.platform !== 'win32') return false
+  const request = parseWindowsApplicationMenuPopupRequest(input)
+  if (!request) throw new Error('Unsupported Windows application menu request')
+
+  const window = BrowserWindow.fromWebContents(event.sender)
+  if (!window || window.isDestroyed() || window !== mainWindow) return false
+  const submenu = windowsApplicationSubmenu(Menu.getApplicationMenu(), request.section)
+  if (!submenu) return false
+
+  const bounds = window.getContentBounds()
+  const maximumX = Math.max(0, bounds.width - 1)
+  const maximumY = Math.max(0, bounds.height - 1)
+  submenu.popup({
+    window,
+    x: Math.max(0, Math.min(request.x, maximumX)),
+    y: Math.max(0, Math.min(request.y, maximumY)),
+    sourceType: request.sourceType
+  })
+  return true
+})
+
+ipcMain.handle('rovai:desktop-session-get-startup', async (event) => {
+  const snapshot = await desktopSessions.getWhenReady(event.sender.id)
+  if (!snapshot) throw new Error('Main Window Session is unavailable')
+  return structuredClone(snapshot)
+})
+
+ipcMain.handle('rovai:desktop-session-get-interface-language', async (event) => {
+  requireMainWindow(event.sender)
+  await localStoresLoaded
+  return requireGeneralPreferences().getInterfaceLanguage()
+})
+
+ipcMain.handle('rovai:desktop-session-commit-location', async (_event, location: unknown) => {
+  const validated = parseRestorableLocation(location)
+  if (!validated) throw new Error('Unsupported restorable location')
+  if (!restorableLocations) throw new Error('Restorable Location store is unavailable')
+  await restorableLocations.commit(validated)
+})
+
+ipcMain.handle(WINDOW_CLOSE_CHANNEL, createWindowCloseRequestHandler(
+  process.platform, () => windowsWindowClose, () => mainWindow
+))
+
+ipcMain.handle('rovai:general-preferences-get', () => hostGeneralPreferences().get())
+ipcMain.handle('rovai:shortcuts-get', async () => { await localStoresLoaded; return requireShortcutPreferences().get() })
+ipcMain.handle('rovai:shortcuts-save', async (_event, input) => {
+  await localStoresLoaded
+  const snapshot = await requireShortcutPreferences().save(input)
+  for (const window of BrowserWindow.getAllWindows()) if (!window.webContents.isDestroyed()) window.webContents.send('rovai:shortcuts-changed', snapshot)
+  return snapshot
+})
+ipcMain.handle('rovai:shortcuts-tasks-enabled', (event, enabled) => {
+  if (typeof enabled !== 'boolean') throw new Error('Invalid shortcut capability')
+  shortcutInputs.get(event.sender.id)?.setTasksEnabled(enabled)
+})
+ipcMain.handle('rovai:shortcuts-recording', (event, recording) => {
+  if (typeof recording !== 'boolean') throw new Error('Invalid recording state')
+  const input = shortcutInputs.get(event.sender.id)
+  if (!input) throw new Error('Shortcut recording is unavailable in this window')
+  input.setRecording(recording)
+})
+
+ipcMain.handle('rovai:general-preferences-set-language', async (_event, preference: unknown) => {
+  if (!isInterfaceLanguagePreference(preference)) throw new Error('Unsupported interface language preference')
+  await localStoresLoaded
+  return hostGeneralPreferences().setInterfaceLanguagePreference(preference)
+})
+
+ipcMain.handle('rovai:general-preferences-set-startup', (_event, mode: unknown) => {
+  if (!isStartupLocationMode(mode)) throw new Error('Unsupported startup location mode')
+  return hostGeneralPreferences().setStartupLocationMode(mode as StartupLocationMode)
+})
+
+ipcMain.handle('rovai:general-preferences-set-section', (_event, section: unknown) => {
+  if (!isSettingsSection(section)) throw new Error('Unsupported settings section')
+  return hostGeneralPreferences().setLastSettingsSection(section as SettingsSection)
+})
+
+ipcMain.handle('rovai:general-preferences-set-execution-placement', (_event, placement: unknown) => {
+  if (!isExecutionConsolePlacement(placement)) throw new Error('Unsupported execution console placement')
+  return hostGeneralPreferences().setExecutionConsolePlacement(
+    placement as ExecutionConsolePlacement
+  )
+})
+
+ipcMain.handle('rovai:general-preferences-set-team', (_event, teamId: unknown, enableOneClick: unknown = false) => {
+  if (typeof enableOneClick !== 'boolean') throw new Error('Invalid one-click preference')
+  if (teamId !== null && (typeof teamId !== 'string' || !teamId || teamId.length > 200)) throw new Error('Invalid Team')
+  return hostGeneralPreferences().setNewConversationTeam(teamId as string | null, enableOneClick)
+})
+
+ipcMain.handle('rovai:general-preferences-set-new-conversation-defaults', (_event, defaults: unknown, enableOneClick: unknown = false) => {
+  if (!isNewConversationDefaults(defaults)) throw new Error('Invalid default new conversation configuration')
+  if (typeof enableOneClick !== 'boolean') throw new Error('Invalid one-click new conversation preference')
+  return hostGeneralPreferences().setNewConversationDefaults(defaults, enableOneClick)
+})
+
+ipcMain.handle('rovai:general-preferences-set-one-click-new-conversation', (_event, enabled: unknown) => {
+  if (typeof enabled !== 'boolean') throw new Error('Invalid one-click new conversation preference')
+  return hostGeneralPreferences().setOneClickNewConversationEnabled(enabled)
+})
+
+ipcMain.handle('rovai:general-preferences-set-world-map', (_event, enabled: unknown) => {
+  if (typeof enabled !== 'boolean') throw new Error('Invalid world map preference')
+  return hostGeneralPreferences().setWorldMapEnabled(enabled)
+})
+
+ipcMain.handle('rovai:general-preferences-invalidate-new-conversation-defaults', (_event, expected: unknown) => {
+  if (!expected || typeof expected !== 'object' || !('expectedTeamId' in expected) || !('expectedDefaults' in expected)) throw new Error('Invalid expected conversation defaults')
+  const { expectedTeamId, expectedDefaults } = expected
+  if (expectedTeamId !== null && (typeof expectedTeamId !== 'string' || !expectedTeamId || expectedTeamId.length > 200)) throw new Error('Invalid expected Team')
+  if (expectedDefaults !== null && !isNewConversationDefaults(expectedDefaults)) throw new Error('Invalid expected conversation defaults')
+  return hostGeneralPreferences().invalidateNewConversationDefaults({ expectedTeamId, expectedDefaults })
+})
+
+ipcMain.handle('rovai:channels-get', (event) => {
+  requireMainWindow(event.sender)
+  return channelSettings.get()
+})
+
+ipcMain.handle('rovai:execution-web-settings-get', (event) => {
+  requireMainWindow(event.sender)
+  return executionView.getSettings()
+})
+
+ipcMain.handle('rovai:execution-web-settings-set', (event, value: unknown) => {
+  requireMainWindow(event.sender)
+  const settings = requireObject(value)
+  if (typeof settings.enabled !== 'boolean' || typeof settings.port !== 'number'
+    || Object.keys(settings).sort().join('\0') !== ['enabled', 'port'].sort().join('\0')) {
+    throw new Error('Invalid Execution Web settings')
+  }
+  return executionView.setSettings({
+    enabled: settings.enabled,
+    port: settings.port
+  } as Pick<ExecutionWebSettingsSnapshot, 'enabled' | 'port'>)
+})
+
+ipcMain.handle('rovai:channels-connect', (event, kind: unknown) => {
+  requireMainWindow(event.sender)
+  return channelSettings.connect(optionalChannelKind(kind))
+})
+
+ipcMain.handle('rovai:channels-disconnect', (event, kind: unknown) => {
+  requireMainWindow(event.sender)
+  return channelSettings.disconnect(optionalChannelKind(kind))
+})
+
+ipcMain.handle('rovai:channels-publish-member-bot', (
+  event,
+  agentId: unknown,
+  kind: unknown
+) => {
+  requireMainWindow(event.sender)
+  if (typeof agentId !== 'string' || !agentId) throw new Error('Invalid Agent ID')
+  return channelSettings.publishMemberBot(agentId, optionalChannelKind(kind))
+})
+
+ipcMain.handle('rovai:channels-retry-member-bot', (event, agentId: unknown, kind: unknown) => {
+  requireMainWindow(event.sender)
+  if (typeof agentId !== 'string' || !agentId) throw new Error('Invalid Agent ID')
+  return channelSettings.retryMemberBot(agentId, optionalChannelKind(kind))
+})
+
+ipcMain.handle('rovai:channels-select-publication-approver', (
+  event,
+  agentId: unknown,
+  userId: unknown,
+  kind: unknown
+) => {
+  requireMainWindow(event.sender)
+  if (typeof agentId !== 'string' || !agentId) throw new Error('Invalid Agent ID')
+  if (typeof userId !== 'string' || !userId) throw new Error('Invalid DingTalk approver')
+  return channelSettings.selectPublicationApprover(
+    agentId,
+    userId,
+    optionalChannelKind(kind)
+  )
+})
+
+ipcMain.handle('rovai:channels-cancel-qr', (event, attemptId: unknown) => {
+  requireMainWindow(event.sender)
+  if (typeof attemptId !== 'string' || !attemptId) throw new Error('Invalid QR attempt ID')
+  return channelSettings.cancelQrAttempt(attemptId)
+})
+
+ipcMain.handle('rovai:channels-login-view-bounds', (event, attemptId: unknown, bounds: unknown) => {
+  requireMainWindow(event.sender)
+  if (typeof attemptId !== 'string' || !attemptId) throw new Error('Invalid QR attempt ID')
+  channelSettings.setLoginViewBounds(attemptId, parseChannelLoginViewBounds(bounds))
+})
+
+ipcMain.handle('rovai:channels-refresh-login-qr', (event, attemptId: unknown) => {
+  requireMainWindow(event.sender)
+  if (typeof attemptId !== 'string' || !attemptId) throw new Error('Invalid QR attempt ID')
+  return channelSettings.refreshLoginQr(attemptId)
+})
+
+ipcMain.handle('rovai:onboarding-get', async () => {
+  await localStoresLoaded
+  return requireOnboarding().getAfterPendingWrites()
+})
+
+ipcMain.handle('rovai:onboarding-show-welcome', () => requireOnboarding().showWelcome())
+
+ipcMain.handle('rovai:onboarding-complete-welcome', () => requireOnboarding().completeWelcome())
+
+ipcMain.handle('rovai:onboarding-select-member', (_event, role: unknown) => {
+  return requireOnboarding().selectMember(role)
+})
+
+ipcMain.handle('rovai:onboarding-show-member-selection', () => {
+  return requireOnboarding().showMemberSelection()
+})
+
+ipcMain.handle('rovai:onboarding-complete-member-selection', () => {
+  return requireOnboarding().completeMemberSelection()
+})
+
+ipcMain.handle('rovai:onboarding-set-runtime-selection', (_event, selection: unknown) => {
+  return requireOnboarding().setRuntimeSelection(selection)
+})
+
+ipcMain.handle('rovai:onboarding-defer-runtime', () => {
+  return requireOnboarding().deferRuntimeSetup()
+})
+
+ipcMain.handle('rovai:onboarding-begin-provisioning', (
+  _event,
+  selection: unknown,
+  runtimePermissions: unknown,
+  interfaceLanguage: unknown
+) => {
+  if (!isInterfaceLanguage(interfaceLanguage)) throw new Error('Unsupported onboarding language')
+  return requireOnboarding().beginProvisioning(selection, runtimePermissions, interfaceLanguage)
+})
+
+ipcMain.handle('rovai:onboarding-record-member', (_event, agentId: unknown, version: unknown) => {
+  return requireOnboarding().recordProvisionedMember(agentId, version)
+})
+
+ipcMain.handle('rovai:onboarding-record-runtime', (_event, version: unknown) => {
+  return requireOnboarding().recordProvisionedRuntime(version)
+})
+
+ipcMain.handle('rovai:onboarding-prepare-runtime-copies', (_event, targets: unknown) => {
+  return requireOnboarding().prepareRuntimeCopies(targets)
+})
+
+ipcMain.handle('rovai:onboarding-record-runtime-copy', (_event, agentId: unknown, commandId: unknown, outcome: unknown) => {
+  return requireOnboarding().recordRuntimeCopy(agentId, commandId, outcome)
+})
+
+ipcMain.handle('rovai:onboarding-record-camp', (_event, threadId: unknown) => {
+  return requireOnboarding().recordProvisionedThread(threadId)
+})
+
+ipcMain.handle('rovai:onboarding-complete', () => requireOnboarding().complete())
+
+ipcMain.handle('rovai:window-reset-capability', (event) => {
+  const window = requireMainWindow(event.sender)
+  return windowResetCapability(window.isFullScreen())
+})
+
+ipcMain.handle('rovai:window-reset-bounds', (event) => {
+  const window = requireMainWindow(event.sender)
+  const display = screen.getDisplayMatching(window.getBounds()).workArea
+  return resetWindowBounds(
+    window,
+    display,
+    MIN_WINDOW_WIDTH,
+    MIN_WINDOW_HEIGHT,
+    (bounds) => writeWindowStateFile(
+      join(app.getPath('userData'), 'window-state.json'),
+      bounds
+    )
+  )
+})
+
+function publishNavigationPreferences(snapshot: NavigationPreferencesSnapshot): NavigationPreferencesSnapshot {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('rovai:navigation-preferences-changed', snapshot)
+  }
+  return snapshot
+}
+
+ipcMain.handle('rovai:navigation-preferences-register-projects', (_event, paths: string[], completeLegacy: boolean) => {
+  if (typeof completeLegacy !== 'boolean') throw new Error('Invalid project registration request')
+  return projectAccessTransactions.run(async () => publishNavigationPreferences(
+    await requireNavigationPreferences().registerProjects(paths, completeLegacy)
+  ))
+})
+
+ipcMain.handle('rovai:navigation-preferences-set-thread-read-state', (_event, threadId: unknown, state: unknown) => {
+  if (typeof threadId !== 'string' || (state !== null && !isNavigationThreadReadState(state))) {
+    throw new Error('Invalid Thread read state request')
+  }
+  return projectAccessTransactions.run(async () => {
+    const snapshot = await requireNavigationPreferences().setThreadReadState(threadId, state)
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('rovai:navigation-preferences-changed', snapshot)
+    }
+    return snapshot
+  })
+})
+
+ipcMain.handle('rovai:navigation-preferences-get', () =>
+  projectAccessTransactions.run(() => requireNavigationPreferences().reload())
+)
+
+ipcMain.handle('rovai:navigation-preferences-replace-pins', (_event, pins: NavigationPin[]) =>
+  projectAccessTransactions.run(() => requireNavigationPreferences().replacePins(pins).then(publishNavigationPreferences))
+)
+
+ipcMain.handle(
+  'rovai:navigation-preferences-set-project-name',
+  (_event, targetKey: unknown, name: unknown) => {
+    if (typeof targetKey !== 'string' || (name !== null && typeof name !== 'string')) {
+      throw new Error('Invalid Project display name request')
+    }
+    return projectAccessTransactions.run(() =>
+      requireNavigationPreferences().setProjectName(targetKey, name).then(publishNavigationPreferences)
+    )
+  }
+)
+
+ipcMain.handle(
+  'rovai:navigation-preferences-remove-project',
+  async (_event, targetKey: unknown, relatedThreadIds: unknown) => {
+    if (typeof targetKey !== 'string' || !Array.isArray(relatedThreadIds)) {
+      throw new Error('Invalid Project removal request')
+    }
+    if (!targetKey.startsWith('directory:')) {
+      throw new Error('Invalid Project removal target')
+    }
+    return projectAccessTransactions.run(async () => {
+      const executionRoot = targetKey.slice('directory:'.length)
+      await core.request('skills.projectAccess.remove', { executionRoot })
+      try {
+        const result = await requireNavigationPreferences().removeProject(targetKey, relatedThreadIds)
+        core.setRemovedSkillProjectRoots(removedProjectRootsFromSnapshot(result))
+        return publishNavigationPreferences(result)
+      } catch (error) {
+        await synchronizeCoreProjectAccessFromNavigation().catch(() => undefined)
+        throw error
+      }
+    })
+  }
+)
+
+ipcMain.handle('rovai:navigation-preferences-restore-project', async (_event, targetKey: unknown) => {
+  if (typeof targetKey !== 'string') throw new Error('Invalid Project restore request')
+  if (!targetKey.startsWith('directory:')) throw new Error('Invalid Project restore target')
+  return projectAccessTransactions.run(async () => {
+    const executionRoot = targetKey.slice('directory:'.length)
+    const navigationPreferences = requireNavigationPreferences()
+    const previousSnapshot = navigationPreferences.get()
+    const removedProject = previousSnapshot.removedProjects.find(
+      (project) => project.targetKey === targetKey
+    )
+    if (!removedProject) return publishNavigationPreferences(await navigationPreferences.registerProjects([executionRoot]))
+    return restoreProjectAccessFailClosed({
+      previousSnapshot,
+      restorationRequired: Boolean(removedProject),
+      persistRestoredPreference: () => navigationPreferences.restoreProject(targetKey),
+      activateExecutionRoot: async () => {
+        await core.request('skills.projectAccess.restore', { executionRoot })
+      },
+      suspendExecutionRoot: async () => {
+        await core.request('skills.projectAccess.remove', { executionRoot })
+      },
+      persistPreviousPreference: () => {
+        if (!removedProject) throw new Error('Project restore transaction has no removed pre-state')
+        return navigationPreferences.reinstateRemovedProject(removedProject)
+      },
+      publishRemovedRoots: (snapshot) => {
+        core.setRemovedSkillProjectRoots(removedProjectRootsFromSnapshot(snapshot))
+        publishNavigationPreferences(snapshot)
+      }
+    })
+  })
+})
+
+ipcMain.handle('rovai:member-avatar-select-source', async () => {
+  const options = {
+    title: '选择头像',
+    buttonLabel: '选择图片',
+    filters: [
+      { name: '静态与动态图片', extensions: ['png', 'jpg', 'jpeg', 'gif'] }
+    ],
+    properties: ['openFile'] as Array<'openFile'>
+  }
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options)
+  if (result.canceled || !result.filePaths[0]) return null
+  return inspectMemberAvatarSourceFile(result.filePaths[0])
+})
+
+ipcMain.handle(
+  'rovai:member-avatar-save',
+  async (_event, input: SaveMemberAvatarAssetInput) => {
+    if (input.kind === 'image') {
+      return core.request('memberAvatars.save', {
+        kind: 'image', sourceBase64: Buffer.from(input.source).toString('base64'),
+        sourceWidth: input.sourceWidth, sourceHeight: input.sourceHeight, crop: input.crop
+      })
+    }
+    if (input.kind === 'recrop') {
+      return core.request('memberAvatars.save', { kind: 'recrop', avatarRef: input.avatarRef, crop: input.crop })
+    }
+    if (input.kind === 'gif') {
+      return core.request('memberAvatars.save', {
+        kind: 'gif',
+        sourceGifBase64: Buffer.from(input.sourceGif).toString('base64'),
+        sourceWidth: input.sourceWidth, sourceHeight: input.sourceHeight, crop: input.crop
+      })
+    }
+    return core.request('memberAvatars.save', {
+      sourceBase64: Buffer.from(input.sourcePng).toString('base64'),
+      iconBase64: Buffer.from(input.iconPng).toString('base64'),
+      sourceWidth: input.sourceWidth, sourceHeight: input.sourceHeight, crop: input.crop
+    })
+  }
+)
+
+ipcMain.handle(
+  'rovai:member-avatar-read',
+  async (
+    _event,
+    avatarRef: unknown,
+    rendition: unknown
+  ) => {
+    if (
+      typeof avatarRef !== 'string'
+      || (rendition !== 'icon' && rendition !== 'portrait')
+    ) {
+      throw new Error('Unsupported member avatar read request')
+    }
+    const image = await core.request<{ base64: string; mediaType: 'image/png' | 'image/gif'; width: number; height: number; crop: import('@contracts').MemberAvatarCrop } | null>('memberAvatars.read', { avatarRef, rendition })
+    return image ? { ...image, bytes: Uint8Array.from(Buffer.from(image.base64, 'base64')) } : null
+  }
+)
+
+const MAX_COMPOSER_ATTACHMENT_BYTES = 25 * 1024 * 1024
+const MAX_COMPOSER_PREVIEW_BYTES = 8 * 1024 * 1024
+
+async function resolveDesktopAttachmentTarget(
+  locator: LocalAttachmentOwnerLocator
+): Promise<{ target: DesktopAttachmentTarget | null; availability: LocalAttachmentAvailability }> {
+  const local = await localComposerAttachments.resolveTarget(locator)
+  if (local) return local
+  try {
+    const value = await core.request<unknown>(
+      'thread.attachments.desktopOpenTarget' as CoreMethod,
+      locator
+    )
+    const target = parseDesktopAttachmentTarget(value, locator.attachmentRefId)
+    return { target, availability: target ? 'available' : 'missing' }
+  } catch (error) {
+    return { target: null, availability: attachmentAvailabilityFromError(error) }
+  }
+}
+
+function attachmentAvailabilityFromError(error: unknown): LocalAttachmentAvailability {
+  if (error instanceof RovaiRequestError) {
+    if (error.code === 'attachment_missing') return 'missing'
+    if (error.code === 'attachment_unreadable') return 'unreadable'
+    if (error.code === 'attachment_kind_changed') return 'kind_changed'
+  }
+  if (error && typeof error === 'object' && 'code' in error) {
+    if (error.code === 'ENOENT') return 'missing'
+    if (typeof error.code === 'string') return 'unreadable'
+  }
+  return 'unknown'
+}
+
+function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLocator {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Attachment Owner 无效。')
+  }
+  const input = value as Record<string, unknown>
+  const owner = input.owner
+  const threadId = requireIpcString(input.threadId, 'Thread ID')
+  const attachmentRefId = requireIpcString(input.attachmentRefId, '附件 ID')
+  if (!isThreadId(threadId) || !isAttachmentId(attachmentRefId)) {
+    throw new Error('Attachment Owner 无效。')
+  }
+  if (owner === 'composer') return { owner, threadId, attachmentRefId }
+  if (owner === 'pending') {
+    return {
+      owner,
+      threadId,
+      pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
+      attachmentRefId
+    }
+  }
+  if (owner === 'pending_edit') {
+    return {
+      owner,
+      threadId,
+      pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
+      editToken: requireIpcString(input.editToken, 'Edit Token'),
+      attachmentRefId
+    }
+  }
+  if (owner === 'message') {
+    return {
+      owner,
+      threadId,
+      messageId: requireIpcString(input.messageId, 'Message ID'),
+      attachmentRefId
+    }
+  }
+  if (owner === 'mission') {
+    return {
+      owner,
+      threadId,
+      missionId: requireIpcString(input.missionId, 'Mission ID'),
+      attachmentRefId
+    }
+  }
+  if (owner === 'single_chat_composer') {
+    return {
+      owner,
+      threadId,
+      conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
+      attachmentRefId
+    }
+  }
+  if (owner === 'single_chat_pending') {
+    return {
+      owner,
+      threadId,
+      conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
+      pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
+      attachmentRefId
+    }
+  }
+  if (owner === 'single_chat_pending_edit') {
+    return {
+      owner,
+      threadId,
+      conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
+      pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
+      editToken: requireIpcString(input.editToken, 'Edit Token'),
+      attachmentRefId
+    }
+  }
+  if (owner === 'single_chat_message') {
+    return {
+      owner,
+      threadId,
+      conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
+      conversationMessageId: requireIpcString(
+        input.conversationMessageId,
+        'Conversation Message ID'
+      ),
+      attachmentRefId
+    }
+  }
+  throw new Error('Attachment Owner 无效。')
+}
+
+function requireIpcString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > 1024) {
+    throw new Error(`${label} 无效。`)
+  }
+  return value
+}
+
+function requireDraftRevision(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error('Draft Revision 无效。')
+  }
+  return value as number
+}
+
+type SingleChatPendingAttachmentOwner = {
+  threadId: string
+  conversationId: string
+  pendingInputId: string
+  expectedRevision: number
+  editToken: string
+}
+
+function requireSingleChatPendingAttachmentOwner(
+  value: unknown
+): SingleChatPendingAttachmentOwner {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Single Chat Pending Attachment Owner 无效。')
+  }
+  const input = value as Record<string, unknown>
+  return {
+    threadId: requireIpcString(input.threadId, 'Thread ID'),
+    conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
+    pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
+    expectedRevision: requireDraftRevision(input.expectedRevision),
+    editToken: requireIpcString(input.editToken, 'Edit Token')
+  }
+}
+
+function temporarySourceAttachmentPath(displayName: string): string {
+  const requestedExtension = extname(displayName).toLocaleLowerCase()
+  const safeExtension = /^\.[a-z0-9]{1,16}$/.test(requestedExtension)
+    ? requestedExtension
+    : ''
+  return join(app.getPath('temp'), `rovai-${randomUUID()}${safeExtension}`)
+}
+
+async function stageLocalComposerAttachment(
+  threadId: string,
+  sourcePath: string,
+  displayName: string,
+  mediaType: string | null
+): Promise<LocalAttachmentSourceView> {
+  return localComposerAttachments.prepare({ threadId, sourcePath, displayName, mediaType })
+}
+
+type MissionAttachmentIpcInput = {
+  id: string
+  sourcePath?: string
+  bytes?: Uint8Array
+  displayName: string
+  mediaType: string | null
+}
+
+async function missionAttachmentPathInputs(value: unknown): Promise<{
+  inputs: Array<{id: string; sourcePath: string; displayName: string; mediaType: string | null}>
+  temporaryPaths: string[]
+}> {
+  if (!Array.isArray(value) || value.length > 10) throw new Error('使命附件最多 10 个。')
+  const inputs: Array<{id: string; sourcePath: string; displayName: string; mediaType: string | null}> = []
+  const temporaryPaths: string[] = []
+  for (const candidate of value as MissionAttachmentIpcInput[]) {
+    if (!candidate || typeof candidate !== 'object' || !isAttachmentId(candidate.id)) {
+      throw new Error('使命附件无效。')
+    }
+    const displayName = requireIpcString(candidate.displayName, '附件名称')
+    const mediaType = typeof candidate.mediaType === 'string' && candidate.mediaType.trim()
+      ? candidate.mediaType
+      : null
+    if (typeof candidate.sourcePath === 'string' && candidate.sourcePath) {
+      inputs.push({ id: candidate.id, sourcePath: candidate.sourcePath, displayName, mediaType })
+      continue
+    }
+    if (!(candidate.bytes instanceof Uint8Array) || candidate.bytes.byteLength > MAX_COMPOSER_ATTACHMENT_BYTES) {
+      throw new Error('附件无效或超过 25 MiB。')
+    }
+    const requestedExtension = extname(displayName).toLocaleLowerCase()
+    const safeExtension = /^\.[a-z0-9]{1,16}$/.test(requestedExtension) ? requestedExtension : ''
+    const temporaryPath = join(app.getPath('temp'), `rovai-mission-${candidate.id}${safeExtension}`)
+    try {
+      await writeFile(temporaryPath, candidate.bytes, { flag: 'wx', mode: 0o600 })
+    } catch (error) {
+      const existing = await readFile(temporaryPath).catch(() => null)
+      if (!existing || !existing.equals(Buffer.from(candidate.bytes))) throw error
+    }
+    temporaryPaths.push(temporaryPath)
+    inputs.push({ id: candidate.id, sourcePath: temporaryPath, displayName, mediaType })
+  }
+  return { inputs, temporaryPaths }
+}
+
+ipcMain.handle(
+  'rovai:mission-create-with-attachments',
+  async (_event, commandId: unknown, command: unknown, attachments: unknown) => {
+    const prepared = await missionAttachmentPathInputs(attachments)
+    let rejected = false
+    try {
+      const result = await core.request('missions.createWithAttachments' as CoreMethod, {
+        commandId: requireIpcString(commandId, 'Command ID'),
+        command,
+        attachments: prepared.inputs
+      }) as { status?: string }
+      rejected = result.status === 'rejected'
+      return result
+    } finally {
+      if (rejected) await Promise.all(prepared.temporaryPaths.map(path => unlink(path).catch(() => undefined)))
+    }
+  }
+)
+
+ipcMain.handle(
+  'rovai:mission-update-with-attachments',
+  async (_event, commandId: unknown, command: unknown, keepAttachmentIds: unknown, attachments: unknown) => {
+    if (!Array.isArray(keepAttachmentIds) || keepAttachmentIds.some(id => !isAttachmentId(id))) {
+      throw new Error('使命附件列表无效。')
+    }
+    const prepared = await missionAttachmentPathInputs(attachments)
+    let rejected = false
+    try {
+      const result = await core.request('missions.updateWithAttachments' as CoreMethod, {
+        commandId: requireIpcString(commandId, 'Command ID'),
+        command,
+        keepAttachmentIds,
+        attachments: prepared.inputs
+      }) as { status?: string }
+      rejected = result.status === 'rejected'
+      return result
+    } finally {
+      if (rejected) await Promise.all(prepared.temporaryPaths.map(path => unlink(path).catch(() => undefined)))
+    }
+  }
+)
+
+ipcMain.handle(
+  'rovai:composer-attachment-prepare-pasted-text',
+  async (_event, threadId: unknown, displayName: unknown, input: unknown) => {
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
+    const name = requireIpcString(displayName, '附件名称')
+    if (!name.endsWith('.txt') || Array.from(name).length > 120
+      || !(input instanceof Uint8Array) || input.byteLength > MAX_COMPOSER_ATTACHMENT_BYTES) {
+      throw new Error('附件无效或超过 25 MiB。')
+    }
+    const root = await core.request<string>('host.thread.attachmentOutputRoot', { threadId: resolvedThreadId })
+    return createPastedTextAttachment(localComposerAttachments, resolvedThreadId, root, name, input)
+  }
+)
+
+ipcMain.handle(
+  'rovai:composer-attachment-remove-pasted-text',
+  async (_event, threadId: unknown, attachmentRefId: unknown) => {
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
+    if (!isAttachmentId(attachmentRefId)) throw new Error('Composer 附件清理范围无效。')
+    return localComposerAttachments.removePastedText(resolvedThreadId, attachmentRefId, () =>
+      core.request<string>('host.thread.attachmentOutputRoot', { threadId: resolvedThreadId })
+    )
+  }
+)
+
+ipcMain.handle(
+  'rovai:composer-attachment-prepare-path',
+  async (
+    _event,
+    threadId: unknown,
+    expectedRevision: unknown,
+    sourcePath: unknown,
+    displayName: unknown,
+    mediaType: unknown
+  ) => {
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
+    requireDraftRevision(expectedRevision)
+    return stageLocalComposerAttachment(
+      resolvedThreadId,
+      requireIpcString(sourcePath, '附件路径'),
+      requireIpcString(displayName, '附件名称'),
+      typeof mediaType === 'string' && mediaType.trim() ? mediaType : null
+    )
+  }
+)
+
+ipcMain.handle(
+  'rovai:composer-attachment-prepare-bytes',
+  async (
+    _event,
+    threadId: unknown,
+    expectedRevision: unknown,
+    displayName: unknown,
+    mediaType: unknown,
+    input: unknown
+  ) => {
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
+    requireDraftRevision(expectedRevision)
+    const resolvedDisplayName = requireIpcString(displayName, '附件名称')
+    if (!(input instanceof Uint8Array) || input.byteLength > MAX_COMPOSER_ATTACHMENT_BYTES) {
+      throw new Error('附件无效或超过 25 MiB。')
+    }
+    const temporaryPath = temporarySourceAttachmentPath(resolvedDisplayName)
+    let staged = false
+    try {
+      await writeFile(temporaryPath, input, { flag: 'wx', mode: 0o600 })
+      const attachment = await stageLocalComposerAttachment(
+        resolvedThreadId,
+        temporaryPath,
+        resolvedDisplayName,
+        typeof mediaType === 'string' && mediaType.trim() ? mediaType : null
+      )
+      staged = true
+      return attachment
+    } finally {
+      if (!staged) await unlink(temporaryPath).catch(() => undefined)
+    }
+  }
+)
+
+ipcMain.handle(
+  'rovai:composer-attachment-restore',
+  async (_event, threadId: unknown, attachments: unknown) => {
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
+    if (!Array.isArray(attachments) || attachments.length > 10) {
+      throw new Error('Composer 附件列表无效。')
+    }
+    const requested = attachments.map((value): LocalAttachmentSourceView => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('Composer 附件无效。')
+      }
+      const attachment = value as Partial<LocalAttachmentSourceView>
+      if (!isAttachmentId(attachment.id)
+        || typeof attachment.displayName !== 'string'
+        || !attachment.displayName.trim()
+        || Array.from(attachment.displayName).length > 120
+        || (attachment.kind !== 'file' && attachment.kind !== 'directory')
+        || (attachment.fileCount !== null
+          && (!Number.isSafeInteger(attachment.fileCount) || Number(attachment.fileCount) < 0))
+        || (attachment.mediaType !== null
+          && (typeof attachment.mediaType !== 'string' || attachment.mediaType.length > 512))
+        || (attachment.byteSize !== null
+          && (!Number.isSafeInteger(attachment.byteSize) || Number(attachment.byteSize) < 0))
+        || (attachment.previewKind !== 'image' && attachment.previewKind !== 'none')
+        || !['unknown', 'available', 'missing', 'unreadable', 'kind_changed']
+          .includes(String(attachment.availability))) {
+        throw new Error('Composer 附件无效。')
+      }
+      return {
+        id: attachment.id,
+        displayName: attachment.displayName,
+        kind: attachment.kind,
+        fileCount: attachment.fileCount,
+        mediaType: attachment.mediaType,
+        byteSize: attachment.byteSize,
+        previewKind: attachment.previewKind,
+        availability: attachment.availability
+      } as LocalAttachmentSourceView
+    })
+    return localComposerAttachments.restore(resolvedThreadId, requested)
+  }
+)
+
+ipcMain.handle(
+  'rovai:composer-attachment-discard',
+  async (_event, threadId: unknown, attachmentRefIds: unknown) => {
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
+    if (attachmentRefIds !== undefined && (
+      !Array.isArray(attachmentRefIds)
+      || attachmentRefIds.length > 10
+      || attachmentRefIds.some((id) => !isAttachmentId(id))
+    )) throw new Error('Composer 附件清理范围无效。')
+    await localComposerAttachments.discard(
+      resolvedThreadId,
+      attachmentRefIds as string[] | undefined
+    )
+  }
+)
+
+ipcMain.handle(
+  'rovai:composer-attachment-preview',
+  async (_event, value: unknown) => {
+    const locator = requireAttachmentOwnerLocator(value)
+    const local = await localComposerAttachments.preview(locator)
+    if (local) return local
+    try {
+      const source = await core.request<{
+        path: string
+        mediaType: string
+        byteSize: number
+      } | null>('thread.attachments.previewSource' as CoreMethod, locator)
+      if (!source) return { preview: null, availability: 'missing' as const }
+      if (source.byteSize > MAX_COMPOSER_PREVIEW_BYTES) {
+        return { preview: null, availability: 'available' as const }
+      }
+      const bytes = await readFile(source.path)
+      if (bytes.byteLength !== source.byteSize || bytes.byteLength > MAX_COMPOSER_PREVIEW_BYTES) {
+        return { preview: null, availability: 'unreadable' as const }
+      }
+      return {
+        preview: {
+          mediaType: source.mediaType,
+          bytes: new Uint8Array(bytes)
+        },
+        availability: 'available' as const
+      }
+    } catch (error) {
+      return { preview: null, availability: attachmentAvailabilityFromError(error) }
+    }
+  }
+)
+
+ipcMain.handle(
+  'rovai:composer-attachment-location',
+  async (_event, value: unknown) => {
+    const locator = requireAttachmentOwnerLocator(value)
+    return localComposerAttachments.location(locator)
+  }
+)
+
+ipcMain.handle(
+  'rovai:single-chat-attachment-prepare-path',
+  async (
+    _event,
+    conversationId: unknown,
+    expectedDraftRevision: unknown,
+    sourcePath: unknown,
+    displayName: unknown,
+    mediaType: unknown
+  ) => {
+    return core.request('singleChat.sourceAttachments.addFromPath' as CoreMethod, {
+      conversationId: requireIpcString(conversationId, 'Conversation ID'),
+      expectedDraftRevision: requireDraftRevision(expectedDraftRevision),
+      sourcePath: requireIpcString(sourcePath, '附件路径'),
+      displayName: requireIpcString(displayName, '附件名称'),
+      mediaType: typeof mediaType === 'string' && mediaType.trim() ? mediaType : null
+    })
+  }
+)
+
+ipcMain.handle(
+  'rovai:single-chat-attachment-prepare-bytes',
+  async (
+    _event,
+    conversationId: unknown,
+    expectedDraftRevision: unknown,
+    displayName: unknown,
+    mediaType: unknown,
+    input: unknown
+  ) => {
+    const resolvedConversationId = requireIpcString(conversationId, 'Conversation ID')
+    const resolvedRevision = requireDraftRevision(expectedDraftRevision)
+    const resolvedDisplayName = requireIpcString(displayName, '附件名称')
+    if (!(input instanceof Uint8Array) || input.byteLength > MAX_COMPOSER_ATTACHMENT_BYTES) {
+      throw new Error('附件无效或超过 25 MiB。')
+    }
+    if (!core.getSnapshot().capabilities.coreRequests) {
+      throw new Error('Core is not available for attachment references')
+    }
+    const temporaryPath = temporarySourceAttachmentPath(resolvedDisplayName)
+    let referenced = false
+    try {
+      await writeFile(temporaryPath, input, { flag: 'wx', mode: 0o600 })
+      const snapshot = await core.request(
+        'singleChat.sourceAttachments.addFromPath' as CoreMethod,
+        {
+          conversationId: resolvedConversationId,
+          expectedDraftRevision: resolvedRevision,
+          sourcePath: temporaryPath,
+          displayName: resolvedDisplayName,
+          mediaType: typeof mediaType === 'string' && mediaType.trim() ? mediaType : null
+        }
+      )
+      referenced = true
+      return snapshot
+    } finally {
+      if (!referenced) await unlink(temporaryPath).catch(() => undefined)
+    }
+  }
+)
+
+ipcMain.handle(
+  'rovai:single-chat-pending-attachment-prepare-path',
+  async (
+    _event,
+    owner: unknown,
+    sourcePath: unknown,
+    displayName: unknown,
+    mediaType: unknown
+  ) => {
+    const resolvedOwner = requireSingleChatPendingAttachmentOwner(owner)
+    return core.request('singleChat.pendingInputs.addSourceAttachmentFromPath' as CoreMethod, {
+      ...resolvedOwner,
+      sourcePath: requireIpcString(sourcePath, '附件路径'),
+      displayName: requireIpcString(displayName, '附件名称'),
+      mediaType: typeof mediaType === 'string' && mediaType.trim() ? mediaType : null
+    })
+  }
+)
+
+ipcMain.handle(
+  'rovai:single-chat-pending-attachment-prepare-bytes',
+  async (
+    _event,
+    owner: unknown,
+    displayName: unknown,
+    mediaType: unknown,
+    input: unknown
+  ) => {
+    const resolvedOwner = requireSingleChatPendingAttachmentOwner(owner)
+    const resolvedDisplayName = requireIpcString(displayName, '附件名称')
+    if (!(input instanceof Uint8Array) || input.byteLength > MAX_COMPOSER_ATTACHMENT_BYTES) {
+      throw new Error('附件无效或超过 25 MiB。')
+    }
+    if (!core.getSnapshot().capabilities.coreRequests) {
+      throw new Error('Core is not available for attachment references')
+    }
+    const temporaryPath = temporarySourceAttachmentPath(resolvedDisplayName)
+    let referenced = false
+    try {
+      await writeFile(temporaryPath, input, { flag: 'wx', mode: 0o600 })
+      const snapshot = await core.request(
+        'singleChat.pendingInputs.addSourceAttachmentFromPath' as CoreMethod,
+        {
+          ...resolvedOwner,
+          sourcePath: temporaryPath,
+          displayName: resolvedDisplayName,
+          mediaType: typeof mediaType === 'string' && mediaType.trim() ? mediaType : null
+        }
+      )
+      referenced = true
+      return snapshot
+    } finally {
+      if (!referenced) await unlink(temporaryPath).catch(() => undefined)
+    }
+  }
+)
+
+ipcMain.handle(
+  'rovai:single-chat-attachment-remove',
+  async (
+    _event,
+    conversationId: unknown,
+    expectedDraftRevision: unknown,
+    attachmentRefId: unknown
+  ) => {
+    return core.request('singleChat.composerDraft.removeAttachment' as CoreMethod, {
+      conversationId: requireIpcString(conversationId, 'Conversation ID'),
+      expectedDraftRevision: requireDraftRevision(expectedDraftRevision),
+      attachmentRefId: requireIpcString(attachmentRefId, '附件 ID')
+    })
+  }
+)
+
+ipcMain.handle(
+  'rovai:attachment-open',
+  async (_event, value: unknown) => {
+    const locator = requireAttachmentOwnerLocator(value)
+    const resolved = await resolveDesktopAttachmentTarget(locator)
+    if (!resolved.target) {
+      return {
+        opened: false,
+        error: 'target_unavailable' as const,
+        availability: resolved.availability
+      }
+    }
+    const result = await openDesktopAttachmentTarget(resolved.target, {
+      async confirm(displayName) {
+        const options = {
+          type: 'warning' as const,
+          buttons: ['取消', '仍然打开'],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+          message: '此文件可能执行程序或安装软件',
+          detail: `只有在你确认来源可信时才继续。\n\n${displayName}`
+        }
+        const result = mainWindow
+          ? await dialog.showMessageBox(mainWindow, options)
+          : await dialog.showMessageBox(options)
+        return result.response === 1
+      },
+      openPath(path) {
+        return shell.openPath(path)
+      }
+    })
+    return { ...result, availability: 'available' as const }
+  }
+)
+
+ipcMain.handle(
+  'rovai:attachment-reveal',
+  async (_event, value: unknown) => {
+    const locator = requireAttachmentOwnerLocator(value)
+    const resolved = await resolveDesktopAttachmentTarget(locator)
+    if (!resolved.target) {
+      return {
+        revealed: false,
+        error: 'target_unavailable' as const,
+        availability: resolved.availability
+      }
+    }
+    const result = await revealDesktopAttachmentTarget(resolved.target, {
+      async canReveal(path) {
+        await readdir(dirname(path))
+        await lstat(path)
+        return true
+      },
+      revealPath(path) {
+        shell.showItemInFolder(path)
+      }
+    })
+    return { ...result, availability: 'available' as const }
+  }
+)
+
+ipcMain.handle('rovai:reveal-project-directory', (_event, projectPath: unknown) =>
+  revealProjectDirectory(projectPath, path => shell.showItemInFolder(path))
+)
+
+ipcMain.handle('rovai:select-workspace-directory', async () => {
+  const options = {
+    title: '选择工作目录',
+    buttonLabel: '选择目录',
+    properties: ['openDirectory'] as Array<'openDirectory'>
+  }
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options)
+  if (result.canceled || !result.filePaths[0]) return null
+  return core.request('workspaces.validate', { path: result.filePaths[0] })
+})
+
+ipcMain.handle('rovai:select-runtime-executable', async () => {
+  const options = {
+    title: '选择本机智能体可执行文件',
+    buttonLabel: '选择 Runtime',
+    properties: ['openFile'] as Array<'openFile'>
+  }
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options)
+  if (result.canceled || !result.filePaths[0]) return null
+  return result.filePaths[0]
+})
+
+ipcMain.handle('rovai:select-skill-import-directory', async () => {
+  const options = {
+    title: '导入 Skill',
+    buttonLabel: '检查目录',
+    properties: ['openDirectory'] as Array<'openDirectory'>
+  }
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options)
+  if (result.canceled || !result.filePaths[0]) return null
+  return result.filePaths[0]
+})
+
+ipcMain.handle('rovai:reveal-skill', async (_event, skillId: unknown) => {
+  if (typeof skillId !== 'string' || !skillId.trim()) {
+    throw new Error('Skill ID 无效。')
+  }
+  const location = await core.request<{ skillId: string; path: string }>(
+    'skills.revealLocation',
+    { skillId }
+  )
+  shell.showItemInFolder(location.path)
+})
+
+ipcMain.handle('rovai:reveal-mcp-config', async () => {
+  const config = await core.request<{ path: string; exists: boolean }>('mcp.config.get')
+  if (config.exists) {
+    shell.showItemInFolder(config.path)
+    return
+  }
+  const directory = dirname(config.path)
+  const error = await shell.openPath(directory)
+  if (error) {
+    throw new Error(`MCP 配置目录尚不存在：${directory}`)
+  }
+})
+
+ipcMain.handle('rovai:export-diagnostics', async () => {
+  const result = mainWindow
+    ? await dialog.showSaveDialog(mainWindow, {
+        title: '导出 Rovai AI 诊断数据',
+        defaultPath: `rovai-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }]
+      })
+    : await dialog.showSaveDialog({
+        title: '导出 Rovai AI 诊断数据',
+        defaultPath: `rovai-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }]
+  })
+  if (result.canceled || !result.filePath) return null
+  const supervisor = core.getSnapshot()
+  const diagnostics = supervisor.capabilities.coreRequests
+    ? await core.request('diagnostics.export')
+    : {
+        schemaVersion: 1,
+        kind: 'desktop_bootstrap_diagnostics',
+        exportedAt: new Date().toISOString(),
+        appVersion: app.getVersion(),
+        platform: process.platform,
+        arch: process.arch,
+        supervisor
+      }
+  const temporary = `${result.filePath}.rovai-${randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, `${JSON.stringify(diagnostics, null, 2)}\n`, {
+      mode: 0o600,
+      flag: 'wx'
+    })
+    await chmod(temporary, 0o600)
+    await rename(temporary, result.filePath)
+    await chmod(result.filePath, 0o600)
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined)
+    throw error
+  }
+  lastDiagnosticsExportPath = result.filePath
+  return result.filePath
+})
+
+ipcMain.handle('rovai:reveal-diagnostics-export', (_event, path: unknown) => {
+  if (typeof path !== 'string' || path !== lastDiagnosticsExportPath) {
+    throw new Error('只能显示本次会话刚刚导出的诊断文件。')
+  }
+  shell.showItemInFolder(path)
+})
+
+ipcMain.handle('rovai:export-monitoring', async (_event, filter: MonitoringFilter) => {
+  const result = mainWindow
+    ? await dialog.showSaveDialog(mainWindow, {
+        title: '导出 Rovai AI 运行监控数据',
+        defaultPath: `rovai-runtime-monitoring-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }]
+      })
+    : await dialog.showSaveDialog({
+        title: '导出 Rovai AI 运行监控数据',
+        defaultPath: `rovai-runtime-monitoring-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }]
+      })
+  if (result.canceled || !result.filePath) return null
+  const snapshot = await core.request<RuntimeUsageSnapshot>('monitoring.snapshot', filter)
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    ...snapshot
+  }
+  const temporary = `${result.filePath}.rovai-${randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, {
+      mode: 0o600,
+      flag: 'wx'
+    })
+    await chmod(temporary, 0o600)
+    await rename(temporary, result.filePath)
+    await chmod(result.filePath, 0o600)
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined)
+    throw error
+  }
+  lastMonitoringExportPath = result.filePath
+  return result.filePath
+})
+
+ipcMain.handle('rovai:reveal-monitoring-export', (_event, path: unknown) => {
+  if (typeof path !== 'string' || path !== lastMonitoringExportPath) {
+    throw new Error('只能显示本次会话刚刚导出的运行监控文件。')
+  }
+  shell.showItemInFolder(path)
+})
+
+ipcMain.handle('rovai:export-memory', async () => {
+  const options = {
+    title: '导出 Rovai AI 记忆',
+    defaultPath: `rovai-memory-${new Date().toISOString().slice(0, 10)}.json`,
+    filters: [{ name: 'JSON', extensions: ['json'] }]
+  }
+  const result = mainWindow
+    ? await dialog.showSaveDialog(mainWindow, options)
+    : await dialog.showSaveDialog(options)
+  if (result.canceled || !result.filePath) return null
+  const exported = await core.request('memory.export')
+  const temporary = `${result.filePath}.rovai-${randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, `${JSON.stringify(exported, null, 2)}\n`, {
+      mode: 0o600,
+      flag: 'wx'
+    })
+    await chmod(temporary, 0o600)
+    await rename(temporary, result.filePath)
+    await chmod(result.filePath, 0o600)
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined)
+    throw error
+  }
+  return result.filePath
+})
+
+const appQuitCoordinator = new AppQuitCoordinator({
+  updateInstallPending: () => appUpdates?.get().status === 'installing',
+  beforeDrain: () => {
+    // Keep services and Core fully available until Renderer Draft preparation succeeds.
+  },
+  prepareRenderer: () => windowsWindowClose
+    ? windowsWindowClose.settlePending().then(() => requestRendererQuitPreparation(mainWindow, () => new MessageChannelMain()))
+    : requestRendererQuitPreparation(mainWindow, () => new MessageChannelMain()),
+  drain: async () => {
+    if (desktopBackgroundTimer) {
+      clearInterval(desktopBackgroundTimer)
+      desktopBackgroundTimer = null
+    }
+    appUpdates?.dispose()
+    nativeTheme.removeListener('updated', publishAppearance)
+    powerMonitor.removeListener('resume', wakeNetworkRecoveryAfterSystemResume)
+    const stopAutomation = userAutomation?.stop() ?? Promise.resolve()
+    userAutomation = null
+    try {
+      await Promise.all([
+        filePreview.closeAll(),
+        stopAutomation,
+        evaluationHost?.stop() ?? Promise.resolve(),
+        channelHostLifecycle.stop(),
+        executionView.stop()
+      ])
+    } catch (error) {
+      console.error('Rovai application services shutdown failed', error)
+    }
+    const result = await core.shutdown()
+    console.error(`[rovai-core] controlled shutdown result ${JSON.stringify(result)}`)
+  },
+  reportFailure: (error) => {
+    console.error('Rovai Core controlled shutdown failed', error)
+  },
+  reportPreparationFailure: (error) => {
+    console.error('Rovai Renderer quit preparation failed; the App remains open', error)
+    windowsWindowClose?.quitPreparationFailed()
+  },
+  finish: () => {
+    // The updater has already staged its installer before update-driven quit.
+    // app.exit finishes the bounded drain without reopening native negotiation.
+    windowsWindowClose?.dispose()
+    app.exit(0)
+  }
+})
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', (event) => {
+  windowsWindowClose?.beginQuit()
+  appQuitCoordinator.handleQuitRequest(event)
+})
+
+let sharedGeneralPreferences: ReturnType<typeof withHostConversationPreferences> | null = null
+function hostGeneralPreferences(): ReturnType<typeof withHostConversationPreferences> {
+  sharedGeneralPreferences ??= withHostConversationPreferences(requireGeneralPreferences(), async (method, params) => {
+    // Import legacy Desktop choices only while the Host has no saved record.
+    // Repeating this after a Core restart cannot overwrite newer Web choices.
+    await core.request('preferences.newConversation.initialize', creationPreferences(requireGeneralPreferences().get()))
+    return core.request(method, params)
+  })
+  return sharedGeneralPreferences
+}
+
+function requireGeneralPreferences(): GeneralPreferencesStore {
+  if (!generalPreferences) throw new Error('General Preferences store is unavailable')
+  return generalPreferences
+}
+
+function requireShortcutPreferences(): ShortcutPreferencesStore {
+  if (!shortcutPreferences) throw new Error('Shortcut preferences are unavailable')
+  return shortcutPreferences
+}
+
+function requireOnboarding(): OnboardingStore {
+  if (!onboarding) throw new Error('Onboarding store is unavailable')
+  return onboarding
+}
+
+function requireNavigationPreferences(): NavigationPreferencesStore {
+  if (!navigationPreferences) throw new Error('Navigation Preferences store is unavailable')
+  return navigationPreferences
+}
+
+function requireMainWindow(webContents: Electron.WebContents): BrowserWindow {
+  const window = BrowserWindow.fromWebContents(webContents)
+  if (!window || window.isDestroyed() || window !== mainWindow) {
+    throw new Error('Main window is unavailable')
+  }
+  return window
+}
+
+function requireObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid channel settings request')
+  }
+  return value as Record<string, unknown>
+}
+
+function requireFilePreviewSender(event: Electron.IpcMainInvokeEvent): number {
+  requireMainWindow(event.sender)
+  if (event.senderFrame !== event.sender.mainFrame) {
+    throw new Error('File preview is only available to the main frame')
+  }
+  return event.sender.id
+}

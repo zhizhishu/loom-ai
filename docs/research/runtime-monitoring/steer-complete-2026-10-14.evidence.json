@@ -1,0 +1,2611 @@
+{
+  "schema": 1,
+  "date": "2026-10-14",
+  "sourceMessageId": "8715914b-298a-4e47-8004-da00e207950a",
+  "baselineCommit": "040980b71642bb34075c3ec2621a8dc97908ca7f",
+  "platform": "macOS 26.6 arm64",
+  "scope": "Native protocol supplement only. No new production adapters, prompts, schema, runtime settings, or App installation. Existing six product results are explicitly reused, not claimed rerun.",
+  "summary": {
+    "catalogRows": 18,
+    "excluded": 3,
+    "runtimesAssessedAcrossStages": 15,
+    "productEnabled": 6,
+    "additionalNativeSteerPass": 4,
+    "remainingTestedEntriesWithoutSameExecutionSteer": 5,
+    "newRuntimeCount": 9,
+    "newProbeAttempts": 15,
+    "positiveNativeSteerAttempts": 4,
+    "observedNonSteerEntryAttempts": 7,
+    "failedOrInconclusiveAttempts": 4
+  },
+  "matrix": [
+    {
+      "runtime": "Codex",
+      "version": "0.162.1",
+      "productStatus": "product_enabled",
+      "observedResult": "passed",
+      "evidence": "steer-2026-10-14.md"
+    },
+    {
+      "runtime": "Claude Code",
+      "version": "2.1.287",
+      "productStatus": "product_enabled",
+      "observedResult": "passed",
+      "evidence": "steer-five-runtimes-2026-10-14.md"
+    },
+    {
+      "runtime": "Pi",
+      "version": "1.1.0",
+      "productStatus": "product_enabled",
+      "observedResult": "passed",
+      "evidence": "steer-five-runtimes-2026-10-14.md"
+    },
+    {
+      "runtime": "CodeBuddy",
+      "version": "2.133.1",
+      "productStatus": "product_enabled",
+      "observedResult": "passed",
+      "evidence": "steer-five-runtimes-2026-10-14.md"
+    },
+    {
+      "runtime": "Qwen Code",
+      "version": "0.25.0",
+      "productStatus": "product_enabled",
+      "observedResult": "passed_with_recorded_ordinary_successor_timeout",
+      "evidence": "steer-five-runtimes-2026-10-14.md"
+    },
+    {
+      "runtime": "Grok Build",
+      "version": "1.0.50",
+      "productStatus": "product_enabled",
+      "observedResult": "passed",
+      "evidence": "steer-five-runtimes-2026-10-14.md"
+    },
+    {
+      "runtime": "Kimi Code",
+      "version": "2.1.1",
+      "productStatus": "not_integrated",
+      "observedResult": "native_steer_pass",
+      "evidence": "kimi-rest-02"
+    },
+    {
+      "runtime": "GitHub Copilot",
+      "version": "1.0.83 without auto-update / launcher 1.0.91",
+      "productStatus": "not_integrated",
+      "observedResult": "native_steer_pass",
+      "evidence": "copilot-sdk-03"
+    },
+    {
+      "runtime": "ZCode App",
+      "version": "3.14.5 / bundled kernel 0.16.9",
+      "productStatus": "not_integrated",
+      "observedResult": "native_steer_pass",
+      "evidence": "zcode-native-01"
+    },
+    {
+      "runtime": "OpenCode",
+      "version": "2.0.25",
+      "productStatus": "not_integrated",
+      "observedResult": "native_steer_pass",
+      "evidence": "opencode-http-01"
+    },
+    {
+      "runtime": "DeepSeek Harness",
+      "version": "0.2.1-alpha.1 (ACP self-report 0.0.1)",
+      "productStatus": "not_integrated",
+      "observedResult": "tested_ACP_busy_rejection",
+      "evidence": "dsh-acp-01"
+    },
+    {
+      "runtime": "Kiro",
+      "version": "2.21.1",
+      "productStatus": "not_integrated",
+      "observedResult": "tested_ACP_busy_rejection",
+      "evidence": "kiro-acp-02"
+    },
+    {
+      "runtime": "TRAE CLI CN",
+      "version": "0.120.52",
+      "productStatus": "not_integrated",
+      "observedResult": "tested_ACP_busy_rejection",
+      "evidence": "trae-acp-01"
+    },
+    {
+      "runtime": "Qoder",
+      "version": "1.1.65",
+      "productStatus": "not_integrated",
+      "observedResult": "tested_ACP_ordinary_next_turn",
+      "evidence": "qoder-acp-01"
+    },
+    {
+      "runtime": "Antigravity",
+      "version": "1.3.3",
+      "productStatus": "not_integrated",
+      "observedResult": "tested_StreamJSON_ordinary_next_turn",
+      "evidence": "antigravity-stream-01"
+    },
+    {
+      "runtime": "Cursor",
+      "version": null,
+      "productStatus": "excluded_by_user",
+      "observedResult": "not_tested",
+      "evidence": null
+    },
+    {
+      "runtime": "Cline",
+      "version": null,
+      "productStatus": "excluded_by_user",
+      "observedResult": "not_tested",
+      "evidence": null
+    },
+    {
+      "runtime": "Command Code",
+      "version": null,
+      "productStatus": "excluded_by_user",
+      "observedResult": "not_tested",
+      "evidence": null
+    }
+  ],
+  "binaryIdentities": {
+    "Kimi Code": {
+      "path": "/opt/homebrew/bin/kimi",
+      "resolvedPath": "/opt/homebrew/Cellar/kimi-code/2.1.1/libexec/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs",
+      "sha256": "496d578ecd3da668b2fdfdd3724e3aefda05c92ea31476d4fe9a87be97b223be"
+    },
+    "GitHub Copilot": {
+      "path": "/opt/homebrew/bin/copilot",
+      "resolvedPath": "/opt/homebrew/Caskroom/copilot-cli/1.0.35/copilot",
+      "sha256": "15f218a936f693a6b73df248824b9f7f528c2c61949ff446e4ca6062ee48b084"
+    },
+    "OpenCode": {
+      "path": "/opt/homebrew/bin/opencode",
+      "resolvedPath": "/opt/homebrew/Cellar/opencode/2.0.25/bin/opencode",
+      "sha256": "e0c5d500b2b3d97d30f57f52a3a9a058098eb76116d1c9fd095951572318f808"
+    },
+    "TRAE CLI CN": {
+      "path": "<USER_HOME>/.local/bin/traecli",
+      "resolvedPath": "<USER_HOME>/.local/share/trae-cli/trae-cli",
+      "sha256": "d135c7cc48aefd227b4ff07680ab6574caac35fc2def4e767415b6b4bbf0c559"
+    },
+    "Kiro": {
+      "path": "<USER_HOME>/.local/bin/kiro-cli",
+      "resolvedPath": "/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli",
+      "sha256": "a15e0053e5775a4e0ee2cb3bac6c089d352ad2486a9eea076702a3f9f4287ef5"
+    },
+    "Qoder": {
+      "path": "<USER_HOME>/.local/bin/qodercli",
+      "resolvedPath": "<USER_HOME>/.qoder/bin/qodercli/qodercli-1.1.65",
+      "sha256": "915724f44800a93ddcd04ab8c38401c256d6b1f862409d430e51286f401c5eb9"
+    },
+    "DeepSeek Harness": {
+      "path": "/opt/homebrew/bin/dsh",
+      "resolvedPath": "/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+      "sha256": "1a03dee18683483ff6a1b27b2a1e650230da6bcca9a0f55f7d81b3308c3f307f"
+    },
+    "Antigravity": {
+      "path": "<USER_HOME>/.local/bin/agy",
+      "resolvedPath": "<USER_HOME>/.local/bin/agy",
+      "sha256": "ebd71c4db14f79fca3fd0160332a38d9037146737422dcfc1f1d21ba01a13fff"
+    },
+    "ZCode App": {
+      "resolvedPath": "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+      "sha256": "fad4c35c4c36ec210d8a06d3fa0e77de23c8545e2eb6ff90aea1eb38d1e6275f"
+    }
+  },
+  "cases": [
+    {
+      "id": "antigravity-stream-01",
+      "runtime": "Antigravity",
+      "transport": "stream-json open stdin",
+      "version": "1.3.3",
+      "startedAt": "2026-10-14T12:50:26.663424+00:00",
+      "finishedAt": "2026-10-14T12:51:08.550827+00:00",
+      "runnerStatus": "observed",
+      "assessment": "ordinary_next_turn",
+      "failure": null,
+      "reportSha256": "e988f922d4754c6935e68a8f4a48ceaa44fd16057e502da530114a50dd187157",
+      "probeScript": "antigravity_probe.py",
+      "probeScriptSha256": "0a45f1521f79e49de113b996059107cc5dc82ac30eb6347ae006271c3cff21c9",
+      "observations": {
+        "actualToolBoundary": true,
+        "eventsBeforeSupplement": 10
+      },
+      "conversationId": "304831f8-ab87-49df-b16d-cce86ba189f5",
+      "results": [
+        {
+          "index": 16,
+          "conversation_id": "304831f8-ab87-49df-b16d-cce86ba189f5",
+          "status": "SUCCESS",
+          "response": "ORIGINAL_026\n",
+          "duration_seconds": 28.032892,
+          "num_turns": 1,
+          "usage": {
+            "input_tokens": 66194,
+            "output_tokens": 2084,
+            "thinking_tokens": 1751,
+            "cache_read_tokens": 0,
+            "total_tokens": 68278
+          }
+        },
+        {
+          "index": 20,
+          "conversation_id": "304831f8-ab87-49df-b16d-cce86ba189f5",
+          "status": "SUCCESS",
+          "response": "STEER_026_成功\n",
+          "duration_seconds": 35.116112,
+          "num_turns": 2,
+          "usage": {
+            "input_tokens": 81018,
+            "output_tokens": 2222,
+            "thinking_tokens": 1881,
+            "cache_read_tokens": 0,
+            "total_tokens": 83240
+          }
+        }
+      ],
+      "eventCounts": {
+        "init": 1,
+        "step_update": 18,
+        "result": 2
+      },
+      "wireSha256": "55d12a35d532ab8e0ae63141b4a0bc04ab1d6119f7b13085ab8bd69e292ef7cd",
+      "nativeStoreNote": "App-data environment variables did not isolate this CLI; actual session in platform-owned ~/.gemini/antigravity-cli. Existing OS keyring authentication reused; only this returned test conversation was created."
+    },
+    {
+      "id": "copilot-acp-01",
+      "runtime": "copilot",
+      "transport": "ACP",
+      "version": "GitHub Copilot CLI 1.0.91.\nRun 'copilot update' to check for updates.",
+      "startedAt": "2026-10-14T12:40:55.634683+00:00",
+      "finishedAt": "2026-10-14T12:41:05.658505+00:00",
+      "runnerStatus": "observed",
+      "assessment": "abort_then_new_interaction",
+      "failure": null,
+      "reportSha256": "0da1cba12cd6b0f6e21293cb06723517055a4253b8e7939908e3c81e3c9b8338",
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "5178f773a194e67e7c10d8cf140b59878c8024beb76e111595703f3aeab5559d",
+      "initializeAgentInfo": {
+        "name": "Copilot",
+        "title": "Copilot",
+        "version": "1.0.83"
+      },
+      "sessionId": "7d795254-baa9-467d-8287-e04245e6810d",
+      "observations": {
+        "toolBoundary": {
+          "ready": true,
+          "firstPromptStillPending": true
+        },
+        "supplement": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "result": {
+            "stopReason": "end_turn",
+            "usage": {
+              "inputTokens": 41899,
+              "outputTokens": 149,
+              "totalTokens": 42048,
+              "thoughtTokens": 8,
+              "cachedReadTokens": 20828,
+              "cachedWriteTokens": 21067
+            }
+          }
+        },
+        "original": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "stopReason": "end_turn",
+            "usage": {
+              "inputTokens": 20830,
+              "outputTokens": 139,
+              "totalTokens": 20969,
+              "thoughtTokens": 8,
+              "cachedReadTokens": 0,
+              "cachedWriteTokens": 20828
+            }
+          }
+        },
+        "assistantText": "STEER_026_成功",
+        "timeline": [
+          {
+            "index": 12,
+            "responseTo": 3,
+            "result": {
+              "stopReason": "end_turn",
+              "usage": {
+                "inputTokens": 20830,
+                "outputTokens": 139,
+                "totalTokens": 20969,
+                "thoughtTokens": 8,
+                "cachedReadTokens": 0,
+                "cachedWriteTokens": 20828
+              }
+            },
+            "error": null
+          },
+          {
+            "index": 16,
+            "responseTo": 4,
+            "result": {
+              "stopReason": "end_turn",
+              "usage": {
+                "inputTokens": 41899,
+                "outputTokens": 149,
+                "totalTokens": 42048,
+                "thoughtTokens": 8,
+                "cachedReadTokens": 20828,
+                "cachedWriteTokens": 21067
+              }
+            },
+            "error": null
+          }
+        ]
+      },
+      "wireSha256": "82477c249161b8fa26c3dedb8bd84340ddd7ef0124f874fa308eb29f89f2ed75",
+      "nativeJournalSha256": "f1eafd831afe3f1b872f8dfb2b92df71268b6de3ca476c299f50040bc7788637",
+      "nativeEvents": [
+        {
+          "index": 2,
+          "type": "user.message",
+          "data": {
+            "messageId": "e7e52239-c83b-4966-a2da-2f10a74c51d1",
+            "turnId": "0",
+            "interactionId": "2ba61648-d5e5-440a-88e6-76e6fac8828a",
+            "content": "Isolated protocol acceptance. You MUST actually run python3 ./hold.py exactly once using a shell tool (intentional test wait). Do not modify or read the script. When it completes, answer exactly ORIGINAL_026. Do not perform other work.",
+            "delivery": "idle"
+          }
+        },
+        {
+          "index": 4,
+          "type": "assistant.turn_start",
+          "data": {
+            "turnId": "0",
+            "interactionId": "2ba61648-d5e5-440a-88e6-76e6fac8828a"
+          }
+        },
+        {
+          "index": 5,
+          "type": "assistant.message",
+          "data": {
+            "messageId": "536fc904-26bd-4e8c-ac71-f5b0ab77f188",
+            "turnId": "0",
+            "interactionId": "2ba61648-d5e5-440a-88e6-76e6fac8828a",
+            "content": "",
+            "model": "claude-opus-5",
+            "requestedTools": [
+              {
+                "toolCallId": "toolu_01BeqPkA85jmt871eb1q6S3g",
+                "name": "bash"
+              }
+            ]
+          }
+        },
+        {
+          "index": 6,
+          "type": "tool.execution_start",
+          "data": {
+            "turnId": "0",
+            "model": "claude-opus-5",
+            "toolCallId": "toolu_01BeqPkA85jmt871eb1q6S3g",
+            "toolName": "bash"
+          }
+        },
+        {
+          "index": 7,
+          "type": "permission.requested",
+          "data": {
+            "requestId": "7163f065-76ea-4648-9c45-7d1a6e660820"
+          }
+        },
+        {
+          "index": 8,
+          "type": "permission.completed",
+          "data": {
+            "requestId": "7163f065-76ea-4648-9c45-7d1a6e660820",
+            "toolCallId": "toolu_01BeqPkA85jmt871eb1q6S3g"
+          }
+        },
+        {
+          "index": 9,
+          "type": "abort",
+          "data": {
+            "reason": "user_initiated"
+          }
+        },
+        {
+          "index": 10,
+          "type": "assistant.turn_end",
+          "data": {
+            "turnId": "0"
+          }
+        },
+        {
+          "index": 12,
+          "type": "user.message",
+          "data": {
+            "messageId": "c6db9f5f-4b77-439d-b612-2935977f5718",
+            "turnId": "0",
+            "interactionId": "e9c5a1af-66a0-4553-818a-a3d2c9e7c9b3",
+            "content": "用户更正：当前工具结束后，只回复 STEER_026_成功，替代原先 ORIGINAL_026；不要运行新工具。",
+            "delivery": "idle"
+          }
+        },
+        {
+          "index": 13,
+          "type": "assistant.turn_start",
+          "data": {
+            "turnId": "0",
+            "interactionId": "e9c5a1af-66a0-4553-818a-a3d2c9e7c9b3"
+          }
+        },
+        {
+          "index": 16,
+          "type": "assistant.message",
+          "data": {
+            "messageId": "05261a64-db77-4112-a5a9-85a111d66031",
+            "turnId": "0",
+            "interactionId": "e9c5a1af-66a0-4553-818a-a3d2c9e7c9b3",
+            "content": "STEER_026_成功",
+            "model": "claude-opus-5"
+          }
+        },
+        {
+          "index": 17,
+          "type": "assistant.turn_end",
+          "data": {
+            "turnId": "0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "copilot-sdk-01",
+      "runtime": "GitHub Copilot",
+      "transport": "native SDK JSON-RPC",
+      "version": "1.0.83 with --no-auto-update; launcher reports 1.0.91; SDK protocol 3; session journal reports 0.0.0",
+      "startedAt": "2026-10-14T12:43:56.402967+00:00",
+      "finishedAt": "2026-10-14T12:45:37.894280+00:00",
+      "runnerStatus": "inconclusive",
+      "assessment": "harness_failure_missing_broadcast_permission_handler",
+      "failure": "tool callback",
+      "reportSha256": "e45f9962f2cea258eff48635b91eced6f0446e53ca5725b4ca772268e8a2aba4",
+      "probeScript": "copilot_sdk.py",
+      "probeScriptSha256": "0056b76ac41938e954ef1e7914d6f55f7402b31c2496757892ddcd11b74af8a2",
+      "observations": {
+        "ping": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "message": "pong: steer-native-026",
+            "timestamp": "2026-10-14T12:43:56.647538Z",
+            "protocolVersion": 3
+          }
+        },
+        "create": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {
+            "sessionId": "15f3780a-906a-4ec9-83c6-4202e563a574",
+            "nativeSessionId": "15f3780a-906a-4ec9-83c6-4202e563a574",
+            "startTime": "2026-10-14T12:43:57.611Z",
+            "isRemote": false,
+            "mode": "interactive",
+            "capabilities": {
+              "ui": {
+                "elicitation": false,
+                "mcpApps": false,
+                "canvases": false
+              },
+              "extensions": false
+            },
+            "modelState": {}
+          }
+        },
+        "initial": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "messageId": "388dc89d-9a96-478b-a702-2285ff73ba8b"
+          }
+        }
+      },
+      "events": [
+        {
+          "index": 10,
+          "type": "user.message",
+          "data": {
+            "messageId": "388dc89d-9a96-478b-a702-2285ff73ba8b",
+            "turnId": "0",
+            "interactionId": "59a4f3eb-5a19-44c4-bba7-714b4dde0395",
+            "content": "Call the hold tool exactly once. After the tool completes, respond exactly ORIGINAL_026.",
+            "delivery": "idle"
+          }
+        },
+        {
+          "index": 13,
+          "type": "assistant.turn_start",
+          "data": {
+            "turnId": "0",
+            "interactionId": "59a4f3eb-5a19-44c4-bba7-714b4dde0395"
+          }
+        },
+        {
+          "index": 23,
+          "type": "assistant.message",
+          "data": {
+            "messageId": "c74f32aa-91e1-4ea5-9ad9-e4d4b0504062",
+            "turnId": "0",
+            "interactionId": "59a4f3eb-5a19-44c4-bba7-714b4dde0395",
+            "content": "",
+            "model": "claude-opus-5",
+            "requestedTools": [
+              {
+                "toolCallId": "toolu_0153Cv7XUK7zvCGMStUGa41K",
+                "name": "hold"
+              }
+            ]
+          }
+        },
+        {
+          "index": 24,
+          "type": "tool.execution_start",
+          "data": {
+            "turnId": "0",
+            "model": "claude-opus-5",
+            "toolCallId": "toolu_0153Cv7XUK7zvCGMStUGa41K",
+            "toolName": "hold"
+          }
+        },
+        {
+          "index": 25,
+          "type": "permission.requested",
+          "data": {
+            "requestId": "251baae1-55bf-4cd6-9ab7-dc16a17a073f"
+          }
+        }
+      ],
+      "wireSha256": "4916cebf1c5a617d48436d3978c46d03683d0e8c1541b28df48afcbbb2d3abd1"
+    },
+    {
+      "id": "copilot-sdk-02",
+      "runtime": "GitHub Copilot",
+      "transport": "native SDK JSON-RPC",
+      "version": "1.0.83 with --no-auto-update; launcher reports 1.0.91; SDK protocol 3; session journal reports 0.0.0",
+      "startedAt": "2026-10-14T12:47:37.756236+00:00",
+      "finishedAt": "2026-10-14T12:47:45.152469+00:00",
+      "runnerStatus": "observed",
+      "assessment": "native_steer_delivered_model_output_filtered",
+      "failure": null,
+      "reportSha256": "b5ce7b05fceb4bf21ebbe9db4d999d6cad818aa07acb395a0378533c27384adc",
+      "probeScript": "copilot_sdk02.py",
+      "probeScriptSha256": "c7933776cbee1af8e3820701c9cfc889383f953b62014950aa27448ef3888cce",
+      "observations": {
+        "ping": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "message": "pong: steer-native-026",
+            "timestamp": "2026-10-14T12:47:38.031649Z",
+            "protocolVersion": 3
+          }
+        },
+        "create": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {
+            "sessionId": "687af64f-82a7-42a2-be57-b7fc1fcb9ff5",
+            "nativeSessionId": "687af64f-82a7-42a2-be57-b7fc1fcb9ff5",
+            "startTime": "2026-10-14T12:47:39.103Z",
+            "isRemote": false,
+            "mode": "interactive",
+            "capabilities": {
+              "ui": {
+                "elicitation": false,
+                "mcpApps": false,
+                "canvases": false
+              },
+              "extensions": false
+            },
+            "modelState": {}
+          }
+        },
+        "initial": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "messageId": "934beea8-4367-4b52-acbc-9e8f808b1802"
+          }
+        },
+        "actualToolBoundary": true,
+        "steer": {
+          "jsonrpc": "2.0",
+          "id": 5,
+          "result": {
+            "messageId": "0b20096d-a07f-433f-81af-2137d2848d0b"
+          }
+        }
+      },
+      "events": [
+        {
+          "index": 10,
+          "type": "user.message",
+          "data": {
+            "messageId": "934beea8-4367-4b52-acbc-9e8f808b1802",
+            "turnId": "0",
+            "interactionId": "cd505223-6eff-4976-98ad-b6bc3ee719f8",
+            "content": "Call the hold tool exactly once. After the tool completes, respond exactly ORIGINAL_026.",
+            "delivery": "idle"
+          }
+        },
+        {
+          "index": 13,
+          "type": "assistant.turn_start",
+          "data": {
+            "turnId": "0",
+            "interactionId": "cd505223-6eff-4976-98ad-b6bc3ee719f8"
+          }
+        },
+        {
+          "index": 23,
+          "type": "assistant.message",
+          "data": {
+            "messageId": "1a06d941-586f-41a6-9727-eb6605ba3403",
+            "turnId": "0",
+            "interactionId": "cd505223-6eff-4976-98ad-b6bc3ee719f8",
+            "content": "",
+            "model": "claude-opus-5",
+            "requestedTools": [
+              {
+                "toolCallId": "toolu_01STUjKbs6toNtJHcKrQSDwa",
+                "name": "hold"
+              }
+            ]
+          }
+        },
+        {
+          "index": 24,
+          "type": "tool.execution_start",
+          "data": {
+            "turnId": "0",
+            "model": "claude-opus-5",
+            "toolCallId": "toolu_01STUjKbs6toNtJHcKrQSDwa",
+            "toolName": "hold"
+          }
+        },
+        {
+          "index": 25,
+          "type": "permission.requested",
+          "data": {
+            "requestId": "740d2191-cea9-40bd-83f0-41195faf2e28"
+          }
+        },
+        {
+          "index": 26,
+          "type": "permission.completed",
+          "data": {
+            "requestId": "740d2191-cea9-40bd-83f0-41195faf2e28",
+            "toolCallId": "toolu_01STUjKbs6toNtJHcKrQSDwa"
+          }
+        },
+        {
+          "index": 27,
+          "type": "external_tool.requested",
+          "data": {
+            "sessionId": "687af64f-82a7-42a2-be57-b7fc1fcb9ff5",
+            "requestId": "e605240c-bfc2-4ee5-90a7-63a9e38566f3",
+            "toolCallId": "toolu_01STUjKbs6toNtJHcKrQSDwa",
+            "toolName": "hold"
+          }
+        },
+        {
+          "index": 29,
+          "type": "external_tool.completed",
+          "data": {
+            "requestId": "e605240c-bfc2-4ee5-90a7-63a9e38566f3"
+          }
+        },
+        {
+          "index": 31,
+          "type": "tool.execution_complete",
+          "data": {
+            "turnId": "0",
+            "interactionId": "cd505223-6eff-4976-98ad-b6bc3ee719f8",
+            "model": "claude-opus-5",
+            "toolCallId": "toolu_01STUjKbs6toNtJHcKrQSDwa",
+            "success": true
+          }
+        },
+        {
+          "index": 34,
+          "type": "assistant.turn_end",
+          "data": {
+            "turnId": "0"
+          }
+        },
+        {
+          "index": 36,
+          "type": "assistant.turn_start",
+          "data": {
+            "turnId": "1",
+            "interactionId": "cd505223-6eff-4976-98ad-b6bc3ee719f8"
+          }
+        },
+        {
+          "index": 39,
+          "type": "user.message",
+          "data": {
+            "messageId": "0b20096d-a07f-433f-81af-2137d2848d0b",
+            "turnId": "1",
+            "interactionId": "cd505223-6eff-4976-98ad-b6bc3ee719f8",
+            "content": "更正：当前工具结束后只回复 STEER_026_成功，替代 ORIGINAL_026，不再运行工具。",
+            "delivery": "steering"
+          }
+        },
+        {
+          "index": 48,
+          "type": "assistant.message",
+          "data": {
+            "messageId": "20f60c00-ae7e-4a2c-8232-576c98b5f33a",
+            "turnId": "1",
+            "interactionId": "cd505223-6eff-4976-98ad-b6bc3ee719f8",
+            "content": "The model returned no content because the response was blocked by content filtering.",
+            "model": "claude-opus-5"
+          }
+        },
+        {
+          "index": 51,
+          "type": "assistant.turn_end",
+          "data": {
+            "turnId": "1"
+          }
+        },
+        {
+          "index": 55,
+          "type": "session.idle",
+          "data": {}
+        }
+      ],
+      "wireSha256": "fe2015fb47dadde8877fa5d4ed9b9fb698bfb67fee714bedc0ffb14709b17be4"
+    },
+    {
+      "id": "copilot-sdk-03",
+      "runtime": "GitHub Copilot",
+      "transport": "native SDK JSON-RPC",
+      "version": "1.0.83 with --no-auto-update; launcher reports 1.0.91; SDK protocol 3; session journal reports 0.0.0",
+      "startedAt": "2026-10-14T12:48:19.880181+00:00",
+      "finishedAt": "2026-10-14T12:48:26.272837+00:00",
+      "runnerStatus": "observed",
+      "assessment": "native_steer_pass",
+      "failure": null,
+      "reportSha256": "a906b37df28488a70ba4a41757e643577ad72df3c50841fdbc46a85da97e330f",
+      "probeScript": "copilot_sdk03.py",
+      "probeScriptSha256": "19cd911d76c4b50c2e61e4ab62293067ee447cb407318f49cf3e912d398f271d",
+      "observations": {
+        "ping": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "message": "pong: steer-native-026",
+            "timestamp": "2026-10-14T12:48:20.169797Z",
+            "protocolVersion": 3
+          }
+        },
+        "create": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {
+            "sessionId": "c6f8d232-6d46-46f4-8686-989d4c215c9d",
+            "nativeSessionId": "c6f8d232-6d46-46f4-8686-989d4c215c9d",
+            "startTime": "2026-10-14T12:48:21.210Z",
+            "isRemote": false,
+            "mode": "interactive",
+            "capabilities": {
+              "ui": {
+                "elicitation": false,
+                "mcpApps": false,
+                "canvases": false
+              },
+              "extensions": false
+            },
+            "modelState": {}
+          }
+        },
+        "initial": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "messageId": "e85e30d6-747e-4433-bd99-e291431a68a8"
+          }
+        },
+        "actualToolBoundary": true,
+        "steer": {
+          "jsonrpc": "2.0",
+          "id": 5,
+          "result": {
+            "messageId": "3fcc76d8-8386-4e13-b85a-748268c6e996"
+          }
+        }
+      },
+      "events": [
+        {
+          "index": 10,
+          "type": "user.message",
+          "data": {
+            "messageId": "e85e30d6-747e-4433-bd99-e291431a68a8",
+            "turnId": "0",
+            "interactionId": "85ff164c-1a0f-4deb-9c95-03c25dce1ebd",
+            "content": "请调用 hold 工具一次，测试完成后回复：等待完成。",
+            "delivery": "idle"
+          }
+        },
+        {
+          "index": 13,
+          "type": "assistant.turn_start",
+          "data": {
+            "turnId": "0",
+            "interactionId": "85ff164c-1a0f-4deb-9c95-03c25dce1ebd"
+          }
+        },
+        {
+          "index": 23,
+          "type": "assistant.message",
+          "data": {
+            "messageId": "074bab74-6c81-436a-99de-1e9032553533",
+            "turnId": "0",
+            "interactionId": "85ff164c-1a0f-4deb-9c95-03c25dce1ebd",
+            "content": "",
+            "model": "claude-opus-5",
+            "requestedTools": [
+              {
+                "toolCallId": "toolu_01M4jhY7NikK8fEzpxPUPSVa",
+                "name": "hold"
+              }
+            ]
+          }
+        },
+        {
+          "index": 24,
+          "type": "tool.execution_start",
+          "data": {
+            "turnId": "0",
+            "model": "claude-opus-5",
+            "toolCallId": "toolu_01M4jhY7NikK8fEzpxPUPSVa",
+            "toolName": "hold"
+          }
+        },
+        {
+          "index": 25,
+          "type": "permission.requested",
+          "data": {
+            "requestId": "30143187-c739-4daa-b77a-e2ee36b37662"
+          }
+        },
+        {
+          "index": 26,
+          "type": "permission.completed",
+          "data": {
+            "requestId": "30143187-c739-4daa-b77a-e2ee36b37662",
+            "toolCallId": "toolu_01M4jhY7NikK8fEzpxPUPSVa"
+          }
+        },
+        {
+          "index": 27,
+          "type": "external_tool.requested",
+          "data": {
+            "sessionId": "c6f8d232-6d46-46f4-8686-989d4c215c9d",
+            "requestId": "86a23e84-aa99-40d4-b7c6-afb16fed4505",
+            "toolCallId": "toolu_01M4jhY7NikK8fEzpxPUPSVa",
+            "toolName": "hold"
+          }
+        },
+        {
+          "index": 29,
+          "type": "external_tool.completed",
+          "data": {
+            "requestId": "86a23e84-aa99-40d4-b7c6-afb16fed4505"
+          }
+        },
+        {
+          "index": 31,
+          "type": "tool.execution_complete",
+          "data": {
+            "turnId": "0",
+            "interactionId": "85ff164c-1a0f-4deb-9c95-03c25dce1ebd",
+            "model": "claude-opus-5",
+            "toolCallId": "toolu_01M4jhY7NikK8fEzpxPUPSVa",
+            "success": true
+          }
+        },
+        {
+          "index": 34,
+          "type": "assistant.turn_end",
+          "data": {
+            "turnId": "0"
+          }
+        },
+        {
+          "index": 36,
+          "type": "assistant.turn_start",
+          "data": {
+            "turnId": "1",
+            "interactionId": "85ff164c-1a0f-4deb-9c95-03c25dce1ebd"
+          }
+        },
+        {
+          "index": 39,
+          "type": "user.message",
+          "data": {
+            "messageId": "3fcc76d8-8386-4e13-b85a-748268c6e996",
+            "turnId": "1",
+            "interactionId": "85ff164c-1a0f-4deb-9c95-03c25dce1ebd",
+            "content": "补充要求：等工具完成后，请用中文回复“已采用补充要求。”，无需执行其他工具。",
+            "delivery": "steering"
+          }
+        },
+        {
+          "index": 53,
+          "type": "assistant.message",
+          "data": {
+            "messageId": "076b0b9a-0e96-45ff-a5bf-959e418569f9",
+            "turnId": "1",
+            "interactionId": "85ff164c-1a0f-4deb-9c95-03c25dce1ebd",
+            "content": "已采用补充要求。",
+            "model": "claude-opus-5"
+          }
+        },
+        {
+          "index": 56,
+          "type": "assistant.turn_end",
+          "data": {
+            "turnId": "1"
+          }
+        },
+        {
+          "index": 60,
+          "type": "session.idle",
+          "data": {}
+        }
+      ],
+      "wireSha256": "3c1c73d4437e10f80e31784a327fc7bf02b0b965f57086dd3b63f753bb92e134"
+    },
+    {
+      "id": "dsh-acp-01",
+      "runtime": "dsh",
+      "transport": "ACP",
+      "version": "0.2.1-alpha.1",
+      "startedAt": "2026-10-14T12:40:55.634647+00:00",
+      "finishedAt": "2026-10-14T12:41:00.571881+00:00",
+      "runnerStatus": "observed",
+      "assessment": "busy_rejection",
+      "failure": null,
+      "reportSha256": "dd76cebf73ee26c46a641e27e46029940ba41a8d6e70af04be0b8c77d746a6a2",
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "5178f773a194e67e7c10d8cf140b59878c8024beb76e111595703f3aeab5559d",
+      "initializeAgentInfo": {
+        "name": "deepseek-harness-acp",
+        "version": "0.0.1"
+      },
+      "sessionId": "1483f772-782a-4fe0-9173-f738bad85305",
+      "observations": {
+        "toolBoundary": {
+          "ready": true,
+          "firstPromptStillPending": true
+        },
+        "supplement": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: a prompt is already in flight for this session"
+          }
+        },
+        "original": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "stopReason": "end_turn"
+          }
+        },
+        "assistantText": "ORIGINAL_026",
+        "timeline": [
+          {
+            "index": 5,
+            "responseTo": 4,
+            "result": null,
+            "error": {
+              "code": -32602,
+              "message": "Invalid params: a prompt is already in flight for this session"
+            }
+          },
+          {
+            "index": 9,
+            "responseTo": 3,
+            "result": {
+              "stopReason": "end_turn"
+            },
+            "error": null
+          }
+        ]
+      },
+      "wireSha256": "d49e3386c512f69bde91a2fa662f31ac570f2e036bf96556441590a6efa14c78"
+    },
+    {
+      "id": "kimi-rest-01",
+      "runtime": "Kimi Code",
+      "transport": "native REST + WebSocket",
+      "version": "2.1.1",
+      "startedAt": "2026-10-14T12:43:08.483Z",
+      "finishedAt": "2026-10-14T12:44:48.760Z",
+      "runnerStatus": "inconclusive",
+      "assessment": "setup_failure_model_not_configured",
+      "failure": "Error: Timeout actual tool boundary",
+      "reportSha256": "f69c559ff060f072a4b6659061663e6dd61235c4fd5e04adede24705a87902d9",
+      "probeScript": "kimi_rest.mjs",
+      "probeScriptSha256": "c43a491ee1ba2d0ad049cadb49187ac9f8e7ca917eb745655ab2cce42c521d56",
+      "observations": {
+        "initial": {
+          "code": 0,
+          "msg": "success",
+          "data": {
+            "prompt_id": "msg_01M4X707HPGEGEDJWRJRE7B6H2",
+            "user_message_id": "msg_01M4X707HPGEGEDJWRJRE7B6H2",
+            "status": "running",
+            "content": [
+              {
+                "type": "text",
+                "text": "请检查当前目录 hold.py，再执行它验证等待逻辑（120秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。"
+              }
+            ],
+            "created_at": "2026-10-14T12:43:08.740Z"
+          },
+          "request_id": "01M4X707GS4NHA95PEJP3Q22HS"
+        }
+      },
+      "events": [
+        {
+          "type": "turn.started",
+          "seq": 5,
+          "session_id": "session_1abcf212-2039-4d4d-adfb-2882193013a7",
+          "timestamp": "2026-10-14T12:43:08.744Z",
+          "payload": {
+            "type": "turn.started",
+            "time": 1791981788744,
+            "agentId": "main",
+            "turnId": 0,
+            "promptId": "msg_01M4X707HPGEGEDJWRJRE7B6H2",
+            "origin": {
+              "kind": "user"
+            },
+            "prompt": "请检查当前目录 hold.py，再执行它验证等待逻辑（120秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。",
+            "sessionId": "session_1abcf212-2039-4d4d-adfb-2882193013a7"
+          },
+          "epoch": "ep_01M4X707DG3X365YGX5Y9WZD10"
+        },
+        {
+          "type": "prompt.started",
+          "seq": 8,
+          "session_id": "session_1abcf212-2039-4d4d-adfb-2882193013a7",
+          "timestamp": "2026-10-14T12:43:08.746Z",
+          "payload": {
+            "type": "prompt.started",
+            "time": 1791981788746,
+            "agentId": "main",
+            "promptId": "msg_01M4X707HPGEGEDJWRJRE7B6H2",
+            "sessionId": "session_1abcf212-2039-4d4d-adfb-2882193013a7"
+          },
+          "epoch": "ep_01M4X707DG3X365YGX5Y9WZD10"
+        },
+        {
+          "type": "turn.ended",
+          "seq": 12,
+          "session_id": "session_1abcf212-2039-4d4d-adfb-2882193013a7",
+          "timestamp": "2026-10-14T12:43:08.752Z",
+          "payload": {
+            "type": "turn.ended",
+            "time": 1791981788752,
+            "agentId": "main",
+            "turnId": 0,
+            "reason": "failed",
+            "error": {
+              "code": "model.not_configured",
+              "message": "Model not set",
+              "name": "Error2",
+              "retryable": false
+            },
+            "durationMs": 8,
+            "interruptReason": "error",
+            "sessionId": "session_1abcf212-2039-4d4d-adfb-2882193013a7"
+          },
+          "epoch": "ep_01M4X707DG3X365YGX5Y9WZD10"
+        },
+        {
+          "type": "prompt.completed",
+          "seq": 15,
+          "session_id": "session_1abcf212-2039-4d4d-adfb-2882193013a7",
+          "timestamp": "2026-10-14T12:43:08.753Z",
+          "payload": {
+            "type": "prompt.completed",
+            "time": 1791981788753,
+            "agentId": "main",
+            "promptId": "msg_01M4X707HPGEGEDJWRJRE7B6H2",
+            "finishedAt": "2026-10-14T12:43:08.753Z",
+            "reason": "failed",
+            "sessionId": "session_1abcf212-2039-4d4d-adfb-2882193013a7"
+          },
+          "epoch": "ep_01M4X707DG3X365YGX5Y9WZD10"
+        }
+      ],
+      "eventCounts": {
+        "server_hello": 1,
+        "ack": 1,
+        "agent.created": 1,
+        "session.meta.updated": 1,
+        "prompt.submitted": 1,
+        "turn.started": 1,
+        "agent.status.updated": 7,
+        "event.session.work_changed": 2,
+        "context.spliced": 3,
+        "prompt.started": 1,
+        "turn.step.interrupted": 1,
+        "turn.ended": 1,
+        "error": 1,
+        "prompt.completed": 1,
+        "ping": 2
+      },
+      "sessionId": "session_1abcf212-2039-4d4d-adfb-2882193013a7",
+      "messages": [],
+      "nativeTerminalEvents": [
+        {
+          "type": "turn.ended",
+          "agentId": "main",
+          "turnId": 0,
+          "reason": "failed",
+          "error": {
+            "code": "model.not_configured",
+            "message": "Model not set",
+            "name": "Error2",
+            "retryable": false
+          },
+          "durationMs": 8,
+          "time": 1791981788752
+        }
+      ],
+      "wireSha256": "746c4bd757ffefe3c8d5eea4924c3d0c3a3c34087984446cf446787f1bf64c2b"
+    },
+    {
+      "id": "kimi-rest-02",
+      "runtime": "Kimi Code",
+      "transport": "native REST + WebSocket",
+      "version": "2.1.1",
+      "startedAt": "2026-10-14T12:47:46.794Z",
+      "finishedAt": "2026-10-14T12:47:59.043Z",
+      "runnerStatus": "observed",
+      "assessment": "native_steer_pass",
+      "failure": null,
+      "reportSha256": "ada559b179bbb3f4e403c8f206891f0a8aa98cc4b2816b7e1f515e330ce9304f",
+      "probeScript": "kimi_rest02.mjs",
+      "probeScriptSha256": "7dec3a04da530d24da28047bfc6aa6a27ced49974a9802aa7417539a994a58b4",
+      "observations": {
+        "initial": {
+          "code": 0,
+          "msg": "success",
+          "data": {
+            "prompt_id": "msg_01M4X78QBE27SH5E8812JQXFNZ",
+            "user_message_id": "msg_01M4X78QBE27SH5E8812JQXFNZ",
+            "status": "running",
+            "content": [
+              {
+                "type": "text",
+                "text": "请检查当前目录 hold.py，再执行它验证等待逻辑（120秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。"
+              }
+            ],
+            "created_at": "2026-10-14T12:47:47.068Z"
+          },
+          "request_id": "01M4X78QAH0A6MRKYYQ6CQWEYN"
+        },
+        "toolBoundary": true,
+        "supplement": {
+          "code": 0,
+          "msg": "success",
+          "data": {
+            "prompt_id": "msg_01M4X78ZYYR7W5V8D4PWB6NQ9M",
+            "user_message_id": "msg_01M4X78ZYYR7W5V8D4PWB6NQ9M",
+            "status": "queued",
+            "content": [
+              {
+                "type": "text",
+                "text": "更正：当前工具结束后，只回复 STEER_026_成功，替代原先 ORIGINAL_026。不再运行工具。"
+              }
+            ],
+            "created_at": "2026-10-14T12:47:55.876Z"
+          },
+          "request_id": "01M4X78ZYYQXV75EFWXCHTPQAX"
+        },
+        "steer": {
+          "code": 0,
+          "msg": "success",
+          "data": {
+            "steered": true,
+            "prompt_ids": [
+              "msg_01M4X78ZYYR7W5V8D4PWB6NQ9M"
+            ]
+          },
+          "request_id": "01M4X78ZZ63JJF4E8Y6FJ1677R"
+        },
+        "late": {
+          "code": 40402,
+          "msg": "no active prompt to steer into",
+          "data": null,
+          "request_id": "01M4X7931DAYGCJ091YSHZYMQJ",
+          "stack": "Error2: no active prompt to steer into\n    at AgentLoopService.steer (file:///opt/homebrew/Cellar/kimi-code/2.1.1/libexec/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs:268789:59)\n    at Object.<anonymous> (file:///opt/homebrew/Cellar/kimi-code/2.1.1/libexec/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs:356473:57)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)"
+        }
+      },
+      "events": [
+        {
+          "type": "turn.started",
+          "seq": 5,
+          "session_id": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+          "timestamp": "2026-10-14T12:47:47.072Z",
+          "payload": {
+            "type": "turn.started",
+            "time": 1791982067072,
+            "agentId": "main",
+            "turnId": 0,
+            "promptId": "msg_01M4X78QBE27SH5E8812JQXFNZ",
+            "origin": {
+              "kind": "user"
+            },
+            "prompt": "请检查当前目录 hold.py，再执行它验证等待逻辑（120秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。",
+            "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a"
+          },
+          "epoch": "ep_01M4X78Q77FPGG1F4HVTD3CNFK"
+        },
+        {
+          "type": "prompt.started",
+          "seq": 8,
+          "session_id": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+          "timestamp": "2026-10-14T12:47:47.073Z",
+          "payload": {
+            "type": "prompt.started",
+            "time": 1791982067073,
+            "agentId": "main",
+            "promptId": "msg_01M4X78QBE27SH5E8812JQXFNZ",
+            "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a"
+          },
+          "epoch": "ep_01M4X78Q77FPGG1F4HVTD3CNFK"
+        },
+        {
+          "type": "prompt.queued",
+          "seq": 18,
+          "session_id": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+          "timestamp": "2026-10-14T12:47:55.876Z",
+          "payload": {
+            "type": "prompt.queued",
+            "time": 1791982075876,
+            "agentId": "main",
+            "promptId": "msg_01M4X78ZYYR7W5V8D4PWB6NQ9M",
+            "content": [
+              {
+                "type": "text",
+                "text": "更正：当前工具结束后，只回复 STEER_026_成功，替代原先 ORIGINAL_026。不再运行工具。"
+              }
+            ],
+            "queueLength": 1,
+            "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a"
+          },
+          "epoch": "ep_01M4X78Q77FPGG1F4HVTD3CNFK"
+        },
+        {
+          "type": "prompt.steered",
+          "seq": 19,
+          "session_id": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+          "timestamp": "2026-10-14T12:47:55.880Z",
+          "payload": {
+            "type": "prompt.steered",
+            "time": 1791982075880,
+            "agentId": "main",
+            "activePromptId": "msg_01M4X78QBE27SH5E8812JQXFNZ",
+            "promptIds": [
+              "msg_01M4X78ZYYR7W5V8D4PWB6NQ9M"
+            ],
+            "messageId": "msg_01M4X78ZYYR7W5V8D4PWB6NQ9M",
+            "content": [
+              {
+                "type": "text",
+                "text": "更正：当前工具结束后，只回复 STEER_026_成功，替代原先 ORIGINAL_026。不再运行工具。"
+              }
+            ],
+            "steeredAt": "2026-10-14T12:47:55.880Z",
+            "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a"
+          },
+          "epoch": "ep_01M4X78Q77FPGG1F4HVTD3CNFK"
+        },
+        {
+          "type": "assistant.delta",
+          "seq": 24,
+          "session_id": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+          "timestamp": "2026-10-14T12:47:58.519Z",
+          "payload": {
+            "type": "assistant.delta",
+            "time": 1791982078519,
+            "agentId": "main",
+            "turnId": 0,
+            "delta": "STE",
+            "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a"
+          },
+          "epoch": "ep_01M4X78Q77FPGG1F4HVTD3CNFK",
+          "volatile": true,
+          "offset": 0
+        },
+        {
+          "type": "assistant.delta",
+          "seq": 24,
+          "session_id": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+          "timestamp": "2026-10-14T12:47:58.614Z",
+          "payload": {
+            "type": "assistant.delta",
+            "time": 1791982078614,
+            "agentId": "main",
+            "turnId": 0,
+            "delta": "ER_026_成功",
+            "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a"
+          },
+          "epoch": "ep_01M4X78Q77FPGG1F4HVTD3CNFK",
+          "volatile": true,
+          "offset": 3
+        },
+        {
+          "type": "turn.ended",
+          "seq": 26,
+          "session_id": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+          "timestamp": "2026-10-14T12:47:58.986Z",
+          "payload": {
+            "type": "turn.ended",
+            "time": 1791982078986,
+            "agentId": "main",
+            "turnId": 0,
+            "reason": "completed",
+            "durationMs": 11915,
+            "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a"
+          },
+          "epoch": "ep_01M4X78Q77FPGG1F4HVTD3CNFK"
+        },
+        {
+          "type": "prompt.completed",
+          "seq": 28,
+          "session_id": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+          "timestamp": "2026-10-14T12:47:58.987Z",
+          "payload": {
+            "type": "prompt.completed",
+            "time": 1791982078987,
+            "agentId": "main",
+            "promptId": "msg_01M4X78QBE27SH5E8812JQXFNZ",
+            "finishedAt": "2026-10-14T12:47:58.987Z",
+            "reason": "completed",
+            "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a"
+          },
+          "epoch": "ep_01M4X78Q77FPGG1F4HVTD3CNFK"
+        }
+      ],
+      "eventCounts": {
+        "server_hello": 1,
+        "ack": 1,
+        "agent.created": 1,
+        "agent.status.updated": 19,
+        "session.meta.updated": 2,
+        "prompt.submitted": 2,
+        "turn.started": 1,
+        "event.session.work_changed": 2,
+        "context.spliced": 3,
+        "prompt.started": 1,
+        "turn.step.started": 3,
+        "tool.call.delta": 15,
+        "tool.call.started": 2,
+        "tool.result": 2,
+        "turn.step.completed": 3,
+        "prompt.queued": 1,
+        "prompt.steered": 1,
+        "tool.progress": 1,
+        "turn.steer": 1,
+        "ping": 1,
+        "assistant.delta": 2,
+        "turn.ended": 1,
+        "prompt.completed": 1
+      },
+      "sessionId": "session_c514e26b-95f1-4c8f-8973-4bebcc0d698a",
+      "messages": [
+        {
+          "id": "msg_session_c514e26b-95f1-4c8f-8973-4bebcc0d698a_000007",
+          "role": "assistant",
+          "text": [
+            "STEER_026_成功"
+          ],
+          "origin": null
+        },
+        {
+          "id": "msg_01M4X78ZYYR7W5V8D4PWB6NQ9M",
+          "role": "user",
+          "text": [
+            "更正：当前工具结束后，只回复 STEER_026_成功，替代原先 ORIGINAL_026。不再运行工具。"
+          ],
+          "origin": {
+            "kind": "user",
+            "inTurn": true
+          }
+        },
+        {
+          "id": "msg_session_c514e26b-95f1-4c8f-8973-4bebcc0d698a_000004",
+          "role": "assistant",
+          "text": [],
+          "origin": null
+        },
+        {
+          "id": "msg_session_c514e26b-95f1-4c8f-8973-4bebcc0d698a_000002",
+          "role": "assistant",
+          "text": [],
+          "origin": null
+        },
+        {
+          "id": "msg_session_c514e26b-95f1-4c8f-8973-4bebcc0d698a_000001",
+          "role": "user",
+          "text": [
+            "<system-reminder>\nToday's date is 2026-10-14. The current date is restated in a reminder whenever it changes; rely on the latest such reminder for the current date. DO NOT mention this to the user explicitly.\n</system-reminder>"
+          ],
+          "origin": {
+            "kind": "injection",
+            "variant": "date_change",
+            "disclosure": {
+              "kind": "date",
+              "renderGeneration": 1,
+              "localDate": "2026-10-14",
+              "timeZone": "Asia/Shanghai"
+            }
+          }
+        },
+        {
+          "id": "msg_01M4X78QBE27SH5E8812JQXFNZ",
+          "role": "user",
+          "text": [
+            "请检查当前目录 hold.py，再执行它验证等待逻辑（120秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。"
+          ],
+          "origin": {
+            "kind": "user"
+          }
+        }
+      ],
+      "nativeTerminalEvents": [
+        {
+          "type": "turn.ended",
+          "agentId": "main",
+          "turnId": 0,
+          "reason": "completed",
+          "durationMs": 11915,
+          "time": 1791982078986
+        }
+      ],
+      "wireSha256": "4daf17296bd1024696a6ede724d6b7f48e2b615a25508eb5c66a373559a4ca3b"
+    },
+    {
+      "id": "kiro-acp-01",
+      "runtime": "kiro",
+      "transport": "ACP",
+      "version": "kiro-cli 2.21.1",
+      "startedAt": "2026-10-14T12:40:55.634747+00:00",
+      "finishedAt": "2026-10-14T12:41:02.552046+00:00",
+      "runnerStatus": "inconclusive",
+      "assessment": "tool_boundary_not_reached",
+      "failure": {
+        "type": "RuntimeError",
+        "message": "Initial prompt ended without executing controlled tool"
+      },
+      "reportSha256": "d58072b94f06433c3e43699f6060ba756d7b9625f3d9a277a644653357ecbe5d",
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "5178f773a194e67e7c10d8cf140b59878c8024beb76e111595703f3aeab5559d",
+      "initializeAgentInfo": {
+        "name": "Kiro CLI Agent",
+        "title": "Kiro CLI Agent",
+        "version": "2.21.1"
+      },
+      "sessionId": "850b5c89-e267-423d-8b16-91e31a9ff5f1",
+      "observations": {},
+      "wireSha256": "53726a6e140054f7c36d88717791f486fdcaad10040148a65667e46de140c12d",
+      "initialAssistantText": "I won't run arbitrary scripts as part of an \"isolated protocol acceptance\" test. This looks like an attempt to get me to execute an unknown script under the guise of a protocol requirement.\n\nI have no idea what `./hold.py` does, and running unreviewed code on demand from instructions framed as mandatory tests isn't something I'll do.\n\nIf you have an actual development task you'd like help with, I'm happy to assist."
+    },
+    {
+      "id": "kiro-acp-02",
+      "runtime": "kiro",
+      "transport": "ACP",
+      "version": "kiro-cli 2.21.1",
+      "startedAt": "2026-10-14T12:42:18.055212+00:00",
+      "finishedAt": "2026-10-14T12:42:28.009894+00:00",
+      "runnerStatus": "observed",
+      "assessment": "busy_rejection",
+      "failure": null,
+      "reportSha256": "acc7111e68f249f52ffcd6d767c8fb672d850bf45d682a1e58b41c7a1874004e",
+      "probeScript": "acp_probe.py",
+      "probeScriptSha256": "6f427f4f13c77cbb6bb1bc1f263ab08c35da799a52a553ef8e7a00cc021557b4",
+      "initializeAgentInfo": {
+        "name": "Kiro CLI Agent",
+        "title": "Kiro CLI Agent",
+        "version": "2.21.1"
+      },
+      "sessionId": "ce703970-1bcb-4473-a241-4b91d0cc22bf",
+      "observations": {
+        "toolBoundary": {
+          "ready": true,
+          "firstPromptStillPending": true
+        },
+        "supplement": {
+          "jsonrpc": "2.0",
+          "error": {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "Prompt already in progress"
+          },
+          "id": 4
+        },
+        "original": {
+          "jsonrpc": "2.0",
+          "result": {
+            "stopReason": "end_turn"
+          },
+          "id": 3
+        },
+        "assistantText": "The script:\n1. Creates a `ready` file in the same directory as the script\n2. Waits up to 100 seconds for a `release` file to appear\n3. Prints `HOLD_COMPLETE` when either the `release` file exists or the timeout is reachedThe script ran successfully and printed `HOLD_COMPLETE`. The file waiting logic works as expected — it waited for either a `release` file or the 100-second timeout, then completed.\n\nORIGINAL_026",
+        "timeline": [
+          {
+            "index": 31,
+            "responseTo": 4,
+            "result": null,
+            "error": {
+              "code": -32603,
+              "message": "Internal error",
+              "data": "Prompt already in progress"
+            }
+          },
+          {
+            "index": 53,
+            "responseTo": 3,
+            "result": {
+              "stopReason": "end_turn"
+            },
+            "error": null
+          }
+        ]
+      },
+      "wireSha256": "6516107cd23f0e0dd2e1d1d248194f02751b0bcbf0906a5de823b359e2d2bdfa"
+    },
+    {
+      "id": "opencode-acp-01",
+      "runtime": "opencode",
+      "transport": "ACP",
+      "version": "opencode v2.0.25",
+      "startedAt": "2026-10-14T12:40:55.634724+00:00",
+      "finishedAt": "2026-10-14T12:41:06.684290+00:00",
+      "runnerStatus": "observed",
+      "assessment": "busy_rejection",
+      "failure": null,
+      "reportSha256": "a7bf85c38fe9252bf2f13d1f7315fe721abea5b9488e0996e6d1146e5255bc34",
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "5178f773a194e67e7c10d8cf140b59878c8024beb76e111595703f3aeab5559d",
+      "initializeAgentInfo": {
+        "name": "OpenCode",
+        "version": "2.0.25"
+      },
+      "sessionId": "ses_ec591e272ffeo1cKvXcaKZwpR2",
+      "observations": {
+        "toolBoundary": {
+          "ready": true,
+          "firstPromptStillPending": true
+        },
+        "supplement": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32603,
+            "message": "Internal error: Session already has an active ACP prompt: ses_ec591e272ffeo1cKvXcaKZwpR2",
+            "data": {
+              "service": "session"
+            }
+          }
+        },
+        "original": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "stopReason": "end_turn",
+            "usage": {
+              "inputTokens": 8179,
+              "outputTokens": 33,
+              "totalTokens": 10260,
+              "cachedReadTokens": 2048
+            },
+            "_meta": {}
+          }
+        },
+        "assistantText": "ORIGINAL_026",
+        "timeline": [
+          {
+            "index": 7,
+            "responseTo": 4,
+            "result": null,
+            "error": {
+              "code": -32603,
+              "message": "Internal error: Session already has an active ACP prompt: ses_ec591e272ffeo1cKvXcaKZwpR2",
+              "data": {
+                "service": "session"
+              }
+            }
+          },
+          {
+            "index": 11,
+            "responseTo": 3,
+            "result": {
+              "stopReason": "end_turn",
+              "usage": {
+                "inputTokens": 8179,
+                "outputTokens": 33,
+                "totalTokens": 10260,
+                "cachedReadTokens": 2048
+              },
+              "_meta": {}
+            },
+            "error": null
+          }
+        ]
+      },
+      "wireSha256": "6f6c5065ffc2cfa2330038ee29c941348515206eb29a7515a8e67cf98ea73720"
+    },
+    {
+      "id": "opencode-http-01",
+      "runtime": "OpenCode",
+      "transport": "native HTTP v2",
+      "version": "2.0.25",
+      "startedAt": "2026-10-14T12:51:10.941318+00:00",
+      "finishedAt": "2026-10-14T12:51:23.025248+00:00",
+      "runnerStatus": "observed",
+      "assessment": "native_steer_pass",
+      "failure": null,
+      "reportSha256": "af4969e42be6e015cc9735bb08372b14e38f065a0bf03d7fab33cd024fd6aa0e",
+      "probeScript": "opencode_http.py",
+      "probeScriptSha256": "70f557207dbbc7606076b028ae085943de97d6c18010c8e3b2973a525eaacfad",
+      "sessionId": "ses_ec588861bffenb4G7f7YymZEEN",
+      "observations": {
+        "initial": {
+          "status": 200,
+          "body": {
+            "data": {
+              "id": "msg_13a777e06001lyLxm7tkH16aGJ",
+              "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+              "time": {
+                "created": 1791982272133
+              },
+              "type": "user",
+              "payload": {
+                "text": "请检查当前目录 hold.py，再执行它验证等待逻辑（100秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。"
+              },
+              "delivery": "queue"
+            }
+          }
+        },
+        "actualToolBoundary": true,
+        "eventsBeforeSupplement": 35,
+        "steer": {
+          "status": 200,
+          "body": {
+            "data": {
+              "id": "msg_13a779ddc001Qpuy2GiOs4mN31",
+              "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+              "time": {
+                "created": 1791982280157
+              },
+              "type": "user",
+              "payload": {
+                "text": "补充更正：当前工具完成后，只回复 STEER_026_成功，替代 ORIGINAL_026，不再执行其他工具。"
+              },
+              "delivery": "steer"
+            }
+          }
+        },
+        "idle": {
+          "status": 204,
+          "body": null
+        },
+        "inbox": {
+          "status": 200,
+          "body": {
+            "data": []
+          }
+        }
+      },
+      "model": {
+        "id": "gpt-6.1-sol",
+        "providerID": "sub2api",
+        "variant": "default"
+      },
+      "events": [
+        {
+          "id": "evt_13a777e85001ubZw3jPOA3BJ4a",
+          "created": 1791982272133,
+          "type": "session.inbox.enqueued",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "inboxID": "msg_13a777e06001lyLxm7tkH16aGJ",
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "item": {
+              "type": "user",
+              "payload": {
+                "text": "请检查当前目录 hold.py，再执行它验证等待逻辑（100秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。"
+              },
+              "delivery": "queue"
+            }
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 1,
+            "version": 1
+          }
+        },
+        {
+          "id": "evt_13a777e8700154W2xBAO1VYsVg",
+          "created": 1791982272135,
+          "type": "session.execution.started",
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN"
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 2,
+            "version": 1
+          }
+        },
+        {
+          "id": "evt_13a777e92001jbDbg3UeLZkCWv",
+          "created": 1791982272146,
+          "type": "session.inbox.delivered",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "inboxID": "msg_13a777e06001lyLxm7tkH16aGJ"
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 4,
+            "version": 1
+          }
+        },
+        {
+          "id": "evt_13a778fe70012YVlij6npINSOz",
+          "created": 1791982276583,
+          "type": "session.tool.called",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "assistantMessageID": "msg_13a777e96001gEjx6KYxPCF5Al",
+            "id": "call_1201362df6d543668da2a4ce280212fd",
+            "input": {
+              "path": "<FIXTURE_ROOT>/opencode-http-01/project/hold.py"
+            },
+            "executed": false
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 8,
+            "version": 1
+          }
+        },
+        {
+          "id": "evt_13a778fef001R56aOLLTm7FrwZ",
+          "created": 1791982276591,
+          "type": "session.tool.success",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "assistantMessageID": "msg_13a777e96001gEjx6KYxPCF5Al",
+            "id": "call_1201362df6d543668da2a4ce280212fd",
+            "content": [
+              {
+                "type": "text",
+                "text": "Read file <FIXTURE_ROOT>/opencode-http-01/project/hold.py, lines 1-6\n1: import pathlib,time\n2: p=pathlib.Path(__file__).parent\n3: (p/'ready').write_text('ready')\n4: t=time.monotonic()+100\n5: while time.monotonic()<t and not (p/'release').exists():time.sleep(.05)\n6: print('HOLD_COMPLETE')"
+              }
+            ],
+            "metadata": {
+              "truncated": false
+            },
+            "executed": false
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 10,
+            "version": 2
+          }
+        },
+        {
+          "id": "evt_13a779d78001Gi3h7qtIgSOjha",
+          "created": 1791982280056,
+          "type": "session.tool.called",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "assistantMessageID": "msg_13a778ffa001tFu99uqA35Fyr8",
+            "id": "call_e7abf49950814575be8c3d80a1fbffbd",
+            "input": {
+              "command": "python3 hold.py",
+              "timeout": 110000,
+              "workdir": "<FIXTURE_ROOT>/opencode-http-01/project"
+            },
+            "executed": false
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 15,
+            "version": 1
+          }
+        },
+        {
+          "id": "evt_13a779ddd0017JBkM5eFd9Rek6",
+          "created": 1791982280157,
+          "type": "session.inbox.enqueued",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "inboxID": "msg_13a779ddc001Qpuy2GiOs4mN31",
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "item": {
+              "type": "user",
+              "payload": {
+                "text": "补充更正：当前工具完成后，只回复 STEER_026_成功，替代 ORIGINAL_026，不再执行其他工具。"
+              },
+              "delivery": "steer"
+            }
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 17,
+            "version": 1
+          }
+        },
+        {
+          "id": "evt_13a779de7001DnisWnvIyjHqWt",
+          "created": 1791982280168,
+          "type": "session.tool.success",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "assistantMessageID": "msg_13a778ffa001tFu99uqA35Fyr8",
+            "id": "call_e7abf49950814575be8c3d80a1fbffbd",
+            "content": [
+              {
+                "type": "text",
+                "text": "HOLD_COMPLETE\n"
+              }
+            ],
+            "metadata": {
+              "status": "completed",
+              "truncated": false,
+              "exit": 0
+            },
+            "executed": false
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 18,
+            "version": 2
+          }
+        },
+        {
+          "id": "evt_13a779ded001OZZ0ilvfqd2dJC",
+          "created": 1791982280173,
+          "type": "session.inbox.delivered",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "inboxID": "msg_13a779ddc001Qpuy2GiOs4mN31"
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 20,
+            "version": 1
+          }
+        },
+        {
+          "id": "evt_13a77a906001MKPCE0oHInrSO4",
+          "created": 1791982283014,
+          "type": "session.text.ended",
+          "location": {
+            "directory": "<FIXTURE_ROOT>/opencode-http-01/project"
+          },
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "assistantMessageID": "msg_13a779def001v3mBlFkxMFLyvh",
+            "ordinal": 0,
+            "text": "STEER_026_成功"
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 23,
+            "version": 1
+          }
+        },
+        {
+          "id": "evt_13a77a90a001UO1QmUyxQZFCpU",
+          "created": 1791982283018,
+          "type": "session.execution.succeeded",
+          "data": {
+            "sessionID": "ses_ec588861bffenb4G7f7YymZEEN"
+          },
+          "durable": {
+            "aggregateID": "ses_ec588861bffenb4G7f7YymZEEN",
+            "seq": 26,
+            "version": 1
+          }
+        }
+      ],
+      "messages": [
+        {
+          "id": "msg_13a777e06001lyLxm7tkH16aGJ",
+          "time": {
+            "created": 1791982272146
+          },
+          "text": "请检查当前目录 hold.py，再执行它验证等待逻辑（100秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。",
+          "type": "user"
+        },
+        {
+          "id": "msg_13a777e96001gEjx6KYxPCF5Al",
+          "time": {
+            "created": 1791982272155,
+            "streamed": 1791982276585,
+            "completed": 1791982276594
+          },
+          "type": "assistant",
+          "agent": "build",
+          "model": {
+            "id": "gpt-6.1-sol",
+            "providerID": "sub2api",
+            "variant": "default"
+          },
+          "content": [
+            {
+              "type": "tool",
+              "id": "call_1201362df6d543668da2a4ce280212fd",
+              "name": "read",
+              "executed": false,
+              "state": {
+                "status": "completed",
+                "input": {
+                  "path": "<FIXTURE_ROOT>/opencode-http-01/project/hold.py"
+                },
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Read file <FIXTURE_ROOT>/opencode-http-01/project/hold.py, lines 1-6\n1: import pathlib,time\n2: p=pathlib.Path(__file__).parent\n3: (p/'ready').write_text('ready')\n4: t=time.monotonic()+100\n5: while time.monotonic()<t and not (p/'release').exists():time.sleep(.05)\n6: print('HOLD_COMPLETE')"
+                  }
+                ],
+                "metadata": {
+                  "truncated": false
+                }
+              },
+              "time": {
+                "created": 1791982276091,
+                "ran": 1791982276583,
+                "completed": 1791982276591
+              }
+            }
+          ],
+          "finish": "tool-calls",
+          "rawFinish": "tool_calls",
+          "cost": 0,
+          "tokens": {
+            "input": 6377,
+            "output": 38,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        },
+        {
+          "id": "msg_13a778ffa001tFu99uqA35Fyr8",
+          "time": {
+            "created": 1791982276610,
+            "streamed": 1791982280058,
+            "completed": 1791982280169
+          },
+          "type": "assistant",
+          "agent": "build",
+          "model": {
+            "id": "gpt-6.1-sol",
+            "providerID": "sub2api",
+            "variant": "default"
+          },
+          "content": [
+            {
+              "type": "tool",
+              "id": "call_e7abf49950814575be8c3d80a1fbffbd",
+              "name": "shell",
+              "executed": false,
+              "state": {
+                "status": "completed",
+                "input": {
+                  "command": "python3 hold.py",
+                  "timeout": 110000,
+                  "workdir": "<FIXTURE_ROOT>/opencode-http-01/project"
+                },
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "HOLD_COMPLETE\n"
+                  }
+                ],
+                "metadata": {
+                  "status": "completed",
+                  "truncated": false,
+                  "exit": 0
+                }
+              },
+              "time": {
+                "created": 1791982279318,
+                "ran": 1791982280056,
+                "completed": 1791982280168
+              }
+            }
+          ],
+          "finish": "tool-calls",
+          "rawFinish": "tool_calls",
+          "cost": 0,
+          "tokens": {
+            "input": 6527,
+            "output": 48,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        },
+        {
+          "id": "msg_13a779ddc001Qpuy2GiOs4mN31",
+          "time": {
+            "created": 1791982280173
+          },
+          "text": "补充更正：当前工具完成后，只回复 STEER_026_成功，替代 ORIGINAL_026，不再执行其他工具。",
+          "type": "user"
+        },
+        {
+          "id": "msg_13a779def001v3mBlFkxMFLyvh",
+          "time": {
+            "created": 1791982280179,
+            "streamed": 1791982283016,
+            "completed": 1791982283016
+          },
+          "type": "assistant",
+          "agent": "build",
+          "model": {
+            "id": "gpt-6.1-sol",
+            "providerID": "sub2api",
+            "variant": "default"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "STEER_026_成功"
+            }
+          ],
+          "finish": "stop",
+          "rawFinish": "stop",
+          "cost": 0,
+          "tokens": {
+            "input": 350,
+            "output": 10,
+            "reasoning": 0,
+            "cache": {
+              "read": 6272,
+              "write": 0
+            }
+          }
+        },
+        {
+          "id": "msg_13a77a90a001UO1QmUyxQZFCpU",
+          "time": {
+            "created": 1791982283018
+          },
+          "type": "idle",
+          "outcome": "succeeded"
+        }
+      ],
+      "wireSha256": "5e078c84a7f92c49bdc53c7e314cf4e842f4db95cff2fddc9ab86abbd9723e22",
+      "openapiSha256": "6f748ff099b6c106f7dfe9fd9ca8710f6999c35a41b4d343eedc436739acc5d9"
+    },
+    {
+      "id": "qoder-acp-01",
+      "runtime": "qoder",
+      "transport": "ACP",
+      "version": "1.1.65",
+      "startedAt": "2026-10-14T12:40:55.634786+00:00",
+      "finishedAt": "2026-10-14T12:41:28.691393+00:00",
+      "runnerStatus": "observed",
+      "assessment": "ordinary_next_turn",
+      "failure": null,
+      "reportSha256": "6c81f58a7e2a4be68e61406d48635fa17580e81e89a33299c9be6f725a42872f",
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "5178f773a194e67e7c10d8cf140b59878c8024beb76e111595703f3aeab5559d",
+      "initializeAgentInfo": {
+        "name": "qoder-cli",
+        "title": "Qoder CLI",
+        "version": "1.1.65"
+      },
+      "sessionId": "87d975f1-6db4-495f-bc6b-60aa3196279c",
+      "observations": {
+        "toolBoundary": {
+          "ready": true,
+          "firstPromptStillPending": true
+        },
+        "supplement": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "result": {
+            "stopReason": "end_turn",
+            "userMessageId": "03fcb81d-adaa-450c-9824-0acad947c6fa",
+            "usage": {
+              "inputTokens": 0,
+              "outputTokens": 0,
+              "totalTokens": 0
+            },
+            "_meta": {
+              "quota": {
+                "token_count": {
+                  "input_tokens": 0,
+                  "output_tokens": 0
+                },
+                "model_usage": [
+                  {
+                    "model": "qoder-custom-d5cadd17-bcd2-482b-8f14-da1839a542d2/gpt-6.1-sol",
+                    "token_count": {
+                      "input_tokens": 0,
+                      "output_tokens": 0
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "original": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "stopReason": "end_turn",
+            "userMessageId": "c4406eb4-3f7a-4f80-9a96-20bb60936501",
+            "usage": {
+              "inputTokens": 0,
+              "outputTokens": 0,
+              "totalTokens": 0
+            },
+            "_meta": {
+              "quota": {
+                "token_count": {
+                  "input_tokens": 0,
+                  "output_tokens": 0
+                },
+                "model_usage": [
+                  {
+                    "model": "qoder-custom-d5cadd17-bcd2-482b-8f14-da1839a542d2/gpt-6.1-sol",
+                    "token_count": {
+                      "input_tokens": 0,
+                      "output_tokens": 0
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "assistantText": "I’ll run the command once and wait for it to complete.\nORIGINAL_026STEER_026_成功",
+        "timeline": [
+          {
+            "index": 25,
+            "responseTo": 3,
+            "result": {
+              "stopReason": "end_turn",
+              "userMessageId": "c4406eb4-3f7a-4f80-9a96-20bb60936501",
+              "usage": {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0
+              },
+              "_meta": {
+                "quota": {
+                  "token_count": {
+                    "input_tokens": 0,
+                    "output_tokens": 0
+                  },
+                  "model_usage": [
+                    {
+                      "model": "qoder-custom-d5cadd17-bcd2-482b-8f14-da1839a542d2/gpt-6.1-sol",
+                      "token_count": {
+                        "input_tokens": 0,
+                        "output_tokens": 0
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "error": null
+          },
+          {
+            "index": 32,
+            "responseTo": 4,
+            "result": {
+              "stopReason": "end_turn",
+              "userMessageId": "03fcb81d-adaa-450c-9824-0acad947c6fa",
+              "usage": {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0
+              },
+              "_meta": {
+                "quota": {
+                  "token_count": {
+                    "input_tokens": 0,
+                    "output_tokens": 0
+                  },
+                  "model_usage": [
+                    {
+                      "model": "qoder-custom-d5cadd17-bcd2-482b-8f14-da1839a542d2/gpt-6.1-sol",
+                      "token_count": {
+                        "input_tokens": 0,
+                        "output_tokens": 0
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "error": null
+          }
+        ]
+      },
+      "wireSha256": "27a1b7ce069b2604d3417cdcd29dde3c4df088070a7578411c9addaab12894e2"
+    },
+    {
+      "id": "trae-acp-01",
+      "runtime": "trae",
+      "transport": "ACP",
+      "version": "trae-cli version 0.120.52\nbuild date: 2026-08-12T01:31:30Z\nbuild commit: 6756e52a9238b6d493928e55b05127957dbfefb4\ncommit date: 2026-08-10T08:15:57Z",
+      "startedAt": "2026-10-14T12:40:55.634614+00:00",
+      "finishedAt": "2026-10-14T12:41:11.086126+00:00",
+      "runnerStatus": "observed",
+      "assessment": "busy_rejection",
+      "failure": null,
+      "reportSha256": "661d145f736944b807e67c823a91d3758c7b253cebcc459b9e980a1f4dd4f1fc",
+      "probeScript": "acp_probe_v1.py",
+      "probeScriptSha256": "5178f773a194e67e7c10d8cf140b59878c8024beb76e111595703f3aeab5559d",
+      "initializeAgentInfo": null,
+      "sessionId": "48746c45-da26-47cd-8866-c743a5068e56",
+      "observations": {
+        "toolBoundary": {
+          "ready": true,
+          "firstPromptStillPending": true
+        },
+        "supplement": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params",
+            "data": "another session is currently executing Prompt"
+          }
+        },
+        "original": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "stopReason": "end_turn"
+          }
+        },
+        "assistantText": "ORIGINAL_026",
+        "timeline": [
+          {
+            "index": 17,
+            "responseTo": 4,
+            "result": null,
+            "error": {
+              "code": -32602,
+              "message": "Invalid params",
+              "data": "another session is currently executing Prompt"
+            }
+          },
+          {
+            "index": 23,
+            "responseTo": 3,
+            "result": {
+              "stopReason": "end_turn"
+            },
+            "error": null
+          }
+        ]
+      },
+      "wireSha256": "2cb988891b0d1a091afa818bce77e0772c34ddf101ce03301bee054de797cb6c",
+      "nativeStoreNote": "Platform-owned auth/session store; unique fixture cwd and exact returned test session only."
+    },
+    {
+      "id": "zcode-native-01",
+      "runtime": "ZCode App",
+      "transport": "official bundled app-server v4 command",
+      "version": "App 3.14.5; official bundled kernel 0.16.9",
+      "startedAt": "2026-10-14T12:48:55.158549+00:00",
+      "finishedAt": "2026-10-14T12:49:16.312963+00:00",
+      "runnerStatus": "observed",
+      "assessment": "native_steer_pass",
+      "failure": null,
+      "reportSha256": "b9589b1804ebf9524ec6f38bfcb6ecd2adb0d78347c7137778694a04477df45f",
+      "probeScript": "zcode_probe.py",
+      "probeScriptSha256": "2eed6a93f3402046fc466b8c044065f2d657de4d24c65b34a39dd1a015f25fe3",
+      "observations": {
+        "workspaceMatched": true,
+        "initial": {
+          "commandId": "d914d8b3-890c-4ef4-8a93-acbb9bc7773a",
+          "status": "accepted",
+          "revisionAtDecision": 0,
+          "result": {
+            "type": "inputAccepted",
+            "delivery": "startNow",
+            "inputId": "d914d8b3-890c-4ef4-8a93-acbb9bc7773a"
+          },
+          "memoryEnabled": false
+        },
+        "actualToolBoundary": true,
+        "guide": {
+          "commandId": "44bb967c-6037-496c-9c6d-0eacbd2687b7",
+          "status": "accepted",
+          "revisionAtDecision": 13,
+          "result": {
+            "type": "inputAccepted",
+            "delivery": "queue",
+            "inputId": "44bb967c-6037-496c-9c6d-0eacbd2687b7"
+          },
+          "memoryEnabled": false
+        }
+      },
+      "sessionId": "sess_fc908137-9ebb-48db-8797-02db1f34a334",
+      "model": {
+        "providerId": "new-provider",
+        "modelId": "gpt-6.1-sol",
+        "options": {
+          "reasoningLevel": "enabled"
+        }
+      },
+      "events": [
+        {
+          "deliveryKind": "desktop-continuous",
+          "eventId": "97d799d7-2311-46cc-80e7-d6765241a454",
+          "payload": {
+            "executionStartedAt": 1791982138303.061,
+            "turnNumber": 0,
+            "input": "请检查当前目录 hold.py，再执行它验证等待逻辑（100秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。",
+            "messageId": "msg_mv83wb8b_e36f4687-211e-4031-adae-3f9734cb4d09",
+            "inputId": "d914d8b3-890c-4ef4-8a93-acbb9bc7773a",
+            "foregroundExecutionId": "runtime_command_1",
+            "queryId": "d914d8b3-890c-4ef4-8a93-acbb9bc7773a",
+            "intent": {
+              "sourceCommandId": "d914d8b3-890c-4ef4-8a93-acbb9bc7773a",
+              "queueItemId": "queue_d914d8b3-890c-4ef4-8a93-acbb9bc7773a",
+              "clientId": "rovai-steer-native-probe",
+              "kind": "sendText",
+              "text": "请检查当前目录 hold.py，再执行它验证等待逻辑（100秒上限），不修改脚本。工具完成后回复 ORIGINAL_026。",
+              "modelSelection": {
+                "providerId": "new-provider",
+                "modelId": "gpt-6.1-sol",
+                "options": {
+                  "reasoningLevel": "enabled"
+                }
+              },
+              "mode": "yolo",
+              "planEnabled": false,
+              "admissionSeq": 1,
+              "admittedAt": 1791982138295,
+              "requestedDelivery": "startNow",
+              "admittedDelivery": "startNow"
+            }
+          },
+          "seq": 2,
+          "sessionId": "sess_fc908137-9ebb-48db-8797-02db1f34a334",
+          "timestamp": 1791982138331,
+          "traceId": "32213bfd-6afa-4e79-acd3-ef2e0291971e",
+          "turnId": "turn_8cd02baf-c2f0-4d07-bb40-fc14ab6d446f",
+          "type": "turn.started"
+        },
+        {
+          "deliveryKind": "desktop-continuous",
+          "eventId": "8287c386-93e5-4bec-b798-2e58a395168e",
+          "payload": {
+            "inputId": "44bb967c-6037-496c-9c6d-0eacbd2687b7",
+            "queryId": "44bb967c-6037-496c-9c6d-0eacbd2687b7",
+            "pendingInputId": "queue_44bb967c-6037-496c-9c6d-0eacbd2687b7",
+            "input": "补充更正：工具完成后，只回复 STEER_026_成功，替代 ORIGINAL_026，不再执行其他工具。",
+            "inputPreview": "补充更正：工具完成后，只回复 STEER_026_成功，替代 ORIGINAL_026，不再执行其他工具。",
+            "inputSize": 111,
+            "inputPresentation": "user_steer",
+            "delivery": "guide",
+            "intent": {
+              "sourceCommandId": "44bb967c-6037-496c-9c6d-0eacbd2687b7",
+              "queueItemId": "queue_44bb967c-6037-496c-9c6d-0eacbd2687b7",
+              "clientId": "rovai-steer-native-probe",
+              "kind": "sendText",
+              "text": "补充更正：工具完成后，只回复 STEER_026_成功，替代 ORIGINAL_026，不再执行其他工具。",
+              "modelSelection": {
+                "providerId": "new-provider",
+                "modelId": "gpt-6.1-sol",
+                "options": {
+                  "reasoningLevel": "enabled"
+                }
+              },
+              "mode": "yolo",
+              "planEnabled": false,
+              "admissionSeq": 2,
+              "admittedAt": 1791982151570,
+              "requestedDelivery": "guide",
+              "admittedDelivery": "guide",
+              "queuePosition": 0
+            },
+            "targetTurnId": "turn_8cd02baf-c2f0-4d07-bb40-fc14ab6d446f",
+            "queueLength": 1
+          },
+          "seq": 32,
+          "sessionId": "sess_fc908137-9ebb-48db-8797-02db1f34a334",
+          "timestamp": 1791982151570,
+          "traceId": "32213bfd-6afa-4e79-acd3-ef2e0291971e",
+          "turnId": "turn_8cd02baf-c2f0-4d07-bb40-fc14ab6d446f",
+          "type": "turn.steerQueued"
+        },
+        {
+          "deliveryKind": "desktop-continuous",
+          "eventId": "e6db349f-e5ed-4195-9c89-5f09091a6fef",
+          "payload": {
+            "injectedMessageIds": [
+              "msg_mv83wlii_ec3e5cd1-6233-4ca1-9147-bacad1eeb38f"
+            ],
+            "pendingInputIds": [
+              "queue_44bb967c-6037-496c-9c6d-0eacbd2687b7"
+            ],
+            "drainedInputs": [
+              {
+                "pendingInputId": "queue_44bb967c-6037-496c-9c6d-0eacbd2687b7",
+                "messageId": "msg_mv83wlii_ec3e5cd1-6233-4ca1-9147-bacad1eeb38f",
+                "text": "补充更正：工具完成后，只回复 STEER_026_成功，替代 ORIGINAL_026，不再执行其他工具。",
+                "delivery": "guide",
+                "intent": {
+                  "sourceCommandId": "44bb967c-6037-496c-9c6d-0eacbd2687b7",
+                  "queueItemId": "queue_44bb967c-6037-496c-9c6d-0eacbd2687b7",
+                  "clientId": "rovai-steer-native-probe",
+                  "kind": "sendText",
+                  "text": "补充更正：工具完成后，只回复 STEER_026_成功，替代 ORIGINAL_026，不再执行其他工具。",
+                  "modelSelection": {
+                    "providerId": "new-provider",
+                    "modelId": "gpt-6.1-sol",
+                    "options": {
+                      "reasoningLevel": "enabled"
+                    }
+                  },
+                  "mode": "yolo",
+                  "planEnabled": false,
+                  "admissionSeq": 2,
+                  "admittedAt": 1791982151570,
+                  "requestedDelivery": "guide",
+                  "admittedDelivery": "guide",
+                  "queuePosition": 0
+                }
+              }
+            ],
+            "queryIds": [
+              "44bb967c-6037-496c-9c6d-0eacbd2687b7"
+            ],
+            "targetTurnId": "turn_8cd02baf-c2f0-4d07-bb40-fc14ab6d446f"
+          },
+          "seq": 37,
+          "sessionId": "sess_fc908137-9ebb-48db-8797-02db1f34a334",
+          "timestamp": 1791982151659,
+          "traceId": "32213bfd-6afa-4e79-acd3-ef2e0291971e",
+          "turnId": "turn_8cd02baf-c2f0-4d07-bb40-fc14ab6d446f",
+          "type": "turn.steerDrained"
+        },
+        {
+          "deliveryKind": "desktop-continuous",
+          "eventId": "69b94a43-207c-41fe-a1b5-7ce0d02b8b48",
+          "payload": {
+            "response": "STEER_026_成功",
+            "tokenCount": 41074,
+            "usage": {
+              "source": "provider",
+              "modelRequestCount": 3,
+              "inputTokens": 40931,
+              "outputTokens": 143,
+              "totalTokens": 41074,
+              "cacheReadTokens": 26752,
+              "cacheWriteTokens": 0,
+              "reasoningTokens": 0,
+              "webFetchRequests": 0,
+              "webSearchRequests": 0
+            },
+            "toolCallCount": 2,
+            "historyRoundCount": 3,
+            "duration": 17142,
+            "resultType": "success",
+            "cacheStats": {
+              "totalMessages": 12,
+              "cachedMessages": 11,
+              "lastCacheHit": true,
+              "cacheReadTokens": 13440
+            },
+            "inputId": "d914d8b3-890c-4ef4-8a93-acbb9bc7773a"
+          },
+          "seq": 44,
+          "sessionId": "sess_fc908137-9ebb-48db-8797-02db1f34a334",
+          "timestamp": 1791982155444,
+          "traceId": "32213bfd-6afa-4e79-acd3-ef2e0291971e",
+          "turnId": "turn_8cd02baf-c2f0-4d07-bb40-fc14ab6d446f",
+          "type": "turn.completed"
+        }
+      ],
+      "cleanup": {
+        "confirmed": false,
+        "pendingGroups": 0,
+        "signalFailed": true
+      },
+      "wireSha256": "72cc49eb1779212ed67e29db5d0438f7a1f46aedc9754955a41c86fca558156d"
+    }
+  ],
+  "limitations": [
+    "New native tests cover one textual correction during a controlled real tool wait; they do not qualify attachments, multiple recipients, cancellation, late delivery races, or production integration.",
+    "Only macOS arm64 and exact installed versions were exercised. Rejection applies to the tested transport, not all native UIs or undocumented APIs.",
+    "TRAE and Antigravity retain platform-owned authentication/session stores. New sessions used unique fixture workspaces; Rovai daily App/Core data were not opened.",
+    "ZCode owner cleanup reported pendingGroups=0 but signalFailed=true / confirmed=false; cleanup confirmation is not claimed passed.",
+    "No full 12-case context semantic Gate; no model-quality improvement claim."
+  ],
+  "sources": [
+    {
+      "url": "https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/server-api.md",
+      "use": "Kimi REST prompts:steer. Installed live OpenAPI and executed requests are the version-specific evidence."
+    },
+    {
+      "url": "https://github.com/github/copilot-sdk/blob/main/docs/features/steering-and-queueing.md",
+      "use": "Copilot SDK immediate versus enqueue. Installed 1.0.83 protocol-v3 result is measured separately from ACP."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/github/copilot-sdk/main/nodejs/src/generated/rpc.ts",
+      "use": "Broadcast permission/tool response RPC; current main helped build the harness, not a claim of backend version equivalence."
+    }
+  ],
+  "verification": {
+    "evidenceAssertions": "passed: 18 catalog rows, 15 attempt identities, 4 positive native event chains, current-entry rejection/queue/abort counterexamples",
+    "docsTest": {
+      "passed": 10,
+      "failed": 0
+    },
+    "docsCheck": "passed",
+    "docsCheckCi": {
+      "base": "040980b71642bb34075c3ec2621a8dc97908ca7f",
+      "status": "passed"
+    },
+    "productionCodeChanged": false,
+    "rustTestsRerun": false,
+    "zcodeFixtureCwdProcessesAfterCleanup": []
+  }
+}

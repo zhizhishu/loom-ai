@@ -1,0 +1,43 @@
+{
+  "verifiedAt": "2026-09-12T19:44:32.773Z",
+  "simulation": false,
+  "realRuntime": true,
+  "setup": "Empty Desktop-managed Host; Runtime check, member configuration and Camp creation use the production browser UI.",
+  "entry": "desktop",
+  "checks": {
+    "browserRuntimeMemberAndCampSetup": true,
+    "browserUploadAndMarkdownRead": true,
+    "browserSend": true,
+    "browserNativeApproval": true,
+    "secondApprovalRejected": true,
+    "composerPreservedDuringExecution": true,
+    "browserArtifactRead": true,
+    "webStopPreservesNativeRun": true,
+    "browserStopBeforeHostShutdown": true,
+    "noElectronBridgeOrRuntimeExceptions": true
+  },
+  "notVerified": [
+    "Second physical device/LAN",
+    "Other platforms",
+    "Physical sleep/wake"
+  ],
+  "campId": "rvcamp_01m2bjda9yf8s9gz7skhar7yh2",
+  "approvalId": "d6800856-2137-45e1-92e1-7fdb9b0dc877",
+  "runId": "89bba266-71c7-4c57-a796-1026d817647b",
+  "messageId": "018ac97d-d8ce-445d-b866-ae982fc32a22",
+  "attachmentId": "03d00454-8abe-46d3-a5aa-5874dbaf36d5",
+  "stopRunId": "8a75651b-bb14-4954-b65d-c28d579e19c4",
+  "hostBinarySha256": "de31ad1dd45d385feb0d303ddeab5c5f3819ff2846dd8828e22c6a5a6893abcc",
+  "status": "passed",
+  "sourceReportSha256": "89a66e674cc91a0f2c9355a45fc3e28d16b6a91e523f6489fa17e72b569eefdb",
+  "screenshots": {
+    "web-native-approval.png": "desktop-web-native-approval.png",
+    "web-runtime-artifact.png": "desktop-web-runtime-artifact.png"
+  },
+  "otherScreenshotsRetainedLocally": [
+    "web-source-upload.png",
+    "web-runtime-complete.png",
+    "web-stop-active.png",
+    "web-stop-complete.png"
+  ]
+}

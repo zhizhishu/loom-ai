@@ -1,0 +1,860 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "linux-x64-minimax-code-v1",
+  "capturedAt": "2026-10-18",
+  "platform": "linux-x64",
+  "hostEnvelope": {
+    "os": "Ubuntu 24.04.5 LTS",
+    "kernel": "6.8.0-41-generic",
+    "libc": "glibc 2.39",
+    "architecture": "x86_64",
+    "cpuCores": 4
+  },
+  "baseRevision": "92736d707c9162133a93b7720ae826e7dad90e8a",
+  "evaluationRevision": "f102e346f3d826f6366c49f184db8d44543e3676",
+  "qualifiedRuntimeKinds": [
+    "minimax-code-cli"
+  ],
+  "runtimeEvidence": {
+    "package": "@minimax-ai/code",
+    "runtimeVersion": "0.6.12",
+    "versionScope": "Exact observed version; no upper-version pin or speculative guarantee for untested versions. Ordinary live checks remain mandatory.",
+    "nodeVersion": "24.21.0",
+    "nodeEngine": ">=22.19 <23 || >=24 <27",
+    "protocol": "ACP v1",
+    "executableSha256": "89acc9b5b534942d13f6fac69696a977107ec9c4dff0a1abfdb8d4049245ca54",
+    "acpModuleSha256": "ee812da54ecd1021855bb004b31e0192b5a384c88dc2e62f92c34f7ed9a52efc",
+    "provider": "Official native custom_provider configuration; real Sub2API gpt-6.1-sol",
+    "credentialUse": "Existing maintainer-authorized BYOK key read in memory by an isolated relay; synthetic native relay credentials; no production native configuration changes."
+  },
+  "acceptance": {
+    "status": "qualified",
+    "platformScope": "GNU linux-x64 only",
+    "referenceMatrix": "docs/research/minimax-code-runtime/linux-qualification-2026-10-18.md",
+    "axes": {
+      "authProviderModel": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native config.yaml BYOK uses Sub2API and real gpt-6.1-sol; native default, opaque model ACK, live unknown-option rejection and observable next-Run provider address/key refresh.",
+        "sourceBatches": [
+          "basics-attempt6",
+          "failures-attempt4"
+        ]
+      },
+      "hostFleetLru": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Shared resident Hosts scoped by Camp/member/native binding; warm reuse, A/B/A and real concurrent isolation; 21 Sessions exercise the unmodified 20-Host LRU and actual 30-minute idle TTL.",
+        "sourceBatches": [
+          "basics-attempt6",
+          "fleet"
+        ]
+      },
+      "nativeSessionContinuation": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Exact native binding survives warm, idle eviction, Host/Core crash and cold resume; one missing native identity yields one replacement rather than a recent-session guess.",
+        "sourceBatches": [
+          "basics-attempt6",
+          "control",
+          "fleet",
+          "failures-attempt4",
+          "compaction-manual-attempt1"
+        ]
+      },
+      "bootstrapContext": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "One high-priority Charter on each root-agent request, stable bytes after compaction and cold resume, current Dynamic Context and no A/B private-memory leakage; auxiliary native title calls remain separate.",
+        "sourceBatches": [
+          "basics-attempt6",
+          "compaction-attempt4",
+          "compaction-manual-attempt1"
+        ]
+      },
+      "compactionContinuity": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Real threshold compaction; Core cancellation closes a held automatic checkpoint without advancing generation; same Session then recalls memory and calls Skill/MCP. Manual rejection leaves generation unchanged; one injected checkpoint overflow is retried, commits once and cold-resumes with unchanged high-priority Bootstrap.",
+        "sourceBatches": [
+          "compaction-attempt4",
+          "compaction-manual-attempt1"
+        ]
+      },
+      "skills": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native user/project discovery and invocation, actual platform/toolbox reads, update/disable, per-member isolation, same-name source identities, deleted explicit source remaining unavailable and cold resume; current Skills Rebuild v2 has no legacy project projection.",
+        "sourceBatches": [
+          "basics-attempt6",
+          "capabilities-attempt5"
+        ]
+      },
+      "externalMcp": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Actual stdio and authenticated HTTP, whole-definition RovaiWins, updates, unassign/native restoration, reassign/delete and adjacent/cold isolation; native cancellation reaps a held mutation server and a 37-second observation finds no delayed write.",
+        "sourceBatches": [
+          "capabilities-attempt5",
+          "mcp",
+          "control"
+        ]
+      },
+      "toolActionCommandOutput": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native read/add/write/edit, overwrite/empty/failure/relative/Chinese-space paths, result patch and file aggregation, stdout/stderr/mixed/empty/nonzero/large output; real Linux Chromium opens persisted edit Diff and the added file.",
+        "sourceBatches": [
+          "files",
+          "control",
+          "web",
+          "basics-attempt6"
+        ]
+      },
+      "narrationFinalMissingSend": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native completion boundaries, tool-to-final, zero-send recovery, accepted-send suppression, sent-plus-empty-final success and sent-plus-runtime-error failure; unsupported questionnaires are dismissed without answers and fail explicitly.",
+        "sourceBatches": [
+          "control",
+          "completion",
+          "questionnaires",
+          "basics-attempt6"
+        ]
+      },
+      "permissionApprovalWorkspace": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Native highest-permission values stay authoritative; allow/deny/cancel use real native approval options with requested effects or zero effects. Plan plus explicit bypass is a workflow mode and permits writes, not an OS read-only sandbox.",
+        "sourceBatches": [
+          "control",
+          "failures-attempt4",
+          "plan-attempt2"
+        ]
+      },
+      "builtinRovaiCli": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "All 30 current contract-v42 / IPC-v3 operation identities have committed real Core evidence, including actual private single-chat history, expired lease rejection and a working successor lease.",
+        "sourceBatches": [
+          "cli-attempt3"
+        ]
+      },
+      "usageCacheCost": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Exact root-native numeric identities cover tool-only records and native compaction snapshots without duplicates. All four available buckets match Core in 8 first/warm/A-B-A/concurrent/refresh/cold Runs and both manual-compaction Runs; automatic pre/post-compaction source checks also match. Contributions remain partial and unreported reasoning/cost remain NULL.",
+        "sourceBatches": [
+          "basics-attempt6",
+          "compaction-attempt4",
+          "compaction-manual-attempt1"
+        ]
+      },
+      "retryQueueCancelCleanup": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Pre-output 503 retries produce one mutation/send; deterministic main overflow fails without input replay; native deny/cancel, ordinary queued successor, Runtime/Core crash, malformed real ACP frame, held MCP mutation, probe timeout and process cleanup are separately verified.",
+        "sourceBatches": [
+          "failures-attempt4",
+          "mcp",
+          "fleet",
+          "compaction-attempt4"
+        ]
+      },
+      "readyVersionPlatform": {
+        "runtimeEvidence": "Verified",
+        "implementation": "Implemented",
+        "result": "Actual official mcode 0.6.12 / Node 24.21.0 and executable fingerprint, real ACP and live catalog checks; timed-out selected-program check returns ready=false. Runtime target-host qualification is independent from the three-distribution Server OS/ABI gate.",
+        "sourceBatches": [
+          "basics-attempt6",
+          "failures-attempt4"
+        ]
+      }
+    },
+    "sourceBatches": [
+      {
+        "batch": "control",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-cli-scripted-provider",
+        "passedCaseNames": [
+          "A",
+          "B",
+          "warm Host reuse",
+          "C",
+          "cold exact native binding resume",
+          "journal input/output/cache observed on active exact Session",
+          "live Steer stays in original Run",
+          "Steer image path + native read reaches provider as image",
+          "assigned MCP actual call after cold resume and Steer retirement",
+          "NO_MCP",
+          "MCP removal fences stale tools while preserving Session",
+          "command output STDOUT",
+          "command output STDERR",
+          "command output EMPTY",
+          "command output NONZERO",
+          "command output LARGE",
+          "native permission ALLOW",
+          "native permission DENY",
+          "cancel held native command and reap its process",
+          "structured command stdout + stderr",
+          "MISSING_SESSION",
+          "exact missing native Session creates replacement before dispatch",
+          "zero-send recovery and accepted-send suppression"
+        ],
+        "checks": [],
+        "reportSha256": "856200ae2e3c3f5faaa41e5edcc42bea5e6745bd88d362c6b565f63652139d81",
+        "coreSha256": null,
+        "harnessSha256": null,
+        "observedDescendantsRemaining": null,
+        "logSha256": "82e361edeb6799bcddc035523d9e9ec86fbab4a39fd8ee4d5fd33e87f43c58fd"
+      },
+      {
+        "batch": "files",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-cli-scripted-provider",
+        "passedCaseNames": [
+          "FILE_READ_ABS",
+          "FILE_READ_REL",
+          "FILE_WRITE_NEW",
+          "FILE_WRITE_EXISTING",
+          "FILE_WRITE_EMPTY",
+          "FILE_EDIT",
+          "FILE_EDIT_BACK",
+          "FILE_EDIT_FAILED",
+          "FILE_WRITE_REL",
+          "FILE_EDIT_REL",
+          "file cards survive Core restart"
+        ],
+        "checks": [],
+        "reportSha256": "3964f3ad12e544bcc8d12b5de156df2c2884d188ac3d533f8069211b8ae83f8e",
+        "coreSha256": null,
+        "harnessSha256": null,
+        "observedDescendantsRemaining": null,
+        "logSha256": "12bae9fdec6df7dc95307be0c284eece81a420331b396ba3b047f3e802c8d6fa"
+      },
+      {
+        "batch": "completion",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-cli-scripted-provider",
+        "passedCaseNames": [
+          "SEND_EMPTY",
+          "AFTER_EMPTY",
+          "empty final accepts one committed send; same Host follow-up succeeds",
+          "EMPTY_NO_SEND",
+          "SEND_ERROR"
+        ],
+        "checks": [],
+        "reportSha256": "fec1cd215613ef476fee6b40680b64070660ac21e9e270dceab154eea58f75aa",
+        "coreSha256": null,
+        "harnessSha256": null,
+        "observedDescendantsRemaining": null,
+        "logSha256": "3bd71699902d586e1071211381c0f7959cd31e3e80720b1e6251861e7343beff"
+      },
+      {
+        "batch": "questionnaires",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-cli-scripted-provider",
+        "passedCaseNames": [
+          "QUESTION_BASELINE",
+          "ASK_SINGLE",
+          "AFTER_ASK_SINGLE",
+          "ASK_MULTIPLE",
+          "AFTER_ASK_MULTIPLE",
+          "SEND_ASK",
+          "AFTER_SEND_ASK",
+          "ASK_DEFAULT",
+          "AFTER_ASK_DEFAULT",
+          "ordinary ALLOW after questionnaire",
+          "ordinary DENY after questionnaire",
+          "native ask_user remains enabled; no synthetic answer injected"
+        ],
+        "checks": [],
+        "reportSha256": "3203eff79fcaec6afc79f22fd23c9eed0f632ed1c31bc21006c50ba443ebd05d",
+        "coreSha256": null,
+        "harnessSha256": null,
+        "observedDescendantsRemaining": null,
+        "logSha256": "03df182d320616260197d6f2e56e22e129ffd9cf4855cb2a948df2bae2c31115"
+      },
+      {
+        "batch": "web",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-linux-chromium-production-web-native-file-evidence",
+        "passedCaseNames": [],
+        "checks": [
+          "Actual native edit opens its persisted +1/-1 Diff in the production Web UI",
+          "Actual native new-file operation opens the current byte-exact Chinese/space-path file preview"
+        ],
+        "reportSha256": "d8195dbe8a6463dac5cc83931d8d8dda9100a507b078101bc9c453b1c11f0732",
+        "coreSha256": null,
+        "harnessSha256": null,
+        "observedDescendantsRemaining": null,
+        "logSha256": "4a8bfb75fbf99ed54220c5a4ab6db736ff8c46d2603c572c6aab272618fa6647",
+        "screenshots": {
+          "native-file-card": {
+            "sha256": "22ea4c67c45f23d8668b968e4996780d7e20bef6b32bd290296efb93bdad7a38"
+          },
+          "native-edit-diff": {
+            "sha256": "86b5a73a387f24697ad50ef2bb19ef8d7c1baf96888db42f1dcfad96abd0f8a7"
+          },
+          "native-added-file-preview": {
+            "sha256": "89ff42be607b58f4e294feb6156056ae8fd15f31a9a73afbc70124af5c405245"
+          }
+        }
+      },
+      {
+        "batch": "capabilities-attempt5",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-linux-mcode-real-provider-production-core",
+        "passedCaseNames": [
+          "native provider discovery and product defaults",
+          "actual native Skill invocation, platform/toolbox file loading, and assigned/native stdio plus HTTP MCP",
+          "next Run reads the updated native Skill, current per-member toolbox and updated MCP definition",
+          "disabled per-member toolbox stays absent and unassigned MCP restores its native same-name definition",
+          "adjacent member keeps its own toolbox and native MCP instead of another member assignment",
+          "MCP reassignment and deletion restore the current native capability without session drift",
+          "same-name native Skills keep distinct identities and a deleted selected source does not rebind",
+          "authenticated HTTP MCP, native source and disabled toolbox persist across exact cold resume without legacy project projections"
+        ],
+        "checks": [],
+        "reportSha256": "8c65bcb4a95c5a23d8baddcaed054122f4d717a4fc65b1830365dfe956a29728",
+        "coreSha256": "119a9b0f0bc1a49d7e02a15ebc0c257bbc6672e3cd6fc984ba489c22373e128b",
+        "harnessSha256": null,
+        "observedDescendantsRemaining": [],
+        "logSha256": "9e3a7d757b1d379e7eda846f51846e6a108e137c6fc12aee93f6f3b9d3a73b62",
+        "usageReconciliation": [
+          {
+            "stage": "capabilities-first",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "capabilities-update",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "capabilities-disabled",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "capabilities-adjacent",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "capabilities-reassigned",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "capabilities-deleted",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "skill-same-name",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "skill-source-deleted",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "capabilities-cold",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          }
+        ],
+        "secretScan": {
+          "coreDatabaseContainsProviderKey": false,
+          "reportContainsUpstreamKey": false
+        }
+      },
+      {
+        "batch": "cli-attempt3",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-linux-mcode-real-provider-production-core",
+        "passedCaseNames": [
+          "native provider discovery and product defaults",
+          "29 public-context CLI operations and expired Run lease rejection",
+          "all 30 current operations have committed Core evidence, including actual private Single Chat history",
+          "successor public Run receives a working new lease and preserves its native binding"
+        ],
+        "checks": [],
+        "reportSha256": "35634fa1a19bb68b499d1b5e5c486f327f0ce5a25248074cc9c4c5ae7b38dc60",
+        "coreSha256": "119a9b0f0bc1a49d7e02a15ebc0c257bbc6672e3cd6fc984ba489c22373e128b",
+        "harnessSha256": null,
+        "observedDescendantsRemaining": [],
+        "logSha256": "df19138e6e6c87eb04b456b1feb9243b0ceae7c46969481174c656315ba22508",
+        "usageReconciliation": [
+          {
+            "stage": "cli-public",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "cli-single-chat",
+            "allBucketsMatch": false,
+            "unknownCost": true
+          }
+        ],
+        "secretScan": {
+          "coreDatabaseContainsProviderKey": false,
+          "reportContainsUpstreamKey": false
+        },
+        "cliOperations": [
+          "automation.close",
+          "automation.create",
+          "automation.delete",
+          "automation.get",
+          "automation.list",
+          "automation.run",
+          "automation.update",
+          "history.search",
+          "member.create",
+          "member.get",
+          "member.list",
+          "member.update",
+          "memory.read",
+          "memory.search",
+          "memory.view",
+          "memory.write",
+          "mission.get",
+          "mission.list",
+          "mission.status",
+          "mission.update",
+          "single_chat.history",
+          "team.create_task",
+          "team.get_task",
+          "team.list_tasks",
+          "team.update_task",
+          "thread.list",
+          "thread.message.send",
+          "thread.read",
+          "thread.runs",
+          "thread.search"
+        ],
+        "completedEvidenceRows": 30
+      },
+      {
+        "batch": "mcp",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-cli-scripted-provider",
+        "passedCaseNames": [
+          "cancel actual native MCP invocation, reap its server and prevent delayed mutation after 37 seconds",
+          "AFTER_MCP_CANCEL"
+        ],
+        "checks": [],
+        "reportSha256": "36e29e0fe61c42ad0d6c7cbf7a70503a899ee4391ab86d13e020cb88c745bd5e",
+        "coreSha256": null,
+        "harnessSha256": null,
+        "observedDescendantsRemaining": null,
+        "logSha256": "66214968b5e6cbdaf569de1d1168e5e9583c5196f4ac7969e6db1ee25c20b338"
+      },
+      {
+        "batch": "plan-attempt2",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-cli-scripted-provider",
+        "passedCaseNames": [
+          "native plan stays a workflow mode under explicit bypassPermissions; no read-only sandbox is claimed"
+        ],
+        "checks": [],
+        "reportSha256": "46209ca2ab4a3446e67d5516dfddfcf2eb078840d242c38850a1c93838f59c57",
+        "coreSha256": null,
+        "harnessSha256": null,
+        "observedDescendantsRemaining": null,
+        "logSha256": "d2178ac5e3a1b0a475b88e66ed99657639f293e5736296b1362663508df7dd76"
+      },
+      {
+        "batch": "fleet",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-cli-scripted-provider",
+        "passedCaseNames": [
+          "FLEET_0",
+          "FLEET_1",
+          "FLEET_2",
+          "FLEET_3",
+          "FLEET_4",
+          "FLEET_5",
+          "FLEET_6",
+          "FLEET_7",
+          "FLEET_8",
+          "FLEET_9",
+          "FLEET_10",
+          "FLEET_11",
+          "FLEET_12",
+          "FLEET_13",
+          "FLEET_14",
+          "FLEET_15",
+          "FLEET_16",
+          "FLEET_17",
+          "FLEET_18",
+          "FLEET_19",
+          "FLEET_20",
+          "FLEET_RETURN",
+          "production 20-Host per-member LRU evicts the oldest idle Host and resumes its exact Session",
+          "AFTER_IDLE_TTL",
+          "production 30-minute idle eviction and exact native Session continuation",
+          "AFTER_CORE_CRASH",
+          "Core crash cleanup and exact Session recovery"
+        ],
+        "checks": [],
+        "reportSha256": "a181a84c9c16c9e3a430a281f6d5455e50a77c70aa460a7f808f8cd120f857cd",
+        "coreSha256": null,
+        "harnessSha256": null,
+        "observedDescendantsRemaining": null,
+        "logSha256": "c7d5d7b6c32277cd2d7c379373102669e53014514a63d9038620cc89ff325ed3",
+        "idleElapsedMs": 1854977,
+        "productionIdleTtlMs": 1800000
+      },
+      {
+        "batch": "basics-attempt6",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-linux-mcode-real-provider-production-core",
+        "passedCaseNames": [
+          "native provider discovery and product defaults",
+          "native user-source discovery respects the executing Host MINIMAX_DATA_DIR",
+          "real first run with native read add edit command and public CLI send",
+          "warm continuation preserves exact binding and resident host",
+          "A to B to A isolation under the shared Camp/member/native-binding host scope",
+          "concurrent public Runs use distinct native Hosts and preserve both private Session memories",
+          "official native provider address and key refresh on the next run without session drift",
+          "Core restart resumes the exact original native session and memory",
+          "every observed root-agent model request keeps one Charter; native title-generation calls stay separate"
+        ],
+        "checks": [],
+        "reportSha256": "ae3d2a6df8051e830f143437a8e10e2482db49a195ad64c6b3b2605f1ecd92ce",
+        "coreSha256": "260355f57ff98a95a08c323603c2f298d5aea48b13025bab6c7f81a583c3f8b2",
+        "harnessSha256": "621954806c11955c972e73b4fd3d67f4365019656097ab67ece5cad85f03065b",
+        "observedDescendantsRemaining": [],
+        "logSha256": "24956f2aefc6d00f3ed08af4d2ebff2a0160eecbe986dc5979a38a0c6ae60cbc",
+        "usageReconciliation": [
+          {
+            "stage": "first-run",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "warm",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "session-b",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "a-return",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "concurrency",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "concurrency",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "provider-refresh",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "cold-resume",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          }
+        ],
+        "secretScan": {
+          "coreDatabaseContainsProviderKey": false,
+          "reportContainsUpstreamKey": false
+        }
+      },
+      {
+        "batch": "failures-attempt4",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-linux-mcode-real-provider-production-core",
+        "passedCaseNames": [
+          "native provider discovery and product defaults",
+          "native opaque model selection is acknowledged and the live Host rejects unsupported options before generation",
+          "a pre-output native transport retry causes exactly one file mutation and one public send",
+          "a deterministic main-request context rejection fails closed without input replay",
+          "the real model crosses native deny approval and leaves zero requested file effects",
+          "cancelling a pending native approval reaches cancelled and prevents delayed mutation",
+          "an ordinary input queued behind a cancelled Run starts once and receives one native accepted delivery",
+          "a native Host crash fails its accepted Run and the next Run recovers the exact original Session",
+          "a corrupted actual native ACP frame fails before model dispatch and a clean successor recovers",
+          "a delayed actual CLI version result times out, clears Ready and reaps its probe process"
+        ],
+        "checks": [],
+        "reportSha256": "fd5547aa945418c97196a2d5fe56751d7da49aaaf203cbe1f230b60ba9851062",
+        "coreSha256": "08e2e3446100335139d5a4785ebc83f140bedb5d9d79c248e26c53398d59a88a",
+        "harnessSha256": "2039a95a3a9627e24152d63df2087b5fd49055011e7288de3079481d40bf67bf",
+        "observedDescendantsRemaining": [],
+        "logSha256": "ee2b96ae4cdfc7fcd4ffbc883bb35655618bc51d29998307f65295966b9ade45",
+        "usageReconciliation": [
+          {
+            "stage": "failure-baseline",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "explicit-native-model",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "invalid-live-option",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "transient-retry",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "deterministic-context-error",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "after-context-error",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "real-approval-deny",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "real-approval-cancel",
+            "allBucketsMatch": false,
+            "unknownCost": true
+          },
+          {
+            "stage": "queue-after-cancel",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "runtime-crash",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "after-runtime-crash",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "protocol-malformed",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "after-protocol-error",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          }
+        ],
+        "secretScan": {
+          "coreDatabaseContainsProviderKey": false,
+          "reportContainsUpstreamKey": false
+        }
+      },
+      {
+        "batch": "compaction-attempt4",
+        "sourceStatus": "failed",
+        "evidenceKind": "real-linux-mcode-real-provider-production-core",
+        "passedCaseNames": [
+          "native provider discovery and product defaults",
+          "real native automatic threshold compaction commits history without changing the Core binding",
+          "automatic compaction preserves actual Skill, assigned MCP, permission configuration and private memory",
+          "Core cancellation during an actual native automatic checkpoint preserves the committed history generation",
+          "after cancelled compaction the next Core Run resumes the exact Session with actual Skill, MCP and private memory",
+          "failed native compaction does not advance history generation"
+        ],
+        "checks": [],
+        "reportSha256": "3b5d42b290dd9bc002381e9ce32d1d7973a7ff525c94d23b55fcda19442c94ef",
+        "coreSha256": "260355f57ff98a95a08c323603c2f298d5aea48b13025bab6c7f81a583c3f8b2",
+        "harnessSha256": "4a0948a714fca722b26e9077669d871e262c8b3cd9f01f7cabc30b420b5f0a61",
+        "observedDescendantsRemaining": null,
+        "logSha256": "540cfc3bf7a6b1d0f058ebc663e843871918b90f0b58a9e69d506ad1fca099c0",
+        "sourceFailureReason": "Additional assertion required the retried request body to shrink. Native retry and a single generation commit succeeded; this batch supplies only its six individually passed automatic/cancel/failure cases. Manual retry/cold closure is independently qualified by compaction-manual-attempt1.",
+        "usageReconciliation": [
+          {
+            "stage": "compact-baseline",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "automatic-pad-0",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "compact-after-auto",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "automatic-compact-cancelled",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "compact-after-cancel",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          }
+        ],
+        "secretScan": {
+          "coreDatabaseContainsProviderKey": false,
+          "reportContainsUpstreamKey": false
+        },
+        "nativeControlCleanup": {
+          "observedDescendants": 0,
+          "remaining": 0
+        },
+        "heldCheckpoints": [
+          {
+            "stage": "automatic-compact-cancelled",
+            "clientDisconnected": true,
+            "checkpoint": true
+          }
+        ],
+        "overflowRequests": [
+          {
+            "status": 400,
+            "injectedFault": "overflow",
+            "bodyBytes": 80990,
+            "checkpoint": true,
+            "sessionTitle": false
+          },
+          {
+            "status": 200,
+            "injectedFault": null,
+            "bodyBytes": 80990,
+            "checkpoint": true,
+            "sessionTitle": false
+          }
+        ]
+      },
+      {
+        "batch": "compaction-manual-attempt1",
+        "sourceStatus": "passed",
+        "evidenceKind": "real-linux-mcode-real-provider-production-core",
+        "passedCaseNames": [
+          "native provider discovery and product defaults",
+          "failed native compaction does not advance history generation",
+          "manual compaction retries after a controlled native checkpoint overflow and commits once",
+          "compaction retains one identical high-priority Bootstrap and exact cold Session memory"
+        ],
+        "checks": [],
+        "reportSha256": "dfacad44e8e846879e823f8c223bfadb3ede2f64f6f0f239c6183af032099754",
+        "coreSha256": "260355f57ff98a95a08c323603c2f298d5aea48b13025bab6c7f81a583c3f8b2",
+        "harnessSha256": "4c578101662c875144fc55c886dd80b4dbd6575e6d163eaf6afedf760291042a",
+        "observedDescendantsRemaining": [],
+        "logSha256": "67fa13e50ece04a5f3718b97dcf30c24e2b63a62f72d80334a3f591ea6fd2cc0",
+        "usageReconciliation": [
+          {
+            "stage": "compact-baseline",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          },
+          {
+            "stage": "compact-cold",
+            "allBucketsMatch": true,
+            "unknownCost": true
+          }
+        ],
+        "secretScan": {
+          "coreDatabaseContainsProviderKey": false,
+          "reportContainsUpstreamKey": false
+        },
+        "nativeControlCleanup": {
+          "observedDescendants": 0,
+          "remaining": 0
+        },
+        "heldCheckpoints": [],
+        "overflowRequests": [
+          {
+            "status": 400,
+            "injectedFault": "overflow",
+            "bodyBytes": 71922,
+            "checkpoint": true,
+            "sessionTitle": false
+          },
+          {
+            "status": 200,
+            "injectedFault": null,
+            "bodyBytes": 71922,
+            "checkpoint": true,
+            "sessionTitle": false
+          }
+        ]
+      }
+    ]
+  },
+  "serverOsGate": {
+    "separateFromRuntimeQualification": true,
+    "builder": "Ubuntu 22.04 x86_64 GNU",
+    "maximumGlibcSymbol": "2.35",
+    "checks": {
+      "Ubuntu 22.04": "passed",
+      "Debian 12 VM": "passed",
+      "Ubuntu 24.04": "passed"
+    },
+    "workflowRun": "https://github.com/murray17/rovai-ai/actions/runs/39118702398",
+    "nativeArchiveSha256": "3c71ad2e8d4e94b4889369df1ef94ad66eab2cae02fc6ee7810440b7817ec864",
+    "coreHostSha256": "260355f57ff98a95a08c323603c2f298d5aea48b13025bab6c7f81a583c3f8b2",
+    "githubArtifactId": 12133617671,
+    "githubArtifactDigest": "sha256:aa4102149bf18d12f87605ad0d9c0598586a943d021eb66d36ec29d5458ff7e7"
+  },
+  "validation": {
+    "rustWorkspace": "474 passed, 1 existing ignored; rerun after merging main 7cf1abb1c",
+    "nativeUsageExistingOwners": "3 passed with extended-tests",
+    "adapterExistingOwners": "25 passed with extended-tests",
+    "documentationTests": "10 passed",
+    "typecheck": "passed",
+    "browser": "2 actual Linux Chromium production UI checks; private screenshot digests in source batch"
+  },
+  "qualificationBasis": {
+    "type": "reproducible-target-host-golden-flows",
+    "request": "Maintainer requested completion of Linux MiniMax Code admission on 2026-10-18.",
+    "authority": "docs/development/runtime-integration-checklist.md",
+    "existingBoundaries": [
+      "docs/versions/v1.72/decisions.md#v1-72-d50",
+      "docs/versions/v1.72/decisions.md#v1-72-d36",
+      "docs/contracts/runtime-usage-monitoring-v11.md",
+      "docs/architecture/runtime-catalog-boundaries.md#minimax-code-acp-实施边界"
+    ]
+  },
+  "limitations": [
+    "Actual mcode execution is on Ubuntu 24.04.5 GNU x86_64. Three-distribution Server smoke does not claim mcode execution on each distribution; no Linux ARM64 or musl qualification.",
+    "Deterministic local model-service batches use the real official CLI and Core but are protocol/effect evidence, not independent real-provider generation proof.",
+    "Native /compact management is exercised by a separate native ACP client; no product manual-compaction button is added. Official 0.6.12 manual-command cancellation did not settle within 240 seconds; that attempted case is invalidated. Actual product Core Run cancellation during automatic compaction and exact successor recovery are separately verified.",
+    "The overflow case injects one typed 400 and forwards the retry to the real provider. Native commits once with an unchanged request body. This does not prove adaptation to a persistently smaller undocumented provider window or natural exhaustion of gpt-6.1-sol capacity.",
+    "Partial native Usage can omit early, short, cancelled or late observations. Root-native metadata does not provide a full bill; absent reasoning and reliable cost remain unknown.",
+    "Native default permission rules can allow simple printf writes; deny qualification therefore uses a real operation that actually asks. Plan mode plus explicit bypass permits writes. No additionalDirectories or OS-level sandbox guarantee is claimed.",
+    "Questionnaires follow the maintainer-accepted dismiss/no-answer policy; Fast remains excluded. macOS arm64 and Windows status are not promoted; existing Intel qualification is independent.",
+    "Older capability/CLI evidence includes token-count relay errors followed by the native fallback; all stated generation/tool effects passed. The relay token-count route was corrected for subsequent clean basic and compaction runs.",
+    "Failed setup and harness-assumption attempts are retained privately. The automatic-compaction batch failed only an extra body-shrinking assertion after its six individual cases had passed; separate manual retry/cold evidence closes the required flow.",
+    "Credentials, raw prompts, private paths, native Session/Run identities, transcript and full tool output are excluded."
+  ],
+  "implementationSourceSha256": {
+    "crates/rovai-core/src/acp.rs": "e6f4c2b2a4c624cc38ccc56e20cccb5fafc7de8e05d40599f0e23817fae6b306",
+    "crates/rovai-core/src/native_usage.rs": "9c3a568665de5440adc26358c099bf3d553ee31d4929ba76a586e62ab0d3bd86",
+    "crates/rovai-core/src/runtime_fleet.rs": "2e73849370f4a149516f9f3e13f9ead1ef8b5558784e095c04592f374578fa50"
+  }
+}

@@ -1,0 +1,211 @@
+{
+  "scope": "Standalone HTML interaction draft; local sample data only",
+  "productionHost": false,
+  "realDevice": false,
+  "baseline": "5588c30f; mobile review revision 4 (compact conversations, per-Run execution and task fields)",
+  "date": "2026-09-14T06:25:30.326Z",
+  "checks": [
+    "five labeled roots and transparent circular-plus creation",
+    "quiet conversation list, optional search and compact project entry",
+    "project pagination: five, ten, eleven; collapse and independent folders",
+    "page titles replace repeated product branding and slogans",
+    "compact unseparated conversations, quiet focus, Runtime label and production settings gear",
+    "new conversation: optional name, portrait Lead and one-click commit only on creation",
+    "Camp, private and refresh retain separate text and recipient",
+    "send consumes only submitted text while preserving later editing",
+    "offline disables send; expiry and demo re-login preserve editing",
+    "conversation back exits across tabs; approvals remain in conversation",
+    "message actions, quote, right-aligned user and minimal composer",
+    "approval and latest command disclosure preserve reading",
+    "execution isolates multiple members and stop; latest is circular",
+    "Compact disclosure and reduced motion",
+    "independent Run disclosures and wrapping execution portraits",
+    "current command icons and running sweep follow the active step",
+    "HTML attachment interactive preview, source and quote",
+    "default team and one-click creation carry into the new Camp",
+    "task create and edit remain in the current Camp",
+    "member Runtime configuration and form survive return",
+    "memory scope, ownership, stop and review",
+    "automation schedule, Cron, timezone and switch",
+    "automation uses exactly one member; selection survives editing and refresh",
+    "font slider, tap alternatives, preview and refresh; no map/motion settings",
+    "white and black page planes; Skills use groups; remote precedes channels in capabilities",
+    "Desktop has channels without an update entry; Server is the inverse",
+    "Server update mock guards active work and completes idle restart",
+    "Desktop channel retry reuses provider state and structured choice"
+  ],
+  "screens": [
+    {
+      "name": "desktop-about-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "conversations-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "camp-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "camp-night",
+      "width": 375,
+      "height": 812,
+      "theme": "night"
+    },
+    {
+      "name": "settings-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "members-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "memory-360",
+      "width": 360,
+      "height": 800,
+      "theme": "day"
+    },
+    {
+      "name": "automation-430",
+      "width": 430,
+      "height": 900,
+      "theme": "night"
+    },
+    {
+      "name": "camp-landscape",
+      "width": 844,
+      "height": 390,
+      "theme": "day"
+    },
+    {
+      "name": "execution-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "execution-night",
+      "width": 390,
+      "height": 844,
+      "theme": "night"
+    },
+    {
+      "name": "member-runtime-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "appearance-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "skills-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "login-expired-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "new-conversation-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "automation-member-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "projects-day",
+      "width": 390,
+      "height": 844,
+      "theme": "day"
+    },
+    {
+      "name": "overview-day",
+      "width": 1440,
+      "height": 1040,
+      "theme": "day"
+    }
+  ],
+  "errors": [],
+  "artifact": {
+    "name": "rovai-mobile.html",
+    "sha256": "25bf85a794e012f2e432e88ee113015979464466c996fbf21bca4fe9e6b5d623"
+  },
+  "result": "pass",
+  "revision": 4,
+  "productionChange": false,
+  "productionBaseline": "5588c30f0f8d655c10c0967009a949001ff29ce4; no production source changes in revision 4",
+  "limitations": [
+    "Local sample state only; no real Host or model execution",
+    "Desktop-hosted page has no update; Server Web update flow remains a proposal",
+    "No iOS/Android physical-device, keyboard, camera or network-switch qualification"
+  ],
+  "sourceChecks": {
+    "files": "FilePreviewPane and file-preview-session restore explicitly opened tabs, not a complete Camp file collection. The invented aggregate file tab is removed.",
+    "recipient": "CampWorkspace.composerRecipientSummary and structured Mention remain production owners. Prototype shows default Lead hint and @, without a separate recipient button.",
+    "skills": "SkillSettings consumes delivery groups; MemberManagement has no Skills/MCP assignment surface.",
+    "latest": "Production return-to-latest has a 36 px circular face, 44 px hit area, centered over reading content.",
+    "automation": "AutomationEditor/AutomationWorkspace persist a single memberId, not a team. The prototype uses a portrait single select and preserves that member through edits, save and refresh.",
+    "projectPagination": "CampNavigation and navigation-window-reader use five initial conversations and five more per step. The sample Rovai project contains eleven unpinned conversations; folder expansion and per-group limits are independent.",
+    "execution": "CampWorkspace continuous process timeline, ExecutionAvatarRail avatar/status semantics, ExecutionStatusGlyph and ExecutionToolGroup command icons. Mobile wraps portraits, keeps each Run independent and compresses terminal headers.",
+    "taskCreation": "TaskFields showStatus only in edit mode; create contains title, description, acceptanceCriteria and required current-Camp assignee. Prototype defaults a new Task to pending.",
+    "messageRuntime": "The member message header includes Runtime display name (Codex CLI) beside the member; production Runtime configuration ownership remains unchanged.",
+    "settingsGlyph": "Settings path copied from current NavigationIcon settings branch.",
+    "focus": "Owner request and DESIGN use no focus-only outlines, border changes or halos. DOM input, keyboard navigation, dialog focus and selected states remain."
+  },
+  "verification": {
+    "prototypeBrowser": "28 interaction groups passed; zero console exceptions",
+    "docsTests": "10 passed",
+    "docsVersionAndDecisionChecks": "pass including diff-aware base 5588c30f",
+    "productionTests": "Not rerun; this revision only changes a local HTML prototype, its documentation and evidence."
+  },
+  "harnessNotes": [
+    "The first ten-avatar stress fixture was overwritten by the mounted page state during reload. Seeding on new-document initialization corrected the fixture; all checks were rerun at the original thresholds. This is not production Host or multi-device evidence."
+  ],
+  "trackedScreens": [
+    "camp-night",
+    "camp-day",
+    "desktop-about-day",
+    "server-update-day",
+    "execution-expanded-day",
+    "overview-day",
+    "new-conversation-day",
+    "appearance-day",
+    "member-runtime-day",
+    "settings-day",
+    "camp-landscape",
+    "login-expired-day",
+    "project-expanded-day",
+    "project-collapsed-day",
+    "automation-member-picker-day",
+    "conversations-day",
+    "execution-runs-day",
+    "execution-avatar-wrap-day",
+    "execution-night",
+    "new-task-day"
+  ]
+}

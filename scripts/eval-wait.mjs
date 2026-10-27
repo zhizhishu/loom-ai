@@ -1,0 +1,22 @@
+// Read-only helper copied into an explicitly configured analysis workspace.
+// It neither executes evaluation nor contacts the owner's App endpoint.
+import { readFile, realpath } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+const args = process.argv.slice(2)
+if (args.length !== 2 || !['--thread-id', '--camp-id'].includes(args[0]) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(args[1])) throw new Error('Usage: node wait-for-evaluation.mjs --thread-id <current-Thread-ID>')
+const root = await realpath(dirname(fileURLToPath(import.meta.url)))
+for (;;) {
+  let receipt = null
+  try { receipt = JSON.parse(await readFile(join(root, 'automation', `${args[1]}.json`), 'utf8')) }
+  catch (error) { if (error.code !== 'ENOENT') throw error }
+  if (receipt) {
+    if (receipt.schemaVersion !== 1 || receipt.threadId !== args[1] || receipt.output !== root || !['running', 'completed', 'failed', 'interrupted'].includes(receipt.state)) throw new Error('Evaluation receipt does not belong to this Thread and workspace')
+    if (receipt.state !== 'running') {
+      console.log(JSON.stringify(receipt, null, 2))
+      process.exitCode = receipt.state === 'completed' ? 0 : 2
+      break
+    }
+  }
+  await new Promise(resolve => setTimeout(resolve, 1000))
+}

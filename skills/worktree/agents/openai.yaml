@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Worktree"
+  short_description: "为独立开发工作创建、复用、交接和安全清理 Git worktree"
+  default_prompt: "Use $worktree to create or reuse an isolated Git worktree for this development task."

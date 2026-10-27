@@ -1,0 +1,605 @@
+{
+  "productionEntry": true,
+  "realHost": true,
+  "runtimeExecution": false,
+  "realPhone": false,
+  "checks": [
+    {
+      "name": "conversations",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "workspace-picker",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "conversations-expanded",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "new-conversation",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "camp-more-menu",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "camp-tasks",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "new-task",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "camp-task-created",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "camp-execution-empty",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "camp",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "local-image-preview",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "html-attachment",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "mention-picker",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "private-chat",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "camp-members",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "members",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "member-detail",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "member-runtime",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "memory-detail",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "memory-versions",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "memory-list",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "settings",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "desktop-about",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "appearance",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "settings-通用",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "settings-Skills",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "settings-MCP",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "settings-运行时",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "settings-远程连接",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "automations",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "automation-date",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "automation-time",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    },
+    {
+      "name": "automation-form",
+      "geometry": {
+        "width": 390,
+        "overflow": false,
+        "shell": {
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "top": 0,
+          "right": 390,
+          "bottom": 844,
+          "left": 0
+        },
+        "errors": []
+      }
+    }
+  ],
+  "sourceCommit": "85c7519c5736c5cc06afd5518dd5c3e4e30d6eb6",
+  "packagedHost": true,
+  "packagedWebAssets": true
+}

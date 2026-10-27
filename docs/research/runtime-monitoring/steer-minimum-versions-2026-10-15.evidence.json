@@ -1,0 +1,428 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-15",
+  "sourceMessageId": "2c16d225-ec63-4d45-9997-b17aefb88df4",
+  "baseline": "251117f0124f1992f63fd1c334443283a57a9998",
+  "platform": "macos-arm64",
+  "excluded": [
+    "Cursor",
+    "Cline",
+    "Command Code"
+  ],
+  "qoder": {
+    "upgrade": {
+      "from": "1.1.65",
+      "to": "1.1.71",
+      "method": "official qodercli update",
+      "binarySha256": "0397bbf51de7e71944faa679faae9be42d2e8f5b5849050c41a9f817d654dce2",
+      "priorBinaryRetained": true,
+      "configAndLoginPreserved": true
+    },
+    "realLlmAttempts": 1,
+    "promptRequests": 2,
+    "transport": "qodercli --acp (official local standalone binary)",
+    "model": "gpt-6.1-sol",
+    "toolBoundary": {
+      "ready": true,
+      "firstPromptStillPending": true
+    },
+    "extensionErrors": {
+      "_session/steer": -32601,
+      "_session/steering": -32601,
+      "session/steer": -32601
+    },
+    "eventOrder": [
+      {
+        "lastTextBeforeOriginalEnd": "ORIGINAL_034"
+      },
+      {
+        "index": 103,
+        "originalStopReason": "end_turn"
+      },
+      {
+        "textAfterOriginalEnd": "STEER_034_成功"
+      },
+      {
+        "index": 110,
+        "supplementStopReason": "end_turn"
+      }
+    ],
+    "verdict": "next_turn_only",
+    "coreReadiness": {
+      "status": "passed",
+      "ready": true,
+      "probeStatus": "ready",
+      "version": "1.1.71",
+      "exitCode": 0
+    }
+  },
+  "versions": [
+    {
+      "runtime": "Codex",
+      "transport": "app-server",
+      "firstVersion": null,
+      "verifiedLlmVersion": "0.162.1",
+      "status": "integrated"
+    },
+    {
+      "runtime": "Claude Code",
+      "transport": "Stream JSON",
+      "firstVersion": null,
+      "verifiedLlmVersion": "2.1.287",
+      "provider": "sub2api",
+      "status": "integrated",
+      "necessaryAckFeatureVersion": "1.0.86",
+      "partialFlagObservedIn": [
+        "1.0.108",
+        "1.0.109"
+      ],
+      "partialFlagAbsentIn": [
+        "1.0.86"
+      ]
+    },
+    {
+      "runtime": "Pi",
+      "transport": "RPC",
+      "firstVersion": "0.32.0",
+      "currentWireMinimum": "0.99.0",
+      "minimumEvidence": "official changelog + version source + current receiver requirement; historical LLM not retested",
+      "productGeneralMinimum": "0.84.4",
+      "verifiedLlmVersion": "1.1.0",
+      "status": "integrated"
+    },
+    {
+      "runtime": "CodeBuddy",
+      "transport": "ACP",
+      "firstVersion": null,
+      "verifiedLlmVersion": "2.133.1",
+      "status": "integrated"
+    },
+    {
+      "runtime": "Qwen Code",
+      "transport": "ACP",
+      "firstStableVersion": "0.18.0",
+      "currentWireMinimum": "0.18.4",
+      "minimumEvidence": "adjacent release source + official npm package format comparison; historical LLM not retested",
+      "verifiedLlmVersion": "0.25.0",
+      "status": "integrated"
+    },
+    {
+      "runtime": "Grok Build",
+      "transport": "ACP stdio",
+      "firstVersion": null,
+      "productGeneralMinimum": "1.0.0",
+      "interfaceSourceConfirmedAt": "1.0.0",
+      "verifiedLlmVersion": "1.0.50",
+      "status": "integrated"
+    },
+    {
+      "runtime": "Kiro CLI",
+      "transport": "ACP v2",
+      "announcedFeatureVersion": "2.7.0",
+      "firstSuccessfulAcpVersion": null,
+      "verifiedLlmVersion": "2.21.1",
+      "status": "integrated",
+      "historicalProbe": "2.6.0 absent; 2.7.0 symbols present but no steer response in three 15-second non-active-turn probes"
+    },
+    {
+      "runtime": "ZCode",
+      "transport": "bundled app-server",
+      "firstVersion": null,
+      "verifiedLlmVersion": {
+        "app": "3.14.5",
+        "kernel": "0.16.9"
+      },
+      "status": "integrated"
+    },
+    {
+      "runtime": "TRAE CLI CN",
+      "transport": "ACP",
+      "firstVersion": null,
+      "verifiedLlmVersion": "0.209.1",
+      "negativeVersion": "0.120.52",
+      "status": "transport_verified_product_pending"
+    },
+    {
+      "runtime": "Qoder",
+      "transport": "ACP",
+      "firstVersion": null,
+      "negativeVersions": [
+        "1.1.65",
+        "1.1.71"
+      ],
+      "status": "next_turn_only"
+    },
+    {
+      "runtime": "Kimi Code",
+      "transport": "ACP",
+      "firstVersion": null,
+      "negativeVersion": "2.1.1",
+      "status": "unsupported_in_verified_version"
+    },
+    {
+      "runtime": "OpenCode",
+      "transport": "ACP",
+      "firstVersion": null,
+      "negativeVersion": "2.0.25",
+      "sourceCheckedThrough": "2.0.29",
+      "status": "busy_rejected"
+    },
+    {
+      "runtime": "DeepSeek Harness",
+      "transport": "official ACP profile",
+      "firstVersion": null,
+      "negativeVersion": "0.2.1-alpha.1",
+      "sourceCheckedThrough": "0.2.1-alpha.3",
+      "status": "inflight_rejected"
+    },
+    {
+      "runtime": "GitHub Copilot",
+      "transport": "ACP",
+      "firstVersion": null,
+      "negativeVersion": {
+        "cli": "1.0.83",
+        "acpLauncher": "1.0.91"
+      },
+      "status": "cancel_and_replace"
+    },
+    {
+      "runtime": "Antigravity",
+      "transport": "official CLI Stream JSON",
+      "firstVersion": null,
+      "negativeVersion": "1.3.5",
+      "status": "next_turn_only"
+    }
+  ],
+  "kiroHistoricalArtifacts": [
+    {
+      "version": "2.6.0",
+      "artifactUrl": "https://prod.download.cli.kiro.dev/stable/2.6.0/Kiro%20CLI.dmg",
+      "dmgSha256": "c45847af95f2431eef515aa1511e53319579f97b28a05941bfceb37120d6f995",
+      "binarySha256": "1ce5a2ad70db944bc14436cdd58269ff8328735b08e22f0a9ce2cc6c9fb8690e",
+      "symbols": {
+        "_session/steer": false,
+        "AgentExecutionUserMessageQueued": false,
+        "AgentExecutionSteeringInjected": false,
+        "AgentExecutionUserMessageCleared": false
+      }
+    },
+    {
+      "version": "2.7.0",
+      "artifactUrl": "https://prod.download.cli.kiro.dev/stable/2.7.0/Kiro%20CLI.dmg",
+      "dmgSha256": "524c2b7212e375b4376961d81be0dc3246ed43228211b1bac1d35f3a9bb8d936",
+      "binarySha256": "e6ae769cb28f3b4c0e195b3262e1df2784d033cb2f692f5960dfc4b603a8c9c2",
+      "symbols": {
+        "_session/steer": true,
+        "AgentExecutionUserMessageQueued": true,
+        "AgentExecutionSteeringInjected": true,
+        "AgentExecutionUserMessageCleared": true
+      }
+    }
+  ],
+  "kiroHistoricalProbes": [
+    {
+      "attempt": "kiro-2.6-method",
+      "version": "kiro-cli-chat 2.6.0",
+      "initializeSucceeded": true,
+      "newSessionSucceeded": false,
+      "unknownMethodControl": -32601,
+      "steer": {
+        "jsonrpc": "2.0",
+        "error": {
+          "code": -32601,
+          "message": "Method not found",
+          "data": "_session/steer"
+        },
+        "id": 3
+      },
+      "error": null,
+      "timeoutSeconds": null,
+      "usedLlm": false
+    },
+    {
+      "attempt": "kiro-2.7-method",
+      "version": "kiro-cli-chat 2.7.0",
+      "initializeSucceeded": true,
+      "newSessionSucceeded": false,
+      "unknownMethodControl": -32601,
+      "steer": null,
+      "error": "_session/steer",
+      "timeoutSeconds": 15,
+      "usedLlm": false
+    },
+    {
+      "attempt": "kiro-2.7-schema",
+      "version": "kiro-cli-chat 2.7.0",
+      "initializeSucceeded": true,
+      "newSessionSucceeded": false,
+      "unknownMethodControl": -32601,
+      "steer": null,
+      "error": "_session/steer",
+      "timeoutSeconds": 15,
+      "usedLlm": false
+    },
+    {
+      "attempt": "kiro-2.7-idle-session",
+      "version": "kiro-cli-chat 2.7.0",
+      "initializeSucceeded": true,
+      "newSessionSucceeded": true,
+      "unknownMethodControl": -32601,
+      "steer": null,
+      "error": "_session/steer",
+      "timeoutSeconds": 15,
+      "usedLlm": false
+    }
+  ],
+  "qwenPublishedPackageChecks": [
+    {
+      "version": "0.17.1",
+      "publishedAt": "2026-06-03T11:58:05.299Z",
+      "sourceGitHead": "09d0faf6b51dea9aa384f3ae0a2b68d2c70204e3",
+      "tarball": "https://registry.npmjs.org/@qwen-code/qwen-code/-/qwen-code-0.17.1.tgz",
+      "sha256": "890d3d1971760226e7e9d3c22925a984e74d0edd319533bc6d3c8959ee50cf35",
+      "drainMethodFiles": []
+    },
+    {
+      "version": "0.18.0",
+      "publishedAt": "2026-06-12T14:41:21.102Z",
+      "sourceGitHead": "a7b8a3655c73c14dde99ab7138a566885e31c68f",
+      "tarball": "https://registry.npmjs.org/@qwen-code/qwen-code/-/qwen-code-0.18.0.tgz",
+      "sha256": "1a245573348a6ba2d014bce421b2419d9d2e7affcb76889f1fb97714772f1fd6",
+      "drainMethodFiles": [
+        "package/cli.js"
+      ]
+    },
+    {
+      "version": "0.18.3",
+      "publishedAt": "2026-06-17T16:27:48.570Z",
+      "sourceGitHead": "4346b8b982b185c9428d28419ac980bd8a09c53a",
+      "tarball": "https://registry.npmjs.org/@qwen-code/qwen-code/-/qwen-code-0.18.3.tgz",
+      "sha256": "41ca0ee791130e04e984b6e1cefef170a73f3c10bfb0c42444f4ba0b68cf5e20",
+      "structuredDrainParser": false
+    },
+    {
+      "version": "0.18.4",
+      "publishedAt": "2026-06-20T09:37:30.853Z",
+      "sourceGitHead": "c898e9f6addd6be40de8ad4da167981acc713cad",
+      "tarball": "https://registry.npmjs.org/@qwen-code/qwen-code/-/qwen-code-0.18.4.tgz",
+      "sha256": "02a6eadeb4d082adb5a6c13378e4e7a12d2d0f6cbaddc568f475a5ef37898fc7",
+      "structuredDrainParser": true
+    }
+  ],
+  "codebuddyReleaseAudit": {
+    "pagesRead": 319,
+    "httpErrors": 0,
+    "emptyBodies": 0,
+    "index": "https://www.codebuddy.ai/docs/cli/release-notes/README",
+    "matchingPublishedVersions": [
+      "2.97.0",
+      "2.111.0",
+      "2.114.0",
+      "2.140.0",
+      "2.143.1"
+    ],
+    "currentConcurrentPromptFirstRelease": null
+  },
+  "sourceManifest": [
+    {
+      "url": "https://raw.githubusercontent.com/earendil-works/pi-mono/main/packages/coding-agent/CHANGELOG.md",
+      "sha256": "6a26f50dda019fd23fd014d0c87b283edd975c7c4f6f1d56ed2f04bf3d749d96"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/earendil-works/pi-mono/v0.32.0/packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+      "sha256": "bab18d6973f939e3707ab647696698d3d8395db9f350d3e383ea9fb232e39f47"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/earendil-works/pi-mono/v0.87.0/packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+      "sha256": "7d4bf1e4291a5320a1ce27504c488622c9a7307ce9e7c2d973f9d95f18a8b2bc"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/earendil-works/pi-mono/v0.99.0/packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+      "sha256": "d534e0fa1484844a097963d5f4fb4df9397c5a1b5e29e42aed7575ab6f67989b"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/QwenLM/qwen-code/v0.17.1/packages/cli/src/acp-integration/session/Session.ts",
+      "sha256": "483ffef7e9476f73429c1ded9c320ba647bd5947e5d986de5ea7af2404d690fe"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/QwenLM/qwen-code/v0.18.0/packages/cli/src/acp-integration/session/Session.ts",
+      "sha256": "1a7e7a84fd1fa192b88ac52d5784c38ce6221c6f88348ad7ffecc1a206d16a01"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/QwenLM/qwen-code/v0.18.3/packages/cli/src/acp-integration/session/Session.ts",
+      "sha256": "5d43c8cff4c01579efb4b83bb4d9d0ddccae8ba6106640787cf6789e4d99933f"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/QwenLM/qwen-code/v0.18.4/packages/cli/src/acp-integration/session/Session.ts",
+      "sha256": "6ff5faf5da40466cc2c58629e1035010de891419e315c319bd934ca36c0d207e"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/xai-org/grok-build/afbc0fb710320c7add294c2106d447ecc3e3af2e/crates/codegen/xai-grok-shell/Cargo.toml",
+      "sha256": "4de51ddd80ae878a6fcaf30f81b47e399f88dcfbe0c6ce7e645b5ff7b6da8d2e"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/xai-org/grok-build/afbc0fb710320c7add294c2106d447ecc3e3af2e/crates/codegen/xai-grok-shell/src/extensions/interject.rs",
+      "sha256": "bde7d12db64b0106cdfb3bb5b8a0cd3ce5a1ebcc4956e235137d416bb8942483"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md",
+      "sha256": "7abf62a98e6739e0b51071c5e289b0a6baef4f3a2d08046a6df2b338b3d0d086"
+    },
+    {
+      "url": "https://docs.qoder.com/release-notes/qoder-cli",
+      "sha256": "23fd91cd6e602e25d3b37fc8a135aa473f30e5f6939d4489af53f9134d714d9a"
+    },
+    {
+      "url": "https://kiro.dev/changelog/cli/2-7/",
+      "sha256": "ac0853f98d4eb8d5d2dd1fbc20dee9772e0c5847d16156653a4ca6ece2523d07"
+    },
+    {
+      "url": "https://zcode.z.ai/cn/changelog",
+      "sha256": "f541108f0756cdcc3eceeb91e05553107597b7022c57b39ec9bf16b742aacf62"
+    },
+    {
+      "url": "https://learn.chatgpt.com/docs/changelog",
+      "sha256": "89c9a0a9ba07df958dfc8fb2d030ba18edc24e1e2767ac0daa0111ea8f5e0e8e"
+    }
+  ],
+  "inheritedRealLlmReports": [
+    "steer-current-transport-2026-10-14.md",
+    "steer-five-runtimes-2026-10-14.md",
+    "steer-kiro-zcode-2026-10-14.md",
+    "steer-trae-upgrade-2026-10-14.md"
+  ],
+  "validation": {
+    "state": "passed",
+    "docsTest": {
+      "passed": 10,
+      "failed": 0
+    },
+    "docsCheck": "passed",
+    "docsCheckCi": {
+      "result": "passed",
+      "baseRef": "251117f0124f1992f63fd1c334443283a57a9998"
+    },
+    "rust": {
+      "command": "cargo test -p rovai-core --lib platform_evidence_revisions_bind_their_frozen_source_bytes",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "filteredOut": 425
+    },
+    "gitDiffCheck": "passed",
+    "scope": "Documentation and compatibility digest only; no runtime implementation changes; no full workspace rerun",
+    "cargoFmtCheck": "passed"
+  },
+  "cleanup": {
+    "state": "completed",
+    "privateQoderNativeCopiesRemoved": [
+      "qoder-native-1.1.71/native",
+      "core-readiness/native"
+    ],
+    "officialQoderConfigRetained": true,
+    "oldQoderBinaryRetained": true,
+    "kiroHistoricalDownloadsAndCopiesRemoved": true,
+    "ownedNativeProcessesClosedByProbeFinally": true,
+    "coreExitCode": 0
+  }
+}

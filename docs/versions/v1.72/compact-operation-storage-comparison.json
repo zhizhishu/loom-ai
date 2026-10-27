@@ -1,0 +1,5966 @@
+{
+  "baseCommit": "d6ae891fcfb4a4a4e4ab41865fc47456b74413a8",
+  "sqlite": "3.53.2 (bundled rusqlite)",
+  "buildProfile": "debug",
+  "readSamplesPerPath": 5,
+  "boundary": "Same synthetic 10000-operation/20000-event stream plus 128 progress updates per format, same bundled SQLite/full schema. 100 large inputs, 100 duplicated native/normalized diffs. Formats 3 and 4 both use actual upgraded view. Warm small samples; no stable speedup or P95 claim. JSON write bytes are trigger-observed SQL values, not physical IO. DB pages include free pages; filesystem main length can lag WAL. Blob peak includes candidates retained in the grace period. No daily data used.",
+  "formats": [
+    {
+      "activityCopyRows": 10001,
+      "blobPeakBytes": 17723766,
+      "dbFileBytes": 207052800,
+      "dbGrowthBytes": 203927552,
+      "dbPagesBytes": 207052800,
+      "digestWriteBytes": 0,
+      "duplicateNativeDiffCases": 100,
+      "eventValueWriteBytes": 208960017,
+      "events": 20000,
+      "inputArgumentCases": 100,
+      "jsonValueWriteBytes": 204932595,
+      "operationRows": 10001,
+      "operations": 10000,
+      "previewAndDiffLogicalBytes": 183569889,
+      "progressChangedRows": 128,
+      "progressSamples": [
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1227
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1097
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1072
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1000
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1043
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 985
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1125
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1119
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 994
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1044
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1008
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1011
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 993
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 979
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1005
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1004
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1071
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 965
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1024
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1032
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1145
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1025
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1035
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1076
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1023
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 995
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 987
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1011
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1018
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1051
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1053
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 973
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1046
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1021
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1069
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 977
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1070
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1042
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 5166
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1046
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1011
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 982
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1038
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1044
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1084
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1138
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1150
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1091
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1051
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1052
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1081
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1136
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1102
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1095
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1060
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1121
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1035
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1007
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1093
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1085
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1112
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1031
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1094
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1090
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1128
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1023
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1112
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1070
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1226
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1105
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1137
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1122
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1094
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1087
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1086
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1129
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1123
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1292
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1105
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1132
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1104
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1094
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1198
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1074
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1159
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1163
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1103
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1115
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1114
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1107
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1154
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1155
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1189
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1179
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1130
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1224
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1118
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1116
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1130
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1176
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1167
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1121
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1237
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1109
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1205
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1149
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1142
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1134
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1229
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1190
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1166
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1151
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1249
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1094
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1093
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1139
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1148
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1121
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1124
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1188
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1182
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1267
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1213
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1206
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1175
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1293
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1206
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1235
+        }
+      ],
+      "progressUpdates": 128,
+      "readSampleCount": 5,
+      "readSamples": [
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 60325
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 716054
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 218
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 726101
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 712795
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 732904
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 54086
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 731274
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 197
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 745249
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 718567
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 710352
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 54321
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 703402
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 200
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 705635
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 706340
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 701095
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 53870
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 702902
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 221
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 700237
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 707816
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 700716
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 58206
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 704478
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 206
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 696441
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 702181
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 699744
+          }
+        }
+      ],
+      "sqlBodyUpdates": 10127,
+      "sqlInserts": 10011,
+      "sqlUpdates": 10127,
+      "storageFormat": 1,
+      "walPeakBytes": 4367232,
+      "writeMs": 44783
+    },
+    {
+      "activityCopyRows": 10001,
+      "blobPeakBytes": 17723766,
+      "dbFileBytes": 114860032,
+      "dbGrowthBytes": 111734784,
+      "dbPagesBytes": 114860032,
+      "digestWriteBytes": 0,
+      "duplicateNativeDiffCases": 100,
+      "eventValueWriteBytes": 106694723,
+      "events": 20000,
+      "inputArgumentCases": 100,
+      "jsonValueWriteBytes": 102667301,
+      "operationRows": 10001,
+      "operations": 10000,
+      "previewAndDiffLogicalBytes": 93980625,
+      "progressChangedRows": 128,
+      "progressSamples": [
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 989
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 946
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 915
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 867
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 836
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 826
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 846
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 896
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 863
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 832
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 832
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 832
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 818
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 871
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 849
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 830
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 852
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 826
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 5752
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 912
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 929
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 885
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 856
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 913
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 881
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 864
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 858
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 857
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 885
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 877
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 851
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 842
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 850
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 860
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 954
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 950
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 870
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 857
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 868
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 856
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 960
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 910
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 947
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 898
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 896
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 934
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 938
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 929
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 880
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1002
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 932
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 929
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1021
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 913
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 896
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 899
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 924
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 966
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 903
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 893
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 873
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 899
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 946
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1092
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 968
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 931
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 928
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 960
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 916
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1025
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 946
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 927
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 994
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 948
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1064
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 986
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 951
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 944
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 932
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 981
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 989
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 949
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 954
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 952
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 974
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 938
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 936
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 979
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 968
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 931
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 962
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1020
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 940
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 934
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 996
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1070
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1024
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1020
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 977
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1027
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1000
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1184
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1191
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1034
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1043
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 969
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1006
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1083
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1028
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1011
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 998
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 989
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1029
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1120
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1048
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1085
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1039
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 996
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1109
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1088
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1009
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1012
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1105
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1014
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1011
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1065
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1002
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1015
+        }
+      ],
+      "progressUpdates": 128,
+      "readSampleCount": 5,
+      "readSamples": [
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 63222
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 842008
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 200
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 848121
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 834457
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 834638
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 67223
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 856865
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 238
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 833114
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 988447
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 832535
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 62358
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 927722
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 241
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 935992
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 931981
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 985446
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 66106
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 977087
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 256
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 964795
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 934478
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 956812
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 60183
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 889639
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 219
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 908626
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 917343
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 888902
+          }
+        }
+      ],
+      "sqlBodyUpdates": 10127,
+      "sqlInserts": 10011,
+      "sqlUpdates": 10127,
+      "storageFormat": 2,
+      "walPeakBytes": 4251872,
+      "writeMs": 37727
+    },
+    {
+      "activityCopyRows": 0,
+      "blobPeakBytes": 17723766,
+      "dbFileBytes": 105291776,
+      "dbGrowthBytes": 102166528,
+      "dbPagesBytes": 105291776,
+      "digestWriteBytes": 0,
+      "duplicateNativeDiffCases": 100,
+      "eventValueWriteBytes": 108018715,
+      "events": 20000,
+      "inputArgumentCases": 100,
+      "jsonValueWriteBytes": 108021282,
+      "operationRows": 10001,
+      "operations": 10000,
+      "previewAndDiffLogicalBytes": 92640889,
+      "progressChangedRows": 128,
+      "progressSamples": [
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1004
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 756
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 2358
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 767
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 733
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 736
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 704
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 693
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 712
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 698
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 698
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 703
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1157
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1148
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1628
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1247
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 779
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 720
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 709
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 704
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 702
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 700
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 700
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 725
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 7633
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 873
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 843
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 804
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 777
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 771
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 762
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 756
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 764
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 759
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 760
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 765
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 763
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 761
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 774
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 769
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 769
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 782
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 771
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 867
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 834
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1036
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 838
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 907
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 787
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 795
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 784
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 784
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 791
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 791
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 794
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 789
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 791
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 791
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 794
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 804
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 798
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 798
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 803
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 826
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 824
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 823
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 821
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 818
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 819
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 818
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 825
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 912
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 822
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 820
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 825
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 831
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 827
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 830
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 832
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 829
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 836
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 836
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 836
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 837
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 858
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 842
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 855
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 845
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 847
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 860
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 846
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 879
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 848
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 857
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 855
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 870
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 862
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 862
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 859
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 868
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 870
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 882
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 905
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1006
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 964
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 918
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 899
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 883
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 891
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 903
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 885
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 883
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 882
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 886
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 885
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 891
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 889
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 889
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 890
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 895
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 898
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 895
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 901
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 903
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 906
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 906
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 905
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 931
+        }
+      ],
+      "progressUpdates": 128,
+      "readSampleCount": 5,
+      "readSamples": [
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 4735
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 876105
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 191
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 953744
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 942128
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 892731
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 830
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 774456
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 330
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 785564
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 847731
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 792430
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 723
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 814389
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 217
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 724544
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 803740
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 692817
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 765
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 774420
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 214
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 706117
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 842768
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 731950
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 788
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 743330
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 210
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 692939
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 740442
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 783850
+          }
+        }
+      ],
+      "sqlBodyUpdates": 10127,
+      "sqlInserts": 10011,
+      "sqlUpdates": 30255,
+      "storageFormat": 3,
+      "walPeakBytes": 4358992,
+      "writeMs": 19542
+    },
+    {
+      "activityCopyRows": 0,
+      "blobPeakBytes": 13720866,
+      "dbFileBytes": 96677888,
+      "dbGrowthBytes": 93552640,
+      "dbPagesBytes": 96677888,
+      "digestWriteBytes": 641792,
+      "duplicateNativeDiffCases": 100,
+      "eventValueWriteBytes": 90235984,
+      "events": 20000,
+      "inputArgumentCases": 100,
+      "jsonValueWriteBytes": 90238551,
+      "operationRows": 10001,
+      "operations": 10000,
+      "previewAndDiffLogicalBytes": 83668647,
+      "progressChangedRows": 1,
+      "progressSamples": [
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1067
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 379
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 342
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 404
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 358
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 4251
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 407
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 333
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 312
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 310
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 309
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 309
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 306
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 326
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 345
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 324
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 320
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 320
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 332
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 350
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 350
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 350
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 352
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 362
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 356
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 358
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 359
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 360
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 360
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 365
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 368
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 367
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 426
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 385
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 373
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 369
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 367
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 368
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 367
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 367
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 370
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 373
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 577
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 386
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 373
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 376
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 376
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 380
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 380
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 384
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 382
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 386
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 386
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 386
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 388
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 391
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 392
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 393
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 397
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 396
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 399
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 401
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 402
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 404
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 414
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 407
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 411
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 412
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 410
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 479
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 453
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 433
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 426
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 424
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 426
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 424
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 424
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 427
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 429
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 432
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 443
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 433
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 434
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 437
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 445
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 444
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 438
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 441
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 445
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 445
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 446
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 450
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 452
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 452
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 457
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 502
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 458
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 459
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 461
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 464
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 464
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 467
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 465
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 485
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 488
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 487
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 490
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 490
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 495
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 498
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 500
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 496
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 502
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 487
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 488
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 490
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 489
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 490
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 493
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 494
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 499
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 498
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 504
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 516
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 522
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 532
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 523
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 528
+        }
+      ],
+      "progressUpdates": 128,
+      "readSampleCount": 5,
+      "readSamples": [
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 8920
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 714011
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 193
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 702567
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 713727
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 655466
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 538
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 811421
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 189
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 646028
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 706681
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 674742
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 604
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 752088
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 218
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 679703
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 736235
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 645467
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 505
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 689440
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 158
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 828041
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 689085
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 640808
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 751
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 691366
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 333
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 625066
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 698582
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 621032
+          }
+        }
+      ],
+      "sqlBodyUpdates": 10000,
+      "sqlInserts": 10011,
+      "sqlUpdates": 30128,
+      "storageFormat": 4,
+      "walPeakBytes": 4227152,
+      "writeMs": 24488
+    }
+  ],
+  "sourceBaseCommit": "d6ae891fcfb4a4a4e4ab41865fc47456b74413a8",
+  "targetBaseCommit": "be6ae4868fc8858e0775645fefbc80d8a6f1216d",
+  "timingNote": "Two final-code passes: format 3/4 writes 19542/24488 ms, then 20582/17381 ms. Variation does not establish a stable throughput gain or slowdown. Five read samples per path per pass include the first selected Blob read. Progress body-write counts and logical reductions agree between passes. First pass compiled before the UI-only main update; Rust sources are identical on target be6ae4868.",
+  "followupFormats": [
+    {
+      "activityCopyRows": 0,
+      "blobPeakBytes": 17723766,
+      "dbFileBytes": 105193472,
+      "dbGrowthBytes": 102150144,
+      "dbPagesBytes": 105275392,
+      "digestWriteBytes": 0,
+      "duplicateNativeDiffCases": 100,
+      "eventValueWriteBytes": 108018715,
+      "events": 20000,
+      "inputArgumentCases": 100,
+      "jsonValueWriteBytes": 108021282,
+      "operationRows": 10001,
+      "operations": 10000,
+      "previewAndDiffLogicalBytes": 92640889,
+      "progressChangedRows": 128,
+      "progressSamples": [
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1369
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1237
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1277
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 949
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1790
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1027
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1054
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 915
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 896
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 796
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1263
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1705
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1157
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 976
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1143
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1044
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1288
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 948
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1744
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1025
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 891
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 911
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1250
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 832
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 857
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1581
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1000
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 922
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 919
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 859
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 984
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 884
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1042
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1238
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1607
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 976
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 879
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1097
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1198
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1020
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1060
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1214
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 981
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 865
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 933
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1049
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1052
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 981
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1396
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 990
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 897
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 810
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 868
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 839
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 939
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 805
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1100
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1213
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 873
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 964
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 851
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 885
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 907
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 845
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 918
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1351
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1123
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 882
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 865
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 853
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 850
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 948
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 852
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1073
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 860
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 845
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 819
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 924
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 891
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 880
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 887
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 925
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1060
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1324
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 920
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 894
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 822
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 818
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 815
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 889
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 843
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1058
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 904
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 886
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 881
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 870
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 875
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 873
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 894
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 853
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 983
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 2287
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1020
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 961
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 963
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1075
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 967
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1122
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1078
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 905
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 915
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 962
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 896
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 917
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 939
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 956
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1468
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 981
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 888
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 917
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1172
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 985
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 952
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1075
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 931
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 944
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1077
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 1001
+        }
+      ],
+      "progressUpdates": 128,
+      "readSampleCount": 5,
+      "readSamples": [
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 4924
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 852947
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 203
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 1058543
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 936329
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 745491
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 727
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 749877
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 183
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 673414
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 746666
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 738662
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 776
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 1026911
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 232
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 653204
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 977276
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 705296
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 713
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 797610
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 169
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 703064
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 718257
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 794777
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 748
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 714777
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 220
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 659340
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 715738
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 663221
+          }
+        }
+      ],
+      "sqlBodyUpdates": 10127,
+      "sqlInserts": 10011,
+      "sqlUpdates": 30255,
+      "storageFormat": 3,
+      "walPeakBytes": 4396072,
+      "writeMs": 20582
+    },
+    {
+      "activityCopyRows": 0,
+      "blobPeakBytes": 13720866,
+      "dbFileBytes": 96509952,
+      "dbGrowthBytes": 93552640,
+      "dbPagesBytes": 96677888,
+      "digestWriteBytes": 641792,
+      "duplicateNativeDiffCases": 100,
+      "eventValueWriteBytes": 90235984,
+      "events": 20000,
+      "inputArgumentCases": 100,
+      "jsonValueWriteBytes": 90238551,
+      "operationRows": 10001,
+      "operations": 10000,
+      "previewAndDiffLogicalBytes": 83668647,
+      "progressChangedRows": 1,
+      "progressSamples": [
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 871
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 318
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 306
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 300
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 297
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 298
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 296
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 299
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 301
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 302
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 303
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 302
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 307
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 308
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 306
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 308
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 314
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 328
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 332
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 332
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 337
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 335
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 336
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 344
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 345
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 345
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 346
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 349
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 345
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 346
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 348
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 341
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 338
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 339
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 341
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 349
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 345
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 350
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 348
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 350
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 351
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 353
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 355
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 359
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 364
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 365
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 379
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 375
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 381
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 386
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 381
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 384
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 383
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 386
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 387
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 396
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 404
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 394
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 384
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 375
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 377
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 378
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 377
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 379
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 387
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 387
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 385
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 386
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 386
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 390
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 389
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 414
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 425
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 418
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 424
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 426
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 429
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 422
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 429
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 433
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 428
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 434
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 428
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 415
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 417
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 417
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 419
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 419
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 417
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 420
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 421
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 425
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 426
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 428
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 444
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 451
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 452
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 455
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 463
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 461
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 460
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 463
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 463
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 465
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 468
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 475
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 452
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 453
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 455
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 456
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 459
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 463
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 466
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 470
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 469
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 466
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 491
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 494
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 495
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 496
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 501
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 492
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 495
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 499
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 508
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 509
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 500
+        },
+        {
+          "blobReads": 0,
+          "fullPayloadReads": 0,
+          "previewReads": 0,
+          "us": 487
+        }
+      ],
+      "progressUpdates": 128,
+      "readSampleCount": 5,
+      "readSamples": [
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 7227
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 674862
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 148
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 618832
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 683764
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 619458
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 514
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 668961
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 161
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 607169
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 670100
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 609437
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 488
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 670824
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 153
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 604817
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 666388
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 609653
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 512
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 685134
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 157
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 606213
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 676789
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 656269
+          }
+        },
+        {
+          "expandDiff": {
+            "blobReads": 1,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 504
+          },
+          "expandGroup": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 666927
+          },
+          "expandResult": {
+            "blobReads": 0,
+            "fullPayloadReads": 1,
+            "previewReads": 0,
+            "us": 165
+          },
+          "first": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 609501
+          },
+          "firstBytes": 2970,
+          "groupNext": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 24,
+            "us": 673053
+          },
+          "next": {
+            "blobReads": 0,
+            "fullPayloadReads": 0,
+            "previewReads": 2,
+            "us": 607317
+          }
+        }
+      ],
+      "sqlBodyUpdates": 10000,
+      "sqlInserts": 10011,
+      "sqlUpdates": 30128,
+      "storageFormat": 4,
+      "walPeakBytes": 4198312,
+      "writeMs": 17381
+    }
+  ]
+}

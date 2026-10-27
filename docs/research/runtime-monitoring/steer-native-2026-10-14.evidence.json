@@ -1,0 +1,303 @@
+{
+  "scope": "Steer feasibility research, not release qualification or product implementation",
+  "date": "2026-10-14",
+  "platform": {
+    "os": "macOS",
+    "version": "26.6",
+    "architecture": "arm64"
+  },
+  "repositoryBaseline": "41c8ca19238de8465c23ff0c030f5c7620dd2c02",
+  "excluded": [
+    "Cursor",
+    "Cline",
+    "Command Code"
+  ],
+  "runtimesReviewed": 15,
+  "runtimesStartedForProtocolProbe": 12,
+  "method": "Isolated native configuration and project; send an initial sleep-and-ORIGINAL marker task, inject a Chinese correction at a native tool event, observe protocol response order and final output. Qwen positive case supplies one native boundary-drain callback. No Rovai App or Core launched.",
+  "limitations": [
+    "Tests are native protocol experiments; current Rovai adapters do not yet expose the proposed feature.",
+    "Positive cases establish the observed text correction and event sequence, not all end/stop/crash/compaction/reconnection races.",
+    "Only this macOS arm64 installation was tested; no minimum supported versions or cross-platform qualification asserted.",
+    "For remaining paths, not verified does not mean the runtime is incapable."
+  ],
+  "results": [
+    {
+      "runtime": "Codex",
+      "version": "codex-cli 0.162.1",
+      "evidenceLevel": "live_native",
+      "conclusion": "active_turn_steering_observed",
+      "observations": {
+        "method": "turn/steer",
+        "correctTurnAccepted": true,
+        "wrongTurnError": -32600,
+        "afterCompletionError": "no active turn to steer",
+        "turnStartedCount": 1,
+        "final": "STEER_064_成功"
+      },
+      "probeStartedAt": "2026-10-14T14:39:28+0800"
+    },
+    {
+      "runtime": "Claude Code",
+      "version": "2.1.287 (Claude Code)",
+      "evidenceLevel": "live_native",
+      "conclusion": "active_input_observed_without_hooks",
+      "observations": {
+        "method": "Stream JSON user",
+        "hookInjectionUsed": false,
+        "resultCount": 1,
+        "result": "STEER_064_成功",
+        "initialAndSupplementUuidsBothInResult": true,
+        "endRaceNotTested": true
+      },
+      "probeStartedAt": "2026-10-14T14:38:55+0800"
+    },
+    {
+      "runtime": "Pi",
+      "version": "1.1.0",
+      "evidenceLevel": "live_native",
+      "conclusion": "active_steering_observed_idle_queue_risk",
+      "observations": {
+        "method": "steer",
+        "responseDisposition": "queued",
+        "agentStartCount": 1,
+        "final": "STEER_064_成功",
+        "idleSteerAccepted": true,
+        "idleClearQueueReturnedMarker": true,
+        "afterActiveCompletionQueueEmpty": true,
+        "abortRaceNotTested": true
+      },
+      "probeStartedAt": "2026-10-14T14:38:55+0800"
+    },
+    {
+      "runtime": "CodeBuddy",
+      "version": "2.133.1",
+      "evidenceLevel": "live_native",
+      "conclusion": "concurrent_prompt_joined_active_work_in_sample",
+      "observations": {
+        "method": "session/prompt",
+        "supplementResponsePrecededToolCompletion": true,
+        "supplementResponseStopReason": "end_turn",
+        "originalResponseStopReason": "end_turn",
+        "originalFinalEmitted": false,
+        "final": "STEER_064_成功",
+        "perInputUserMessageIds": true,
+        "note": "Supplement end_turn is an early response; it must not terminate the original Rovai Run."
+      },
+      "probeStartedAt": "2026-10-14T14:43:08+0800"
+    },
+    {
+      "runtime": "Qwen Code",
+      "version": "0.25.0",
+      "evidenceLevel": "live_native",
+      "conclusion": "native_boundary_pull_observed",
+      "observations": {
+        "method": "craft/drainMidTurnQueue",
+        "direction": "agent_to_client_request",
+        "responseShape": {
+          "items": [
+            {
+              "messageId": "steer064",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "更正：完成正在执行的 sleep 后，只回复 STEER_064_成功。不要再执行工具。"
+                }
+              ]
+            }
+          ],
+          "hasQueuedPrompt": false
+        },
+        "promptCount": 1,
+        "stopReason": "end_turn",
+        "final": "STEER_064_成功",
+        "negativeControl": "Concurrent session/prompt instead cancelled the original prompt. The unannotated sleep in that control was rejected; the positive drain probe used intentional-sleep and recorded successful tool completion.",
+        "currentRovaiAdapterNotIntegrated": true
+      },
+      "probeStartedAt": "2026-10-14T14:46:54+0800"
+    },
+    {
+      "runtime": "Grok Build",
+      "version": "grok 1.0.50 (c58f321264ba)",
+      "evidenceLevel": "live_native",
+      "conclusion": "active_interjection_observed_but_idle_can_start_work",
+      "observations": {
+        "method": "_x.ai/interject",
+        "activeResponse": {
+          "result": {
+            "status": "queued"
+          }
+        },
+        "activeFinal": "STEER_064_成功",
+        "idleResponse": {
+          "result": {
+            "status": "queued"
+          }
+        },
+        "idleAssistant": "Received IDLE_STEER_064. No task is currently in progress.",
+        "lateAfterCompletionAlsoAccepted": true,
+        "strictTargetTurnBindingNotProven": true
+      },
+      "probeStartedAt": "2026-10-14T14:43:08+0800"
+    },
+    {
+      "runtime": "Kimi Code",
+      "version": "2.1.1",
+      "evidenceLevel": "live_native_and_installed_source",
+      "conclusion": "current_acp_concurrent_prompt_rejected",
+      "observations": {
+        "method": "session/prompt",
+        "code": -32600,
+        "dataCode": "turn.agent_busy",
+        "message": "another turn is already in progress",
+        "originalFinal": "ORIGINAL_064",
+        "installedNativeSdkSteerExists": true,
+        "alternateTransportParityNotTested": true
+      },
+      "probeStartedAt": "2026-10-14T14:43:08+0800"
+    },
+    {
+      "runtime": "OpenCode",
+      "version": "opencode v2.0.25",
+      "evidenceLevel": "live_native",
+      "conclusion": "current_acp_concurrent_prompt_rejected",
+      "observations": {
+        "method": "session/prompt",
+        "code": -32603,
+        "message": "Session already has an active ACP prompt",
+        "originalFinal": "ORIGINAL_064",
+        "otherTransportNotTested": true
+      },
+      "probeStartedAt": "2026-10-14T14:44:04+0800"
+    },
+    {
+      "runtime": "DeepSeek Harness",
+      "version": "0.2.1-alpha.1",
+      "evidenceLevel": "live_native_and_installed_source",
+      "conclusion": "current_acp_concurrent_prompt_rejected",
+      "observations": {
+        "method": "session/prompt",
+        "code": -32602,
+        "message": "a prompt is already in flight for this session",
+        "originalFinal": "ORIGINAL_064",
+        "initializeAgentVersion": "0.0.1",
+        "packageVersion": "0.2.1-alpha.1"
+      },
+      "probeStartedAt": "2026-10-14T14:46:31+0800"
+    },
+    {
+      "runtime": "Qoder",
+      "version": "1.1.65",
+      "evidenceLevel": "live_native",
+      "conclusion": "concurrent_prompt_queued_after_original",
+      "observations": {
+        "method": "session/prompt",
+        "advertisedPromptQueueing": true,
+        "orderedFinals": [
+          "ORIGINAL_064",
+          "STEER_064_成功"
+        ],
+        "originalPromptResponseBeforeSupplementOutput": true,
+        "sameTurnSteerNotEstablished": true
+      },
+      "probeStartedAt": "2026-10-14T14:44:04+0800"
+    },
+    {
+      "runtime": "GitHub Copilot",
+      "version": "GitHub Copilot CLI 1.0.91.\nRun 'copilot update' to check for updates.",
+      "evidenceLevel": "live_native_inconclusive",
+      "conclusion": "no_consumption_proof_from_concurrent_acp",
+      "observations": {
+        "pathVersionOutput": "GitHub Copilot CLI 1.0.91.\nRun 'copilot update' to check for updates.",
+        "initializeAgentVersion": "1.0.83",
+        "bothPromptResponses": "end_turn",
+        "finalAssistantText": "",
+        "supplementNotPresentInObservedNativeUserMessages": true,
+        "observedNativeAbort": true,
+        "note": "This concurrent-ACP sample is not evidence of SDK steering support; version identity differs between launcher and selected ACP backend."
+      },
+      "probeStartedAt": "2026-10-14T14:44:04+0800"
+    },
+    {
+      "runtime": "Kiro",
+      "version": "kiro-cli 2.21.1",
+      "evidenceLevel": "live_native_inconclusive",
+      "conclusion": "tool_boundary_not_reached",
+      "observations": {
+        "initializeVersion": "2.21.1",
+        "firstPromptFinal": "ORIGINAL_064",
+        "noToolBoundary": true,
+        "noConcurrentInputSubmitted": true
+      },
+      "probeStartedAt": "2026-10-14T14:45:57+0800"
+    },
+    {
+      "runtime": "ZCode App",
+      "version": "App 3.14.5",
+      "evidenceLevel": "installed_source_only",
+      "conclusion": "guide_path_is_candidate_with_automatic_queue_fallback",
+      "observations": {
+        "appVersion": "3.14.5",
+        "pathCliVersionNotApplicable": "0.16.9",
+        "nativeCommand": "v4/command sendText requestedDelivery=guide",
+        "nativeEvents": [
+          "turn.steerQueued",
+          "turn.steerDrained"
+        ],
+        "fallbackObservedInCode": "fallbackPendingGuidesToQueue / guide.noToolBoundary",
+        "liveNativeGenerationTested": false
+      },
+      "probeStartedAt": null
+    },
+    {
+      "runtime": "TRAE CLI CN",
+      "version": null,
+      "evidenceLevel": "repository_evidence_only",
+      "conclusion": "not_verified_for_steering",
+      "observations": {
+        "currentRovaiTransport": "ACP acp serve",
+        "priorResumeEvidenceDate": "2026-10-12",
+        "priorVersionNotRemeasured": "0.120.52",
+        "liveSteeringTested": false
+      },
+      "probeStartedAt": null
+    },
+    {
+      "runtime": "Antigravity",
+      "version": "1.3.3",
+      "evidenceLevel": "current_adapter_and_version_only",
+      "conclusion": "input_channel_extension_requires_investigation",
+      "observations": {
+        "version": "1.3.3",
+        "currentAdapter": "writes initial Stream JSON then shuts stdin",
+        "liveSteeringTested": false
+      },
+      "probeStartedAt": null
+    }
+  ],
+  "storageFindings": {
+    "existingMessageFacts": "CampMessage owns body, author and sequence; per-target camp_message_delivery already owns id, message_id, queue_sequence and claimed_agent_run_id.",
+    "frozenInitialInput": "Do not mutate the existing initial AgentRunInput/ContextManifest.",
+    "runtimeInputConstraint": "Existing runtime_input_delivery uses UNIQUE(agent_run_id,execution_epoch) and unique native binding/input identity; do not naively insert each steer as another initial input using the same native Turn ID.",
+    "minimalDirection": "Reuse ordinary message and Delivery identities. Extend only routing/execution association and necessary input acceptance outcome. Avoid a second RunSupplement aggregate and duplicate payload/proof digests.",
+    "historyBoundary": "Keep initial accepted-public boundary semantics separate from per-message steer acceptance; a newer accepted supplement must not skip older waiting delivery."
+  },
+  "officialReferences": [
+    "https://learn.chatgpt.com/docs/app-server",
+    "https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode",
+    "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc-commands.md",
+    "https://agentclientprotocol.com/protocol/v1/prompt-turn"
+  ],
+  "currentCodeReferences": [
+    "crates/rovai-core/src/delivery_queue.rs:110",
+    "crates/rovai-core/src/delivery_queue.rs:1151",
+    "crates/rovai-core/src/context.rs:2531",
+    "crates/rovai-core/src/db.rs:14989",
+    "crates/rovai-core/src/claude_control.rs:142",
+    "crates/rovai-core/src/codex.rs:1040",
+    "crates/rovai-core/src/pi/host.rs:1428",
+    "crates/rovai-core/src/antigravity.rs:648",
+    "crates/rovai-core/src/zcode/transport.rs:773",
+    "docs/contracts/input-snapshot-storage-v1.md:15"
+  ]
+}

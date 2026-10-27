@@ -1,0 +1,8930 @@
+use std::{fmt, sync::OnceLock};
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::{
+    agent_profile::AdapterKind,
+    automation::{
+        AUTOMATION_CLOSE_TOOL_NAME, AUTOMATION_CREATE_TOOL_NAME, AUTOMATION_DELETE_TOOL_NAME,
+        AUTOMATION_GET_TOOL_NAME, AUTOMATION_LIST_TOOL_NAME, AUTOMATION_RUN_TOOL_NAME,
+        AUTOMATION_UPDATE_TOOL_NAME,
+    },
+    camp_attachment::MAX_PREPARED_ATTACHMENTS,
+    camp_history::{
+        CAMP_LIST_TOOL_NAME, CAMP_READ_TOOL_NAME, CAMP_SEARCH_TOOL_NAME, HISTORY_SEARCH_TOOL_NAME,
+    },
+    camp_message_send_teaching::{
+        CAMP_MESSAGE_SEND_PUBLIC_ONLY_SCHEMA_DESCRIPTION,
+        CAMP_MESSAGE_SEND_TO_PRINCIPAL_SCHEMA_DESCRIPTION,
+    },
+    channel::ChannelService,
+    collaboration::{
+        CollaborationService, CreateTaskCommand, TaskAssigneeFilter, TaskAssigneeUpdate,
+        TaskDetail, TaskListPage, TaskListQuery, TaskStatus, UpdateTaskCommand,
+        append_domain_event,
+    },
+    command::{
+        ActorRef, CommandEnvelope, CommandExecution, CommandHandlerResult, DomainCommand,
+        DomainCommandGateway, canonical_json_digest, sealed,
+    },
+    db::Database,
+    execution_budget::{PRODUCT_MAX_ACCEPTED_A2A, camp_turn_execution_budget_now},
+    local_attachment_source::LocalAttachmentSourceRef,
+    member_studio::MEMBER_CREATE_TOOL_NAME,
+    member_tool::{MEMBER_GET_TOOL_NAME, MEMBER_LIST_TOOL_NAME, MEMBER_UPDATE_TOOL_NAME},
+    message_delivery::{
+        AgentAddressingMode, CAMP_MESSAGE_SEND_MAX_BODY_BYTES, CAMP_MESSAGE_SEND_TOOL_NAME,
+        SendQueuedAgentMessage, persist_queued_agent_message,
+    },
+    runtime::AgentRunWorkspace,
+    single_chat::SINGLE_CHAT_HISTORY_TOOL_NAME,
+};
+
+pub const TASK_CREATE_DESCRIPTION: &str = "Create an independently owned task that persists across runs or handoffs.\nPrefer existing tasks; do not create tasks for one-off collaboration or local steps.\nUser/Default Lead only. Put scope and requirements in description.\nDoes not notify or start work; use rovai send --to <assignee>.";
+
+pub const TEAM_CREATE_TASK_TOOL_NAME: &str = "team.create_task";
+pub const TEAM_GET_TASK_TOOL_NAME: &str = "team.get_task";
+pub const TEAM_UPDATE_TASK_TOOL_NAME: &str = "team.update_task";
+pub const TEAM_LIST_TASKS_TOOL_NAME: &str = "team.list_tasks";
+pub const TEAM_TOOL_NAMES: [&str; 30] = [
+    "mission.list",
+    "mission.get",
+    "mission.update",
+    "mission.status",
+    AUTOMATION_LIST_TOOL_NAME,
+    AUTOMATION_GET_TOOL_NAME,
+    AUTOMATION_CREATE_TOOL_NAME,
+    AUTOMATION_RUN_TOOL_NAME,
+    AUTOMATION_CLOSE_TOOL_NAME,
+    AUTOMATION_UPDATE_TOOL_NAME,
+    AUTOMATION_DELETE_TOOL_NAME,
+    CAMP_MESSAGE_SEND_TOOL_NAME,
+    MEMBER_LIST_TOOL_NAME,
+    MEMBER_GET_TOOL_NAME,
+    MEMBER_UPDATE_TOOL_NAME,
+    MEMBER_CREATE_TOOL_NAME,
+    TEAM_CREATE_TASK_TOOL_NAME,
+    TEAM_GET_TASK_TOOL_NAME,
+    TEAM_UPDATE_TASK_TOOL_NAME,
+    TEAM_LIST_TASKS_TOOL_NAME,
+    CAMP_LIST_TOOL_NAME,
+    CAMP_SEARCH_TOOL_NAME,
+    HISTORY_SEARCH_TOOL_NAME,
+    CAMP_READ_TOOL_NAME,
+    crate::thread_runs::THREAD_RUNS_TOOL_NAME,
+    SINGLE_CHAT_HISTORY_TOOL_NAME,
+    "memory.view",
+    "memory.search",
+    "memory.read",
+    "memory.write",
+];
+pub const MAX_A2A_DEPTH: i64 = 5;
+pub const MAX_A2A_RUNS_PER_TURN: i64 = PRODUCT_MAX_ACCEPTED_A2A;
+pub const A2A_DEPTH_WARNING_AT: i64 = 2;
+pub const A2A_RUN_WARNING_AT: i64 = 12;
+
+static TEAM_TOOL_PROCESS_SECRET: OnceLock<String> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadMessageSendInput {
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub mention_user: bool,
+    #[serde(default)]
+    pub public_only: bool,
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamCreateTaskInput {
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub assignee_agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamGetTaskInput {
+    pub task_id: String,
+}
+
+fn deserialize_non_null_optional_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamUpdateTaskInput {
+    pub task_id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<TaskStatus>,
+    #[serde(default, deserialize_with = "deserialize_non_null_optional_string")]
+    pub assignee_agent_id: Option<String>,
+    #[serde(default)]
+    pub clear_assignee: bool,
+    pub blocked_reason: Option<String>,
+    pub completion_summary: Option<String>,
+    pub cancel_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamListTasksInput {
+    pub statuses: Option<Vec<TaskStatus>>,
+    #[serde(default, deserialize_with = "deserialize_non_null_optional_string")]
+    pub assignee_agent_id: Option<String>,
+    #[serde(default)]
+    pub unassigned_only: bool,
+    #[serde(default)]
+    pub limit: usize,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessageSendCommand {
+    native_binding_id: String,
+    credential_digest: String,
+    runtime_tool_call_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
+    camp_id: String,
+    body: String,
+    to: Vec<String>,
+    mention_user: bool,
+    agent_addressing_mode: AgentAddressingMode,
+    task_id: Option<String>,
+    files: Vec<String>,
+}
+
+impl sealed::Sealed for ThreadMessageSendCommand {}
+impl DomainCommand for ThreadMessageSendCommand {
+    const TYPE: &'static str = CAMP_MESSAGE_SEND_TOOL_NAME;
+}
+
+/// The raw credential is deliberately separate from the durable domain command.
+/// Command records contain only its digest, so the credential never reaches SQLite.
+pub struct ThreadMessageSendInvocation {
+    pub native_binding_id: String,
+    pub binding_credential: String,
+    pub runtime_tool_call_id: String,
+    pub input: ThreadMessageSendInput,
+    pub source_files: Vec<LocalAttachmentSourceRef>,
+}
+
+pub struct TeamTaskToolInvocation<T> {
+    pub native_binding_id: String,
+    pub binding_credential: String,
+    pub runtime_tool_call_id: String,
+    pub input: T,
+}
+
+#[derive(Clone)]
+pub struct BuiltinToolBindingCredential {
+    pub native_binding_id: String,
+    pub native_binding_generation: i64,
+    pub binding_credential: String,
+    pub conversation_version: i64,
+    pub adapter_installation_id: String,
+    pub native_session_id: Option<String>,
+    pub binding_compatibility_digest: Option<String>,
+    pub binding_replaced: bool,
+    pub previous_adapter_installation_id: Option<String>,
+    pub previous_native_session_id: Option<String>,
+    pub previous_binding_compatibility_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamToolInvocationError {
+    pub code: String,
+    pub message: String,
+}
+
+impl fmt::Display for TeamToolInvocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for TeamToolInvocationError {}
+
+#[derive(Debug, Default)]
+pub struct TeamToolService {
+    gateway: DomainCommandGateway,
+}
+
+#[derive(Debug, Clone)]
+struct SenderIdentity {
+    camp_id: String,
+    agent_id: String,
+    agent_run_id: String,
+    execution_epoch: i64,
+    credential_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedTeamCommandIdentity {
+    camp_id: String,
+    agent_id: String,
+    source_agent_run_id: String,
+    execution_epoch: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedTeamToolRun {
+    pub camp_id: String,
+    pub agent_id: String,
+    pub agent_run_id: String,
+    pub execution_epoch: i64,
+}
+
+impl TeamToolService {
+    pub fn authenticate_binding(
+        &self,
+        database: &Database,
+        native_binding_id: &str,
+        binding_credential: &str,
+        runtime_tool_call_id: &str,
+    ) -> Result<AuthenticatedTeamToolRun> {
+        validate_invocation_identity(native_binding_id, binding_credential, runtime_tool_call_id)?;
+        let identity = resolve_sender_identity(
+            database.connection(),
+            native_binding_id,
+            &credential_digest(binding_credential),
+            None,
+        )?;
+        Ok(AuthenticatedTeamToolRun {
+            camp_id: identity.camp_id,
+            agent_id: identity.agent_id,
+            agent_run_id: identity.agent_run_id,
+            execution_epoch: identity.execution_epoch,
+        })
+    }
+
+    pub fn authenticate_read_binding(
+        &self,
+        database: &Database,
+        native_binding_id: &str,
+        binding_credential: &str,
+        runtime_tool_call_id: &str,
+    ) -> Result<AuthenticatedTeamToolRun> {
+        self.authenticate_read_binding_on_connection(
+            database.connection(),
+            native_binding_id,
+            binding_credential,
+            runtime_tool_call_id,
+        )
+    }
+
+    pub(crate) fn authenticate_read_binding_on_connection(
+        &self,
+        connection: &Connection,
+        native_binding_id: &str,
+        binding_credential: &str,
+        runtime_tool_call_id: &str,
+    ) -> Result<AuthenticatedTeamToolRun> {
+        validate_invocation_identity(native_binding_id, binding_credential, runtime_tool_call_id)?;
+        let identity = resolve_sender_identity(
+            connection,
+            native_binding_id,
+            &credential_digest(binding_credential),
+            None,
+        )?;
+        Ok(AuthenticatedTeamToolRun {
+            camp_id: identity.camp_id,
+            agent_id: identity.agent_id,
+            agent_run_id: identity.agent_run_id,
+            execution_epoch: identity.execution_epoch,
+        })
+    }
+
+    pub fn authenticate_attested_binding(
+        &self,
+        database: &Database,
+        native_binding_id: &str,
+        binding_credential: &str,
+        runtime_tool_call_id: &str,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<AuthenticatedTeamToolRun> {
+        self.authenticate_attested_binding_on_connection(
+            database.connection(),
+            native_binding_id,
+            binding_credential,
+            runtime_tool_call_id,
+            agent_run_id,
+            execution_epoch,
+        )
+    }
+
+    pub(crate) fn authenticate_attested_binding_on_connection(
+        &self,
+        connection: &Connection,
+        native_binding_id: &str,
+        binding_credential: &str,
+        runtime_tool_call_id: &str,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<AuthenticatedTeamToolRun> {
+        if agent_run_id.trim().is_empty() || execution_epoch <= 0 {
+            return Err(invocation_error(
+                "team_tool.invalid_attested_run",
+                "Attested AgentRun identity is incomplete",
+            ));
+        }
+        validate_invocation_identity(native_binding_id, binding_credential, runtime_tool_call_id)?;
+        let identity = resolve_sender_identity(
+            connection,
+            native_binding_id,
+            &credential_digest(binding_credential),
+            Some((agent_run_id, execution_epoch)),
+        )?;
+        Ok(AuthenticatedTeamToolRun {
+            camp_id: identity.camp_id,
+            agent_id: identity.agent_id,
+            agent_run_id: identity.agent_run_id,
+            execution_epoch: identity.execution_epoch,
+        })
+    }
+
+    pub fn authenticate_public_message_binding_or_recorded_scope(
+        &self,
+        database: &Database,
+        native_binding_id: &str,
+        binding_credential: &str,
+        provider_tool_call_id: &str,
+        attested_run: Option<(&str, i64)>,
+    ) -> Result<AuthenticatedTeamToolRun> {
+        let active = match attested_run {
+            Some((agent_run_id, execution_epoch)) => self.authenticate_attested_binding(
+                database,
+                native_binding_id,
+                binding_credential,
+                provider_tool_call_id,
+                agent_run_id,
+                execution_epoch,
+            ),
+            None => self.authenticate_read_binding(
+                database,
+                native_binding_id,
+                binding_credential,
+                provider_tool_call_id,
+            ),
+        };
+        match active {
+            Ok(active) => Ok(active),
+            Err(error)
+                if !matches!(
+                    error.downcast_ref::<TeamToolInvocationError>(),
+                    Some(TeamToolInvocationError { code, .. })
+                        if code == "team_tool.binding_fenced"
+                ) =>
+            {
+                Err(error)
+            }
+            Err(active_fence) => {
+                validate_invocation_identity(
+                    native_binding_id,
+                    binding_credential,
+                    provider_tool_call_id,
+                )?;
+                let supplied_credential_digest = credential_digest(binding_credential);
+                let mut statement = database.connection().prepare(
+                    r#"
+                    SELECT COALESCE(agent_run.camp_id, camp_turn.camp_id), conversation.agent_id,
+                           agent_run.id, agent_run.execution_epoch
+                    FROM conversation
+                    JOIN agent_run ON agent_run.conversation_id = conversation.id
+                    LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                    WHERE conversation.native_binding_id = ?1
+                      AND conversation.native_binding_secret_digest = ?2
+                      AND (?3 IS NULL OR (agent_run.id = ?3 AND agent_run.execution_epoch = ?4))
+                    ORDER BY agent_run.created_at DESC, agent_run.id
+                    "#,
+                )?;
+                let candidates = statement
+                    .query_map(
+                        params![
+                            native_binding_id,
+                            supplied_credential_digest,
+                            attested_run.map(|value| value.0),
+                            attested_run.map(|value| value.1),
+                        ],
+                        |row| {
+                            Ok(AuthenticatedTeamToolRun {
+                                camp_id: row.get(0)?,
+                                agent_id: row.get(1)?,
+                                agent_run_id: row.get(2)?,
+                                execution_epoch: row.get(3)?,
+                            })
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                for candidate in candidates {
+                    let scoped_tool_call_id = format!(
+                        "agent-run:{}:{}",
+                        candidate.agent_run_id, provider_tool_call_id
+                    );
+                    let command_id = team_command_id(
+                        native_binding_id,
+                        &supplied_credential_digest,
+                        &scoped_tool_call_id,
+                    )?;
+                    let recorded =
+                        load_recorded_team_command_identity(database.connection(), &command_id)?;
+                    if recorded.as_ref().is_some_and(|recorded| {
+                        recorded.camp_id == candidate.camp_id
+                            && recorded.agent_id == candidate.agent_id
+                            && recorded.source_agent_run_id == candidate.agent_run_id
+                            && recorded.execution_epoch == candidate.execution_epoch
+                    }) {
+                        return Ok(candidate);
+                    }
+                }
+                Err(active_fence)
+            }
+        }
+    }
+
+    pub fn binding_command_id(
+        &self,
+        native_binding_id: &str,
+        binding_credential: &str,
+        runtime_tool_call_id: &str,
+    ) -> Result<String> {
+        validate_invocation_identity(native_binding_id, binding_credential, runtime_tool_call_id)?;
+        team_command_id(
+            native_binding_id,
+            &credential_digest(binding_credential),
+            runtime_tool_call_id,
+        )
+    }
+
+    pub fn recorded_binding_command_exists(
+        &self,
+        database: &Database,
+        command_id: &str,
+    ) -> Result<bool> {
+        database
+            .connection()
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM event_log
+                    WHERE event_type = 'command.result' AND command_id = ?1
+                )
+                "#,
+                [command_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn agent_file_ingress_scope(
+        &self,
+        database: &Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<Option<(String, AgentRunWorkspace)>> {
+        let row = database
+            .connection()
+            .query_row(
+                r#"
+                SELECT COALESCE(run.camp_id, turn.camp_id), run.workspace_json
+                FROM agent_run AS run
+                LEFT JOIN camp_turn AS turn ON turn.id = run.camp_turn_id
+                WHERE run.id = ?1 AND run.execution_epoch = ?2
+                  AND run.status IN ('running','waiting')
+                "#,
+                params![agent_run_id, execution_epoch],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        row.map(|(camp_id, workspace_json)| {
+            let workspace_json = workspace_json.context("AgentRun workspace is unavailable")?;
+            let workspace = serde_json::from_str::<AgentRunWorkspace>(&workspace_json)
+                .context("AgentRun workspace is invalid")?;
+            workspace.validate()?;
+            Ok((camp_id, workspace))
+        })
+        .transpose()
+    }
+
+    pub fn camp_message_send_input_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "body": {
+                    "type": "string",
+                    "default": "",
+                    "maxLength": CAMP_MESSAGE_SEND_MAX_BODY_BYTES,
+                    "description": "Optional exact public message body; omit it when at least one file supplies the complete payload."
+                },
+                "to": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "uniqueItems": true,
+                    "items": {"type": "string", "minLength": 1},
+                    "description": "Optional canonical Agent ID to wake; repeat for multiple recipients. Display names are not accepted here. Input order is presentation metadata, never scheduling priority."
+                },
+                "mentionUser": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": CAMP_MESSAGE_SEND_TO_PRINCIPAL_SCHEMA_DESCRIPTION
+                },
+                "publicOnly": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": CAMP_MESSAGE_SEND_PUBLIC_ONLY_SCHEMA_DESCRIPTION
+                },
+                "files": {
+                    "type": "array",
+                    "default": [],
+                    "maxItems": MAX_PREPARED_ATTACHMENTS,
+                    "uniqueItems": true,
+                    "items": {"type": "string", "minLength": 1},
+                    "description": "Optional local file or directory paths to attach, in order. Pass each actual path directly. Rovai registers a reference without copying, moving, linking or changing permissions. Later reads use the current file at that path. Temporary files may become unavailable when their source is cleaned up."
+                }
+            }
+        })
+    }
+
+    pub fn create_task_input_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "description": TASK_CREATE_DESCRIPTION,
+            "required": ["title", "assigneeAgentId"],
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160,
+                    "description": "Short title for one independently owned durable responsibility."
+                },
+                "description": {
+                    "type": "string",
+                    "maxLength": 16000,
+                    "description": "Task scope and requirements."
+                },
+                "assigneeAgentId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Required Current ThreadMember who owns the responsibility. Creation does not notify, wake, or start this Assignee."
+                }
+            }
+        })
+    }
+
+    pub fn get_task_input_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["taskId"],
+            "properties": {
+                "taskId": {"type": "string", "minLength": 1}
+            }
+        })
+    }
+
+    pub fn update_task_input_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Update explicit fields of a non-terminal task.\nUser/Default Lead may edit task content, assignment and status.\nOther assignees may update only their own status and matching blockedReason or completionSummary.\nDoes not notify or start work.",
+            "required": ["taskId"],
+            "properties": {
+                "taskId": {"type": "string", "minLength": 1},
+                "title": {"type": "string", "minLength": 1, "maxLength": 160},
+                "description": {
+                    "type": "string",
+                    "maxLength": 16000,
+                    "description": "Task scope and requirements."
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"]
+                },
+                "assigneeAgentId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Set an active Thread member, or omit to leave unchanged."
+                },
+                "clearAssignee": {
+                    "type": "boolean",
+                    "description": "User/Default Lead only. Set true with final status pending to place the Task in the unassigned holding/recovery state. Must not be combined with assigneeAgentId."
+                },
+                "blockedReason": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "completionSummary": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "cancelReason": {"type": "string", "minLength": 1, "maxLength": 4000}
+            }
+        })
+    }
+
+    pub fn list_tasks_input_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "statuses": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 5,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"]
+                    }
+                },
+                "assigneeAgentId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Filter by one Agent, or omit for every visible assignee."
+                },
+                "unassignedOnly": {
+                    "type": "boolean",
+                    "description": "Set true to return only Tasks in the unassigned holding/recovery state. Must not be combined with assigneeAgentId."
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": "string", "minLength": 1}
+            }
+        })
+    }
+
+    /// Reserves or reuses the Native Binding and derives its private Core
+    /// credential for this Rovai-ai process. The credential is stable for the
+    /// lifetime of a compatible Native Binding and changes when that Binding is
+    /// replaced or after Rovai-ai restarts. A newly reserved Binding is
+    /// deliberately unusable until the Adapter attaches a concrete Native
+    /// Session through `BindNativeSessionCommand`.
+    pub fn prepare_binding_credential(
+        &self,
+        database: &mut Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        force_new_binding: bool,
+    ) -> Result<BuiltinToolBindingCredential> {
+        self.prepare_binding(
+            database,
+            agent_run_id,
+            execution_epoch,
+            force_new_binding,
+            false,
+        )
+    }
+
+    /// Retains the current Native Binding while an Adapter performs the one
+    /// controlled continuation allowed across an unverified-to-verified
+    /// session compatibility transition. The successful bind updates the
+    /// compatibility metadata atomically; a failed continuation must replace
+    /// the Binding through `prepare_binding_credential(..., true)`.
+    pub fn prepare_controlled_resume_binding_credential(
+        &self,
+        database: &mut Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<BuiltinToolBindingCredential> {
+        self.prepare_binding(database, agent_run_id, execution_epoch, false, true)
+    }
+
+    fn prepare_binding(
+        &self,
+        database: &mut Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        force_new_binding: bool,
+        _allow_controlled_session_transition: bool,
+    ) -> Result<BuiltinToolBindingCredential> {
+        if agent_run_id.trim().is_empty() || execution_epoch <= 0 {
+            return Err(invocation_error(
+                "team_tool.invalid_binding_request",
+                "AgentRun ID and execution epoch are required",
+            ));
+        }
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if force_new_binding
+            && !crate::run_continuation::can_replace_session_before_dispatch(
+                &transaction,
+                agent_run_id,
+                execution_epoch,
+            )?
+        {
+            return Err(invocation_error(
+                "team_tool.binding_fenced",
+                "Replacement requires a current execution with no dispatched input",
+            ));
+        }
+        let now = camp_turn_execution_budget_now().to_rfc3339();
+        let binding = transaction
+            .query_row(
+                r#"
+                SELECT conversation.camp_id, conversation.id,
+                       conversation.native_binding_id,
+                       conversation.native_binding_generation,
+                       conversation.native_adapter_installation_id,
+                       conversation.native_session_id,
+                       conversation.native_binding_compatibility_digest,
+                       conversation.native_installation_generation,
+                       conversation.native_session_compatibility_key,
+                       conversation.version,
+                       agent_run.runtime_adapter_kind,
+                       agent_run.runtime_capabilities_json,
+                       agent_run.runtime_installation_id,
+                       agent_run.runtime_binding_compatibility_digest,
+                       agent_run.runtime_installation_generation,
+                       agent_run.runtime_native_session_compatibility_key
+                FROM agent_run
+                LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+                JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
+                JOIN conversation ON conversation.id = agent_run.conversation_id
+                JOIN camp_member
+                  ON camp_member.camp_id = camp.id
+                 AND camp_member.agent_id = conversation.agent_id
+                JOIN agent_profile ON agent_profile.id = conversation.agent_id
+                WHERE agent_run.id = ?1
+                  AND agent_run.execution_epoch = ?2
+                  AND agent_run.status = 'running'
+                  AND agent_run.cancel_requested_at IS NULL
+                  AND (
+                        agent_run.camp_turn_id IS NULL
+                     OR (
+                            camp_turn.status IN ('running', 'waiting')
+                        AND camp_turn.cancel_requested_at IS NULL
+                        AND camp_turn.execution_budget_exhausted_at IS NULL
+                        AND (camp_turn.execution_budget_deadline_at > ?3
+                             OR (camp_turn.execution_budget_deadline_at IS NULL
+                                 AND camp_turn.execution_budget_schema_version = 2))
+                     )
+                  )
+                  AND camp_member.status = 'active'
+                  AND camp_member.leave_requested_at IS NULL
+                  AND camp_member.version = CAST(
+                      json_extract(agent_run.effective_config_json, '$.campMemberVersion')
+                      AS INTEGER
+                  )
+                "#,
+                params![agent_run_id, execution_epoch, now],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            camp_id,
+            conversation_id,
+            current_binding_id,
+            current_generation,
+            _current_installation_id,
+            current_native_session_id,
+            _current_compatibility_digest,
+            _current_installation_generation,
+            _current_session_compatibility_key,
+            conversation_version,
+            adapter_kind,
+            _capabilities,
+            frozen_installation_id,
+            frozen_compatibility_digest,
+            frozen_installation_generation,
+            frozen_session_compatibility_key,
+        )) = binding
+        else {
+            return Err(invocation_error(
+                "team_tool.binding_unavailable",
+                "AgentRun is not current and active",
+            ));
+        };
+        ensure_runtime_is_frozen(adapter_kind.as_deref())?;
+        let frozen_installation_id = frozen_installation_id
+            .context("Team Tool AgentRun has no frozen Runtime installation")?;
+        anyhow::ensure!(
+            matches!(
+                adapter_kind.as_deref(),
+                Some("command-code-cli" | "hermes-cli")
+            ) || frozen_compatibility_digest.is_some(),
+            "Team Tool AgentRun has no frozen Native Binding compatibility digest"
+        );
+        let frozen_installation_generation = frozen_installation_generation
+            .context("Team Tool AgentRun has no frozen installation generation")?;
+
+        let current_kind =
+            crate::runtime::native_session_adapter_kind(&transaction, &conversation_id)?;
+        let compatible_binding = current_binding_id.is_some()
+            && current_generation >= 1
+            && current_kind.is_none_or(|kind| Some(kind.as_str()) == adapter_kind.as_deref());
+        let binding_replaced = force_new_binding || !compatible_binding;
+        let binding_id = if binding_replaced {
+            Uuid::new_v4().to_string()
+        } else {
+            current_binding_id.context("compatible Native Binding has no identity")?
+        };
+        let generation = if binding_replaced {
+            current_generation
+                .checked_add(1)
+                .context("Native Binding generation overflow")?
+                .max(1)
+        } else {
+            current_generation
+        };
+        let native_session_id = (!binding_replaced)
+            .then_some(current_native_session_id)
+            .flatten();
+        let credential = binding_credential(&binding_id, generation);
+        let digest = credential_digest(&credential);
+        let current_secret_digest = transaction.query_row(
+            "SELECT native_binding_secret_digest FROM conversation WHERE id = ?1",
+            [&conversation_id],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        let credential_changed = current_secret_digest.as_deref() != Some(digest.as_str());
+        let now = chrono::Utc::now().to_rfc3339();
+        let updated = if binding_replaced {
+            transaction.execute(
+                r#"
+                UPDATE conversation
+                SET native_adapter_installation_id = CASE WHEN native_session_id IS NULL THEN ?2 ELSE native_adapter_installation_id END,
+                    native_session_id = native_session_id,
+                    native_binding_compatibility_digest = CASE WHEN native_session_id IS NULL THEN ?3 ELSE native_binding_compatibility_digest END,
+                    native_installation_generation = CASE WHEN native_session_id IS NULL THEN ?11 ELSE native_installation_generation END,
+                    native_session_compatibility_key = CASE WHEN native_session_id IS NULL THEN ?12 ELSE native_session_compatibility_key END,
+                    native_binding_id = ?4,
+                    native_binding_generation = ?5,
+                    native_binding_secret_digest = ?6,
+                    last_accepted_public_boundary_sequence = CASE
+                        WHEN kind = 'single_chat' THEN 0
+                        ELSE last_accepted_public_boundary_sequence
+                    END,
+                    native_charter_digest = NULL,
+                    native_collaboration_state_digest = NULL,
+                    version = version + 1,
+                    updated_at = ?7
+                WHERE id = ?1 AND version = ?8
+                  AND EXISTS (
+                      SELECT 1 FROM agent_run
+                      WHERE agent_run.id = ?9
+                        AND agent_run.conversation_id = conversation.id
+                        AND agent_run.execution_epoch = ?10
+                        AND agent_run.status = 'running'
+                        AND agent_run.cancel_requested_at IS NULL
+                  )
+                "#,
+                params![
+                    conversation_id,
+                    frozen_installation_id,
+                    frozen_compatibility_digest,
+                    binding_id,
+                    generation,
+                    digest,
+                    now,
+                    conversation_version,
+                    agent_run_id,
+                    execution_epoch,
+                    frozen_installation_generation,
+                    frozen_session_compatibility_key,
+                ],
+            )?
+        } else if credential_changed {
+            transaction.execute(
+                r#"
+                UPDATE conversation
+                SET native_binding_secret_digest = ?2,
+                    version = version + 1,
+                    updated_at = ?3
+                WHERE id = ?1 AND version = ?4
+                  AND native_binding_id = ?5
+                  AND native_binding_generation = ?6
+                  AND EXISTS (
+                      SELECT 1 FROM agent_run
+                      WHERE agent_run.id = ?7
+                        AND agent_run.conversation_id = conversation.id
+                        AND agent_run.execution_epoch = ?8
+                        AND agent_run.status = 'running'
+                        AND agent_run.cancel_requested_at IS NULL
+                  )
+                "#,
+                params![
+                    conversation_id,
+                    digest,
+                    now,
+                    conversation_version,
+                    binding_id,
+                    generation,
+                    agent_run_id,
+                    execution_epoch,
+                ],
+            )?
+        } else {
+            1
+        };
+        if updated != 1 {
+            return Err(invocation_error(
+                "team_tool.binding_fenced",
+                "Native Binding changed while its Team Tool credential was prepared",
+            ));
+        }
+        if binding_replaced || credential_changed {
+            append_domain_event(
+                &transaction,
+                if binding_replaced {
+                    "builtin_tool.binding_credential_issued"
+                } else {
+                    "builtin_tool.binding_credential_refreshed"
+                },
+                Some(&camp_id),
+                Some(("conversation", &conversation_id)),
+                &ActorRef::System {
+                    component_id: "builtin-tool-credential-issuer".to_string(),
+                },
+                None,
+                &json!({
+                    "agentRunId": agent_run_id,
+                    "executionEpoch": execution_epoch,
+                    "nativeBindingId": binding_id,
+                    "nativeBindingGeneration": generation,
+                    "bindingReplaced": binding_replaced,
+                    "credentialDigest": digest,
+                }),
+            )?;
+        }
+        // Reserve tool credentials without replacing the durable restore target.
+        // The Adapter commits that target only after native activation succeeds.
+        let previous = transaction.query_row(
+            "SELECT native_adapter_installation_id, native_session_id, native_binding_compatibility_digest FROM conversation WHERE id=?1",
+            [&conversation_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        transaction.commit()?;
+        Ok(BuiltinToolBindingCredential {
+            native_binding_id: binding_id,
+            native_binding_generation: generation,
+            binding_credential: credential,
+            conversation_version: if binding_replaced || credential_changed {
+                conversation_version + 1
+            } else {
+                conversation_version
+            },
+            adapter_installation_id: frozen_installation_id,
+            native_session_id,
+            binding_compatibility_digest: frozen_compatibility_digest,
+            binding_replaced,
+            previous_adapter_installation_id: previous.0,
+            previous_native_session_id: previous.1,
+            previous_binding_compatibility_digest: previous.2,
+        })
+    }
+
+    /// Returns the stable credential for the current Native Binding.
+    /// Adapter launchers use `prepare_binding_credential` directly when a
+    /// failed Resume must reserve a replacement Binding before starting
+    /// another Native Session.
+    pub fn issue_binding_credential(
+        &self,
+        database: &mut Database,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<BuiltinToolBindingCredential> {
+        self.prepare_binding_credential(database, agent_run_id, execution_epoch, false)
+    }
+
+    pub fn send_public_message(
+        &self,
+        database: &mut Database,
+        invocation: &ThreadMessageSendInvocation,
+    ) -> Result<CommandExecution> {
+        self.send_public_message_authorized(database, invocation, None)
+    }
+
+    pub fn send_public_message_attested(
+        &self,
+        database: &mut Database,
+        invocation: &ThreadMessageSendInvocation,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<CommandExecution> {
+        if agent_run_id.trim().is_empty() || execution_epoch <= 0 {
+            return Err(invocation_error(
+                "team_tool.invalid_attested_run",
+                "Attested AgentRun identity is incomplete",
+            ));
+        }
+        self.send_public_message_authorized(
+            database,
+            invocation,
+            Some((agent_run_id, execution_epoch)),
+        )
+    }
+
+    fn send_public_message_authorized(
+        &self,
+        database: &mut Database,
+        invocation: &ThreadMessageSendInvocation,
+        attested_run: Option<(&str, i64)>,
+    ) -> Result<CommandExecution> {
+        validate_public_send_invocation(invocation)?;
+        let supplied_credential_digest = credential_digest(&invocation.binding_credential);
+        let command_id = team_command_id(
+            &invocation.native_binding_id,
+            &supplied_credential_digest,
+            &invocation.runtime_tool_call_id,
+        )?;
+        if let Some(recorded) =
+            load_recorded_team_command_identity(database.connection(), &command_id)?
+        {
+            if attested_run.is_some_and(|(agent_run_id, execution_epoch)| {
+                recorded.source_agent_run_id != agent_run_id
+                    || recorded.execution_epoch != execution_epoch
+            }) {
+                return Err(invocation_error(
+                    "team_tool.binding_fenced",
+                    "Recorded public send belongs to a different attested AgentRun",
+                ));
+            }
+            let command = ThreadMessageSendCommand {
+                native_binding_id: invocation.native_binding_id.clone(),
+                credential_digest: supplied_credential_digest.clone(),
+                runtime_tool_call_id: invocation.runtime_tool_call_id.clone(),
+                camp_id: recorded.camp_id.clone(),
+                body: invocation.input.body.clone(),
+                to: invocation.input.to.clone(),
+                mention_user: invocation.input.mention_user,
+                agent_addressing_mode: AgentAddressingMode::from_public_only(
+                    invocation.input.public_only,
+                ),
+                task_id: invocation.input.task_id.clone(),
+                files: invocation.input.files.clone(),
+            };
+            let replay_envelope = CommandEnvelope {
+                command_id: command_id.clone(),
+                actor: ActorRef::Agent {
+                    agent_id: recorded.agent_id,
+                    source_agent_run_id: recorded.source_agent_run_id,
+                },
+                camp_id: Some(recorded.camp_id),
+                expected_versions: Vec::new(),
+                execution_epoch: Some(recorded.execution_epoch),
+                payload: command.clone(),
+            };
+            return self
+                .gateway
+                .replay_if_recorded(database, &replay_envelope)?
+                .context("recorded public send disappeared before replay");
+        }
+        if invocation.input.files.len() != invocation.source_files.len() {
+            return Err(invocation_error(
+                "message.invalid_input",
+                "Every requested file must have one source path reference",
+            ));
+        }
+
+        let sender = resolve_sender_identity(
+            database.connection(),
+            &invocation.native_binding_id,
+            &supplied_credential_digest,
+            attested_run,
+        )?;
+        ChannelService::default().ensure_topic_roster_members(
+            database,
+            &sender.camp_id,
+            &invocation.input.to,
+            &command_id,
+        )?;
+        let command = ThreadMessageSendCommand {
+            native_binding_id: invocation.native_binding_id.clone(),
+            credential_digest: supplied_credential_digest.clone(),
+            runtime_tool_call_id: invocation.runtime_tool_call_id.clone(),
+            camp_id: sender.camp_id.clone(),
+            body: invocation.input.body.clone(),
+            to: invocation.input.to.clone(),
+            mention_user: invocation.input.mention_user,
+            agent_addressing_mode: AgentAddressingMode::from_public_only(
+                invocation.input.public_only,
+            ),
+            task_id: invocation.input.task_id.clone(),
+            files: invocation.input.files.clone(),
+        };
+        let envelope = CommandEnvelope {
+            command_id,
+            actor: ActorRef::Agent {
+                agent_id: sender.agent_id.clone(),
+                source_agent_run_id: sender.agent_run_id.clone(),
+            },
+            camp_id: Some(sender.camp_id.clone()),
+            expected_versions: Vec::new(),
+            execution_epoch: Some(sender.execution_epoch),
+            payload: command,
+        };
+
+        let execution = self.gateway.execute(database, &envelope, |transaction| {
+            let current = match resolve_sender_identity_by_digest(
+                transaction,
+                &envelope.payload.native_binding_id,
+                &envelope.payload.credential_digest,
+                attested_run,
+            ) {
+                Ok(current) => current,
+                Err(error) if error.downcast_ref::<TeamToolInvocationError>().is_some() => {
+                    return Ok(rejected(
+                        "team_tool.binding_fenced",
+                        "Native Binding, AgentRun, or execution epoch is no longer current",
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            if current.agent_run_id != sender.agent_run_id
+                || current.execution_epoch != sender.execution_epoch
+                || current.agent_id != sender.agent_id
+                || current.camp_id != sender.camp_id
+                || current.credential_digest != sender.credential_digest
+            {
+                return Ok(rejected(
+                    "team_tool.binding_fenced",
+                    "Native Binding changed before the public send transaction",
+                ));
+            }
+            if envelope.camp_id.as_deref() != Some(current.camp_id.as_str())
+                || envelope.payload.camp_id != current.camp_id
+            {
+                return Err(anyhow::anyhow!(
+                    "internal camp identity invariant violated for public message send"
+                ));
+            }
+            persist_queued_agent_message(
+                transaction,
+                &SendQueuedAgentMessage {
+                    command_id: &envelope.command_id,
+                    camp_id: &current.camp_id,
+                    source_agent_run_id: &current.agent_run_id,
+                    author_agent_id: &current.agent_id,
+                    execution_epoch: current.execution_epoch,
+                    body: &envelope.payload.body,
+                    explicit_recipients: &envelope.payload.to,
+                    agent_addressing_mode: envelope.payload.agent_addressing_mode,
+                    mention_user: envelope.payload.mention_user,
+                    task_id: envelope.payload.task_id.as_deref(),
+                    source_files: &invocation.source_files,
+                },
+            )
+        })?;
+        Ok(execution)
+    }
+
+    pub fn create_task(
+        &self,
+        database: &mut Database,
+        invocation: &TeamTaskToolInvocation<TeamCreateTaskInput>,
+    ) -> Result<CommandExecution> {
+        self.create_task_authorized(database, invocation, None)
+    }
+
+    pub fn create_task_attested(
+        &self,
+        database: &mut Database,
+        invocation: &TeamTaskToolInvocation<TeamCreateTaskInput>,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<CommandExecution> {
+        self.create_task_authorized(database, invocation, Some((agent_run_id, execution_epoch)))
+    }
+
+    fn create_task_authorized(
+        &self,
+        database: &mut Database,
+        invocation: &TeamTaskToolInvocation<TeamCreateTaskInput>,
+        attested_run: Option<(&str, i64)>,
+    ) -> Result<CommandExecution> {
+        validate_task_invocation_identity(invocation)?;
+        let supplied_credential_digest = credential_digest(&invocation.binding_credential);
+        let sender = resolve_sender_identity(
+            database.connection(),
+            &invocation.native_binding_id,
+            &supplied_credential_digest,
+            attested_run,
+        )?;
+        let envelope = CommandEnvelope {
+            command_id: team_command_id(
+                &invocation.native_binding_id,
+                &supplied_credential_digest,
+                &invocation.runtime_tool_call_id,
+            )?,
+            actor: ActorRef::Agent {
+                agent_id: sender.agent_id,
+                source_agent_run_id: sender.agent_run_id,
+            },
+            camp_id: Some(sender.camp_id.clone()),
+            expected_versions: Vec::new(),
+            execution_epoch: Some(sender.execution_epoch),
+            payload: CreateTaskCommand {
+                camp_id: sender.camp_id,
+                title: invocation.input.title.clone(),
+                description: invocation.input.description.clone(),
+                assignee_agent_id: invocation.input.assignee_agent_id.clone(),
+            },
+        };
+        CollaborationService::default().create_task(database, &envelope)
+    }
+
+    pub fn get_task(
+        &self,
+        database: &Database,
+        invocation: &TeamTaskToolInvocation<TeamGetTaskInput>,
+    ) -> Result<TaskDetail> {
+        self.get_task_authorized(database, invocation, None)
+    }
+
+    pub fn get_task_attested(
+        &self,
+        database: &Database,
+        invocation: &TeamTaskToolInvocation<TeamGetTaskInput>,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<TaskDetail> {
+        self.get_task_authorized(database, invocation, Some((agent_run_id, execution_epoch)))
+    }
+
+    fn get_task_authorized(
+        &self,
+        database: &Database,
+        invocation: &TeamTaskToolInvocation<TeamGetTaskInput>,
+        attested_run: Option<(&str, i64)>,
+    ) -> Result<TaskDetail> {
+        validate_task_invocation_identity(invocation)?;
+        if invocation.input.task_id.trim().is_empty() {
+            return Err(invocation_error(
+                "team_tool.invalid_input",
+                "taskId must not be empty",
+            ));
+        }
+        let supplied_credential_digest = credential_digest(&invocation.binding_credential);
+        let sender = resolve_sender_identity(
+            database.connection(),
+            &invocation.native_binding_id,
+            &supplied_credential_digest,
+            attested_run,
+        )?;
+        CollaborationService::default()
+            .get_visible_task(
+                database,
+                &sender.camp_id,
+                &invocation.input.task_id,
+                &ActorRef::Agent {
+                    agent_id: sender.agent_id,
+                    source_agent_run_id: sender.agent_run_id,
+                },
+                Some(sender.execution_epoch),
+            )?
+            .ok_or_else(|| invocation_error("task.not_found", "Task does not exist"))
+    }
+
+    pub fn update_task(
+        &self,
+        database: &mut Database,
+        invocation: &TeamTaskToolInvocation<TeamUpdateTaskInput>,
+    ) -> Result<CommandExecution> {
+        self.update_task_authorized(database, invocation, None)
+    }
+
+    pub fn update_task_attested(
+        &self,
+        database: &mut Database,
+        invocation: &TeamTaskToolInvocation<TeamUpdateTaskInput>,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<CommandExecution> {
+        self.update_task_authorized(database, invocation, Some((agent_run_id, execution_epoch)))
+    }
+
+    fn update_task_authorized(
+        &self,
+        database: &mut Database,
+        invocation: &TeamTaskToolInvocation<TeamUpdateTaskInput>,
+        attested_run: Option<(&str, i64)>,
+    ) -> Result<CommandExecution> {
+        validate_task_invocation_identity(invocation)?;
+        let supplied_credential_digest = credential_digest(&invocation.binding_credential);
+        let sender = resolve_sender_identity(
+            database.connection(),
+            &invocation.native_binding_id,
+            &supplied_credential_digest,
+            attested_run,
+        )?;
+        if invocation.input.clear_assignee && invocation.input.assignee_agent_id.is_some() {
+            return Err(invocation_error(
+                "team_tool.invalid_input",
+                "clearAssignee cannot be combined with assigneeAgentId",
+            ));
+        }
+        let assignee = match (
+            &invocation.input.assignee_agent_id,
+            invocation.input.clear_assignee,
+        ) {
+            (_, true) => TaskAssigneeUpdate::Clear,
+            (None, false) => TaskAssigneeUpdate::Unchanged,
+            (Some(agent_id), false) => TaskAssigneeUpdate::Assign {
+                agent_id: agent_id.clone(),
+            },
+        };
+        let envelope = CommandEnvelope {
+            command_id: team_command_id(
+                &invocation.native_binding_id,
+                &supplied_credential_digest,
+                &invocation.runtime_tool_call_id,
+            )?,
+            actor: ActorRef::Agent {
+                agent_id: sender.agent_id,
+                source_agent_run_id: sender.agent_run_id,
+            },
+            camp_id: Some(sender.camp_id),
+            expected_versions: Vec::new(),
+            execution_epoch: Some(sender.execution_epoch),
+            payload: UpdateTaskCommand {
+                task_id: invocation.input.task_id.clone(),
+                title: invocation.input.title.clone(),
+                description: invocation.input.description.clone(),
+                status: invocation.input.status,
+                assignee,
+                blocked_reason: invocation.input.blocked_reason.clone(),
+                completion_summary: invocation.input.completion_summary.clone(),
+                cancel_reason: invocation.input.cancel_reason.clone(),
+            },
+        };
+        CollaborationService::default().update_task(database, &envelope)
+    }
+
+    pub fn list_tasks(
+        &self,
+        database: &Database,
+        invocation: &TeamTaskToolInvocation<TeamListTasksInput>,
+    ) -> Result<TaskListPage> {
+        self.list_tasks_authorized(database, invocation, None)
+    }
+
+    pub fn list_tasks_attested(
+        &self,
+        database: &Database,
+        invocation: &TeamTaskToolInvocation<TeamListTasksInput>,
+        agent_run_id: &str,
+        execution_epoch: i64,
+    ) -> Result<TaskListPage> {
+        self.list_tasks_authorized(database, invocation, Some((agent_run_id, execution_epoch)))
+    }
+
+    fn list_tasks_authorized(
+        &self,
+        database: &Database,
+        invocation: &TeamTaskToolInvocation<TeamListTasksInput>,
+        attested_run: Option<(&str, i64)>,
+    ) -> Result<TaskListPage> {
+        validate_task_invocation_identity(invocation)?;
+        let supplied_credential_digest = credential_digest(&invocation.binding_credential);
+        let sender = resolve_sender_identity(
+            database.connection(),
+            &invocation.native_binding_id,
+            &supplied_credential_digest,
+            attested_run,
+        )?;
+        if invocation.input.unassigned_only && invocation.input.assignee_agent_id.is_some() {
+            return Err(invocation_error(
+                "team_tool.invalid_input",
+                "unassignedOnly cannot be combined with assigneeAgentId",
+            ));
+        }
+        let assignee = match (
+            &invocation.input.assignee_agent_id,
+            invocation.input.unassigned_only,
+        ) {
+            (_, true) => TaskAssigneeFilter::Unassigned,
+            (None, false) => TaskAssigneeFilter::Any,
+            (Some(agent_id), false) => TaskAssigneeFilter::Agent {
+                agent_id: agent_id.clone(),
+            },
+        };
+        CollaborationService::default().query_visible_tasks(
+            database,
+            &sender.camp_id,
+            &ActorRef::Agent {
+                agent_id: sender.agent_id,
+                source_agent_run_id: sender.agent_run_id,
+            },
+            Some(sender.execution_epoch),
+            &TaskListQuery {
+                statuses: invocation.input.statuses.clone(),
+                assignee,
+                limit: invocation.input.limit,
+                cursor: invocation.input.cursor.clone(),
+            },
+        )
+    }
+}
+
+fn validate_public_send_invocation(invocation: &ThreadMessageSendInvocation) -> Result<()> {
+    validate_invocation_identity(
+        &invocation.native_binding_id,
+        &invocation.binding_credential,
+        &invocation.runtime_tool_call_id,
+    )?;
+    if invocation.input.body.trim().is_empty() && invocation.input.files.is_empty() {
+        return Err(invocation_error(
+            "message.invalid_input",
+            "a non-empty body or at least one file is required",
+        ));
+    }
+    if invocation.input.body.len() > CAMP_MESSAGE_SEND_MAX_BODY_BYTES {
+        return Err(invocation_error(
+            "message.body_too_large",
+            "Public message body exceeds the 32 KiB send limit",
+        ));
+    }
+    if !invocation.input.public_only && invocation.input.to.len() > 16 {
+        return Err(invocation_error(
+            "message.fanout_exceeded",
+            "The explicit recipient input exceeds the absolute fanout limit of 16",
+        ));
+    }
+    if invocation.input.files.len() > MAX_PREPARED_ATTACHMENTS
+        || invocation
+            .input
+            .files
+            .iter()
+            .any(|path| path.trim().is_empty())
+        || invocation
+            .input
+            .files
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != invocation.input.files.len()
+    {
+        return Err(invocation_error(
+            "message.invalid_input",
+            "files must contain at most 10 unique non-empty paths",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_task_invocation_identity<T>(invocation: &TeamTaskToolInvocation<T>) -> Result<()> {
+    validate_invocation_identity(
+        &invocation.native_binding_id,
+        &invocation.binding_credential,
+        &invocation.runtime_tool_call_id,
+    )
+}
+
+fn validate_invocation_identity(
+    native_binding_id: &str,
+    binding_credential: &str,
+    runtime_tool_call_id: &str,
+) -> Result<()> {
+    if native_binding_id.trim().is_empty()
+        || binding_credential.trim().is_empty()
+        || runtime_tool_call_id.trim().is_empty()
+    {
+        return Err(invocation_error(
+            "team_tool.invalid_invocation",
+            "Binding identity, credential, and Runtime Tool Call ID are required",
+        ));
+    }
+    Uuid::parse_str(native_binding_id).map_err(|_| {
+        invocation_error(
+            "team_tool.invalid_binding",
+            "Native Binding ID must be a UUID",
+        )
+    })?;
+    if runtime_tool_call_id.len() > 512 {
+        return Err(invocation_error(
+            "team_tool.invalid_tool_call_id",
+            "Runtime Tool Call ID exceeds 512 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_sender_identity(
+    connection: &Connection,
+    native_binding_id: &str,
+    credential_digest: &str,
+    attested_run: Option<(&str, i64)>,
+) -> Result<SenderIdentity> {
+    resolve_sender_identity_by_digest(
+        connection,
+        native_binding_id,
+        credential_digest,
+        attested_run,
+    )
+}
+
+fn resolve_sender_identity_by_digest(
+    connection: &Connection,
+    native_binding_id: &str,
+    credential_digest: &str,
+    attested_run: Option<(&str, i64)>,
+) -> Result<SenderIdentity> {
+    let identity = connection
+        .query_row(
+            r#"
+            SELECT conversation.camp_id, conversation.agent_id,
+                   agent_run.id, agent_run.execution_epoch,
+                   agent_run.runtime_adapter_kind,
+                   agent_run.runtime_capabilities_json,
+                   conversation.native_binding_secret_digest,
+                   agent_run.effective_config_json
+            FROM conversation
+            JOIN camp ON camp.id = conversation.camp_id
+            JOIN camp_member
+              ON camp_member.camp_id = conversation.camp_id
+             AND camp_member.agent_id = conversation.agent_id
+            JOIN agent_profile ON agent_profile.id = conversation.agent_id
+            JOIN agent_run ON agent_run.conversation_id = conversation.id
+            LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
+            WHERE conversation.native_binding_id = ?1
+              AND conversation.native_binding_secret_digest = ?2
+              AND (
+                    (?3 IS NULL AND conversation.native_session_id IS NOT NULL)
+                 OR (?3 IS NOT NULL AND agent_run.id = ?3 AND agent_run.execution_epoch = ?4)
+              )
+              AND agent_run.status = 'running'
+              AND agent_run.cancel_requested_at IS NULL
+              AND (
+                    agent_run.camp_turn_id IS NULL
+                 OR (
+                        camp_turn.status IN ('running', 'waiting')
+                    AND camp_turn.cancel_requested_at IS NULL
+                 )
+              )
+              AND camp_member.status = 'active'
+              AND camp_member.leave_requested_at IS NULL
+              AND camp_member.version = CAST(
+                  json_extract(agent_run.effective_config_json, '$.campMemberVersion')
+                  AS INTEGER
+              )
+            "#,
+            params![
+                native_binding_id,
+                credential_digest,
+                attested_run.map(|value| value.0),
+                attested_run.map(|value| value.1),
+            ],
+            |row| {
+                Ok((
+                    SenderIdentity {
+                        camp_id: row.get(0)?,
+                        agent_id: row.get(1)?,
+                        agent_run_id: row.get(2)?,
+                        execution_epoch: row.get(3)?,
+                        credential_digest: row.get(6)?,
+                    },
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((identity, adapter_kind, _capabilities, _effective_config)) = identity else {
+        return Err(invocation_error(
+            "team_tool.binding_fenced",
+            "Native Binding credential does not resolve to one current active AgentRun",
+        ));
+    };
+    ensure_runtime_is_frozen(adapter_kind.as_deref())?;
+    Ok(identity)
+}
+
+fn ensure_runtime_is_frozen(adapter_kind: Option<&str>) -> Result<()> {
+    let Some(adapter_kind) = adapter_kind else {
+        return Err(invocation_error(
+            "team_tool.runtime_not_frozen",
+            "AgentRun has no frozen Runtime Adapter",
+        ));
+    };
+    let _adapter_kind = adapter_kind.parse::<AdapterKind>()?;
+    Ok(())
+}
+
+fn credential_digest(credential: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(credential.as_bytes());
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn binding_credential(native_binding_id: &str, native_binding_generation: i64) -> String {
+    let process_secret = TEAM_TOOL_PROCESS_SECRET.get_or_init(|| {
+        format!(
+            "{}.{}",
+            Uuid::new_v4().as_hyphenated(),
+            Uuid::new_v4().as_hyphenated()
+        )
+    });
+    let mut digest = Sha256::new();
+    digest.update(b"rovai-team-binding-v1\0");
+    digest.update(process_secret.as_bytes());
+    digest.update([0]);
+    digest.update(native_binding_id.as_bytes());
+    digest.update([0]);
+    digest.update(native_binding_generation.to_be_bytes());
+    format!("v1.{:x}", digest.finalize())
+}
+
+fn team_command_id(
+    native_binding_id: &str,
+    credential_digest: &str,
+    runtime_tool_call_id: &str,
+) -> Result<String> {
+    let digest = canonical_json_digest(&json!({
+        "nativeBindingId": native_binding_id,
+        "credentialDigest": credential_digest,
+        "runtimeToolCallId": runtime_tool_call_id,
+    }))?;
+    Ok(format!("builtin-tool-{digest}"))
+}
+
+fn load_recorded_team_command_identity(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<RecordedTeamCommandIdentity>> {
+    let recorded = connection
+        .query_row(
+            r#"
+            SELECT camp_id, actor_type, actor_id, source_agent_run_id, execution_epoch
+            FROM event_log
+            WHERE event_type = 'command.result' AND command_id = ?1
+            "#,
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((camp_id, actor_type, agent_id, source_agent_run_id, execution_epoch)) = recorded
+    else {
+        return Ok(None);
+    };
+    if actor_type != "agent" {
+        anyhow::bail!("recorded Team Tool command actor is not an Agent");
+    }
+    Ok(Some(RecordedTeamCommandIdentity {
+        camp_id: camp_id.context("recorded Team Tool command has no Thread")?,
+        agent_id,
+        source_agent_run_id: source_agent_run_id
+            .context("recorded Team Tool command has no source AgentRun")?,
+        execution_epoch: execution_epoch
+            .context("recorded Team Tool command has no execution epoch")?,
+    }))
+}
+
+fn invocation_error(code: &str, message: &str) -> anyhow::Error {
+    TeamToolInvocationError {
+        code: code.to_string(),
+        message: message.to_string(),
+    }
+    .into()
+}
+
+fn rejected(code: &str, message: &str) -> CommandHandlerResult {
+    CommandHandlerResult::rejected(code, json!({ "message": message }))
+}
+
+#[cfg(all(test, feature = "extended-tests"))]
+mod tests {
+    use super::*;
+    use crate::{
+        camp_attachment_view::ThreadAttachmentViewStore,
+        collaboration::{
+            AddThreadMemberCommand, CollaborationService, CreateTaskCommand, CreateThreadCommand,
+            ExecutionRequest, TestThreadMessageAddress, TestThreadMessageCommand,
+        },
+        command::CommandResultStatus,
+        memory::{
+            AcceptHearthReviewItemCommand, CreateMemoryCommand, ForgetMemoryCommand,
+            MEMORY_BODY_MAX_BYTES, MemoryKind, MemoryScopeKind, MemoryService, MemoryTarget,
+            RejectHearthReviewItemCommand, RelationshipDirection, ReviseMemoryCommand,
+        },
+        memory_retrieval::{
+            MemoryRetrievalInvocation, MemoryRetrievalService, MemoryViewInput, MemoryViewOutput,
+        },
+        memory_tool::{MemoryToolService, MemoryWriteToolInput, MemoryWriteToolInvocation},
+        runtime::{
+            BindNativeSessionCommand, ClaimAgentRunCommand, ExecutionRuntimeService,
+            MissingSendRecoveryBoundary, MissingSendRecoveryCandidate, SucceedAgentRunCommand,
+        },
+    };
+    #[cfg(feature = "slow-tests")]
+    use crate::{
+        collaboration::{RemoveThreadMemberCommand, end_camp_membership},
+        context::{
+            CharterDeliveryMode, ContextMaterialization, ContextService,
+            DEFAULT_MAX_CONTEXT_PAYLOAD_BYTES, MaterializeContextRequest,
+        },
+        managed_blob::ManagedBlobStore,
+        memory::{MEMORY_AGENT_MUTATIONS_PER_RUN, MemoryCreationOrigin, RetireMemoryCommand},
+        memory_retrieval::{MemoryCacheState, MemoryReadInput, MemorySearchInput},
+        runtime::{CancelAgentRunCommand, FailAgentRunCommand},
+    };
+
+    fn user_envelope<P>(command_id: &str, camp_id: Option<&str>, payload: P) -> CommandEnvelope<P> {
+        CommandEnvelope {
+            command_id: command_id.to_string(),
+            actor: ActorRef::User {
+                user_id: "local_user".to_string(),
+            },
+            camp_id: camp_id.map(str::to_string),
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload,
+        }
+    }
+
+    fn assert_memory_unavailable(execution: &CommandExecution) {
+        assert_eq!(execution.result.status, CommandResultStatus::Rejected);
+        assert_eq!(execution.result.code, "memory.unavailable");
+        assert_eq!(
+            execution.result.payload,
+            json!({"message": "Memory is unavailable"})
+        );
+    }
+
+    fn assert_memory_export_isolated(database: &Database, forbidden_values: &[&str]) -> Value {
+        let exported = MemoryService::default().export(database).unwrap();
+        assert_eq!(exported["format"], "rovai-memory-export-v3");
+        assert!(exported.get("hearthReviewItems").is_none());
+        let encoded = serde_json::to_string(&exported).unwrap();
+        for field in [
+            "hearthReviewItems",
+            "reviewItemId",
+            "createdFromHearthReviewItemId",
+            "candidateKind",
+            "candidateBody",
+            "candidateRetrievalKeys",
+        ] {
+            assert!(
+                !encoded.contains(&format!("\"{field}\"")),
+                "Memory export leaked Hearth Review field {field}"
+            );
+        }
+        for value in forbidden_values {
+            assert!(
+                !encoded.contains(value),
+                "Memory export leaked Hearth Review value {value}"
+            );
+        }
+        exported
+    }
+
+    struct Fixture {
+        database: crate::test_support::OwnedTestDatabase,
+        directory: std::path::PathBuf,
+        camp_id: String,
+        #[cfg(feature = "slow-tests")]
+        task_id: String,
+        source_run_id: String,
+        source_epoch: i64,
+        credential: BuiltinToolBindingCredential,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::with_members(&["agent_1", "agent_2", "agent_3"])
+        }
+
+        fn with_members(member_agent_ids: &[&str]) -> Self {
+            let mut database = crate::test_support::seeded_runtime_database_owned();
+            let directory = database.directory().to_path_buf();
+            let workspace = directory.join("workspace");
+            std::fs::create_dir_all(&workspace).expect("workspace should exist");
+            let collaboration = CollaborationService::default();
+            let camp = collaboration
+                .create_camp(
+                    &mut database,
+                    &user_envelope(
+                        "create-team-camp",
+                        None,
+                        CreateThreadCommand::for_test_with_members(
+                            workspace.to_string_lossy().to_string(),
+                            member_agent_ids,
+                            "agent_1",
+                        ),
+                    ),
+                )
+                .expect("Camp should be created");
+            let camp_id = camp.result.payload["threadId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let view = ThreadAttachmentViewStore::for_test(&database)
+                .expect("Runtime Camp Files Root should be admitted");
+            view.ensure_empty_camp_ready(&mut database, &camp_id)
+                .expect("new Camp should have its production attachment root");
+            drop(view);
+            for (index, agent_id) in member_agent_ids.iter().enumerate() {
+                collaboration
+                    .add_camp_member(
+                        &mut database,
+                        &user_envelope(
+                            &format!("add-member-{index}"),
+                            Some(&camp_id),
+                            AddThreadMemberCommand {
+                                camp_id: camp_id.clone(),
+                                agent_id: (*agent_id).to_string(),
+                                expected_membership_generation: 1,
+                                capability_overrides: json!({}),
+                                source: None,
+                            },
+                        ),
+                    )
+                    .expect("member should be added");
+            }
+            crate::task_capability::set(database.connection(), true).unwrap();
+            let task = collaboration
+                .create_task(
+                    &mut database,
+                    &user_envelope(
+                        "create-team-task",
+                        Some(&camp_id),
+                        CreateTaskCommand {
+                            camp_id: camp_id.clone(),
+                            title: "Collaborative task".to_string(),
+                            description: "Exercise A2A execution".to_string(),
+                            assignee_agent_id: "agent_1".to_string(),
+                        },
+                    ),
+                )
+                .expect("Task should be created");
+            let task_id = task.result.payload["taskId"].as_str().unwrap().to_string();
+            let send = collaboration
+                .send_test_camp_message(
+                    &mut database,
+                    &user_envelope(
+                        "queue-source-run",
+                        Some(&camp_id),
+                        TestThreadMessageCommand {
+                            camp_id: camp_id.clone(),
+                            draft_revision: None,
+                            body: "Start the collaboration".to_string(),
+                            prepared_attachment_ids: Vec::new(),
+                            address: TestThreadMessageAddress::Explicit {
+                                agent_ids: vec!["agent_1".to_string()],
+                            },
+                            reply_to_camp_message_id: None,
+                            execution: Some(ExecutionRequest {
+                                task_id: Some(task_id.clone()),
+                                purpose: "Coordinate work".to_string(),
+                                completion_role: "required".to_string(),
+                                budget: None,
+                            }),
+                        },
+                    ),
+                )
+                .expect("source Run should queue");
+            let source_run_id = send.result.payload["agentRunIds"][0]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let runtime = ExecutionRuntimeService::default();
+            let candidate = runtime
+                .list_dispatchable_agent_runs(&database, 10)
+                .expect("Run should be dispatchable")
+                .into_iter()
+                .find(|candidate| candidate.agent_run_id == source_run_id)
+                .unwrap();
+            let workspace = candidate.execution_workspace();
+            let claimed = runtime
+                .claim_agent_run(
+                    &mut database,
+                    &CommandEnvelope {
+                        command_id: "claim-source-run".to_string(),
+                        actor: ActorRef::System {
+                            component_id: "agent-run-scheduler".to_string(),
+                        },
+                        camp_id: Some(camp_id.clone()),
+                        expected_versions: Vec::new(),
+                        execution_epoch: None,
+                        payload: ClaimAgentRunCommand {
+                            agent_run_id: source_run_id.clone(),
+                            expected_version: candidate.version,
+                            lease_owner: "test-scheduler".to_string(),
+                            lease_seconds: 300,
+                            workspace: Some(workspace),
+                            starting_git_observation: None,
+                        },
+                    },
+                )
+                .expect("source Run should be claimed");
+            let source_epoch = claimed.result.payload["executionEpoch"].as_i64().unwrap();
+            let execution = runtime
+                .load_agent_run_execution(&database, &source_run_id, source_epoch)
+                .unwrap()
+                .unwrap();
+            let bound = runtime
+                .bind_native_session(
+                    &mut database,
+                    &CommandEnvelope {
+                        command_id: "bind-source-session".to_string(),
+                        actor: ActorRef::System {
+                            component_id: "runtime-adapter:codex-cli".to_string(),
+                        },
+                        camp_id: Some(camp_id.clone()),
+                        expected_versions: Vec::new(),
+                        execution_epoch: None,
+                        payload: BindNativeSessionCommand {
+                            conversation_id: execution.conversation_id,
+                            agent_run_id: source_run_id.clone(),
+                            expected_conversation_version: execution.conversation_version,
+                            expected_execution_epoch: source_epoch,
+                            previous_adapter_installation_id: None,
+                            previous_native_session_id: None,
+                            previous_binding_compatibility_digest: None,
+                            proposed_binding_id: None,
+                            adapter_installation_id: execution.runtime.installation_id.clone(),
+                            native_session_id: "native-source".to_string(),
+                            binding_compatibility_digest: execution
+                                .runtime
+                                .binding_compatibility_digest,
+                        },
+                    },
+                )
+                .expect("source session should bind");
+            assert_eq!(bound.result.status, CommandResultStatus::Applied);
+            let credential = TeamToolService::default()
+                .issue_binding_credential(&mut database, &source_run_id, source_epoch)
+                .expect("credential should be issued");
+            Self {
+                database,
+                directory,
+                camp_id,
+                #[cfg(feature = "slow-tests")]
+                task_id,
+                source_run_id,
+                source_epoch,
+                credential,
+            }
+        }
+
+        #[cfg(feature = "slow-tests")]
+        fn queue_direct_run(&mut self, command_id: &str, agent_id: &str) -> String {
+            CollaborationService::default()
+                .send_test_camp_message(
+                    &mut self.database,
+                    &user_envelope(
+                        command_id,
+                        Some(&self.camp_id),
+                        TestThreadMessageCommand {
+                            camp_id: self.camp_id.clone(),
+                            draft_revision: None,
+                            body: format!("Keep {agent_id} busy"),
+                            prepared_attachment_ids: Vec::new(),
+                            address: TestThreadMessageAddress::Explicit {
+                                agent_ids: vec![agent_id.to_string()],
+                            },
+                            reply_to_camp_message_id: None,
+                            execution: Some(ExecutionRequest {
+                                task_id: None,
+                                purpose: "Occupy the recipient FIFO".to_string(),
+                                completion_role: "required".to_string(),
+                                budget: None,
+                            }),
+                        },
+                    ),
+                )
+                .expect("direct Run should queue")
+                .result
+                .payload["agentRunIds"][0]
+                .as_str()
+                .expect("direct Run id should exist")
+                .to_string()
+        }
+
+        #[cfg(feature = "slow-tests")]
+        fn claim_delivery_run(
+            &mut self,
+            delivery_id: &str,
+            native_session_id: &str,
+        ) -> (String, i64, BuiltinToolBindingCredential) {
+            crate::delivery_queue::claim_waiting_delivery_batches(&mut self.database, 100)
+                .expect("waiting Deliveries should claim into batch Runs");
+            let run_id: String = self
+                .database
+                .connection()
+                .query_row(
+                    "SELECT claimed_agent_run_id FROM camp_message_delivery WHERE id = ?1",
+                    [delivery_id],
+                    |row| row.get(0),
+                )
+                .expect("Delivery should bind a batch Run");
+            let (epoch, credential) = self.claim_bind_and_issue(&run_id, native_session_id);
+            (run_id, epoch, credential)
+        }
+
+        #[cfg(feature = "slow-tests")]
+        fn remove_member(&mut self, agent_id: &str, command_id: &str) -> CommandExecution {
+            let collaboration = CollaborationService::default();
+            let preview = collaboration
+                .camp_member_removal_preview(&self.database, &self.camp_id, agent_id)
+                .unwrap()
+                .unwrap();
+            collaboration
+                .remove_camp_member(
+                    &mut self.database,
+                    &user_envelope(
+                        command_id,
+                        Some(&self.camp_id),
+                        RemoveThreadMemberCommand {
+                            camp_id: self.camp_id.clone(),
+                            agent_id: agent_id.to_string(),
+                            expected_membership_generation: preview.membership_generation,
+                            expected_membership_version: preview.membership_version,
+                            replacement_default_lead_agent_id: preview.next_default_lead_agent_id,
+                            reason: Some("test membership cutover".to_string()),
+                            source: None,
+                        },
+                    ),
+                )
+                .unwrap()
+        }
+
+        fn public_send_invocation(
+            &self,
+            call_id: &str,
+            body: &str,
+            to: &[&str],
+        ) -> ThreadMessageSendInvocation {
+            self.public_send_invocation_for(&self.credential, call_id, body, to)
+        }
+
+        fn public_send_invocation_for(
+            &self,
+            credential: &BuiltinToolBindingCredential,
+            call_id: &str,
+            body: &str,
+            to: &[&str],
+        ) -> ThreadMessageSendInvocation {
+            ThreadMessageSendInvocation {
+                native_binding_id: credential.native_binding_id.clone(),
+                binding_credential: credential.binding_credential.clone(),
+                runtime_tool_call_id: call_id.to_string(),
+                input: ThreadMessageSendInput {
+                    body: body.to_string(),
+                    to: to.iter().map(|value| (*value).to_string()).collect(),
+                    mention_user: false,
+                    public_only: false,
+                    task_id: None,
+                    files: Vec::new(),
+                },
+                source_files: Vec::new(),
+            }
+        }
+
+        fn prepare_agent_source_attachment(
+            &mut self,
+            invocation: &mut ThreadMessageSendInvocation,
+            file_name: &str,
+            bytes: &[u8],
+        ) -> String {
+            self.prepare_agent_source_attachments(invocation, &[(file_name, bytes)])
+                .into_iter()
+                .next()
+                .unwrap()
+        }
+
+        fn prepare_agent_source_attachments(
+            &mut self,
+            invocation: &mut ThreadMessageSendInvocation,
+            files: &[(&str, &[u8])],
+        ) -> Vec<String> {
+            let workspace = self.directory.join("workspace");
+            for (file_name, bytes) in files {
+                std::fs::write(workspace.join(file_name), bytes).unwrap();
+            }
+            let run_tmp = self.directory.join("run-tmp");
+            std::fs::create_dir_all(&run_tmp).unwrap();
+            invocation.input.files = files
+                .iter()
+                .map(|(file_name, _)| (*file_name).to_string())
+                .collect();
+            invocation.source_files =
+                crate::local_attachment_source::observe_agent_source_attachments(
+                    &invocation.input.files,
+                    &workspace,
+                )
+                .unwrap();
+            invocation
+                .source_files
+                .iter()
+                .map(|source| source.id.clone())
+                .collect()
+        }
+
+        fn task_invocation<T>(&self, call_id: &str, input: T) -> TeamTaskToolInvocation<T> {
+            TeamTaskToolInvocation {
+                native_binding_id: self.credential.native_binding_id.clone(),
+                binding_credential: self.credential.binding_credential.clone(),
+                runtime_tool_call_id: call_id.to_string(),
+                input,
+            }
+        }
+
+        fn memory_write(
+            &mut self,
+            call_id: &str,
+            input: MemoryWriteToolInput,
+        ) -> Result<CommandExecution> {
+            MemoryToolService.write(
+                &mut self.database,
+                &MemoryWriteToolInvocation {
+                    native_binding_id: self.credential.native_binding_id.clone(),
+                    binding_credential: self.credential.binding_credential.clone(),
+                    runtime_tool_call_id: call_id.to_string(),
+                    input,
+                },
+            )
+        }
+
+        fn memory_view(
+            &mut self,
+            call_id: &str,
+            input: MemoryViewInput,
+        ) -> Result<MemoryViewOutput> {
+            MemoryRetrievalService.view(
+                &mut self.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: self.credential.native_binding_id.clone(),
+                    binding_credential: self.credential.binding_credential.clone(),
+                    runtime_tool_call_id: call_id.to_string(),
+                    input,
+                },
+            )
+        }
+
+        fn memory_revise(
+            &mut self,
+            call_id: &str,
+            memory_id: &str,
+            base_revision_id: &str,
+            body: &str,
+            retrieval_keys: &[&str],
+        ) -> CommandExecution {
+            let target = MemoryService::default()
+                .get(&self.database, memory_id)
+                .unwrap();
+            let scope = target
+                .as_ref()
+                .and_then(|memory| memory.scope)
+                .unwrap_or(MemoryScopeKind::Hearth);
+            let counterparty_agent_id = target.as_ref().and_then(|memory| {
+                (scope == MemoryScopeKind::Relationship).then(|| {
+                    memory
+                        .relationship_agent_ids
+                        .iter()
+                        .find(|agent_id| agent_id.as_str() != "agent_1")
+                        .cloned()
+                        .unwrap()
+                })
+            });
+            self.memory_write(
+                call_id,
+                MemoryWriteToolInput {
+                    action: "revise".to_string(),
+                    scope: None,
+                    kind: None,
+                    body: body.to_string(),
+                    retrieval_keys: retrieval_keys
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                    counterparty_agent_id: None,
+                    direction: None,
+                    target: Some(MemoryTarget {
+                        memory_id: memory_id.to_string(),
+                        revision_id: base_revision_id.to_string(),
+                        scope,
+                        counterparty_agent_id,
+                        direction: (scope == MemoryScopeKind::Relationship)
+                            .then_some(RelationshipDirection::Directed),
+                    }),
+                },
+            )
+            .unwrap()
+        }
+
+        fn hearth_review_add(
+            &mut self,
+            call_id: &str,
+            body: &str,
+            retrieval_key: &str,
+        ) -> CommandExecution {
+            self.memory_write(
+                call_id,
+                MemoryWriteToolInput {
+                    action: "add".to_string(),
+                    scope: Some(MemoryScopeKind::Hearth),
+                    kind: Some(MemoryKind::Lesson),
+                    body: body.to_string(),
+                    retrieval_keys: vec![retrieval_key.to_string()],
+                    counterparty_agent_id: None,
+                    direction: None,
+                    target: None,
+                },
+            )
+            .unwrap()
+        }
+
+        #[cfg(feature = "slow-tests")]
+        fn claim_bind_and_issue(
+            &mut self,
+            agent_run_id: &str,
+            native_session_id: &str,
+        ) -> (i64, BuiltinToolBindingCredential) {
+            let runtime = ExecutionRuntimeService::default();
+            let candidate = runtime
+                .list_dispatchable_agent_runs(&self.database, 100)
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.agent_run_id == agent_run_id)
+                .expect("target Run should be dispatchable");
+            let claimed = runtime
+                .claim_agent_run(
+                    &mut self.database,
+                    &CommandEnvelope {
+                        command_id: format!("claim-{agent_run_id}"),
+                        actor: ActorRef::System {
+                            component_id: "agent-run-scheduler".to_string(),
+                        },
+                        camp_id: Some(self.camp_id.clone()),
+                        expected_versions: Vec::new(),
+                        execution_epoch: None,
+                        payload: ClaimAgentRunCommand {
+                            agent_run_id: agent_run_id.to_string(),
+                            expected_version: candidate.version,
+                            lease_owner: format!("scheduler-{agent_run_id}"),
+                            lease_seconds: 300,
+                            workspace: Some(candidate.execution_workspace()),
+                            starting_git_observation: None,
+                        },
+                    },
+                )
+                .expect("target Run should be claimed");
+            let epoch = claimed.result.payload["executionEpoch"].as_i64().unwrap();
+            let execution = runtime
+                .load_agent_run_execution(&self.database, agent_run_id, epoch)
+                .unwrap()
+                .unwrap();
+            let bound = runtime
+                .bind_native_session(
+                    &mut self.database,
+                    &CommandEnvelope {
+                        command_id: format!("bind-{agent_run_id}"),
+                        actor: ActorRef::System {
+                            component_id: "runtime-adapter:codex-cli".to_string(),
+                        },
+                        camp_id: Some(self.camp_id.clone()),
+                        expected_versions: Vec::new(),
+                        execution_epoch: None,
+                        payload: BindNativeSessionCommand {
+                            conversation_id: execution.conversation_id,
+                            agent_run_id: agent_run_id.to_string(),
+                            expected_conversation_version: execution.conversation_version,
+                            expected_execution_epoch: epoch,
+                            previous_adapter_installation_id: execution
+                                .native_adapter_installation_id,
+                            previous_native_session_id: execution.native_session_id,
+                            previous_binding_compatibility_digest: execution
+                                .native_binding_compatibility_digest,
+                            proposed_binding_id: None,
+                            adapter_installation_id: execution.runtime.installation_id,
+                            native_session_id: native_session_id.to_string(),
+                            binding_compatibility_digest: execution
+                                .runtime
+                                .binding_compatibility_digest,
+                        },
+                    },
+                )
+                .expect("target Native Session should bind");
+            assert_eq!(bound.result.status, CommandResultStatus::Applied);
+            let credential = TeamToolService::default()
+                .issue_binding_credential(&mut self.database, agent_run_id, epoch)
+                .expect("target credential should be issued");
+            (epoch, credential)
+        }
+
+        fn succeed_run(&mut self, agent_run_id: &str, execution_epoch: i64, output: &str) {
+            self.succeed_run_with_candidate(agent_run_id, execution_epoch, output, None);
+        }
+
+        #[cfg(feature = "slow-tests")]
+        fn fail_run(
+            &mut self,
+            agent_run_id: &str,
+            execution_epoch: i64,
+            error_code: &str,
+        ) -> CommandExecution {
+            let runtime = ExecutionRuntimeService::default();
+            let execution = runtime
+                .load_agent_run_execution(&self.database, agent_run_id, execution_epoch)
+                .unwrap()
+                .expect("claimed AgentRun should remain executable");
+            let failed = runtime
+                .fail_agent_run(
+                    &mut self.database,
+                    &CommandEnvelope {
+                        command_id: format!("fail-{agent_run_id}-{error_code}"),
+                        actor: ActorRef::System {
+                            component_id: "runtime-adapter:codex-cli".to_string(),
+                        },
+                        camp_id: Some(self.camp_id.clone()),
+                        expected_versions: Vec::new(),
+                        execution_epoch: None,
+                        payload: FailAgentRunCommand {
+                            agent_run_id: agent_run_id.to_string(),
+                            expected_version: execution.version,
+                            execution_epoch,
+                            error_code: error_code.to_string(),
+                            error_detail: None,
+                            failure: None,
+                            manual_retry_allowed: false,
+                            ending_git_observation: None,
+                        },
+                    },
+                )
+                .expect("AgentRun failure should settle");
+            assert_eq!(failed.result.status, CommandResultStatus::Applied);
+            failed
+        }
+
+        fn succeed_run_with_candidate(
+            &mut self,
+            agent_run_id: &str,
+            execution_epoch: i64,
+            output: &str,
+            missing_send_recovery_candidate: Option<MissingSendRecoveryCandidate>,
+        ) -> CommandExecution {
+            let runtime = ExecutionRuntimeService::default();
+            let execution = runtime
+                .load_agent_run_execution(&self.database, agent_run_id, execution_epoch)
+                .unwrap()
+                .expect("claimed AgentRun should remain executable");
+            let completed = runtime
+                .succeed_agent_run(
+                    &mut self.database,
+                    &CommandEnvelope {
+                        command_id: format!("succeed-{agent_run_id}"),
+                        actor: ActorRef::System {
+                            component_id: "runtime-adapter:codex-cli".to_string(),
+                        },
+                        camp_id: Some(self.camp_id.clone()),
+                        expected_versions: Vec::new(),
+                        execution_epoch: None,
+                        payload: SucceedAgentRunCommand {
+                            agent_run_id: agent_run_id.to_string(),
+                            expected_version: execution.version,
+                            execution_epoch,
+                            native_turn_id: format!("native-turn-{agent_run_id}"),
+                            final_output: output.to_string(),
+                            missing_send_recovery_candidate,
+                            ending_git_observation: None,
+                        },
+                    },
+                )
+                .expect("AgentRun should complete");
+            assert_eq!(completed.result.status, CommandResultStatus::Applied);
+            completed
+        }
+    }
+
+    // Owns the Agent CLI's global Profile PATCH and scoped read seam, using
+    // the existing authenticated-Run fixture (not a second authorization store).
+    #[test]
+    fn member_profile_reads_and_patches_preserve_scope_atomicity_and_replay() {
+        use crate::builtin_tool_cli_output::validate_schema;
+        use crate::member_studio::resolve_member_avatar_input;
+        use crate::member_tool::*;
+        let mut fixture = Fixture::new();
+        let run = TeamToolService::default()
+            .authenticate_attested_binding(
+                &fixture.database,
+                &fixture.credential.native_binding_id,
+                &fixture.credential.binding_credential,
+                "member-input-regression",
+                &fixture.source_run_id,
+                fixture.source_epoch,
+            )
+            .unwrap();
+        // The frozen Run root can differ from the Thread workspace and Core cwd.
+        let execution_root = fixture.directory.join("run-execution");
+        std::fs::create_dir(&execution_root).unwrap();
+        let workspace_json = serde_json::to_string(&AgentRunWorkspace::runtime_managed_path(
+            execution_root.to_str().unwrap().into(),
+        ))
+        .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET workspace_json=?1 WHERE id=?2",
+                params![workspace_json, run.agent_run_id],
+            )
+            .unwrap();
+        let relative_input = json!({"avatarFile":"./missing-avatar.png"});
+        let mut resolved = relative_input.clone();
+        resolve_member_avatar_input(
+            &fixture.database,
+            &run,
+            MEMBER_UPDATE_TOOL_NAME,
+            &mut resolved,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved["avatarFile"],
+            json!(execution_root.join("./missing-avatar.png"))
+        );
+        assert_ne!(execution_root, std::env::current_dir().unwrap());
+        for invalid_run in [
+            AuthenticatedTeamToolRun {
+                execution_epoch: run.execution_epoch + 1,
+                ..run.clone()
+            },
+            AuthenticatedTeamToolRun {
+                agent_run_id: "missing-run".into(),
+                ..run.clone()
+            },
+        ] {
+            assert!(
+                resolve_member_avatar_input(
+                    &fixture.database,
+                    &invalid_run,
+                    MEMBER_UPDATE_TOOL_NAME,
+                    &mut relative_input.clone()
+                )
+                .is_err()
+            );
+        }
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET workspace_json=NULL WHERE id=?1",
+                [&run.agent_run_id],
+            )
+            .unwrap();
+        assert!(
+            resolve_member_avatar_input(
+                &fixture.database,
+                &run,
+                MEMBER_UPDATE_TOOL_NAME,
+                &mut relative_input.clone()
+            )
+            .is_err()
+        );
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET workspace_json=?1 WHERE id=?2",
+                params![workspace_json, run.agent_run_id],
+            )
+            .unwrap();
+        let tmp = fixture.directory.join("member-run-tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let read = |db: &Database, target: &str| {
+            get_member(
+                db.connection(),
+                &fixture.directory,
+                &tmp,
+                &run,
+                &MemberGetInput {
+                    agent_id: target.into(),
+                },
+            )
+            .unwrap()
+        };
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status='away' WHERE id='agent_2'",
+                [],
+            )
+            .unwrap();
+        fixture.database.connection().execute("UPDATE agent_profile SET member_order=CASE id WHEN 'agent_2' THEN 4000 WHEN 'agent_1' THEN 5000 ELSE 6000 END",[]).unwrap();
+        let list = list_members(fixture.database.connection(), &run).unwrap();
+        assert_eq!(list["items"][0]["agentId"], "agent_2");
+
+        validate_schema(&list, &member_list_output_schema()).unwrap();
+        for item in list["items"].as_array().unwrap() {
+            assert_eq!(item.as_object().unwrap().len(), 4);
+            assert!(item.get("professionalResponsibilities").is_none());
+        }
+        let mut old_list = list.clone();
+        old_list["items"][0]["professionalResponsibilities"] = json!("");
+        assert!(validate_schema(&old_list, &member_list_output_schema()).is_err());
+        assert_eq!(list["items"].as_array().unwrap().len(), 3);
+        assert!(
+            list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["agentId"] == "agent_1" && m["isDefaultLead"] == true)
+        );
+        assert!(
+            list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["agentId"] == "agent_2")
+        );
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp SET default_lead_agent_id=NULL WHERE id=?1",
+                [&fixture.camp_id],
+            )
+            .unwrap();
+        let without_lead = list_members(fixture.database.connection(), &run).unwrap();
+        let mut expected_without_lead = list.clone();
+        for member in expected_without_lead["items"].as_array_mut().unwrap() {
+            member["isDefaultLead"] = json!(false);
+        }
+        assert_eq!(without_lead, expected_without_lead);
+        assert!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT default_lead_agent_id FROM camp WHERE id=?1",
+                    [&fixture.camp_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .is_none(),
+            "listing must not appoint a Lead"
+        );
+        assert!(
+            authorize_member_target(fixture.database.connection(), &run, "agent_4", false).is_err()
+        );
+        let full_responsibilities = "😀\n\"中".repeat(2_500);
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET professional_responsibilities=?1 WHERE id='agent_2'",
+                [&full_responsibilities],
+            )
+            .unwrap();
+        let file_count = || std::fs::read_dir(&tmp).unwrap().count();
+        let before_count = file_count();
+        let before = read(&fixture.database, "agent_2");
+        assert_eq!(file_count(), before_count + 1, "one avatar file per read");
+        assert_eq!(
+            before["professionalResponsibilities"],
+            full_responsibilities
+        );
+        let unavailable = get_member(
+            fixture.database.connection(),
+            &fixture.directory,
+            &tmp.join("unavailable"),
+            &run,
+            &MemberGetInput {
+                agent_id: "agent_2".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unavailable["avatar"],
+            json!({"path":null,"status":"unavailable","displayCrop":null})
+        );
+        assert_eq!(file_count(), before_count + 1);
+        assert_eq!(
+            unavailable["professionalResponsibilities"],
+            full_responsibilities
+        );
+
+        validate_schema(&before, &member_get_output_schema()).unwrap();
+        assert_eq!(before["avatar"]["status"], "available");
+        assert!(before["avatar"]["displayCrop"].is_null());
+        let path = std::path::Path::new(before["avatar"]["path"].as_str().unwrap());
+        assert!(path.starts_with(&tmp) && path.is_file());
+        std::fs::remove_file(path).unwrap();
+        let refreshed = read(&fixture.database, "agent_2");
+        assert!(std::path::Path::new(refreshed["avatar"]["path"].as_str().unwrap()).is_file());
+        assert_ne!(refreshed["avatar"]["path"], before["avatar"]["path"]);
+        assert_eq!(file_count(), before_count + 1);
+        let parse_patch = |database: &Database, mut value: Value| {
+            crate::team_tool_catalog::validate_builtin_tool_input(MEMBER_UPDATE_TOOL_NAME, &value)
+                .unwrap();
+            resolve_member_avatar_input(database, &run, MEMBER_UPDATE_TOOL_NAME, &mut value)
+                .unwrap();
+            serde_json::from_value::<MemberUpdateInput>(value).unwrap()
+        };
+        let patch = parse_patch(
+            &fixture.database,
+            json!({"agentId":"agent_2","requestId":Uuid::new_v4().to_string(),"expectedVersion":before["version"],"teamRole":"Updated role"}),
+        );
+        let first = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            patch.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.result.status, CommandResultStatus::Applied);
+        validate_schema(&first.result.payload, &member_update_output_schema()).unwrap();
+        let updated = read(&fixture.database, "agent_2");
+        assert_eq!(updated["teamRole"], "Updated role");
+        for field in [
+            "displayName",
+            "professionalResponsibilities",
+            "personalityTraits",
+            "workingPrinciples",
+            "growthTopic",
+        ] {
+            assert_eq!(updated[field], before[field]);
+        }
+        assert_eq!(
+            updated["version"].as_i64().unwrap(),
+            before["version"].as_i64().unwrap() + 1
+        );
+        // Simulate a lost response: a fresh gateway instance returns the committed
+        // result, without a second version increment (even after another patch).
+        let replay = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            patch.clone(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload, first.result.payload);
+        let mut reused = patch.clone();
+        reused.team_role = Some("Different request".into());
+        let reused =
+            update_member(&mut fixture.database, &fixture.directory, &run, reused).unwrap();
+        assert!(reused.replayed);
+        assert_eq!(reused.result.payload, first.result.payload);
+        let mut stale = patch.clone();
+        stale.request_id = Uuid::new_v4().to_string();
+        assert_eq!(
+            update_member(&mut fixture.database, &fixture.directory, &run, stale)
+                .unwrap()
+                .result
+                .code,
+            "version_conflict"
+        );
+        let mut noop = patch.clone();
+        noop.request_id = Uuid::new_v4().to_string();
+        noop.expected_version = updated["version"].as_i64().unwrap();
+        let no_change =
+            update_member(&mut fixture.database, &fixture.directory, &run, noop).unwrap();
+        assert_eq!(no_change.result.payload["changed"], false);
+        assert_eq!(no_change.result.payload["version"], updated["version"]);
+        let mut invalid_image = patch.clone();
+        invalid_image.request_id = Uuid::new_v4().to_string();
+        invalid_image.expected_version = updated["version"].as_i64().unwrap();
+        invalid_image.team_role = Some("Must not save".into());
+        invalid_image.avatar_file = Some(tmp.join("missing.png").to_str().unwrap().into());
+        assert!(
+            update_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &run,
+                invalid_image
+            )
+            .is_err()
+        );
+        assert_eq!(
+            read(&fixture.database, "agent_2")["teamRole"],
+            "Updated role"
+        );
+        let mut oversized = patch.clone();
+        oversized.request_id = Uuid::new_v4().to_string();
+        oversized.expected_version = updated["version"].as_i64().unwrap();
+        oversized.team_role = Some("Must not partially save".into());
+        oversized.professional_responsibilities = Some(format!("{full_responsibilities}中"));
+        let error =
+            update_member(&mut fixture.database, &fixture.directory, &run, oversized).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::member_studio::MemberOperationError>()
+                .unwrap()
+                .message,
+            crate::agent_profile::PROFESSIONAL_RESPONSIBILITIES_TOO_LONG
+        );
+        let after_failure = read(&fixture.database, "agent_2");
+        for field in [
+            "version",
+            "displayName",
+            "teamRole",
+            "professionalResponsibilities",
+            "personalityTraits",
+            "workingPrinciples",
+            "growthTopic",
+        ] {
+            assert_eq!(
+                after_failure[field], updated[field],
+                "no partial commit: {field}"
+            );
+        }
+        let source = execution_root.join("new-source.png");
+        image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            400,
+            500,
+            image::Rgba([24, 48, 96, 255]),
+        ))
+        .save(&source)
+        .unwrap();
+        image::DynamicImage::new_rgba8(400, 500)
+            .save(fixture.directory.join("workspace/new-source.png"))
+            .unwrap();
+        let image_patch = parse_patch(
+            &fixture.database,
+            json!({"agentId":"agent_2","requestId":Uuid::new_v4().to_string(),"expectedVersion":updated["version"],"teamRole":"Image and text","avatarFile":"./new-source.png"}),
+        );
+        assert_eq!(
+            std::path::Path::new(image_patch.avatar_file.as_deref().unwrap()),
+            source
+        );
+        // Force SQL failure after image preparation: no partial Profile commit.
+        fixture.database.connection().execute_batch("CREATE TEMP TRIGGER reject_patch BEFORE UPDATE ON agent_profile BEGIN SELECT RAISE(ABORT,'patch failure'); END").unwrap();
+        assert!(
+            update_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &run,
+                image_patch.clone()
+            )
+            .is_err()
+        );
+        fixture
+            .database
+            .connection()
+            .execute_batch("DROP TRIGGER reject_patch")
+            .unwrap();
+        assert_eq!(
+            read(&fixture.database, "agent_2")["version"],
+            updated["version"]
+        );
+        let image_execution = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            image_patch.clone(),
+        )
+        .unwrap();
+        let image_updated = read(&fixture.database, "agent_2");
+        assert_eq!(image_updated["teamRole"], "Image and text");
+        assert_eq!(
+            image_updated["avatar"]["displayCrop"],
+            json!({"centerX":0.5,"centerY":0.5,"size":1.0})
+        );
+        validate_schema(&image_updated, &member_get_output_schema()).unwrap();
+        assert_eq!(
+            image::open(image_updated["avatar"]["path"].as_str().unwrap())
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(0, 0)
+                .0,
+            [24, 48, 96, 255],
+        );
+        let original_input = std::fs::read(&source).unwrap();
+        let mut duplicate_upload = image_patch.clone();
+        duplicate_upload.request_id = Uuid::new_v4().to_string();
+        duplicate_upload.expected_version = image_updated["version"].as_i64().unwrap();
+        let duplicate_result = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            duplicate_upload,
+        )
+        .unwrap();
+        assert_eq!(duplicate_result.result.payload["changed"], false);
+        assert_eq!(
+            duplicate_result.result.payload["version"],
+            image_updated["version"]
+        );
+        let bound_asset = fixture
+            .directory
+            .join("member-avatars")
+            .join(&image_patch.request_id);
+        let saved_asset = fixture.directory.join("asset-retained-for-test");
+        std::fs::rename(&bound_asset, &saved_asset).unwrap();
+        image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            400,
+            500,
+            image::Rgba([99, 88, 77, 255]),
+        ))
+        .save(&source)
+        .unwrap();
+        assert!(
+            update_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &run,
+                image_patch.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            !bound_asset.exists(),
+            "replay must never rebind a missing immutable asset"
+        );
+        std::fs::rename(&saved_asset, &bound_asset).unwrap();
+        std::fs::write(&source, &original_input).unwrap();
+
+        image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            400,
+            500,
+            image::Rgba([32, 64, 96, 255]),
+        ))
+        .save(&source)
+        .unwrap();
+        let changed_source = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            image_patch.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            changed_source
+                .downcast_ref::<crate::member_studio::MemberOperationError>()
+                .unwrap()
+                .code,
+            "builtin_tool.idempotency_conflict"
+        );
+        std::fs::write(&source, &original_input).unwrap();
+        assert!(
+            update_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &run,
+                image_patch.clone()
+            )
+            .unwrap()
+            .replayed
+        );
+        std::fs::remove_file(&source).unwrap();
+        let mut cleaned_source = json!({"avatarFile":"./new-source.png"});
+        resolve_member_avatar_input(
+            &fixture.database,
+            &run,
+            MEMBER_UPDATE_TOOL_NAME,
+            &mut cleaned_source,
+        )
+        .unwrap();
+        assert_eq!(
+            cleaned_source["avatarFile"].as_str(),
+            image_patch.avatar_file.as_deref()
+        );
+        let missing_source_replay = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            image_patch.clone(),
+        )
+        .unwrap();
+        assert!(missing_source_replay.replayed);
+        assert_eq!(
+            missing_source_replay.result.payload,
+            image_execution.result.payload
+        );
+        let mut different_missing_path = image_patch.clone();
+        different_missing_path.avatar_file =
+            Some(tmp.join("different-missing.png").to_str().unwrap().into());
+        let path_replay = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            different_missing_path,
+        )
+        .unwrap();
+        assert!(path_replay.replayed);
+        assert_eq!(path_replay.result.payload, image_execution.result.payload);
+        let original_source =
+            std::fs::read(image_updated["avatar"]["path"].as_str().unwrap()).unwrap();
+        let crop_patch = parse_patch(
+            &fixture.database,
+            json!({"agentId":"agent_2","requestId":Uuid::new_v4().to_string(),"expectedVersion":image_updated["version"],"avatarCenterX":0.5,"avatarCenterY":0.5,"avatarSize":0.5}),
+        );
+        update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            crop_patch.clone(),
+        )
+        .unwrap();
+        assert!(
+            update_member(&mut fixture.database, &fixture.directory, &run, crop_patch)
+                .unwrap()
+                .replayed
+        );
+        let cropped = read(&fixture.database, "agent_2");
+        assert_eq!(
+            cropped["avatar"]["displayCrop"],
+            json!({"centerX":0.5,"centerY":0.5,"size":0.5})
+        );
+        assert_eq!(
+            std::fs::read(cropped["avatar"]["path"].as_str().unwrap()).unwrap(),
+            original_source
+        );
+        let invalid_crop = parse_patch(
+            &fixture.database,
+            json!({"agentId":"agent_2","requestId":Uuid::new_v4().to_string(),"expectedVersion":cropped["version"],"teamRole":"Must roll back crop","avatarCenterX":0.0,"avatarCenterY":0.0,"avatarSize":1.0}),
+        );
+        assert!(
+            update_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &run,
+                invalid_crop
+            )
+            .is_err()
+        );
+        assert_eq!(
+            read(&fixture.database, "agent_2")["teamRole"],
+            "Image and text"
+        );
+        assert!(
+            update_member(&mut fixture.database, &fixture.directory, &run, image_patch)
+                .unwrap()
+                .replayed
+        );
+        // Legacy get and crop-only update must use the same source coordinates.
+        // Image geometry and GIF cases stay in member_avatar's lower-cost owner.
+        let legacy_crop = crate::member_avatar::MemberAvatarCrop {
+            center_x: 0.25,
+            center_y: 0.2,
+            size: 0.5,
+        };
+        let icon = image::load_from_memory(&original_source)
+            .unwrap()
+            .crop_imm(0, 0, 200, 200)
+            .resize_exact(192, 192, image::imageops::FilterType::Lanczos3);
+        let mut icon_bytes = std::io::Cursor::new(Vec::new());
+        icon.write_to(&mut icon_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let legacy = crate::member_avatar::save_managed_member_avatar(
+            &fixture.directory,
+            &original_source,
+            icon_bytes.get_ref(),
+            400,
+            500,
+            legacy_crop.clone(),
+        )
+        .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET avatar_ref=?1 WHERE id='agent_2'",
+                [&legacy.avatar_ref],
+            )
+            .unwrap();
+        let legacy_read = read(&fixture.database, "agent_2");
+        assert_eq!(
+            legacy_read["avatar"]["displayCrop"],
+            serde_json::to_value(&legacy_crop).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(legacy_read["avatar"]["path"].as_str().unwrap()).unwrap(),
+            original_source
+        );
+        let legacy_source = fixture
+            .directory
+            .join("member-avatars")
+            .join(legacy.avatar_ref.rsplit('/').next().unwrap())
+            .join("source.png");
+        std::fs::remove_file(&legacy_source).unwrap();
+        let before_count = file_count();
+        let unavailable = read(&fixture.database, "agent_2");
+        assert_eq!(
+            unavailable["avatar"],
+            json!({"path":null,"status":"unavailable","displayCrop":null})
+        );
+        assert_eq!(
+            unavailable["professionalResponsibilities"],
+            legacy_read["professionalResponsibilities"]
+        );
+        assert_eq!(unavailable["version"], legacy_read["version"]);
+        assert_eq!(file_count(), before_count);
+        assert!(
+            crate::member_avatar::read_managed_member_avatar(
+                &fixture.directory,
+                &legacy.avatar_ref,
+                false,
+            )
+            .unwrap()
+            .is_some(),
+            "existing icon must not mask a missing source in Agent get"
+        );
+        std::fs::write(&legacy_source, &original_source).unwrap();
+        let legacy_patch = parse_patch(
+            &fixture.database,
+            json!({"agentId":"agent_2","requestId":Uuid::new_v4().to_string(),"expectedVersion":legacy_read["version"],"avatarCenterX":0.75,"avatarCenterY":0.8,"avatarSize":0.5}),
+        );
+        update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            legacy_patch,
+        )
+        .unwrap();
+        let cropped = read(&fixture.database, "agent_2");
+        assert_eq!(
+            cropped["avatar"]["displayCrop"],
+            json!({"centerX":0.75,"centerY":0.8,"size":0.5})
+        );
+        assert_eq!(
+            std::fs::read(cropped["avatar"]["path"].as_str().unwrap()).unwrap(),
+            original_source
+        );
+        // Built-in get and crop-only update must retain the image the Agent saw.
+        // The avatar owner covers the four presets' exact pixel geometry.
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET avatar_ref=?1 WHERE id='agent_2'",
+                [crate::member_avatar::LUOKE_AVATAR_REF],
+            )
+            .unwrap();
+        let builtin = read(&fixture.database, "agent_2");
+        assert!(builtin["avatar"]["displayCrop"].is_null());
+        let builtin_bytes = std::fs::read(builtin["avatar"]["path"].as_str().unwrap()).unwrap();
+        let builtin_patch = parse_patch(
+            &fixture.database,
+            json!({"agentId":"agent_2","requestId":Uuid::new_v4().to_string(),"expectedVersion":builtin["version"],"avatarCenterX":0.375,"avatarCenterY":0.625,"avatarSize":0.5}),
+        );
+        let execution = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            builtin_patch.clone(),
+        )
+        .unwrap();
+        let replay = update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            builtin_patch,
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload, execution.result.payload);
+        let cropped = read(&fixture.database, "agent_2");
+        assert_eq!(
+            cropped["version"].as_i64().unwrap(),
+            builtin["version"].as_i64().unwrap() + 1
+        );
+        assert_eq!(
+            cropped["professionalResponsibilities"],
+            builtin["professionalResponsibilities"]
+        );
+        assert_eq!(
+            cropped["avatar"]["displayCrop"],
+            json!({"centerX":0.375,"centerY":0.625,"size":0.5})
+        );
+        assert_eq!(
+            std::fs::read(cropped["avatar"]["path"].as_str().unwrap()).unwrap(),
+            builtin_bytes
+        );
+        let clear_patch = parse_patch(
+            &fixture.database,
+            json!({"agentId":"agent_2","requestId":Uuid::new_v4().to_string(),"expectedVersion":cropped["version"],"teamRole":"","personalityTraits":[],"clearAvatar":true}),
+        );
+        update_member(&mut fixture.database, &fixture.directory, &run, clear_patch).unwrap();
+        let cleared = read(&fixture.database, "agent_2");
+        assert_eq!(
+            cleared["avatar"],
+            json!({"path":null,"status":"absent","displayCrop":null})
+        );
+        assert_eq!(cleared["teamRole"], "");
+        assert_eq!(cleared["personalityTraits"], json!([]));
+        let legacy_duties = "\u{feff}legacy duties\u{feff}";
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET professional_responsibilities=?1 WHERE id='agent_2'",
+                [legacy_duties],
+            )
+            .unwrap();
+        let legacy_patch = parse_patch(
+            &fixture.database,
+            json!({
+                "agentId":"agent_2","requestId":Uuid::new_v4().to_string(),
+                "expectedVersion":cleared["version"],"teamRole":"Preserve omitted legacy duties"
+            }),
+        );
+        update_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &run,
+            legacy_patch,
+        )
+        .unwrap();
+        assert_eq!(
+            read(&fixture.database, "agent_2")["professionalResponsibilities"],
+            legacy_duties
+        );
+        assert!(
+            update_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &run,
+                patch.clone()
+            )
+            .unwrap()
+            .replayed
+        );
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp_member SET status='left' WHERE camp_id=?1 AND agent_id='agent_2'",
+                [&fixture.camp_id],
+            )
+            .unwrap();
+        assert!(update_member(&mut fixture.database, &fixture.directory, &run, patch).is_err());
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status='removed',removed_at='2026-10-06T00:00:00Z' WHERE id='agent_3'",
+                [],
+            )
+            .unwrap();
+        let list = list_members(fixture.database.connection(), &run).unwrap();
+        assert_eq!(list["items"].as_array().unwrap().len(), 1);
+        assert!(
+            authorize_member_target(fixture.database.connection(), &run, "agent_3", false).is_err()
+        );
+        fixture.database.connection().execute("UPDATE camp_message SET author_type='agent',author_id='agent_2' WHERE id IN (SELECT message_id FROM agent_run_input WHERE agent_run_id=?1)",[&fixture.source_run_id]).unwrap();
+        assert!(
+            authorize_member_target(fixture.database.connection(), &run, "agent_1", true).is_err()
+        );
+        assert!(
+            authorize_member_target(fixture.database.connection(), &run, "agent_1", false).is_ok()
+        );
+    }
+
+    #[test]
+    fn confirmed_user_input_can_create_one_idempotent_member_but_agent_input_cannot() {
+        use crate::member_studio::{MemberCreateInput, resolve_member_avatar_input};
+        let mut fixture = Fixture::new();
+        let authenticated_run = TeamToolService::default()
+            .authenticate_attested_binding(
+                &fixture.database,
+                &fixture.credential.native_binding_id,
+                &fixture.credential.binding_credential,
+                "member-create-input-regression",
+                &fixture.source_run_id,
+                fixture.source_epoch,
+            )
+            .unwrap();
+        let creation_key = Uuid::new_v4().to_string();
+        let input = crate::member_studio::MemberCreateInput {
+            creation_key: creation_key.clone(),
+            display_name: "Nova Test Member".to_string(),
+            team_role: "Researcher".to_string(),
+            professional_responsibilities: "😀\n\"中".repeat(2_500),
+            personality_traits: vec!["Precise".to_string()],
+            working_principles: "State evidence and uncertainty.".to_string(),
+            growth_topic: "Shorten feedback loops.".to_string(),
+            avatar_file: None,
+        };
+        let original_messages: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message WHERE camp_id=?1",
+                [&fixture.camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // A receipt failure must roll back the member and helper preference as one command.
+        fixture.database.connection().execute_batch("CREATE TEMP TRIGGER reject_member_receipt BEFORE INSERT ON member_creation BEGIN SELECT RAISE(ABORT,'receipt failure'); END").unwrap();
+        assert!(
+            crate::member_studio::create_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &authenticated_run,
+                input.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            crate::member_studio::last_creation_helper(fixture.database.connection())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_profile WHERE display_name='Nova Test Member'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        fixture
+            .database
+            .connection()
+            .execute_batch("DROP TRIGGER reject_member_receipt")
+            .unwrap();
+        let first = crate::member_studio::create_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &authenticated_run,
+            input.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.execution.result.status, CommandResultStatus::Applied);
+        assert!(!first.execution.replayed);
+        assert!(first.avatar_ref.is_none());
+        let saved: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT professional_responsibilities FROM agent_profile WHERE id=?1",
+                [first.execution.result.payload["agentId"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, input.professional_responsibilities);
+        let mut oversized = input.clone();
+        oversized.creation_key = Uuid::new_v4().to_string();
+        oversized.display_name = "Oversize must not exist".into();
+        oversized.professional_responsibilities.push('界');
+        assert!(
+            crate::member_studio::create_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &authenticated_run,
+                oversized
+            )
+            .is_err()
+        );
+        assert_eq!(fixture.database.connection().query_row("SELECT count(*) FROM agent_profile WHERE display_name='Oversize must not exist'", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+        let replay = crate::member_studio::create_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &authenticated_run,
+            input,
+        )
+        .unwrap();
+        assert!(replay.execution.replayed);
+        assert_eq!(
+            replay.execution.result.payload["agentId"],
+            first.execution.result.payload["agentId"]
+        );
+        let receipts = crate::member_studio::list_member_creations(
+            fixture.database.connection(),
+            &fixture.camp_id,
+        )
+        .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].display_name, "Nova Test Member");
+        assert_eq!(receipts[0].creator_agent_id, "agent_1");
+        assert_eq!(
+            receipts[0].source_agent_run_id.as_deref(),
+            Some(authenticated_run.agent_run_id.as_str())
+        );
+        // Pre-association snapshots stay readable; never reconstruct a Run from timestamps.
+        let mut legacy_receipt = serde_json::to_value(&receipts[0]).unwrap();
+        legacy_receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceAgentRunId");
+        assert!(
+            serde_json::from_value::<crate::member_studio::MemberCreationView>(legacy_receipt)
+                .unwrap()
+                .source_agent_run_id
+                .is_none()
+        );
+        assert_eq!(
+            crate::member_studio::last_creation_helper(fixture.database.connection())
+                .unwrap()
+                .as_deref(),
+            Some("agent_1")
+        );
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM camp_message WHERE camp_id=?1",
+                    [&fixture.camp_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            original_messages
+        );
+        let created_id = first.execution.result.payload["agentId"].as_str().unwrap();
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM camp_member WHERE agent_id=?1",
+                    [created_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let created_get = crate::member_tool::MemberGetInput {
+            agent_id: created_id.into(),
+        };
+        let created_profile = crate::member_tool::get_member(
+            fixture.database.connection(),
+            &fixture.directory,
+            &fixture.directory,
+            &authenticated_run,
+            &created_get,
+        )
+        .unwrap();
+        assert_eq!(created_profile["displayName"], "Nova Test Member");
+        let changed_profile = crate::member_tool::update_member(&mut fixture.database,&fixture.directory,&authenticated_run,serde_json::from_value(json!({"requestId":Uuid::new_v4().to_string(),"agentId":created_id,"expectedVersion":1,"growthTopic":"Revised after creation"})).unwrap()).unwrap();
+        assert_eq!(changed_profile.result.payload["version"], 2);
+        assert_eq!(
+            crate::member_studio::list_member_creations(
+                fixture.database.connection(),
+                &fixture.camp_id
+            )
+            .unwrap()[0]
+                .display_name,
+            "Nova Test Member"
+        );
+        for scope in [
+            AuthenticatedTeamToolRun {
+                agent_id: "agent_2".into(),
+                ..authenticated_run.clone()
+            },
+            AuthenticatedTeamToolRun {
+                camp_id: "other-thread".into(),
+                ..authenticated_run.clone()
+            },
+        ] {
+            assert!(
+                crate::member_tool::authorize_member_target(
+                    fixture.database.connection(),
+                    &scope,
+                    created_id,
+                    false
+                )
+                .is_err()
+            );
+        }
+        let subsequent_run = AuthenticatedTeamToolRun {
+            agent_run_id: "later-authenticated-run".into(),
+            ..authenticated_run.clone()
+        };
+        assert!(
+            crate::member_tool::authorize_member_target(
+                fixture.database.connection(),
+                &subsequent_run,
+                created_id,
+                false
+            )
+            .is_ok()
+        );
+        fixture.database.connection().execute("UPDATE agent_profile SET display_name='Changed later', profile_status='away' WHERE id=?1", [created_id]).unwrap();
+        assert_eq!(
+            crate::member_studio::list_member_creations(
+                fixture.database.connection(),
+                &fixture.camp_id
+            )
+            .unwrap()[0]
+                .display_name,
+            "Nova Test Member"
+        );
+        assert_eq!(
+            crate::read_model::ReadModelService
+                .camp_open_projection(&mut fixture.database, &fixture.camp_id)
+                .unwrap()
+                .member_creations
+                .len(),
+            1
+        );
+        let changed = crate::member_studio::create_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &authenticated_run,
+            crate::member_studio::MemberCreateInput {
+                creation_key: creation_key.clone(),
+                display_name: "Nova Test Member".to_string(),
+                team_role: "Changed after confirmation".to_string(),
+                professional_responsibilities: "Synthesize bounded evidence.".to_string(),
+                personality_traits: vec!["Precise".to_string()],
+                working_principles: "State evidence and uncertainty.".to_string(),
+                growth_topic: "Shorten feedback loops.".to_string(),
+                avatar_file: None,
+            },
+        )
+        .unwrap();
+        assert!(changed.execution.replayed);
+        assert_eq!(changed.execution.result.payload["agentId"], created_id);
+
+        let (_, workspace) = TeamToolService::default()
+            .agent_file_ingress_scope(
+                &fixture.database,
+                &authenticated_run.agent_run_id,
+                authenticated_run.execution_epoch,
+            )
+            .unwrap()
+            .unwrap();
+        let relative_source = workspace.path().join("portrait.png");
+        let absolute_source = fixture.directory.join("portrait.png");
+        for (path, color) in [
+            (&relative_source, [24, 48, 96, 255]),
+            (&absolute_source, [96, 48, 24, 255]),
+        ] {
+            image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+                400,
+                500,
+                image::Rgba(color),
+            ))
+            .save(path)
+            .unwrap();
+        }
+        // The same single create command accepts an intact animation; codec
+        // frame semantics are owned by member_avatar's lower-cost tests.
+        {
+            let file = std::fs::File::create(workspace.path().join("portrait.gif")).unwrap();
+            let mut encoder = gif::Encoder::new(file, 400, 500, &[24, 48, 96, 96, 48, 24]).unwrap();
+            encoder.set_repeat(gif::Repeat::Infinite).unwrap();
+            for color in [0, 1] {
+                encoder
+                    .write_frame(&gif::Frame {
+                        width: 400,
+                        height: 500,
+                        delay: 10,
+                        buffer: std::borrow::Cow::Owned(vec![color; 400 * 500]),
+                        ..gif::Frame::default()
+                    })
+                    .unwrap();
+            }
+        }
+        for (name, source, color) in [
+            (
+                "Run relative GIF avatar",
+                "./portrait.gif",
+                [24, 48, 96, 255],
+            ),
+            ("Run relative avatar", "./portrait.png", [24, 48, 96, 255]),
+            (
+                "Absolute avatar",
+                absolute_source.to_str().unwrap(),
+                [96, 48, 24, 255],
+            ),
+        ] {
+            let mut value = json!({"creationKey":Uuid::new_v4().to_string(),"displayName":name,"avatarFile":source});
+            resolve_member_avatar_input(
+                &fixture.database,
+                &authenticated_run,
+                MEMBER_CREATE_TOOL_NAME,
+                &mut value,
+            )
+            .unwrap();
+            if source == absolute_source.to_str().unwrap() {
+                assert_eq!(
+                    value["avatarFile"], source,
+                    "absolute input must stay unchanged"
+                );
+            }
+            let with_image = crate::member_studio::create_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &authenticated_run,
+                serde_json::from_value::<MemberCreateInput>(value).unwrap(),
+            )
+            .unwrap();
+            let avatar = crate::member_avatar::materialize_member_avatar(
+                &fixture.directory,
+                &fixture.directory,
+                with_image.avatar_ref.as_deref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                image::open(&avatar.path)
+                    .unwrap()
+                    .to_rgba8()
+                    .get_pixel(0, 0)
+                    .0,
+                color
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&relative_source, workspace.path().join("linked.png"))
+                .unwrap();
+            let mut value = json!({"creationKey":Uuid::new_v4().to_string(),"displayName":"Reject linked avatar","avatarFile":"./linked.png"});
+            resolve_member_avatar_input(
+                &fixture.database,
+                &authenticated_run,
+                MEMBER_CREATE_TOOL_NAME,
+                &mut value,
+            )
+            .unwrap();
+            assert_eq!(
+                value["avatarFile"],
+                json!(workspace.path().join("./linked.png"))
+            );
+            let rejected = crate::member_studio::create_member(
+                &mut fixture.database,
+                &fixture.directory,
+                &authenticated_run,
+                serde_json::from_value::<MemberCreateInput>(value).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                rejected
+                    .downcast_ref::<crate::member_studio::MemberOperationError>()
+                    .unwrap()
+                    .code,
+                "member.avatar_invalid"
+            );
+        }
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM camp_message WHERE camp_id=?1",
+                    [&fixture.camp_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            original_messages,
+            "avatar import must not publish attachments"
+        );
+
+        fixture
+            .database
+            .connection()
+            .execute(
+                r#"
+                UPDATE camp_message
+                SET author_type = 'agent', author_id = 'agent_2'
+                WHERE id IN (
+                    SELECT message_id FROM agent_run_input WHERE agent_run_id = ?1
+                )
+                "#,
+                [&fixture.source_run_id],
+            )
+            .unwrap();
+        let blocked = crate::member_studio::create_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &authenticated_run,
+            crate::member_studio::MemberCreateInput {
+                creation_key: Uuid::new_v4().to_string(),
+                display_name: "Blocked A2A Member".to_string(),
+                team_role: String::new(),
+                professional_responsibilities: String::new(),
+                personality_traits: Vec::new(),
+                working_principles: String::new(),
+                growth_topic: String::new(),
+                avatar_file: None,
+            },
+        )
+        .unwrap_err();
+        let blocked = blocked
+            .downcast_ref::<crate::member_studio::MemberOperationError>()
+            .unwrap();
+        assert_eq!(blocked.code, "member.user_confirmation_required");
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_profile WHERE display_name = 'Blocked A2A Member'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn public_send_atomically_persists_one_message_and_canonical_deliveries() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let invocation = fixture.public_send_invocation(
+            "public-send-union",
+            "Please inspect this @agent_2",
+            &["agent_2"],
+        );
+        let sent = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(sent.result.code, "camp_message.send_accepted");
+        assert_eq!(sent.result.payload["visibility"], "camp_public");
+        assert_eq!(
+            sent.result.payload["effectiveRecipients"],
+            json!(["agent_2"])
+        );
+        assert_eq!(
+            sent.result.payload["deliveryIds"].as_array().unwrap().len(),
+            1
+        );
+
+        let message_id = sent.result.payload["messageId"].as_str().unwrap();
+        let message: (String, String, String, String) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT body, effective_recipient_ids_json,
+                       recipient_presentation_json, source_operation_id
+                FROM camp_message WHERE id = ?1
+                "#,
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(message.0, "Please inspect this @芝士");
+        assert_eq!(message.1, r#"["agent_2"]"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&message.2).unwrap()["inlineOrder"],
+            json!(["agent_2"])
+        );
+        assert!(!message.3.is_empty());
+
+        let delivery: (String, String, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT recipient_agent_id, status, claimed_agent_run_id
+                FROM camp_message_delivery WHERE message_id = ?1
+                "#,
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            delivery,
+            ("agent_2".to_string(), "waiting".to_string(), None)
+        );
+
+        let replay = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload["messageId"], message_id);
+
+        let source_run_id = fixture.source_run_id.clone();
+        fixture.succeed_run(&source_run_id, fixture.source_epoch, "source completed");
+        let durable_replay = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert!(durable_replay.replayed);
+        assert_eq!(durable_replay.result.payload["messageId"], message_id);
+    }
+
+    #[test]
+    fn public_sends_to_first_time_recipient_create_one_conversation_and_one_batch_run() {
+        let mut fixture = Fixture::new();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "DELETE FROM conversation WHERE camp_id = ?1 AND agent_id = 'agent_2'",
+                [&fixture.camp_id],
+            )
+            .unwrap();
+        let conversation_count = |database: &Database| {
+            database
+                .connection()
+                .query_row(
+                    r#"
+                    SELECT COUNT(*) FROM conversation
+                    WHERE camp_id = ?1 AND agent_id = 'agent_2'
+                      AND kind = 'camp_member'
+                    "#,
+                    [&fixture.camp_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(conversation_count(&fixture.database), 0);
+
+        let invocation = fixture.public_send_invocation(
+            "public-send-first-time-recipient",
+            "Please take the next action",
+            &["agent_2"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(conversation_count(&fixture.database), 1);
+        let second = fixture.public_send_invocation(
+            "public-send-first-time-recipient-again",
+            "Please also include this follow-up",
+            &["agent_2"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &second)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(conversation_count(&fixture.database), 1);
+
+        let claimed =
+            crate::delivery_queue::claim_waiting_delivery_batches(&mut fixture.database, 100)
+                .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let (recipient_agent_id, invocation_kind, input_count): (String, String, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT conversation.agent_id, agent_run.invocation_kind,
+                       COUNT(*)
+                FROM agent_run
+                JOIN conversation ON conversation.id = agent_run.conversation_id
+                JOIN agent_run_input ON agent_run_input.agent_run_id = agent_run.id
+                WHERE agent_run.id = ?1
+                GROUP BY conversation.agent_id, agent_run.invocation_kind
+                "#,
+                [&claimed[0]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(recipient_agent_id, "agent_2");
+        assert_eq!(invocation_kind, "batch");
+        assert_eq!(input_count, 2);
+    }
+
+    #[test]
+    fn public_send_rejects_empty_and_oversized_bodies_without_publishing() {
+        let mut fixture = Fixture::new();
+        let message_count = |database: &Database| -> i64 {
+            database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM camp_message", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = message_count(&fixture.database);
+        for (body, code, message) in [
+            (
+                String::new(),
+                "message.invalid_input",
+                "body or at least one file",
+            ),
+            (
+                " \r\n\t ".to_string(),
+                "message.invalid_input",
+                "body or at least one file",
+            ),
+            (
+                "x".repeat(CAMP_MESSAGE_SEND_MAX_BODY_BYTES + 1),
+                "message.body_too_large",
+                "32 KiB",
+            ),
+            (
+                "中".repeat(CAMP_MESSAGE_SEND_MAX_BODY_BYTES / 3 + 1),
+                "message.body_too_large",
+                "32 KiB",
+            ),
+            (
+                "🌸".repeat(CAMP_MESSAGE_SEND_MAX_BODY_BYTES / 4 + 1),
+                "message.body_too_large",
+                "32 KiB",
+            ),
+        ] {
+            let invocation = fixture.public_send_invocation("invalid-body-send", &body, &[]);
+            let error = TeamToolService::default()
+                .send_public_message(&mut fixture.database, &invocation)
+                .unwrap_err();
+            let error = error.downcast_ref::<TeamToolInvocationError>().unwrap();
+            assert_eq!(error.code, code);
+            assert!(error.message.contains(message));
+            assert_eq!(message_count(&fixture.database), before);
+        }
+    }
+
+    #[test]
+    fn attachment_send_keeps_source_path_and_dispatches_without_projection_gate() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let mut invocation =
+            fixture.public_send_invocation("attachment-send-real-identities", "", &["agent_2"]);
+        let attachment_id = fixture.prepare_agent_source_attachment(
+            &mut invocation,
+            "frozen-agent-file.txt",
+            b"file",
+        );
+
+        let sent = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        let message_id = sent.result.payload["messageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let delivery_id = sent.result.payload["deliveryIds"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(Uuid::parse_str(&message_id).is_ok());
+        assert!(Uuid::parse_str(&delivery_id).is_ok());
+        let body: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT body FROM camp_message WHERE id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "");
+        let source_json: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT source_attachments_json FROM camp_message WHERE id=?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sources: Vec<crate::local_attachment_source::LocalAttachmentSourceRef> =
+            serde_json::from_str(&source_json).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, attachment_id);
+        let path = fixture.directory.join("workspace/frozen-agent-file.txt");
+        assert_eq!(sources[0].source_path, path.to_string_lossy());
+        assert_eq!(
+            sent.result.payload["attachments"][0]["path"],
+            path.to_string_lossy().as_ref()
+        );
+        let managed_count: i64 = fixture.database.connection().query_row(
+            "SELECT (SELECT count(*) FROM managed_attachment)+(SELECT count(*) FROM message_attachment)", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(managed_count, 0, "publishing must not make a managed copy");
+        // Replacement save changes bytes and size while preserving identity and location.
+        let replacement = path.with_extension("tmp");
+        std::fs::write(&replacement, b"edited replacement").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        let mut again = fixture.public_send_invocation("same-path-after-edit", "edited", &[]);
+        again.input.files = vec![path.to_string_lossy().into_owned()];
+        again.source_files = crate::local_attachment_source::observe_agent_source_attachments(
+            &again.input.files,
+            &fixture.directory.join("workspace"),
+        )
+        .unwrap();
+        let resent = service
+            .send_public_message(&mut fixture.database, &again)
+            .unwrap();
+        assert_eq!(
+            resent.result.payload["attachments"][0]["attachmentId"],
+            attachment_id
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"edited replacement");
+        // External, temporary, default-output and directory sources use the same
+        // public send boundary; none enters the historical ingest/view tables.
+        let output = crate::storage_layout::ThreadOutputDirectory::prepare(
+            &fixture.database,
+            &fixture.camp_id,
+        )
+        .unwrap()
+        .output_root;
+        let external = fixture.directory.join("external/report.txt");
+        let temporary = fixture.directory.join("run-tmp/report.txt");
+        let permanent = output.join("report.txt");
+        let directory = fixture.directory.join("site");
+        for file in [&external, &temporary, &permanent] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"original source").unwrap();
+        }
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("index.html"), b"<link href='./style.css'>").unwrap();
+        std::fs::write(directory.join("style.css"), b"body{color:red}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let mut variants = fixture.public_send_invocation("all-source-locations", "", &[]);
+        variants.input.files = [&external, &temporary, &permanent, &directory]
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        variants.source_files = crate::local_attachment_source::observe_agent_source_attachments(
+            &variants.input.files,
+            &fixture.directory.join("workspace"),
+        )
+        .unwrap();
+        let published = service
+            .send_public_message(&mut fixture.database, &variants)
+            .unwrap();
+        assert_eq!(
+            published.result.payload["attachments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        for (index, expected) in variants.input.files.iter().enumerate() {
+            assert_eq!(
+                published.result.payload["attachments"][index]["path"],
+                expected.as_str()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
+        let mut other = Fixture::new();
+        let mut forward = other.public_send_invocation("cross-camp-reference", "", &[]);
+        forward.input.files = vec![external.to_string_lossy().into_owned()];
+        forward.source_files = crate::local_attachment_source::observe_agent_source_attachments(
+            &forward.input.files,
+            &other.directory.join("workspace"),
+        )
+        .unwrap();
+        let forwarded = service
+            .send_public_message(&mut other.database, &forward)
+            .unwrap();
+        assert_eq!(
+            forwarded.result.payload["attachments"][0]["path"],
+            published.result.payload["attachments"][0]["path"]
+        );
+        assert_ne!(
+            forwarded.result.payload["attachments"][0]["attachmentId"],
+            published.result.payload["attachments"][0]["attachmentId"]
+        );
+        assert_eq!(std::fs::read(&external).unwrap(), b"original source");
+        let count: i64 = fixture.database.connection().query_row("SELECT (SELECT count(*) FROM managed_attachment)+(SELECT count(*) FROM message_attachment)", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        // Internal transport replay does not require the source to remain readable.
+        std::fs::remove_file(&path).unwrap();
+        again.source_files.clear();
+        let replay = service
+            .send_public_message(&mut fixture.database, &again)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload, resent.result.payload);
+        let delivery_state: (String, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT status, claimed_agent_run_id
+                FROM camp_message_delivery WHERE id = ?1
+                "#,
+                [&delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delivery_state, ("waiting".to_string(), None));
+    }
+
+    #[test]
+    fn running_source_sends_fourteen_mib_without_waiting_for_camp_publication() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let mut invocation = fixture.public_send_invocation(
+            "attachment-send-while-source-running",
+            "",
+            &["agent_2"],
+        );
+        let four_mib = vec![b'a'; 4 * 1024 * 1024];
+        let three_mib = vec![b'b'; 3 * 1024 * 1024];
+        let attachment_ids = fixture.prepare_agent_source_attachments(
+            &mut invocation,
+            &[
+                ("one.bin", four_mib.as_slice()),
+                ("two.bin", four_mib.as_slice()),
+                ("three.bin", three_mib.as_slice()),
+                ("four.bin", three_mib.as_slice()),
+            ],
+        );
+        assert_eq!(attachment_ids.len(), 4);
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT status FROM agent_run WHERE id = ?1",
+                    [&fixture.source_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "running"
+        );
+
+        let sent = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        let state: (String, Option<String>, i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT delivery.status, delivery.claimed_agent_run_id,
+                       (SELECT COUNT(*) FROM managed_attachment WHERE camp_id = delivery.camp_id),
+                       (SELECT COUNT(*) FROM camp_attachment_view_operation
+                        WHERE camp_id = delivery.camp_id)
+                FROM camp_message_delivery AS delivery WHERE delivery.id = ?1
+                "#,
+                [delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "waiting");
+        assert_eq!(state.1, None);
+        assert_eq!(state.2, 0);
+        assert_eq!(
+            sent.result.payload["attachments"].as_array().unwrap().len(),
+            4
+        );
+        assert_eq!(
+            state.3, 0,
+            "new send must not enter legacy Camp publication"
+        );
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT status FROM agent_run WHERE id = ?1",
+                    [&fixture.source_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "running",
+            "sending attachments must not stop or fence the source Run"
+        );
+    }
+
+    #[test]
+    fn public_only_rejects_routing_fields_and_bypasses_every_agent_addressing_effect() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let before: (i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT COUNT(*),
+                       (SELECT COUNT(*) FROM camp_message_delivery)
+                FROM camp_message
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let mut conflict = fixture.public_send_invocation(
+            "public-only-conflict",
+            "must not persist",
+            &["agent_2"],
+        );
+        conflict.input.public_only = true;
+        conflict.input.task_id = Some("task-not-loaded".to_string());
+        let rejected = service
+            .send_public_message(&mut fixture.database, &conflict)
+            .unwrap();
+        assert_eq!(rejected.result.status, CommandResultStatus::Rejected);
+        assert_eq!(rejected.result.code, "message.public_only_conflict");
+        assert_eq!(
+            rejected.result.payload,
+            json!({
+                "message": "--public-only cannot be combined with Agent-routing inputs.",
+                "details": {
+                    "conflictingFields": ["to"],
+                    "newRequestIdRequired": true,
+                }
+            })
+        );
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM camp_message", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            before.0
+        );
+
+        fixture
+            .database
+            .connection()
+            .execute_batch(
+                "UPDATE agent_profile SET display_name = '爱丽丝' WHERE id = 'agent_2';
+                 UPDATE agent_profile SET display_name = '鲍勃' WHERE id = 'agent_3';",
+            )
+            .unwrap();
+        let literal_body = "@爱丽丝 @鲍勃 @agent_2 谢谢";
+        let mut invocation = fixture.public_send_invocation(
+            "public-only-literal-agent-lookalikes",
+            literal_body,
+            &[],
+        );
+        invocation.input.public_only = true;
+        invocation.input.mention_user = true;
+        invocation.input.task_id = Some("retired-task-reference".into());
+        crate::task_capability::set(fixture.database.connection(), false).unwrap();
+        let sent = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(sent.result.payload["agentAddressingMode"], "public_only");
+        assert_eq!(sent.result.payload["effectiveRecipients"], json!([]));
+        assert_eq!(sent.result.payload["deliveryIds"], json!([]));
+        let message_id = sent.result.payload["messageId"].as_str().unwrap();
+        let persisted: (String, String, String, String, i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT body, structured_content_json, agent_addressing_mode,
+                       effective_recipient_ids_json,
+                       (SELECT COUNT(*) FROM camp_message_mention
+                        WHERE camp_message_id = message.id),
+                       (SELECT COUNT(*) FROM camp_message_delivery
+                        WHERE message_id = message.id)
+                FROM camp_message AS message
+                WHERE id = ?1
+                "#,
+                [message_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(persisted.0, format!("@你 {literal_body}"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&persisted.1).unwrap(),
+            json!([
+                {"kind": "current_user_mention", "userId": "local_user"},
+                {"kind": "text", "text": literal_body},
+            ])
+        );
+        assert_eq!(persisted.2, "public_only");
+        assert_eq!(persisted.3, "[]");
+        assert_eq!(persisted.4, 0);
+        assert_eq!(persisted.5, 0);
+        let event: Value = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT payload_json FROM event_log
+                WHERE event_type = 'camp_message.sent'
+                  AND entity_id = ?1
+                "#,
+                [message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|payload| serde_json::from_str(&payload).unwrap())
+            .unwrap();
+        assert_eq!(event["addressSource"], "agent_send");
+        assert_eq!(event["addressedAgentIds"], json!([]));
+        assert_eq!(event["deliveryIds"], json!([]));
+        let after_deliveries: i64 = fixture
+            .database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM camp_message_delivery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after_deliveries, before.1);
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM notification_occurrence WHERE semantic = 'user_mention' AND source_message_id = ?1",
+                    [message_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let replay = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload["agentAddressingMode"], "public_only");
+        assert_eq!(replay.result.payload["messageId"], message_id);
+
+        let mut mixed = fixture.public_send_invocation(
+            "public-only-inline-principal",
+            "\u{3000}@爱丽丝\u{a0}@鲍勃 @User @Principal 谢谢",
+            &[],
+        );
+        mixed.input.public_only = true;
+        let sent = service
+            .send_public_message(&mut fixture.database, &mixed)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(sent.result.payload["effectiveRecipients"], json!([]));
+        assert_eq!(sent.result.payload["deliveryIds"], json!([]));
+        let mixed_id = sent.result.payload["messageId"].as_str().unwrap();
+        let (content_json, attention_count, delivery_count): (String, i64, i64) = fixture.database.connection().query_row(
+            "SELECT structured_content_json,
+                (SELECT COUNT(*) FROM notification_occurrence WHERE source_message_id = message.id AND semantic = 'user_mention'),
+                (SELECT COUNT(*) FROM camp_message_delivery WHERE message_id = message.id)
+             FROM camp_message AS message WHERE id = ?1",
+            [mixed_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&content_json).unwrap(),
+            json!([
+                {"kind": "text", "text": "\u{3000}@爱丽丝\u{a0}@鲍勃 "},
+                {"kind": "current_user_mention", "userId": "local_user"},
+                {"kind": "text", "text": " "},
+                {"kind": "current_user_mention", "userId": "local_user"},
+                {"kind": "text", "text": " 谢谢"}
+            ])
+        );
+        assert_eq!(attention_count, 1);
+        assert_eq!(delivery_count, 0);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn public_send_resolves_line_leading_display_name_cluster_before_delivery() {
+        let mut fixture = Fixture::new();
+        fixture
+            .database
+            .connection()
+            .execute_batch(
+                "UPDATE agent_profile SET display_name = '爱丽丝' WHERE id = 'agent_2';
+                 UPDATE agent_profile SET display_name = '鲍勃' WHERE id = 'agent_3';",
+            )
+            .unwrap();
+        let invocation = fixture.public_send_invocation(
+            "public-send-display-name-cluster",
+            "@爱丽丝 @鲍勃 v35 实现完成，请做只读 CR。",
+            &[],
+        );
+
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(
+            sent.result.payload["effectiveRecipients"],
+            json!(["agent_2", "agent_3"])
+        );
+        assert_eq!(
+            sent.result.payload["deliveryIds"].as_array().unwrap().len(),
+            2
+        );
+        let message_id = sent.result.payload["messageId"].as_str().unwrap();
+        let (body, content_json, delivery_count): (String, String, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT message.body, message.structured_content_json,
+                       (SELECT COUNT(*) FROM camp_message_delivery
+                        WHERE message_id = message.id)
+                FROM camp_message AS message
+                WHERE message.id = ?1
+                "#,
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "@爱丽丝 @鲍勃 v35 实现完成，请做只读 CR。");
+        assert_eq!(
+            serde_json::from_str::<Value>(&content_json).unwrap(),
+            json!([
+                {"kind": "member_mention", "agentId": "agent_2"},
+                {"kind": "text", "text": " "},
+                {"kind": "member_mention", "agentId": "agent_3"},
+                {"kind": "text", "text": " v35 实现完成，请做只读 CR。"}
+            ])
+        );
+        assert_eq!(delivery_count, 2);
+
+        let literal_tail_body = "@爱丽丝 @Principal 请处理";
+        let literal_tail = fixture.public_send_invocation(
+            "public-send-display-name-cluster-literal-tail",
+            literal_tail_body,
+            &[],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &literal_tail)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(
+            sent.result.payload["effectiveRecipients"],
+            json!(["agent_2"])
+        );
+        assert_eq!(
+            sent.result.payload["deliveryIds"].as_array().unwrap().len(),
+            1
+        );
+        let content_json: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT structured_content_json FROM camp_message WHERE id = ?1",
+                [sent.result.payload["messageId"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&content_json).unwrap(),
+            json!([
+                {"kind": "member_mention", "agentId": "agent_2"},
+                {"kind": "text", "text": " "},
+                {"kind": "current_user_mention", "userId": "local_user"},
+                {"kind": "text", "text": " 请处理"}
+            ])
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn public_send_keeps_mid_line_display_name_alias_as_public_text() {
+        let mut fixture = Fixture::new();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET display_name = 'Alice' WHERE id = 'agent_2'",
+                [],
+            )
+            .unwrap();
+        let body = "让 Bob 分析一下 @Alice 提出的迁移方案";
+        let invocation =
+            fixture.public_send_invocation("public-send-mid-line-display-name", body, &[]);
+
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(sent.result.payload["effectiveRecipients"], json!([]));
+        assert_eq!(sent.result.payload["deliveryIds"], json!([]));
+        let message_id = sent.result.payload["messageId"].as_str().unwrap();
+        let (stored_body, content_json, delivery_count): (String, String, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT message.body, message.structured_content_json,
+                       (SELECT COUNT(*) FROM message_delivery
+                        WHERE message_id = message.id)
+                FROM camp_message AS message
+                WHERE message.id = ?1
+                "#,
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_body, body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&content_json).unwrap(),
+            json!([{"kind": "text", "text": body}])
+        );
+        assert_eq!(delivery_count, 0);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn recipient_free_public_send_creates_no_delivery_and_replies_to_frozen_anchor() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let trigger_message_id: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT anchor_message_id FROM agent_run WHERE id = ?1",
+                [&fixture.source_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let before: i64 = fixture
+            .database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM camp_message_delivery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let invocation = fixture.public_send_invocation(
+            "public-only-send",
+            "A public progress fact with no recipient.",
+            &[],
+        );
+        let sent = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(sent.result.payload["deliveryIds"], json!([]));
+        assert_eq!(sent.result.payload["effectiveRecipients"], json!([]));
+        let message_id = sent.result.payload["messageId"].as_str().unwrap();
+        let reply_to_message_id: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT reply_to_camp_message_id FROM camp_message WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reply_to_message_id, trigger_message_id);
+        let after: i64 = fixture
+            .database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM camp_message_delivery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, before);
+
+        let later = fixture.public_send_invocation(
+            "later-recipient-free-public-send",
+            "A later recipient-free public fact.",
+            &[],
+        );
+        let later = service
+            .send_public_message(&mut fixture.database, &later)
+            .unwrap();
+        assert_eq!(later.result.status, CommandResultStatus::Accepted);
+        assert_eq!(later.result.payload["deliveryIds"], json!([]));
+    }
+
+    #[test]
+    fn current_user_attention_is_orthogonal_atomic_and_replay_safe() {
+        for (source_body, explicit, public_only) in [
+            ("Please choose A or B", true, false),
+            ("@Principal Please choose A or B", false, false),
+            ("@Principal Please choose A or B", true, false),
+            ("@Principal Please choose A or B", false, true),
+            ("@Principal Please choose A or B", true, true),
+            ("@User Please choose A or B", false, false),
+            ("@User Please choose A or B", true, true),
+        ] {
+            let mut fixture = Fixture::new();
+            let service = TeamToolService::default();
+            let before_deliveries: i64 = fixture
+                .database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM camp_message_delivery", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let mut invocation =
+                fixture.public_send_invocation("public-current-user-attention", source_body, &[]);
+            invocation.input.mention_user = explicit;
+            invocation.input.public_only = public_only;
+
+            let sent = service
+                .send_public_message(&mut fixture.database, &invocation)
+                .unwrap();
+            assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+            assert_eq!(sent.result.payload["effectiveRecipients"], json!([]));
+            assert_eq!(sent.result.payload["deliveryIds"], json!([]));
+            let message_id = sent.result.payload["messageId"].as_str().unwrap();
+            let (body, content_json): (String, String) = fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT body, structured_content_json FROM camp_message WHERE id = ?1",
+                    [message_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(body, "@你 Please choose A or B");
+            assert_eq!(
+                serde_json::from_str::<Value>(&content_json).unwrap(),
+                json!([
+                    {"kind": "current_user_mention", "userId": "local_user"},
+                    {"kind": "text", "text": "Please choose A or B"}
+                ])
+            );
+            let notification: (String, String, String) = fixture
+                .database
+                .connection()
+                .query_row(
+                    r#"
+                    SELECT semantic, recipient_user_id, source_message_id
+                    FROM notification_occurrence
+                    WHERE semantic = 'user_mention'
+                    "#,
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(notification.0, "user_mention");
+            assert_eq!(notification.1, "local_user");
+            assert_eq!(notification.2, message_id);
+            let after_deliveries: i64 = fixture
+                .database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM camp_message_delivery", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(after_deliveries, before_deliveries);
+
+            let replay = service
+                .send_public_message(&mut fixture.database, &invocation)
+                .unwrap();
+            assert!(replay.replayed);
+            assert_eq!(replay.result.payload["messageId"], message_id);
+            let notification_count: i64 = fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM notification_occurrence WHERE semantic = 'user_mention'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(notification_count, 1);
+        }
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn current_user_text_lookalikes_do_not_create_attention() {
+        let mut fixture = Fixture::new();
+        let invocation = fixture.public_send_invocation(
+            "public-current-user-lookalikes",
+            "@你 @local_user @local-user are plain text",
+            &[],
+        );
+        TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let notification_count: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM notification_occurrence WHERE semantic = 'user_mention'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notification_count, 0);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn legacy_task_link_is_ignored_without_changing_explicit_recipients() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let mut ambiguous = fixture.public_send_invocation(
+            "task-user-only-is-ambiguous",
+            "Notify the User without a task relation",
+            &[],
+        );
+        ambiguous.input.mention_user = true;
+        ambiguous.input.task_id = Some(fixture.task_id.clone());
+        let rejected = service
+            .send_public_message(&mut fixture.database, &ambiguous)
+            .unwrap();
+        assert_eq!(rejected.result.status, CommandResultStatus::Accepted);
+        assert_eq!(rejected.result.code, "camp_message.send_accepted");
+        let rejected_effects: (i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM camp_message WHERE id = ?1),
+                    (SELECT COUNT(*) FROM notification_occurrence
+                     WHERE semantic = 'user_mention')
+                "#,
+                [rejected.result.payload["messageId"].as_str().unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rejected_effects, (1, 1));
+
+        let target_task = CollaborationService::default()
+            .create_task(
+                &mut fixture.database,
+                &user_envelope(
+                    "create-user-attention-target-task",
+                    Some(&fixture.camp_id),
+                    CreateTaskCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        title: "User attention target task".to_string(),
+                        assignee_agent_id: "agent_2".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        let target_task_id = target_task.result.payload["taskId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut accepted = fixture.public_send_invocation(
+            "task-agent-and-user-is-valid",
+            "Coordinate the linked responsibility",
+            &["agent_2"],
+        );
+        accepted.input.mention_user = true;
+        accepted.input.task_id = Some(target_task_id);
+        crate::task_capability::set(fixture.database.connection(), false).unwrap();
+        let sent = service
+            .send_public_message(&mut fixture.database, &accepted)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(
+            sent.result.payload["effectiveRecipients"],
+            json!(["agent_2"])
+        );
+        let replay = service
+            .send_public_message(&mut fixture.database, &accepted)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload, sent.result.payload);
+    }
+
+    #[test]
+    fn notification_write_failure_rolls_back_the_entire_send() {
+        let mut fixture = Fixture::new();
+        fixture
+            .database
+            .connection()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER reject_test_user_mention_notification
+                BEFORE INSERT ON notification_occurrence
+                WHEN NEW.semantic = 'user_mention'
+                BEGIN
+                    SELECT RAISE(ABORT, 'test notification failure');
+                END;
+                "#,
+            )
+            .unwrap();
+        let before_sequence: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT last_message_sequence FROM camp WHERE id = ?1",
+                [&fixture.camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut invocation = fixture.public_send_invocation(
+            "notification-failure-is-atomic",
+            "No partial message",
+            &["agent_2"],
+        );
+        invocation.input.mention_user = true;
+        let error = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("test notification failure"));
+        let after: (i64, i64, i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT
+                    last_message_sequence,
+                    (SELECT COUNT(*) FROM camp_message WHERE body LIKE '%No partial message%'),
+                    (SELECT COUNT(*) FROM message_delivery
+                     WHERE source_agent_run_id = ?2 AND created_at >= '2000-01-01'),
+                    (SELECT COUNT(*) FROM notification_occurrence
+                     WHERE semantic = 'user_mention')
+                FROM camp WHERE id = ?1
+                "#,
+                rusqlite::params![fixture.camp_id, fixture.source_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(after.0, before_sequence);
+        assert_eq!(after.1, 0);
+        assert_eq!(after.2, 0);
+        assert_eq!(after.3, 0);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn agent_send_rejects_a_tombstoned_frozen_reply_anchor() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp_message SET tombstoned_at = '2026-08-12T00:00:00Z' WHERE id = (SELECT anchor_message_id FROM agent_run WHERE id = ?1)",
+                [&fixture.source_run_id],
+            )
+            .unwrap();
+
+        let invocation = fixture.public_send_invocation(
+            "tombstoned-trigger-send",
+            "This message must not be persisted.",
+            &[],
+        );
+        let error = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Agent-authored send reply anchor is unavailable")
+        );
+        let persisted: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message WHERE body = 'This message must not be persisted.'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 0);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn batch_a2a_send_does_not_require_a_legacy_trigger_delivery() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let forward_invocation = fixture.public_send_invocation(
+            "missing-trigger-forward",
+            "Create an A2A child",
+            &["agent_2"],
+        );
+        let forward = service
+            .send_public_message(&mut fixture.database, &forward_invocation)
+            .unwrap();
+        let delivery_id = forward.result.payload["deliveryIds"][0].as_str().unwrap();
+        let (child_run_id, _child_epoch, child_credential) =
+            fixture.claim_delivery_run(delivery_id, "native-missing-trigger");
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET trigger_message_delivery_id = NULL WHERE id = ?1",
+                [&child_run_id],
+            )
+            .unwrap();
+
+        let invocation = fixture.public_send_invocation_for(
+            &child_credential,
+            "missing-trigger-send",
+            "This message must not be persisted either.",
+            &[],
+        );
+        let sent = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        let persisted: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message WHERE body = 'This message must not be persisted either.'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn reverse_a2a_message_queues_for_a_busy_caller_then_claims_as_a_batch() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let forward_invocation = fixture.public_send_invocation(
+            "forward-to-agent-2",
+            "Please inspect this",
+            &["agent_2"],
+        );
+        let forward = service
+            .send_public_message(&mut fixture.database, &forward_invocation)
+            .unwrap();
+        let forward_message_id = forward.result.payload["messageId"].as_str().unwrap();
+        let forward_delivery_id = forward.result.payload["deliveryIds"][0].as_str().unwrap();
+        let (_child_run_id, _child_epoch, child_credential) =
+            fixture.claim_delivery_run(forward_delivery_id, "native-child-return");
+
+        let return_invocation = fixture.public_send_invocation_for(
+            &child_credential,
+            "return-to-agent-1",
+            "Review complete @agent_1",
+            &["agent_1"],
+        );
+        let returned = service
+            .send_public_message(&mut fixture.database, &return_invocation)
+            .unwrap();
+        assert_eq!(returned.result.status, CommandResultStatus::Accepted);
+        assert_eq!(
+            returned.result.payload["effectiveRecipients"],
+            json!(["agent_1"])
+        );
+        assert_eq!(
+            returned.result.payload["deliveryIds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let return_message_id = returned.result.payload["messageId"].as_str().unwrap();
+        let reply_to_message_id: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT reply_to_camp_message_id FROM camp_message WHERE id = ?1",
+                [return_message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reply_to_message_id, forward_message_id);
+
+        let return_delivery_id = returned.result.payload["deliveryIds"][0].as_str().unwrap();
+        let waiting: (String, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status, claimed_agent_run_id FROM camp_message_delivery WHERE id = ?1",
+                [return_delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(waiting, ("waiting".to_string(), None));
+
+        let source_run_id = fixture.source_run_id.clone();
+        fixture.succeed_run(&source_run_id, fixture.source_epoch, "caller yielded");
+        crate::delivery_queue::claim_waiting_delivery_batches(&mut fixture.database, 100).unwrap();
+        let claimed: (String, String) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT delivery.status, run.invocation_kind
+                FROM camp_message_delivery AS delivery
+                JOIN agent_run AS run ON run.id = delivery.claimed_agent_run_id
+                WHERE delivery.id = ?1
+                "#,
+                [return_delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claimed, ("claimed".to_string(), "batch".to_string()));
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn multi_hop_a2a_can_address_an_earlier_member_without_legacy_lineage_gates() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let to_agent_2_invocation =
+            fixture.public_send_invocation("ancestor-chain-agent-2", "Ask agent 2", &["agent_2"]);
+        let to_agent_2 = service
+            .send_public_message(&mut fixture.database, &to_agent_2_invocation)
+            .unwrap();
+        let agent_2_delivery_id = to_agent_2.result.payload["deliveryIds"][0]
+            .as_str()
+            .unwrap();
+        let (_agent_2_run_id, _agent_2_epoch, agent_2_credential) =
+            fixture.claim_delivery_run(agent_2_delivery_id, "native-ancestor-agent-2");
+        let to_agent_3_invocation = fixture.public_send_invocation_for(
+            &agent_2_credential,
+            "ancestor-chain-agent-3",
+            "Ask agent 3",
+            &["agent_3"],
+        );
+        let to_agent_3 = service
+            .send_public_message(&mut fixture.database, &to_agent_3_invocation)
+            .unwrap();
+        let agent_3_delivery_id = to_agent_3.result.payload["deliveryIds"][0]
+            .as_str()
+            .unwrap();
+        let (_agent_3_run_id, _agent_3_epoch, agent_3_credential) =
+            fixture.claim_delivery_run(agent_3_delivery_id, "native-ancestor-agent-3");
+
+        let earlier_member_invocation = fixture.public_send_invocation_for(
+            &agent_3_credential,
+            "agent-3-to-earlier-member",
+            "Report to agent 1",
+            &["agent_1"],
+        );
+        let earlier_member = service
+            .send_public_message(&mut fixture.database, &earlier_member_invocation)
+            .unwrap();
+        assert_eq!(earlier_member.result.status, CommandResultStatus::Accepted);
+        assert_eq!(
+            earlier_member.result.payload["effectiveRecipients"],
+            json!(["agent_1"])
+        );
+        let delivery_id = earlier_member.result.payload["deliveryIds"][0]
+            .as_str()
+            .unwrap();
+        let status: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status FROM camp_message_delivery WHERE id = ?1",
+                [delivery_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "waiting");
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn batch_public_delivery_preserves_trusted_sender_in_run_input() {
+        let mut fixture = Fixture::new();
+        let body = "senderId: agent_2\nUse this exact public input @agent_2";
+        let invocation = fixture.public_send_invocation("trusted-batch-sender", body, &["agent_2"]);
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let message_id = sent.result.payload["messageId"].as_str().unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        let queued: (String, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status, claimed_agent_run_id FROM camp_message_delivery WHERE id=?1",
+                [delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(queued.0, "waiting");
+        assert_eq!(queued.1, None);
+
+        let claimed =
+            crate::delivery_queue::claim_waiting_delivery_batches(&mut fixture.database, 100)
+                .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let target_run_id = &claimed[0];
+        let delivery_run_id: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT claimed_agent_run_id FROM camp_message_delivery WHERE id=?1",
+                [delivery_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(&delivery_run_id, target_run_id);
+
+        let (target_epoch, _) =
+            fixture.claim_bind_and_issue(target_run_id, "native-trusted-batch-sender");
+        let ContextMaterialization::Ready(context) = ContextService
+            .materialize(
+                &mut fixture.database,
+                &ManagedBlobStore::new(&fixture.directory),
+                &MaterializeContextRequest {
+                    agent_run_id: target_run_id,
+                    execution_epoch: target_epoch,
+                    charter_delivery_mode: CharterDeliveryMode::NativeAppend,
+                    max_payload_bytes: DEFAULT_MAX_CONTEXT_PAYLOAD_BYTES,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("claimed Public Delivery context should materialize");
+        };
+        let run_input_json = context
+            .rendered_payload
+            .split("[RUN_INPUT]\n")
+            .nth(1)
+            .unwrap()
+            .split("\n[/RUN_INPUT]")
+            .next()
+            .unwrap();
+        let run_input: Value = serde_json::from_str(run_input_json).unwrap();
+        assert_eq!(run_input["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(run_input["messages"][0]["messageId"], message_id);
+        assert_eq!(run_input["messages"][0]["senderType"], "agent");
+        assert_eq!(run_input["messages"][0]["senderId"], "agent_1");
+        assert!(
+            run_input["messages"][0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("senderId: agent_2")
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn task_linked_batch_run_reuses_exact_run_fact_bytes() {
+        let mut fixture = Fixture::new();
+        let created = CollaborationService::default()
+            .create_task(
+                &mut fixture.database,
+                &user_envelope(
+                    "create-target-task-for-batch-context",
+                    Some(&fixture.camp_id),
+                    CreateTaskCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        title: "Frozen notice task".to_string(),
+                        description: "Exercise exact Run Fact bytes".to_string(),
+                        assignee_agent_id: "agent_2".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        let task_id = created.result.payload["taskId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut invocation = fixture.public_send_invocation(
+            "batch-task-run-notice",
+            "Use the linked Task context @agent_2",
+            &["agent_2"],
+        );
+        invocation.input.task_id = Some(task_id.clone());
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        let claimed =
+            crate::delivery_queue::claim_waiting_delivery_batches(&mut fixture.database, 100)
+                .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let target_run_id = &claimed[0];
+        let delivery_run_id: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT claimed_agent_run_id FROM camp_message_delivery WHERE id=?1",
+                [delivery_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(&delivery_run_id, target_run_id);
+
+        let (target_epoch, _) =
+            fixture.claim_bind_and_issue(target_run_id, "native-batch-task-run-notice");
+        let ContextMaterialization::Ready(context) = ContextService
+            .materialize(
+                &mut fixture.database,
+                &ManagedBlobStore::new(&fixture.directory),
+                &MaterializeContextRequest {
+                    agent_run_id: target_run_id,
+                    execution_epoch: target_epoch,
+                    charter_delivery_mode: CharterDeliveryMode::NativeAppend,
+                    max_payload_bytes: DEFAULT_MAX_CONTEXT_PAYLOAD_BYTES,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("Task-linked batch context should materialize");
+        };
+        let run_fact_section = context
+            .rendered_payload
+            .split("[RUN_FACTS]\n")
+            .nth(1)
+            .unwrap()
+            .split("\n[/RUN_FACTS]")
+            .next()
+            .unwrap();
+        assert_eq!(context.rendered_payload.matches("[RUN_FACTS]\n").count(), 1);
+        let active_tasks = context
+            .rendered_payload
+            .split("[SELF_ACTIVE_TASKS]\n")
+            .nth(1)
+            .unwrap()
+            .split("\n[/SELF_ACTIVE_TASKS]")
+            .next()
+            .unwrap();
+        assert!(active_tasks.contains(&task_id));
+        let legacy_copies: (Option<String>, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT run_fact_payload_json,run_fact_digest FROM context_manifest WHERE id=?1",
+                [&context.manifest_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_copies, (None, None));
+        let facts: Value = serde_json::from_str(run_fact_section).unwrap();
+        assert!(facts.is_object());
+        let ContextMaterialization::Ready(replayed) = ContextService
+            .materialize(
+                &mut fixture.database,
+                &ManagedBlobStore::new(&fixture.directory),
+                &MaterializeContextRequest {
+                    agent_run_id: target_run_id,
+                    execution_epoch: target_epoch,
+                    charter_delivery_mode: CharterDeliveryMode::NativeAppend,
+                    max_payload_bytes: DEFAULT_MAX_CONTEXT_PAYLOAD_BYTES,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("Task-linked batch context should replay");
+        };
+        assert_eq!(replayed.manifest_id, context.manifest_id);
+        assert_eq!(replayed.rendered_payload, context.rendered_payload);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn missing_send_recovery_publishes_one_literal_recipient_free_message() {
+        let mut fixture = Fixture::new();
+        let body = "Recovered final with literal @agent_2";
+        let run_id = fixture.source_run_id.clone();
+        let completed = fixture.succeed_run_with_candidate(
+            &run_id,
+            fixture.source_epoch,
+            body,
+            Some(MissingSendRecoveryCandidate::new(
+                MissingSendRecoveryBoundary::CodexCompletedTurn,
+                body,
+            )),
+        );
+        assert_eq!(
+            completed.result.payload["missingSendRecovery"]["decision"],
+            "published"
+        );
+        assert_eq!(
+            completed.result.payload["missingSendRecovery"]["acceptedSendDetected"],
+            false
+        );
+
+        let message_id = completed.result.payload["finalThreadMessageId"]
+            .as_str()
+            .expect("recovery must link the public message");
+        let message: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                    SELECT body, structured_content_json, address_mode,
+                           addressed_agent_ids_json, effective_recipient_ids_json,
+                           source_operation_id, reply_to_camp_message_id
+                    FROM camp_message WHERE id = ?1
+                    "#,
+                [message_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(message.0, body);
+        assert_eq!(
+            message.1,
+            serde_json::to_string(&json!([{"kind":"text","text":body}])).unwrap()
+        );
+        assert_eq!(message.2, "default");
+        assert_eq!(message.3, "[]");
+        assert_eq!(message.4, "[]");
+        assert!(message.5.is_none());
+        let frozen_anchor: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT anchor_message_id FROM agent_run WHERE id = ?1",
+                [&fixture.source_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message.6.as_deref(), Some(frozen_anchor.as_str()));
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM message_delivery WHERE message_id = ?1",
+                    [message_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn terminal_evidence_cannot_publish_after_the_run_membership_is_replaced() {
+        let mut fixture = Fixture::new();
+        let now = chrono::Utc::now().to_rfc3339();
+        let actor = ActorRef::User {
+            user_id: "local_user".to_string(),
+        };
+        let transaction = fixture
+            .database
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        end_camp_membership(
+            &transaction,
+            &fixture.camp_id,
+            "agent_1",
+            Some("agent_2"),
+            "test_membership_ended",
+            "terminal-publication-membership-ended",
+            &actor,
+            None,
+            &now,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let membership_generation: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT membership_generation FROM camp WHERE id = ?1",
+                [&fixture.camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        CollaborationService::default()
+            .add_camp_member(
+                &mut fixture.database,
+                &user_envelope(
+                    "terminal-publication-membership-readded",
+                    Some(&fixture.camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        agent_id: "agent_1".to_string(),
+                        expected_membership_generation: membership_generation,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+
+        // A terminal arriving from the departed lifetime may not overwrite the
+        // cancellation or publish, even after that Agent has rejoined the Camp.
+        let version = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [&fixture.source_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completed = ExecutionRuntimeService::default()
+            .succeed_agent_run(
+                &mut fixture.database,
+                &CommandEnvelope {
+                    command_id: "late-membership-terminal".into(),
+                    actor: ActorRef::System {
+                        component_id: "runtime-adapter:codex-cli".into(),
+                    },
+                    camp_id: Some(fixture.camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: SucceedAgentRunCommand {
+                        agent_run_id: fixture.source_run_id.clone(),
+                        expected_version: version,
+                        execution_epoch: fixture.source_epoch,
+                        native_turn_id: "late-turn".into(),
+                        final_output: "这份迟到终态不能覆盖离队结算，也不能再公开".into(),
+                        missing_send_recovery_candidate: Some(MissingSendRecoveryCandidate::new(
+                            MissingSendRecoveryBoundary::CodexCompletedTurn,
+                            "这份迟到终态不能覆盖离队结算，也不能再公开",
+                        )),
+                        ending_git_observation: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(completed.result.status, CommandResultStatus::Rejected);
+        assert_eq!(completed.result.code, "agent_run.terminal_fenced");
+        let state: (String, i64, String) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT run.status,
+                       (SELECT COUNT(*) FROM camp_message
+                        WHERE source_agent_run_id = run.id),
+                       (SELECT status || ':' || settled_run_count || '/' || target_run_count
+                        FROM camp_membership_reconciliation
+                        WHERE command_id = 'terminal-publication-membership-ended')
+                FROM agent_run AS run WHERE run.id = ?1
+                "#,
+                [&fixture.source_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("cancelled".into(), 0, "completed:1/1".into()));
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn accepted_recipient_free_send_suppresses_missing_send_recovery() {
+        // A send receipt can satisfy output only for its exact Run/epoch. This
+        // is a terminal admission rule, separate from recovery suppression.
+        {
+            let mut fixture = Fixture::new();
+            let runtime = ExecutionRuntimeService::default();
+            let id = fixture.source_run_id.clone();
+            let epoch = fixture.source_epoch;
+            assert!(
+                !runtime
+                    .has_current_run_public_send(&fixture.database, &id, epoch)
+                    .unwrap()
+            );
+            let execution = runtime
+                .load_agent_run_execution(&fixture.database, &id, epoch)
+                .unwrap()
+                .unwrap();
+            let rejected = runtime
+                .succeed_agent_run(
+                    &mut fixture.database,
+                    &CommandEnvelope {
+                        command_id: "empty-without-send".into(),
+                        actor: ActorRef::System {
+                            component_id: "runtime-adapter:codex-cli".into(),
+                        },
+                        camp_id: Some(fixture.camp_id.clone()),
+                        expected_versions: Vec::new(),
+                        execution_epoch: None,
+                        payload: SucceedAgentRunCommand {
+                            agent_run_id: id.clone(),
+                            expected_version: execution.version,
+                            execution_epoch: epoch,
+                            native_turn_id: "native-empty".into(),
+                            final_output: String::new(),
+                            missing_send_recovery_candidate: None,
+                            ending_git_observation: None,
+                        },
+                    },
+                )
+                .unwrap();
+            assert_eq!(rejected.result.code, "agent_run.missing_final_output");
+            let invocation =
+                fixture.public_send_invocation("empty-final-send", "Published once", &[]);
+            TeamToolService::default()
+                .send_public_message(&mut fixture.database, &invocation)
+                .unwrap();
+            assert!(
+                runtime
+                    .has_current_run_public_send(&fixture.database, &id, epoch)
+                    .unwrap()
+            );
+            assert!(
+                !runtime
+                    .has_current_run_public_send(&fixture.database, &id, epoch + 1)
+                    .unwrap()
+            );
+            assert!(
+                !runtime
+                    .has_current_run_public_send(&fixture.database, "different-run", epoch)
+                    .unwrap()
+            );
+            let completed = fixture.succeed_run_with_candidate(&id, epoch, "", None);
+            assert!(completed.result.payload["finalOutputDigest"].is_null());
+            let count: i64 = fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "empty final does not publish or recover a duplicate"
+            );
+        }
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let body = "The exact answer is already public.";
+        let invocation = fixture.public_send_invocation("explicit-final", body, &[]);
+        let sent = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let explicit_message_id = sent.result.payload["messageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let source_epoch = fixture.source_epoch;
+        fixture.succeed_run_with_candidate(
+            &fixture.source_run_id.clone(),
+            source_epoch,
+            body,
+            Some(MissingSendRecoveryCandidate::new(
+                MissingSendRecoveryBoundary::CodexCompletedTurn,
+                "A different final that must not be recovered",
+            )),
+        );
+
+        let (message_count, final_message_id, output_mode, suppressed): (
+            i64,
+            Option<String>,
+            String,
+            bool,
+        ) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM camp_message
+                     WHERE source_agent_run_id = ?1),
+                    agent_run.final_camp_message_id,
+                    (SELECT json_extract(payload_json, '$.publicOutputMode')
+                     FROM event_log
+                     WHERE event_type = 'agent_run.succeeded'
+                       AND entity_type = 'agent_run'
+                       AND entity_id = ?1),
+                    EXISTS(
+                        SELECT 1 FROM event_log
+                        WHERE event_type = 'agent_run.succeeded'
+                          AND entity_type = 'agent_run'
+                          AND entity_id = ?1
+                          AND json_extract(payload_json, '$.automaticPublicOutputSuppressed') = 1
+                    )
+                FROM agent_run
+                WHERE agent_run.id = ?1
+                "#,
+                [&fixture.source_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(message_count, 1);
+        assert!(final_message_id.is_none());
+        assert_eq!(output_mode, "explicit_send_only");
+        assert!(!suppressed);
+        let recovery_decision: String = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT json_extract(payload_json, '$.missingSendRecovery.decision')
+                FROM event_log
+                WHERE event_type = 'agent_run.succeeded'
+                  AND entity_type = 'agent_run' AND entity_id = ?1
+                "#,
+                [&fixture.source_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovery_decision, "suppressed_accepted_send");
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT id FROM camp_message WHERE source_agent_run_id = ?1",
+                    [&fixture.source_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            explicit_message_id
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn accepted_addressed_send_also_suppresses_missing_send_recovery() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let body = "The answer is public for the target, but still needs a final.";
+        let invocation =
+            fixture.public_send_invocation("recipient-bound-final", body, &["agent_2"]);
+        service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+
+        fixture.succeed_run_with_candidate(
+            &fixture.source_run_id.clone(),
+            fixture.source_epoch,
+            body,
+            Some(MissingSendRecoveryCandidate::new(
+                MissingSendRecoveryBoundary::CodexCompletedTurn,
+                "A final after the addressed progress update",
+            )),
+        );
+
+        let (message_count, suppressed): (i64, bool) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id = ?1),
+                    EXISTS(
+                        SELECT 1 FROM event_log
+                        WHERE event_type = 'agent_run.succeeded'
+                          AND entity_type = 'agent_run'
+                          AND entity_id = ?1
+                          AND json_extract(payload_json, '$.automaticPublicOutputSuppressed') = 1
+                    )
+                "#,
+                [&fixture.source_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(message_count, 1);
+        assert!(!suppressed);
+        let recovery: (String, bool) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT json_extract(payload_json, '$.missingSendRecovery.decision'),
+                       json_extract(payload_json, '$.missingSendRecovery.acceptedSendDetected')
+                FROM event_log
+                WHERE event_type = 'agent_run.succeeded'
+                  AND entity_type = 'agent_run' AND entity_id = ?1
+                "#,
+                [&fixture.source_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recovery, ("suppressed_accepted_send".to_string(), true));
+        let automatic_reply: Option<String> = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT reply_to_camp_message_id
+                FROM camp_message
+                WHERE source_agent_run_id = ?1 AND source_operation_id IS NULL
+                ORDER BY sequence DESC LIMIT 1
+                "#,
+                [&fixture.source_run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert!(automatic_reply.is_none());
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn a2a_target_run_recovers_independently_from_the_source_send() {
+        let mut fixture = Fixture::new();
+        let invocation = fixture.public_send_invocation(
+            "create-a2a-target-recovery",
+            "Please handle this @agent_2",
+            &["agent_2"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (target_run_id, target_epoch, _) =
+            fixture.claim_delivery_run(&delivery_id, "native-a2a-recovery");
+        let recovered = fixture.succeed_run_with_candidate(
+            &target_run_id,
+            target_epoch,
+            "A2A target final",
+            Some(MissingSendRecoveryCandidate::new(
+                MissingSendRecoveryBoundary::CodexCompletedTurn,
+                "A2A target final",
+            )),
+        );
+        assert_eq!(
+            recovered.result.payload["missingSendRecovery"]["decision"],
+            "published"
+        );
+        let recovery_message_id = recovered.result.payload["finalThreadMessageId"]
+            .as_str()
+            .unwrap();
+        let recovery_fact: (String, String, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT source_agent_run_id, effective_recipient_ids_json,
+                       (SELECT COUNT(*) FROM camp_message_delivery WHERE message_id = camp_message.id)
+                FROM camp_message WHERE id = ?1
+                "#,
+                [recovery_message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(recovery_fact, (target_run_id, "[]".to_string(), 0));
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn missing_send_recovery_failures_do_not_change_run_success() {
+        let cases = vec![
+            (None, "skipped_no_candidate"),
+            (
+                Some(MissingSendRecoveryCandidate::new(
+                    MissingSendRecoveryBoundary::ClaudeSuccessResult,
+                    "wrong Adapter boundary",
+                )),
+                "skipped_boundary_mismatch",
+            ),
+            (
+                Some(MissingSendRecoveryCandidate::new(
+                    MissingSendRecoveryBoundary::CodexCompletedTurn,
+                    "   ",
+                )),
+                "skipped_empty_candidate",
+            ),
+            (
+                Some(MissingSendRecoveryCandidate::new(
+                    MissingSendRecoveryBoundary::CodexCompletedTurn,
+                    "x".repeat(CAMP_MESSAGE_SEND_MAX_BODY_BYTES + 1),
+                )),
+                "skipped_candidate_too_large",
+            ),
+        ];
+        for (candidate, expected_decision) in cases {
+            let mut fixture = Fixture::new();
+            let run_id = fixture.source_run_id.clone();
+            let completed = fixture.succeed_run_with_candidate(
+                &run_id,
+                fixture.source_epoch,
+                "Run success remains authoritative",
+                candidate,
+            );
+            assert_eq!(
+                completed.result.payload["missingSendRecovery"]["decision"],
+                expected_decision
+            );
+            assert_eq!(
+                fixture
+                    .database
+                    .connection()
+                    .query_row(
+                        "SELECT status FROM agent_run WHERE id = ?1",
+                        [&run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "succeeded"
+            );
+            assert_eq!(
+                fixture
+                    .database
+                    .connection()
+                    .query_row(
+                        "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id = ?1",
+                        [&run_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn rejected_send_does_not_suppress_recovery_but_tombstoned_accepted_send_does() {
+        let service = TeamToolService::default();
+
+        let mut rejected_fixture = Fixture::new();
+        let rejected_invocation = rejected_fixture.public_send_invocation(
+            "rejected-before-recovery",
+            "invalid recipient",
+            &["agent_999"],
+        );
+        let rejected = service
+            .send_public_message(&mut rejected_fixture.database, &rejected_invocation)
+            .unwrap();
+        assert_eq!(rejected.result.status, CommandResultStatus::Rejected);
+        let rejected_run_id = rejected_fixture.source_run_id.clone();
+        let recovered = rejected_fixture.succeed_run_with_candidate(
+            &rejected_run_id,
+            rejected_fixture.source_epoch,
+            "successful final",
+            Some(MissingSendRecoveryCandidate::new(
+                MissingSendRecoveryBoundary::CodexCompletedTurn,
+                "successful final",
+            )),
+        );
+        assert_eq!(
+            recovered.result.payload["missingSendRecovery"]["decision"],
+            "published"
+        );
+
+        let mut tombstoned_fixture = Fixture::new();
+        let tombstoned_invocation = tombstoned_fixture.public_send_invocation(
+            "accepted-then-tombstoned",
+            "accepted fact",
+            &[],
+        );
+        let sent = service
+            .send_public_message(&mut tombstoned_fixture.database, &tombstoned_invocation)
+            .unwrap();
+        let message_id = sent.result.payload["messageId"].as_str().unwrap();
+        tombstoned_fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp_message SET tombstoned_at = '2026-08-12T00:00:00Z' WHERE id = ?1",
+                [message_id],
+            )
+            .unwrap();
+        let tombstoned_run_id = tombstoned_fixture.source_run_id.clone();
+        let suppressed = tombstoned_fixture.succeed_run_with_candidate(
+            &tombstoned_run_id,
+            tombstoned_fixture.source_epoch,
+            "later final",
+            Some(MissingSendRecoveryCandidate::new(
+                MissingSendRecoveryBoundary::CodexCompletedTurn,
+                "later final",
+            )),
+        );
+        assert_eq!(
+            suppressed.result.payload["missingSendRecovery"]["decision"],
+            "suppressed_accepted_send"
+        );
+        assert_eq!(
+            tombstoned_fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id = ?1",
+                    [&tombstoned_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_terminal_replay_is_exactly_once_and_late_send_is_fenced() {
+        let mut fixture = Fixture::new();
+        let runtime = ExecutionRuntimeService::default();
+        let execution = runtime
+            .load_agent_run_execution(
+                &fixture.database,
+                &fixture.source_run_id,
+                fixture.source_epoch,
+            )
+            .unwrap()
+            .unwrap();
+        let envelope = CommandEnvelope {
+            command_id: "stable-recovery-terminal".to_string(),
+            actor: ActorRef::System {
+                component_id: "runtime-adapter:codex-cli".to_string(),
+            },
+            camp_id: Some(fixture.camp_id.clone()),
+            expected_versions: Vec::new(),
+            execution_epoch: None,
+            payload: SucceedAgentRunCommand {
+                agent_run_id: fixture.source_run_id.clone(),
+                expected_version: execution.version,
+                execution_epoch: fixture.source_epoch,
+                native_turn_id: "recovery-turn".to_string(),
+                final_output: "replay final".to_string(),
+                missing_send_recovery_candidate: Some(MissingSendRecoveryCandidate::new(
+                    MissingSendRecoveryBoundary::CodexCompletedTurn,
+                    "replay final",
+                )),
+                ending_git_observation: None,
+            },
+        };
+        let first = runtime
+            .succeed_agent_run(&mut fixture.database, &envelope)
+            .unwrap();
+        let replay = runtime
+            .succeed_agent_run(&mut fixture.database, &envelope)
+            .unwrap();
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        assert_eq!(first.result.payload, replay.result.payload);
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id = ?1",
+                    [&fixture.source_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let late_invocation =
+            fixture.public_send_invocation("late-after-recovery", "too late", &[]);
+        let late_send =
+            TeamToolService::default().send_public_message(&mut fixture.database, &late_invocation);
+        assert!(late_send.is_err());
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM camp_message WHERE source_agent_run_id = ?1",
+                    [&fixture.source_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_addressing_reports_all_offenders_and_leaves_no_partial_facts() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let before: (i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM camp_message), (SELECT COUNT(*) FROM camp_message_delivery)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let invocation = fixture.public_send_invocation(
+            "invalid-public-send",
+            "Malformed @agent_0 and missing @agent_999",
+            &["agent_1"],
+        );
+        let rejected = service
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(rejected.result.status, CommandResultStatus::Rejected);
+        assert_eq!(rejected.result.code, "message.addressing_invalid");
+        let offenders = rejected.result.payload["details"]["offending"]
+            .as_array()
+            .unwrap();
+        assert_eq!(offenders.len(), 3);
+        assert!(offenders.iter().any(|item| item["reason"] == "self_target"));
+        assert!(
+            offenders
+                .iter()
+                .any(|item| item["reason"] == "not_current_camp_member")
+        );
+        assert!(
+            offenders
+                .iter()
+                .any(|item| item["reason"] == "invalid_format")
+        );
+        assert_eq!(
+            rejected.result.payload["details"]["newRequestIdRequired"],
+            true
+        );
+        let after: (i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM camp_message), (SELECT COUNT(*) FROM camp_message_delivery)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn task_tool_schemas_use_cross_adapter_assignee_controls() {
+        assert!(
+            TeamToolService::update_task_input_schema()
+                .get("anyOf")
+                .is_none(),
+            "direct CLI input must remain representable without a root anyOf"
+        );
+        for schema in [
+            TeamToolService::create_task_input_schema(),
+            TeamToolService::update_task_input_schema(),
+            TeamToolService::list_tasks_input_schema(),
+        ] {
+            let properties = schema["properties"].as_object().unwrap();
+            assert_eq!(properties["assigneeAgentId"]["type"], "string");
+            for forbidden in [
+                "threadId",
+                "agentId",
+                "sourceAgentRunId",
+                "executionEpoch",
+                "commandId",
+            ] {
+                assert!(!properties.contains_key(forbidden));
+            }
+        }
+        assert_eq!(
+            TeamToolService::update_task_input_schema()["properties"]["clearAssignee"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            TeamToolService::list_tasks_input_schema()["properties"]["unassignedOnly"]["type"],
+            "boolean"
+        );
+        let missing = serde_json::from_value::<TeamUpdateTaskInput>(json!({
+            "taskId": "task-1",
+            "status": "in_progress"
+        }))
+        .unwrap();
+        assert_eq!(missing.assignee_agent_id, None);
+        assert!(!missing.clear_assignee);
+        let clear = serde_json::from_value::<TeamUpdateTaskInput>(json!({
+            "taskId": "task-1",
+            "clearAssignee": true
+        }))
+        .unwrap();
+        assert_eq!(clear.assignee_agent_id, None);
+        assert!(clear.clear_assignee);
+        let assign = serde_json::from_value::<TeamUpdateTaskInput>(json!({
+            "taskId": "task-1",
+            "assigneeAgentId": "agent_1"
+        }))
+        .unwrap();
+        assert_eq!(assign.assignee_agent_id, Some("agent_1".to_string()));
+        assert!(!assign.clear_assignee);
+        assert!(
+            serde_json::from_value::<TeamUpdateTaskInput>(json!({
+                "taskId": "task-1",
+                "assigneeAgentId": null
+            }))
+            .is_err()
+        );
+        let unassigned = serde_json::from_value::<TeamListTasksInput>(json!({
+            "unassignedOnly": true
+        }))
+        .unwrap();
+        assert_eq!(unassigned.assignee_agent_id, None);
+        assert!(unassigned.unassigned_only);
+    }
+
+    #[test]
+    fn task_tools_are_idempotent_authorized_and_never_wake_an_agent() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let execution_count_before: i64 = fixture
+            .database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM agent_run", [], |row| row.get(0))
+            .unwrap();
+        let invocation = fixture.task_invocation(
+            "create-durable-task",
+            TeamCreateTaskInput {
+                title: "Persistent follow-up".to_string(),
+                description: "Track this across runs".to_string(),
+                assignee_agent_id: "agent_1".to_string(),
+            },
+        );
+        let created = service
+            .create_task(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(created.result.status, CommandResultStatus::Applied);
+        let task_id = created.result.payload["taskId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let replayed = service
+            .create_task(&mut fixture.database, &invocation)
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.result.payload["taskId"], task_id);
+
+        let conflicting = fixture.task_invocation(
+            "create-durable-task",
+            TeamCreateTaskInput {
+                title: "Different payload".to_string(),
+                description: String::new(),
+                assignee_agent_id: "agent_1".to_string(),
+            },
+        );
+        let replayed = service
+            .create_task(&mut fixture.database, &conflicting)
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.result.payload, created.result.payload);
+
+        let listed = service
+            .list_tasks(
+                &fixture.database,
+                &fixture.task_invocation(
+                    "list-durable-tasks",
+                    TeamListTasksInput {
+                        statuses: None,
+                        assignee_agent_id: None,
+                        unassigned_only: false,
+                        limit: 50,
+                        cursor: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(listed.tasks.iter().any(|task| task.task_id == task_id));
+        let update_invocation = fixture.task_invocation(
+            "claim-durable-task",
+            TeamUpdateTaskInput {
+                task_id: task_id.clone(),
+                title: None,
+                description: None,
+                status: Some(TaskStatus::InProgress),
+                assignee_agent_id: Some("agent_1".to_string()),
+                clear_assignee: false,
+                ..Default::default()
+            },
+        );
+        let updated = service
+            .update_task(&mut fixture.database, &update_invocation)
+            .unwrap();
+        assert_eq!(updated.result.status, CommandResultStatus::Applied);
+        assert!(updated.result.payload.get("version").is_none());
+        assert_eq!(updated.result.payload["status"], "in_progress");
+        let execution_count_after: i64 = fixture
+            .database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM agent_run", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(execution_count_after, execution_count_before);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn task_tool_reads_are_camp_wide_without_audit_writes() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp SET default_lead_agent_id = 'agent_2' WHERE id = ?1",
+                [&fixture.camp_id],
+            )
+            .unwrap();
+        let hidden = CollaborationService::default()
+            .create_task(
+                &mut fixture.database,
+                &user_envelope(
+                    "create-hidden-muwa-task",
+                    Some(&fixture.camp_id),
+                    CreateTaskCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        title: "Muwa private assignment".to_string(),
+                        description: String::new(),
+                        assignee_agent_id: "agent_2".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        let hidden_id = hidden.result.payload["taskId"].as_str().unwrap();
+        let event_count_before: i64 = fixture
+            .database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM event_log", [], |row| row.get(0))
+            .unwrap();
+        let listed = service
+            .list_tasks(
+                &fixture.database,
+                &fixture.task_invocation(
+                    "ordinary-member-list",
+                    TeamListTasksInput {
+                        statuses: None,
+                        assignee_agent_id: None,
+                        unassigned_only: false,
+                        limit: 100,
+                        cursor: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let visible = listed
+            .tasks
+            .iter()
+            .find(|task| task.task_id == hidden_id)
+            .expect("ordinary current Camp Agent should see every Camp Task");
+        assert!(visible.available_actions.is_empty());
+        let event_count_after: i64 = fixture
+            .database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM event_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count_after, event_count_before);
+
+        let forbidden_invocation = fixture.task_invocation(
+            "ordinary-member-create-forbidden",
+            TeamCreateTaskInput {
+                title: "Ordinary member cannot define responsibility".to_string(),
+                assignee_agent_id: "agent_1".to_string(),
+                ..Default::default()
+            },
+        );
+        let forbidden = service
+            .create_task(&mut fixture.database, &forbidden_invocation)
+            .unwrap();
+        assert_eq!(forbidden.result.code, "task.create_forbidden");
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn every_agent_business_tool_binding_is_fenced_after_leave_and_readd() {
+        let mut fixture = Fixture::new();
+        let now = chrono::Utc::now().to_rfc3339();
+        let actor = ActorRef::User {
+            user_id: "local_user".to_string(),
+        };
+        let transaction = fixture
+            .database
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        end_camp_membership(
+            &transaction,
+            &fixture.camp_id,
+            "agent_1",
+            Some("agent_2"),
+            "test_membership_ended",
+            "team-tool-membership-ended",
+            &actor,
+            None,
+            &now,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let membership_generation: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT membership_generation FROM camp WHERE id = ?1",
+                [&fixture.camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        CollaborationService::default()
+            .add_camp_member(
+                &mut fixture.database,
+                &user_envelope(
+                    "team-tool-membership-readd",
+                    Some(&fixture.camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        agent_id: "agent_1".to_string(),
+                        expected_membership_generation: membership_generation,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                r#"
+                UPDATE agent_run
+                SET status = 'running', cancel_requested_at = NULL,
+                    cancel_reason_code = NULL, ended_at = NULL
+                WHERE id = ?1
+                "#,
+                [&fixture.source_run_id],
+            )
+            .unwrap();
+
+        let list_error = TeamToolService::default()
+            .list_tasks(
+                &fixture.database,
+                &fixture.task_invocation(
+                    "membership-fenced-task-list",
+                    TeamListTasksInput {
+                        statuses: None,
+                        assignee_agent_id: None,
+                        unassigned_only: false,
+                        limit: 10,
+                        cursor: None,
+                    },
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            list_error
+                .downcast_ref::<TeamToolInvocationError>()
+                .unwrap()
+                .code,
+            "team_tool.binding_fenced"
+        );
+        let binding_error = match TeamToolService::default().prepare_binding_credential(
+            &mut fixture.database,
+            &fixture.source_run_id,
+            fixture.source_epoch,
+            false,
+        ) {
+            Ok(_) => panic!("a stale Agent Run must not receive a fresh binding credential"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            binding_error
+                .downcast_ref::<TeamToolInvocationError>()
+                .unwrap()
+                .code,
+            "team_tool.binding_unavailable"
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn an_existing_run_can_address_a_member_added_after_its_context_was_frozen() {
+        let mut fixture = Fixture::with_members(&["agent_1", "agent_2"]);
+        let added = CollaborationService::default()
+            .add_camp_member(
+                &mut fixture.database,
+                &user_envelope(
+                    "add-member-after-source-context-freeze",
+                    Some(&fixture.camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        agent_id: "agent_3".to_string(),
+                        expected_membership_generation: 1,
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(added.result.code, "camp.member_added");
+
+        let invocation = fixture.public_send_invocation(
+            "send-to-member-added-after-source-freeze",
+            "Current target membership controls this admission",
+            &["agent_3"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        assert_eq!(sent.result.status, CommandResultStatus::Accepted);
+        assert_eq!(
+            sent.result.payload["effectiveRecipients"],
+            json!(["agent_3"])
+        );
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT status FROM camp_message_delivery WHERE id = ?1",
+                    [delivery_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "waiting"
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn cancelled_recipient_run_leaves_the_next_delivery_for_batch_claim() {
+        let mut fixture = Fixture::new();
+        let busy_run_id = fixture.queue_direct_run("queue-run-cancel-recipient", "agent_2");
+        let invocation = fixture.public_send_invocation(
+            "run-cancel-waiting-delivery",
+            "Dispatch after the busy Run is cancelled",
+            &["agent_2"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        let waiting: (String, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status, claimed_agent_run_id FROM camp_message_delivery WHERE id = ?1",
+                [delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(waiting, ("waiting".to_string(), None));
+
+        let busy_run_version: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id = ?1",
+                [&busy_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cancelled = ExecutionRuntimeService::default()
+            .request_agent_run_cancellation(
+                &mut fixture.database,
+                &user_envelope(
+                    "cancel-busy-recipient-run",
+                    Some(&fixture.camp_id),
+                    CancelAgentRunCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        agent_run_id: busy_run_id,
+                        expected_version: busy_run_version,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(cancelled.result.code, "agent_run.cancelled");
+        crate::delivery_queue::claim_waiting_delivery_batches(&mut fixture.database, 100).unwrap();
+        let claimed: (String, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status, claimed_agent_run_id FROM camp_message_delivery WHERE id = ?1",
+                [delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claimed.0, "claimed");
+        assert!(claimed.1.is_some());
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn source_membership_removal_keeps_an_admitted_recipient_delivery_waiting() {
+        let mut fixture = Fixture::new();
+        let invocation = fixture.public_send_invocation(
+            "outbound-before-source-leaves",
+            "Recipient admission is independent of the source's later membership",
+            &["agent_2"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        let preview = CollaborationService::default()
+            .camp_member_removal_preview(&fixture.database, &fixture.camp_id, "agent_1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.pending_delivery_count, 0);
+        let removed = fixture.remove_member("agent_1", "remove-source-after-outbound-send");
+        assert_eq!(removed.result.status, CommandResultStatus::Accepted);
+        assert_eq!(removed.result.payload["cancelledDeliveryCount"], 0);
+        let delivery: (String, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status, failure_code FROM camp_message_delivery WHERE id = ?1",
+                [delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delivery, ("waiting".to_string(), None));
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn claimed_recipient_run_survives_the_source_membership_cutover() {
+        let mut fixture = Fixture::new();
+        let invocation = fixture.public_send_invocation(
+            "running-outbound-before-source-leaves",
+            "Already claimed recipient work belongs to the recipient lifetime",
+            &["agent_2"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        let (target_run_id, _target_epoch, _) =
+            fixture.claim_delivery_run(delivery_id, "native-recipient-before-source-leaves");
+        let removed = fixture.remove_member("agent_1", "remove-source-after-recipient-claim");
+        assert_eq!(removed.result.status, CommandResultStatus::Accepted);
+        let target_cancel: Option<String> = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT cancel_requested_at FROM agent_run WHERE id = ?1",
+                [&target_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(target_cancel.is_none());
+        let delivery_status: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status FROM camp_message_delivery WHERE id = ?1",
+                [delivery_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivery_status, "claimed");
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn batch_claim_uses_the_recipient_lifetime_after_source_membership_changes() {
+        let mut fixture = Fixture::new();
+        let invocation = fixture.public_send_invocation(
+            "source-changes-after-outbound-admission",
+            "The recipient's admitted Delivery remains claimable",
+            &["agent_2"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp_member SET version = version + 2 WHERE camp_id = ?1 AND agent_id = 'agent_1'",
+                [&fixture.camp_id],
+            )
+            .unwrap();
+        crate::delivery_queue::claim_waiting_delivery_batches(&mut fixture.database, 100).unwrap();
+        let claimed: (String, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status, claimed_agent_run_id FROM camp_message_delivery WHERE id = ?1",
+                [delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claimed.0, "claimed");
+        assert!(claimed.1.is_some());
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn failed_batch_delivery_stays_terminal_after_recipient_rejoins() {
+        let mut fixture = Fixture::new();
+        let invocation = fixture.public_send_invocation(
+            "delivery-before-membership-cutover",
+            "这条旧投递不能跨成员任期复活",
+            &["agent_2"],
+        );
+        let sent = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &invocation)
+            .unwrap();
+        let delivery_id = sent.result.payload["deliveryIds"][0].as_str().unwrap();
+        let (target_run_id, target_epoch, _) =
+            fixture.claim_delivery_run(delivery_id, "native-delivery-before-membership-cutover");
+        fixture.fail_run(
+            &target_run_id,
+            target_epoch,
+            "recipient_failed_before_membership_cutover",
+        );
+        let removed = fixture.remove_member("agent_2", "remove-delivery-recipient");
+        assert_eq!(removed.result.status, CommandResultStatus::Accepted);
+        let readded = CollaborationService::default()
+            .add_camp_member(
+                &mut fixture.database,
+                &user_envelope(
+                    "readd-delivery-recipient",
+                    Some(&fixture.camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation:
+                            removed.result.payload["membershipGeneration"]
+                                .as_i64()
+                                .unwrap(),
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(readded.result.status, CommandResultStatus::Applied);
+
+        let delivery_state: (String, Option<String>, i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT delivery.status, delivery.failure_code,
+                       delivery.recipient_membership_version_at_admission,
+                       member.version
+                FROM camp_message_delivery AS delivery
+                JOIN camp_member AS member
+                  ON member.camp_id = delivery.camp_id
+                 AND member.agent_id = delivery.recipient_agent_id
+                WHERE delivery.id = ?1
+                "#,
+                [delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(delivery_state.0, "failed");
+        assert!(delivery_state.1.is_some());
+        assert_ne!(delivery_state.2, delivery_state.3);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn public_send_rejects_a_left_recipient_and_accepts_a_new_membership() {
+        let mut fixture = Fixture::new();
+        let collaboration = CollaborationService::default();
+        let preview = collaboration
+            .camp_member_removal_preview(&fixture.database, &fixture.camp_id, "agent_2")
+            .unwrap()
+            .unwrap();
+        let removed = collaboration
+            .remove_camp_member(
+                &mut fixture.database,
+                &user_envelope(
+                    "remove-public-send-recipient",
+                    Some(&fixture.camp_id),
+                    RemoveThreadMemberCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation: preview.membership_generation,
+                        expected_membership_version: preview.membership_version,
+                        replacement_default_lead_agent_id: None,
+                        reason: Some("test send admission".to_string()),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(removed.result.status, CommandResultStatus::Accepted);
+
+        let rejected_invocation = fixture.public_send_invocation(
+            "send-to-left-recipient",
+            "离队后不能收到这次 send",
+            &["agent_2"],
+        );
+        let rejected = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &rejected_invocation)
+            .unwrap();
+        assert_eq!(rejected.result.status, CommandResultStatus::Rejected);
+        assert_eq!(rejected.result.code, "message.addressing_invalid");
+        assert_eq!(
+            rejected.result.payload["details"]["offending"][0]["reason"],
+            "not_current_camp_member"
+        );
+
+        collaboration
+            .add_camp_member(
+                &mut fixture.database,
+                &user_envelope(
+                    "add-new-public-send-recipient-membership",
+                    Some(&fixture.camp_id),
+                    AddThreadMemberCommand {
+                        camp_id: fixture.camp_id.clone(),
+                        agent_id: "agent_2".to_string(),
+                        expected_membership_generation:
+                            removed.result.payload["membershipGeneration"]
+                                .as_i64()
+                                .unwrap(),
+                        capability_overrides: json!({}),
+                        source: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let accepted_invocation = fixture.public_send_invocation(
+            "send-to-new-recipient-membership",
+            "重新加入后，这次 send 成立",
+            &["agent_2"],
+        );
+        let accepted = TeamToolService::default()
+            .send_public_message(&mut fixture.database, &accepted_invocation)
+            .unwrap();
+        assert_eq!(accepted.result.status, CommandResultStatus::Accepted);
+        assert_eq!(
+            accepted.result.payload["deliveryIds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn task_tool_lead_creation_ignores_capability_catalog_and_updates_fields() {
+        let mut fixture = Fixture::new();
+        let service = TeamToolService::default();
+        let current_config: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT effective_config_json FROM agent_run WHERE id = ?1",
+                [&fixture.source_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut config: Value = serde_json::from_str(&current_config).unwrap();
+        config["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|capability| capability.as_str() != Some("task.create"));
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET effective_config_json = ?2 WHERE id = ?1",
+                params![
+                    fixture.source_run_id,
+                    serde_json::to_string(&config).unwrap()
+                ],
+            )
+            .unwrap();
+        let allowed_invocation = fixture.task_invocation(
+            "capability-list-does-not-gate-builtin-cli",
+            TeamCreateTaskInput {
+                title: "Must not exist".to_string(),
+                description: String::new(),
+                assignee_agent_id: "agent_1".to_string(),
+            },
+        );
+        let allowed = service
+            .create_task(&mut fixture.database, &allowed_invocation)
+            .unwrap();
+        assert_eq!(allowed.result.status, CommandResultStatus::Applied);
+        let later_invocation = fixture.task_invocation(
+            "later-task-title",
+            TeamUpdateTaskInput {
+                task_id: fixture.task_id.clone(),
+                title: Some("Latest title".to_string()),
+                description: None,
+                status: None,
+                assignee_agent_id: None,
+                clear_assignee: false,
+                ..Default::default()
+            },
+        );
+        let later = service
+            .update_task(&mut fixture.database, &later_invocation)
+            .unwrap();
+        assert_eq!(later.result.status, CommandResultStatus::Applied);
+        assert_eq!(later.result.payload["taskId"], fixture.task_id);
+        assert_eq!(later.result.payload["title"], "Latest title");
+        assert!(later.result.payload.get("version").is_none());
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn memory_read_reports_revision_inactive_and_deleted_without_returning_stale_body() {
+        let mut fixture = Fixture::new();
+        let service = MemoryService::default();
+        let created = service
+            .create(
+                &mut fixture.database,
+                &user_envelope(
+                    "create-readable-memory",
+                    None,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Hearth,
+                        kind: MemoryKind::Agreement,
+                        body: "Use the immutable context manifest during recovery.".to_string(),
+                        retrieval_keys: vec!["immutable recovery".to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: Vec::new(),
+                        direction: None,
+                        directed_actor_agent_id: None,
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let memory_id = created.result.payload["memoryId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let revision_id = created.result.payload["revisionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let retrieval = MemoryRetrievalService;
+        let search = retrieval
+            .search(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "memory-search-current".to_string(),
+                    input: MemorySearchInput {
+                        query: "immutable recovery".to_string(),
+                        limit: Some(6),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(search.results[0].memory_id, memory_id);
+        assert_eq!(search.results[0].scope, MemoryScopeKind::Hearth);
+        assert!(search.results[0].counterparty_agent_id.is_none());
+        assert!(search.results[0].direction.is_none());
+        let current = retrieval
+            .read(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "memory-read-current".to_string(),
+                    input: MemoryReadInput {
+                        memory_ids: vec![memory_id.clone()],
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(current.memories[0].cache_state, MemoryCacheState::Current);
+        let target = current.memories[0].target.as_ref().unwrap();
+        assert_eq!(target.scope, MemoryScopeKind::Hearth);
+        assert!(target.counterparty_agent_id.is_none());
+        assert!(target.direction.is_none());
+        assert!(
+            current.memories[0]
+                .body
+                .as_deref()
+                .unwrap()
+                .contains("immutable")
+        );
+
+        let revised = service
+            .revise(
+                &mut fixture.database,
+                &user_envelope(
+                    "revise-readable-memory",
+                    None,
+                    ReviseMemoryCommand {
+                        memory_id: memory_id.clone(),
+                        expected_version: 1,
+                        base_revision_id: revision_id,
+                        body: "Use the exact immutable context payload during recovery."
+                            .to_string(),
+                        retrieval_keys: vec!["exact recovery".to_string()],
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(revised.result.status, CommandResultStatus::Applied);
+        let changed = retrieval
+            .read(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "memory-read-changed".to_string(),
+                    input: MemoryReadInput {
+                        memory_ids: vec![memory_id.clone()],
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            changed.memories[0].cache_state,
+            MemoryCacheState::RevisionChanged
+        );
+        assert_eq!(
+            changed.memories[0].body.as_deref(),
+            Some("Use the exact immutable context payload during recovery.")
+        );
+
+        service
+            .retire(
+                &mut fixture.database,
+                &user_envelope(
+                    "retire-readable-memory",
+                    None,
+                    RetireMemoryCommand {
+                        memory_id: memory_id.clone(),
+                        expected_version: 2,
+                    },
+                ),
+            )
+            .unwrap();
+        let inactive = retrieval
+            .read(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "memory-read-inactive".to_string(),
+                    input: MemoryReadInput {
+                        memory_ids: vec![memory_id.clone()],
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(inactive.memories[0].cache_state, MemoryCacheState::Inactive);
+        assert!(inactive.memories[0].body.is_none());
+        assert!(inactive.memories[0].retrieval_keys.is_empty());
+        assert!(inactive.memories[0].target.is_none());
+        assert!(
+            serde_json::to_value(&inactive.memories[0])
+                .unwrap()
+                .get("scope")
+                .is_none()
+        );
+
+        service
+            .forget(
+                &mut fixture.database,
+                &user_envelope(
+                    "forget-readable-memory",
+                    None,
+                    ForgetMemoryCommand {
+                        memory_id: memory_id.clone(),
+                        expected_version: 3,
+                    },
+                ),
+            )
+            .unwrap();
+        let deleted = retrieval
+            .read(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "memory-read-deleted".to_string(),
+                    input: MemoryReadInput {
+                        memory_ids: vec![memory_id, Uuid::new_v4().to_string()],
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(deleted.memories[0].cache_state, MemoryCacheState::Deleted);
+        assert_eq!(
+            deleted.memories[1].cache_state,
+            MemoryCacheState::Unavailable
+        );
+        assert!(deleted.memories.iter().all(|memory| memory.body.is_none()));
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn memory_search_and_read_identify_relationship_counterparties() {
+        let mut fixture = Fixture::new();
+        let service = MemoryService::default();
+        let create_relationship =
+            |fixture: &mut Fixture, command_id: &str, counterparty: &str| -> String {
+                service
+                    .create(
+                        &mut fixture.database,
+                        &user_envelope(
+                            command_id,
+                            None,
+                            CreateMemoryCommand {
+                                scope: MemoryScopeKind::Relationship,
+                                kind: MemoryKind::Agreement,
+                                body: "Provide exact test evidence during every handoff."
+                                    .to_string(),
+                                retrieval_keys: vec!["test handoff".to_string()],
+                                companion_agent_id: None,
+                                relationship_agent_ids: vec![
+                                    "agent_1".to_string(),
+                                    counterparty.to_string(),
+                                ],
+                                direction: Some(RelationshipDirection::Directed),
+                                directed_actor_agent_id: Some("agent_1".to_string()),
+                                review_after: None,
+                            },
+                        ),
+                    )
+                    .unwrap()
+                    .result
+                    .payload["memoryId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+        let agent_two_memory =
+            create_relationship(&mut fixture, "relationship-agent-two", "agent_2");
+        let agent_three_memory =
+            create_relationship(&mut fixture, "relationship-agent-three", "agent_3");
+
+        let retrieval = MemoryRetrievalService;
+        let search = retrieval
+            .search(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "search-similar-relationships".to_string(),
+                    input: MemorySearchInput {
+                        query: "test handoff".to_string(),
+                        limit: Some(6),
+                    },
+                },
+            )
+            .unwrap();
+        for (memory_id, counterparty) in [
+            (&agent_two_memory, "agent_2"),
+            (&agent_three_memory, "agent_3"),
+        ] {
+            let result = search
+                .results
+                .iter()
+                .find(|result| &result.memory_id == memory_id)
+                .unwrap();
+            assert_eq!(result.scope, MemoryScopeKind::Relationship);
+            assert_eq!(result.counterparty_agent_id.as_deref(), Some(counterparty));
+            assert_eq!(result.direction, Some(RelationshipDirection::Directed));
+        }
+
+        let read = retrieval
+            .read(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "read-similar-relationships".to_string(),
+                    input: MemoryReadInput {
+                        memory_ids: vec![agent_two_memory, agent_three_memory],
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(read.memories.len(), 2);
+        assert_eq!(
+            read.memories[0].target.as_ref().unwrap().scope,
+            MemoryScopeKind::Relationship
+        );
+        assert_eq!(
+            read.memories[0]
+                .target
+                .as_ref()
+                .unwrap()
+                .counterparty_agent_id
+                .as_deref(),
+            Some("agent_2")
+        );
+        assert_eq!(
+            read.memories[1]
+                .target
+                .as_ref()
+                .unwrap()
+                .counterparty_agent_id
+                .as_deref(),
+            Some("agent_3")
+        );
+        assert!(
+            read.memories
+                .iter()
+                .all(|memory| memory.target.as_ref().unwrap().direction
+                    == Some(RelationshipDirection::Directed))
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn memory_view_returns_complete_exact_scope_targets_in_deterministic_order() {
+        let mut fixture = Fixture::new();
+        let service = MemoryService::default();
+        let companion_id = {
+            let mut create = |command_id: &str, command: CreateMemoryCommand| {
+                service
+                    .create(
+                        &mut fixture.database,
+                        &user_envelope(command_id, None, command),
+                    )
+                    .unwrap()
+            };
+
+            for (command_id, kind, body, key) in [
+                (
+                    "view-hearth-lesson",
+                    MemoryKind::Lesson,
+                    "Keep the verified recovery trail.",
+                    "recovery trail",
+                ),
+                (
+                    "view-hearth-preference",
+                    MemoryKind::Preference,
+                    "Prefer concise status updates.",
+                    "concise status",
+                ),
+                (
+                    "view-hearth-agreement",
+                    MemoryKind::Agreement,
+                    "Every handoff includes exact evidence.",
+                    "exact evidence",
+                ),
+            ] {
+                create(
+                    command_id,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Hearth,
+                        kind,
+                        body: body.to_string(),
+                        retrieval_keys: vec![key.to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: Vec::new(),
+                        direction: None,
+                        directed_actor_agent_id: None,
+                        review_after: None,
+                    },
+                );
+            }
+            let companion = create(
+                "view-companion-agent-one",
+                CreateMemoryCommand {
+                    scope: MemoryScopeKind::Companion,
+                    kind: MemoryKind::Lesson,
+                    body: "Agent one validates the exact frozen payload.".to_string(),
+                    retrieval_keys: vec!["frozen payload".to_string()],
+                    companion_agent_id: Some("agent_1".to_string()),
+                    relationship_agent_ids: Vec::new(),
+                    direction: None,
+                    directed_actor_agent_id: None,
+                    review_after: None,
+                },
+            );
+            let companion_id = companion.result.payload["memoryId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            create(
+                "view-companion-agent-two",
+                CreateMemoryCommand {
+                    scope: MemoryScopeKind::Companion,
+                    kind: MemoryKind::Lesson,
+                    body: "Agent two owns a separate Companion Memory.".to_string(),
+                    retrieval_keys: vec!["separate companion".to_string()],
+                    companion_agent_id: Some("agent_2".to_string()),
+                    relationship_agent_ids: Vec::new(),
+                    direction: None,
+                    directed_actor_agent_id: None,
+                    review_after: None,
+                },
+            );
+
+            for (command_id, kind, body, key, pair, direction, actor) in [
+                (
+                    "view-forward-lesson",
+                    MemoryKind::Lesson,
+                    "I give agent two exact test output.",
+                    "test output",
+                    ["agent_1", "agent_2"],
+                    RelationshipDirection::Directed,
+                    Some("agent_1"),
+                ),
+                (
+                    "view-reverse-agreement",
+                    MemoryKind::Agreement,
+                    "Agent two gives me exact test output.",
+                    "reverse output",
+                    ["agent_1", "agent_2"],
+                    RelationshipDirection::Directed,
+                    Some("agent_2"),
+                ),
+                (
+                    "view-mutual-agreement",
+                    MemoryKind::Agreement,
+                    "We acknowledge handoffs before continuing.",
+                    "acknowledge handoff",
+                    ["agent_1", "agent_2"],
+                    RelationshipDirection::Mutual,
+                    None,
+                ),
+                (
+                    "view-forward-agreement",
+                    MemoryKind::Agreement,
+                    "I identify the tested revision for agent two.",
+                    "tested revision",
+                    ["agent_1", "agent_2"],
+                    RelationshipDirection::Directed,
+                    Some("agent_1"),
+                ),
+                (
+                    "view-other-pair",
+                    MemoryKind::Lesson,
+                    "I give agent three a separate handoff.",
+                    "separate handoff",
+                    ["agent_1", "agent_3"],
+                    RelationshipDirection::Directed,
+                    Some("agent_1"),
+                ),
+            ] {
+                create(
+                    command_id,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Relationship,
+                        kind,
+                        body: body.to_string(),
+                        retrieval_keys: vec![key.to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: pair.into_iter().map(str::to_string).collect(),
+                        direction: Some(direction),
+                        directed_actor_agent_id: actor.map(str::to_string),
+                        review_after: None,
+                    },
+                );
+            }
+            companion_id
+        };
+
+        let pending_marker = "pending-view-candidate-marker";
+        let pending = fixture.hearth_review_add(
+            "view-pending-hearth-review",
+            pending_marker,
+            "pending view marker",
+        );
+        assert_eq!(pending.result.status, CommandResultStatus::Accepted);
+
+        let hearth = fixture
+            .memory_view(
+                "view-hearth",
+                MemoryViewInput {
+                    scope: MemoryScopeKind::Hearth,
+                    counterparty_agent_id: None,
+                },
+            )
+            .unwrap();
+        assert!(hearth.complete);
+        assert_eq!(hearth.item_count, 3);
+        assert_eq!(
+            hearth
+                .items
+                .iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                MemoryKind::Agreement,
+                MemoryKind::Preference,
+                MemoryKind::Lesson
+            ]
+        );
+        assert_eq!(
+            hearth.total_body_bytes,
+            hearth
+                .items
+                .iter()
+                .map(|item| item.body.len())
+                .sum::<usize>()
+        );
+        assert!(hearth.items.iter().all(|item| {
+            item.target.scope == MemoryScopeKind::Hearth
+                && item.target.counterparty_agent_id.is_none()
+                && item.target.direction.is_none()
+                && item.agent_can_revise
+                && item.body != pending_marker
+        }));
+
+        let companion = fixture
+            .memory_view(
+                "view-companion",
+                MemoryViewInput {
+                    scope: MemoryScopeKind::Companion,
+                    counterparty_agent_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(companion.item_count, 1);
+        assert_eq!(companion.items[0].target.memory_id, companion_id);
+        assert_eq!(companion.items[0].target.scope, MemoryScopeKind::Companion);
+        assert!(companion.items[0].agent_can_revise);
+
+        let relationship = fixture
+            .memory_view(
+                "view-relationship-agent-two",
+                MemoryViewInput {
+                    scope: MemoryScopeKind::Relationship,
+                    counterparty_agent_id: Some("agent_2".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            relationship.counterparty_agent_id.as_deref(),
+            Some("agent_2")
+        );
+        assert_eq!(relationship.item_count, 3);
+        assert_eq!(
+            relationship
+                .items
+                .iter()
+                .map(|item| (item.target.direction, item.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(RelationshipDirection::Directed), MemoryKind::Agreement),
+                (Some(RelationshipDirection::Directed), MemoryKind::Lesson),
+                (Some(RelationshipDirection::Mutual), MemoryKind::Agreement),
+            ]
+        );
+        assert!(
+            relationship.items[..2]
+                .iter()
+                .all(|item| item.agent_can_revise)
+        );
+        assert!(!relationship.items[2].agent_can_revise);
+        assert!(
+            relationship
+                .items
+                .iter()
+                .all(|item| { item.target.counterparty_agent_id.as_deref() == Some("agent_2") })
+        );
+
+        let revised = fixture
+            .memory_write(
+                "view-copy-target-revise",
+                MemoryWriteToolInput {
+                    action: "revise".to_string(),
+                    scope: None,
+                    kind: None,
+                    body: "Agent one validates the exact immutable payload.".to_string(),
+                    retrieval_keys: vec!["immutable payload".to_string()],
+                    counterparty_agent_id: None,
+                    direction: None,
+                    target: Some(companion.items[0].target.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(revised.result.status, CommandResultStatus::Applied);
+        let mutual_revise = fixture
+            .memory_write(
+                "view-mutual-target-revise",
+                MemoryWriteToolInput {
+                    action: "revise".to_string(),
+                    scope: None,
+                    kind: None,
+                    body: "A mutual target must remain user governed.".to_string(),
+                    retrieval_keys: vec!["mutual governance".to_string()],
+                    counterparty_agent_id: None,
+                    direction: None,
+                    target: Some(relationship.items[2].target.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(mutual_revise.result.status, CommandResultStatus::Rejected);
+        assert_eq!(mutual_revise.result.code, "memory.invalid_input");
+
+        let delivered: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_access_evidence WHERE evidence_kind = 'view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivered, 7);
+        let leaked_pending: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_access_evidence WHERE memory_id = ?1",
+                [pending.result.payload["reviewItemId"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_pending, 0);
+
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status = 'away' WHERE id = 'agent_3'",
+                [],
+            )
+            .unwrap();
+        let unavailable = fixture
+            .memory_view(
+                "view-away-counterparty",
+                MemoryViewInput {
+                    scope: MemoryScopeKind::Relationship,
+                    counterparty_agent_id: Some("agent_3".to_string()),
+                },
+            )
+            .unwrap_err();
+        let unavailable = unavailable
+            .downcast_ref::<TeamToolInvocationError>()
+            .unwrap();
+        assert_eq!(unavailable.code, "memory.view_unavailable");
+        assert_eq!(unavailable.message, "Memory View is unavailable");
+    }
+
+    #[test]
+    fn memory_view_fails_closed_before_recording_evidence_for_invalid_scope_state() {
+        let mut fixture = Fixture::new();
+        let service = MemoryService::default();
+        for index in 0..8 {
+            let created = service
+                .create(
+                    &mut fixture.database,
+                    &user_envelope(
+                        &format!("view-full-hearth-{index}"),
+                        None,
+                        CreateMemoryCommand {
+                            scope: MemoryScopeKind::Hearth,
+                            kind: MemoryKind::Agreement,
+                            body: format!("{index}{}", "q".repeat(MEMORY_BODY_MAX_BYTES - 1)),
+                            retrieval_keys: vec![format!("view quota {index}")],
+                            companion_agent_id: None,
+                            relationship_agent_ids: Vec::new(),
+                            direction: None,
+                            directed_actor_agent_id: None,
+                            review_after: None,
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(created.result.status, CommandResultStatus::Applied);
+        }
+        fixture
+            .database
+            .connection()
+            .execute_batch(
+                r#"
+                PRAGMA defer_foreign_keys = ON;
+                BEGIN IMMEDIATE;
+                INSERT INTO memory(
+                    id, scope_kind, kind, creation_origin, lifecycle_status,
+                    current_revision_id, version, created_at, updated_at
+                ) VALUES (
+                    'invalid-view-memory', 'hearth', 'lesson', 'user', 'active',
+                    'invalid-view-revision', 1, '2026-08-14T00:00:00Z',
+                    '2026-08-14T00:00:00Z'
+                );
+                INSERT INTO memory_revision(
+                    id, memory_id, body, body_utf8_bytes, body_digest,
+                    actor_kind, actor_id, created_at
+                ) VALUES (
+                    'invalid-view-revision', 'invalid-view-memory', 'z', 1,
+                    'sha256:invalid-view', 'user', 'local_user',
+                    '2026-08-14T00:00:00Z'
+                );
+                COMMIT;
+                "#,
+            )
+            .unwrap();
+
+        let error = fixture
+            .memory_view(
+                "view-invalid-scope-state",
+                MemoryViewInput {
+                    scope: MemoryScopeKind::Hearth,
+                    counterparty_agent_id: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<TeamToolInvocationError>()
+                .unwrap()
+                .code,
+            "memory.view_unavailable"
+        );
+        let evidence: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_access_evidence WHERE evidence_kind = 'view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence, 0);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn hearth_review_acceptance_checks_body_quota_and_replays_the_first_rejection() {
+        let mut fixture = Fixture::new();
+        let service = MemoryService::default();
+        let mut first_memory_id = None;
+        for index in 0..8 {
+            let created = service
+                .create(
+                    &mut fixture.database,
+                    &user_envelope(
+                        &format!("review-quota-hearth-{index}"),
+                        None,
+                        CreateMemoryCommand {
+                            scope: MemoryScopeKind::Hearth,
+                            kind: MemoryKind::Agreement,
+                            body: format!("{index}{}", "h".repeat(MEMORY_BODY_MAX_BYTES - 1)),
+                            retrieval_keys: vec![format!("review quota {index}")],
+                            companion_agent_id: None,
+                            relationship_agent_ids: Vec::new(),
+                            direction: None,
+                            directed_actor_agent_id: None,
+                            review_after: None,
+                        },
+                    ),
+                )
+                .unwrap();
+            first_memory_id.get_or_insert_with(|| {
+                created.result.payload["memoryId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            });
+        }
+        let review = fixture.hearth_review_add(
+            "review-quota-propose",
+            "Accept only after aggregate body capacity is available.",
+            "aggregate acceptance",
+        );
+        let review_item_id = review.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let accept = user_envelope(
+            "review-quota-accept",
+            None,
+            AcceptHearthReviewItemCommand {
+                review_item_id: review_item_id.clone(),
+                expected_review_item_version: 1,
+                final_body: None,
+                final_retrieval_keys: None,
+            },
+        );
+        let rejected = service
+            .accept_hearth_review_item(&mut fixture.database, &accept)
+            .unwrap();
+        assert_eq!(rejected.result.status, CommandResultStatus::Rejected);
+        assert_eq!(rejected.result.code, "memory.capacity_exceeded");
+        let pending = service
+            .list_hearth_review_items(&fixture.database)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.review_item_id == review_item_id)
+            .unwrap();
+        assert_eq!(pending.status, "pending");
+        assert!(pending.candidate_body.is_some());
+
+        service
+            .retire(
+                &mut fixture.database,
+                &user_envelope(
+                    "review-quota-retire",
+                    None,
+                    RetireMemoryCommand {
+                        memory_id: first_memory_id.unwrap(),
+                        expected_version: 1,
+                    },
+                ),
+            )
+            .unwrap();
+        let replay = service
+            .accept_hearth_review_item(&mut fixture.database, &accept)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result, rejected.result);
+
+        let accepted = service
+            .accept_hearth_review_item(
+                &mut fixture.database,
+                &user_envelope(
+                    "review-quota-accept-new-command",
+                    None,
+                    AcceptHearthReviewItemCommand {
+                        review_item_id,
+                        expected_review_item_version: 1,
+                        final_body: None,
+                        final_retrieval_keys: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(accepted.result.status, CommandResultStatus::Applied);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn agent_companion_write_is_effective_while_hearth_requires_user_acceptance() {
+        let mut fixture = Fixture::new();
+        let tools = MemoryToolService;
+        let companion = tools
+            .write(
+                &mut fixture.database,
+                &MemoryWriteToolInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "memory-write-companion".to_string(),
+                    input: MemoryWriteToolInput {
+                        action: "add".to_string(),
+                        scope: Some(MemoryScopeKind::Companion),
+                        kind: Some(MemoryKind::Lesson),
+                        body: "Verify the frozen input digest before recovery.".to_string(),
+                        retrieval_keys: vec!["frozen digest".to_string()],
+                        counterparty_agent_id: None,
+                        direction: None,
+                        target: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(companion.result.status, CommandResultStatus::Applied);
+        assert_eq!(companion.result.payload["outcome"], "effective");
+        let companion_id = companion.result.payload["memoryId"].as_str().unwrap();
+        let companion_memory = MemoryService::default()
+            .get(&fixture.database, companion_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            companion_memory.creation_origin,
+            Some(MemoryCreationOrigin::Agent)
+        );
+        assert_eq!(companion_memory.lifecycle, "active");
+
+        let proposed = tools
+            .write(
+                &mut fixture.database,
+                &MemoryWriteToolInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "memory-write-hearth".to_string(),
+                    input: MemoryWriteToolInput {
+                        action: "add".to_string(),
+                        scope: Some(MemoryScopeKind::Hearth),
+                        kind: Some(MemoryKind::Agreement),
+                        body: "All recovery retries must reuse the exact frozen payload."
+                            .to_string(),
+                        retrieval_keys: vec!["exact retry".to_string()],
+                        counterparty_agent_id: None,
+                        direction: None,
+                        target: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(proposed.result.status, CommandResultStatus::Accepted);
+        assert_eq!(proposed.result.payload["outcome"], "review_pending");
+        let review_item_id = proposed.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            MemoryService::default()
+                .list(&fixture.database)
+                .unwrap()
+                .memories
+                .iter()
+                .all(|memory| memory.current_body.as_deref()
+                    != Some("All recovery retries must reuse the exact frozen payload."))
+        );
+
+        let accepted = MemoryService::default()
+            .accept_hearth_review_item(
+                &mut fixture.database,
+                &user_envelope(
+                    "accept-hearth-review",
+                    None,
+                    AcceptHearthReviewItemCommand {
+                        review_item_id,
+                        expected_review_item_version: 1,
+                        final_body: None,
+                        final_retrieval_keys: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(accepted.result.status, CommandResultStatus::Applied);
+        let accepted_memory_id = accepted.result.payload["memoryId"].as_str().unwrap();
+        let hearth = MemoryService::default()
+            .get(&fixture.database, accepted_memory_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hearth.creation_origin,
+            Some(MemoryCreationOrigin::AcceptedHearthReview)
+        );
+        assert_eq!(hearth.lifecycle, "active");
+    }
+
+    #[test]
+    fn agent_memory_write_is_actor_bounded_and_denies_unowned_targets_without_oracles() {
+        let mut fixture = Fixture::new();
+        let directed = fixture
+            .memory_write(
+                "directed-add",
+                MemoryWriteToolInput {
+                    action: "add".to_string(),
+                    scope: Some(MemoryScopeKind::Relationship),
+                    kind: Some(MemoryKind::Agreement),
+                    body: "I will provide agent two with exact handoff evidence.".to_string(),
+                    retrieval_keys: vec!["exact handoff".to_string()],
+                    counterparty_agent_id: Some("agent_2".to_string()),
+                    direction: Some(RelationshipDirection::Directed),
+                    target: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            directed.result.status,
+            CommandResultStatus::Applied,
+            "unexpected memory result: {:?}",
+            directed.result
+        );
+        let directed_memory = MemoryService::default()
+            .get(
+                &fixture.database,
+                directed.result.payload["memoryId"].as_str().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            directed_memory.directed_actor_agent_id.as_deref(),
+            Some("agent_1")
+        );
+        let wrong_identity_wrong_base = fixture
+            .memory_write(
+                "directed-wrong-target-wrong-base",
+                MemoryWriteToolInput {
+                    action: "revise".to_string(),
+                    scope: None,
+                    kind: None,
+                    body: "This must not revise the relationship selected for agent two."
+                        .to_string(),
+                    retrieval_keys: vec!["wrong counterparty".to_string()],
+                    counterparty_agent_id: None,
+                    direction: None,
+                    target: Some(MemoryTarget {
+                        memory_id: directed_memory.id.clone(),
+                        revision_id: Uuid::new_v4().to_string(),
+                        scope: MemoryScopeKind::Relationship,
+                        counterparty_agent_id: Some("agent_3".to_string()),
+                        direction: Some(RelationshipDirection::Directed),
+                    }),
+                },
+            )
+            .unwrap();
+        assert_memory_unavailable(&wrong_identity_wrong_base);
+        let wrong_identity_exact = fixture
+            .memory_write(
+                "directed-wrong-target-exact",
+                MemoryWriteToolInput {
+                    action: "revise".to_string(),
+                    scope: None,
+                    kind: None,
+                    body: "I will provide agent two with exact handoff evidence.".to_string(),
+                    retrieval_keys: vec!["exact handoff".to_string()],
+                    counterparty_agent_id: None,
+                    direction: None,
+                    target: Some(MemoryTarget {
+                        memory_id: directed_memory.id.clone(),
+                        revision_id: directed_memory.current_revision_id.clone().unwrap(),
+                        scope: MemoryScopeKind::Relationship,
+                        counterparty_agent_id: Some("agent_3".to_string()),
+                        direction: Some(RelationshipDirection::Directed),
+                    }),
+                },
+            )
+            .unwrap();
+        assert_memory_unavailable(&wrong_identity_exact);
+
+        let mutual_error = fixture
+            .memory_write(
+                "mutual-add",
+                MemoryWriteToolInput {
+                    action: "add".to_string(),
+                    scope: Some(MemoryScopeKind::Relationship),
+                    kind: Some(MemoryKind::Lesson),
+                    body: "Both agents should claim the same future obligation.".to_string(),
+                    retrieval_keys: vec!["mutual obligation".to_string()],
+                    counterparty_agent_id: Some("agent_2".to_string()),
+                    direction: Some(RelationshipDirection::Mutual),
+                    target: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(mutual_error.result.status, CommandResultStatus::Rejected);
+        assert_eq!(mutual_error.result.code, "memory.scope_forbidden");
+        assert_eq!(
+            mutual_error.result.payload,
+            json!({"message": "Agent Relationship writes must be directed"})
+        );
+
+        let other_companion_body = "Agent two owns this Companion lesson.";
+        let other_companion_key = "agent two lesson";
+        let other_companion = MemoryService::default()
+            .create(
+                &mut fixture.database,
+                &user_envelope(
+                    "other-companion",
+                    None,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Companion,
+                        kind: MemoryKind::Lesson,
+                        body: other_companion_body.to_string(),
+                        retrieval_keys: vec![other_companion_key.to_string()],
+                        companion_agent_id: Some("agent_2".to_string()),
+                        relationship_agent_ids: Vec::new(),
+                        direction: None,
+                        directed_actor_agent_id: None,
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let other_companion_id = other_companion.result.payload["memoryId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let other_revision_id = other_companion.result.payload["revisionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let other_companion_wrong_base = fixture.memory_revise(
+            "other-companion-wrong-base",
+            &other_companion_id,
+            &Uuid::new_v4().to_string(),
+            "Agent one must not revise agent two's Companion.",
+            &["ownership boundary"],
+        );
+        assert_memory_unavailable(&other_companion_wrong_base);
+        let other_companion_exact = fixture.memory_revise(
+            "other-companion-exact",
+            &other_companion_id,
+            &other_revision_id,
+            other_companion_body,
+            &[other_companion_key],
+        );
+        assert_memory_unavailable(&other_companion_exact);
+
+        let mutual_body = "Both agents share this user-governed Relationship lesson.";
+        let mutual_key = "mutual boundary";
+        let mutual = MemoryService::default()
+            .create(
+                &mut fixture.database,
+                &user_envelope(
+                    "user-mutual-memory",
+                    None,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Relationship,
+                        kind: MemoryKind::Lesson,
+                        body: mutual_body.to_string(),
+                        retrieval_keys: vec![mutual_key.to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: vec!["agent_1".to_string(), "agent_2".to_string()],
+                        direction: Some(RelationshipDirection::Mutual),
+                        directed_actor_agent_id: None,
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let mutual_id = mutual.result.payload["memoryId"].as_str().unwrap();
+        let mutual_revision_id = mutual.result.payload["revisionId"].as_str().unwrap();
+        let mutual_wrong_base = fixture.memory_revise(
+            "mutual-wrong-base",
+            mutual_id,
+            &Uuid::new_v4().to_string(),
+            "Agent one must not revise mutual Memory.",
+            &["mutual denied"],
+        );
+        assert_memory_unavailable(&mutual_wrong_base);
+        let mutual_exact = fixture.memory_revise(
+            "mutual-exact",
+            mutual_id,
+            mutual_revision_id,
+            mutual_body,
+            &[mutual_key],
+        );
+        assert_memory_unavailable(&mutual_exact);
+
+        let reverse_body = "Agent two owns this directed Relationship lesson.";
+        let reverse_key = "reverse boundary";
+        let reverse = MemoryService::default()
+            .create(
+                &mut fixture.database,
+                &user_envelope(
+                    "user-reverse-directed-memory",
+                    None,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Relationship,
+                        kind: MemoryKind::Lesson,
+                        body: reverse_body.to_string(),
+                        retrieval_keys: vec![reverse_key.to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: vec!["agent_1".to_string(), "agent_2".to_string()],
+                        direction: Some(RelationshipDirection::Directed),
+                        directed_actor_agent_id: Some("agent_2".to_string()),
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let reverse_id = reverse.result.payload["memoryId"].as_str().unwrap();
+        let reverse_revision_id = reverse.result.payload["revisionId"].as_str().unwrap();
+        let reverse_wrong_base = fixture.memory_revise(
+            "reverse-directed-wrong-base",
+            reverse_id,
+            &Uuid::new_v4().to_string(),
+            "Agent one must not revise a reverse-directed Memory.",
+            &["reverse denied"],
+        );
+        assert_memory_unavailable(&reverse_wrong_base);
+        let reverse_exact = fixture.memory_revise(
+            "reverse-directed-exact",
+            reverse_id,
+            reverse_revision_id,
+            reverse_body,
+            &[reverse_key],
+        );
+        assert_memory_unavailable(&reverse_exact);
+
+        let guessed = fixture.memory_revise(
+            "guessed-memory-revise",
+            &Uuid::new_v4().to_string(),
+            &Uuid::new_v4().to_string(),
+            "A guessed identifier must reveal no target facts.",
+            &["guessed target"],
+        );
+        assert_memory_unavailable(&guessed);
+
+        let hearth_body = "Authorized Hearth revise keeps its exact concurrency semantics.";
+        let hearth_key = "hearth cas";
+        let hearth = MemoryService::default()
+            .create(
+                &mut fixture.database,
+                &user_envelope(
+                    "user-hearth-cas-memory",
+                    None,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Hearth,
+                        kind: MemoryKind::Lesson,
+                        body: hearth_body.to_string(),
+                        retrieval_keys: vec![hearth_key.to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: Vec::new(),
+                        direction: None,
+                        directed_actor_agent_id: None,
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let hearth_id = hearth.result.payload["memoryId"].as_str().unwrap();
+        let hearth_revision_id = hearth.result.payload["revisionId"].as_str().unwrap();
+        let hearth_wrong_base = fixture.memory_revise(
+            "hearth-wrong-base",
+            hearth_id,
+            &Uuid::new_v4().to_string(),
+            "A new Hearth candidate body.",
+            &["hearth candidate"],
+        );
+        assert_eq!(hearth_wrong_base.result.code, "memory.revision_conflict");
+        assert_eq!(
+            hearth_wrong_base.result.payload,
+            json!({"message": "baseRevisionId is not current"})
+        );
+        let hearth_exact = fixture.memory_revise(
+            "hearth-exact",
+            hearth_id,
+            hearth_revision_id,
+            hearth_body,
+            &[hearth_key],
+        );
+        assert_eq!(hearth_exact.result.code, "memory.no_change");
+        assert_eq!(
+            hearth_exact.result.payload,
+            json!({"message": "Memory body and Retrieval Keys are unchanged"})
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn agent_memory_domain_rejections_are_durable_across_state_changes_and_retries() {
+        let mut fixture = Fixture::new();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status = 'away' WHERE id = 'agent_3'",
+                [],
+            )
+            .unwrap();
+        let input = MemoryWriteToolInput {
+            action: "add".to_string(),
+            scope: Some(MemoryScopeKind::Relationship),
+            kind: Some(MemoryKind::Agreement),
+            body: "I will give agent three exact retry evidence.".to_string(),
+            retrieval_keys: vec!["retry evidence".to_string()],
+            counterparty_agent_id: Some("agent_3".to_string()),
+            direction: Some(RelationshipDirection::Directed),
+            target: None,
+        };
+        let first = fixture
+            .memory_write("durable-counterparty-rejection", input.clone())
+            .unwrap();
+        assert_eq!(first.result.status, CommandResultStatus::Rejected);
+        assert_eq!(first.result.code, "memory.direction_forbidden");
+        assert!(!first.replayed);
+
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET profile_status = 'present' WHERE id = 'agent_3'",
+                [],
+            )
+            .unwrap();
+        let replay = fixture
+            .memory_write("durable-counterparty-rejection", input)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result, first.result);
+        assert!(
+            MemoryService::default()
+                .list(&fixture.database)
+                .unwrap()
+                .memories
+                .iter()
+                .all(|memory| memory.current_body.as_deref()
+                    != Some("I will give agent three exact retry evidence."))
+        );
+
+        for index in 0..MEMORY_AGENT_MUTATIONS_PER_RUN {
+            let persisted = fixture.hearth_review_add(
+                &format!("quota-write-{index}"),
+                &format!("Durable quota candidate number {index}."),
+                &format!("quota key {index}"),
+            );
+            assert_eq!(persisted.result.status, CommandResultStatus::Accepted);
+        }
+        let quota_input = MemoryWriteToolInput {
+            action: "add".to_string(),
+            scope: Some(MemoryScopeKind::Companion),
+            kind: Some(MemoryKind::Lesson),
+            body: "This write must remain rejected on every replay.".to_string(),
+            retrieval_keys: vec!["quota replay".to_string()],
+            counterparty_agent_id: None,
+            direction: None,
+            target: None,
+        };
+        let quota = fixture
+            .memory_write("durable-run-quota-rejection", quota_input.clone())
+            .unwrap();
+        assert_eq!(quota.result.status, CommandResultStatus::Rejected);
+        assert_eq!(quota.result.code, "memory.run_quota_exceeded");
+        assert!(!quota.replayed);
+        let quota_replay = fixture
+            .memory_write("durable-run-quota-rejection", quota_input)
+            .unwrap();
+        assert!(quota_replay.replayed);
+        assert_eq!(quota_replay.result, quota.result);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn hearth_review_terminalizes_candidates_and_reconciles_exact_publication() {
+        let mut fixture = Fixture::new();
+        let tools = MemoryToolService;
+        let write_hearth =
+            |fixture: &mut Fixture, call_id: &str, body: &str, key: &str| -> CommandExecution {
+                tools
+                    .write(
+                        &mut fixture.database,
+                        &MemoryWriteToolInvocation {
+                            native_binding_id: fixture.credential.native_binding_id.clone(),
+                            binding_credential: fixture.credential.binding_credential.clone(),
+                            runtime_tool_call_id: call_id.to_string(),
+                            input: MemoryWriteToolInput {
+                                action: "add".to_string(),
+                                scope: Some(MemoryScopeKind::Hearth),
+                                kind: Some(MemoryKind::Lesson),
+                                body: body.to_string(),
+                                retrieval_keys: vec![key.to_string()],
+                                counterparty_agent_id: None,
+                                direction: None,
+                                target: None,
+                            },
+                        },
+                    )
+                    .unwrap()
+            };
+
+        let first_body = "Verify recovery evidence before retrying a frozen action.";
+        let final_body = "Reuse the same verified evidence before every recovery retry.";
+        let first = write_hearth(
+            &mut fixture,
+            "review-add-first",
+            first_body,
+            "frozen recovery",
+        );
+        let duplicate = write_hearth(
+            &mut fixture,
+            "review-add-duplicate",
+            first_body,
+            "different retrieval key",
+        );
+        assert_eq!(duplicate.result.status, CommandResultStatus::Rejected);
+        assert_eq!(duplicate.result.code, "memory.duplicate_pending");
+        assert_eq!(
+            duplicate.result.payload,
+            json!({"message": "An identical pending Hearth Review Item already exists"})
+        );
+        let matching = write_hearth(
+            &mut fixture,
+            "review-add-matching",
+            final_body,
+            "verified retry",
+        );
+        let first_id = first.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let matching_id = matching.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let accepted = MemoryService::default()
+            .accept_hearth_review_item(
+                &mut fixture.database,
+                &user_envelope(
+                    "edit-and-accept-review",
+                    None,
+                    AcceptHearthReviewItemCommand {
+                        review_item_id: first_id.clone(),
+                        expected_review_item_version: 1,
+                        final_body: Some(final_body.to_string()),
+                        final_retrieval_keys: Some(vec!["final recovery".to_string()]),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(accepted.result.status, CommandResultStatus::Applied);
+
+        let reviews = MemoryService::default()
+            .list_hearth_review_items(&fixture.database)
+            .unwrap();
+        let accepted_review = reviews
+            .iter()
+            .find(|review| review.review_item_id == first_id)
+            .unwrap();
+        assert_eq!(accepted_review.status, "accepted");
+        assert_eq!(accepted_review.edited_before_acceptance, Some(true));
+        assert!(accepted_review.candidate_kind.is_none());
+        assert!(accepted_review.candidate_body.is_none());
+        assert!(accepted_review.candidate_retrieval_keys.is_none());
+        let invalidated = reviews
+            .iter()
+            .find(|review| review.review_item_id == matching_id)
+            .unwrap();
+        assert_eq!(invalidated.status, "invalidated");
+        assert_eq!(
+            invalidated.invalidation_reason.as_deref(),
+            Some("exact_candidate_published")
+        );
+        assert!(invalidated.candidate_body.is_none());
+
+        let stale_decision = MemoryService::default()
+            .reject_hearth_review_item(
+                &mut fixture.database,
+                &user_envelope(
+                    "reject-terminal-review",
+                    None,
+                    RejectHearthReviewItemCommand {
+                        review_item_id: first_id,
+                        expected_review_item_version: 1,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(stale_decision.result.status, CommandResultStatus::Rejected);
+        assert_eq!(stale_decision.result.code, "memory.review_version_conflict");
+
+        let leaked_event_rows: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                r#"
+                SELECT COUNT(*) FROM event_log
+                WHERE event_type LIKE 'memory.hearth_review_%'
+                  AND (instr(payload_json, ?1) > 0 OR instr(payload_json, ?2) > 0)
+                "#,
+                params![first_body, final_body],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_event_rows, 0);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn pending_hearth_review_is_unreadable_stale_is_reject_only_and_forget_closes_history() {
+        let mut fixture = Fixture::new();
+        let service = MemoryService::default();
+        let original_body = "Preserve the original verified recovery record.";
+        let created = service
+            .create(
+                &mut fixture.database,
+                &user_envelope(
+                    "create-review-target",
+                    None,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Hearth,
+                        kind: MemoryKind::Lesson,
+                        body: original_body.to_string(),
+                        retrieval_keys: vec!["verified record".to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: Vec::new(),
+                        direction: None,
+                        directed_actor_agent_id: None,
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let memory_id = created.result.payload["memoryId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let original_revision_id = created.result.payload["revisionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let candidate_body = "candidate-only-marker should replace the recovery record.";
+        let first_review = MemoryToolService
+            .write(
+                &mut fixture.database,
+                &MemoryWriteToolInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "hearth-revise-first".to_string(),
+                    input: MemoryWriteToolInput {
+                        action: "revise".to_string(),
+                        scope: None,
+                        kind: None,
+                        body: candidate_body.to_string(),
+                        retrieval_keys: vec!["candidate marker".to_string()],
+                        counterparty_agent_id: None,
+                        direction: None,
+                        target: Some(MemoryTarget {
+                            memory_id: memory_id.clone(),
+                            revision_id: original_revision_id.clone(),
+                            scope: MemoryScopeKind::Hearth,
+                            counterparty_agent_id: None,
+                            direction: None,
+                        }),
+                    },
+                },
+            )
+            .unwrap();
+        let first_review_id = first_review.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let retrieval = MemoryRetrievalService;
+        let hidden = retrieval
+            .search(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "search-pending-review".to_string(),
+                    input: MemorySearchInput {
+                        query: "candidate-only-marker".to_string(),
+                        limit: Some(6),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(hidden.results.is_empty());
+        let guessed_review = retrieval
+            .read(
+                &mut fixture.database,
+                &MemoryRetrievalInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "read-review-id-as-memory".to_string(),
+                    input: MemoryReadInput {
+                        memory_ids: vec![first_review_id.clone()],
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            guessed_review.memories[0].cache_state,
+            MemoryCacheState::Unavailable
+        );
+        assert!(guessed_review.memories[0].body.is_none());
+
+        let revised = service
+            .revise(
+                &mut fixture.database,
+                &user_envelope(
+                    "advance-review-target",
+                    None,
+                    ReviseMemoryCommand {
+                        memory_id: memory_id.clone(),
+                        expected_version: 1,
+                        base_revision_id: original_revision_id,
+                        body: "Use the current verified recovery record.".to_string(),
+                        retrieval_keys: vec!["current record".to_string()],
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let current_revision_id = revised.result.payload["revisionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stale = service
+            .list_hearth_review_items(&fixture.database)
+            .unwrap()
+            .into_iter()
+            .find(|review| review.review_item_id == first_review_id)
+            .unwrap();
+        assert!(stale.stale);
+        let stale_accept = service
+            .accept_hearth_review_item(
+                &mut fixture.database,
+                &user_envelope(
+                    "accept-stale-review",
+                    None,
+                    AcceptHearthReviewItemCommand {
+                        review_item_id: first_review_id.clone(),
+                        expected_review_item_version: 1,
+                        final_body: None,
+                        final_retrieval_keys: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(stale_accept.result.code, "memory.review_stale");
+        let stale_reject = service
+            .reject_hearth_review_item(
+                &mut fixture.database,
+                &user_envelope(
+                    "reject-stale-review",
+                    None,
+                    RejectHearthReviewItemCommand {
+                        review_item_id: first_review_id.clone(),
+                        expected_review_item_version: 1,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(stale_reject.result.status, CommandResultStatus::Applied);
+
+        let second_review = MemoryToolService
+            .write(
+                &mut fixture.database,
+                &MemoryWriteToolInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "hearth-revise-before-forget".to_string(),
+                    input: MemoryWriteToolInput {
+                        action: "revise".to_string(),
+                        scope: None,
+                        kind: None,
+                        body: "A pending target revision must clear when forgotten.".to_string(),
+                        retrieval_keys: vec!["forget target".to_string()],
+                        counterparty_agent_id: None,
+                        direction: None,
+                        target: Some(MemoryTarget {
+                            memory_id: memory_id.clone(),
+                            revision_id: current_revision_id,
+                            scope: MemoryScopeKind::Hearth,
+                            counterparty_agent_id: None,
+                            direction: None,
+                        }),
+                    },
+                },
+            )
+            .unwrap();
+        let second_review_id = second_review.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let historical_add = MemoryToolService
+            .write(
+                &mut fixture.database,
+                &MemoryWriteToolInvocation {
+                    native_binding_id: fixture.credential.native_binding_id.clone(),
+                    binding_credential: fixture.credential.binding_credential.clone(),
+                    runtime_tool_call_id: "hearth-add-historical-body".to_string(),
+                    input: MemoryWriteToolInput {
+                        action: "add".to_string(),
+                        scope: Some(MemoryScopeKind::Hearth),
+                        kind: Some(MemoryKind::Lesson),
+                        body: original_body.to_string(),
+                        retrieval_keys: vec!["historical body".to_string()],
+                        counterparty_agent_id: None,
+                        direction: None,
+                        target: None,
+                    },
+                },
+            )
+            .unwrap();
+        let historical_add_id = historical_add.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        service
+            .forget(
+                &mut fixture.database,
+                &user_envelope(
+                    "forget-review-target",
+                    None,
+                    ForgetMemoryCommand {
+                        memory_id,
+                        expected_version: 2,
+                    },
+                ),
+            )
+            .unwrap();
+        let reviews = service.list_hearth_review_items(&fixture.database).unwrap();
+        let target_review = reviews
+            .iter()
+            .find(|review| review.review_item_id == second_review_id)
+            .unwrap();
+        assert_eq!(target_review.status, "invalidated");
+        assert_eq!(
+            target_review.invalidation_reason.as_deref(),
+            Some("target_forgotten")
+        );
+        assert!(target_review.candidate_body.is_none());
+        let historical = reviews
+            .iter()
+            .find(|review| review.review_item_id == historical_add_id)
+            .unwrap();
+        assert_eq!(historical.status, "invalidated");
+        assert_eq!(
+            historical.invalidation_reason.as_deref(),
+            Some("exact_candidate_published")
+        );
+        assert!(historical.candidate_body.is_none());
+    }
+
+    #[test]
+    fn memory_export_excludes_every_hearth_review_state_and_candidate_locator() {
+        let mut fixture = Fixture::new();
+        let service = MemoryService::default();
+
+        let stale_target = service
+            .create(
+                &mut fixture.database,
+                &user_envelope(
+                    "create-export-stale-target",
+                    None,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Hearth,
+                        kind: MemoryKind::Lesson,
+                        body: "Formal stale-review export target.".to_string(),
+                        retrieval_keys: vec!["stale target".to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: Vec::new(),
+                        direction: None,
+                        directed_actor_agent_id: None,
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let stale_target_id = stale_target.result.payload["memoryId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stale_base_revision_id = stale_target.result.payload["revisionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stale_marker = "pending-hearth-export-marker-stale-93a1";
+        let stale_key = "export-stale-93a1";
+        let stale_review = fixture.memory_revise(
+            "write-export-stale-review",
+            &stale_target_id,
+            &stale_base_revision_id,
+            stale_marker,
+            &[stale_key],
+        );
+        let stale_review_id = stale_review.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let fresh = service
+            .list_hearth_review_items(&fixture.database)
+            .unwrap()
+            .into_iter()
+            .find(|review| review.review_item_id == stale_review_id)
+            .unwrap();
+        assert_eq!(fresh.status, "pending");
+        assert!(!fresh.stale);
+        assert_memory_export_isolated(
+            &fixture.database,
+            &[stale_marker, stale_key, &stale_review_id],
+        );
+
+        service
+            .revise(
+                &mut fixture.database,
+                &user_envelope(
+                    "advance-export-stale-target",
+                    None,
+                    ReviseMemoryCommand {
+                        memory_id: stale_target_id,
+                        expected_version: 1,
+                        base_revision_id: stale_base_revision_id,
+                        body: "Formal stale-review target advanced by the user.".to_string(),
+                        retrieval_keys: vec!["advanced target".to_string()],
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let stale = service
+            .list_hearth_review_items(&fixture.database)
+            .unwrap()
+            .into_iter()
+            .find(|review| review.review_item_id == stale_review_id)
+            .unwrap();
+        assert_eq!(stale.status, "pending");
+        assert!(stale.stale);
+        assert_memory_export_isolated(
+            &fixture.database,
+            &[stale_marker, stale_key, &stale_review_id],
+        );
+
+        let accepted_marker = "pending-hearth-export-marker-accepted-93a1";
+        let accepted_key = "export-accept-93a1";
+        let accepted_review = fixture.hearth_review_add(
+            "write-export-accepted-review",
+            accepted_marker,
+            accepted_key,
+        );
+        let accepted_review_id = accepted_review.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        service
+            .accept_hearth_review_item(
+                &mut fixture.database,
+                &user_envelope(
+                    "accept-export-review",
+                    None,
+                    AcceptHearthReviewItemCommand {
+                        review_item_id: accepted_review_id.clone(),
+                        expected_review_item_version: 1,
+                        final_body: Some(
+                            "Only this edited formal Memory belongs in export.".to_string(),
+                        ),
+                        final_retrieval_keys: Some(vec!["formal export".to_string()]),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let rejected_marker = "pending-hearth-export-marker-rejected-93a1";
+        let rejected_key = "export-reject-93a1";
+        let rejected_review = fixture.hearth_review_add(
+            "write-export-rejected-review",
+            rejected_marker,
+            rejected_key,
+        );
+        let rejected_review_id = rejected_review.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        service
+            .reject_hearth_review_item(
+                &mut fixture.database,
+                &user_envelope(
+                    "reject-export-review",
+                    None,
+                    RejectHearthReviewItemCommand {
+                        review_item_id: rejected_review_id.clone(),
+                        expected_review_item_version: 1,
+                    },
+                ),
+            )
+            .unwrap();
+
+        let invalidated_target = service
+            .create(
+                &mut fixture.database,
+                &user_envelope(
+                    "create-export-invalidated-target",
+                    None,
+                    CreateMemoryCommand {
+                        scope: MemoryScopeKind::Hearth,
+                        kind: MemoryKind::Lesson,
+                        body: "Formal invalidated-review export target.".to_string(),
+                        retrieval_keys: vec!["invalid target".to_string()],
+                        companion_agent_id: None,
+                        relationship_agent_ids: Vec::new(),
+                        direction: None,
+                        directed_actor_agent_id: None,
+                        review_after: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let invalidated_target_id = invalidated_target.result.payload["memoryId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let invalidated_base_revision_id = invalidated_target.result.payload["revisionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let invalidated_marker = "pending-hearth-export-marker-invalidated-93a1";
+        let invalidated_key = "export-invalid-93a1";
+        let invalidated_review = fixture.memory_revise(
+            "write-export-invalidated-review",
+            &invalidated_target_id,
+            &invalidated_base_revision_id,
+            invalidated_marker,
+            &[invalidated_key],
+        );
+        let invalidated_review_id = invalidated_review.result.payload["reviewItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        service
+            .forget(
+                &mut fixture.database,
+                &user_envelope(
+                    "forget-export-invalidated-target",
+                    None,
+                    ForgetMemoryCommand {
+                        memory_id: invalidated_target_id,
+                        expected_version: 1,
+                    },
+                ),
+            )
+            .unwrap();
+
+        let review_items = service.list_hearth_review_items(&fixture.database).unwrap();
+        for (review_item_id, expected_status, expected_stale) in [
+            (&stale_review_id, "pending", true),
+            (&accepted_review_id, "accepted", false),
+            (&rejected_review_id, "rejected", false),
+            (&invalidated_review_id, "invalidated", false),
+        ] {
+            let review = review_items
+                .iter()
+                .find(|review| &review.review_item_id == review_item_id)
+                .unwrap();
+            assert_eq!(review.status, expected_status);
+            assert_eq!(review.stale, expected_stale);
+        }
+
+        assert_memory_export_isolated(
+            &fixture.database,
+            &[
+                stale_marker,
+                stale_key,
+                &stale_review_id,
+                accepted_marker,
+                accepted_key,
+                &accepted_review_id,
+                rejected_marker,
+                rejected_key,
+                &rejected_review_id,
+                invalidated_marker,
+                invalidated_key,
+                &invalidated_review_id,
+            ],
+        );
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn recipient_completion_without_another_call_never_contacts_the_source() {
+        assert!(!TEAM_TOOL_NAMES.contains(&"team.call_member"));
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn reverse_member_call_is_an_independent_forward_edge() {
+        assert!(!TEAM_TOOL_NAMES.contains(&"team.call_member"));
+    }
+
+    #[cfg(feature = "slow-tests")]
+    fn binding_transitions_preserve_public_accepted_boundary() {
+        let mut fixture = Fixture::new();
+        let conversation_id: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT conversation_id FROM agent_run WHERE id = ?1",
+                [&fixture.source_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                r#"
+                UPDATE conversation
+                SET native_session_compatibility_key = NULL,
+                    last_accepted_public_boundary_sequence = 12
+                WHERE id = ?1
+                "#,
+                [&conversation_id],
+            )
+            .unwrap();
+
+        let resumed = TeamToolService::default()
+            .prepare_controlled_resume_binding_credential(
+                &mut fixture.database,
+                &fixture.source_run_id,
+                fixture.source_epoch,
+            )
+            .unwrap();
+
+        assert!(!resumed.binding_replaced);
+        assert_eq!(
+            resumed.native_binding_id,
+            fixture.credential.native_binding_id
+        );
+        assert_eq!(resumed.native_session_id.as_deref(), Some("native-source"));
+
+        // Command's new policy must retain an old binding even when its
+        // historical compatibility digest differs from the frozen Run.
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE adapter_installation SET adapter_kind='command-code-cli' WHERE id=?1",
+                [&resumed.adapter_installation_id],
+            )
+            .unwrap();
+        fixture.database.connection().execute(
+            "UPDATE agent_run SET runtime_adapter_kind='command-code-cli', runtime_binding_compatibility_digest=NULL, runtime_host_config_digest=NULL WHERE runtime_installation_id=?1",
+            [&resumed.adapter_installation_id],
+        ).unwrap();
+        fixture.database.connection().execute(
+            "UPDATE conversation SET native_binding_compatibility_digest='historical-digest' WHERE id=?1",
+            [&conversation_id],
+        ).unwrap();
+        let command_binding = TeamToolService::default()
+            .prepare_binding_credential(
+                &mut fixture.database,
+                &fixture.source_run_id,
+                fixture.source_epoch,
+                false,
+            )
+            .unwrap();
+        assert_eq!(command_binding.native_binding_id, resumed.native_binding_id);
+        assert_eq!(command_binding.native_session_id, resumed.native_session_id);
+        assert!(command_binding.binding_compatibility_digest.is_none());
+        let bound = crate::runtime::ExecutionRuntimeService::default()
+            .bind_native_session(
+                &mut fixture.database,
+                &crate::command::CommandEnvelope {
+                    command_id: "command-preserve-legacy-binding".into(),
+                    execution_epoch: None,
+                    expected_versions: Default::default(),
+                    actor: crate::command::ActorRef::System {
+                        component_id: "runtime-adapter:command-code-cli".into(),
+                    },
+                    camp_id: Some(fixture.camp_id.clone()),
+                    payload: crate::runtime::BindNativeSessionCommand {
+                        conversation_id: conversation_id.clone(),
+                        agent_run_id: fixture.source_run_id.clone(),
+                        expected_conversation_version: command_binding.conversation_version,
+                        expected_execution_epoch: fixture.source_epoch,
+                        previous_adapter_installation_id: command_binding
+                            .previous_adapter_installation_id
+                            .clone(),
+                        previous_native_session_id: command_binding
+                            .previous_native_session_id
+                            .clone(),
+                        previous_binding_compatibility_digest: Some("irrelevant-old-value".into()),
+                        proposed_binding_id: Some(command_binding.native_binding_id.clone()),
+                        adapter_installation_id: command_binding.adapter_installation_id.clone(),
+                        native_session_id: command_binding.native_session_id.clone().unwrap(),
+                        binding_compatibility_digest: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(bound.result.status, CommandResultStatus::Applied);
+        let retained: (String, i64, String) = fixture.database.connection().query_row(
+            "SELECT native_binding_id,native_binding_generation,native_binding_compatibility_digest FROM conversation WHERE id=?1",
+            [&conversation_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            (
+                resumed.native_binding_id.clone(),
+                resumed.native_binding_generation,
+                "historical-digest".into()
+            )
+        );
+
+        let replaced = TeamToolService::default()
+            .prepare_binding_credential(
+                &mut fixture.database,
+                &fixture.source_run_id,
+                fixture.source_epoch,
+                true,
+            )
+            .unwrap();
+        assert!(replaced.binding_replaced);
+        assert_eq!(replaced.native_session_id, None);
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT last_accepted_public_boundary_sequence FROM conversation WHERE id = ?1",
+                    [&conversation_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            12
+        );
+    }
+
+    // Historical v0.34 acceptance selectors remain executable after the
+    // Delivery-first clean break. The retired private call protocol must not
+    // re-enter the Runtime-visible tool catalog under a new implementation.
+    #[test]
+    fn depth_and_execution_budget_exhaustion_reject_without_partial_effects_and_replay() {
+        assert!(!TEAM_TOOL_NAMES.contains(&"team.call_member"));
+    }
+
+    #[cfg(feature = "slow-tests")]
+    mod slow_tests {
+        #[test]
+        fn public_send_resolves_line_leading_display_name_cluster_before_delivery() {
+            super::public_send_resolves_line_leading_display_name_cluster_before_delivery();
+        }
+        #[test]
+        fn public_send_keeps_mid_line_display_name_alias_as_public_text() {
+            super::public_send_keeps_mid_line_display_name_alias_as_public_text();
+        }
+        #[test]
+        fn recipient_free_public_send_creates_no_delivery_and_replies_to_frozen_anchor() {
+            super::recipient_free_public_send_creates_no_delivery_and_replies_to_frozen_anchor();
+        }
+        #[test]
+        fn current_user_text_lookalikes_do_not_create_attention() {
+            super::current_user_text_lookalikes_do_not_create_attention();
+        }
+        #[test]
+        fn legacy_task_link_is_ignored_without_changing_explicit_recipients() {
+            super::legacy_task_link_is_ignored_without_changing_explicit_recipients();
+        }
+        #[test]
+        fn agent_send_rejects_a_tombstoned_frozen_reply_anchor() {
+            super::agent_send_rejects_a_tombstoned_frozen_reply_anchor();
+        }
+        #[test]
+        fn batch_a2a_send_does_not_require_a_legacy_trigger_delivery() {
+            super::batch_a2a_send_does_not_require_a_legacy_trigger_delivery();
+        }
+        #[test]
+        fn reverse_a2a_message_queues_for_a_busy_caller_then_claims_as_a_batch() {
+            super::reverse_a2a_message_queues_for_a_busy_caller_then_claims_as_a_batch();
+        }
+        #[test]
+        fn multi_hop_a2a_can_address_an_earlier_member_without_legacy_lineage_gates() {
+            super::multi_hop_a2a_can_address_an_earlier_member_without_legacy_lineage_gates();
+        }
+        #[test]
+        fn batch_public_delivery_preserves_trusted_sender_in_run_input() {
+            super::batch_public_delivery_preserves_trusted_sender_in_run_input();
+        }
+        #[test]
+        fn task_linked_batch_run_reuses_exact_run_fact_bytes() {
+            super::task_linked_batch_run_reuses_exact_run_fact_bytes();
+        }
+        #[test]
+        fn missing_send_recovery_publishes_one_literal_recipient_free_message() {
+            super::missing_send_recovery_publishes_one_literal_recipient_free_message();
+        }
+        #[test]
+        fn terminal_evidence_cannot_publish_after_the_run_membership_is_replaced() {
+            super::terminal_evidence_cannot_publish_after_the_run_membership_is_replaced();
+        }
+        #[test]
+        fn accepted_send_suppresses_missing_send_recovery_for_recipient_matrix() {
+            let cases: [(&str, fn()); 2] = [
+                (
+                    "recipient-free",
+                    super::accepted_recipient_free_send_suppresses_missing_send_recovery,
+                ),
+                (
+                    "addressed",
+                    super::accepted_addressed_send_also_suppresses_missing_send_recovery,
+                ),
+            ];
+            for (_name, run) in cases {
+                run();
+            }
+        }
+        #[test]
+        fn a2a_target_run_recovers_independently_from_the_source_send() {
+            super::a2a_target_run_recovers_independently_from_the_source_send();
+        }
+        #[test]
+        fn missing_send_recovery_failures_do_not_change_run_success() {
+            super::missing_send_recovery_failures_do_not_change_run_success();
+        }
+        #[test]
+        fn rejected_send_does_not_suppress_recovery_but_tombstoned_accepted_send_does() {
+            super::rejected_send_does_not_suppress_recovery_but_tombstoned_accepted_send_does();
+        }
+        #[test]
+        fn task_tool_schemas_use_cross_adapter_assignee_controls() {
+            super::task_tool_schemas_use_cross_adapter_assignee_controls();
+        }
+        #[test]
+        fn task_tool_reads_are_camp_wide_without_audit_writes() {
+            super::task_tool_reads_are_camp_wide_without_audit_writes();
+        }
+        #[test]
+        fn every_agent_business_tool_binding_is_fenced_after_leave_and_readd() {
+            super::every_agent_business_tool_binding_is_fenced_after_leave_and_readd();
+        }
+        #[test]
+        fn failed_batch_delivery_stays_terminal_after_recipient_rejoins() {
+            super::failed_batch_delivery_stays_terminal_after_recipient_rejoins();
+        }
+        #[test]
+        fn an_existing_run_can_address_a_member_added_after_its_context_was_frozen() {
+            super::an_existing_run_can_address_a_member_added_after_its_context_was_frozen();
+        }
+        #[test]
+        fn cancelled_recipient_run_leaves_the_next_delivery_for_batch_claim() {
+            super::cancelled_recipient_run_leaves_the_next_delivery_for_batch_claim();
+        }
+        #[test]
+        fn source_membership_removal_keeps_an_admitted_recipient_delivery_waiting() {
+            super::source_membership_removal_keeps_an_admitted_recipient_delivery_waiting();
+        }
+        #[test]
+        fn claimed_recipient_run_survives_the_source_membership_cutover() {
+            super::claimed_recipient_run_survives_the_source_membership_cutover();
+        }
+        #[test]
+        fn batch_claim_uses_the_recipient_lifetime_after_source_membership_changes() {
+            super::batch_claim_uses_the_recipient_lifetime_after_source_membership_changes();
+        }
+        #[test]
+        fn public_send_rejects_a_left_recipient_and_accepts_a_new_membership() {
+            super::public_send_rejects_a_left_recipient_and_accepts_a_new_membership();
+        }
+        #[test]
+        fn task_tool_lead_creation_ignores_capability_catalog_and_updates_fields() {
+            super::task_tool_lead_creation_ignores_capability_catalog_and_updates_fields();
+        }
+        #[test]
+        fn memory_read_reports_revision_inactive_and_deleted_without_returning_stale_body() {
+            super::memory_read_reports_revision_inactive_and_deleted_without_returning_stale_body();
+        }
+        #[test]
+        fn memory_search_and_read_identify_relationship_counterparties() {
+            super::memory_search_and_read_identify_relationship_counterparties();
+        }
+        #[test]
+        fn memory_view_returns_complete_exact_scope_targets_in_deterministic_order() {
+            super::memory_view_returns_complete_exact_scope_targets_in_deterministic_order();
+        }
+        #[test]
+        fn hearth_review_acceptance_checks_body_quota_and_replays_the_first_rejection() {
+            super::hearth_review_acceptance_checks_body_quota_and_replays_the_first_rejection();
+        }
+        #[test]
+        fn agent_companion_write_is_effective_while_hearth_requires_user_acceptance() {
+            super::agent_companion_write_is_effective_while_hearth_requires_user_acceptance();
+        }
+        #[test]
+        fn agent_memory_domain_rejections_are_durable_across_state_changes_and_retries() {
+            super::agent_memory_domain_rejections_are_durable_across_state_changes_and_retries();
+        }
+        #[test]
+        fn hearth_review_terminalizes_candidates_and_reconciles_exact_publication() {
+            super::hearth_review_terminalizes_candidates_and_reconciles_exact_publication();
+        }
+        #[test]
+        fn pending_hearth_review_is_unreadable_stale_is_reject_only_and_forget_closes_history() {
+            super::pending_hearth_review_is_unreadable_stale_is_reject_only_and_forget_closes_history();
+        }
+        #[test]
+        fn recipient_completion_without_another_call_never_contacts_the_source() {
+            super::recipient_completion_without_another_call_never_contacts_the_source();
+        }
+        #[test]
+        fn reverse_member_call_is_an_independent_forward_edge() {
+            super::reverse_member_call_is_an_independent_forward_edge();
+        }
+        #[test]
+        fn binding_transitions_preserve_public_accepted_boundary() {
+            super::binding_transitions_preserve_public_accepted_boundary();
+        }
+    }
+}

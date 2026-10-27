@@ -1,0 +1,1466 @@
+use super::*;
+use crate::{
+    collaboration::{
+        CollaborationService, ProjectBindingKind, TestThreadConversationCommand,
+        TestThreadMessageAddress,
+    },
+    command::{ActorRef, CommandEnvelope},
+    test_support::{OwnedTestDatabase, seeded_runtime_database_fast_owned},
+};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use serde_json::json;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+    time::{Duration, Instant},
+};
+
+// These tests own the complete CampOpen SQL boundary. A pure query test cannot
+// detect an event read introduced by message hydration or another nested loader.
+fn business_fixture() -> (OwnedTestDatabase, String, String, String) {
+    let mut database = seeded_runtime_database_fast_owned();
+    let workspace = database.directory().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let created = CollaborationService::default()
+        .create_test_camp_conversation(
+            &mut database,
+            &CommandEnvelope {
+                command_id: "camp-open-business-fixture".to_string(),
+                actor: ActorRef::User {
+                    user_id: "local_user".to_string(),
+                },
+                camp_id: None,
+                expected_versions: vec![],
+                execution_epoch: None,
+                payload: TestThreadConversationCommand {
+                    project_binding_kind: ProjectBindingKind::Directory,
+                    project_path: workspace.to_string_lossy().to_string(),
+                    body: "保留业务状态".to_string(),
+                    address: TestThreadMessageAddress::Explicit {
+                        agent_ids: vec!["agent_1".to_string(), "agent_2".to_string()],
+                    },
+                    purpose: "CampOpen SQL isolation".to_string(),
+                },
+            },
+        )
+        .unwrap();
+    let camp_id = created.result.payload["threadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let completed_run = created.result.payload["agentRunIds"][0].as_str().unwrap();
+    let active_run = created.result.payload["agentRunIds"][1].as_str().unwrap();
+    let connection = database.connection();
+    let now = "2026-08-31T00:00:00Z";
+    connection.execute(
+        "UPDATE agent_run SET execution_epoch = 1, status = 'succeeded', ended_at = ?2,
+         runtime_adapter_kind = 'codex-cli',
+         runtime_model_selection_json = '{\"source\":\"explicit\",\"modelId\":\"frozen-model\",\"options\":{\"reasoning_effort\":\"high\"}}'
+         WHERE id = ?1",
+        params![completed_run, now],
+    ).unwrap();
+    connection
+        .execute(
+            "UPDATE agent_run SET execution_epoch = 1, status = 'running', started_at = ?2,
+         runtime_adapter_kind = 'claude-code-cli',
+         runtime_model_selection_json = '{\"source\":\"runtime_default\"}',
+         runtime_observed_model_id = 'observed-model' WHERE id = ?1",
+            params![active_run, now],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO task (
+            id, camp_id, title, description, acceptance_criteria_json, status,
+            assignee_agent_id, created_by_type, created_by_id, created_at, updated_at
+        ) VALUES ('open-task', ?1, '旧任务', '保留任务业务数据', '[]', 'pending',
+                  'agent_2', 'user', 'local_user', ?2, ?2)"#,
+            params![camp_id, now],
+        )
+        .unwrap();
+    // Supported historical shape: the event has no direct Camp identity.
+    connection
+        .execute(
+            r#"INSERT INTO event_log (
+            event_id, task_id, sequence, event_type, camp_id, entity_type,
+            entity_id, payload_json, created_at
+        ) VALUES ('legacy-open-task-event', 'open-task', 1, 'task.created', NULL,
+                  'task', 'open-task', '{}', ?1)"#,
+            [now],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO agent_run_execution_evidence (
+            id, agent_run_id, execution_epoch, sequence, event_type, kind, phase,
+            payload_preview_json, content_byte_count, is_truncated, occurred_at
+        ) VALUES ('open-evidence', ?1, 1, 1, 'agent.text.delta', 'narration', 'updated',
+                  '{"delta":"仍在执行"}', 12, 0, ?2)"#,
+            params![active_run, now],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO action_execution (
+            id, agent_run_id, action_kind, action_schema_version, action_digest,
+            digest_algorithm, canonicalization_version, canonical_input_json,
+            input_completeness, action_summary, execution_authority, control_mode,
+            policy_decision, policy_version, status, created_at, updated_at
+        ) VALUES ('open-action', ?1, 'test.action', '1', 'sha256:open-action',
+                  'sha256', 'canonical-json-v1', '{}', 'complete', '等待用户批准',
+                  'core', 'mediated', 'ask', '1', 'prepared', ?2, ?2)"#,
+            params![active_run, now],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO approval (
+            id, action_id, action_kind, action_digest, digest_algorithm,
+            canonicalization_version, action_summary, requested_for_user_id,
+            request_policy_version, request_json, reason, status, requested_at, updated_at
+        ) VALUES ('open-approval', 'open-action', 'test.action', 'sha256:open-action',
+                  'sha256', 'canonical-json-v1', '等待用户批准', 'local_user', '1',
+                  '{}', '确认操作', 'pending', ?1, ?1)"#,
+            [now],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO managed_blob (
+            id, sha256, byte_size, media_type, storage_relative_path, state,
+            sensitivity, created_at, updated_at
+        ) VALUES ('open-file-blob', 'sha256:open-file', 2, 'application/json',
+                  'open-file.json', 'present', 'normal', ?1, ?1)"#,
+            [now],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO agent_run_file_change_projection (
+            agent_run_id, execution_epoch, schema_version, status, file_count,
+            operation_count, files_summary_json, details_blob_id, source_evidence_ids_json,
+            completed_at, created_at
+        ) VALUES (?1, 1, 2, 'complete', 1, 1, ?2, 'open-file-blob', '[]', ?3, ?3)"#,
+            params![
+                completed_run,
+                json!([{
+                    "evidenceFileId": "open-file", "path": "src/fixture.rs", "changeKind": "update",
+                    "presentationKind": "operation_history", "operationCount": 1
+                }])
+                .to_string(),
+                now
+            ],
+        )
+        .unwrap();
+    let message_id: String = connection.query_row(
+        "SELECT id FROM camp_message WHERE camp_id = ?1 AND author_type = 'user' ORDER BY sequence LIMIT 1",
+        [&camp_id], |row| row.get(0),
+    ).unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO camp_message (
+            id, camp_id, sequence, author_type, author_id, source_agent_run_id,
+            body, structured_content_json, content_digest, address_mode,
+            addressed_agent_ids_json, camp_turn_id, version, created_at, updated_at
+        ) SELECT 'open-agent-message', ?1,
+                 (SELECT MAX(sequence) + 1 FROM camp_message WHERE camp_id = ?1),
+                 'agent', source_conversation.agent_id, source_run.id, '交接',
+                 '[{"kind":"text","text":"交接"}]', 'sha256:open-message', 'default',
+                 json_array(target_conversation.agent_id), NULL, 1, ?4, ?4
+          FROM agent_run AS source_run
+          JOIN conversation AS source_conversation
+            ON source_conversation.id = source_run.conversation_id
+          JOIN agent_run AS target_run ON target_run.id = ?3
+          JOIN conversation AS target_conversation
+            ON target_conversation.id = target_run.conversation_id
+          WHERE source_run.id = ?2"#,
+            params![camp_id, completed_run, active_run, now],
+        )
+        .unwrap();
+    // Exercise the current Delivery-first storage seam. Writing the retired
+    // message_delivery table here would let Camp Open drift from publication
+    // while this boundary test continued to pass.
+    connection
+        .execute(
+            r#"INSERT INTO camp_message_delivery (
+            id, camp_id, message_id, recipient_agent_id,
+            recipient_membership_version_at_admission, queue_sequence,
+            status, claimed_agent_run_id, failure_code, version,
+            created_at, claimed_at, ended_at, updated_at
+        ) SELECT 'open-delivery', ?1, 'open-agent-message', conversation.agent_id,
+                 camp_member.version,
+                 (SELECT sequence FROM camp_message WHERE id = 'open-agent-message'),
+                 'claimed', ?2, NULL, 1, ?3, ?3, NULL, ?3
+          FROM agent_run
+          JOIN conversation ON conversation.id = agent_run.conversation_id
+          JOIN camp_member
+            ON camp_member.camp_id = ?1
+           AND camp_member.agent_id = conversation.agent_id
+          WHERE agent_run.id = ?2"#,
+            params![camp_id, active_run, now],
+        )
+        .unwrap();
+    let attachment_path = database.directory().join("open-attachment.txt");
+    std::fs::write(&attachment_path, "attachment").unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO message_attachment (
+            id, camp_id, camp_message_id, position, display_name, media_type, byte_size,
+            content_digest, storage_path, preview_kind, created_by_type, created_by_id, created_at
+        ) VALUES ('open-attachment', ?1, ?2, 0, 'attachment.txt', 'text/plain', 10,
+                  'sha256:open-attachment', ?3, 'none', 'user', 'local_user', ?4)"#,
+            params![camp_id, message_id, attachment_path.to_string_lossy(), now],
+        )
+        .unwrap();
+    (
+        database,
+        camp_id,
+        completed_run.to_string(),
+        active_run.to_string(),
+    )
+}
+
+fn deny_event_log(context: AuthContext<'_>) -> Authorization {
+    match context.action {
+        AuthAction::Read {
+            table_name: "event_log",
+            ..
+        } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }
+}
+
+fn read_metered(database: &mut Database, camp_id: &str) -> (ThreadOpenProjection, usize, Duration) {
+    let steps = Arc::new(AtomicUsize::new(0));
+    let observed_steps = Arc::clone(&steps);
+    database
+        .connection()
+        .authorizer(Some(deny_event_log))
+        .unwrap();
+    database
+        .connection()
+        .progress_handler(
+            1,
+            Some(move || {
+                observed_steps.fetch_add(1, AtomicOrdering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+    let started = Instant::now();
+    let result = ReadModelService.camp_open_projection(database, camp_id);
+    let elapsed = started.elapsed();
+    database
+        .connection()
+        .progress_handler(0, None::<fn() -> bool>)
+        .unwrap();
+    database
+        .connection()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    (
+        result.expect("CampOpen must succeed with every event_log read denied"),
+        steps.load(AtomicOrdering::Relaxed),
+        elapsed,
+    )
+}
+
+fn append_waiting_user_deliveries(database: &mut Database, camp_id: &str, active_run: &str) {
+    {
+        let connection = database.connection();
+        let recipient_agent_id: String = connection
+            .query_row(
+                r#"SELECT conversation.agent_id
+                   FROM agent_run
+                   JOIN conversation ON conversation.id = agent_run.conversation_id
+                   WHERE agent_run.id = ?1"#,
+                [active_run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (index, created_at) in ["2026-08-31T00:00:01Z", "2026-08-31T00:00:02Z"]
+            .into_iter()
+            .enumerate()
+        {
+            let message_id = format!("open-user-waiting-{}", index + 1);
+            let delivery_id = format!("open-user-waiting-delivery-{}", index + 1);
+            let body = format!("排队消息 {}", index + 1);
+            let structured_content = json!([{"kind": "text", "text": body}]).to_string();
+            connection
+                .execute(
+                    r#"INSERT INTO camp_message (
+                        id, camp_id, sequence, author_type, author_id,
+                        body, structured_content_json, content_digest,
+                        address_mode, addressed_agent_ids_json,
+                        effective_recipient_ids_json, recipient_presentation_json,
+                        agent_addressing_mode, origin_kind,
+                        version, created_at, updated_at
+                    ) VALUES (
+                        ?1, ?2,
+                        (SELECT COALESCE(MAX(sequence), 0) + 1
+                         FROM camp_message WHERE camp_id = ?2),
+                        'user', 'local_user', ?3, ?4, ?5,
+                        'explicit', json_array(?6), json_array(?6), '{}',
+                        'automatic', 'local_composer', 1, ?7, ?7
+                    )"#,
+                    params![
+                        message_id,
+                        camp_id,
+                        body,
+                        structured_content,
+                        format!("sha256:open-user-waiting-{}", index + 1),
+                        recipient_agent_id,
+                        created_at,
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    r#"INSERT INTO camp_message_delivery (
+                        id, camp_id, message_id, recipient_agent_id,
+                        recipient_membership_version_at_admission,
+                        queue_sequence, status, version, created_at, updated_at
+                    ) SELECT ?1, ?2, ?3, ?4, camp_member.version,
+                             (SELECT COALESCE(MAX(queue_sequence), 0) + 1
+                              FROM camp_message_delivery
+                              WHERE camp_id = ?2 AND recipient_agent_id = ?4),
+                             'waiting', 1, ?5, ?5
+                      FROM camp_member
+                      WHERE camp_member.camp_id = ?2
+                        AND camp_member.agent_id = ?4"#,
+                    params![
+                        delivery_id,
+                        camp_id,
+                        message_id,
+                        recipient_agent_id,
+                        created_at,
+                    ],
+                )
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn camp_open_preserves_business_state_without_reading_event_history() {
+    let (mut database, camp_id, completed_run, active_run) = business_fixture();
+    append_waiting_user_deliveries(&mut database, &camp_id, &active_run);
+    let snapshot = ReadModelService
+        .camp_snapshot(&mut database, &camp_id)
+        .unwrap();
+    assert!(
+        snapshot
+            .messages
+            .iter()
+            .any(|message| message.timeline_global_sequence.is_some())
+    );
+    assert!(
+        snapshot
+            .timeline
+            .iter()
+            .any(|event| event.event_id.as_deref() == Some("legacy-open-task-event"))
+    );
+    database
+        .connection()
+        .authorizer(Some(deny_event_log))
+        .unwrap();
+    assert!(
+        database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM event_log", [], |row| row
+                .get::<_, i64>(0))
+            .is_err()
+    );
+    let (open, _, _) = read_metered(&mut database, &camp_id);
+    let open_json = serde_json::to_value(&open).unwrap();
+    let snapshot_json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(open.schema_version, CAMP_OPEN_SCHEMA_VERSION);
+    assert_eq!(open_json["thread"], snapshot_json["thread"]);
+    let frozen_model =
+        json!({"adapterKind":"codex-cli", "modelId":"frozen-model", "reasoningEffort":"high"});
+    // Snapshot and bounded Open carry explicit selection and an active Run's
+    // observed default. Provider/options matrices belong to message_model's
+    // pure test; both public surfaces reuse that projector.
+    for projection in [&open_json, &snapshot_json] {
+        let runs = projection["agentRuns"].as_array().unwrap();
+        assert_eq!(
+            runs.iter().find(|run| run["id"] == completed_run).unwrap()["runtimeModel"],
+            frozen_model
+        );
+        assert_eq!(
+            runs.iter().find(|run| run["id"] == active_run).unwrap()["runtimeModel"],
+            json!({"adapterKind":"claude-code-cli", "modelId":"observed-model", "reasoningEffort":null})
+        );
+    }
+    assert_eq!(
+        open_json["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["id"] == "open-agent-message")
+            .unwrap()["runtimeModel"],
+        frozen_model
+    );
+    assert!(
+        open.messages
+            .iter()
+            .filter(|message| message.author_type != "agent")
+            .all(|message| message.runtime_model.is_none())
+    );
+    // Paging and reveal hydrate the source Run directly, without requiring it
+    // in the independently bounded CampOpen Run window or reading event_log.
+    let page = ReadModelService
+        .camp_messages_page(&mut database, &camp_id, 3, open.through_global_sequence, 20)
+        .unwrap();
+    let around = ReadModelService
+        .camp_messages_around(&mut database, &camp_id, "open-agent-message")
+        .unwrap();
+    for messages in [&page.messages, &around.messages] {
+        let model = &messages
+            .iter()
+            .find(|message| message.id == "open-agent-message")
+            .unwrap()
+            .runtime_model;
+        assert_eq!(serde_json::to_value(model).unwrap(), frozen_model);
+    }
+    let delivery = open
+        .message_deliveries
+        .iter()
+        .find(|delivery| delivery.id == "open-delivery")
+        .expect("Camp Open must project current camp_message_delivery rows");
+    // The fixture starts with one user-authored Delivery for each addressed
+    // Agent, then appends an Agent-authored hand-off and two waiting user
+    // Deliveries. Camp Open must project all five current queue facts rather
+    // than filtering by author.
+    assert_eq!(open.message_deliveries.len(), 5);
+    assert_eq!(delivery.message_id, "open-agent-message");
+    assert_eq!(
+        delivery.target_agent_run_id.as_deref(),
+        Some(active_run.as_str())
+    );
+    assert!(matches!(
+        &delivery.kind,
+        MessageDeliveryKindView::PublicA2a {
+            source_agent_run_id,
+            recipient_canonical_position: 0,
+            ..
+        } if source_agent_run_id.as_deref() == Some(completed_run.as_str())
+    ));
+    let waiting = open
+        .message_deliveries
+        .iter()
+        .filter(|delivery| delivery.id.starts_with("open-user-waiting-delivery-"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        waiting.len(),
+        2,
+        "waiting user deliveries must reach Camp Open"
+    );
+    assert!(waiting.iter().all(|delivery| {
+        delivery.status == "waiting"
+            && delivery.dispatch_phase == "never_attempted"
+            && delivery.target_agent_run_id.is_none()
+            && matches!(
+                &delivery.kind,
+                MessageDeliveryKindView::PublicA2a {
+                    source_agent_run_id: None,
+                    ..
+                }
+            )
+    }));
+    assert_eq!(open.coverage.message_deliveries.loaded_count, 5);
+    assert_eq!(open.coverage.message_deliveries.total_count, 5);
+    assert_eq!(open.coverage.message_deliveries.omitted_count, 0);
+    assert!(open.coverage.message_deliveries.complete);
+    for collection in [
+        "members",
+        "tasks",
+        "turns",
+        "agentRuns",
+        "approvals",
+        "messageDeliveries",
+        "agentRunFileChanges",
+    ] {
+        let mut actual = open_json[collection].as_array().unwrap().clone();
+        let mut expected = snapshot_json[collection].as_array().unwrap().clone();
+        // Delivery-first Runs no longer create CampTurns. Historical Turns must
+        // still compare exactly when present, but an all-current fixture may
+        // legitimately have none.
+        if collection != "turns" {
+            assert!(!actual.is_empty(), "missing {collection}");
+        }
+        // Open prioritizes non-terminal Runs; the full diagnostic Snapshot has
+        // its own ordering. Compare complete Run objects by identity, not position.
+        if collection == "agentRuns" {
+            actual.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            expected.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+        }
+        assert_eq!(actual, expected, "changed {collection}");
+    }
+    assert!(open.execution_evidence.is_empty());
+    assert!(open_json["coverage"].get("executionEvidence").is_none());
+    let mut expected_messages = snapshot_json["messages"].clone();
+    for message in expected_messages.as_array_mut().unwrap() {
+        message["timelineGlobalSequence"] = Value::Null;
+    }
+    assert_eq!(open_json["messages"], expected_messages);
+    assert!(
+        open.messages
+            .iter()
+            .any(|message| !message.attachments.is_empty())
+    );
+    assert!(open_json.get("timeline").is_none());
+    assert!(open_json["coverage"].get("timeline").is_none());
+    assert_eq!(
+        open.through_global_sequence,
+        snapshot.through_global_sequence
+    );
+    database.connection().execute(
+        "INSERT INTO event_log(event_type, payload_json, created_at) VALUES ('test.unrelated', '{}', '2026-08-31T00:00:00Z')", [],
+    ).unwrap();
+    let (refreshed, _, _) = read_metered(&mut database, &camp_id);
+    assert_eq!(
+        refreshed.through_global_sequence,
+        open.through_global_sequence + 1
+    );
+    assert_eq!(
+        serde_json::to_value(refreshed.messages).unwrap(),
+        open_json["messages"]
+    );
+    database.connection().execute(
+        "UPDATE camp_message SET author_id = (
+            SELECT conversation.agent_id FROM agent_run JOIN conversation ON conversation.id = agent_run.conversation_id
+            WHERE agent_run.id = ?1) WHERE id = 'open-agent-message'", [&active_run],
+    ).unwrap();
+    let mismatched = ReadModelService
+        .camp_messages_around(&mut database, &camp_id, "open-agent-message")
+        .unwrap();
+    assert!(
+        mismatched
+            .messages
+            .iter()
+            .find(|message| message.id == "open-agent-message")
+            .unwrap()
+            .runtime_model
+            .is_none(),
+        "a source Run belonging to another author cannot supply model metadata"
+    );
+}
+
+#[test]
+fn camp_open_run_titles_and_start_boundaries_survive_message_paging() {
+    let (mut database, camp_id, completed_run, active_run) = business_fixture();
+    let source_id: String = database.connection().query_row(
+        "SELECT message_id FROM agent_run_input WHERE agent_run_id = ?1 ORDER BY ordinal LIMIT 1",
+        [&active_run], |row| row.get(0),
+    ).unwrap();
+    // A later input/anchor must not replace the first input as its message falls
+    // out of the conversation page. The fixture's hand-off is already claimed.
+    database.connection().execute(
+        "INSERT INTO agent_run_input(agent_run_id, ordinal, delivery_id, message_id, message_sequence, message_content_digest, context_manifest_version)
+         SELECT ?1, 1, 'open-delivery', id, sequence, content_digest,
+         (SELECT context_manifest_version FROM agent_run_input WHERE agent_run_id = ?1 AND ordinal = 0)
+         FROM camp_message WHERE id = 'open-agent-message'",
+        [&active_run],
+    ).unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET anchor_message_id = 'open-agent-message',
+             current_public_tail_sequence = 2 WHERE id = ?1",
+            [&active_run],
+        )
+        .unwrap();
+    for sequence in 3..=32 {
+        database.connection().execute(
+            "INSERT INTO camp_message(id, camp_id, sequence, author_type, author_id, body,
+             structured_content_json, content_digest, address_mode, addressed_agent_ids_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'user', 'local_user', '较新消息',
+             '[{\"kind\":\"text\",\"text\":\"较新消息\"}]', 'sha256:later', 'default', '[]',
+             '2026-08-31T00:00:00Z', '2026-08-31T00:00:00Z')",
+            params![format!("title-page-{sequence}"), camp_id, sequence],
+        ).unwrap();
+    }
+    // Exercise supported pre-batch Runs through the same summary loader.
+    database.connection().execute(
+        "INSERT INTO camp_turn(id, camp_id, trigger_type, trigger_id, status, created_at, updated_at,
+         execution_budget_schema_version, execution_budget_accepted_at,
+         execution_budget_max_agent_run_responsibilities, execution_budget_max_accepted_a2a,
+         execution_budget_root_agent_run_responsibilities)
+         VALUES ('title-legacy-turn', ?1, 'camp_message', ?2, 'running',
+         '2026-08-31T00:00:00Z', '2026-08-31T00:00:00Z',
+         1, '2026-08-31T00:00:00Z', 32, 16, 1)", params![camp_id, source_id],
+    ).unwrap();
+    database
+        .connection()
+        .execute(
+            "DELETE FROM agent_run_input WHERE agent_run_id = ?1",
+            [&completed_run],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET invocation_kind = 'direct', camp_turn_id = 'title-legacy-turn',
+         camp_id = NULL, anchor_message_id = NULL, current_public_tail_sequence = NULL,
+         trigger_camp_message_id = ?2 WHERE id = ?1",
+            params![completed_run, source_id],
+        )
+        .unwrap();
+    // Changing source state proves that summaries are read projections, not a
+    // persisted duplicate that could keep erased content. Unicode is bounded
+    // by scalars without splitting UTF-8; attachment metadata needs no file IO.
+    let long_body = "花🌷".repeat(130);
+    let shortened = format!("{}…", long_body.chars().take(239).collect::<String>());
+    for (body, recall, tombstoned, expected) in [
+        (
+            "保留业务状态\n  并换行",
+            "closed",
+            false,
+            Some("保留业务状态 并换行"),
+        ),
+        (
+            long_body.as_str(),
+            "closed",
+            false,
+            Some(shortened.as_str()),
+        ),
+        (" \n ", "closed", false, Some("attachment.txt")),
+        (
+            "should not escape",
+            "withdrawn",
+            false,
+            Some("Message withdrawn"),
+        ),
+        ("deleted text", "closed", true, None),
+    ] {
+        database.connection().execute(
+            "UPDATE camp_message SET body = ?2, structured_content_json = ?3,
+             recall_state = ?4, tombstoned_at = CASE WHEN ?5 THEN '2026-08-31T00:00:00Z' END WHERE id = ?1",
+            params![source_id, body, json!([{"kind":"text", "text":body}]).to_string(), recall, tombstoned],
+        ).unwrap();
+        let (open, _, _) = read_metered(&mut database, &camp_id);
+        assert_eq!(open.messages.len(), 20);
+        assert!(open.messages.iter().all(|message| message.id != source_id));
+        for run in &open.agent_runs {
+            assert_eq!(run.input_summary.as_deref(), expected, "{}", run.id);
+            // The immutable claim boundary survives after its message leaves
+            // the page; it must not become the newer public tail (32).
+            assert_eq!(
+                run.public_tail_sequence_at_start,
+                if run.id == active_run { Some(2) } else { None },
+                "{}",
+                run.id
+            );
+        }
+    }
+    let snapshot = ReadModelService
+        .camp_snapshot(&mut database, &camp_id)
+        .unwrap();
+    for run in &snapshot.agent_runs {
+        let expected = if run.id == active_run {
+            json!(2)
+        } else {
+            Value::Null
+        };
+        assert_eq!(
+            serde_json::to_value(run).unwrap()["publicTailSequenceAtStart"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn camp_open_work_is_independent_of_unrelated_event_and_evidence_volume() {
+    let (mut database, camp_id, _, _) = business_fixture();
+    let unrelated_workspace = database.directory().join("unrelated-workspace");
+    std::fs::create_dir_all(&unrelated_workspace).unwrap();
+    let unrelated = CollaborationService::default()
+        .create_test_camp_conversation(
+            &mut database,
+            &CommandEnvelope {
+                command_id: "camp-open-unrelated-evidence-fixture".to_string(),
+                actor: ActorRef::User {
+                    user_id: "local_user".to_string(),
+                },
+                camp_id: None,
+                expected_versions: vec![],
+                execution_epoch: None,
+                payload: TestThreadConversationCommand {
+                    project_binding_kind: ProjectBindingKind::Directory,
+                    project_path: unrelated_workspace.to_string_lossy().to_string(),
+                    body: "无关会话".to_string(),
+                    address: TestThreadMessageAddress::Default,
+                    purpose: "验证无关 Evidence 不影响 Camp Open".to_string(),
+                },
+            },
+        )
+        .unwrap();
+    let unrelated_run_id = unrelated.result.payload["agentRunIds"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (baseline, baseline_steps, _) = read_metered(&mut database, &camp_id);
+    let base_sequence = baseline.through_global_sequence;
+    let mut expected = serde_json::to_value(baseline).unwrap();
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("throughGlobalSequence");
+    let mut previous_volume = 0_i64;
+    // Each scale is a different regression input; five reads report a bounded
+    // latency sample. The gate is SQL VM work, not machine-dependent wall time.
+    for volume in [50_000_i64, 500_000, 5_000_000] {
+        let transaction = database.connection_mut().transaction().unwrap();
+        transaction
+            .execute(
+                r#"WITH RECURSIVE rows(n) AS (
+                SELECT ?1 UNION ALL SELECT n + 1 FROM rows WHERE n < ?2
+            )
+            INSERT INTO event_log(global_sequence, event_type, payload_json, created_at)
+            SELECT ?3 + n, 'test.unrelated', '{}', '2026-08-31T00:00:00Z' FROM rows"#,
+                params![previous_volume + 1, volume, base_sequence],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE event_sequence SET last_sequence = ?1 WHERE singleton = 1",
+                [base_sequence + volume],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        let mut timings = Vec::new();
+        for _ in 0..5 {
+            let (open, steps, elapsed) = read_metered(&mut database, &camp_id);
+            assert_eq!(
+                steps, baseline_steps,
+                "SQL work grew at {volume} unrelated events"
+            );
+            assert_eq!(open.through_global_sequence, base_sequence + volume);
+            let mut actual = serde_json::to_value(open).unwrap();
+            actual
+                .as_object_mut()
+                .unwrap()
+                .remove("throughGlobalSequence");
+            assert_eq!(actual, expected);
+            timings.push(elapsed);
+        }
+        timings.sort();
+        eprintln!(
+            "camp_open_scale unrelated_events={volume} vm_steps={baseline_steps} median_ms={:.3} max_ms={:.3}",
+            timings[2].as_secs_f64() * 1_000.0,
+            timings[4].as_secs_f64() * 1_000.0
+        );
+        previous_volume = volume;
+    }
+
+    let (evidence_baseline, evidence_baseline_steps, _) = read_metered(&mut database, &camp_id);
+    let mut evidence_expected = serde_json::to_value(evidence_baseline).unwrap();
+    evidence_expected
+        .as_object_mut()
+        .unwrap()
+        .remove("throughGlobalSequence");
+    let mut previous_evidence_volume = 0_i64;
+    for volume in [1_000_i64, 10_000, 100_000] {
+        let transaction = database.connection_mut().transaction().unwrap();
+        transaction
+            .execute(
+                r#"WITH RECURSIVE rows(n) AS (
+                SELECT ?1 UNION ALL SELECT n + 1 FROM rows WHERE n < ?2
+            )
+            INSERT INTO agent_run_execution_evidence(
+                id, agent_run_id, execution_epoch, sequence,
+                event_type, kind, phase, payload_preview_json,
+                content_byte_count, is_truncated, occurred_at
+            )
+            SELECT 'unrelated-evidence-' || n, ?3, 0, n,
+                   'runtime.action', 'command', 'completed', '{}',
+                   0, 0, '2026-08-31T00:00:00Z'
+            FROM rows"#,
+                params![previous_evidence_volume + 1, volume, unrelated_run_id],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        let (open, steps, elapsed) = read_metered(&mut database, &camp_id);
+        // Moving the target key away from an index edge can add a constant
+        // boundary check. The gate rejects work that scales with unrelated rows.
+        assert!(
+            steps <= evidence_baseline_steps + 4,
+            "SQL work grew with {volume} unrelated Evidence rows: baseline={evidence_baseline_steps}, actual={steps}"
+        );
+        let mut actual = serde_json::to_value(open).unwrap();
+        actual
+            .as_object_mut()
+            .unwrap()
+            .remove("throughGlobalSequence");
+        assert_eq!(actual, evidence_expected);
+        eprintln!(
+            "camp_open_scale unrelated_evidence={volume} vm_steps={evidence_baseline_steps} elapsed_ms={:.3}",
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        previous_evidence_volume = volume;
+    }
+}
+
+// Owns full navigation's SQL/read-only boundary. CampOpen's existing owner only
+// covers its bounded body window, and cannot detect truncation or heavy hydration here.
+#[test]
+fn user_anchor_index_is_complete_lightweight_and_read_only() {
+    let (mut database, camp_id, _, _) = business_fixture();
+    for sequence in 3..=203 {
+        database.connection().execute(
+            "INSERT INTO camp_message(id, camp_id, sequence, author_type, author_id, body,
+             structured_content_json, content_digest, address_mode, addressed_agent_ids_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'user', 'local_user', 'stale body cache', ?4, 'sha256:anchor', 'default', '[]',
+             '2026-08-31T00:00:00Z', '2026-08-31T00:00:00Z')",
+            params![format!("anchor-{sequence}"), camp_id, sequence,
+                json!([{"kind":"text","text":format!("  问题 {sequence}\n {}", "🌷".repeat(250))}]).to_string()],
+        ).unwrap();
+    }
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET recall_state = 'withdrawn' WHERE id = 'anchor-3'",
+            [],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET tombstoned_at = '2026-08-31T00:00:00Z' WHERE id = 'anchor-4'",
+            [],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET author_type = 'external_principal' WHERE id = 'anchor-5'",
+            [],
+        )
+        .unwrap();
+    database.connection().execute("UPDATE camp_message SET structured_content_json = '[{\"kind\":\"member_mention\",\"agentId\":\"agent_1\"}]' WHERE id = 'anchor-6'", []).unwrap();
+    database.connection().execute("UPDATE camp_message SET structured_content_json = '[]', source_attachments_json = ?1 WHERE id = 'anchor-7'",
+        [json!([{"id":"00000000-0000-4000-8000-000000000001","sourcePath":"/missing/never-read-anchor-file",
+            "displayName":"设计稿.html","kind":"file","mediaType":"text/html","observedByteSize":2}]).to_string()]).unwrap();
+    database.connection().execute("UPDATE camp_message SET structured_content_json = '[]', quotes_json = ?1 WHERE id = 'anchor-8'",
+        [json!([{"version":1,"quoteId":"quote","source":{"scope":"camp","campId":camp_id,"messageId":"source"},
+            "authorAtCapture":{"type":"user","displayName":"User"},"text":"引用的文本","format":"plain_text",
+            "capturedAt":"2026-08-31T00:00:00Z","sourceContentDigest":"sha256:source","snapshotDigest":"sha256:quote"}]).to_string()]).unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET structured_content_json = '[]' WHERE id = 'anchor-9'",
+            [],
+        )
+        .unwrap();
+    let before = database.connection().total_changes();
+    // Deny the heavy reader's dependent tables, message body cache, and all writes.
+    database
+        .connection()
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name,
+                column_name,
+            } if matches!(
+                table_name,
+                "agent_run"
+                    | "camp_turn"
+                    | "agent_run_execution_evidence"
+                    | "managed_attachment"
+                    | "event_log"
+            ) || (table_name == "camp_message" && column_name == "body") =>
+            {
+                Authorization::Deny
+            }
+            AuthAction::Insert { .. } | AuthAction::Update { .. } | AuthAction::Delete { .. } => {
+                Authorization::Deny
+            }
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let material = ReadModelService
+        .user_anchors(&mut database, &camp_id)
+        .unwrap();
+    assert!(
+        database.connection().is_autocommit(),
+        "formatting must not retain the read transaction"
+    );
+    let index = material.format().unwrap();
+    database
+        .connection()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    assert_eq!(index.total_count, 200); // original source + 201 users - withdrawn - tombstoned
+    assert_eq!(index.items.last().unwrap().message_id, "anchor-203");
+    assert!(index.items.iter().any(|item| item.message_id == "anchor-5"));
+    assert!(
+        index
+            .items
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    let title = &index
+        .items
+        .iter()
+        .find(|item| item.message_id == "anchor-5")
+        .unwrap()
+        .title;
+    assert_eq!(title.chars().count(), 240);
+    assert!(title.starts_with("问题 5 ") && title.ends_with('…'));
+    for (id, expected) in [
+        ("anchor-7", "设计稿.html"),
+        ("anchor-8", "引用的文本"),
+        ("anchor-9", "（无文本）"),
+    ] {
+        assert_eq!(
+            index
+                .items
+                .iter()
+                .find(|item| item.message_id == id)
+                .unwrap()
+                .title,
+            expected
+        );
+    }
+    let name: String = database
+        .connection()
+        .query_row(
+            "SELECT display_name FROM agent_profile WHERE id = 'agent_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        index
+            .items
+            .iter()
+            .find(|item| item.message_id == "anchor-6")
+            .unwrap()
+            .title
+            .contains(&name)
+    );
+    assert_eq!(before, database.connection().total_changes());
+    let wire = serde_json::to_value(&index).unwrap();
+    assert_eq!(wire["threadId"], camp_id);
+    assert!(wire.get("campId").is_none());
+    assert!(wire["items"][0].get("body").is_none());
+}
+
+// Owns direct child reply identity and its indexed read boundary. Run/Turn inference
+// is intentionally retired; existing relationship fixtures now prove it stays absent.
+#[test]
+fn user_anchor_preview_resolves_first_valid_direct_reply() {
+    let (mut database, camp_id, completed_run, _) = business_fixture();
+    let source: String = database.connection().query_row(
+        "SELECT id FROM camp_message WHERE camp_id = ?1 AND author_type = 'user' ORDER BY sequence LIMIT 1",
+        [&camp_id], |r| r.get(0)).unwrap();
+    database
+        .connection()
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "agent_run" | "agent_run_input" | "camp_turn",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let preview = ReadModelService
+        .user_anchor_preview(&mut database, &camp_id, &source)
+        .unwrap()
+        .format()
+        .unwrap();
+    assert!(preview.first_reply.is_none());
+    database
+        .connection()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    let plan = database
+        .connection()
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            user_anchors::DIRECT_REPLY_SQL
+        ))
+        .unwrap()
+        .query_map(params![camp_id, source, 1], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n");
+    assert!(plan.contains("camp_message_direct_reply_idx (camp_id=? AND reply_to_camp_message_id=? AND sequence>?)"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    let candidate_steps = |database: &Database| {
+        let mut query = database
+            .connection()
+            .prepare(user_anchors::DIRECT_REPLY_SQL)
+            .unwrap();
+        assert!(
+            query
+                .query_row(params![camp_id, source, 1], |r| r.get::<_, String>(0))
+                .optional()
+                .unwrap()
+                .is_none()
+        );
+        query.get_status(rusqlite::StatementStatus::VmStep)
+    };
+    let before_steps = candidate_steps(&database);
+    // More later messages without this reply relationship must not increase candidate work.
+    database.connection().execute("WITH RECURSIVE n(i) AS (VALUES(100) UNION ALL SELECT i+1 FROM n WHERE i<10100)
+        INSERT INTO camp_message(id,camp_id,sequence,author_type,author_id,body,structured_content_json,
+            content_digest,address_mode,addressed_agent_ids_json,created_at,updated_at)
+        SELECT 'unrelated-anchor-reply-'||i,?1,i,'agent','agent_1','never hydrated','[]','sha256:unrelated','default','[]','2026-10-08','2026-10-08' FROM n", [&camp_id]).unwrap();
+    assert_eq!(candidate_steps(&database), before_steps);
+    eprintln!("direct_reply_candidates unrelated_later_messages=10001 vm_steps={before_steps}");
+
+    database.connection().execute(
+        "INSERT INTO camp_message(id, camp_id, sequence, author_type, author_id, body,
+         structured_content_json, content_digest, address_mode, addressed_agent_ids_json, created_at, updated_at)
+         VALUES ('anchor-later-user', ?1, 3, 'user', 'local_user', '后来加入',
+         '[{\"kind\":\"text\",\"text\":\"后来加入\"}]', 'sha256:later', 'default', '[]',
+         '2026-08-31T00:00:00Z', '2026-08-31T00:00:00Z')", [&camp_id]).unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET anchor_message_id = 'anchor-later-user' WHERE id = ?1",
+            [&completed_run],
+        )
+        .unwrap();
+    assert!(
+        ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, &source)
+            .unwrap()
+            .format()
+            .unwrap()
+            .first_reply
+            .is_none()
+    );
+    // Run input/anchor relationships never supply a preview; neither does an output
+    // published before the user it explicitly replies to.
+    assert!(
+        ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, "anchor-later-user")
+            .unwrap()
+            .format()
+            .unwrap()
+            .first_reply
+            .is_none()
+    );
+    database.connection().execute("UPDATE camp_message SET reply_to_camp_message_id = 'anchor-later-user' WHERE id = 'open-agent-message'", []).unwrap();
+    assert!(
+        ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, &source)
+            .unwrap()
+            .format()
+            .unwrap()
+            .first_reply
+            .is_none()
+    );
+    database.connection().execute("UPDATE camp_message SET reply_to_camp_message_id = ?1, sequence = 5 WHERE id = 'open-agent-message'", [&source]).unwrap();
+    database.connection().execute(
+        "INSERT INTO camp_message(id, camp_id, sequence, author_type, author_id, body,
+         structured_content_json, content_digest, address_mode, addressed_agent_ids_json, reply_to_camp_message_id, created_at, updated_at)
+         VALUES ('anchor-earliest-reply', ?1, 4, 'agent', 'agent_2', 'earliest',
+         '[{\"kind\":\"text\",\"text\":\"首条有效回复\"}]', 'sha256:earliest', 'default', '[]', ?2,
+         '2026-08-31T00:00:00Z', '2026-08-31T00:00:00Z')", params![camp_id, source]).unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_profile SET display_name = '实际回复队员',
+        avatar_ref = 'rovai://member-avatar/builtin/qilu/v1' WHERE id = 'agent_2'",
+            [],
+        )
+        .unwrap();
+    let before_changes = database.connection().total_changes();
+    let preview = ReadModelService
+        .user_anchor_preview(&mut database, &camp_id, &source)
+        .unwrap()
+        .format()
+        .unwrap();
+    assert_eq!(before_changes, database.connection().total_changes());
+    let reply = preview.first_reply.unwrap();
+    assert_eq!(reply.message_id, "anchor-earliest-reply");
+    let author = reply.author.unwrap();
+    assert_eq!(author.agent_id, "agent_2");
+    assert_eq!(author.display_name, "实际回复队员");
+    assert_eq!(
+        author.avatar_ref.as_deref(),
+        Some("rovai://member-avatar/builtin/qilu/v1")
+    );
+    // Identity belongs to the same detached read as the summary, even if a profile
+    // changes before formatting outside the database guard.
+    let read = ReadModelService
+        .user_anchor_preview(&mut database, &camp_id, &source)
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_profile SET display_name = '更新的姓名',
+        avatar_ref = NULL WHERE id = 'agent_2'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        read.format()
+            .unwrap()
+            .first_reply
+            .unwrap()
+            .author
+            .unwrap()
+            .display_name,
+        "实际回复队员"
+    );
+    let refreshed = serde_json::to_value(
+        ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, &source)
+            .unwrap()
+            .format()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        refreshed["firstReply"]["author"],
+        json!({
+            "agentId": "agent_2", "displayName": "更新的姓名", "avatarRef": null
+        })
+    );
+    // A historical/missing profile cannot suppress the selected reply or impersonate the lead.
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET author_id = 'missing-preview-author'
+        WHERE id = 'anchor-earliest-reply'",
+            [],
+        )
+        .unwrap();
+    let missing = ReadModelService
+        .user_anchor_preview(&mut database, &camp_id, &source)
+        .unwrap()
+        .format()
+        .unwrap()
+        .first_reply
+        .unwrap();
+    assert_eq!(missing.summary, "首条有效回复");
+    assert!(missing.author.is_none());
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET author_id = 'agent_2'
+        WHERE id = 'anchor-earliest-reply'",
+            [],
+        )
+        .unwrap();
+    database.connection().execute("INSERT INTO camp_turn(id, camp_id, trigger_type, trigger_id, status, created_at, updated_at,
+        execution_budget_schema_version, execution_budget_accepted_at, execution_budget_max_agent_run_responsibilities,
+        execution_budget_max_accepted_a2a, execution_budget_root_agent_run_responsibilities)
+        VALUES ('anchor-turn', ?1, 'camp_message', 'anchor-later-user', 'running', '2026-08-31T00:00:00Z',
+        '2026-08-31T00:00:00Z', 1, '2026-08-31T00:00:00Z', 32, 16, 1)", [&camp_id]).unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET anchor_message_id = ?2 WHERE id = ?1",
+            params![completed_run, source],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET reply_to_camp_message_id = NULL, source_agent_run_id = ?1,
+        camp_turn_id = 'anchor-turn' WHERE id = 'anchor-earliest-reply'",
+            [&completed_run],
+        )
+        .unwrap();
+    assert!(
+        ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, "anchor-later-user")
+            .unwrap()
+            .format()
+            .unwrap()
+            .first_reply
+            .is_none()
+    );
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET source_agent_run_id = NULL WHERE id = 'anchor-earliest-reply'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, "anchor-later-user")
+            .unwrap()
+            .format()
+            .unwrap()
+            .first_reply
+            .is_none()
+    );
+    database.connection().execute("UPDATE camp_message SET reply_to_camp_message_id = ?1, camp_turn_id = NULL WHERE id = 'anchor-earliest-reply'", [&source]).unwrap();
+
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET recall_state = 'withdrawn' WHERE id = 'anchor-earliest-reply'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, &source)
+            .unwrap()
+            .format()
+            .unwrap()
+            .first_reply
+            .unwrap()
+            .message_id,
+        "open-agent-message"
+    );
+    database.connection().execute("UPDATE camp_message SET tombstoned_at = '2026-08-31T00:00:00Z' WHERE id = 'open-agent-message'", []).unwrap();
+    assert!(
+        ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, &source)
+            .unwrap()
+            .format()
+            .unwrap()
+            .first_reply
+            .is_none()
+    );
+    for id in [&source, &"missing".to_string()] {
+        if id == &source {
+            database
+                .connection()
+                .execute(
+                    "UPDATE camp_message SET recall_state = 'withdrawn' WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
+        }
+        let unavailable = ReadModelService
+            .user_anchor_preview(&mut database, &camp_id, id)
+            .unwrap()
+            .format()
+            .unwrap();
+        assert!(!unavailable.source_available);
+        assert!(unavailable.first_reply.is_none());
+    }
+}
+
+// New owner: complete reply components, scoped traversal, bounded hydration and
+// tombstone continuity. Direct-reply preview cannot prove descendants or paging.
+#[test]
+fn reply_pages_follow_only_scoped_parent_links_and_hydrate_one_page() {
+    let (mut database, camp_id, _, _) = business_fixture();
+    for (id, sequence, parent) in [
+        ("reply-root", 100, None),
+        ("reply-a", 101, Some("reply-root")),
+        ("reply-b", 102, Some("reply-root")),
+        ("reply-c", 103, Some("reply-a")),
+        ("other-root", 104, None),
+        ("other-batch-reply", 105, Some("other-root")),
+    ] {
+        database.connection().execute("INSERT INTO camp_message(id,camp_id,sequence,author_type,author_id,body,
+          structured_content_json,content_digest,address_mode,addressed_agent_ids_json,reply_to_camp_message_id,created_at,updated_at)
+          VALUES (?1,?2,?3,'user','local_user',?1,?4,'sha256:reply','default','[]',?5,'2026-10-21','2026-10-21')",
+          params![id,camp_id,sequence,serde_json::to_string(&json!([{"kind":"text","text":id}])).unwrap(),parent]).unwrap();
+    }
+    let mut request: ReplyPageParams = serde_json::from_value(json!({
+      "threadId":camp_id,"messageId":"reply-c","limit":2,
+      "runAnchorMessageIds":["reply-root","reply-c","other-root"]
+    }))
+    .unwrap();
+    let changes = database.connection().total_changes();
+    let first = ReadModelService
+        .reply_page(&mut database, &request)
+        .unwrap();
+    assert_eq!(first.root_message_id.as_deref(), Some("reply-root"));
+    assert_eq!(first.reply_count, 3);
+    assert_eq!(
+        first
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["reply-root", "reply-a"]
+    );
+    assert_eq!(first.run_anchor_message_ids, ["reply-root", "reply-c"]);
+    assert!(!first.has_earlier && first.has_later);
+    request.sequence = 101;
+    let next = ReadModelService
+        .reply_page(&mut database, &request)
+        .unwrap();
+    assert_eq!(
+        next.messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["reply-b", "reply-c"]
+    );
+    assert!(next.has_earlier && !next.has_later);
+    request.sequence = 102;
+    request.before = true;
+    assert_eq!(
+        serde_json::to_value(
+            ReadModelService
+                .reply_page(&mut database, &request)
+                .unwrap()
+        )
+        .unwrap()["messages"],
+        serde_json::to_value(first).unwrap()["messages"]
+    );
+    assert_eq!(database.connection().total_changes(), changes);
+
+    // Structural parents survive unavailable content; withdrawal never leaks text.
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET tombstoned_at='2026-10-21' WHERE id='reply-a'",
+            [],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET recall_state='withdrawn' WHERE id='reply-b'",
+            [],
+        )
+        .unwrap();
+    request.sequence = 0;
+    request.before = false;
+    request.limit = 100;
+    let removed = ReadModelService
+        .reply_page(&mut database, &request)
+        .unwrap();
+    assert_eq!(
+        removed
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["reply-root", "reply-b", "reply-c"]
+    );
+    assert!(removed.messages[1].withdrawn);
+    assert!(!removed.messages[1].body.contains("reply-b"));
+    // A corrupt forward parent/cycle terminates at the same root.
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET reply_to_camp_message_id='reply-c' WHERE id='reply-root'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        ReadModelService
+            .reply_page(&mut database, &request)
+            .unwrap()
+            .messages
+            .len(),
+        3
+    );
+    for missing in ["reply-a", "missing-or-other-thread"] {
+        request.message_id = missing.into();
+        let result = ReadModelService
+            .reply_page(&mut database, &request)
+            .unwrap();
+        assert!(!result.source_available && result.messages.is_empty());
+    }
+    request.message_id = "reply-c".into();
+    // The relationship query cannot inspect batches, turns, events or evidence.
+    // Hydration retains the shared per-page source-model/withdrawal metadata reads.
+    database
+        .connection()
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name:
+                    "agent_run_input" | "camp_turn" | "event_log" | "agent_run_execution_evidence",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let chain_count = database
+        .connection()
+        .prepare(replies::REPLY_CHAIN_SQL)
+        .unwrap()
+        .query_map(params![camp_id, "reply-c"], |row| row.get::<_, String>(0))
+        .unwrap()
+        .count();
+    assert_eq!(chain_count, 4);
+    database
+        .connection()
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "event_log" | "agent_run_execution_evidence",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    ReadModelService
+        .reply_page(&mut database, &request)
+        .unwrap();
+    database
+        .connection()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    let plan = database
+        .connection()
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", replies::REPLY_CHAIN_SQL))
+        .unwrap()
+        .query_map(params![camp_id, "reply-c"], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n");
+    assert!(plan.contains("camp_message_direct_reply_idx (camp_id=? AND reply_to_camp_message_id=? AND sequence>?)"), "{plan}");
+    let steps = |database: &Database| {
+        let mut query = database
+            .connection()
+            .prepare(replies::REPLY_CHAIN_SQL)
+            .unwrap();
+        let count = query
+            .query_map(params![camp_id, "reply-c"], |r| r.get::<_, String>(0))
+            .unwrap()
+            .count();
+        (count, query.get_status(rusqlite::StatementStatus::VmStep))
+    };
+    let baseline = steps(&database);
+    database.connection().execute("WITH RECURSIVE n(i) AS (VALUES(1000) UNION ALL SELECT i+1 FROM n WHERE i<11000)
+      INSERT INTO camp_message(id,camp_id,sequence,author_type,author_id,body,structured_content_json,content_digest,address_mode,addressed_agent_ids_json,created_at,updated_at)
+      SELECT 'reply-unrelated-'||i,?1,i,'user','local_user','not loaded','[]','sha256:unrelated','default','[]','2026-10-21','2026-10-21' FROM n", [&camp_id]).unwrap();
+    let unrelated = steps(&database);
+    assert_eq!(unrelated.0, baseline.0);
+    // Index end/seek bookkeeping can change by a few instructions; 10,001
+    // unrelated messages must not introduce work proportional to their count.
+    assert!(
+        unrelated.1 <= baseline.1 + 32,
+        "{baseline:?} -> {unrelated:?}"
+    );
+    eprintln!(
+        "reply_chain unrelated=10001 vm_steps_before={} vm_steps_after={}",
+        baseline.1, unrelated.1
+    );
+    // A long component is traversed by identities; hydration remains one bounded page.
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_message SET reply_to_camp_message_id='reply-c' WHERE sequence>=1000",
+            [],
+        )
+        .unwrap();
+    let long = ReadModelService
+        .reply_page(&mut database, &request)
+        .unwrap();
+    assert_eq!(long.reply_count, 10003);
+    assert_eq!(long.messages.len(), 100);
+    assert!(long.has_later);
+    let long_steps = steps(&database);
+    assert_eq!(long_steps.0, 10005);
+    // One indexed child lookup per node, not repeated scans of the component.
+    assert!(long_steps.1 < 1_000_000, "{long_steps:?}");
+    eprintln!(
+        "reply_chain nodes={} vm_steps={} hydrated={}",
+        long_steps.0,
+        long_steps.1,
+        long.messages.len()
+    );
+}

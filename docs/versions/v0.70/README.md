@@ -1,0 +1,158 @@
+---
+document_type: version-overview
+version: v0.70
+lifecycle: historical
+authority: version-scope-and-status
+design_status: accepted
+implementation_status: closed_incomplete
+last_updated: 2026-08-13
+---
+
+# Rovai-ai v0.70：消息局部 User Attention 教学收窄
+
+> 冻结状态：实现、确定性门禁与 Codex 单 Runtime 行为 smoke 已通过；九 Runtime v8 正式矩阵未在
+> 版本关闭前执行，因此以 `closed_incomplete` 保留该证据缺口。Core-owned Current User Attention 的持久化、Notification、Delivery 与
+> 权限语义保持不变。同一 current snapshot 已把三项固定 `mattpocock/skills` 工程工作流纳入十项
+> official Skill inventory，并完成自动生成 Camp 标题的起始 Structured Mention 去噪与本地预发布
+> 数据刷新。
+>
+> 后续版本：[v0.71 Notification Episode](../v0.71/README.md)
+>
+> 前置版本：[v0.69 Planned Shutdown 线性化与硬期限修正](../v0.69/README.md)
+
+## 版本目标
+
+修正 `rovai send --to-user` 被 Agent 误解为“发送给用户”或与 `--to` 配套使用的常规模式。普通
+CampMessage 已经对用户可见；`--to-user` 只把当前这条公开消息升级为需要用户特别处理的 attention，
+其统一判据是：消息新产生了一个尚未解决的用户决定、回答或行动，或者履行用户明确要求的重要异步
+结果通知。
+
+本版本不修改 `mentionUser=true` 的 Core 效果，不分析正文、不按 Agent 角色拒绝、不自动抑制连续
+Mention，也不从 reply、Task、父子 AgentRun、A2A 或历史消息继承 attention。
+
+Skill inventory 增量以 [ADR-0174](decisions.md#adr-0174)
+替代七项集合，离线引入 `diagnosing-bugs`、`tdd` 与 `writing-for-agents`；不改变 Skill Library、
+Runtime Group Assignment 或权限模型。
+
+Camp 标题增量以 [ADR-0173](decisions.md#adr-0173)
+收窄首条用户消息的自动命名投影；不改变 Message、Mention 寻址或侧栏操作。
+
+## 交付范围
+
+### 单一 Agent-facing 判据
+
+- 新增集中式 Send teaching module，统一 catalog summary、`mentionUser` schema description、精确 help
+  文案和三条基础示例；
+- `rovai send --help` 明确普通消息已对用户可见，列出正向判据、常规负向场景、消息局部不继承、
+  无 Agent Delivery 与不代表用户批准；
+- 基础示例分别展示 public-only、Agent-only、User-attention-only，不演示 `--to + --to-user`；
+- Session Charter 增加一条短且高信号的相同边界，避免每个新 Session 都重新从宽泛语义猜测。
+
+### 协作责任与非例行组合
+
+- `cli-operations` Send reference 删除“需要用户查看”这一过宽条件；
+- 内部评审、子任务、验证和临时协助 Agent 默认把结果返回调用方，由承担用户侧闭环责任的 Agent
+  重新判断；该规则只是 Agent 使用指导，不成为 Core authorization；
+- 只有用户和 Agent 各自拥有相互独立的行动时才组合 `--to` 与 `--to-user`；依赖用户决定的 Agent
+  工作必须等待用户回复后再唤醒。
+
+### 合同与 Runtime rollout
+
+- Camp Message Send v5 保留 v4 closed input、wire、原子效果、幂等、错误和 compact output，只收窄
+  `mentionUser` / `--to-user` 的 Agent-facing 使用合同；
+- Built-in Tool Transport v8 保留十三项命令、IPC、Envelope、receipt 与 Agent Output，升级 CLI context、
+  capability 和 catalog identity；
+- catalog digest 必须因 summary/schema 教学变化而改变；Antigravity 既有 binding digest 包含该 identity，
+  因此建立 replacement Native Session；其他 Runtime 不因 Charter copy 全局丢弃会话，续接进程使用当前
+  v8 CLI/help 与 official Skill Revision，新 Session 使用当前 Charter。
+
+### 十项 official Skill inventory
+
+- 从 `mattpocock/skills@84fdeffd12f2ee307994d1eb6feb48173b6e0502` 完整 vendor
+  `diagnosing-bugs`、`tdd` 与 `writing-for-agents` 的选定目录，并附 MIT LICENSE/NOTICE；
+- Core 构建脚本递归打包四项固定 GitHub 来源 Skill，拒绝 symlink 与非普通文件，构建和运行时均不访问网络；
+- 三项 Skill 仅收窄调用 description 并本地化 `agents/openai.yaml`，其余上游工作流正文与资源保持不变；
+- 新 Skill 作为普通 official row 默认启用并投递九个 Runtime Groups，设置页显示固定 GitHub 来源与
+  8 字符 Revision，不增加专属分组、required/locked 状态或新权限；
+- `code-review` 暂不原样导入，先围绕 Camp public A2A、独立双轴审查、solo fallback 与 authority
+  boundary 设计 Rovai-native 版本。
+
+### 自动生成 Camp 标题去噪
+
+- Core 从首条用户 Structured Content 生成默认标题时，只移除开头连续的真实队员/所有队员 Mention block；
+- 首段正文之后的 Mention 与手写 `@文字` 继续作为普通标题文字，避免字符串规则误删；
+- 去除后为空时保存“未命名对话”并把 origin 收口为 `generated`，后续消息不再二次命名；
+- 侧栏 Camp 行保持单一会话导航目标，不增加 Mention 人物卡、复制或独立点击能力；
+- 本机四条 `generated` 历史 Camp 已按同一规则备份后刷新；预发布阶段不建立旧版本兼容或通用 Migration。
+
+完整字段与长期边界由 [Camp Message Send v5](../../contracts/camp-message-send-v5.md)、
+[Built-in Tool Transport v8](../../contracts/builtin-tool-transport-v8.md)、
+[Current User Attention v2](../../contracts/current-user-attention-v2.md)、[ADR-0165](../v0.65/decisions.md#adr-0165)
+与 [ADR-0166](../v0.65/decisions.md#adr-0166) 拥有；自动 Camp 标题规则由
+[ADR-0173](decisions.md#adr-0173)拥有；实施证据见
+[实施计划](implementation-plan.md)。
+
+## 冻结边界
+
+- User Attention 增量不修改 Current User identity、Structured Content、Notification、read lifecycle、
+  Renderer 或数据库；
+- 不新增字段、Migration、Agent recipient、Delivery、Task cardinality、A2A budget 或用户批准语义；
+- 不让 Core 分析正文价值、推断 Agent 角色、限制提醒频率或修正 Agent 提交的布尔值；
+- 不把完整 Send 决策树塞入 Charter，也不扩大 `cli-operations` 的普通单操作触发范围；
+- 不把文案变化冒充模型行为已经改善；真实 Runtime 行为必须由单独 smoke 证据确认。
+- 不动态扫描或导入上游仓库其他 Skill，不跟随浮动分支，不在构建/运行时联网更新固定副本；
+- 不让 Skill trigger、默认启用或 GitHub 来源成为诊断、修复、实现、测试 seam、文档写入或 Tool 权限。
+- Camp 标题不解析手写 `@文字`，不隐藏中后部 Mention，不新增侧栏 Mention 交互，也不引入通用数据迁移。
+
+## 发布门槛
+
+1. Rust tests 覆盖精确 help 三类分离示例、schema 判据、catalog digest 变化和 Antigravity binding replacement；
+2. Charter 与 bundled `cli-operations` tests 覆盖 message-local、负向场景、闭环责任和独立行动组合；
+3. CLI smoke 验证 Transport v8 capability/version、精确 help 正反断言和原有 `mentionUser` Core effects；
+4. 文档链接、版本生命周期、合同/Architecture 路由、ADR history 与 diff-aware governance 全部通过；
+5. 至少一个目标 Runtime 完成针对“普通最终回复/内部协作不再连续提醒用户”的真实行为 smoke；九 Runtime
+   正式兼容矩阵应在发布前补齐。该矩阵未在版本关闭前执行，因此本版本以 `closed_incomplete` 冻结；
+   关闭后的补测只能作为追溯证据，不能倒推版本当时已经完成；
+6. Skill validator、Core manifest/provenance/risk tests、Renderer source presentation、十项 fresh-Core
+   inventory fixture 与文档治理全部通过；
+7. Camp 标题测试证明只移除开头真实 Structured Mention，保留中后部 Mention 与手写 `@文字`，并完成
+   本机历史数据库备份、四条标题刷新和安装版重启复核。
+
+## 跨版本文档影响
+
+| 范围 | 结论 | 证据或理由 |
+| --- | --- | --- |
+| Version lifecycle | 已更新 | v0.69 按已完成事实冻结为 historical；v0.70 成为唯一 current，并记录 User Attention 教学收窄范围与证据缺口 |
+| ADR | 已更新 | ADR-0165/0166 只增加当前 v5/v8 Contract References；新增 [ADR-0173](decisions.md#adr-0173)细化自动标题投影；[ADR-0174](decisions.md#adr-0174)替代七项 official inventory |
+| Contracts | 已更新 | 新增 Camp Message Send v5 与 Built-in Tool Transport v8；v4/v7 转为 historical current-entry，不改 Current User Attention v2 |
+| Architecture | 已更新 | Built-in Tool Runtime 与 Public A2A 路由到 v5/v8，并记录十项 inventory 与固定 GitHub 来源的离线边界 |
+| UI | 已更新 | Current User Attention 的 Renderer 合同不变；Settings surface 与 UI 验收同步十项普通列表和四项 GitHub 来源；[App Shell 与统一侧栏](../../ui/components/app-shell-navigation.md)明确自动标题投影与 Camp 行单一点击语义 |
+| Runtime Activity | 确认无需更新 | 不新增 operation、Activity identity、provider event 或 classifier；现有 send Evidence 形状不变 |
+| Runtime compatibility | 已更新 | 当前合同入口切换到 v8；冻结时只有 Codex 聚焦证据，关闭后在最终快照补跑为 Built-in CLI 与 Skill 各 8/9 通过、Copilot 配额阻塞；该追溯证据不改写 `closed_incomplete` |
+| Documentation routing | 已更新 | docs map、CURRENT、Contract/Architecture 索引和 current version pointer 路由到 v0.70 权威；Camp/workspace 与 Skills 主题分别进入 ADR-0173/0174 |
+| Root README | 确认无需更新 | 项目定位、常青能力与支持 Runtime 集合不变；根 README 不记录版本局部教学修正 |
+
+## 关闭后兼容性补测
+
+2026-08-13 在 v0.70 最终产品快照 `a6397f32` 上，以全新隔离 Core data-dir、Skill Library、Git
+workspace 与 Native Session 补跑九 Runtime v8 矩阵。Codex、OpenCode、Claude Code、Antigravity、
+Kiro、Qoder、CodeBuddy 与 Qwen Code 的 Built-in CLI v8 和 managed Skill discovery 均通过；GitHub
+Copilot CLI 两类用例都在接受输入后明确返回月度配额耗尽，因此记为外部条件阻塞，不记 pass，也不
+归因于 v0.70 产品失败。
+
+这组结果把关闭后的实测覆盖提高到两类矩阵各 `8/9 pass + 1 blocked`，但没有满足“版本关闭前完成
+九 Runtime 正式矩阵”的原发布门槛；版本状态继续是 `closed_incomplete`。具体 Runtime/模型版本、
+断言范围与测试夹具修正见[实施计划](implementation-plan.md)和
+[Runtime 兼容性清单](../../runtime-compatibility.md)。
+
+## References
+
+- [v0.70 实施与验收计划](implementation-plan.md)
+- [ADR-0165](../v0.65/decisions.md#adr-0165)
+- [ADR-0166](../v0.65/decisions.md#adr-0166)
+- [ADR-0173](decisions.md#adr-0173)
+- [ADR-0174](decisions.md#adr-0174)
+- [Camp Message Send v5](../../contracts/camp-message-send-v5.md)
+- [Built-in Tool Transport v8](../../contracts/builtin-tool-transport-v8.md)
+- [Built-in Tool Runtime 架构](../../architecture/builtin-tool-runtime.md)
+- [App Shell 与统一侧栏](../../ui/components/app-shell-navigation.md)
