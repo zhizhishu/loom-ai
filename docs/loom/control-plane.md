@@ -1,8 +1,20 @@
-# LOOM 控制层契约 v0.2
+# LOOM 控制层契约 v0.3
 
-> 状态：基于 Pi 工兵 ACCP 盘点 + Astra UI 审查的最终草案。
+> 状态：阶段一已关闭（2026-10-27，Astra 终审 + 主管独立验证）。
 > 原则：Rovai 是能用的完整产品，只做 ACCP 补全 + archify 流程视图。
-> 证据：`docs/loom/accp-gap-analysis.md`（Pi 工兵盘点）、Astra UI 审查结果。
+> 证据：`docs/loom/accp-gap-analysis.md`（Pi 工兵盘点）、Astra 三轮审查结果。
+
+## 阶段一交付与验证（已关闭）
+
+| 交付 | 验证 | 结果 |
+|---|---|---|
+| TS 契约 `packages/contracts/src/loom.ts` | 本机 `pnpm typecheck`、`vitest` | 7 条契约回归通过 |
+| Rust 只读投影 + 受控导入（迁移 218/219，schema 168/169） | bero `cargo test -p rovai-core --lib loom` | 12 passed / 0 failed |
+| Core 端到端（真实二进制） | bero `node --test scripts/lib/loom-core-e2e.test.mjs` | 1 passed |
+| 编排/交付 UI 接真数据 | 本机 Electron fixture | 8 场景通过 |
+| 全量回归 | bero `cargo test -p rovai-core --lib` | 432 passed / 3 failed（基线 `33f6ded` 复现同样 3 个，属机器环境） |
+
+已知未做：写路径只有 `loom.plan.import`；无 Candidate/Review/Claim；UI 仍是顺序卡片不是连线拓扑；品牌未换。
 
 ## 从 ACCP 直接抄的机制
 
