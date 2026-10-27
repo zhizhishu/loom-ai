@@ -764,8 +764,11 @@ pub fn plan_import(
         )?;
     }
     let mut dependency_ids = Vec::with_capacity(conditioned_edges.len());
-    for (upstream, downstream, condition) in conditioned_edges {
-        let dependency_id = format!("{plan_id}:{upstream}->{downstream}");
+    for (ordinal, (upstream, downstream, condition)) in conditioned_edges.into_iter().enumerate() {
+        // Task IDs are opaque and may contain the "->" separator itself, so an edge ID
+        // composed from the endpoint names can collide (a -> b->c vs a->b -> c). The plan
+        // allows exactly one import, so a submission-order ordinal is unique and stable.
+        let dependency_id = format!("{plan_id}:dep-{ordinal}");
         transaction.execute(
             "INSERT INTO loom_dependency(dependency_id,plan_id,upstream_task_id,
                                         downstream_task_id,condition,created_at)
@@ -1212,6 +1215,39 @@ mod tests {
             loom_rows(&database),
             (0, 0, 0),
             "assertion self_dependency_writes_no_loom_rows"
+        );
+    }
+
+    #[test]
+    fn task_ids_containing_the_edge_separator_do_not_collide() {
+        // Task IDs are opaque: a -> b->c and a->b -> c are both legal acyclic graphs.
+        // Composing an edge ID from endpoint names made both produce "a->b->c".
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM separator task ids");
+        let mut input = plan_input(&mission_id);
+        input.tasks = vec![
+            task("a", "Task A"),
+            task("b->c", "Task B to C"),
+            task("a->b", "Task A to B"),
+            task("c", "Task C"),
+        ];
+        input.dependencies = vec![edge("a", "b->c"), edge("a->b", "c")];
+        let receipt = plan_import(&mut database, input).expect("assertion legal graph imports");
+        assert_eq!(
+            receipt.dependency_ids.len(),
+            2,
+            "assertion both separator-shaped edges are recorded"
+        );
+        assert_ne!(
+            receipt.dependency_ids[0], receipt.dependency_ids[1],
+            "assertion separator-shaped edges keep distinct dependency ids"
+        );
+        let edges = dependencies_list(&database, &mission_id).expect("assertion edges read back");
+        assert_eq!(edges.len(), 2, "assertion both edges persist");
+        assert_eq!(
+            loom_rows(&database),
+            (1, 4, 2),
+            "assertion separator-shaped plan writes one full graph"
         );
     }
 
