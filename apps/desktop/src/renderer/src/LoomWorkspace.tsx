@@ -76,8 +76,9 @@ function LoomFlow({ tasks, dependencies, agents }: {
   </div>
 }
 
-function PlanWorkspace({ mission, plan, tasks, dependencies, loading, error }: {
+function PlanWorkspace({ mission, agents, plan, tasks, dependencies, loading, error }: {
   mission: MissionRecord
+  agents: AgentProfile[]
   plan: LoomPlan | null
   tasks: LoomTask[]
   dependencies: LoomDependency[]
@@ -136,7 +137,7 @@ function PlanWorkspace({ mission, plan, tasks, dependencies, loading, error }: {
       <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
     </header>
     <p className="loom-intro">{t('把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。')}</p>
-    <LoomFlow tasks={tasks} dependencies={dependencies} agents={[]} />
+    <LoomFlow tasks={tasks} dependencies={dependencies} agents={agents} />
   </div>
 }
 
@@ -213,7 +214,7 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       </button>)}
     </nav>
     <div className="loom-section-body">
-      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} plan={plan} tasks={tasks} dependencies={dependencies} loading={loading} error={error}/></div>}
+      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} loading={loading} error={error}/></div>}
       <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
         {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview/></div>}
         <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>
