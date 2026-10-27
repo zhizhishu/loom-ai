@@ -1198,7 +1198,7 @@ pub fn claim_acquire(
     let fence_generation: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(fence_generation),0) FROM loom_claim WHERE task_id=?1",
         [&task_id],
-        |row| row.get(0),
+        |row| row.get::<_, i64>(0),
     )? + 1;
     if let Some((held_claim_id, held_lease_expires_at)) = open_claim {
         if !lease_expired(&held_lease_expires_at, now) {
