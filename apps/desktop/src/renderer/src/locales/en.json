@@ -4183,5 +4183,22 @@
   "名称后": "After name",
   "标题预览": "Title preview",
   "添加内容": "Include",
-  "显示位置": "Position"
+  "显示位置": "Position",
+  "编排": "Orchestration",
+  "工作关系": "Working relationships",
+  "把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。": "Keep goals, ownership and delivery on one working map. Execution state and human acceptance stay separate.",
+  "尚未配置编排": "No orchestration configured yet",
+  "这个使命还没有任务依赖或执行计划。": "This Mission has no task dependencies or execution plan yet.",
+  "由主助手建立计划后，这里会显示任务关系、负责队员和真实阻塞。": "Once the lead assistant creates a plan, task relationships, responsible teammates and real blockers appear here.",
+  "当前使命基础": "Current Mission facts",
+  "当前使命": "Current Mission",
+  "交付": "Delivery",
+  "成果与验收": "Outcomes and acceptance",
+  "人工验收状态": "Human acceptance state",
+  "独立验收尚未接入": "Independent acceptance is not connected yet",
+  "执行结束或使命完成均不代表验收通过。接入可追溯的验收记录后，才能在这里接受或打回。": "Neither a finished run nor a completed Mission means acceptance passed. Accept or send back only after traceable acceptance records are connected.",
+  "验收条件": "Acceptance criteria",
+  "尚未配置独立的验收条件。": "No independent acceptance criteria configured yet.",
+  "后续由任务合同提供；当前使命描述仍可在对话中查看。": "A task contract will supply them later; the current Mission description stays visible in the conversation.",
+  "使命工作区": "Mission workspace"
 }
