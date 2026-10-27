@@ -246,11 +246,17 @@ pub(super) fn migrate_acceptance_criteria_version(database: &mut Database) -> Re
         plan_holds_acceptance_criteria_version(&tx)?,
         "LOOM acceptance criteria version migration did not create the required column"
     );
+    // 169 is only Current while nothing newer exists; once a later migration lands this
+    // step must stay admissible as a supported source instead of pinning Current.
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(marker) => {
+            marker.projection_schema_version == 169
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
     anyhow::ensure!(
-        matches!(
-            classify_database_contract(&tx)?,
-            DatabaseContractClassification::Current(_)
-        ),
+        admitted,
         "LOOM acceptance criteria version schema admission failed"
     );
     tx.commit()?;
