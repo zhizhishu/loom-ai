@@ -40,5 +40,21 @@
 .loom-criteria p span { color: var(--faint); font-size: 11px; }
 .loom-delivery > .mission-delivery-panel { padding: 24px 0 0; overflow: visible; }
 .loom-delivery .mission-delivery-section h3 { font-size: 12px; }
+
+/* archify 流程视图 */
+.loom-flow { margin-top: 24px; }
+.loom-flow-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.loom-flow-stats { display: flex; gap: 16px; color: var(--muted); font-size: 11px; }
+.loom-flow-graph { display: flex; flex-direction: column; gap: 12px; }
+.loom-flow-node { border: 1px solid var(--line); border-radius: 6px; padding: 12px; background: var(--surface); }
+.loom-flow-node.ready { border-color: var(--accent); background: var(--accent-subtle); }
+.loom-flow-node.blocked { border-color: var(--attention); background: var(--attention-subtle); }
+.loom-flow-node-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.loom-flow-node-title { font-size: 12px; font-weight: 550; }
+.loom-flow-node-status { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.loom-flow-node-assignee { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.loom-flow-node-deps { font-size: 10px; color: var(--faint); margin-bottom: 4px; }
+.loom-flow-node-blocked { font-size: 10px; color: var(--attention); font-style: italic; }
+
 @media(max-width:640px) { .loom-section-tabs { padding-inline: 18px; }.loom-section-body > .mission-activity-document { padding: 18px; }.loom-plan,.loom-delivery { padding: 24px 20px; }.loom-foundation { grid-template-columns: minmax(0,1fr) 64px 64px; gap: 12px; } }
 @media(prefers-reduced-motion:reduce) { .loom-section-tabs button { transition: none; } }

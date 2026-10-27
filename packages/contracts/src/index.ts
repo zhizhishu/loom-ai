@@ -4,6 +4,7 @@ import type { BuiltinMemberAvatarRole } from './member-avatar'
 
 export * from './member-avatar'
 export * from './current-user-profile'
+export * from './loom'
 
 export const THREAD_ID_PATTERN = /^rvcamp_[0-7][0123456789abcdefghjkmnpqrstvwxyz]{25}$/u
 
@@ -4308,6 +4309,9 @@ export type CoreMethod =
   | 'missions.status'
   | 'missions.start'
   | 'missions.linkPr'
+  | 'loom.plan.get'
+  | 'loom.tasks.list'
+  | 'loom.dependencies.list'
   | 'automations.create'
   | 'automations.update'
   | 'automations.configureTimeLimit'

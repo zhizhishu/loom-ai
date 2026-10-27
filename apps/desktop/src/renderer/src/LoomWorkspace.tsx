@@ -1,8 +1,9 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import type { AgentProfile, MissionRecord } from '@contracts'
+import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency } from '@contracts'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
 import { UiText, uiAttribute, useUiText } from './interface-language'
+import { useThreadClient } from './camp-client'
 
 export type LoomSection = 'activity' | 'plan' | 'delivery'
 
@@ -14,23 +15,128 @@ function LoomEmpty({ title, children }: { title: string; children: ReactNode }) 
   </div>
 }
 
-function PlanWorkspace({ mission }: { mission: MissionRecord }) {
+/** 依赖就绪判定：一条规则求值，不是事件。 */
+export function loomTaskReady(task: LoomTask, dependencies: LoomDependency[], tasks: LoomTask[]): boolean {
+  const upstreams = dependencies.filter(d => d.downstreamTaskId === task.taskId)
+  return upstreams.every(dep => {
+    const upstream = tasks.find(t => t.taskId === dep.upstreamTaskId)
+    if (!upstream) return false
+    if (dep.condition === 'task_done') return upstream.status === 'done'
+    if (dep.condition === 'artifact_accepted') return upstream.status === 'done' // 简化：先只看 task_done
+    return false
+  })
+}
+
+/** 依赖图渲染：archify 流程视图。 */
+function LoomFlow({ tasks, dependencies, agents }: {
+  tasks: LoomTask[]
+  dependencies: LoomDependency[]
+  agents: AgentProfile[]
+}) {
   const t = useUiText()
+  const readyTasks = tasks.filter(task => loomTaskReady(task, dependencies, tasks))
+  const blockedTasks = tasks.filter(task => task.status === 'blocked')
+  
+  return <div className="loom-flow">
+    <div className="loom-flow-header">
+      <span className="loom-eyebrow">{t('任务依赖')}</span>
+      <div className="loom-flow-stats">
+        <span>{t('可执行')}: {readyTasks.length}</span>
+        <span>{t('阻塞')}: {blockedTasks.length}</span>
+        <span>{t('总任务')}: {tasks.length}</span>
+      </div>
+    </div>
+    
+    <div className="loom-flow-graph">
+      {tasks.map(task => {
+        const upstreams = dependencies.filter(d => d.downstreamTaskId === task.taskId)
+        const ready = loomTaskReady(task, dependencies, tasks)
+        const assignee = agents.find(a => a.agentId === task.assigneeAgentId)
+        
+        return <div key={task.taskId} className={`loom-flow-node ${ready ? 'ready' : ''} ${task.status}`}>
+          <div className="loom-flow-node-header">
+            <span className="loom-flow-node-title">{task.title}</span>
+            <span className="loom-flow-node-status">{t(task.status)}</span>
+          </div>
+          {assignee && <div className="loom-flow-node-assignee">{assignee.displayName}</div>}
+          {upstreams.length > 0 && (
+            <div className="loom-flow-node-deps">
+              {t('依赖')}: {upstreams.map(d => {
+                const upstream = tasks.find(t => t.taskId === d.upstreamTaskId)
+                return upstream?.title ?? d.upstreamTaskId
+              }).join(', ')}
+            </div>
+          )}
+          {task.blockedReason && (
+            <div className="loom-flow-node-blocked">{task.blockedReason}</div>
+          )}
+        </div>
+      })}
+    </div>
+  </div>
+}
+
+function PlanWorkspace({ mission, plan, tasks, dependencies, loading, error }: {
+  mission: MissionRecord
+  plan: LoomPlan | null
+  tasks: LoomTask[]
+  dependencies: LoomDependency[]
+  loading?: boolean
+  error?: string
+}) {
+  const t = useUiText()
+  
+  if (loading) {
+    return <div className="loom-plan">
+      <header className="loom-section-heading">
+        <div><span className="loom-eyebrow">LOOM · {t('编排')}</span><h2>{t('工作关系')}</h2></div>
+        <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
+      </header>
+      <LoomEmpty title={t('正在读取编排…')}>
+        <p>{t('从控制面读取计划、任务与依赖关系。')}</p>
+      </LoomEmpty>
+    </div>
+  }
+  
+  if (error) {
+    return <div className="loom-plan">
+      <header className="loom-section-heading">
+        <div><span className="loom-eyebrow">LOOM · {t('编排')}</span><h2>{t('工作关系')}</h2></div>
+        <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
+      </header>
+      <LoomEmpty title={t('读取编排失败')}>
+        <p>{error}</p>
+        <p>{t('请检查控制面连接后重试。')}</p>
+      </LoomEmpty>
+    </div>
+  }
+  
+  if (!plan || tasks.length === 0) {
+    return <div className="loom-plan">
+      <header className="loom-section-heading">
+        <div><span className="loom-eyebrow">LOOM · {t('编排')}</span><h2>{t('工作关系')}</h2></div>
+        <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
+      </header>
+      <p className="loom-intro">{t('把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。')}</p>
+      <LoomEmpty title={t('尚未配置编排')}>
+        <p>{t('这个使命还没有任务依赖或执行计划。')}</p>
+        <p>{t('由主助手建立计划后，这里会显示任务关系、负责队员和真实阻塞。')}</p>
+      </LoomEmpty>
+      <section className="loom-foundation" aria-label={uiAttribute('当前使命基础')}>
+        <div><span>{t('当前使命')}</span><strong>{mission.title}</strong></div>
+        <div><span>{t('队员')}</span><strong>{mission.memberAgentIds.length}</strong></div>
+        <div><span>{t('执行中')}</span><strong>{mission.runningAgentIds.length}</strong></div>
+      </section>
+    </div>
+  }
+  
   return <div className="loom-plan">
     <header className="loom-section-heading">
-      <div><span className="loom-eyebrow">LOOM · {t('编排')}</span><h2>{t('工作关系')}</h2></div>
+      <div><span className="loom-eyebrow">LOOM · {t('编排')}</span><h2>{plan.goal}</h2></div>
       <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
     </header>
     <p className="loom-intro">{t('把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。')}</p>
-    <LoomEmpty title={t('尚未配置编排')}>
-      <p>{t('这个使命还没有任务依赖或执行计划。')}</p>
-      <p>{t('由主助手建立计划后，这里会显示任务关系、负责队员和真实阻塞。')}</p>
-    </LoomEmpty>
-    <section className="loom-foundation" aria-label={uiAttribute('当前使命基础')}>
-      <div><span>{t('当前使命')}</span><strong>{mission.title}</strong></div>
-      <div><span>{t('队员')}</span><strong>{mission.memberAgentIds.length}</strong></div>
-      <div><span>{t('执行中')}</span><strong>{mission.runningAgentIds.length}</strong></div>
-    </section>
+    <LoomFlow tasks={tasks} dependencies={dependencies} agents={[]} />
   </div>
 }
 
@@ -61,12 +167,38 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
   const [visited, setVisited] = useState<ReadonlySet<LoomSection>>(() => new Set(['activity']))
   const shared = useRef<HTMLDivElement>(null)
   const scrollPositions = useRef<Partial<Record<LoomSection, { top: number; left: number }>>>({})
+  
+  const client = useThreadClient()
+  const [plan, setPlan] = useState<LoomPlan | null>(null)
+  const [tasks, setTasks] = useState<LoomTask[]>([])
+  const [dependencies, setDependencies] = useState<LoomDependency[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  
   useLayoutEffect(() => {
     if (section === 'plan') return
     const saved = scrollPositions.current[section]
     const node = shared.current
     if (node && saved) { node.scrollTop = saved.top; node.scrollLeft = saved.left }
   }, [section])
+  
+  useLayoutEffect(() => {
+    let alive = true
+    setLoading(true)
+    void Promise.all([
+      client.request<LoomPlan | null>('loom.plan.get', { missionId: mission.missionId }),
+      client.request<LoomTask[]>('loom.tasks.list', { missionId: mission.missionId }),
+      client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId })
+    ]).then(([p, t, d]) => {
+      if (alive) { setPlan(p); setTasks(t); setDependencies(d); setError('') }
+    }).catch(e => {
+      if (alive) setError(e.message ?? '读取编排数据失败')
+    }).finally(() => {
+      if (alive) setLoading(false)
+    })
+    return () => { alive = false }
+  }, [client, mission.missionId])
+  
   const select = (next: LoomSection): void => {
     const node = shared.current
     if (node && section !== 'plan') scrollPositions.current[section] = { top: node.scrollTop, left: node.scrollLeft }
@@ -81,7 +213,7 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       </button>)}
     </nav>
     <div className="loom-section-body">
-      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission}/></div>}
+      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} plan={plan} tasks={tasks} dependencies={dependencies} loading={loading} error={error}/></div>}
       <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
         {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview/></div>}
         <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>

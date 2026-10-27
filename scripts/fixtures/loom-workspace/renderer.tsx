@@ -1,5 +1,5 @@
 import { createRoot } from 'react-dom/client'
-import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord } from '@contracts'
+import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomCandidate, LoomReview } from '@contracts'
 import { LoomWorkspace } from '../../../apps/desktop/src/renderer/src/LoomWorkspace'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { applyAppearanceSnapshot } from '../../../apps/desktop/src/renderer/src/theme'
@@ -48,6 +48,59 @@ const mission: MissionRecord = {
   workspaceEverCreated: true, workspaceResourcesPresent: true, cleanupAvailable: true
 }
 
+// Mock LOOM Plan/Task/Dependency for archify flow view
+const plan: LoomPlan = {
+  planId: 'plan-loom-018',
+  missionId: mission.missionId,
+  goal: '实现工作区恢复与验收闭环',
+  acceptanceCriteria: {
+    version: 'v1',
+    criteria: [
+      { criterionId: 'c1', text: '工作区保存后可恢复' },
+      { criterionId: 'c2', text: '交付有独立验收记录' }
+    ]
+  },
+  createdAt,
+  revision: 1
+}
+
+const tasks: LoomTask[] = [
+  {
+    taskId: 'task-1', planId: plan.planId,
+    title: '设计恢复协议', description: '定义工作区快照格式',
+    assigneeAgentId: 'agent-lead', status: 'done',
+    acceptanceCriteria: plan.acceptanceCriteria,
+    blockedReason: null, createdAt, updatedAt: createdAt, revision: 1
+  },
+  {
+    taskId: 'task-2', planId: plan.planId,
+    title: '实现快照保存', description: '在 Core 中实现工作区快照',
+    assigneeAgentId: 'agent-build', status: 'done',
+    acceptanceCriteria: plan.acceptanceCriteria,
+    blockedReason: null, createdAt, updatedAt: createdAt, revision: 1
+  },
+  {
+    taskId: 'task-3', planId: plan.planId,
+    title: '实现恢复逻辑', description: '从快照恢复工作区状态',
+    assigneeAgentId: 'agent-build', status: 'in_progress',
+    acceptanceCriteria: plan.acceptanceCriteria,
+    blockedReason: null, createdAt, updatedAt: createdAt, revision: 1
+  },
+  {
+    taskId: 'task-4', planId: plan.planId,
+    title: '验收测试', description: '验证恢复正确性',
+    assigneeAgentId: 'agent-lead', status: 'blocked',
+    acceptanceCriteria: plan.acceptanceCriteria,
+    blockedReason: '等待恢复逻辑完成', createdAt, updatedAt: createdAt, revision: 1
+  }
+]
+
+const dependencies: LoomDependency[] = [
+  { dependencyId: 'dep-1', upstreamTaskId: 'task-1', downstreamTaskId: 'task-2', condition: 'task_done', resolvedArtifactId: null, resolution: null, createdAt },
+  { dependencyId: 'dep-2', upstreamTaskId: 'task-2', downstreamTaskId: 'task-3', condition: 'task_done', resolvedArtifactId: null, resolution: null, createdAt },
+  { dependencyId: 'dep-3', upstreamTaskId: 'task-3', downstreamTaskId: 'task-4', condition: 'artifact_accepted', resolvedArtifactId: null, resolution: null, createdAt }
+]
+
 const delivery: MissionDelivery = {
   threadId: mission.threadId, workingDirectory: '/workspace/rovai-ai-mission-018', git: true,
   workspace: {
@@ -83,7 +136,10 @@ const selections: string[] = []
 const replies: Readonly<Record<string, unknown>> = {
   'preferences.tasks.get': { enabled: false, headsUpAfterSequence: 0, observedThroughChangeSequence: 0 },
   'missions.delivery': delivery,
-  'missions.activity': activity
+  'missions.activity': activity,
+  'loom.plan.get': plan,
+  'loom.tasks.list': tasks,
+  'loom.dependencies.list': dependencies
 }
 
 async function request<T>(method: string, params: unknown = {}): Promise<T> {
