@@ -9500,6 +9500,24 @@ impl Core {
                 }
                 Ok(serde_json::to_value(snapshot)?)
             }
+            "loom.plan.get" | "loom.tasks.list" | "loom.dependencies.list" => {
+                let params: rovai_core::loom::MissionScopeInput =
+                    serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                let mission_id = params.mission_id.as_str();
+                Ok(match request.method.as_str() {
+                    "loom.plan.get" => {
+                        serde_json::to_value(rovai_core::loom::plan_get(&database, mission_id)?)?
+                    }
+                    "loom.tasks.list" => {
+                        serde_json::to_value(rovai_core::loom::tasks_list(&database, mission_id)?)?
+                    }
+                    _ => serde_json::to_value(rovai_core::loom::dependencies_list(
+                        &database,
+                        mission_id,
+                    )?)?,
+                })
+            }
             "teams.list" => {
                 let database = self.database.lock().await;
                 Ok(serde_json::to_value(rovai_core::teams::list(&database)?)?)

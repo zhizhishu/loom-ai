@@ -185,7 +185,8 @@ pub(super) fn migrate_rules(database: &mut Database) -> Result<()> {
     anyhow::ensure!(
         matches!(
             classify_database_contract(&tx)?,
-            DatabaseContractClassification::Current(_)
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 167
         ),
         "Hermes rules schema failed admission"
     );
@@ -195,6 +196,7 @@ pub(super) fn migrate_rules(database: &mut Database) -> Result<()> {
 
 #[cfg(test)]
 pub(super) fn downgrade_rules_for_test(c: &Connection) {
+    super::loom::downgrade_for_test(c);
     if c.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=217)",
         [],
