@@ -14,7 +14,15 @@
 | 编排/交付 UI 接真数据 | 本机 Electron fixture | 8 场景通过 |
 | 全量回归 | bero `cargo test -p rovai-core --lib` | 432 passed / 3 failed（基线 `33f6ded` 复现同样 3 个，属机器环境） |
 
-已知未做：写路径只有 `loom.plan.import`；无 Candidate/Review/Claim；UI 仍是顺序卡片不是连线拓扑；品牌未换。
+已知未做：写路径为 `loom.plan.import` / `loom.task.release` / `loom.claim.acquire`；无 Candidate/Review；**claim 的 fence 只生成、尚无提交端校验**（失租防提交未闭环）；UI 仍是顺序卡片不是连线拓扑；品牌未换。
+
+## 阶段二进度
+
+| 切片 | 内容 | 状态 |
+|---|---|---|
+| 2.1 | 迁移 220 / schema 170：`loom_claim` + `loom.task.release` + `loom.claim.acquire`（原子、fence 单调、commandId 幂等、租约过期接管） | 已收（限"存储与 API 基础"，不含提交端 fencing） |
+| 2.2 | Candidate + Review + 提交端 fence 校验 + 依赖首次释放冻结 | 未开始 |
+| 2.3 | claim/Candidate 接入 UI | 未开始 |
 
 ## 从 ACCP 直接抄的机制
 
