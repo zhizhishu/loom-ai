@@ -4311,6 +4311,8 @@ export type CoreMethod =
   | 'missions.linkPr'
   | 'loom.plan.get'
   | 'loom.plan.import'
+  | 'loom.task.release'
+  | 'loom.claim.acquire'
   | 'loom.tasks.list'
   | 'loom.dependencies.list'
   | 'automations.create'

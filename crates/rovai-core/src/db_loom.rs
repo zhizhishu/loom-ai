@@ -1,11 +1,12 @@
-//! LOOM orchestration projection: plan, task and dependency facts for one Mission.
-//! This migration only creates the tables; the single write path is
-//! `loom::plan_import`, which validates the whole graph in one transaction.
+//! LOOM orchestration projection: plan, task and dependency facts for one Mission, plus the
+//! lease claim that binds a Task to one AgentRun. This module only owns the tables; the write
+//! paths are `loom::plan_import`, `loom::task_release` and `loom::claim_acquire`.
 use super::*;
 
 const PLAN_TABLE: &str = "loom_plan";
 const TASK_TABLE: &str = "loom_task";
 const DEPENDENCY_TABLE: &str = "loom_dependency";
+const CLAIM_TABLE: &str = "loom_claim";
 
 /// Task states follow the LOOM control-plane contract
 /// (DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED).
@@ -67,6 +68,57 @@ fn create_sql() -> String {
     )
 }
 
+/// Migration 220: the lease claim a Task hands to exactly one AgentRun. The partial
+/// unique index keeps at most one unreleased claim per Task, so two Runs can never both
+/// hold the same Task; `fence_generation` advances on every expired-lease takeover.
+fn claim_sql() -> String {
+    format!(
+        r#"
+        CREATE TABLE {CLAIM_TABLE} (
+            claim_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            agent_run_id TEXT NOT NULL,
+            claimant_agent_id TEXT,
+            command_id TEXT NOT NULL UNIQUE,
+            lease_expires_at TEXT NOT NULL,
+            fence_generation INTEGER NOT NULL CHECK(fence_generation >= 1),
+            claimed_at TEXT NOT NULL,
+            released_at TEXT,
+            FOREIGN KEY(plan_id, task_id)
+                REFERENCES {TASK_TABLE}(plan_id, task_id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX loom_claim_open_task_idx
+            ON {CLAIM_TABLE}(task_id) WHERE released_at IS NULL;
+        CREATE INDEX loom_claim_plan_idx ON {CLAIM_TABLE}(plan_id, claim_id);
+        "#
+    )
+}
+
+/// The claim projection is part of the LOOM schema from migration 220 on; earlier
+/// markers keep admitting databases that predate the lease table.
+fn claim_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('claim_id','plan_id','task_id','agent_run_id','claimant_agent_id',
+              'command_id','lease_expires_at','fence_generation','claimed_at','released_at')",
+        [CLAIM_TABLE],
+        |row| row.get(0),
+    )?;
+    let open_task_index: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index'
+             AND name='loom_claim_open_task_idx' AND sql LIKE '%released_at IS NULL%')",
+        [],
+        |row| row.get(0),
+    )?;
+    let declared = table_sql(connection, CLAIM_TABLE)?.is_some_and(|sql| {
+        let sql = sql.split_whitespace().collect::<String>();
+        sql.contains("CHECK(fence_generation>=1)")
+            && sql.contains("REFERENCESloom_task(plan_id,task_id)")
+    });
+    Ok(columns == 10 && open_task_index && declared)
+}
+
 fn table_sql(connection: &Connection, table: &str) -> rusqlite::Result<Option<String>> {
     connection
         .query_row(
@@ -90,6 +142,7 @@ pub(super) fn schema_matches(
     };
     let plan_version_recorded =
         projection_schema_version < 169 || plan_holds_acceptance_criteria_version(connection)?;
+    let claim_recorded = projection_schema_version < 170 || claim_schema_matches(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -113,7 +166,8 @@ pub(super) fn schema_matches(
                 "CHECK(upstream_task_id <> downstream_task_id)",
                 "REFERENCES loom_task(plan_id, task_id)",
             ],
-        )?)
+        )?
+        && claim_recorded)
 }
 
 /// Migration 219 hangs the acceptance criteria version on the Plan; Tasks inherit it.
@@ -203,6 +257,41 @@ pub(super) fn migrate_acceptance_criteria_version(database: &mut Database) -> Re
     Ok(())
 }
 
+/// Migration 220: one Task lease projection. A claim is the only place a Task binds to
+/// an AgentRun, so the Task itself keeps its control-plane state (`READY`) untouched.
+pub(super) fn migrate_claim_lease(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 169
+        ),
+        "LOOM claim lease migration requires schema 169"
+    );
+    tx.execute_batch(&claim_sql())?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(220,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=170,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(&tx, &[CLAIM_TABLE])?;
+    anyhow::ensure!(
+        claim_schema_matches(&tx)?,
+        "LOOM claim lease migration did not create the required table"
+    );
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::Current(_)
+        ),
+        "LOOM claim lease schema admission failed"
+    );
+    tx.commit()?;
+    Ok(())
+}
+
 /// Only synthetic migration fixtures reverse this projection; product code never drops it.
 #[cfg(test)]
 pub(super) fn downgrade_for_test(connection: &Connection) {
@@ -219,11 +308,12 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+            DROP TABLE IF EXISTS loom_claim;
             DROP TABLE IF EXISTS loom_dependency;
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
-            DELETE FROM schema_migration WHERE version IN (218,219);
+            DELETE FROM schema_migration WHERE version IN (218,219,220);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
@@ -398,10 +488,22 @@ mod tests {
             1,
             "assertion schema_migration_records_219_once"
         );
+
+        // Migration 220 adds the Task lease projection and advances the marker to 170.
+        migrate_claim_lease(&mut database).unwrap();
+        assert!(
+            claim_schema_matches(database.connection()).unwrap(),
+            "assertion schema_170_creates_the_loom_claim_projection"
+        );
+        assert_eq!(
+            migration_receipts(&database, 220),
+            1,
+            "assertion schema_migration_records_220_once"
+        );
         assert_eq!(
             projection_version(&database),
-            169,
-            "assertion contract_marker_advances_to_169"
+            170,
+            "assertion contract_marker_advances_to_170"
         );
         assert!(matches!(
             classify_database_contract(database.connection()).unwrap(),

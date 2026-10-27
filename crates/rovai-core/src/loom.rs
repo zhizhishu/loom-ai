@@ -1,6 +1,6 @@
 //! LOOM orchestration. Plans, tasks and dependency edges are read-only facts for one
-//! Mission; every query is scoped by `missionId`. The only write path is
-//! [`plan_import`]: one Mission, one Plan, one transaction.
+//! Mission; every query is scoped by `missionId`. The write paths are [`plan_import`],
+//! [`task_release`] and [`claim_acquire`], each one Mission, one transaction.
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
@@ -472,6 +472,46 @@ const LOOM_DEPENDENCY_TASK_MISSING: &str = "LOOM_DEPENDENCY_TASK_MISSING";
 const LOOM_DEPENDENCY_SELF: &str = "LOOM_DEPENDENCY_SELF";
 const LOOM_DEPENDENCY_DUPLICATE: &str = "LOOM_DEPENDENCY_DUPLICATE";
 const LOOM_DAG_CYCLE: &str = "LOOM_DAG_CYCLE";
+const LOOM_PLAN_NOT_FOUND: &str = "LOOM_PLAN_NOT_FOUND";
+const LOOM_TASK_NOT_FOUND: &str = "LOOM_TASK_NOT_FOUND";
+const LOOM_TASK_NOT_DRAFT: &str = "LOOM_TASK_NOT_DRAFT";
+const LOOM_TASK_NOT_READY: &str = "LOOM_TASK_NOT_READY";
+const LOOM_DEPENDENCY_UNRELEASED: &str = "LOOM_DEPENDENCY_UNRELEASED";
+const LOOM_CLAIM_HELD: &str = "LOOM_CLAIM_HELD";
+const LOOM_CLAIM_COMMAND_REUSED: &str = "LOOM_CLAIM_COMMAND_REUSED";
+
+/// Rejection of a LOOM task release or claim; `code` is the stable error code the Host
+/// returns, exactly like [`LoomPlanImportError`].
+#[derive(Debug)]
+pub struct LoomCommandError {
+    code: &'static str,
+    message: String,
+}
+
+impl LoomCommandError {
+    fn rejection(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            code,
+            message: message.into(),
+        })
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for LoomCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for LoomCommandError {}
 
 /// Persisted shape of one acceptance criterion; `criterionId` is the stable identity.
 #[derive(Serialize)]
@@ -792,6 +832,416 @@ pub fn plan_import(
         acceptance_criteria_version: acceptance_criteria_version.to_string(),
         task_ids: plan_task_ids.into_iter().map(str::to_string).collect(),
         dependency_ids,
+    })
+}
+
+/// Release input: the Mission-scoped Task that becomes `READY` for claiming.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomTaskReleaseInput {
+    pub mission_id: String,
+    pub task_id: String,
+}
+
+/// Release receipt: the Task as it now stands, so the caller reads back the state change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomTaskReleaseResult {
+    pub mission_id: String,
+    pub plan_id: String,
+    pub task: LoomTask,
+}
+
+/// Claim input. `commandId` is the idempotency key: replaying it returns the original
+/// binding instead of writing a second claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomClaimAcquireInput {
+    pub mission_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    #[serde(default)]
+    pub claimant_agent_id: Option<String>,
+    pub command_id: String,
+    /// Lease length in seconds; defaults to [`DEFAULT_CLAIM_LEASE_SECONDS`].
+    #[serde(default)]
+    pub lease_seconds: Option<i64>,
+}
+
+/// Claim receipt: the binding a Run holds on the Task, plus the fence it must present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomClaimAcquireResult {
+    pub claim_id: String,
+    pub mission_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    pub claimant_agent_id: Option<String>,
+    pub fence_generation: i64,
+    pub claimed_at: String,
+    pub lease_expires_at: String,
+    pub released_at: Option<String>,
+    /// True when the same `commandId` replayed and no new claim was written.
+    pub replayed: bool,
+}
+
+const DEFAULT_CLAIM_LEASE_SECONDS: i64 = 300;
+const MAX_CLAIM_LEASE_SECONDS: i64 = 3600;
+
+fn required_field(operation: &str, field: &str, value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(LoomCommandError::rejection(
+            LOOM_INVALID_INPUT,
+            format!("LOOM {operation} requires a {field}"),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// One persisted claim; the row keeps the fence so a late holder can be fenced off.
+struct StoredClaim {
+    claim_id: String,
+    plan_id: String,
+    task_id: String,
+    agent_run_id: String,
+    claimant_agent_id: Option<String>,
+    fence_generation: i64,
+    claimed_at: String,
+    lease_expires_at: String,
+    released_at: Option<String>,
+}
+
+impl StoredClaim {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            claim_id: row.get(0)?,
+            plan_id: row.get(1)?,
+            task_id: row.get(2)?,
+            agent_run_id: row.get(3)?,
+            claimant_agent_id: row.get(4)?,
+            fence_generation: row.get(5)?,
+            claimed_at: row.get(6)?,
+            lease_expires_at: row.get(7)?,
+            released_at: row.get(8)?,
+        })
+    }
+
+    fn into_result(self, mission_id: &str, replayed: bool) -> LoomClaimAcquireResult {
+        LoomClaimAcquireResult {
+            claim_id: self.claim_id,
+            mission_id: mission_id.to_string(),
+            plan_id: self.plan_id,
+            task_id: self.task_id,
+            agent_run_id: self.agent_run_id,
+            claimant_agent_id: self.claimant_agent_id,
+            fence_generation: self.fence_generation,
+            claimed_at: self.claimed_at,
+            lease_expires_at: self.lease_expires_at,
+            released_at: self.released_at,
+            replayed,
+        }
+    }
+}
+
+/// A lease is live only while it parses and lies in the future; an unreadable value is not
+/// proof of a live lease, so a takeover fences it instead of trusting it.
+fn lease_expired(lease_expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(lease_expires_at) {
+        Ok(expires) => expires.with_timezone(&chrono::Utc) <= now,
+        Err(_) => true,
+    }
+}
+
+/// The edges that still block a claim, using the same rule as the contract's
+/// `loomEvaluateDependency`: a frozen release wins, otherwise a `TASK_DONE` edge needs its
+/// upstream Task `DONE`. The `ARTIFACT_ACCEPTED` branch needs a candidate and an accepted
+/// review, which this projection does not hold yet, so an unresolved artifact edge stays
+/// unreleased.
+fn blocking_dependencies(
+    transaction: &rusqlite::Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+) -> Result<Vec<String>> {
+    let rows = transaction
+        .prepare(
+            "SELECT dependency.dependency_id, dependency.condition, dependency.resolved_at,
+                    upstream.status
+             FROM loom_dependency AS dependency
+             JOIN loom_task AS upstream
+               ON upstream.plan_id=dependency.plan_id
+              AND upstream.task_id=dependency.upstream_task_id
+             WHERE dependency.plan_id=?1 AND dependency.downstream_task_id=?2
+             ORDER BY dependency.created_at, dependency.dependency_id",
+        )?
+        .query_map(params![plan_id, task_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut blocking = Vec::new();
+    for (dependency_id, condition, resolved_at, upstream_status) in rows {
+        if resolved_at.is_some() {
+            continue;
+        }
+        if upstream_status != "DONE" {
+            blocking.push(format!("{dependency_id}:upstream_task_not_done"));
+        } else if condition != LoomDependencyCondition::TaskDone.as_str() {
+            blocking.push(format!("{dependency_id}:artifact_not_accepted"));
+        }
+    }
+    Ok(blocking)
+}
+
+/// LOOM release path: a Task the Plan already defines becomes `READY` inside the Mission
+/// that owns its Plan, and nothing else about it moves.
+pub fn task_release(
+    database: &mut Database,
+    input: LoomTaskReleaseInput,
+) -> Result<LoomTaskReleaseResult> {
+    let mission_id = required_field("task release", "missionId", &input.mission_id)?;
+    let task_id = required_field("task release", "taskId", &input.task_id)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mission_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mission WHERE id=?1)",
+        [&mission_id],
+        |row| row.get(0),
+    )?;
+    if !mission_exists {
+        return Err(LoomCommandError::rejection(
+            LOOM_MISSION_NOT_FOUND,
+            format!("mission {mission_id} does not exist"),
+        ));
+    }
+    let plan_id: Option<String> = transaction
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(plan_id) = plan_id else {
+        return Err(LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} has no LOOM plan"),
+        ));
+    };
+    let status: Option<String> = transaction
+        .query_row(
+            "SELECT status FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![&plan_id, &task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(status) = status else {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_FOUND,
+            format!("task {task_id} does not belong to the plan of mission {mission_id}"),
+        ));
+    };
+    if status != "DRAFT" {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_DRAFT,
+            format!("LOOM task {task_id} is {status}; only a DRAFT task can be released"),
+        ));
+    }
+    transaction.execute(
+        "UPDATE loom_task SET status='READY', updated_at=?1, revision=revision+1
+         WHERE plan_id=?2 AND task_id=?3",
+        params![&now, &plan_id, &task_id],
+    )?;
+    transaction.commit()?;
+    let task = tasks_list(&*database, &mission_id)?
+        .into_iter()
+        .find(|task| task.task_id == task_id)
+        .ok_or_else(|| {
+            LoomCommandError::rejection(
+                LOOM_TASK_NOT_FOUND,
+                format!("released task {task_id} is not readable"),
+            )
+        })?;
+    Ok(LoomTaskReleaseResult {
+        mission_id,
+        plan_id,
+        task,
+    })
+}
+
+/// LOOM claim path: one Task, one Run, one lease. Everything the claim depends on
+/// (Mission, Plan ownership, Task state, dependency release, the previous lease) is
+/// checked and written in one immediate transaction, so a rejected or failed claim leaves
+/// no half binding behind; `commandId` makes a replay return the original claim.
+pub fn claim_acquire(
+    database: &mut Database,
+    input: LoomClaimAcquireInput,
+) -> Result<LoomClaimAcquireResult> {
+    let mission_id = required_field("claim acquire", "missionId", &input.mission_id)?;
+    let task_id = required_field("claim acquire", "taskId", &input.task_id)?;
+    let agent_run_id = required_field("claim acquire", "agentRunId", &input.agent_run_id)?;
+    let command_id = required_field("claim acquire", "commandId", &input.command_id)?;
+    let claimant_agent_id = input
+        .claimant_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent_id| !agent_id.is_empty())
+        .map(str::to_string);
+    let lease_seconds = input.lease_seconds.unwrap_or(DEFAULT_CLAIM_LEASE_SECONDS);
+    if !(1..=MAX_CLAIM_LEASE_SECONDS).contains(&lease_seconds) {
+        return Err(LoomCommandError::rejection(
+            LOOM_INVALID_INPUT,
+            format!("LOOM claim leaseSeconds must be 1 to {MAX_CLAIM_LEASE_SECONDS}"),
+        ));
+    }
+    let now = chrono::Utc::now();
+    let claimed_at = now.to_rfc3339();
+    let lease_expires_at = (now + chrono::Duration::seconds(lease_seconds)).to_rfc3339();
+
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mission_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mission WHERE id=?1)",
+        [&mission_id],
+        |row| row.get(0),
+    )?;
+    if !mission_exists {
+        return Err(LoomCommandError::rejection(
+            LOOM_MISSION_NOT_FOUND,
+            format!("mission {mission_id} does not exist"),
+        ));
+    }
+    let plan_id: Option<String> = transaction
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(plan_id) = plan_id else {
+        return Err(LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} has no LOOM plan"),
+        ));
+    };
+    let status: Option<String> = transaction
+        .query_row(
+            "SELECT status FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![&plan_id, &task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(status) = status else {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_FOUND,
+            format!("task {task_id} does not belong to the plan of mission {mission_id}"),
+        ));
+    };
+
+    // A replay must not depend on the current Task state: it returns the binding the
+    // command already created, and only for the same Task and Run.
+    let replay: Option<StoredClaim> = transaction
+        .query_row(
+            "SELECT claim_id, plan_id, task_id, agent_run_id, claimant_agent_id,
+                    fence_generation, claimed_at, lease_expires_at, released_at
+             FROM loom_claim WHERE command_id=?1",
+            [&command_id],
+            StoredClaim::read,
+        )
+        .optional()?;
+    if let Some(claim) = replay {
+        if claim.task_id != task_id || claim.agent_run_id != agent_run_id {
+            return Err(LoomCommandError::rejection(
+                LOOM_CLAIM_COMMAND_REUSED,
+                format!(
+                    "commandId {command_id} already bound task {} to agentRun {}",
+                    claim.task_id, claim.agent_run_id
+                ),
+            ));
+        }
+        return Ok(claim.into_result(&mission_id, true));
+    }
+
+    if status != "READY" {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_READY,
+            format!("LOOM task {task_id} is {status} and cannot be claimed"),
+        ));
+    }
+    let blocking = blocking_dependencies(&transaction, &plan_id, &task_id)?;
+    if !blocking.is_empty() {
+        return Err(LoomCommandError::rejection(
+            LOOM_DEPENDENCY_UNRELEASED,
+            format!(
+                "LOOM task {task_id} is still blocked by {}",
+                blocking.join(", ")
+            ),
+        ));
+    }
+
+    let open_claim: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT claim_id, lease_expires_at FROM loom_claim
+             WHERE task_id=?1 AND released_at IS NULL",
+            [&task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    // Every claim on the Task, released or not, counts: the fence only ever advances.
+    let fence_generation: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(fence_generation),0) FROM loom_claim WHERE task_id=?1",
+        [&task_id],
+        |row| row.get(0),
+    )? + 1;
+    if let Some((held_claim_id, held_lease_expires_at)) = open_claim {
+        if !lease_expired(&held_lease_expires_at, now) {
+            return Err(LoomCommandError::rejection(
+                LOOM_CLAIM_HELD,
+                format!("task {task_id} is held by claim {held_claim_id} until {held_lease_expires_at}"),
+            ));
+        }
+        transaction.execute(
+            "UPDATE loom_claim SET released_at=?1 WHERE claim_id=?2 AND released_at IS NULL",
+            params![&claimed_at, &held_claim_id],
+        )?;
+    }
+    let claim_id = format!("claim_{}", uuid::Uuid::new_v4().simple());
+    transaction.execute(
+        "INSERT INTO loom_claim(claim_id,plan_id,task_id,agent_run_id,claimant_agent_id,
+                              command_id,lease_expires_at,fence_generation,claimed_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            &claim_id,
+            &plan_id,
+            &task_id,
+            &agent_run_id,
+            claimant_agent_id.as_deref(),
+            &command_id,
+            &lease_expires_at,
+            fence_generation,
+            &claimed_at,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(LoomClaimAcquireResult {
+        claim_id,
+        mission_id,
+        plan_id,
+        task_id,
+        agent_run_id,
+        claimant_agent_id,
+        fence_generation,
+        claimed_at,
+        lease_expires_at,
+        released_at: None,
+        replayed: false,
     })
 }
 
@@ -1442,6 +1892,508 @@ mod tests {
             loom_rows(&database),
             (2, 4, 2),
             "assertion two_missions_hold_two_independent_graphs"
+        );
+    }
+
+    fn release_input(mission_id: &str, task_id: &str) -> LoomTaskReleaseInput {
+        LoomTaskReleaseInput {
+            mission_id: mission_id.into(),
+            task_id: task_id.into(),
+        }
+    }
+
+    fn claim_input(
+        mission_id: &str,
+        task_id: &str,
+        agent_run_id: &str,
+        command_id: &str,
+    ) -> LoomClaimAcquireInput {
+        LoomClaimAcquireInput {
+            mission_id: mission_id.into(),
+            task_id: task_id.into(),
+            agent_run_id: agent_run_id.into(),
+            claimant_agent_id: Some("agent_1".into()),
+            command_id: command_id.into(),
+            lease_seconds: None,
+        }
+    }
+
+    fn command_code(error: &anyhow::Error) -> &'static str {
+        error
+            .downcast_ref::<LoomCommandError>()
+            .unwrap_or_else(|| panic!("expected a LOOM command rejection, got: {error}"))
+            .code()
+    }
+
+    fn claim_rows(database: &Database) -> i64 {
+        database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_claim", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn open_claims(database: &Database, task_id: &str) -> i64 {
+        database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM loom_claim WHERE task_id=?1 AND released_at IS NULL",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn task_status(database: &Database, task_id: &str) -> String {
+        database
+            .connection()
+            .query_row("SELECT status FROM loom_task WHERE task_id=?1", [task_id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    /// Age an open lease so the takeover rule, not the wall clock, decides.
+    fn expire_lease(database: &Database, claim_id: &str) {
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE claim_id=?1",
+                [claim_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn release_moves_a_draft_task_to_ready_and_a_second_release_is_rejected() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM release");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "DRAFT",
+            "assertion imported_task_starts_as_draft"
+        );
+
+        let released = task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        assert_eq!(
+            released.mission_id, mission_id,
+            "assertion release_result_echoes_mission_id"
+        );
+        assert_eq!(
+            released.task.task_id, "task_a",
+            "assertion release_result_names_the_released_task"
+        );
+        assert_eq!(
+            released.task.status,
+            LoomTaskStatus::Ready,
+            "assertion released_task_reads_back_ready"
+        );
+        assert_eq!(
+            released.task.revision, 2,
+            "assertion release_bumps_the_task_revision"
+        );
+        assert_eq!(
+            task_status(&database, "task_b"),
+            "DRAFT",
+            "assertion release_leaves_the_other_task_alone"
+        );
+
+        let error = task_release(&mut database, release_input(&mission_id, "task_a")).unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_TASK_NOT_DRAFT,
+            "assertion second_release_of_the_same_task_is_rejected"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion rejected_release_keeps_the_task_ready"
+        );
+    }
+
+    #[test]
+    fn release_rejects_a_task_outside_the_mission_plan() {
+        let mut database = fixture();
+        let first_mission = create_mission(&mut database, "LOOM release owner");
+        let second_mission = create_mission(&mut database, "LOOM release stranger");
+        plan_import(&mut database, plan_input(&first_mission)).unwrap();
+        let mut stranger_plan = plan_input(&second_mission);
+        stranger_plan.tasks = vec![task("task_c", "Task C")];
+        stranger_plan.dependencies = vec![];
+        plan_import(&mut database, stranger_plan).unwrap();
+
+        let error =
+            task_release(&mut database, release_input(&second_mission, "task_a")).unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_TASK_NOT_FOUND,
+            "assertion release_rejects_a_task_of_another_missions_plan"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "DRAFT",
+            "assertion foreign_mission_release_changes_nothing"
+        );
+
+        let unplanned = create_mission(&mut database, "LOOM release unplanned");
+        let error = task_release(&mut database, release_input(&unplanned, "task_a")).unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_PLAN_NOT_FOUND,
+            "assertion release_rejects_a_mission_without_a_plan"
+        );
+        let error = task_release(&mut database, release_input("mission_missing", "task_a"))
+            .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_MISSION_NOT_FOUND,
+            "assertion release_rejects_an_unknown_mission"
+        );
+    }
+
+    #[test]
+    fn second_acquire_of_a_ready_task_is_rejected_as_claim_held() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim held");
+        let plan_id = plan_import(&mut database, plan_input(&mission_id))
+            .unwrap()
+            .plan_id;
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let first = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        assert_eq!(
+            first.fence_generation, 1,
+            "assertion first_claim_starts_at_fence_one"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion acquire_keeps_the_task_ready"
+        );
+
+        let error = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_HELD,
+            "assertion second_run_cannot_hold_a_leased_task"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion rejected_acquire_writes_no_claim"
+        );
+
+        // The uniqueness is a database guard, not only the Rust pre-check: a direct write
+        // of a second open claim has to be refused by the partial unique index.
+        let raw = database.connection().execute(
+            "INSERT INTO loom_claim(claim_id,plan_id,task_id,agent_run_id,claimant_agent_id,
+                                   command_id,lease_expires_at,fence_generation,claimed_at)
+             VALUES('claim_direct',?1,'task_a','run_three','agent_1','command_three',
+                    '2999-01-01T00:00:00+00:00',2,'2999-01-01T00:00:00+00:00')",
+            [&plan_id],
+        );
+        assert!(
+            raw.is_err(),
+            "assertion open_lease_is_enforced_by_a_partial_unique_index"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion rejected_direct_insert_writes_no_claim"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion exactly_one_run_holds_the_task"
+        );
+    }
+
+    #[test]
+    fn replayed_command_id_returns_the_original_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim replay");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_b")).unwrap();
+
+        let first = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let replay = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        assert_eq!(
+            replay.claim_id, first.claim_id,
+            "assertion replay_returns_the_original_claim_id"
+        );
+        assert!(
+            replay.replayed,
+            "assertion replay_reports_that_it_replayed"
+        );
+        assert_eq!(
+            replay.fence_generation, first.fence_generation,
+            "assertion replay_does_not_advance_the_fence"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion replay_writes_no_second_claim"
+        );
+
+        let reused = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_b", "run_one", "command_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&reused),
+            LOOM_CLAIM_COMMAND_REUSED,
+            "assertion a_command_id_cannot_be_reused_for_another_task"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion reused_command_writes_no_claim"
+        );
+    }
+
+    #[test]
+    fn expired_lease_is_taken_over_with_a_higher_fence() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim takeover");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let first = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        expire_lease(&database, &first.claim_id);
+
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation, 2,
+            "assertion takeover_advances_the_fence"
+        );
+        assert_ne!(
+            takeover.claim_id, first.claim_id,
+            "assertion takeover_binds_a_new_claim_row"
+        );
+        assert_eq!(
+            takeover.agent_run_id, "run_two",
+            "assertion takeover_binds_the_new_run"
+        );
+        let released: Option<String> = database
+            .connection()
+            .query_row(
+                "SELECT released_at FROM loom_claim WHERE claim_id=?1",
+                [&first.claim_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            released.is_some(),
+            "assertion takeover_releases_the_expired_claim"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion takeover_leaves_one_open_claim"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            2,
+            "assertion takeover_keeps_the_released_claim_as_history"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion takeover_keeps_the_task_ready"
+        );
+    }
+
+    #[test]
+    fn acquire_rejects_a_task_whose_dependency_is_unreleased() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim dependency");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_b")).unwrap();
+
+        let error = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_b", "run_one", "command_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_DEPENDENCY_UNRELEASED,
+            "assertion downstream_task_cannot_be_claimed_before_its_edge_releases"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            0,
+            "assertion blocked_acquire_writes_no_claim"
+        );
+
+        // The release rule reads the upstream Task state, not a caller assertion.
+        database
+            .connection()
+            .execute("UPDATE loom_task SET status='DONE' WHERE task_id='task_a'", [])
+            .unwrap();
+        let acquired = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_b", "run_one", "command_one"),
+        )
+        .unwrap();
+        assert_eq!(
+            acquired.task_id, "task_b",
+            "assertion released_edge_admits_the_downstream_claim"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion released_edge_writes_exactly_one_claim"
+        );
+    }
+
+    #[test]
+    fn acquire_rejects_a_task_that_was_never_released() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim not ready");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+
+        let error = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_TASK_NOT_READY,
+            "assertion draft_task_cannot_be_claimed"
+        );
+        let error = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_missing", "run_one", "command_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_TASK_NOT_FOUND,
+            "assertion unknown_task_cannot_be_claimed"
+        );
+        let error = claim_acquire(
+            &mut database,
+            claim_input("mission_missing", "task_a", "run_one", "command_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_MISSION_NOT_FOUND,
+            "assertion unknown_mission_cannot_be_claimed"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            0,
+            "assertion rejected_acquires_write_no_claims"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "DRAFT",
+            "assertion rejected_acquires_leave_the_task_state_alone"
+        );
+    }
+
+    #[test]
+    fn failed_claim_insert_rolls_back_the_whole_takeover() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim rollback");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let first = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        expire_lease(&database, &first.claim_id);
+        database
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_claim_insert BEFORE INSERT ON loom_claim
+                 BEGIN SELECT RAISE(ABORT, 'loom claim insert rejected'); END;",
+            )
+            .unwrap();
+
+        let error = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("loom claim insert rejected"),
+            "unexpected claim failure: {error:#}"
+        );
+        database
+            .connection()
+            .execute_batch("DROP TRIGGER reject_claim_insert")
+            .unwrap();
+
+        let released: Option<String> = database
+            .connection()
+            .query_row(
+                "SELECT released_at FROM loom_claim WHERE claim_id=?1",
+                [&first.claim_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            released.is_none(),
+            "assertion failed_insert_does_not_release_the_expired_claim"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion failed_insert_leaves_no_orphan_claim"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion failed_insert_keeps_the_single_open_claim"
+        );
+
+        // The same command then commits as one unit once the fault is gone.
+        let retried = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            retried.fence_generation, 2,
+            "assertion retry_after_the_rolled_back_failure_advances_the_fence"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            2,
+            "assertion retry_writes_the_takeover_claim"
         );
     }
 }

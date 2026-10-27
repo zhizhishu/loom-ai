@@ -598,6 +598,15 @@ fn request_error_body(error: &anyhow::Error) -> ErrorBody {
             details: json!({}),
         };
     }
+    if let Some(error) = error.downcast_ref::<rovai_core::loom::LoomCommandError>() {
+        return ErrorBody {
+            kind: "domain_rejection",
+            code: error.code().to_string(),
+            message: error.message().to_string(),
+            retryable: false,
+            details: json!({}),
+        };
+    }
     if let Some(error) = error.downcast_ref::<CommandGatewayError>() {
         let code = match error {
             CommandGatewayError::InvalidEnvelope(_) => "COMMAND_ENVELOPE_INVALID",
@@ -9514,6 +9523,23 @@ impl Core {
                     serde_json::from_value(request.params.clone())?;
                 let mut database = self.database.lock().await;
                 let result = rovai_core::loom::plan_import(&mut database, input)?;
+                Ok(serde_json::to_value(result)?)
+            }
+            // Release and claim are the two LOOM write paths that move a Task out of DRAFT
+            // and bind it to one AgentRun; both hold the database lock for the whole
+            // transaction, because each checks the state it then writes.
+            "loom.task.release" => {
+                let input: rovai_core::loom::LoomTaskReleaseInput =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let result = rovai_core::loom::task_release(&mut database, input)?;
+                Ok(serde_json::to_value(result)?)
+            }
+            "loom.claim.acquire" => {
+                let input: rovai_core::loom::LoomClaimAcquireInput =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let result = rovai_core::loom::claim_acquire(&mut database, input)?;
                 Ok(serde_json::to_value(result)?)
             }
             "loom.plan.get" | "loom.tasks.list" | "loom.dependencies.list" => {
