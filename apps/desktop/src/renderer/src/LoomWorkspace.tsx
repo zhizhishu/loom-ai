@@ -26,7 +26,10 @@ function LoomFlow({ tasks, dependencies, agents }: {
   // 尚无 Candidate/Review 读取路径，传空集合：artifact_accepted 边因此保持未释放，
   // 不会被"上游 done"误判为已验收。
   const graph = { tasks, dependencies, candidates: [], reviews: [], evaluatedAt: new Date(0).toISOString() }
-  const readyTasks = tasks.filter(task => loomTaskReady(task.taskId, graph).ready)
+  // 「可执行」= 依赖已释放 且 任务本身处于可领取状态；done/canceled/draft 不算可执行。
+  const claimable = (task: LoomTask): boolean =>
+    (task.status === 'ready' || task.status === 'in_review') && loomTaskReady(task.taskId, graph).ready
+  const readyTasks = tasks.filter(claimable)
   const blockedTasks = tasks.filter(task => task.status === 'blocked')
   
   return <div className="loom-flow">
@@ -42,7 +45,7 @@ function LoomFlow({ tasks, dependencies, agents }: {
     <div className="loom-flow-graph">
       {tasks.map(task => {
         const upstreams = dependencies.filter(d => d.downstreamTaskId === task.taskId)
-        const ready = loomTaskReady(task.taskId, graph).ready
+        const ready = claimable(task)
         const assignee = agents.find(a => a.agentId === task.assigneeAgentId)
         
         return <div key={task.taskId} className={`loom-flow-node ${ready ? 'ready' : ''} ${task.status}`}>
