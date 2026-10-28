@@ -116,7 +116,7 @@ app.whenReady().then(async () => {
     return area.value
   })()`)
   const writeLog = () => script('window.loomQA.writes')
-  // 写后回读的精确预算：六个读方法各「挂载 1 次 + 写后刷新 1 次」，多一次少一次都 FAIL。
+  // 写后回读的精确预算：七个读方法各「挂载 1 次 + 写后刷新 1 次」，多一次少一次都 FAIL。
   // activity / delivery 沿用本文件既有计数规则（恒为 1）。任务能力快照不在这里验：各写用例都先
   // resetLoom() 再重挂载，而能力快照只在首屏挂载那条路径上读，故 preferences.tasks.get 只在
   // 首屏 / 回切 / 截图后三处断言，写用例里不断言它。
@@ -130,7 +130,8 @@ app.whenReady().then(async () => {
       dependencies: window.loomQA.countOf('loom.dependencies.list'),
       candidates: window.loomQA.countOf('loom.candidates.list'),
       reviews: window.loomQA.countOf('loom.reviews.list'),
-      verifications: window.loomQA.countOf('loom.verifications.list')
+      verifications: window.loomQA.countOf('loom.verifications.list'),
+      claims: window.loomQA.countOf('loom.claims.list')
     })`)
     assert.equal(counts.activity, 1, `${label} repeated the activity read: ${JSON.stringify(counts)}`)
     assert.equal(counts.delivery, 1, `${label} repeated the delivery read: ${JSON.stringify(counts)}`)
@@ -138,6 +139,10 @@ app.whenReady().then(async () => {
       assert.equal(counts[method], 2,
         `${label} must re-read ${method} exactly once after the write (1 mount + 1 refresh): ${JSON.stringify(counts)}`)
     }
+    // 第七个投影：写后刷新里删掉 loom.claims.list 的请求，认领区会停在旧租约上而其他六个投影照样新鲜，
+    // 所以它必须同样精确计数（挂载 1 + 写后 1），不许只靠「至少读过一次」。
+    assert.equal(counts.claims, 2,
+      `${label} must re-read the seventh projection (loom.claims.list) exactly once after the write (1 mount + 1 refresh): ${JSON.stringify(counts)}`)
     return counts
   }
   // 回读不能只是夹具内存变了：切到「编排」tab 看任务节点是否真的被推进，再切回「交付」看徽章。
@@ -975,8 +980,10 @@ app.whenReady().then(async () => {
   const anonymousNode = claimOf(anonymousClaims, '实现快照保存')
   assert.equal(anonymousNode.status, '已认领', `A run-only claim is still held: ${JSON.stringify(anonymousNode)}`)
   assert.match(anonymousNode.owner, /^认领者：/u, `The owner line lost its 认领者 prefix: ${JSON.stringify(anonymousNode.owner)}`)
-  assert(anonymousNode.owner.includes('run-7f7f7f7f'),
-    `claimantAgentId 为空时必须回退到 agentRunId 原值: ${JSON.stringify(anonymousNode.owner)}`)
+  // 右侧本来就完整显示 Run ID，所以「整条含 run-7f7f7f7f」证明不了回退：名字必须精确落在 · 左侧。
+  assert.equal(anonymousNode.owner.split(' · ')[0], '认领者：run-7f7f7f7f',
+    `claimantAgentId 为空时 · 左侧（含前缀）必须回退成 agentRunId 原值，而不是别的名字: ${JSON.stringify(anonymousNode.owner)}`)
+  expectRunToken(anonymousNode.owner, 'run-7f7f7f7f', 'Run-only claim')
   assert.equal(anonymousNode.owner.includes('null'), false,
     `An empty claimantAgentId must not leak a literal null: ${JSON.stringify(anonymousNode.owner)}`)
   assert.equal(anonymousNode.owner.includes('undefined'), false,
@@ -990,10 +997,20 @@ app.whenReady().then(async () => {
   await openClaimsCase('held', { fail: true }, 'the failing claims read')
   await waitFor("(document.querySelector('.loom-plan')?.innerText ?? '').includes('认领状态未知')",
     'A failing loom.claims.list did not surface 认领状态未知 in the 编排 section')
-  const unknownClaims = await claimNodes()
-  assert.equal(unknownClaims.some(node => ['held', 'expired', 'released'].includes(node.state ?? '')), false,
-    `A failed claims read still claimed a lease state: ${JSON.stringify(unknownClaims)}`)
-  assert.equal(unknownClaims.some(node => node.ownerRendered || node.leaseRendered || node.fenceRendered), false,
+  // 未知态必须落在四个节点上，且不许冒充任何一种已知态——data-claim-state 一个都不能有
+  // （含 none：「读不到」和「没人认领」是两件事）。
+  const unknownClaims = await waitClaims(
+    nodes => nodes.every(node => node.rendered && node.state === null && node.status === '认领状态未知'),
+    'A failing loom.claims.list did not put all four flow nodes into 认领状态未知')
+  assert.equal(unknownClaims.length, 4,
+    `A failed claims read must keep all four flow nodes: ${JSON.stringify(unknownClaims.map(node => node.title))}`)
+  assert.deepEqual(unknownClaims.filter(node => !node.rendered).map(node => node.title), [],
+    `every flow node must still render .loom-flow-claim when the claims read fails: ${JSON.stringify(unknownClaims)}`)
+  assert.deepEqual(unknownClaims.filter(node => node.state !== null).map(node => [node.title, node.state]), [],
+    `A failed claims read still stamped a data-claim-state on a node: ${JSON.stringify(unknownClaims.map(node => [node.title, node.state]))}`)
+  assert.deepEqual(unknownClaims.map(node => node.status), ['认领状态未知', '认领状态未知', '认领状态未知', '认领状态未知'],
+    `all four nodes must read 认领状态未知, not just one of them: ${JSON.stringify(unknownClaims.map(node => node.status))}`)
+  assert.deepEqual(unknownClaims.filter(node => node.ownerRendered || node.leaseRendered || node.fenceRendered).map(node => node.title), [],
     `A failed claims read still rendered owner, lease or fence copy: ${JSON.stringify(unknownClaims)}`)
   const failedPlan = await script(`({
     nodeCount: document.querySelectorAll('.loom-plan .loom-flow-node').length,

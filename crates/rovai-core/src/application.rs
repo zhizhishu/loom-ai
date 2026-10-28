@@ -9556,6 +9556,16 @@ impl Core {
             // dependency release freeze all happen inside one transaction.
             // Verification record is the evidence axis: a passing check flips the candidate
             // to VERIFIED and releases artifact edges once the Owner has also accepted it.
+            "loom.artifact.register" => {
+                // The creator identity is injected from the trusted Host; the digest is computed
+                // here from the bytes on disk, so a payload can never nominate its own evidence.
+                let input: rovai_core::loom::LoomArtifactRegisterInput =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let result =
+                    rovai_core::loom::artifact_register(&mut database, CURRENT_USER_ID, input)?;
+                Ok(serde_json::to_value(result)?)
+            }
             "loom.verification.record" => {
                 let mut input: rovai_core::loom::LoomVerificationRecordInput =
                     serde_json::from_value(request.params.clone())?;
