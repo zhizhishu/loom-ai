@@ -1952,14 +1952,26 @@ fn freeze_released_dependencies(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The evaluator in the TS contract releases an artifact edge only for a candidate that is
+    // both verified and accepted. Freezing it before verification would make storage claim a
+    // release the wire still reports as blocked, so this waits for the verification slice.
+    let verified: bool = transaction.query_row(
+        "SELECT verification_status='VERIFIED' FROM loom_candidate WHERE candidate_id=?1",
+        [candidate_id],
+        |row| row.get(0),
+    )?;
     let mut released = Vec::new();
     for (dependency_id, condition) in pending {
         // A TASK_DONE edge is released by the completion itself; an ARTIFACT_ACCEPTED edge
         // keeps the candidate and the review that justified it.
-        let trace = if condition == LoomDependencyCondition::TaskDone.as_str() {
-            (None::<&str>, None::<&str>)
-        } else {
+        let artifact = condition != LoomDependencyCondition::TaskDone.as_str();
+        if artifact && !verified {
+            continue;
+        }
+        let trace = if artifact {
             (Some(candidate_id), Some(review_id))
+        } else {
+            (None::<&str>, None::<&str>)
         };
         transaction.execute(
             "UPDATE loom_dependency

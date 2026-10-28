@@ -199,6 +199,23 @@ fn review_sql() -> String {
         CREATE TRIGGER loom_review_immutable
             BEFORE UPDATE ON {REVIEW_TABLE}
             BEGIN SELECT RAISE(ABORT, 'a recorded LOOM review is immutable'); END;
+        -- INSERT OR REPLACE would delete and re-insert, slipping past a BEFORE UPDATE guard,
+        -- so a second row claiming the same identity is refused outright.
+        CREATE TRIGGER loom_review_no_replace
+            BEFORE INSERT ON {REVIEW_TABLE}
+            WHEN EXISTS(
+                SELECT 1 FROM {REVIEW_TABLE}
+                WHERE review_id=NEW.review_id
+                   OR candidate_id=NEW.candidate_id
+                   OR command_id=NEW.command_id
+            )
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM review is immutable'); END;
+        -- A direct DELETE is refused while the candidate still exists; only the aggregate
+        -- cascade, where the candidate is already gone, may remove the verdict.
+        CREATE TRIGGER loom_review_no_direct_delete
+            BEFORE DELETE ON {REVIEW_TABLE}
+            WHEN EXISTS(SELECT 1 FROM {CANDIDATE_TABLE} WHERE candidate_id=OLD.candidate_id)
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM review is immutable'); END;
         "#
     )
 }
@@ -214,10 +231,10 @@ fn review_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
         [REVIEW_TABLE],
         |row| row.get(0),
     )?;
-    let immutable_trigger: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger'
-             AND name='loom_review_immutable' AND tbl_name=?1
-             AND sql LIKE '%BEFORE UPDATE%')",
+    let immutable_triggers: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1
+             AND name IN ('loom_review_immutable','loom_review_no_replace',
+                          'loom_review_no_direct_delete')",
         [REVIEW_TABLE],
         |row| row.get(0),
     )?;
@@ -229,7 +246,7 @@ fn review_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
             && sql.contains("REFERENCESloom_candidate(candidate_id)")
             && sql.contains("REFERENCESloom_task(plan_id,task_id)")
     });
-    Ok(columns == 11 && immutable_trigger && declared)
+    Ok(columns == 11 && immutable_triggers == 3 && declared)
 }
 
 /// The claim projection is part of the LOOM schema from migration 220 on; earlier
