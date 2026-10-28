@@ -282,6 +282,7 @@ pub(super) fn schema_matches(
     let claim_recorded = projection_schema_version < 170 || claim_schema_matches(connection)?;
     let candidate_recorded =
         projection_schema_version < 171 || candidate_schema_matches(connection)?;
+    let review_recorded = projection_schema_version < 172 || review_schema_matches(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -307,7 +308,8 @@ pub(super) fn schema_matches(
             ],
         )?
         && claim_recorded
-        && candidate_recorded)
+        && candidate_recorded
+        && review_recorded)
 }
 
 /// Migration 219 hangs the acceptance criteria version on the Plan; Tasks inherit it.
