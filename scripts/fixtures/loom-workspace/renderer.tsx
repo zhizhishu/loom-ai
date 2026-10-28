@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt } from '@contracts'
+import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt, LoomClaim, LoomClaimsListResult } from '@contracts'
 import { LoomWorkspace } from '../../../apps/desktop/src/renderer/src/LoomWorkspace'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { applyAppearanceSnapshot } from '../../../apps/desktop/src/renderer/src/theme'
@@ -27,6 +27,8 @@ type LoomState = {
   reviews: LoomReview[]
   verifications: LoomVerification[]
 }
+// 认领回读的六种回包形态：空 / held / 同任务多代次 / 租约过期 / 已释放 / 认领者为空。
+type LoomClaimsScenario = 'empty' | 'held' | 'multiGeneration' | 'expired' | 'released' | 'anonymous'
 type LoomQa = {
   calls: LoomCall[]
   writes: LoomWrite[]
@@ -36,6 +38,7 @@ type LoomQa = {
   state(): LoomState
   reset(): void
   setTheme(theme: 'day' | 'night'): void
+  setClaims(scenario: LoomClaimsScenario, options?: { fail?: boolean }): void
 }
 declare global { interface Window { loomQA: LoomQa } }
 
@@ -139,6 +142,57 @@ const reviews: LoomReview[] = [
 const verifications: LoomVerification[] = [
   { verificationId: 'verification-1', candidateId: 'candidate-1', method: 'manual', executorId: 'local_user', result: 'passed', evidenceIds: ['evidence-1'], verifiedAt: createdAt }
 ]
+
+// 认领回读：loom.claims.list 的回包由用例切换。时刻一律固定成字符串——evaluatedAt 是服务端
+// 判定过期用的那一个瞬间，租约时间同理；任何一处用 Date.now() 都会让「已过期 / 未过期」
+// 随运行时刻翻面，同一份夹具就不再有确定结论。
+const claimsEvaluatedAt = '2026-09-27T10:00:00.000Z'
+const claimClaimedAt = '2026-09-27T09:50:00.000Z'
+const claimLeaseOpen = '2026-09-27T10:05:00.000Z'
+const claimLeaseLapsed = '2026-09-27T09:55:00.000Z'
+const claimReleasedAt = '2026-09-27T09:58:00.000Z'
+
+function makeClaim(claim: Pick<LoomClaim, 'claimId' | 'taskId' | 'agentRunId'> & Partial<LoomClaim>): LoomClaim {
+  return {
+    claimId: claim.claimId,
+    taskId: claim.taskId,
+    agentRunId: claim.agentRunId,
+    claimantAgentId: claim.claimantAgentId ?? null,
+    fenceGeneration: claim.fenceGeneration ?? 1,
+    claimedAt: claim.claimedAt ?? claimClaimedAt,
+    leaseExpiresAt: claim.leaseExpiresAt ?? claimLeaseOpen,
+    releasedAt: claim.releasedAt ?? null,
+    expired: claim.expired ?? false
+  }
+}
+
+const claimsByScenario: Readonly<Record<LoomClaimsScenario, LoomClaim[]>> = {
+  // a. 空列表：没有认领时 Core 回空数组，UI 必须落到 none，而不是留一块空壳。
+  empty: [],
+  // b. 单条 held：task-2 被临舟的 run 占着，租约在未来、fence 第 1 代。
+  held: [makeClaim({ claimId: 'claim-task-2-fence-1', taskId: 'task-2', agentRunId: 'run-8f3a2c11', claimantAgentId: 'agent-build', fenceGeneration: 1 })],
+  // c. 同一任务多代次：fence 1 已释放、fence 2 held，节点只能显示最高的 fence 2。
+  multiGeneration: [
+    makeClaim({ claimId: 'claim-task-3-fence-1', taskId: 'task-3', agentRunId: 'run-0d1e2f33', claimantAgentId: 'agent-lead', fenceGeneration: 1, releasedAt: claimReleasedAt }),
+    makeClaim({ claimId: 'claim-task-3-fence-2', taskId: 'task-3', agentRunId: 'run-9c8d7e66', claimantAgentId: 'agent-build', fenceGeneration: 2 })
+  ],
+  // d. 租约过期：releasedAt 仍为空，expired 由服务端判定为 true。
+  expired: [makeClaim({ claimId: 'claim-task-4-fence-1', taskId: 'task-4', agentRunId: 'run-4a4a4a44', claimantAgentId: 'agent-lead', leaseExpiresAt: claimLeaseLapsed, expired: true })],
+  // e. 已释放（且刻意让 expired 也为 true）：释放是结论，过期只是没续上，UI 必须先认释放。
+  released: [makeClaim({ claimId: 'claim-task-1-fence-1', taskId: 'task-1', agentRunId: 'run-2b2b2b22', claimantAgentId: 'agent-build', releasedAt: claimReleasedAt, expired: true })],
+  // f. claimantAgentId 为 null：没有绑定 Agent 的认领只能回退到 agentRunId 原值。
+  anonymous: [makeClaim({ claimId: 'claim-task-2-fence-1', taskId: 'task-2', agentRunId: 'run-7f7f7f7f', claimantAgentId: null })]
+}
+
+let claimsScenario: LoomClaimsScenario = 'empty'
+// 读失败开关：打开后 loom.claims.list 直接抛错。抛错不等于「夹具没应答这个方法」，所以
+// 不进 errors；UI 必须落到「认领状态未知」，不许自己猜一个 none 或一个 held。
+let claimsReadFails = false
+
+function readClaims(): LoomClaimsListResult {
+  if (claimsReadFails) throw new Error('LOOM fixture forced the claims projection read to fail')
+  return { evaluatedAt: claimsEvaluatedAt, claims: structuredClone(claimsByScenario[claimsScenario]) }
+}
 
 const delivery: MissionDelivery = {
   threadId: mission.threadId, workingDirectory: '/workspace/rovai-ai-mission-018', git: true,
@@ -286,6 +340,9 @@ async function request<T>(method: string, params: unknown = {}): Promise<T> {
     const receipt = recordLoomVerification(params as LoomVerificationRecordInput)
     writes.push({ method, params: params as Record<string, unknown>, receipt })
     reply = receipt
+  } else if (method === 'loom.claims.list') {
+    // 认领投影按场景生成；读失败开关在这里抛错，让 UI 走「认领状态未知」分支。
+    reply = readClaims()
   } else if (method === 'missions.diffSession.release') {
     // 写成功后的收尾副作用：只应答，不进 writes，也不参与 loom 写方法统计。
     reply = { released: true }
@@ -344,11 +401,20 @@ window.loomQA = {
     restoreBaseline(candidates, baseline.candidates)
     restoreBaseline(reviews, baseline.reviews)
     restoreBaseline(verifications, baseline.verifications)
+    // 认领回读也回初始态：空列表、读成功，下一条用例自己切形态。
+    claimsScenario = 'empty'
+    claimsReadFails = false
     calls.length = 0
     writes.length = 0
     remountWorkspace()
   },
-  setTheme
+  setTheme,
+  // 切回包后重挂载：无论生产侧是「挂载时读」「进编排时读」还是「写后重读」，都会拿到新回包。
+  setClaims: (scenario, options) => {
+    claimsScenario = scenario
+    claimsReadFails = options?.fail === true
+    remountWorkspace()
+  }
 }
 
 createRoot(document.getElementById('root')!).render(<LoomFixture />)

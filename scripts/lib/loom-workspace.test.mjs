@@ -10,7 +10,7 @@ import electron from 'electron'
 import { build } from 'vite'
 import { admitElectronIntegrationTest } from './electron-sandbox-capability.mjs'
 
-const EXPECTED_CASES = 12
+const EXPECTED_CASES = 19
 
 test('production LOOM workspace keeps visited sections mounted and reports honest states', { timeout: 150_000 }, async t => {
   if (!admitElectronIntegrationTest(t)) return

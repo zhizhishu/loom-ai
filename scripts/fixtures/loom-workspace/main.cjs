@@ -173,6 +173,72 @@ app.whenReady().then(async () => {
     await expectPressed(2, `Delivery did not reopen after checking ${label}`)
     await waitFor(`!!(${cardFor(TARGET_CANDIDATE)})`, `The target candidate card is missing after checking ${label}`)
   }
+  // 认领回读：编排节点里的认领块是 loom.claims.list 的唯一呈现，所以断言直接读 DOM，
+  // 不读夹具内存（读内存只能证明夹具自说自话）。文案统一折成单行，换行不该影响断言。
+  const claimNodes = () => script(`(() => {
+    const line = value => value === null || value === undefined ? null : value.replace(/\\s+/gu, ' ').trim()
+    return [...document.querySelectorAll('.loom-plan .loom-flow-node')].map(node => {
+      const block = node.querySelector('.loom-flow-claim') ?? null
+      const owner = block === null ? null : block.querySelector('.loom-flow-claim-owner')
+      const lease = block === null ? null : block.querySelector('.loom-flow-claim-lease')
+      const fence = block === null ? null : block.querySelector('.loom-flow-claim-fence')
+      return {
+        title: line(node.querySelector('.loom-flow-node-title')?.innerText ?? null),
+        rendered: block !== null,
+        state: block?.getAttribute('data-claim-state') ?? null,
+        status: block === null ? null : line(block.querySelector('.loom-flow-claim-status')?.innerText ?? null),
+        owner: owner === null ? null : line(owner.innerText),
+        ownerRendered: owner !== null,
+        leaseDatetime: lease?.getAttribute('datetime') ?? null,
+        leaseCopy: lease === null ? null : line(lease.innerText),
+        leaseRendered: lease !== null,
+        fence: fence === null ? null : line(fence.innerText),
+        fenceRendered: fence !== null
+      }
+    })
+  })()`)
+
+  // 认领是一次独立请求，可能比任务节点晚落地：断言等状态，不读一次就下结论。
+  const waitClaims = async (predicate, message) => {
+    const deadline = Date.now() + 8000
+    let seen = []
+    while (Date.now() < deadline) {
+      seen = await claimNodes()
+      if (seen.length === 4 && predicate(seen)) return seen
+      await sleep(30)
+    }
+    throw new Error(`${message}: ${JSON.stringify(seen)}`)
+  }
+  const claimOf = (nodes, title) => nodes.find(node => node.title === title) ?? null
+  // 切回包 → 重挂载 → 开编排：挂载时读 / 进编排时读 / 写后重读，三种生产实现都会拿到新回包。
+  const switchClaims = async (scenario, options = {}) => {
+    await script("(() => { const node = document.querySelector('.loom-workspace'); if (node) node.__loomReset = 'stale'; return true })()")
+    await script(`window.loomQA.setClaims(${JSON.stringify(scenario)}, ${JSON.stringify(options)})`)
+    await waitFor("document.querySelector('.loom-workspace') !== null && document.querySelector('.loom-workspace').__loomReset === undefined",
+      `LOOM workspace did not remount to read the ${scenario} claims projection`)
+  }
+  const openClaimsCase = async (scenario, options, label) => {
+    await resetLoom()
+    await switchClaims(scenario, options)
+    await openPlanTab(label)
+  }
+  // 认领块会改变节点高度，但不能改变图区宽度预算：1440 下仍然不许横向溢出。
+  const expectPlanWidths = async label => {
+    const widths = await script(`({
+      scrollWidth: document.querySelector('.loom-plan .loom-flow-graph')?.scrollWidth ?? -1,
+      clientWidth: document.querySelector('.loom-plan .loom-flow-graph')?.clientWidth ?? -1
+    })`)
+    assert(widths.scrollWidth >= 0 && widths.scrollWidth <= widths.clientWidth + 1,
+      `Plan flow graph overflowed its 1440px lane budget with ${label}: ${JSON.stringify(widths)}`)
+    return widths
+  }
+  // owner 里的 Run 是短 ID：不预设截断方向，只要求它是真实 agentRunId 的一段。
+  const expectRunToken = (owner, fullRunId, label) => {
+    assert.match(owner, /^认领者：.+ · \S+$/u, `${label} claim owner lost the 名 · Run shape: ${JSON.stringify(owner)}`)
+    const token = owner.slice(owner.lastIndexOf(' · ') + 3)
+    assert(token.length >= 4 && fullRunId.includes(token),
+      `${label} claim owner did not name the real run: ${JSON.stringify(owner)} for ${fullRunId}`)
+  }
   // 逐条结论按 criterionId 绑定：只认渲染出来的「cN · 满足 / 未满足」两行。
   const criterionVerdicts = reviewText => reviewText.split('\n').map(line => line.trim())
     .filter(line => / · (未)?满足$/.test(line))
@@ -294,9 +360,9 @@ app.whenReady().then(async () => {
   assert(plan.firstTitle?.includes('设计恢复协议'), `Plan flow lost its first task title: ${JSON.stringify(plan.firstTitle)}`)
   assert(plan.blockedCopy.includes('等待恢复逻辑完成'), `Plan flow lost the real blocked reason: ${JSON.stringify(plan.blockedCopy)}`)
   assert(plan.stats.includes('总任务: 4'), `Plan flow stats no longer count the real tasks: ${JSON.stringify(plan.stats)}`)
-  // 可执行 = 依赖已释放且任务处于可领取状态：基线里只有 task-3 可领取（in_review 仍算可领取），
+  // 依赖就绪 = 依赖已释放且任务处于可领取状态：基线里只有 task-3 可领取（in_review 仍算可领取），
   // 阻塞只数 blocked，所以两个计数不随 ready→in_review 的修正变化。
-  assert(plan.stats.includes('可执行: 1'), `Plan flow stats lost the one claimable task: ${JSON.stringify(plan.stats)}`)
+  assert(plan.stats.includes('依赖就绪: 1'), `Plan flow stats lost the one dependency-ready task: ${JSON.stringify(plan.stats)}`)
   assert(plan.stats.includes('阻塞: 1'), `Plan flow stats lost the one blocked task: ${JSON.stringify(plan.stats)}`)
   // 节点文案必须是指挥层真实状态机：task-3 的候选已提交，所以是「评审中」而不是「就绪」。
   assert.equal(plan.statusCopies.filter(copy => copy === '评审中').length, 1,
@@ -820,6 +886,133 @@ app.whenReady().then(async () => {
   cases.push('核验失败 writes exactly one loom.verification.record from its own initial state, reads the failed badge back and keeps the acceptance axis pending with its buttons')
 
   assert.deepEqual(await script('window.loomQA.errors'), [], 'The delivery write cases requested a method the fixture did not answer')
+
+  stage = 'claim projection: empty list'
+  await openClaimsCase('empty', {}, 'the empty claims projection')
+  const emptyClaims = await waitClaims(nodes => nodes.every(node => node.state === 'none'),
+    'An empty loom.claims.list did not fall back to unclaimed nodes')
+  assert.equal(emptyClaims.every(node => node.rendered), true,
+    `Every flow node must render its claim block even when nothing is claimed: ${JSON.stringify(emptyClaims)}`)
+  assert.equal(emptyClaims.filter(node => node.status === '未认领').length, 4,
+    `An empty loom.claims.list must show 未认领 on all four nodes: ${JSON.stringify(emptyClaims.map(node => node.status))}`)
+  assert.deepEqual(emptyClaims.filter(node => node.ownerRendered || node.leaseRendered || node.fenceRendered).map(node => node.title), [],
+    `An unclaimed node rendered an owner, lease or fence line: ${JSON.stringify(emptyClaims)}`)
+  assert.ok(await script("window.loomQA.countOf('loom.claims.list')") >= 1, '编排 never asked for the claims projection')
+  await expectPlanWidths('an empty claim list')
+  cases.push('编排 renders 未认领 on every node from an empty loom.claims.list with no owner, lease or fence line, and the flow graph still fits 1440 without horizontal overflow')
+
+  stage = 'claim projection: held lease'
+  await openClaimsCase('held', {}, 'the held claim')
+  const heldClaims = await waitClaims(nodes => claimOf(nodes, '实现快照保存')?.state === 'held',
+    'A held claim never reached its flow node')
+  const heldNode = claimOf(heldClaims, '实现快照保存')
+  assert.equal(heldNode.status, '已认领', `A held lease must read 已认领: ${JSON.stringify(heldNode)}`)
+  assert(heldNode.owner.includes('认领者：') && heldNode.owner.includes('临舟'),
+    `A held lease must name its claimant agent: ${JSON.stringify(heldNode.owner)}`)
+  expectRunToken(heldNode.owner, 'run-8f3a2c11', 'Held')
+  assert.equal(heldNode.fence, 'fence 第1代', `A held lease must show its fence generation: ${JSON.stringify(heldNode.fence)}`)
+  assert.equal(heldNode.leaseDatetime, '2026-09-27T10:05:00.000Z',
+    `The lease line must carry the real leaseExpiresAt in datetime: ${JSON.stringify(heldNode.leaseDatetime)}`)
+  assert(heldNode.leaseCopy.startsWith('到期：') && heldNode.leaseCopy.replace('到期：', '').trim() !== '',
+    `The lease line lost its human readable expiry: ${JSON.stringify(heldNode.leaseCopy)}`)
+  assert.deepEqual(heldClaims.filter(node => node.state === 'none').map(node => node.title).sort(),
+    ['实现恢复逻辑', '验收测试', '设计恢复协议'].sort(),
+    `Only the claimed task may leave 未认领: ${JSON.stringify(heldClaims.map(node => [node.title, node.state]))}`)
+  await expectPlanWidths('a held lease')
+  cases.push('一个 held 租约在编排节点里显示已认领、认领者姓名与 Run 短 ID、到期时刻（datetime 即 leaseExpiresAt）以及 fence 代数，其余节点仍为未认领')
+
+  stage = 'claim projection: multiple fence generations'
+  await openClaimsCase('multiGeneration', {}, 'the multi-generation claim')
+  const multiClaims = await waitClaims(nodes => claimOf(nodes, '实现恢复逻辑')?.state === 'held',
+    'The higher fence generation of a multi-generation task never reached its node')
+  const multiNode = claimOf(multiClaims, '实现恢复逻辑')
+  assert.equal(multiNode.fence, 'fence 第2代',
+    `The highest fence generation must win over the released one: ${JSON.stringify(multiNode)}`)
+  assert.equal(multiNode.status, '已认领', `The fence 2 claim must read 已认领, not 已释放: ${JSON.stringify(multiNode.status)}`)
+  assert(multiNode.owner.includes('临舟'), `The shown owner must be the fence 2 claimant: ${JSON.stringify(multiNode.owner)}`)
+  expectRunToken(multiNode.owner, 'run-9c8d7e66', 'Multi-generation')
+  assert.equal(multiClaims.some(node => node.state === 'released' || node.status === '已释放'), false,
+    `The released fence 1 leaked into the node view: ${JSON.stringify(multiClaims)}`)
+  assert.equal(multiClaims.filter(node => node.state === 'held').length, 1,
+    `A multi-generation task must occupy exactly one node: ${JSON.stringify(multiClaims.map(node => [node.title, node.state]))}`)
+  await expectPlanWidths('multiple fence generations')
+  cases.push('同一任务多代认领只显示最大 fenceGeneration 的那一代：fence 1 的已释放不得盖住 fence 2 的已认领')
+
+  stage = 'claim projection: expired lease'
+  await openClaimsCase('expired', {}, 'the expired lease')
+  const expiredClaims = await waitClaims(nodes => claimOf(nodes, '验收测试')?.state === 'expired',
+    'An expired lease never reached its flow node')
+  const expiredNode = claimOf(expiredClaims, '验收测试')
+  assert.equal(expiredNode.status, '租约已过期',
+    `expired=true 且未释放必须读成租约已过期: ${JSON.stringify(expiredNode)}`)
+  assert(expiredNode.owner.includes('亚纪'), `An expired lease still has an owner: ${JSON.stringify(expiredNode.owner)}`)
+  expectRunToken(expiredNode.owner, 'run-4a4a4a44', 'Expired')
+  assert.equal(expiredNode.leaseDatetime, '2026-09-27T09:55:00.000Z',
+    `An expired lease must show the very leaseExpiresAt it was judged on: ${JSON.stringify(expiredNode.leaseDatetime)}`)
+  assert.equal(expiredNode.fence, 'fence 第1代', `An expired lease keeps its fence: ${JSON.stringify(expiredNode.fence)}`)
+  await expectPlanWidths('an expired lease')
+  cases.push('expired=true 且 releasedAt 为空时节点读成租约已过期，且仍展示认领者、Run 短 ID、到期时刻与 fence 代数')
+
+  stage = 'claim projection: released beats expired'
+  await openClaimsCase('released', {}, 'the released claim')
+  const releasedClaims = await waitClaims(nodes => claimOf(nodes, '设计恢复协议')?.state === 'released',
+    'A released claim never reached its flow node')
+  const releasedNode = claimOf(releasedClaims, '设计恢复协议')
+  assert.equal(releasedNode.status, '已释放',
+    `releasedAt 非空时即使 expired 为 true 也必须读成已释放: ${JSON.stringify(releasedNode)}`)
+  assert.notEqual(releasedNode.status, '租约已过期',
+    `Release is a conclusion and must outrank expiry: ${JSON.stringify(releasedNode.status)}`)
+  assert.equal(releasedClaims.some(node => node.state === 'expired' || node.status === '租约已过期'), false,
+    `A released claim must not be reported as expired anywhere: ${JSON.stringify(releasedClaims.map(node => [node.title, node.state]))}`)
+  expectRunToken(releasedNode.owner, 'run-2b2b2b22', 'Released')
+  await expectPlanWidths('a released claim')
+  cases.push('releasedAt 非空的认领即使 expired 也为 true，也必须显示已释放而不是租约已过期')
+
+  stage = 'claim projection: claimant fallback'
+  await openClaimsCase('anonymous', {}, 'the claim without a claimant agent')
+  const anonymousClaims = await waitClaims(nodes => claimOf(nodes, '实现快照保存')?.state === 'held',
+    'A claim without a claimant agent never reached its node')
+  const anonymousNode = claimOf(anonymousClaims, '实现快照保存')
+  assert.equal(anonymousNode.status, '已认领', `A run-only claim is still held: ${JSON.stringify(anonymousNode)}`)
+  assert.match(anonymousNode.owner, /^认领者：/u, `The owner line lost its 认领者 prefix: ${JSON.stringify(anonymousNode.owner)}`)
+  assert(anonymousNode.owner.includes('run-7f7f7f7f'),
+    `claimantAgentId 为空时必须回退到 agentRunId 原值: ${JSON.stringify(anonymousNode.owner)}`)
+  assert.equal(anonymousNode.owner.includes('null'), false,
+    `An empty claimantAgentId must not leak a literal null: ${JSON.stringify(anonymousNode.owner)}`)
+  assert.equal(anonymousNode.owner.includes('undefined'), false,
+    `An empty claimantAgentId must not leak undefined: ${JSON.stringify(anonymousNode.owner)}`)
+  assert.equal(anonymousNode.fence, 'fence 第1代',
+    `A run-only claim must still show its fence: ${JSON.stringify(anonymousNode.fence)}`)
+  await expectPlanWidths('a claim without a claimant agent')
+  cases.push('claimantAgentId 为 null 的认领把 owner 文案回退成 agentRunId 原值，不渲染 null / undefined，也不丢 fence 与到期')
+
+  stage = 'claim projection: read failure'
+  await openClaimsCase('held', { fail: true }, 'the failing claims read')
+  await waitFor("(document.querySelector('.loom-plan')?.innerText ?? '').includes('认领状态未知')",
+    'A failing loom.claims.list did not surface 认领状态未知 in the 编排 section')
+  const unknownClaims = await claimNodes()
+  assert.equal(unknownClaims.some(node => ['held', 'expired', 'released'].includes(node.state ?? '')), false,
+    `A failed claims read still claimed a lease state: ${JSON.stringify(unknownClaims)}`)
+  assert.equal(unknownClaims.some(node => node.ownerRendered || node.leaseRendered || node.fenceRendered), false,
+    `A failed claims read still rendered owner, lease or fence copy: ${JSON.stringify(unknownClaims)}`)
+  const failedPlan = await script(`({
+    nodeCount: document.querySelectorAll('.loom-plan .loom-flow-node').length,
+    stats: document.querySelector('.loom-plan .loom-flow-stats')?.innerText ?? '',
+    edges: document.querySelectorAll('.loom-plan .loom-flow-edge').length
+  })`)
+  assert.equal(failedPlan.nodeCount, 4,
+    `A failed claims read must not take the task nodes down with it: ${JSON.stringify(failedPlan)}`)
+  assert(failedPlan.stats.includes('依赖就绪: 1') && failedPlan.stats.includes('总任务: 4'),
+    `A failed claims read must not blank the flow stats: ${JSON.stringify(failedPlan.stats)}`)
+  assert.equal(failedPlan.edges, 3, `A failed claims read must keep the dependency edges: ${JSON.stringify(failedPlan.edges)}`)
+  await expectPlanWidths('a failing claims read')
+  await backToDelivery('the failing claims read')
+  const deliveryAfterClaimsFailure = await cardState(TARGET_CANDIDATE)
+  assert.equal(deliveryAfterClaimsFailure.acceptanceState, 'pending',
+    `A failed claims read must leave the delivery section intact: ${JSON.stringify(deliveryAfterClaimsFailure)}`)
+  assert.deepEqual(await script('window.loomQA.errors'), [],
+    'A forced claims read failure was misreported as an unanswered fixture method')
+  cases.push('loom.claims.list 读失败时编排显示认领状态未知、不猜任何一个租约状态，且任务节点、统计、连线与交付面板仍正常')
 
   console.log(JSON.stringify({ ok: true, cases, shots, counts: final, output }))
   app.exit(0)

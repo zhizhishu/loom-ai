@@ -1,9 +1,9 @@
 import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification } from '@contracts'
+import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification, LoomClaim, LoomClaimsListResult } from '@contracts'
 import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
-import { UiText, uiAttribute, useUiText } from './interface-language'
+import { UiText, uiAttribute, useUiText, getInterfaceLanguage } from './interface-language'
 import { useThreadClient } from './camp-client'
 
 export type LoomSection = 'activity' | 'plan' | 'delivery'
@@ -78,13 +78,82 @@ function flowEdgePath(upstream: FlowPoint, downstream: FlowPoint): string {
   return `M ${upstream.x} ${upstream.y} C ${middle} ${upstream.y}, ${middle} ${downstream.y}, ${downstream.x} ${downstream.y}`
 }
 
+/** 认领展示态：只有这四种落在 data-claim-state 上；读不到认领时不算任何一种（不许冒充未认领）。 */
+type FlowClaimState = 'held' | 'expired' | 'released' | 'none'
+
+/** 一个任务可能有多代认领：取 fence 代次最大的那条当当前认领，同代次保留先出现的。 */
+function flowClaim(claims: LoomClaim[], taskId: string): LoomClaim | null {
+  let latest: LoomClaim | null = null
+  for (const claim of claims) {
+    if (claim.taskId !== taskId) continue
+    if (latest === null || claim.fenceGeneration > latest.fenceGeneration) latest = claim
+  }
+  return latest
+}
+
+/** 已释放优先于过期：释放是结论，过期只是没续上。
+ *  expired 由 Host 用服务端时钟判定，这里不拿本地时间重算。 */
+function flowClaimState(claim: LoomClaim | null): FlowClaimState {
+  if (claim === null) return 'none'
+  if (claim.releasedAt !== null) return 'released'
+  return claim.expired ? 'expired' : 'held'
+}
+
+/** Run 身份只用来定位：短值原样显示，长值取尾部 8 位（UUID 前缀几乎不含信息）。 */
+function flowRunShortId(agentRunId: string): string {
+  return agentRunId.length <= 12 ? agentRunId : `…${agentRunId.slice(-8)}`
+}
+
+/** 本地化日期时间；解析不出来就回退原始字符串，不显示 Invalid Date。 */
+function flowDateTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat(getInterfaceLanguage() === 'en' ? 'en-US' : 'zh-CN', {
+    dateStyle: 'short',
+    timeStyle: 'short'
+  }).format(date)
+}
+
+/** 节点认领区：谁占着、租约何时到期、fence 第几代。
+ *  claims 为 null = 认领投影没读到，只显示「认领状态未知」，不影响节点其他内容。 */
+function FlowClaimBadge({ claims, taskId, agents }: { claims: LoomClaim[] | null; taskId: string; agents: AgentProfile[] }) {
+  const t = useUiText()
+  if (claims === null) {
+    return <div className="loom-flow-claim">
+      <span className="loom-flow-claim-status">{t('认领状态未知')}</span>
+    </div>
+  }
+  const claim = flowClaim(claims, taskId)
+  const state = flowClaimState(claim)
+  const stateLabel = state === 'held' ? t('已认领')
+    : state === 'expired' ? t('租约已过期')
+      : state === 'released' ? t('已释放') : t('未认领')
+  if (claim === null) {
+    return <div className="loom-flow-claim" data-claim-state={state}>
+      <span className="loom-flow-claim-status">{stateLabel}</span>
+    </div>
+  }
+  // 认领者三级回退：已知 Agent 显示其显示名 → 未知 Agent 回退原 ID → 都没绑定才回退 agentRunId，不编造用户名。
+  const claimantAgentId = (claim.claimantAgentId ?? '').trim()
+  const claimant = claimantAgentId === '' ? undefined : agents.find(agent => agent.agentId === claimantAgentId)
+  const owner = claimant !== undefined ? claimant.displayName
+    : claimantAgentId !== '' ? claimantAgentId : claim.agentRunId
+  return <div className="loom-flow-claim" data-claim-state={state}>
+    <span className="loom-flow-claim-status">{stateLabel}</span>
+    <span className="loom-flow-claim-owner">{t('认领者：{0} · {1}', owner, flowRunShortId(claim.agentRunId))}</span>
+    <time className="loom-flow-claim-lease" dateTime={claim.leaseExpiresAt}>{t('到期：{0}', flowDateTime(claim.leaseExpiresAt))}</time>
+    <span className="loom-flow-claim-fence">{t('fence 第{0}代', claim.fenceGeneration)}</span>
+  </div>
+}
+
 /** 依赖图渲染：archify 流程视图。就绪判定走控制层契约，不在 UI 里另立规则。 */
-function LoomFlow({ tasks, dependencies, candidates, reviews, agents }: {
+function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims }: {
   tasks: LoomTask[]
   dependencies: LoomDependency[]
   candidates: LoomCandidate[]
   reviews: LoomReview[]
   agents: AgentProfile[]
+  claims: LoomClaim[] | null
 }) {
   const t = useUiText()
   // 界面文案：契约里的枚举值是英文标识，不直接展示给用户。
@@ -94,7 +163,8 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents }: {
   // 候选与人工验收记录一律喂真实读取结果：artifact_accepted 边只认 verified + accepted + 同版本 Review，
   // 不会被"上游 done"误判为已验收。evaluatedAt 固定为纪元，求值是纯规则，不给渲染引入会漂移的输入。
   const graph = { tasks, dependencies, candidates, reviews, evaluatedAt: new Date(0).toISOString() }
-  // 「可执行」= 依赖已释放 且 任务本身处于可领取状态；done/canceled/draft 不算可执行。
+  // 「依赖就绪」= 依赖已放行 且 任务本身处于 ready；只说明没人拦着，不代表没人占着（占用与否看节点认领区）。
+  // done/canceled/draft 不算依赖就绪。
   const claimable = (task: LoomTask): boolean =>
     (task.status === 'ready' || task.status === 'in_review') && loomTaskReady(task.taskId, graph).ready
   const readyTasks = tasks.filter(claimable)
@@ -151,7 +221,7 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents }: {
     <div className="loom-flow-header">
       <span className="loom-eyebrow">{t('任务依赖')}</span>
       <div className="loom-flow-stats">
-        <span>{t('可执行')}: {readyTasks.length}</span>
+        <span>{t('依赖就绪')}: {readyTasks.length}</span>
         <span>{t('阻塞')}: {blockedTasks.length}</span>
         <span>{t('总任务')}: {tasks.length}</span>
       </div>
@@ -223,6 +293,7 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents }: {
             {task.blockedReason && (
               <div className="loom-flow-node-blocked">{task.blockedReason}</div>
             )}
+            <FlowClaimBadge claims={claims} taskId={task.taskId} agents={agents}/>
           </div>
         })}
       </div>)}
@@ -236,7 +307,7 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents }: {
   </div>
 }
 
-function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates, reviews, loading, error }: {
+function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates, reviews, claims, loading, error }: {
   mission: MissionRecord
   agents: AgentProfile[]
   plan: LoomPlan | null
@@ -244,6 +315,7 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
   dependencies: LoomDependency[]
   candidates: LoomCandidate[]
   reviews: LoomReview[]
+  claims: LoomClaim[] | null
   loading?: boolean
   error?: string
 }) {
@@ -299,7 +371,7 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
       <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
     </header>
     <p className="loom-intro">{t('把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。')}</p>
-    <LoomFlow tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} agents={agents} />
+    <LoomFlow tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} agents={agents} claims={claims} />
   </div>
 }
 
@@ -519,10 +591,12 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
   const [candidates, setCandidates] = useState<LoomCandidate[]>([])
   const [reviews, setReviews] = useState<LoomReview[]>([])
   const [verifications, setVerifications] = useState<LoomVerification[]>([])
+  // 认领投影：null = 读不到（不是「没有认领」）。数组为空才算真的没人认领。
+  const [claims, setClaims] = useState<LoomClaim[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
-  // 写入口（验收 / 核验）成功后重新读一遍六个投影：状态只认控制面回读，不在本地猜。
+  // 写入口（验收 / 核验）成功后重新读一遍七个投影：状态只认控制面回读，不在本地猜。
   const reload = useCallback((): void => {
     void Promise.all([
       client.request<LoomPlan | null>('loom.plan.get', { missionId: mission.missionId }),
@@ -530,9 +604,13 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId }),
       client.request<LoomCandidate[]>('loom.candidates.list', { missionId: mission.missionId }),
       client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId }),
-      client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId })
-    ]).then(([p, t, d, c, r, v]) => {
-      setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v); setError('')
+      client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId }),
+      // 认领读失败不拖垮其他六个投影：只把认领区降级成「认领状态未知」。
+      client.request<LoomClaimsListResult>('loom.claims.list', { missionId: mission.missionId })
+        .then((result): LoomClaimsListResult | null => result, () => null)
+    ]).then(([p, t, d, c, r, v, k]) => {
+      setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v)
+      setClaims(k === null ? null : k.claims); setError('')
     }).catch(e => setError(e.message ?? '刷新失败'))
   }, [client, mission.missionId])
   
@@ -552,9 +630,14 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId }),
       client.request<LoomCandidate[]>('loom.candidates.list', { missionId: mission.missionId }),
       client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId }),
-      client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId })
-    ]).then(([p, t, d, c, r, v]) => {
-      if (alive) { setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v); setError('') }
+      client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId }),
+      client.request<LoomClaimsListResult>('loom.claims.list', { missionId: mission.missionId })
+        .then((result): LoomClaimsListResult | null => result, () => null)
+    ]).then(([p, t, d, c, r, v, k]) => {
+      if (alive) {
+        setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v)
+        setClaims(k === null ? null : k.claims); setError('')
+      }
     }).catch(e => {
       if (alive) setError(e.message ?? '读取编排数据失败')
     }).finally(() => {
@@ -577,7 +660,7 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       </button>)}
     </nav>
     <div className="loom-section-body">
-      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} loading={loading} error={error}/></div>}
+      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} claims={claims} loading={loading} error={error}/></div>}
       <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
         {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews} verifications={verifications} plan={plan} missionId={mission.missionId} onRefresh={reload}/></div>}
         <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>

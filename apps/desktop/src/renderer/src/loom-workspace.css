@@ -70,6 +70,18 @@
 .loom-flow-node-assignee { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
 .loom-flow-node-deps { font-size: 11px; color: var(--faint); margin-bottom: 4px; }
 .loom-flow-node-blocked { font-size: 10px; color: var(--attention); font-style: italic; }
+/* 认领区：节点底部一块，说的是「谁占着、租约何时到期、fence 第几代」。
+   长 ID 只靠 anywhere 折行，不撑宽游道；颜色一律走主题 token，不新增色值。
+   过期只额外用 attention 语义色，文字「租约已过期」仍在，不单靠颜色区分。 */
+.loom-flow-claim { display: flex; flex-direction: column; gap: 2px; min-width: 0; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; line-height: 1.5; }
+.loom-flow-claim > .loom-flow-claim-status,.loom-flow-claim > .loom-flow-claim-owner,.loom-flow-claim > .loom-flow-claim-lease,.loom-flow-claim > .loom-flow-claim-fence { display: block; min-width: 0; overflow-wrap: anywhere; }
+.loom-flow-claim-status { color: var(--ink); font-weight: 550; letter-spacing: .04em; }
+.loom-flow-claim[data-claim-state='held'] > .loom-flow-claim-status { color: var(--accent); }
+.loom-flow-claim[data-claim-state='expired'] > .loom-flow-claim-status { color: var(--attention); }
+.loom-flow-claim[data-claim-state='released'] > .loom-flow-claim-status { color: var(--muted); }
+/* 租约与 fence 是同一条认领的补充信息：等宽数字便于扫读，字号不低于 10px。 */
+.loom-flow-claim-lease,.loom-flow-claim-fence { color: var(--faint); font-variant-numeric: tabular-nums; }
+.loom-flow-claim-fence { font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }
 /* 依赖连线：SVG 绝对定位覆盖整个图区域，不参与命中测试。 */
 .loom-flow-edges { position: absolute; top: 0; left: 0; z-index: 0; overflow: visible; pointer-events: none; }
 .loom-flow-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; }
