@@ -45,12 +45,12 @@
 .loom-flow { margin-top: 24px; }
 .loom-flow-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .loom-flow-stats { display: flex; gap: 16px; color: var(--muted); font-size: 11px; }
-/* 图区横向：depth 0 → n 自左向右排泳道；泳道可变宽，容器窄于「列数 × 150px + 间距」时才横滚。 */
+/* 图区横向：depth 0 → n 自左向右排泳道；泳道可变宽，容器窄于「列数 × 180px + 间距」时才横滚。 */
 .loom-flow-graph { position: relative; display: flex; flex-direction: row; align-items: flex-start; gap: 48px; max-width: 100%; min-width: 0; padding-bottom: 4px; overflow-x: auto; }
-.loom-flow-lane { display: flex; flex: 1 1 0; min-width: 150px; max-width: 240px; flex-direction: column; gap: 14px; }
+.loom-flow-lane { display: flex; flex: 1 1 0; min-width: 180px; max-width: 260px; flex-direction: column; gap: 14px; }
 /* 列头：泳道第一个子元素；列内 gap 14px，要让列头下沿只占 8px，所以回吐 6px。 */
 .loom-flow-lane-label { margin-bottom: -6px; color: var(--muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
-.loom-flow-node { position: relative; z-index: 1; width: 100%; min-width: 0; flex: 0 0 auto; border: 1px solid var(--line); border-left: 2px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / 6%); }
+.loom-flow-node { position: relative; z-index: 1; width: 100%; min-width: 0; flex: 0 0 auto; border: 1px solid var(--line); border-left: 2px solid var(--line); border-radius: 8px; padding: 14px 16px; background: var(--surface); box-shadow: 0 1px 3px rgb(0 0 0 / 8%), 0 1px 2px rgb(0 0 0 / 4%); }
 .loom-flow-node.ready { border-color: var(--accent); border-left-color: var(--accent); background: var(--accent-subtle); }
 .loom-flow-node.blocked { border-color: var(--attention); border-left-color: var(--attention); background: var(--attention-subtle); }
 /* 其余状态只换左侧状态条，不改边框底色。 */
@@ -77,6 +77,8 @@
 /* 节点状态点：横向排进原有 header，标题让位并允许换行。 */
 .loom-flow-node-header { gap: 7px; }
 .loom-flow-node-header > .loom-flow-node-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+/* 状态行独立一行，和标题分开；与下方内容留 6px。 */
+.loom-flow-node-meta { margin-bottom: 6px; }
 .loom-flow-node-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--faint); transition: background-color 140ms ease; }
 .loom-flow-node-dot[data-status='done'] { background: var(--muted); }
 .loom-flow-node-dot[data-status='ready'] { background: var(--accent); }
@@ -84,6 +86,13 @@
 .loom-flow-node-dot[data-status='blocked'] { background: var(--attention); }
 .loom-flow-node-dot[data-status='canceled'] { background: var(--faint); opacity: .55; }
 .loom-flow-node-dot[data-status='draft'] { background: transparent; box-shadow: inset 0 0 0 1px var(--faint); }
+/* 图例：说明三种边的含义，也把图区下方的空白收住。 */
+.loom-flow-legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+.loom-flow-legend-item { display: inline-flex; align-items: center; gap: 8px; }
+/* 小线段：默认 task_done 的实心灰线，后两条按条件色覆写。 */
+.loom-flow-legend-item::before { content: ''; width: 18px; height: 0; border-top: 1.5px solid var(--muted); }
+.loom-flow-legend-artifact-accepted::before { border-top-color: var(--accent); border-top-style: dashed; }
+.loom-flow-legend-blocked::before { border-top-color: var(--attention); }
 
 @media(max-width:640px) { .loom-section-tabs { padding-inline: 18px; }.loom-section-body > .mission-activity-document { padding: 18px; }.loom-plan,.loom-delivery { padding: 24px 20px; }.loom-foundation { grid-template-columns: minmax(0,1fr) 64px 64px; gap: 12px; } }
 @media(prefers-reduced-motion:reduce) { .loom-section-tabs button { transition: none; } }

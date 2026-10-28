@@ -124,6 +124,7 @@ app.whenReady().then(async () => {
       edgeCount: document.querySelectorAll('.loom-plan .loom-flow-edge').length,
       dashedCount: document.querySelectorAll('.loom-plan .loom-flow-edge-artifact-accepted').length,
       laneCount: document.querySelectorAll('.loom-plan .loom-flow-lane').length,
+      legendItems: document.querySelectorAll('.loom-plan .loom-flow-legend-item').length,
       graphScrollWidth: document.querySelector('.loom-plan .loom-flow-graph')?.scrollWidth ?? -1,
       graphClientWidth: document.querySelector('.loom-plan .loom-flow-graph')?.clientWidth ?? -1,
       controls: document.querySelectorAll('.loom-plan input, .loom-plan button, .loom-plan textarea').length
@@ -139,6 +140,7 @@ app.whenReady().then(async () => {
   assert(plan.laneCount >= 2, `Plan flow must layer the DAG into depth lanes: ${JSON.stringify(plan.laneCount)}`)
   assert(plan.graphScrollWidth >= 0 && plan.graphScrollWidth <= plan.graphClientWidth + 1,
     `Plan flow graph overflows its 1440px lane budget: ${plan.graphScrollWidth} > ${plan.graphClientWidth}`)
+  assert.equal(plan.legendItems, 3, `Plan flow must explain all three edge kinds: ${JSON.stringify(plan.legendItems)}`)
   assert.equal(plan.controls, 0, 'Plan section must not offer controls for a read-only plan')
   cases.push('编排 section renders the real task dependency flow with four nodes, the blocked task reason, honest stats and no invented controls')
 

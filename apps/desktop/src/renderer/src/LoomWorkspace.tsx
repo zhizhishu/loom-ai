@@ -1,5 +1,5 @@
 import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency } from '@contracts'
+import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus } from '@contracts'
 import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
@@ -85,6 +85,10 @@ function LoomFlow({ tasks, dependencies, agents }: {
   agents: AgentProfile[]
 }) {
   const t = useUiText()
+  // 界面文案：契约里的枚举值是英文标识，不直接展示给用户。
+  const statusLabels: Record<LoomTaskStatus, string> = {
+    draft: '草稿', ready: '就绪', blocked: '阻塞', in_review: '评审中', done: '已完成', canceled: '已取消'
+  }
   // 尚无 Candidate/Review 读取路径，传空集合：artifact_accepted 边因此保持未释放，
   // 不会被"上游 done"误判为已验收。
   const graph = { tasks, dependencies, candidates: [], reviews: [], evaluatedAt: new Date(0).toISOString() }
@@ -201,7 +205,9 @@ function LoomFlow({ tasks, dependencies, agents }: {
             <div className="loom-flow-node-header">
               <span className="loom-flow-node-dot" data-status={task.status}/>
               <span className="loom-flow-node-title">{task.title}</span>
-              <span className="loom-flow-node-status">{t(task.status)}</span>
+            </div>
+            <div className="loom-flow-node-meta">
+              <span className="loom-flow-node-status">{statusLabels[task.status]}</span>
             </div>
             {assignee && <div className="loom-flow-node-assignee">{assignee.displayName}</div>}
             {upstreams.length > 0 && (
@@ -218,6 +224,12 @@ function LoomFlow({ tasks, dependencies, agents }: {
           </div>
         })}
       </div>)}
+    </div>
+    
+    <div className="loom-flow-legend">
+      <span className="loom-flow-legend-item loom-flow-legend-task-done">{t('任务完成即可放行')}</span>
+      <span className="loom-flow-legend-item loom-flow-legend-artifact-accepted">{t('需人工验收后放行')}</span>
+      <span className="loom-flow-legend-item loom-flow-legend-blocked">{t('当前阻塞')}</span>
     </div>
   </div>
 }
