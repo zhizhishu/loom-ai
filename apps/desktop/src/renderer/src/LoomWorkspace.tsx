@@ -331,6 +331,15 @@ function DeliveryReview({ candidates, reviews, verifications, plan, missionId, o
     state === 'verified' ? t('已核验') : state === 'failed' ? t('核验失败') : t('未核验')
   const acceptanceLabel = (state: LoomCandidate['acceptanceStatus']): string =>
     state === 'accepted' ? t('已验收') : state === 'rejected' ? t('已驳回') : t('待验收')
+  // 候选 ID 先去掉冗余的 candidate- 前缀再截尾：直接 slice(-6) 会把 "candidate-1"
+  // 切成 "date-1"，看起来像个日期。
+  const candidateLabel = (candidateId: string): string => {
+    const bare = candidateId.replace(/^candidate-/, '')
+    return bare.length > 8 ? `…${bare.slice(-8)}` : bare
+  }
+  // 核验方法目前只有人工与自动两种；已知取值翻译，未知值原样显示，不丢信息。
+  const methodLabel = (method: string): string =>
+    method === 'manual' ? t('人工核验') : method === 'automated' ? t('自动核验') : method
   // 新的返工版本在最前；createdAt 相同就保持后端顺序。
   const ordered = [...candidates].sort((a, b) =>
     a.createdAt === b.createdAt ? 0 : a.createdAt < b.createdAt ? 1 : -1)
@@ -424,7 +433,7 @@ function DeliveryReview({ candidates, reviews, verifications, plan, missionId, o
         const open = draft?.candidateId === candidate.candidateId ? draft : null
         return <div key={candidate.candidateId} className="loom-candidate">
           <div className="loom-candidate-header">
-            <span className="loom-candidate-title">{t('候选')} {candidate.candidateId.slice(-6)}</span>
+            <span className="loom-candidate-title">{t('候选')} {candidateLabel(candidate.candidateId)}</span>
             <span className="loom-badge loom-badge-verification" data-state={candidate.verificationStatus}>
               {verificationLabel(candidate.verificationStatus)}
             </span>
@@ -440,7 +449,7 @@ function DeliveryReview({ candidates, reviews, verifications, plan, missionId, o
             </div>)}
           </div>}
           {verification !== undefined && <div className="loom-candidate-verification">
-            <div>{t('核验结论')}：{verification.result === 'passed' ? t('通过') : t('失败')} · {verification.method}</div>
+            <div>{t('核验结论')}：{verification.result === 'passed' ? t('通过') : t('失败')} · {methodLabel(verification.method)}</div>
           </div>}
           {(reviewable || verifiable) && <div className="loom-delivery-actions">
             {reviewable && <button

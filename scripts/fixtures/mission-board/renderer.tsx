@@ -14,7 +14,7 @@ import {EMPTY_SNAPSHOT} from '../../../apps/desktop/src/shared/navigation-prefer
 import {applyAppearanceSnapshot} from '../../../apps/desktop/src/renderer/src/theme'
 import '../../../apps/desktop/src/renderer/src/styles.css'
 import '../../../apps/web/src/mobile.css'
-import type {MissionRecord, ThreadOpenProjection, NotificationEpisodeChange, NotificationEpisodeView, NotificationActionView, LoomPlan, LoomTask, LoomDependency, LoomCandidate, LoomReview} from '@contracts'
+import type {MissionRecord, ThreadOpenProjection, NotificationEpisodeChange, NotificationEpisodeView, NotificationActionView, LoomPlan, LoomTask, LoomDependency, LoomCandidate, LoomReview, LoomVerification} from '@contracts'
 
 // UI-only acceptance: production BusinessApp/components, deterministic memory adapter.
 const query=new URLSearchParams(location.search), theme=query.get('theme')==='night'?'night':'day'
@@ -144,15 +144,31 @@ const loomDependencies=(planId:string):LoomDependency[]=>[
  {dependencyId:'dep-2',planId,upstreamTaskId:'task-2',downstreamTaskId:'task-3',condition:'task_done',resolvedArtifactId:null,resolution:null,createdAt:now},
  {dependencyId:'dep-3',planId,upstreamTaskId:'task-3',downstreamTaskId:'task-4',condition:'artifact_accepted',resolvedArtifactId:null,resolution:null,createdAt:now}
 ]
-// 候选与验收记录：task-1 已核验且已验收，task-3 只有待验收候选（所以 task-4 的
-// artifact_accepted 边仍然未释放，blocked 断言继续成立）。
-const loomCandidates=(missionId:string):LoomCandidate[]=>[
- {candidateId:'candidate-1',taskId:'task-1',agentRunId:'run-1',contentHash:'sha256:restore-protocol',evidenceIds:['evidence-1','evidence-2'],acceptanceCriteria:loomAcceptance,previousCandidateId:null,verificationStatus:'verified',acceptanceStatus:'accepted',createdAt:now},
- {candidateId:'candidate-2',taskId:'task-3',agentRunId:'run-2',contentHash:'sha256:restore-runtime',evidenceIds:['evidence-3'],acceptanceCriteria:loomAcceptance,previousCandidateId:null,verificationStatus:'unverified',acceptanceStatus:'pending',createdAt:now}
-]
-const loomReviews=(missionId:string):LoomReview[]=>[
- {reviewId:'review-1',candidateId:'candidate-1',acceptanceCriteriaVersion:'v1',verdict:'accepted',reason:'恢复协议已覆盖保存与恢复两条路径',criteriaResults:[{criterionId:'c1',satisfied:true,evidenceIds:['evidence-1'],note:null},{criterionId:'c2',satisfied:true,evidenceIds:['evidence-2'],note:null}],reviewerId:'local_user',reviewedAt:now}
-]
+// 候选/评审/核验是**状态化**的：人工走查时点了按钮要真看到变化，所以存在本进程内存里。
+// task-1 已核验且已验收，task-3 只有待验收候选（所以 task-4 的 artifact_accepted 边仍然
+// 未释放，blocked 断言继续成立）。不接 Core、不写盘，只服务 UI 走查。
+const loomStores=new Map<string,{candidates:LoomCandidate[];reviews:LoomReview[];verifications:LoomVerification[]}>()
+const loomStore=(missionId:string)=>{
+ const existing=loomStores.get(missionId)
+ if(existing)return existing
+ const seeded={
+  candidates:[
+   {candidateId:'candidate-1',taskId:'task-1',agentRunId:'run-1',contentHash:'sha256:restore-protocol',evidenceIds:['evidence-1','evidence-2'],acceptanceCriteria:loomAcceptance,previousCandidateId:null,verificationStatus:'verified',acceptanceStatus:'accepted',createdAt:now},
+   {candidateId:'candidate-2',taskId:'task-3',agentRunId:'run-2',contentHash:'sha256:restore-runtime',evidenceIds:['evidence-3'],acceptanceCriteria:loomAcceptance,previousCandidateId:null,verificationStatus:'unverified',acceptanceStatus:'pending',createdAt:now}
+  ] as LoomCandidate[],
+  reviews:[
+   {reviewId:'review-1',candidateId:'candidate-1',acceptanceCriteriaVersion:'v1',verdict:'accepted',reason:'恢复协议已覆盖保存与恢复两条路径',criteriaResults:[{criterionId:'c1',satisfied:true,evidenceIds:['evidence-1'],note:null},{criterionId:'c2',satisfied:true,evidenceIds:['evidence-2'],note:null}],reviewerId:'local_user',reviewedAt:now}
+  ] as LoomReview[],
+  verifications:[
+   {verificationId:'verification-1',candidateId:'candidate-1',method:'manual',executorId:'local_user',result:'passed',evidenceIds:['evidence-1'],verifiedAt:now}
+  ] as LoomVerification[]
+ }
+ loomStores.set(missionId,seeded)
+ return seeded
+}
+const loomCandidates=(missionId:string):LoomCandidate[]=>loomStore(missionId).candidates
+const loomReviews=(missionId:string):LoomReview[]=>loomStore(missionId).reviews
+const loomVerifications=(missionId:string):LoomVerification[]=>loomStore(missionId).verifications
 const client={...model.client,onInvalidated:undefined,onEvent:(fn:any)=>{events.add(fn);return()=>events.delete(fn)},missionAttachments:{
  update:async(_commandId:string,patch:any,keepAttachmentIds:string[],attachments:any[])=>{
   calls.push({method:'missions.updateWithAttachments',p:{patch,keepAttachmentIds,attachments}})
@@ -263,6 +279,23 @@ const client={...model.client,onInvalidated:undefined,onEvent:(fn:any)=>{events.
  if(method==='loom.dependencies.list')return loomDependencies(`plan-${p.missionId}`)
  if(method==='loom.candidates.list')return loomCandidates(p.missionId)
  if(method==='loom.reviews.list')return loomReviews(p.missionId)
+ if(method==='loom.verifications.list')return loomVerifications(p.missionId)
+ if(method==='loom.review.record'){
+  const store=loomStore(p.missionId),candidate=store.candidates.find(row=>row.candidateId===p.candidateId)
+  if(!candidate)throw new Error('fixture has no such candidate')
+  const review:LoomReview={reviewId:`review-${store.reviews.length+1}`,candidateId:p.candidateId,acceptanceCriteriaVersion:p.acceptanceCriteriaVersion,verdict:p.verdict,reason:p.reason,criteriaResults:p.criteriaResults,reviewerId:'local_user',reviewedAt:new Date().toISOString()}
+  store.reviews.push(review)
+  candidate.acceptanceStatus=p.verdict==='accepted'?'accepted':'rejected'
+  return {review,missionId:p.missionId,planId:`plan-${p.missionId}`,taskId:candidate.taskId,taskStatus:p.verdict==='accepted'?'done':'ready',candidateAcceptanceStatus:candidate.acceptanceStatus,releasedDependencyIds:[],replayed:false}
+ }
+ if(method==='loom.verification.record'){
+  const store=loomStore(p.missionId),candidate=store.candidates.find(row=>row.candidateId===p.candidateId)
+  if(!candidate)throw new Error('fixture has no such candidate')
+  const verification:LoomVerification={verificationId:`verification-${store.verifications.length+1}`,candidateId:p.candidateId,method:p.method,executorId:'local_user',result:p.result,evidenceIds:p.evidenceIds??[],verifiedAt:new Date().toISOString()}
+  store.verifications.push(verification)
+  candidate.verificationStatus=p.result==='passed'?'verified':'failed'
+  return {verification,missionId:p.missionId,planId:`plan-${p.missionId}`,taskId:candidate.taskId,candidateVerificationStatus:candidate.verificationStatus,releasedDependencyIds:[],replayed:false}
+ }
  return model.client.request(method as any,p)
 }}
 const preferences:any={appearance:{get:async()=>appearance,onChanged:()=>()=>{}},generalPreferences:new Proxy({}, {get:(_,key)=>key==='onChanged'?()=>()=>{}:async(...args:any[])=>{if(key==='setInterfaceLanguagePreference')Object.assign(prefs,{interfaceLanguage:args[0],interfaceLanguagePreference:args[0],languageRevision:prefs.languageRevision+1});if(String(key).startsWith('set'))calls.push({method:`preferences.${String(key)}`,p:args});if(key==='setNewConversationDefaults')prefs.newConversationDefaults=args[0];return structuredClone(prefs)}}),navigationPreferences:new Proxy({}, {get:(_,key)=>key==='onChanged'?()=>()=>{}:async()=>navigationPrefs})}

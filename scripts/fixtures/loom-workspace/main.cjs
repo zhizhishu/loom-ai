@@ -19,7 +19,10 @@ const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 
 app.whenReady().then(async () => {
   const window = new BrowserWindow({
-    show: process.platform === 'linux', width: 1440, height: 920, useContentSize: true,
+    // A visual-acceptance fixture that writes PNGs must actually paint. A hidden window
+    // produces no compositor frames on Windows, so `capturePage()` hands back the previous
+    // frame and every screenshot silently lags one section behind its filename.
+    show: true, width: 1440, height: 920, useContentSize: true,
     webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false, backgroundThrottling: false }
   })
   const script = expression => window.webContents.executeJavaScript(expression, true)
@@ -63,6 +66,21 @@ app.whenReady().then(async () => {
   const capture = async (section, theme, size, zoom) => {
     const name = `loom-workspace-${section}-${theme}-${size}${zoom === 100 ? '' : '-zoom' + zoom}.png`
     const path = join(output, name)
+    // Scroll-retention cases leave the panes part-way down. Screenshots are read by a human
+    // deciding whether the surface is finished, so each one starts at the top of its pane.
+    await script(`(() => {
+      for (const selector of ['.loom-delivery', '.mission-activity-document']) {
+        const pane = document.querySelector(selector)
+        if (pane) pane.scrollTop = 0
+      }
+      window.scrollTo(0, 0)
+      return true
+    })()`)
+    await settle(120)
+    // Burn one frame so a section that was switched microseconds ago cannot be captured
+    // from the compositor's previous output; only the second frame is written.
+    await window.webContents.capturePage()
+    await settle(120)
     writeFileSync(path, (await window.webContents.capturePage()).toPNG())
     shots.push({ section, theme, size, zoom, path })
   }
@@ -258,7 +276,7 @@ app.whenReady().then(async () => {
   cases.push('Delivery owns and restores its scroll position across the short plan section')
 
   stage = 'screenshots'
-  for (const [width, height] of [[1440, 920], [1040, 700]]) {
+  for (const [width, height] of [[1440, 920], [1040, 700], [390, 844]]) {
     window.setContentSize(width, height)
     await waitFor(`window.innerWidth === ${width} && window.innerHeight === ${height}`, `LOOM fixture did not resize to ${width}x${height}`)
     for (const theme of ['day', 'night']) {
