@@ -230,6 +230,79 @@ export interface LoomReviewSubmission {
 }
 
 /** 验收提交结果：逐条验收标准全 true 才通过。 */
+/** 验收提交入参：Owner 对一个 Candidate 的终判。 */
+export interface LoomReviewRecordInput {
+  missionId: string
+  taskId: string
+  candidateId: string
+  /** 幂等键：同一 commandId 重放返回既有评审，不再写第二条 */
+  commandId: string
+  /** 必须与该候选钉住的验收标准版本一致 */
+  acceptanceCriteriaVersion: string
+  verdict: 'accepted' | 'rejected'
+  reason: string
+  /** accepted 必须恰好覆盖该版本每条 criterionId 且全为 true */
+  criteriaResults: LoomAcceptanceCriterionResult[]
+  reviewerId: string
+}
+
+/** 验收回执：写入的评审 + 它推进了什么。 */
+export interface LoomReviewRecordReceipt {
+  review: LoomReview
+  missionId: string
+  planId: string
+  taskId: string
+  /** 接受 → done；驳回 → ready */
+  taskStatus: LoomTaskStatus
+  candidateAcceptanceStatus: 'pending' | 'accepted' | 'rejected'
+  /** 本次判定冻结放行的依赖边 ID，按依赖顺序 */
+  releasedDependencyIds: string[]
+  /** 同一 commandId 重放且未写新行时为 true */
+  replayed: boolean
+}
+
+/** 验收提交入参：Owner 对一个 Candidate 的终判。 */
+export interface LoomReviewRecordInput {
+  /** Mission 作用域 */
+  missionId: string
+  /** 被判定的 Task ID */
+  taskId: string
+  /** 被判定的 Candidate ID（一个候选只能有一份评审） */
+  candidateId: string
+  /** 幂等键：同一 commandId 重放返回既有评审，不再写第二条 */
+  commandId: string
+  /** 必须与该候选钉住的验收标准版本一致 */
+  acceptanceCriteriaVersion: string
+  /** 验收结论 */
+  verdict: 'accepted' | 'rejected'
+  /** 验收理由（必填，不接受空串） */
+  reason: string
+  /** accepted 必须恰好覆盖该版本每条 criterionId 且全为 true */
+  criteriaResults: LoomAcceptanceCriterionResult[]
+  /** 验收人 */
+  reviewerId: string
+}
+
+/** 验收回执：写入的评审 + 它推进了什么。 */
+export interface LoomReviewRecordReceipt {
+  /** 写入（或重放）的那份评审 */
+  review: LoomReview
+  /** Mission 作用域回显 */
+  missionId: string
+  /** 所属计划 ID */
+  planId: string
+  /** 被判定的 Task ID */
+  taskId: string
+  /** 接受 → done；驳回 → ready */
+  taskStatus: LoomTaskStatus
+  /** 候选的验收轴结论 */
+  candidateAcceptanceStatus: 'pending' | 'accepted' | 'rejected'
+  /** 本次判定冻结放行的依赖边 ID，按依赖顺序 */
+  releasedDependencyIds: string[]
+  /** 同一 commandId 重放且未写新行时为 true */
+  replayed: boolean
+}
+
 export interface LoomReviewResult {
   /** 是否通过 */
   passed: boolean
