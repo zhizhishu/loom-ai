@@ -1040,6 +1040,27 @@ mod tests {
             173,
             "assertion contract_marker_advances_to_173"
         );
+        // Migration 224 adds the artifact projection, so the 173 receipt is a source now.
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 173
+        ));
+        migrate_artifact(&mut database).unwrap();
+        assert!(
+            artifact_schema_matches(database.connection()).unwrap(),
+            "assertion schema_174_creates_the_loom_artifact_projection"
+        );
+        assert_eq!(
+            migration_receipts(&database, 224),
+            1,
+            "assertion schema_migration_records_224_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            174,
+            "assertion contract_marker_advances_to_174"
+        );
         assert!(matches!(
             classify_database_contract(database.connection()).unwrap(),
             DatabaseContractClassification::Current(_)
