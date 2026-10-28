@@ -493,6 +493,9 @@ const LOOM_TASK_NOT_IN_REVIEW: &str = "LOOM_TASK_NOT_IN_REVIEW";
 const LOOM_REVIEW_EXISTS: &str = "LOOM_REVIEW_EXISTS";
 const LOOM_REVIEW_CRITERIA_INCOMPLETE: &str = "LOOM_REVIEW_CRITERIA_INCOMPLETE";
 const LOOM_VERIFICATION_EXISTS: &str = "LOOM_VERIFICATION_EXISTS";
+const LOOM_REVIEW_REPLAY_CONFLICT: &str = "LOOM_REVIEW_REPLAY_CONFLICT";
+const LOOM_VERIFICATION_REPLAY_CONFLICT: &str = "LOOM_VERIFICATION_REPLAY_CONFLICT";
+const LOOM_ACCEPTANCE_CRITERIA_EMPTY: &str = "LOOM_ACCEPTANCE_CRITERIA_EMPTY";
 
 /// Rejection of a LOOM task release or claim; `code` is the stable error code the Host
 /// returns, exactly like [`LoomPlanImportError`].
@@ -2121,6 +2124,33 @@ pub fn review_record(
             [&review_id],
             |row| row.get(0),
         )?;
+        // A replayed submission must target the same mission, task, and candidate.
+        // Returning the original record against a different target would let a caller
+        // silently substitute the review subject.
+        let replay_task_id: String = transaction.query_row(
+            "SELECT task_id FROM loom_review WHERE review_id=?1",
+            [&review_id],
+            |row| row.get(0),
+        )?;
+        let original_mission: Option<String> = transaction
+            .query_row(
+                "SELECT mission_id FROM loom_plan WHERE plan_id=?1",
+                [&plan_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if original_mission.as_deref() != Some(mission_id.as_str())
+            || replay_task_id != task_id
+            || review.candidate_id != candidate_id
+        {
+            return Err(LoomCommandError::rejection(
+                LOOM_REVIEW_REPLAY_CONFLICT,
+                format!(
+                    "command {command_id} was recorded for a different mission/task/candidate"
+                ),
+            )
+            .into());
+        }
         let task_status = task_status_of(&transaction, &plan_id, &task_id)?;
         let acceptance_status: String = transaction.query_row(
             "SELECT acceptance_status FROM loom_candidate WHERE candidate_id=?1",
@@ -2231,7 +2261,18 @@ pub fn review_record(
 
     // Every criterion of the pinned snapshot must carry exactly one verdict, and an accepted
     // review must have satisfied all of them. Order is irrelevant; identity is not.
+    // Empty criteria sets must not be accepted — the TS evaluator rejects them outright
+    // (loom.ts:400), and the Rust side must agree.
     let snapshot = criteria_snapshot(&acceptance_criteria_json, &candidate_version, "task")?;
+    if snapshot.criteria.is_empty() && verdict == LoomReviewVerdict::Accepted {
+        return Err(LoomCommandError::rejection(
+            LOOM_ACCEPTANCE_CRITERIA_EMPTY,
+            format!(
+                "candidate {candidate_id} has no acceptance criteria; an accepted review requires at least one criterion"
+            ),
+        )
+        .into());
+    }
     let mut expected: Vec<&str> = snapshot
         .criteria
         .iter()
@@ -2540,6 +2581,31 @@ pub fn verification_record(
             [&verification_id],
             |row| row.get(0),
         )?;
+        // A replayed submission must target the same mission, task, and candidate.
+        let replay_task_id: String = transaction.query_row(
+            "SELECT task_id FROM loom_verification WHERE verification_id=?1",
+            [&verification_id],
+            |row| row.get(0),
+        )?;
+        let original_mission: Option<String> = transaction
+            .query_row(
+                "SELECT mission_id FROM loom_plan WHERE plan_id=?1",
+                [&plan_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if original_mission.as_deref() != Some(mission_id.as_str())
+            || replay_task_id != task_id
+            || verification.candidate_id != candidate_id
+        {
+            return Err(LoomCommandError::rejection(
+                LOOM_VERIFICATION_REPLAY_CONFLICT,
+                format!(
+                    "command {command_id} was recorded for a different mission/task/candidate"
+                ),
+            )
+            .into());
+        }
         let status: String = transaction.query_row(
             "SELECT verification_status FROM loom_candidate WHERE candidate_id=?1",
             [&verification.candidate_id],
@@ -5465,6 +5531,226 @@ mod tests {
             stored[0].result,
             LoomVerificationResult::Passed,
             "assertion the_immutable_guard_keeps_the_recorded_result"
+        );
+    }
+
+    // ---------- P4-fix tests ----------
+
+    /// P1: An accepted review on a plan with no acceptance criteria must be rejected.
+    /// The TS evaluator returns false for empty criteria (loom.ts:400); the Rust side must
+    /// agree, or the storage would say "released" while the wire says "blocked".
+    #[test]
+    fn accepted_review_with_empty_criteria_is_rejected() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM empty criteria rejection");
+        // Import a plan with no acceptance criteria.
+        let empty_plan = LoomPlanImportInput {
+            mission_id: mission_id.clone(),
+            goal: "empty criteria edge case".into(),
+            acceptance_criteria_version: "ac-v1".into(),
+            criteria: vec![],
+            tasks: vec![task("task_a", "Task A"), task("task_b", "Task B")],
+            dependencies: vec![edge("task_a", "task_b")],
+        };
+        let candidate = submitted_candidate(&mut database, empty_plan, "task_a");
+        // Attempt to accept with no criteria results — should fail because the plan is empty.
+        let result = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "vacuously true — should be blocked",
+                vec![],
+            ),
+        );
+        assert!(
+            result.is_err(),
+            "assertion empty_criteria_acceptance_must_be_rejected"
+        );
+        let error_text = format!("{}", result.unwrap_err());
+        assert!(
+            error_text.contains("LOOM_ACCEPTANCE_CRITERIA_EMPTY"),
+            "assertion empty_criteria_returns_the_correct_code: {error_text}"
+        );
+    }
+
+    /// P1 companion: rejecting a plan with empty criteria is allowed (rejection does not
+    /// claim all criteria are satisfied).
+    #[test]
+    fn rejected_review_with_empty_criteria_is_allowed() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM empty criteria rejection allowed");
+        let empty_plan = LoomPlanImportInput {
+            mission_id: mission_id.clone(),
+            goal: "empty criteria for rejection".into(),
+            acceptance_criteria_version: "ac-v1".into(),
+            criteria: vec![],
+            tasks: vec![task("task_a", "Task A"), task("task_b", "Task B")],
+            dependencies: vec![edge("task_a", "task_b")],
+        };
+        let candidate = submitted_candidate(&mut database, empty_plan, "task_a");
+        let result = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Rejected,
+                "cannot accept without criteria, sending back",
+                vec![],
+            ),
+        );
+        assert!(
+            result.is_ok(),
+            "assertion a_rejection_does_not_require_nonempty_criteria: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    /// P2: Replay of review_record with a different candidate must return REPLAY_CONFLICT.
+    #[test]
+    fn review_replay_with_different_target_is_rejected() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review replay conflict");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        let command_id = "replay_conflict_command";
+        // Record a review with this command_id.
+        review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                command_id,
+                LoomReviewVerdict::Accepted,
+                "accept",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+
+        // Now make a second mission and candidate with unique task IDs, then replay with
+        // the same command_id but pointing at the different candidate.
+        let mission_id_2 = create_mission(&mut database, "LOOM review replay conflict 2");
+        let plan_2 = LoomPlanImportInput {
+            mission_id: mission_id_2.clone(),
+            goal: "replay conflict plan 2".into(),
+            acceptance_criteria_version: "ac-v1".into(),
+            criteria: vec![
+                criterion("criterion_one", "one"),
+                criterion("criterion_two", "two"),
+            ],
+            tasks: vec![task("task_c", "Task C"), task("task_d", "Task D")],
+            dependencies: vec![edge("task_c", "task_d")],
+        };
+        plan_import(&mut database, plan_2).unwrap();
+        task_release(&mut database, release_input(&mission_id_2, "task_c")).unwrap();
+        let claim_2 = claim_acquire(
+            &mut database,
+            claim_input(&mission_id_2, "task_c", "run_two", "claim_cmd_2"),
+        )
+        .unwrap();
+        let candidate_2 = candidate_record(
+            &mut database,
+            candidate_input_for(&mission_id_2, "task_c", "run_two", "cand_cmd_2", &claim_2),
+        )
+        .unwrap();
+
+        let result = review_record(
+            &mut database,
+            review_input(
+                &mission_id_2,
+                "task_c",
+                &candidate_2.candidate_id,
+                command_id,
+                LoomReviewVerdict::Accepted,
+                "accept",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        );
+        assert!(
+            result.is_err(),
+            "assertion replay_with_different_target_must_fail"
+        );
+        let error_text = format!("{}", result.unwrap_err());
+        assert!(
+            error_text.contains("LOOM_REVIEW_REPLAY_CONFLICT"),
+            "assertion replay_returns_correct_code: {error_text}"
+        );
+    }
+
+    /// P2: Replay of verification_record with a different candidate must return REPLAY_CONFLICT.
+    #[test]
+    fn verification_replay_with_different_target_is_rejected() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verif replay conflict");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        let command_id = "verif_replay_conflict_command";
+        verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                command_id,
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+
+        let mission_id_2 = create_mission(&mut database, "LOOM verif replay conflict 2");
+        let plan_2 = LoomPlanImportInput {
+            mission_id: mission_id_2.clone(),
+            goal: "verif replay conflict plan 2".into(),
+            acceptance_criteria_version: "ac-v1".into(),
+            criteria: vec![
+                criterion("criterion_one", "one"),
+                criterion("criterion_two", "two"),
+            ],
+            tasks: vec![task("task_e", "Task E"), task("task_f", "Task F")],
+            dependencies: vec![edge("task_e", "task_f")],
+        };
+        plan_import(&mut database, plan_2).unwrap();
+        task_release(&mut database, release_input(&mission_id_2, "task_e")).unwrap();
+        let claim_2 = claim_acquire(
+            &mut database,
+            claim_input(&mission_id_2, "task_e", "run_three", "claim_cmd_3"),
+        )
+        .unwrap();
+        let candidate_2 = candidate_record(
+            &mut database,
+            candidate_input_for(&mission_id_2, "task_e", "run_three", "cand_cmd_3", &claim_2),
+        )
+        .unwrap();
+
+        let result = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id_2,
+                "task_e",
+                &candidate_2.candidate_id,
+                command_id,
+                LoomVerificationResult::Passed,
+            ),
+        );
+        assert!(
+            result.is_err(),
+            "assertion verification_replay_with_different_target_must_fail"
+        );
+        let error_text = format!("{}", result.unwrap_err());
+        assert!(
+            error_text.contains("LOOM_VERIFICATION_REPLAY_CONFLICT"),
+            "assertion verification_replay_returns_correct_code: {error_text}"
         );
     }
 }

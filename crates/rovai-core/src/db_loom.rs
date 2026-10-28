@@ -211,6 +211,7 @@ fn review_sql() -> String {
                 WHERE review_id=NEW.review_id
                    OR candidate_id=NEW.candidate_id
                    OR command_id=NEW.command_id
+                   OR rowid=NEW.rowid
             )
             BEGIN SELECT RAISE(ABORT, 'a recorded LOOM review is immutable'); END;
         -- A direct DELETE is refused while the candidate still exists; only the aggregate
@@ -286,6 +287,7 @@ fn verification_sql() -> String {
                 WHERE verification_id=NEW.verification_id
                    OR candidate_id=NEW.candidate_id
                    OR command_id=NEW.command_id
+                   OR rowid=NEW.rowid
             )
             BEGIN SELECT RAISE(ABORT, 'a recorded LOOM verification is immutable'); END;
         CREATE TRIGGER loom_verification_no_direct_delete
