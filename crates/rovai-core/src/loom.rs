@@ -1789,7 +1789,7 @@ pub struct LoomReviewRecordResult {
 /// Every Candidate the Mission's plan produced, oldest first.
 pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<LoomCandidate>> {
     let mission_id = scoped_mission(mission_id)?;
-    let mut statement = database.connection.prepare(
+    let mut statement = database.connection().prepare(
         "SELECT candidate.candidate_id, candidate.task_id, candidate.agent_run_id,
                 candidate.content_hash, candidate.evidence_ids_json,
                 candidate.acceptance_criteria_version, candidate.previous_candidate_id,
@@ -1802,7 +1802,20 @@ pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<Loom
          WHERE plan.mission_id=?1
          ORDER BY candidate.created_at, candidate.candidate_id",
     )?;
-    let rows = statement
+    type CandidateRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+    );
+    let rows: Vec<CandidateRow> = statement
         .query_map([mission_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1863,7 +1876,7 @@ pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<Loom
 /// Every Review recorded under the Mission's plan, oldest first.
 pub fn reviews_list(database: &Database, mission_id: &str) -> Result<Vec<LoomReview>> {
     let mission_id = scoped_mission(mission_id)?;
-    let mut statement = database.connection.prepare(
+    let mut statement = database.connection().prepare(
         "SELECT review.review_id, review.candidate_id, review.acceptance_criteria_version,
                 review.verdict, review.reason, review.criteria_results_json, review.reviewer_id,
                 review.reviewed_at
@@ -1872,7 +1885,8 @@ pub fn reviews_list(database: &Database, mission_id: &str) -> Result<Vec<LoomRev
          WHERE plan.mission_id=?1
          ORDER BY review.reviewed_at, review.review_id",
     )?;
-    let rows = statement
+    type ReviewRow = (String, String, String, String, String, String, String, String);
+    let rows: Vec<ReviewRow> = statement
         .query_map([mission_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
