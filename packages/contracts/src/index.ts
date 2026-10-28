@@ -4319,6 +4319,7 @@ export type CoreMethod =
   | 'loom.candidates.list'
   | 'loom.claims.list'
   | 'loom.artifact.register'
+  | 'loom.artifacts.list'
   | 'loom.reviews.list'
   | 'loom.review.record'
   | 'loom.verifications.list'

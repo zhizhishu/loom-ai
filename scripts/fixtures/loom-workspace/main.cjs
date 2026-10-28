@@ -116,7 +116,7 @@ app.whenReady().then(async () => {
     return area.value
   })()`)
   const writeLog = () => script('window.loomQA.writes')
-  // 写后回读的精确预算：七个读方法各「挂载 1 次 + 写后刷新 1 次」，多一次少一次都 FAIL。
+  // 写后回读的精确预算：八个读方法各「挂载 1 次 + 写后刷新 1 次」，多一次少一次都 FAIL。
   // activity / delivery 沿用本文件既有计数规则（恒为 1）。任务能力快照不在这里验：各写用例都先
   // resetLoom() 再重挂载，而能力快照只在首屏挂载那条路径上读，故 preferences.tasks.get 只在
   // 首屏 / 回切 / 截图后三处断言，写用例里不断言它。
@@ -131,7 +131,8 @@ app.whenReady().then(async () => {
       candidates: window.loomQA.countOf('loom.candidates.list'),
       reviews: window.loomQA.countOf('loom.reviews.list'),
       verifications: window.loomQA.countOf('loom.verifications.list'),
-      claims: window.loomQA.countOf('loom.claims.list')
+      claims: window.loomQA.countOf('loom.claims.list'),
+      artifacts: window.loomQA.countOf('loom.artifacts.list')
     })`)
     assert.equal(counts.activity, 1, `${label} repeated the activity read: ${JSON.stringify(counts)}`)
     assert.equal(counts.delivery, 1, `${label} repeated the delivery read: ${JSON.stringify(counts)}`)
@@ -143,6 +144,9 @@ app.whenReady().then(async () => {
     // 所以它必须同样精确计数（挂载 1 + 写后 1），不许只靠「至少读过一次」。
     assert.equal(counts.claims, 2,
       `${label} must re-read the seventh projection (loom.claims.list) exactly once after the write (1 mount + 1 refresh): ${JSON.stringify(counts)}`)
+    // 第八个投影：产物读只影响候选卡的证据区，但同样是「挂载 1 + 写后 1」，不能靠「至少读过一次」蒙过去。
+    assert.equal(counts.artifacts, 2,
+      `${label} must re-read the eighth projection (loom.artifacts.list) exactly once after the write (1 mount + 1 refresh): ${JSON.stringify(counts)}`)
     return counts
   }
   // 回读不能只是夹具内存变了：切到「编排」tab 看任务节点是否真的被推进，再切回「交付」看徽章。
@@ -227,6 +231,38 @@ app.whenReady().then(async () => {
     await switchClaims(scenario, options)
     await openPlanTab(label)
   }
+  // 产物回读只有「读成功 / 读失败」两个开关；同样先切开关再重挂载，两种实现都会拿到新回包。
+  const switchArtifacts = async (options = {}) => {
+    await script("(() => { const node = document.querySelector('.loom-workspace'); if (node) node.__loomReset = 'stale'; return true })()")
+    await script(`window.loomQA.setArtifacts(${JSON.stringify(options)})`)
+    await waitFor("document.querySelector('.loom-workspace') !== null && document.querySelector('.loom-workspace').__loomReset === undefined",
+      'LOOM workspace did not remount to read the artifacts projection')
+  }
+  // 候选卡的逐条证据区：只读已渲染的 DOM（不读夹具内存），一条证据一行。
+  const evidenceRows = hash => script(`(() => {
+    const card = ${cardFor(hash)}
+    if (!card) return null
+    return [...card.querySelectorAll('.loom-candidate-evidence .loom-evidence-row')].map(row => ({
+      state: row.querySelector('.loom-evidence-state')?.getAttribute('data-artifact-state') ?? null,
+      path: row.querySelector('.loom-evidence-path')?.innerText ?? null,
+      pathTitle: row.querySelector('.loom-evidence-path')?.getAttribute('title') ?? null,
+      hash: row.querySelector('.loom-evidence-hash')?.innerText ?? null,
+      hashTitle: row.querySelector('.loom-evidence-hash')?.getAttribute('title') ?? null,
+      size: row.querySelector('.loom-evidence-size')?.innerText ?? null,
+      badge: row.querySelector('.loom-evidence-state')?.innerText ?? null
+    }))
+  })()`)
+  // 产物投影与任务节点一样可能晚落地：断言等行数，不读一次就下结论。
+  const waitEvidence = async (hash, count, message) => {
+    const deadline = Date.now() + 8000
+    let seen = null
+    while (Date.now() < deadline) {
+      seen = await evidenceRows(hash)
+      if (seen !== null && seen.length === count) return seen
+      await sleep(30)
+    }
+    throw new Error(`${message}: ${JSON.stringify(seen)}`)
+  }
   // 认领块会改变节点高度，但不能改变图区宽度预算：1440 下仍然不许横向溢出。
   const expectPlanWidths = async label => {
     const widths = await script(`({
@@ -248,7 +284,7 @@ app.whenReady().then(async () => {
   const criterionVerdicts = reviewText => reviewText.split('\n').map(line => line.trim())
     .filter(line => / · (未)?满足$/.test(line))
     .map(line => ({ criterionId: line.split(' · ')[0], satisfied: line.endsWith('· 满足') }))
-  // 每条点击用例都从同一个初始态开始：数据回基线，工作区按基线重挂载并重读六个投影。
+  // 每条点击用例都从同一个初始态开始：数据回基线，工作区按基线重挂载并重读八个投影。
   const resetLoom = async () => {
     await script("(() => { const node = document.querySelector('.loom-workspace'); if (node) node.__loomReset = 'stale'; return true })()")
     await script('window.loomQA.reset()')
@@ -503,7 +539,7 @@ app.whenReady().then(async () => {
   stage = 'wide layout density'
   // 宽屏信息密度（Astra 方案 B）：三档全部量「工作区实际宽度」的占比与卡片相对位置，
   // 不用「看起来更满」当证据；既有断言一条不动，这里只加。本段不新增 cases 条目，
-  // 因为 scripts/lib/loom-workspace.test.mjs 的 EXPECTED_CASES = 19 是既有预算。
+  // 因为 scripts/lib/loom-workspace.test.mjs 的 EXPECTED_CASES 是既有预算（本段不占名额）。
   const resizeTo = async (width, height, label) => {
     window.setContentSize(width, height)
     await waitFor(`window.innerWidth === ${width} && window.innerHeight === ${height}`,
@@ -1146,6 +1182,121 @@ app.whenReady().then(async () => {
   assert.deepEqual(await script('window.loomQA.errors'), [],
     'A forced claims read failure was misreported as an unanswered fixture method')
   cases.push('loom.claims.list 读失败时编排显示认领状态未知、不猜任何一个租约状态，且任务节点、统计、连线与交付面板仍正常')
+
+  stage = 'candidate card: registered artifact'
+  await resetLoom()
+  await openDelivery()
+  // 已登记与未登记同屏：candidate-1 的 evidence-1 对得上产物，evidence-2 对不上。
+  const reviewedEvidence = await waitEvidence('sha256:restore-protocol', 2,
+    'The reviewed candidate did not render one evidence row per evidenceId')
+  const registeredRow = reviewedEvidence[0]
+  assert.equal(registeredRow.state, 'registered',
+    `A registered artifact must be marked data-artifact-state=registered: ${JSON.stringify(registeredRow)}`)
+  assert.equal(registeredRow.path, 'artifacts/restore-protocol.md',
+    `The registered artifact lost its relative path: ${JSON.stringify(registeredRow)}`)
+  assert.equal(registeredRow.pathTitle, 'artifacts/restore-protocol.md',
+    `The registered artifact path must stay complete in title: ${JSON.stringify(registeredRow.pathTitle)}`)
+  assert.match(registeredRow.hash, /^[0-9a-f]{12}$/u,
+    `The artifact hash must be the first 12 hex characters of sha256: ${JSON.stringify(registeredRow.hash)}`)
+  assert.equal(registeredRow.hash, 'a1b2c3d4a1b2',
+    `The short hash does not match the fixture sha256 prefix: ${JSON.stringify(registeredRow.hash)}`)
+  assert.equal(registeredRow.hashTitle, 'a1b2c3d4'.repeat(8),
+    `The short hash must carry the full sha256 in title: ${JSON.stringify(registeredRow.hashTitle)}`)
+  assert.equal(registeredRow.size, '512 B',
+    `Byte sizes must print without a decimal: ${JSON.stringify(registeredRow.size)}`)
+  assert.equal(registeredRow.badge, '已登记',
+    `A registered artifact may only read 已登记, never 已核验: ${JSON.stringify(registeredRow.badge)}`)
+  assert.deepEqual(reviewedEvidence.filter(row => row.badge === '已核验' || row.badge === '已验证').map(row => row.badge), [],
+    `The artifact badge must not claim verification: ${JSON.stringify(reviewedEvidence.map(row => row.badge))}`)
+  // 只列候选自己引用的产物：未被引用的那一条（evidence-9）不得被当成“凑数”显示出来。
+  const deliveryCopy = await script("document.querySelector('.loom-delivery-context')?.innerText ?? ''")
+  assert.equal(deliveryCopy.includes('restore-trace-with-a-deliberately-long-file-name.log'), false,
+    'The evidence block listed a registered artifact no candidate evidenceId refers to')
+  cases.push('候选卡逐条渲染已登记产物的相对路径、12 位短 hash（title 保留全长）、人类可读大小与「已登记」徽章，只列被引用的产物且不冒充已核验')
+
+  stage = 'candidate card: unregistered evidence id'
+  const unmatchedRow = reviewedEvidence[1]
+  assert.equal(unmatchedRow.state, 'unregistered',
+    `An evidence id with no registered artifact must be marked unregistered: ${JSON.stringify(unmatchedRow)}`)
+  assert.equal(unmatchedRow.path, 'evidence-2',
+    `An unregistered evidence row must show the raw evidenceId: ${JSON.stringify(unmatchedRow.path)}`)
+  assert.equal(unmatchedRow.hash, null, `An unregistered evidence row must not invent a hash: ${JSON.stringify(unmatchedRow.hash)}`)
+  assert.equal(unmatchedRow.size, null, `An unregistered evidence row must not invent a size: ${JSON.stringify(unmatchedRow.size)}`)
+  assert.equal(unmatchedRow.badge, '未登记',
+    `An unmatched evidence id must read 未登记: ${JSON.stringify(unmatchedRow.badge)}`)
+  const targetEvidence = await waitEvidence(TARGET_CANDIDATE, 1,
+    'The target candidate did not render its own evidence row')
+  assert.equal(targetEvidence[0].state, 'unregistered',
+    `The target candidate's evidence id has no artifact and must read unregistered: ${JSON.stringify(targetEvidence[0])}`)
+  assert.equal(targetEvidence[0].path, 'evidence-3',
+    `The target candidate must show the raw evidenceId, not another candidate's path: ${JSON.stringify(targetEvidence[0].path)}`)
+  assert.equal(targetEvidence[0].badge, '未登记',
+    `The target candidate's unmatched evidence id must read 未登记: ${JSON.stringify(targetEvidence[0].badge)}`)
+  cases.push('对不上任何已登记产物的 evidenceId 显示 evidenceId 原文与「未登记」徽章，不借用其他候选的路径、hash 或大小')
+
+  stage = 'artifact projection: read failure'
+  await resetLoom()
+  await switchArtifacts({ fail: true })
+  await openDelivery()
+  const unknownEvidence = await waitEvidence('sha256:restore-protocol', 2,
+    'A failing loom.artifacts.list dropped the evidence rows')
+  assert.deepEqual(unknownEvidence.map(row => row.state), ['unknown', 'unknown'],
+    `A failed artifacts read must mark every evidence row unknown: ${JSON.stringify(unknownEvidence.map(row => row.state))}`)
+  assert.deepEqual(unknownEvidence.map(row => row.badge), ['产物信息读取失败', '产物信息读取失败'],
+    `A failed artifacts read must read 产物信息读取失败 on every row: ${JSON.stringify(unknownEvidence.map(row => row.badge))}`)
+  assert.equal(unknownEvidence.some(row => row.badge === '未登记' || row.badge === '已登记'), false,
+    `A failed artifacts read must not pretend registered or unregistered: ${JSON.stringify(unknownEvidence.map(row => row.badge))}`)
+  assert.deepEqual(unknownEvidence.map(row => row.path), ['evidence-1', 'evidence-2'],
+    `A failed artifacts read must fall back to the raw evidenceIds: ${JSON.stringify(unknownEvidence.map(row => row.path))}`)
+  assert.deepEqual(unknownEvidence.filter(row => row.hash !== null || row.size !== null).map(row => row.path), [],
+    `A failed artifacts read must not invent hash or size: ${JSON.stringify(unknownEvidence)}`)
+  // 其余七个投影必须照常：候选、两枚徽章、写入口、共享交付面板、编排图都不受影响。
+  const afterArtifactsFailure = await script(`({
+    candidates: document.querySelectorAll('.loom-delivery-context .loom-candidate').length,
+    verificationBadges: [...document.querySelectorAll('.loom-badge-verification')].map(node => node.getAttribute('data-state')),
+    acceptanceBadges: [...document.querySelectorAll('.loom-badge-acceptance')].map(node => node.getAttribute('data-state')),
+    actions: [...document.querySelectorAll('.loom-delivery-actions button')].map(button => button.innerText),
+    review: document.querySelector('.loom-candidate-review')?.innerText ?? null,
+    sharedEvidence: document.querySelectorAll('.loom-workspace .mission-evidence-row').length,
+    deliveryEmpty: document.querySelectorAll('.loom-delivery-context .loom-empty').length
+  })`)
+  assert.equal(afterArtifactsFailure.candidates, 2,
+    `A failed artifacts read must keep both candidate cards: ${JSON.stringify(afterArtifactsFailure)}`)
+  assert.deepEqual(afterArtifactsFailure.verificationBadges, ['verified', 'unverified'],
+    `A failed artifacts read changed the verification axis: ${JSON.stringify(afterArtifactsFailure.verificationBadges)}`)
+  assert.deepEqual(afterArtifactsFailure.acceptanceBadges, ['accepted', 'pending'],
+    `A failed artifacts read changed the acceptance axis: ${JSON.stringify(afterArtifactsFailure.acceptanceBadges)}`)
+  assert.deepEqual(afterArtifactsFailure.actions, ['接受', '驳回', '通过核验', '核验失败'],
+    `A failed artifacts read removed the delivery actions: ${JSON.stringify(afterArtifactsFailure.actions)}`)
+  assert.equal(typeof afterArtifactsFailure.review, 'string',
+    `A failed artifacts read dropped the recorded review: ${JSON.stringify(afterArtifactsFailure.review)}`)
+  assert.ok(afterArtifactsFailure.sharedEvidence >= 4,
+    `A failed artifacts read blanked the shared delivery panel: ${JSON.stringify(afterArtifactsFailure.sharedEvidence)}`)
+  assert.equal(afterArtifactsFailure.deliveryEmpty, 0,
+    `A failed artifacts read degraded the delivery section into an error empty state: ${JSON.stringify(afterArtifactsFailure.deliveryEmpty)}`)
+  await openPlanTab('the failing artifacts read')
+  const planAfterArtifactsFailure = await script(`({
+    nodes: document.querySelectorAll('.loom-plan .loom-flow-node').length,
+    edges: document.querySelectorAll('.loom-plan .loom-flow-edge').length,
+    stats: document.querySelector('.loom-plan .loom-flow-stats')?.innerText ?? '',
+    empty: document.querySelectorAll('.loom-plan .loom-empty').length,
+    claimStates: [...document.querySelectorAll('.loom-plan .loom-flow-claim')].map(node => node.getAttribute('data-claim-state'))
+  })`)
+  assert.equal(planAfterArtifactsFailure.nodes, 4,
+    `A failed artifacts read must not take the task nodes down: ${JSON.stringify(planAfterArtifactsFailure)}`)
+  assert.equal(planAfterArtifactsFailure.edges, 3,
+    `A failed artifacts read must keep the dependency edges: ${JSON.stringify(planAfterArtifactsFailure.edges)}`)
+  assert(planAfterArtifactsFailure.stats.includes('总任务: 4') && planAfterArtifactsFailure.stats.includes('依赖就绪: 1'),
+    `A failed artifacts read must not blank the flow stats: ${JSON.stringify(planAfterArtifactsFailure.stats)}`)
+  assert.equal(planAfterArtifactsFailure.empty, 0,
+    `A failed artifacts read turned 编排 into the read-failed empty state: ${JSON.stringify(planAfterArtifactsFailure.empty)}`)
+  assert.deepEqual(planAfterArtifactsFailure.claimStates, ['none', 'none', 'none', 'none'],
+    `A failed artifacts read disturbed the claims projection: ${JSON.stringify(planAfterArtifactsFailure.claimStates)}`)
+  await expectPlanWidths('a failing artifacts read')
+  await backToDelivery('the failing artifacts read')
+  assert.deepEqual(await script('window.loomQA.errors'), [],
+    'A forced artifacts read failure was misreported as an unanswered fixture method')
+  cases.push('loom.artifacts.list 读失败时只有候选卡产物区降级成「产物信息读取失败」（不冒充未登记），其余七个投影照常渲染')
 
   console.log(JSON.stringify({ ok: true, cases, shots, counts: final, output }))
   app.exit(0)

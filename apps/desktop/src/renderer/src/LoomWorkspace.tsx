@@ -1,5 +1,5 @@
-import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification, LoomClaim, LoomClaimsListResult } from '@contracts'
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
 import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
@@ -375,6 +375,16 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
   </div>
 }
 
+/**
+ * 产物大小的展示换算：B / KiB / MiB 三档，B 不带小数。
+ * 只换单位，不回写、不四舍五入到「看起来更整」的值。
+ */
+function artifactSizeLabel(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+}
+
 /** 一次人工验收的在途表单：勾选集合按 criterionId 记，不依赖数组下标。 */
 type DeliveryDraft = {
   candidateId: string
@@ -383,15 +393,20 @@ type DeliveryDraft = {
   satisfied: readonly string[]
 }
 
-function DeliveryReview({ candidates, reviews, verifications, plan, missionId, onRefresh }: {
+function DeliveryReview({ candidates, reviews, verifications, artifacts, plan, missionId, onRefresh }: {
   candidates: LoomCandidate[]
   reviews: LoomReview[]
   verifications: LoomVerification[]
+  artifacts: LoomArtifact[] | null
   plan: LoomPlan | null
   missionId: string
   onRefresh: () => void
 }) {
   const t = useUiText()
+  // 证据 ID 就是产物登记里的 artifactId：一次建索引，逐条回填，不在渲染里反复扫数组。
+  const artifactById = useMemo(
+    () => new Map<string, LoomArtifact>((artifacts ?? []).map(entry => [entry.artifactId, entry] as const)),
+    [artifacts])
   const client = useThreadClient()
   const [draft, setDraft] = useState<DeliveryDraft | null>(null)
   // 写入是串行的人工动作：在途时禁用全部操作，避免重复 commandId 之外的并发提交。
@@ -514,6 +529,26 @@ function DeliveryReview({ candidates, reviews, verifications, plan, missionId, o
             </span>
           </div>
           <div className="loom-candidate-meta">{candidate.contentHash} · {t('证据')} {candidate.evidenceIds.length} {t('条')}</div>
+          {/* 逐条证据：只读已登记的产物行。登记证明当时算过 hash，不重读字节，所以徽章只说「已登记」，
+              不说「已核验」。artifacts 为 null 是整条投影读不到，不能降级成「未登记」。 */}
+          {candidate.evidenceIds.length > 0 && <div className="loom-candidate-evidence">
+            {candidate.evidenceIds.map(evidenceId => {
+              const artifact = artifacts === null ? undefined : artifactById.get(evidenceId)
+              const state = artifacts === null ? 'unknown' : artifact === undefined ? 'unregistered' : 'registered'
+              return <div key={evidenceId} className="loom-evidence-row">
+                {artifact === undefined
+                  ? <span className="loom-evidence-path">{evidenceId}</span>
+                  : <>
+                    <span className="loom-evidence-path" title={artifact.relativePath}>{artifact.relativePath}</span>
+                    <span className="loom-evidence-hash" title={artifact.sha256}>{artifact.sha256.slice(0, 12)}</span>
+                    <span className="loom-evidence-size">{artifactSizeLabel(artifact.sizeBytes)}</span>
+                  </>}
+                <span className="loom-evidence-state" data-artifact-state={state}>
+                  {state === 'unknown' ? t('产物信息读取失败') : state === 'registered' ? t('已登记') : t('未登记')}
+                </span>
+              </div>
+            })}
+          </div>}
           {review !== undefined && <div className="loom-candidate-review">
             <div>{t('验收结论')}：{review.verdict === 'accepted' ? t('通过') : t('驳回')} · {review.reason}</div>
             {review.criteriaResults.map(result => <div key={result.criterionId}>
@@ -593,10 +628,12 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
   const [verifications, setVerifications] = useState<LoomVerification[]>([])
   // 认领投影：null = 读不到（不是「没有认领」）。数组为空才算真的没人认领。
   const [claims, setClaims] = useState<LoomClaim[] | null>(null)
+  // 产物投影：语义同 claims——null = 读不到（不是「没有产物」）。数组为空才算真的没有登记过。
+  const [artifacts, setArtifacts] = useState<LoomArtifact[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
-  // 写入口（验收 / 核验）成功后重新读一遍七个投影：状态只认控制面回读，不在本地猜。
+  // 写入口（验收 / 核验）成功后重新读一遍八个投影：状态只认控制面回读，不在本地猜。
   const reload = useCallback((): void => {
     void Promise.all([
       client.request<LoomPlan | null>('loom.plan.get', { missionId: mission.missionId }),
@@ -605,12 +642,15 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       client.request<LoomCandidate[]>('loom.candidates.list', { missionId: mission.missionId }),
       client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId }),
       client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId }),
-      // 认领读失败不拖垮其他六个投影：只把认领区降级成「认领状态未知」。
+      // 认领读失败不拖垮其他投影：只把认领区降级成「认领状态未知」。
       client.request<LoomClaimsListResult>('loom.claims.list', { missionId: mission.missionId })
-        .then((result): LoomClaimsListResult | null => result, () => null)
-    ]).then(([p, t, d, c, r, v, k]) => {
+        .then((result): LoomClaimsListResult | null => result, () => null),
+      // 产物读失败同理：只把候选卡的产物区降级成「产物信息读取失败」，其他七个投影照常。
+      client.request<LoomArtifactsListResult>('loom.artifacts.list', { missionId: mission.missionId })
+        .then((result): LoomArtifactsListResult | null => result, () => null)
+    ]).then(([p, t, d, c, r, v, k, a]) => {
       setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v)
-      setClaims(k === null ? null : k.claims); setError('')
+      setClaims(k === null ? null : k.claims); setArtifacts(a === null ? null : a.artifacts); setError('')
     }).catch(e => setError(e.message ?? '刷新失败'))
   }, [client, mission.missionId])
   
@@ -632,11 +672,13 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId }),
       client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId }),
       client.request<LoomClaimsListResult>('loom.claims.list', { missionId: mission.missionId })
-        .then((result): LoomClaimsListResult | null => result, () => null)
-    ]).then(([p, t, d, c, r, v, k]) => {
+        .then((result): LoomClaimsListResult | null => result, () => null),
+      client.request<LoomArtifactsListResult>('loom.artifacts.list', { missionId: mission.missionId })
+        .then((result): LoomArtifactsListResult | null => result, () => null)
+    ]).then(([p, t, d, c, r, v, k, a]) => {
       if (alive) {
         setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v)
-        setClaims(k === null ? null : k.claims); setError('')
+        setClaims(k === null ? null : k.claims); setArtifacts(a === null ? null : a.artifacts); setError('')
       }
     }).catch(e => {
       if (alive) setError(e.message ?? '读取编排数据失败')
@@ -662,7 +704,7 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
     <div className="loom-section-body">
       {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} claims={claims} loading={loading} error={error}/></div>}
       <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
-        {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews} verifications={verifications} plan={plan} missionId={mission.missionId} onRefresh={reload}/></div>}
+        {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews} verifications={verifications} artifacts={artifacts} plan={plan} missionId={mission.missionId} onRefresh={reload}/></div>}
         <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>
         <div hidden={section !== 'activity'}><MissionActivityPanel mission={mission} agents={agents} onSource={onSource}/></div>
       </div>

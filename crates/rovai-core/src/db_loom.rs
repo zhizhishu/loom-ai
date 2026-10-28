@@ -404,6 +404,54 @@ fn artifact_sql() -> String {
     )
 }
 
+/// The unique index that stops one plan registering the same path twice. Only the columns are
+/// checked: an index with the expected name over different columns admits the duplicates the write
+/// path assumes cannot exist.
+fn artifact_path_index_covers_plan_and_path(connection: &Connection) -> rusqlite::Result<bool> {
+    // `unique` is a keyword, so it has to be quoted to be read as the pragma's column name.
+    let mut list =
+        connection.prepare("SELECT name FROM pragma_index_list(?1) WHERE \"unique\"=1")?;
+    let names: Vec<String> = list
+        .query_map([ARTIFACT_TABLE], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for name in names {
+        let mut info =
+            connection.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+        let columns: Vec<String> = info
+            .query_map([name.as_str()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if columns.len() == 2 && columns[0] == "plan_id" && columns[1] == "relative_path" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A trigger is only worth its name when its body raises. Checking the name alone accepts
+/// `CREATE TRIGGER loom_artifact_immutable BEFORE UPDATE ON loom_artifact BEGIN SELECT 1; END;`,
+/// which blocks nothing while still carrying the name the schema check looks for.
+fn trigger_body_blocks(
+    connection: &Connection,
+    name: &str,
+    header: &str,
+    tokens: &[&str],
+) -> rusqlite::Result<bool> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(false);
+    };
+    let compact = sql.split_whitespace().collect::<String>().to_lowercase();
+    Ok(compact.contains(header)
+        && compact.contains("raise(abort")
+        && tokens.iter().all(|token| compact.contains(token)))
+}
+
 fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     let columns: i64 = connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
@@ -425,7 +473,38 @@ fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
             && sql.contains("CHECK(size_bytes>=0)")
             && sql.contains("REFERENCESloom_plan(plan_id)ONDELETECASCADE")
     });
-    Ok(columns == 10 && triggers == 3 && declared)
+    let path_index = artifact_path_index_covers_plan_and_path(connection)?;
+    let header = |event: &str| format!("before{event}on{ARTIFACT_TABLE}");
+    let immutable = trigger_body_blocks(
+        connection,
+        "loom_artifact_immutable",
+        &header("update"),
+        &[],
+    )?;
+    let no_replace = trigger_body_blocks(
+        connection,
+        "loom_artifact_no_replace",
+        &header("insert"),
+        &[
+            "plan_id=new.plan_id",
+            "relative_path=new.relative_path",
+            "rowid=new.rowid",
+        ],
+    )?;
+    let plan_source = format!("from{PLAN_TABLE}");
+    let no_direct_delete = trigger_body_blocks(
+        connection,
+        "loom_artifact_no_direct_delete",
+        &header("delete"),
+        &[plan_source.as_str()],
+    )?;
+    Ok(columns == 10
+        && triggers == 3
+        && declared
+        && path_index
+        && immutable
+        && no_replace
+        && no_direct_delete)
 }
 
 /// Migration 224: the artifact row an evidence id can point at.
@@ -857,6 +936,57 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    /// A schema check that only looks at names accepts a table that enforces nothing: a same-named
+    /// trigger with an empty body, or a unique index over the wrong columns. Both must be refused,
+    /// because either one silently reopens a hole migration 224 was written to close.
+    #[test]
+    fn artifact_schema_check_refuses_a_hollow_trigger_and_a_narrow_index() {
+        let database = crate::test_support::seeded_runtime_database_owned();
+        assert!(
+            artifact_schema_matches(database.connection()).unwrap(),
+            "assertion the shipped artifact projection passes its own check"
+        );
+
+        // Same name, same event, a body that never raises: only the body tells them apart.
+        database
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER loom_artifact_immutable;
+                 CREATE TRIGGER loom_artifact_immutable BEFORE UPDATE ON loom_artifact
+                 BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        assert!(
+            !artifact_schema_matches(database.connection()).unwrap(),
+            "assertion a trigger whose body never raises is not accepted"
+        );
+        database
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER loom_artifact_immutable;
+                 CREATE TRIGGER loom_artifact_immutable BEFORE UPDATE ON loom_artifact
+                 BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;",
+            )
+            .unwrap();
+        assert!(
+            artifact_schema_matches(database.connection()).unwrap(),
+            "assertion the restoring trigger is accepted again"
+        );
+
+        // A unique index that only covers plan_id admits two rows for the same relative path.
+        database
+            .connection()
+            .execute_batch(
+                "DROP INDEX loom_artifact_plan_path_idx;
+                 CREATE UNIQUE INDEX loom_artifact_plan_path_idx ON loom_artifact(plan_id);",
+            )
+            .unwrap();
+        assert!(
+            !artifact_schema_matches(database.connection()).unwrap(),
+            "assertion an index that does not cover the path is not accepted"
+        );
     }
 
     fn plan_criteria_version_columns(database: &Database) -> i64 {

@@ -218,6 +218,17 @@ export interface LoomClaimsListResult {
   claims: LoomClaim[]
 }
 
+/**
+ * 产物投影：该 Mission 的 Plan 下已登记的产物，按登记时间排序。
+ *
+ * 只读已记录的行：`sha256` 是登记当时 Host 算出的值，不代表磁盘上的字节现在仍然一致——
+ * 那只有核验会重读。所以界面只能说「已登记」，不能说「已核验」。
+ */
+export interface LoomArtifactsListResult {
+  /** 该 Mission 下已登记的产物，最早的在前 */
+  artifacts: LoomArtifact[]
+}
+
 /** 依赖未释放原因。 */
 export type LoomDependencyBlockReason =
   | 'upstream_task_missing'

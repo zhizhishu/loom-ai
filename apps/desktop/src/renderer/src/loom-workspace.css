@@ -141,6 +141,17 @@
 .loom-badge-acceptance[data-state='accepted'] { color: var(--accent); }
 .loom-badge-acceptance[data-state='rejected'] { color: var(--attention); }
 .loom-candidate-meta { margin-top: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+/* 逐条证据：一行装「相对路径 + 短 hash + 大小 + 徽章」。路径可换行，卡片不被撑破；
+   三态只靠已有语义色区分（登记=主色、未登记=弱化、读不到=attention），不用纯红纯绿。 */
+.loom-candidate-evidence { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.loom-evidence-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.loom-evidence-path { min-width: 0; flex: 1 1 12ch; overflow-wrap: anywhere; color: var(--ink); font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }
+.loom-evidence-hash { flex: 0 0 auto; color: var(--faint); font: 11px ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric: tabular-nums; }
+.loom-evidence-size { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.loom-evidence-state { flex: 0 0 auto; border: 1px solid currentColor; border-radius: 999px; padding: 1px 7px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.loom-evidence-state[data-artifact-state='registered'] { color: var(--accent); }
+.loom-evidence-state[data-artifact-state='unregistered'] { color: var(--faint); border-style: dashed; }
+.loom-evidence-state[data-artifact-state='unknown'] { color: var(--attention); }
 .loom-candidate-review { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font-size: 11px; line-height: 1.7; }
 /* 写入口：验收与核验是两条独立的人工轴。按钮只提示结论方向，小圆角、无动效。 */
 /* 核验记录用独立 class：验收记录的条数断言不能被核验记录混在一起。 */

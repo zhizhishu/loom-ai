@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt, LoomClaim, LoomClaimsListResult } from '@contracts'
+import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
 import { LoomWorkspace } from '../../../apps/desktop/src/renderer/src/LoomWorkspace'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { applyAppearanceSnapshot } from '../../../apps/desktop/src/renderer/src/theme'
@@ -39,6 +39,7 @@ type LoomQa = {
   reset(): void
   setTheme(theme: 'day' | 'night'): void
   setClaims(scenario: LoomClaimsScenario, options?: { fail?: boolean }): void
+  setArtifacts(options?: { fail?: boolean }): void
 }
 declare global { interface Window { loomQA: LoomQa } }
 
@@ -194,6 +195,35 @@ function readClaims(): LoomClaimsListResult {
   return { evaluatedAt: claimsEvaluatedAt, claims: structuredClone(claimsByScenario[claimsScenario]) }
 }
 
+// 产物登记回读：固定两条。一条与候选的 evidenceId 对得上（evidence-1），一条对不上任何候选
+// （evidence-9），好让「已登记 / 未登记」两个分支在同一张卡片上同时可见。
+// sha256 都是合法 64 位十六进制，sizeBytes 一小一大（512 B / 2.5 MiB），单位换算能被断言。
+const artifactsRegisteredAt = '2026-09-27T09:30:00.000Z'
+const artifactShaShort = 'a1b2c3d4'.repeat(8)
+const artifactShaLong = 'f0e1d2c3'.repeat(8)
+const artifacts: LoomArtifact[] = [
+  {
+    artifactId: 'evidence-1', planId: plan.planId, taskId: 'task-1', agentRunId: 'run-1',
+    relativePath: 'artifacts/restore-protocol.md', sha256: artifactShaShort, sizeBytes: 512,
+    contentType: 'text/markdown', creatorId: 'local_user', createdAt: artifactsRegisteredAt
+  },
+  {
+    artifactId: 'evidence-9', planId: plan.planId, taskId: null, agentRunId: null,
+    relativePath: 'artifacts/runtime/restore-trace-with-a-deliberately-long-file-name.log',
+    sha256: artifactShaLong, sizeBytes: 2_621_440, contentType: 'text/plain',
+    creatorId: 'local_user', createdAt: artifactsRegisteredAt
+  }
+]
+
+// 读失败开关：打开后 loom.artifacts.list 直接抛错。抛错不等于「夹具没应答这个方法」，所以不进
+// errors；UI 只能把候选卡的产物区降级成「产物信息读取失败」，不许说成「未登记」，也不许拦下其余投影。
+let artifactsReadFails = false
+
+function readArtifacts(): LoomArtifactsListResult {
+  if (artifactsReadFails) throw new Error('LOOM fixture forced the artifacts projection read to fail')
+  return { artifacts: structuredClone(artifacts) }
+}
+
 const delivery: MissionDelivery = {
   threadId: mission.threadId, workingDirectory: '/workspace/rovai-ai-mission-018', git: true,
   workspace: {
@@ -228,7 +258,7 @@ const writes: LoomWrite[] = []
 const errors: string[] = []
 const selections: string[] = []
 
-// 写入侧状态：验收/核验两条轴的写结果直接落在内存投影上，六个读方法随之回读一致数据。
+// 写入侧状态：验收/核验两条轴的写结果直接落在内存投影上，八个读方法随之回读一致数据。
 const writeStamp = '2026-09-27T09:00:00.000Z'
 let writeSequence = 0
 // 每条点击用例都从同一初始态开始：基线在首次写入前冻结，reset() 原样拷回。
@@ -343,6 +373,9 @@ async function request<T>(method: string, params: unknown = {}): Promise<T> {
   } else if (method === 'loom.claims.list') {
     // 认领投影按场景生成；读失败开关在这里抛错，让 UI 走「认领状态未知」分支。
     reply = readClaims()
+  } else if (method === 'loom.artifacts.list') {
+    // 产物投影固定两条；读失败开关在这里抛错，让 UI 只降级候选卡的产物区。
+    reply = readArtifacts()
   } else if (method === 'missions.diffSession.release') {
     // 写成功后的收尾副作用：只应答，不进 writes，也不参与 loom 写方法统计。
     reply = { released: true }
@@ -373,7 +406,7 @@ Object.defineProperty(document, 'hasFocus', { value: () => true })
 Object.defineProperty(document, 'visibilityState', { value: 'visible' })
 setTheme(new URLSearchParams(location.search).get('theme') === 'night' ? 'night' : 'day')
 
-// reset() 换 key 强制重挂载：LoomWorkspace 会按恢复后的初始数据重读六个投影，
+// reset() 换 key 强制重挂载：LoomWorkspace 会按恢复后的初始数据重读八个投影，
 // 这样每条点击用例都从同一个初始态开始，不继承上一条用例写下的结论。
 let remountWorkspace: () => void = () => undefined
 
@@ -404,6 +437,8 @@ window.loomQA = {
     // 认领回读也回初始态：空列表、读成功，下一条用例自己切形态。
     claimsScenario = 'empty'
     claimsReadFails = false
+    // 产物回读同样回初始态：两条已登记产物、读成功。
+    artifactsReadFails = false
     calls.length = 0
     writes.length = 0
     remountWorkspace()
@@ -413,6 +448,11 @@ window.loomQA = {
   setClaims: (scenario, options) => {
     claimsScenario = scenario
     claimsReadFails = options?.fail === true
+    remountWorkspace()
+  },
+  // 产物回读只有「读成功 / 读失败」两个开关（没有场景维度），切换后同样重挂载。
+  setArtifacts: options => {
+    artifactsReadFails = options?.fail === true
     remountWorkspace()
   }
 }

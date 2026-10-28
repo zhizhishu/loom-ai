@@ -987,6 +987,16 @@ pub struct LoomClaimsListResult {
     pub claims: Vec<LoomClaim>,
 }
 
+/// Every artifact registered against the Mission's plan.
+///
+/// This is a read of the recorded rows only: it says what was registered and with which digest,
+/// not that the bytes on disk still match. Only a verification re-reads the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomArtifactsListResult {
+    pub artifacts: Vec<LoomArtifact>,
+}
+
 fn required_field(operation: &str, field: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1881,18 +1891,64 @@ pub struct LoomReviewRecordResult {
 
 /// Every Candidate the Mission's plan produced, oldest first.
 /// Filesystem digest of one artifact. The Host computes this; nothing here trusts a payload.
+///
+/// The bytes are read through a handle that refuses to follow a link at any component, because the
+/// path was only proven to stay inside the workspace a moment earlier: between `resolve_artifact_path`
+/// and a plain `std::fs::read` the file can be swapped for a symlink pointing outside the workspace,
+/// and a by-path read would then hash bytes nobody validated.
 fn artifact_digest(path: &std::path::Path) -> Result<(String, i64)> {
     use sha2::Digest;
-    let bytes = std::fs::read(path)
+    use std::io::Read;
+
+    let mut file = crate::local_attachment_snapshot::open_resolved_file_without_following(path)
         .with_context(|| format!("LOOM artifact {} is not readable", path.to_string_lossy()))?;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(&bytes);
+    let mut size_bytes: i64 = 0;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("LOOM artifact {} is not readable", path.to_string_lossy()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size_bytes = size_bytes
+            .checked_add(read as i64)
+            .context("LOOM artifact size overflowed")?;
+    }
     let digest = hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    Ok((digest, bytes.len() as i64))
+    Ok((digest, size_bytes))
+}
+
+/// Test-only seam between resolving an artifact path and reading its bytes.
+///
+/// The swap this guards against happens inside that window, and no test can schedule it from the
+/// outside: by the time the command is called, the file is already whatever the caller left behind.
+/// A test installs a callback here and the next registration takes it exactly once. Compiled out of
+/// every non-test build, so the shipped path carries no hook.
+#[cfg(test)]
+mod artifact_swap_hook {
+    use std::sync::Mutex;
+
+    static PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+    pub(super) fn install(callback: Box<dyn FnOnce() + Send>) {
+        if let Ok(mut slot) = PENDING.lock() {
+            *slot = Some(callback);
+        }
+    }
+
+    pub(super) fn run() {
+        let callback = PENDING.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
 }
 
 /// Resolve a Mission-relative artifact path, refusing anything that leaves the workspace.
@@ -2023,7 +2079,14 @@ pub fn artifact_register(
     }
 
     let resolved = resolve_artifact_path(&workspace, &relative_path)?;
-    let (sha256, size_bytes) = artifact_digest(&resolved)?;
+    #[cfg(test)]
+    artifact_swap_hook::run();
+    let (sha256, size_bytes) = artifact_digest(&resolved).map_err(|error| {
+        LoomCommandError::rejection(
+            LOOM_ARTIFACT_PATH_REJECTED,
+            format!("artifact {relative_path} cannot be read without following links: {error:#}"),
+        )
+    })?;
 
     let existing: Option<(String, String)> = transaction
         .query_row(
@@ -2163,7 +2226,14 @@ fn ensure_evidence_bytes_match(
             ));
         };
         let resolved = resolve_artifact_path(workspace, &relative_path)?;
-        let (actual, _) = artifact_digest(&resolved)?;
+        let (actual, _) = artifact_digest(&resolved).map_err(|error| {
+            LoomCommandError::rejection(
+                LOOM_EVIDENCE_HASH_MISMATCH,
+                format!(
+                    "evidence {evidence_id} at {relative_path} cannot be read without following links: {error:#}"
+                ),
+            )
+        })?;
         if actual != expected {
             return Err(LoomCommandError::rejection(
                 LOOM_EVIDENCE_HASH_MISMATCH,
@@ -2251,6 +2321,41 @@ pub fn claims_list(database: &Database, mission_id: &str) -> Result<LoomClaimsLi
         evaluated_at: now.to_rfc3339(),
         claims,
     })
+}
+
+/// Every artifact registered against the Mission's plan, oldest first.
+///
+/// Listing an artifact is not a claim about its bytes: `sha256` and `size_bytes` are what the Host
+/// computed when the artifact was registered, and only a verification re-reads the file. A reader
+/// therefore shows "registered", never "verified".
+pub fn artifacts_list(database: &Database, mission_id: &str) -> Result<LoomArtifactsListResult> {
+    let mission_id = scoped_mission(mission_id)?;
+    let mut statement = database.connection().prepare(
+        "SELECT artifact.artifact_id, artifact.plan_id, artifact.task_id, artifact.agent_run_id,
+                artifact.relative_path, artifact.sha256, artifact.size_bytes,
+                artifact.content_type, artifact.creator_id, artifact.created_at
+         FROM loom_artifact AS artifact
+         JOIN loom_plan AS plan ON plan.plan_id=artifact.plan_id
+         WHERE plan.mission_id=?1
+         ORDER BY artifact.created_at, artifact.relative_path",
+    )?;
+    let artifacts = statement
+        .query_map([mission_id], |row| {
+            Ok(LoomArtifact {
+                artifact_id: row.get(0)?,
+                plan_id: row.get(1)?,
+                task_id: row.get(2)?,
+                agent_run_id: row.get(3)?,
+                relative_path: row.get(4)?,
+                sha256: row.get(5)?,
+                size_bytes: row.get(6)?,
+                content_type: row.get(7)?,
+                creator_id: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(LoomArtifactsListResult { artifacts })
 }
 
 pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<LoomCandidate>> {
@@ -6685,6 +6790,181 @@ mod tests {
                 "assertion {relative_path} must not resolve outside the workspace: {error}"
             );
         }
+    }
+
+    /// The race this closes: a path is resolved and proven to stay inside the workspace, then the
+    /// file is swapped for a symlink pointing outside it. A by-path read would follow the replacement
+    /// and hash bytes that were never validated; the digest now goes through a handle that refuses to
+    /// follow a link at any component, so the swap is refused and no artifact row is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_swapped_symlink_is_refused_between_resolution_and_read() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact swap");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        write_workspace_file(
+            &database,
+            &mission_id,
+            "report.md",
+            "the bytes that were reviewed",
+        );
+        let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
+
+        let outside = workspace
+            .parent()
+            .expect("workspace has a parent")
+            .join(format!(
+                "loom-artifact-outside-{}.txt",
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::write(&outside, b"bytes nobody validated").unwrap();
+
+        // Resolution happens while the path is still the reviewed regular file.
+        let resolved = resolve_artifact_path(&workspace, "report.md").unwrap();
+        std::fs::remove_file(workspace.join("report.md")).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("report.md")).unwrap();
+
+        // Reading through the already resolved path must refuse the swapped link instead of hashing
+        // the file outside the workspace.
+        let error = artifact_digest(&resolved).unwrap_err();
+        assert!(
+            error.to_string().contains("not readable"),
+            "assertion the swapped link is not read: {error:#}"
+        );
+
+        // The same swap through the public command is refused, and no artifact row is created.
+        let error = artifact_register(
+            &mut database,
+            "local_user",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: None,
+                agent_run_id: None,
+                relative_path: "report.md".into(),
+                content_type: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_ARTIFACT_PATH_REJECTED,
+            "assertion a link pointing outside the workspace cannot be registered: {error}"
+        );
+        let rows: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "assertion the refused registration writes no row");
+
+        std::fs::remove_file(&outside).unwrap();
+    }
+
+    /// The registration window itself: resolution succeeds on the reviewed file, the file is swapped
+    /// for a link pointing outside the workspace, and the read that follows must refuse it. A test
+    /// that swaps before calling the command only exercises the containment check, never the read.
+    #[cfg(unix)]
+    #[test]
+    fn a_swap_inside_the_registration_window_writes_no_artifact_row() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact window");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "the reviewed bytes");
+        let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
+        let outside = workspace
+            .parent()
+            .expect("workspace has a parent")
+            .join(format!("loom-artifact-window-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, b"bytes nobody validated").unwrap();
+
+        let swapped_workspace = workspace.clone();
+        let swapped_outside = outside.clone();
+        artifact_swap_hook::install(Box::new(move || {
+            std::fs::remove_file(swapped_workspace.join("report.md")).unwrap();
+            std::os::unix::fs::symlink(&swapped_outside, swapped_workspace.join("report.md"))
+                .unwrap();
+        }));
+
+        let error = artifact_register(
+            &mut database,
+            "local_user",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: None,
+                agent_run_id: None,
+                relative_path: "report.md".into(),
+                content_type: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_ARTIFACT_PATH_REJECTED,
+            "assertion a swap inside the registration window is refused: {error}"
+        );
+        let rows: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "assertion the refused registration writes no row");
+
+        std::fs::remove_file(&outside).unwrap();
+    }
+
+    /// Reading artifacts is scoped to one Mission's plan: another Mission registering the same
+    /// relative path must not leak into this one's projection, and the digest reported is the one
+    /// recorded at registration rather than anything recomputed on read.
+    #[test]
+    fn artifacts_list_returns_only_this_missions_registered_files() {
+        let mut database = fixture();
+        let first = create_mission(&mut database, "LOOM artifacts list one");
+        plan_import(&mut database, plan_input(&first)).unwrap();
+        write_workspace_file(&database, &first, "alpha.md", "alpha bytes");
+        write_workspace_file(&database, &first, "beta.md", "beta bytes and then some");
+        let alpha = register(&mut database, &first, "alpha.md");
+        let beta = register(&mut database, &first, "beta.md");
+
+        let second = create_mission(&mut database, "LOOM artifacts list two");
+        // Task ids are global, so the second plan needs its own names before it can exist at all.
+        let mut second_input = plan_input(&second);
+        second_input.tasks = vec![task("task_c", "Task C"), task("task_d", "Task D")];
+        second_input.dependencies = vec![edge("task_c", "task_d")];
+        plan_import(&mut database, second_input).unwrap();
+        write_workspace_file(&database, &second, "alpha.md", "another mission's alpha");
+        let foreign = register(&mut database, &second, "alpha.md");
+
+        let listed = artifacts_list(&database, &first).unwrap();
+        let ids: Vec<&str> = listed
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id.as_str())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "assertion only this mission's artifacts are listed: {ids:?}"
+        );
+        assert!(ids.contains(&alpha.artifact_id.as_str()));
+        assert!(ids.contains(&beta.artifact_id.as_str()));
+        assert!(
+            !ids.contains(&foreign.artifact_id.as_str()),
+            "assertion another mission's artifact never appears: {ids:?}"
+        );
+
+        let listed_alpha = listed
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == alpha.artifact_id)
+            .unwrap();
+        assert_eq!(listed_alpha.relative_path, "alpha.md");
+        assert_eq!(
+            listed_alpha.sha256, alpha.sha256,
+            "assertion the projection reports the recorded digest"
+        );
+        assert_eq!(
+            listed_alpha.size_bytes, 11,
+            "assertion the projection reports the recorded size"
+        );
+        assert_eq!(listed_alpha.plan_id, alpha.plan_id);
     }
 
     #[test]
