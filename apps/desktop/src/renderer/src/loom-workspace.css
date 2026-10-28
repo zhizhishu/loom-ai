@@ -46,8 +46,8 @@
 .loom-flow-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .loom-flow-stats { display: flex; gap: 16px; color: var(--muted); font-size: 11px; }
 /* 图区横向：depth 0 → n 自左向右排泳道；泳道可变宽，容器窄于「列数 × 180px + 间距」时才横滚。 */
-.loom-flow-graph { position: relative; display: flex; flex-direction: row; align-items: flex-start; gap: 48px; max-width: 100%; min-width: 0; padding-bottom: 4px; overflow-x: auto; }
-.loom-flow-lane { display: flex; flex: 1 1 0; min-width: 180px; max-width: 260px; flex-direction: column; gap: 14px; }
+.loom-flow-graph { position: relative; display: flex; flex-direction: row; align-items: flex-start; gap: 32px; max-width: 100%; min-width: 0; padding-bottom: 4px; overflow-x: auto; }
+.loom-flow-lane { display: flex; flex: 1 1 0; min-width: 160px; max-width: 260px; flex-direction: column; gap: 14px; }
 /* 列头：泳道第一个子元素；列内 gap 14px，要让列头下沿只占 8px，所以回吐 6px。 */
 .loom-flow-lane-label { margin-bottom: -6px; color: var(--muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
 .loom-flow-node { position: relative; z-index: 1; width: 100%; min-width: 0; flex: 0 0 auto; border: 1px solid var(--line); border-left: 2px solid var(--line); border-radius: 8px; padding: 14px 16px; background: var(--surface); box-shadow: 0 1px 3px rgb(0 0 0 / 8%), 0 1px 2px rgb(0 0 0 / 4%); }
