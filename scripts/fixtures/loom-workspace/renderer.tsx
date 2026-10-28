@@ -1,5 +1,6 @@
+import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomCandidate, LoomReview, LoomVerification } from '@contracts'
+import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt } from '@contracts'
 import { LoomWorkspace } from '../../../apps/desktop/src/renderer/src/LoomWorkspace'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { applyAppearanceSnapshot } from '../../../apps/desktop/src/renderer/src/theme'
@@ -13,11 +14,27 @@ import '../../../apps/desktop/src/renderer/src/loom-workspace.css'
 // No Core, SQLite, Skill Library, Runtime or daily userData is touched here.
 
 type LoomCall = { method: string; params: unknown }
+// 写入回执也留在 fixtures 侧：payload 与回执都要能在验收脚本里逐字段断言。
+type LoomWrite = {
+  method: string
+  params: Record<string, unknown>
+  receipt: LoomReviewRecordReceipt | LoomVerificationRecordReceipt
+}
+type LoomState = {
+  plan: LoomPlan
+  tasks: LoomTask[]
+  candidates: LoomCandidate[]
+  reviews: LoomReview[]
+  verifications: LoomVerification[]
+}
 type LoomQa = {
   calls: LoomCall[]
+  writes: LoomWrite[]
   errors: string[]
   selections: string[]
   countOf(method: string): number
+  state(): LoomState
+  reset(): void
   setTheme(theme: 'day' | 'night'): void
 }
 declare global { interface Window { loomQA: LoomQa } }
@@ -147,8 +164,93 @@ const activity: MissionActivity[] = [
 ]
 
 const calls: LoomCall[] = []
+const writes: LoomWrite[] = []
 const errors: string[] = []
 const selections: string[] = []
+
+// 写入侧状态：验收/核验两条轴的写结果直接落在内存投影上，六个读方法随之回读一致数据。
+const writeStamp = '2026-09-27T09:00:00.000Z'
+let writeSequence = 0
+// 每条点击用例都从同一初始态开始：基线在首次写入前冻结，reset() 原样拷回。
+const baseline = {
+  tasks: structuredClone(tasks),
+  candidates: structuredClone(candidates),
+  reviews: structuredClone(reviews),
+  verifications: structuredClone(verifications)
+}
+
+function restoreBaseline<T>(target: T[], source: readonly T[]): void {
+  target.splice(0, target.length, ...structuredClone(source))
+}
+
+/** 验收写入：接受 → done/accepted，驳回 → ready/rejected；回执照 LoomReviewRecordReceipt 全字段。 */
+function recordLoomReview(input: LoomReviewRecordInput): LoomReviewRecordReceipt {
+  const task = tasks.find(entry => entry.taskId === input.taskId)
+  if (task === undefined) throw new Error(`LOOM fixture has no task ${input.taskId}`)
+  const candidate = candidates.find(entry => entry.candidateId === input.candidateId)
+  if (candidate === undefined) throw new Error(`LOOM fixture has no candidate ${input.candidateId}`)
+  const taskIndex = tasks.indexOf(task)
+  const candidateIndex = candidates.indexOf(candidate)
+  writeSequence += 1
+  const review: LoomReview = {
+    reviewId: `review-fixture-${writeSequence}`,
+    candidateId: candidate.candidateId,
+    acceptanceCriteriaVersion: input.acceptanceCriteriaVersion,
+    verdict: input.verdict,
+    reason: input.reason,
+    criteriaResults: input.criteriaResults.map(result => ({ ...result, evidenceIds: [...result.evidenceIds] })),
+    // 契约里 reviewerId 由 Core 从可信身份注入；fixture 在记录上落一个本地用户。
+    reviewerId: 'user-local',
+    reviewedAt: writeStamp
+  }
+  const taskStatus: LoomTaskStatus = input.verdict === 'accepted' ? 'done' : 'ready'
+  reviews.push(review)
+  candidates[candidateIndex] = { ...candidate, acceptanceStatus: input.verdict }
+  tasks[taskIndex] = { ...task, status: taskStatus }
+  return {
+    review,
+    missionId: input.missionId,
+    planId: task.planId,
+    taskId: task.taskId,
+    taskStatus,
+    candidateAcceptanceStatus: input.verdict,
+    releasedDependencyIds: [],
+    replayed: false
+  }
+}
+
+/** 核验写入：passed → verified，failed → failed；核验与验收是两条独立的轴。 */
+function recordLoomVerification(input: LoomVerificationRecordInput): LoomVerificationRecordReceipt {
+  const task = tasks.find(entry => entry.taskId === input.taskId)
+  if (task === undefined) throw new Error(`LOOM fixture has no task ${input.taskId}`)
+  const candidate = candidates.find(entry => entry.candidateId === input.candidateId)
+  if (candidate === undefined) throw new Error(`LOOM fixture has no candidate ${input.candidateId}`)
+  const candidateIndex = candidates.indexOf(candidate)
+  writeSequence += 1
+  const verification: LoomVerification = {
+    verificationId: `verification-fixture-${writeSequence}`,
+    candidateId: candidate.candidateId,
+    method: input.method,
+    // 契约里 executorId 由 Core 从可信 Host 身份注入；fixture 在记录上落一个本地用户。
+    executorId: 'user-local',
+    result: input.result,
+    evidenceIds: input.evidenceIds === undefined ? [] : [...input.evidenceIds],
+    verifiedAt: writeStamp
+  }
+  const candidateVerificationStatus = input.result === 'passed' ? 'verified' : 'failed'
+  verifications.push(verification)
+  candidates[candidateIndex] = { ...candidate, verificationStatus: candidateVerificationStatus }
+  return {
+    verification,
+    missionId: input.missionId,
+    planId: task.planId,
+    taskId: task.taskId,
+    candidateVerificationStatus,
+    releasedDependencyIds: [],
+    replayed: false
+  }
+}
+
 const replies: Readonly<Record<string, unknown>> = {
   'preferences.tasks.get': { enabled: false, headsUpAfterSequence: 0, observedThroughChangeSequence: 0 },
   'missions.delivery': delivery,
@@ -163,7 +265,21 @@ const replies: Readonly<Record<string, unknown>> = {
 
 async function request<T>(method: string, params: unknown = {}): Promise<T> {
   calls.push({ method, params })
-  const reply = replies[method]
+  let reply: unknown
+  if (method === 'loom.review.record') {
+    const receipt = recordLoomReview(params as LoomReviewRecordInput)
+    writes.push({ method, params: params as Record<string, unknown>, receipt })
+    reply = receipt
+  } else if (method === 'loom.verification.record') {
+    const receipt = recordLoomVerification(params as LoomVerificationRecordInput)
+    writes.push({ method, params: params as Record<string, unknown>, receipt })
+    reply = receipt
+  } else if (method === 'missions.diffSession.release') {
+    // 写成功后的收尾副作用：只应答，不进 writes，也不参与 loom 写方法统计。
+    reply = { released: true }
+  } else {
+    reply = replies[method]
+  }
   if (reply === undefined) {
     errors.push(method)
     throw new Error(`LOOM fixture has no reply for ${method}`)
@@ -188,16 +304,39 @@ Object.defineProperty(document, 'hasFocus', { value: () => true })
 Object.defineProperty(document, 'visibilityState', { value: 'visible' })
 setTheme(new URLSearchParams(location.search).get('theme') === 'night' ? 'night' : 'day')
 
-window.loomQA = {
-  calls, errors, selections, countOf: method => calls.filter(call => call.method === method).length, setTheme
+// reset() 换 key 强制重挂载：LoomWorkspace 会按恢复后的初始数据重读六个投影，
+// 这样每条点击用例都从同一个初始态开始，不继承上一条用例写下的结论。
+let remountWorkspace: () => void = () => undefined
+
+function LoomFixture() {
+  const [generation, setGeneration] = useState(0)
+  remountWorkspace = () => setGeneration(current => current + 1)
+  return <ThreadClientProvider client={client}>
+    <LoomWorkspace
+      key={generation}
+      mission={mission}
+      agents={agents}
+      onSource={messageId => { selections.push(messageId) }}
+      onNotify={() => undefined}
+      onWorkspaceCleanupRequested={async () => undefined}
+    />
+  </ThreadClientProvider>
 }
 
-createRoot(document.getElementById('root')!).render(<ThreadClientProvider client={client}>
-  <LoomWorkspace
-    mission={mission}
-    agents={agents}
-    onSource={messageId => { selections.push(messageId) }}
-    onNotify={() => undefined}
-    onWorkspaceCleanupRequested={async () => undefined}
-  />
-</ThreadClientProvider>)
+window.loomQA = {
+  calls, writes, errors, selections,
+  countOf: method => calls.filter(call => call.method === method).length,
+  state: () => structuredClone({ plan, tasks, candidates, reviews, verifications }),
+  reset: () => {
+    restoreBaseline(tasks, baseline.tasks)
+    restoreBaseline(candidates, baseline.candidates)
+    restoreBaseline(reviews, baseline.reviews)
+    restoreBaseline(verifications, baseline.verifications)
+    calls.length = 0
+    writes.length = 0
+    remountWorkspace()
+  },
+  setTheme
+}
+
+createRoot(document.getElementById('root')!).render(<LoomFixture />)

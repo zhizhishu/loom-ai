@@ -5,6 +5,7 @@ const { app, BrowserWindow } = require('electron')
 
 const [renderer, userData, output] = process.argv.slice(2)
 let stage = 'startup'
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u
 assert(isAbsolute(renderer) && isAbsolute(userData) && isAbsolute(output),
   'LOOM workspace fixture requires absolute renderer, userData and output paths')
 mkdirSync(userData, { recursive: true })
@@ -35,15 +36,15 @@ app.whenReady().then(async () => {
     }
     throw new Error(message)
   }
-  const pointFor = selector => script(`(() => {
-    const element = document.querySelector(${JSON.stringify(selector)})
+  const pointForExpression = expression => script(`(() => {
+    const element = ${expression}
     if (!element) return null
     const bounds = element.getClientRects()[0] ?? element.getBoundingClientRect()
     return { x: Math.round(bounds.x + bounds.width / 2), y: Math.round(bounds.y + bounds.height / 2) }
   })()`)
-  const click = async selector => {
-    const point = await pointFor(selector)
-    assert(point, `No pointer target for ${selector}`)
+  const pointFor = selector => pointForExpression(`document.querySelector(${JSON.stringify(selector)})`)
+  const clickAt = async (point, label) => {
+    assert(point, `No pointer target for ${label}`)
     const zoom = window.webContents.getZoomFactor()
     point.x = Math.round(point.x * zoom)
     point.y = Math.round(point.y * zoom)
@@ -51,6 +52,9 @@ app.whenReady().then(async () => {
     window.webContents.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
     window.webContents.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
   }
+  const click = async selector => clickAt(await pointFor(selector), selector)
+  // 交付用例要在某张候选卡片内部点按钮，指针目标是一个表达式而不是全局 CSS 选择器。
+  const clickElement = async expression => clickAt(await pointForExpression(expression), expression)
   const pressKey = keyCode => {
     window.webContents.sendInputEvent({ type: 'keyDown', keyCode })
     if (keyCode === 'Enter') window.webContents.sendInputEvent({ type: 'char', keyCode: '\r' })
@@ -62,6 +66,85 @@ app.whenReady().then(async () => {
     const state = await pressed()
     assert.deepEqual(state, [0, 1, 2].map(position => position === index ? 'true' : 'false'),
       `Unexpected LOOM section state ${JSON.stringify(state)}`)
+  }
+  // 交付验收：候选卡片按内容（内容 hash）定位，不依赖列表下标，也不共用别条候选的状态。
+  const TARGET_CANDIDATE = 'sha256:restore-runtime'
+  const cardFor = hash => `[...document.querySelectorAll('.loom-delivery-context .loom-candidate')].find(card => (card.querySelector('.loom-candidate-meta')?.innerText ?? '').includes(${JSON.stringify(hash)}))`
+  const inCard = (hash, selector) => `${cardFor(hash)}?.querySelector(${JSON.stringify(selector)}) ?? null`
+  const criterionBox = (hash, index) => `${cardFor(hash)}?.querySelectorAll('.loom-review-criterion input')[${index}] ?? null`
+  const submitFor = hash => `${cardFor(hash)}?.querySelector('.loom-review-form button[type=submit]') ?? null`
+  const cardState = hash => script(`(() => {
+    const card = ${cardFor(hash)}
+    if (!card) return null
+    const verification = card.querySelector('.loom-badge-verification')
+    const acceptance = card.querySelector('.loom-badge-acceptance')
+    const submit = card.querySelector('.loom-review-form button[type=submit]')
+    const actionRow = card.querySelector(':scope > .loom-delivery-actions')
+    return {
+      verificationState: verification?.getAttribute('data-state') ?? null,
+      verificationCopy: verification?.innerText ?? '',
+      acceptanceState: acceptance?.getAttribute('data-state') ?? null,
+      acceptanceCopy: acceptance?.innerText ?? '',
+      actionRow: [...(actionRow?.querySelectorAll('button') ?? [])].map(button => button.innerText),
+      forms: card.querySelectorAll('.loom-review-form').length,
+      criteriaLabels: [...card.querySelectorAll('.loom-review-criterion-id')].map(node => node.innerText),
+      checkboxes: [...card.querySelectorAll('.loom-review-criterion input')].map(input => input.checked),
+      reason: card.querySelector('.loom-review-reason')?.value ?? null,
+      submit: submit === null ? null : { label: submit.innerText, disabled: submit.disabled },
+      review: card.querySelector('.loom-candidate-review')?.innerText ?? null,
+      verification: card.querySelector('.loom-candidate-verification')?.innerText ?? null,
+      failure: card.querySelector('.loom-review-failure')?.innerText ?? null
+    }
+  })()`)
+  // 写入后的状态只能从控制面回读得到，所以断言要等回读落地，而不是等固定时长。
+  const waitCard = async (hash, predicate, message) => {
+    const deadline = Date.now() + 8000
+    while (Date.now() < deadline) {
+      const state = await cardState(hash)
+      if (state !== null && predicate(state)) return state
+      await sleep(30)
+    }
+    throw new Error(`${message}: ${JSON.stringify(await cardState(hash))}`)
+  }
+  // 受控输入框只认原生 setter + input 事件：直接赋 value 不会触发 React 的 onChange。
+  const fillReason = (hash, text) => script(`(() => {
+    const area = ${cardFor(hash)}?.querySelector('.loom-review-form textarea.loom-review-reason')
+    if (!area) return null
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set
+    setter.call(area, ${JSON.stringify(text)})
+    area.dispatchEvent(new Event('input', { bubbles: true }))
+    return area.value
+  })()`)
+  const writeLog = () => script('window.loomQA.writes')
+  // 逐条结论按 criterionId 绑定：只认渲染出来的「cN · 满足 / 未满足」两行。
+  const criterionVerdicts = reviewText => reviewText.split('\n').map(line => line.trim())
+    .filter(line => / · (未)?满足$/.test(line))
+    .map(line => ({ criterionId: line.split(' · ')[0], satisfied: line.endsWith('· 满足') }))
+  // 每条点击用例都从同一个初始态开始：数据回基线，工作区按基线重挂载并重读六个投影。
+  const resetLoom = async () => {
+    await script("(() => { const node = document.querySelector('.loom-workspace'); if (node) node.__loomReset = 'stale'; return true })()")
+    await script('window.loomQA.reset()')
+    await waitFor("document.querySelector('.loom-workspace') !== null && document.querySelector('.loom-workspace').__loomReset === undefined",
+      'LOOM workspace did not remount from the reset baseline')
+  }
+  const openDelivery = async () => {
+    await expectPressed(0, 'Reset did not land back on the activity section')
+    await click('.loom-section-tabs button:nth-of-type(3)')
+    await expectPressed(2, 'Delivery did not open after resetting the fixture')
+    await waitFor("document.querySelectorAll('.loom-delivery-context .loom-candidate').length === 2",
+      'Delivery section did not relist the two recorded candidates after the reset')
+    await waitFor(`!!(${cardFor(TARGET_CANDIDATE)})`, 'The target candidate card is missing after the reset')
+    // 只挪交付面板自己的滚动位置，不动整个文档的滚动位置，否则后面的 tab 点击会落空。
+    await script(`(() => {
+      const card = ${cardFor(TARGET_CANDIDATE)}
+      const pane = document.querySelector('.loom-delivery')
+      if (!card || !pane) return false
+      const cardBox = card.getBoundingClientRect()
+      const paneBox = pane.getBoundingClientRect()
+      if (cardBox.top < paneBox.top || cardBox.bottom > paneBox.bottom) pane.scrollTop += cardBox.top - paneBox.top - 24
+      return true
+    })()`)
+    await settle(120)
   }
   const capture = async (section, theme, size, zoom) => {
     const name = `loom-workspace-${section}-${theme}-${size}${zoom === 100 ? '' : '-zoom' + zoom}.png`
@@ -325,6 +408,273 @@ app.whenReady().then(async () => {
   assert.equal(final.retainedDelivery && final.retainedActivity && final.retainedUnread, true,
     'Screenshot section switching recreated a previously visited panel')
   cases.push('Repeated section switching after the screenshot sweep keeps one delivery read, one activity read and the same mounted panels')
+
+  stage = 'delivery acceptance chain'
+  await resetLoom()
+  await openDelivery()
+  const acceptStart = await cardState(TARGET_CANDIDATE)
+  assert.equal(acceptStart.acceptanceState, 'pending', `Target candidate acceptance badge did not start pending: ${JSON.stringify(acceptStart)}`)
+  assert.equal(acceptStart.acceptanceCopy, '待验收', `Acceptance badge copy changed: ${JSON.stringify(acceptStart.acceptanceCopy)}`)
+  assert.equal(acceptStart.verificationState, 'unverified', `Target candidate verification axis did not start unverified: ${JSON.stringify(acceptStart.verificationState)}`)
+  assert.deepEqual(acceptStart.actionRow, ['接受', '驳回', '通过核验', '核验失败'],
+    `Target candidate lost its two independent action axes: ${JSON.stringify(acceptStart.actionRow)}`)
+  assert.equal(acceptStart.forms, 0, 'The review form was already open before any pointer click')
+
+  await clickElement(inCard(TARGET_CANDIDATE, '.loom-btn-accept'))
+  const acceptOpened = await waitCard(TARGET_CANDIDATE, state => state.forms === 1, 'Accept did not open the per-criterion review form')
+  assert.equal(await script("document.querySelectorAll('.loom-review-form').length"), 1,
+    'Accept must open exactly one review form, on the clicked candidate only')
+  assert.deepEqual(acceptOpened.criteriaLabels, ['c1', 'c2'],
+    `Review form must list every versioned criterion once: ${JSON.stringify(acceptOpened.criteriaLabels)}`)
+  assert.deepEqual(acceptOpened.checkboxes, [false, false], `Review form started with boxes already checked: ${JSON.stringify(acceptOpened.checkboxes)}`)
+  assert.deepEqual(acceptOpened.submit, { label: '确认接受', disabled: true },
+    `Accept started submittable before any criterion was checked: ${JSON.stringify(acceptOpened.submit)}`)
+
+  const reasonText = '  恢复路径已按计划实现，证据齐全  '
+  const trimmedReason = reasonText.trim()
+  assert.equal(await fillReason(TARGET_CANDIDATE, reasonText), reasonText, 'The reason textarea did not take the typed reason')
+  await settle(120)
+  const acceptMissing = await cardState(TARGET_CANDIDATE)
+  assert.equal(acceptMissing.reason, reasonText, `Reason input lost the typed text: ${JSON.stringify(acceptMissing.reason)}`)
+  assert.deepEqual(acceptMissing.checkboxes, [false, false], `Criterion boxes changed without a click: ${JSON.stringify(acceptMissing.checkboxes)}`)
+  assert.equal(acceptMissing.submit.disabled, true, 'Accept must stay disabled until every criterion is checked')
+  await clickElement(submitFor(TARGET_CANDIDATE))
+  await settle(160)
+  assert.equal(await script("window.loomQA.countOf('loom.review.record')"), 0, 'A blocked accept still sent loom.review.record')
+  assert.equal((await cardState(TARGET_CANDIDATE)).forms, 1, 'A blocked accept closed the review form')
+
+  await clickElement(criterionBox(TARGET_CANDIDATE, 0))
+  await clickElement(criterionBox(TARGET_CANDIDATE, 1))
+  await waitCard(TARGET_CANDIDATE, state => state.checkboxes.length === 2 && state.checkboxes.every(checked => checked === true),
+    'Both criterion checkboxes did not toggle from pointer clicks')
+
+  await fillReason(TARGET_CANDIDATE, '    ')
+  await settle(120)
+  const acceptBlank = await cardState(TARGET_CANDIDATE)
+  assert.equal(acceptBlank.reason, '    ', `Whitespace reason input lost what was typed: ${JSON.stringify(acceptBlank.reason)}`)
+  assert.deepEqual(acceptBlank.checkboxes, [true, true], `Criterion checkboxes lost their state: ${JSON.stringify(acceptBlank.checkboxes)}`)
+  assert.equal(acceptBlank.submit.disabled, true, 'Accept must stay disabled when the reason is only whitespace')
+  await clickElement(submitFor(TARGET_CANDIDATE))
+  await settle(160)
+  assert.equal(await script("window.loomQA.countOf('loom.review.record')"), 0, 'A whitespace-only accept reason still sent loom.review.record')
+
+  await fillReason(TARGET_CANDIDATE, reasonText)
+  await settle(120)
+  const acceptReady = await cardState(TARGET_CANDIDATE)
+  assert.deepEqual(acceptReady.submit, { label: '确认接受', disabled: false },
+    `A fully checked accept with a reason did not become submittable: ${JSON.stringify(acceptReady.submit)}`)
+  await clickElement(submitFor(TARGET_CANDIDATE))
+  await waitFor("window.loomQA.countOf('loom.review.record') >= 1", 'Accept never sent loom.review.record')
+  assert.equal(await script("window.loomQA.countOf('loom.review.record')"), 1, 'Accept must send exactly one loom.review.record')
+  const accepted = await waitCard(TARGET_CANDIDATE, state => state.acceptanceState === 'accepted' && state.forms === 0,
+    'The accepted verdict was never read back into the delivery section')
+  assert.equal(accepted.acceptanceCopy, '已验收', `Accepted badge copy is not the recorded verdict: ${JSON.stringify(accepted.acceptanceCopy)}`)
+  assert.deepEqual(accepted.actionRow, ['通过核验', '核验失败'],
+    `Accept must remove its own buttons and keep the verification buttons: ${JSON.stringify(accepted.actionRow)}`)
+  assert.equal(accepted.verificationState, 'unverified', 'Accepting a candidate must not move the verification axis')
+  assert.deepEqual(accepted.criteriaLabels, [], 'The collapsed review form left its criteria behind')
+  assert.equal(typeof accepted.review, 'string', `The accepted review was not rendered back: ${JSON.stringify(accepted.review)}`)
+  const acceptedLines = accepted.review.split('\n').map(line => line.trim()).filter(line => line !== '')
+  assert(acceptedLines.some(line => line.includes('验收结论：通过')), `The accepted verdict line is missing: ${JSON.stringify(accepted.review)}`)
+  assert(acceptedLines.some(line => line.includes(trimmedReason)), `The written reason was not rendered back: ${JSON.stringify(accepted.review)}`)
+  assert.equal(acceptedLines.filter(line => line.includes(reasonText)).length, 0, 'The acceptance reason was rendered untrimmed')
+  assert.deepEqual(criterionVerdicts(accepted.review), [{ criterionId: 'c1', satisfied: true }, { criterionId: 'c2', satisfied: true }],
+    `The accepted review must show two satisfied criteria: ${JSON.stringify(accepted.review)}`)
+
+  const acceptedWrites = await writeLog()
+  assert.equal(acceptedWrites.length, 1, `Accept must send exactly one write: ${JSON.stringify(acceptedWrites)}`)
+  const reviewWrite = acceptedWrites[0]
+  assert.equal(reviewWrite.method, 'loom.review.record', `Unexpected write method: ${JSON.stringify(reviewWrite.method)}`)
+  const reviewPayload = reviewWrite.params
+  assert.equal(reviewPayload.missionId, 'mission-loom-018', `Review payload lost the mission id: ${JSON.stringify(reviewPayload)}`)
+  assert.equal(reviewPayload.candidateId, 'candidate-2', `Review payload must address the clicked candidate: ${JSON.stringify(reviewPayload.candidateId)}`)
+  assert.equal(reviewPayload.taskId, 'task-3', `Review payload must address the clicked candidate task: ${JSON.stringify(reviewPayload.taskId)}`)
+  assert.equal('reviewerId' in reviewPayload, false, 'Clients must not send reviewerId; Core injects it')
+  assert.match(reviewPayload.commandId, UUID_PATTERN, `Review commandId is not a UUID: ${JSON.stringify(reviewPayload.commandId)}`)
+  const acceptState = await script('window.loomQA.state()')
+  const acceptTask = acceptState.tasks.find(task => task.taskId === 'task-3')
+  assert.equal(reviewWrite.receipt.planId, acceptState.plan.planId, `Receipt plan does not match the plan projection: ${JSON.stringify(reviewWrite.receipt)}`)
+  assert.equal(acceptTask.planId, acceptState.plan.planId, 'The task and the plan disagree about the plan id')
+  assert.equal(reviewPayload.acceptanceCriteriaVersion, acceptState.plan.acceptanceCriteria.version,
+    'The review must pin the plan criteria version')
+  assert.equal(reviewPayload.verdict, 'accepted', `Review payload lost the verdict: ${JSON.stringify(reviewPayload.verdict)}`)
+  assert.equal(reviewPayload.reason, trimmedReason, `The recorded reason must be trimmed: ${JSON.stringify(reviewPayload.reason)}`)
+  assert.deepEqual(reviewPayload.criteriaResults, [
+    { criterionId: 'c1', satisfied: true, evidenceIds: [], note: null },
+    { criterionId: 'c2', satisfied: true, evidenceIds: [], note: null }
+  ], `Review criteria results must cover every criterion once, follow the checks and invent no evidence: ${JSON.stringify(reviewPayload.criteriaResults)}`)
+  assert.equal(reviewWrite.receipt.missionId, 'mission-loom-018', `Receipt lost the mission id: ${JSON.stringify(reviewWrite.receipt)}`)
+  assert.equal(reviewWrite.receipt.taskId, 'task-3', `Receipt lost the task id: ${JSON.stringify(reviewWrite.receipt)}`)
+  assert.equal(reviewWrite.receipt.taskStatus, 'done', `An accepted review must move the task to done: ${JSON.stringify(reviewWrite.receipt.taskStatus)}`)
+  assert.equal(reviewWrite.receipt.candidateAcceptanceStatus, 'accepted', `Receipt acceptance status is wrong: ${JSON.stringify(reviewWrite.receipt.candidateAcceptanceStatus)}`)
+  assert.deepEqual(reviewWrite.receipt.releasedDependencyIds, [], `Receipt released dependencies it never evaluated: ${JSON.stringify(reviewWrite.receipt.releasedDependencyIds)}`)
+  assert.equal(reviewWrite.receipt.replayed, false, `A first acceptance must not claim replay: ${JSON.stringify(reviewWrite.receipt.replayed)}`)
+  assert.equal(acceptTask.status, 'done', 'The read-back task status must follow the acceptance receipt')
+  assert.equal(acceptState.candidates.find(candidate => candidate.candidateId === 'candidate-2').acceptanceStatus, 'accepted',
+    'The read-back candidate must carry the accepted verdict')
+  assert.equal(acceptState.reviews.filter(review => review.candidateId === 'candidate-2').length, 1, 'The review write must add exactly one row')
+  assert.equal(await script("window.loomQA.countOf('loom.candidates.list')"), 2, 'The accepted verdict must be re-read exactly once after the write')
+  cases.push('接受 stays blocked until every criterion is checked and the reason is non-blank, writes exactly one loom.review.record, reads accepted back and leaves the verification axis untouched')
+
+  stage = 'delivery rejection chain'
+  await resetLoom()
+  await openDelivery()
+  const rejectStart = await cardState(TARGET_CANDIDATE)
+  assert.equal(rejectStart.acceptanceState, 'pending', `Reset did not restore the pending acceptance axis: ${JSON.stringify(rejectStart.acceptanceState)}`)
+  assert.deepEqual(rejectStart.actionRow, ['接受', '驳回', '通过核验', '核验失败'],
+    `Reset did not restore both action axes: ${JSON.stringify(rejectStart.actionRow)}`)
+
+  await clickElement(inCard(TARGET_CANDIDATE, '.loom-btn-reject'))
+  const rejectOpened = await waitCard(TARGET_CANDIDATE, state => state.forms === 1, 'Reject did not open the review form')
+  assert.deepEqual(rejectOpened.submit, { label: '确认驳回', disabled: true },
+    `Reject started submittable without a reason: ${JSON.stringify(rejectOpened.submit)}`)
+  await clickElement(submitFor(TARGET_CANDIDATE))
+  await settle(160)
+  assert.equal(await script("window.loomQA.countOf('loom.review.record')"), 0, 'A reject without a reason still sent loom.review.record')
+
+  const rejectReason = '  证据不足，证据链条缺一份恢复日志  '
+  assert.equal(await fillReason(TARGET_CANDIDATE, rejectReason), rejectReason, 'The reject reason textarea did not take the typed reason')
+  await settle(120)
+  const rejectReady = await cardState(TARGET_CANDIDATE)
+  assert.deepEqual(rejectReady.checkboxes, [false, false], `Reject must not demand criterion checks: ${JSON.stringify(rejectReady.checkboxes)}`)
+  assert.deepEqual(rejectReady.submit, { label: '确认驳回', disabled: false },
+    `A reject with a reason and no checks must be submittable: ${JSON.stringify(rejectReady.submit)}`)
+  await clickElement(submitFor(TARGET_CANDIDATE))
+  await waitFor("window.loomQA.countOf('loom.review.record') >= 1", 'Reject never sent loom.review.record')
+  assert.equal(await script("window.loomQA.countOf('loom.review.record')"), 1, 'Reject must send exactly one loom.review.record')
+  const rejected = await waitCard(TARGET_CANDIDATE, state => state.acceptanceState === 'rejected' && state.forms === 0,
+    'The rejected verdict was never read back into the delivery section')
+  assert.equal(rejected.acceptanceCopy, '已驳回', `Rejected badge copy is not the recorded verdict: ${JSON.stringify(rejected.acceptanceCopy)}`)
+  assert.deepEqual(rejected.actionRow, ['通过核验', '核验失败'],
+    `Reject must remove its own buttons and keep the verification buttons: ${JSON.stringify(rejected.actionRow)}`)
+  assert.equal(rejected.verificationState, 'unverified', 'Rejecting a candidate must not move the verification axis')
+  const rejectedLines = rejected.review.split('\n').map(line => line.trim()).filter(line => line !== '')
+  assert(rejectedLines.some(line => line.includes('验收结论：驳回')), `The rejected verdict line is missing: ${JSON.stringify(rejected.review)}`)
+  assert(rejectedLines.some(line => line.includes(rejectReason.trim())), `The written reject reason was not rendered back: ${JSON.stringify(rejected.review)}`)
+  assert.deepEqual(criterionVerdicts(rejected.review), [{ criterionId: 'c1', satisfied: false }, { criterionId: 'c2', satisfied: false }],
+    `A rejection that checked nothing must record every criterion as unsatisfied: ${JSON.stringify(rejected.review)}`)
+
+  const rejectedWrites = await writeLog()
+  assert.equal(rejectedWrites.length, 1, `Reject must send exactly one write: ${JSON.stringify(rejectedWrites)}`)
+  const rejectWrite = rejectedWrites[0]
+  assert.equal(rejectWrite.method, 'loom.review.record', `Unexpected reject write method: ${JSON.stringify(rejectWrite.method)}`)
+  const rejectPayload = rejectWrite.params
+  assert.equal(rejectPayload.candidateId, 'candidate-2', `Reject payload must address the clicked candidate: ${JSON.stringify(rejectPayload.candidateId)}`)
+  assert.equal(rejectPayload.taskId, 'task-3', `Reject payload must address the clicked candidate task: ${JSON.stringify(rejectPayload.taskId)}`)
+  assert.equal('reviewerId' in rejectPayload, false, 'Clients must not send reviewerId; Core injects it')
+  assert.match(rejectPayload.commandId, UUID_PATTERN, `Reject commandId is not a UUID: ${JSON.stringify(rejectPayload.commandId)}`)
+  const rejectState = await script('window.loomQA.state()')
+  assert.equal(rejectWrite.receipt.planId, rejectState.plan.planId, `Reject receipt plan does not match the plan projection: ${JSON.stringify(rejectWrite.receipt)}`)
+  assert.equal(rejectPayload.acceptanceCriteriaVersion, rejectState.plan.acceptanceCriteria.version, 'The rejection must pin the plan criteria version')
+  assert.equal(rejectPayload.verdict, 'rejected', `Reject payload lost the verdict: ${JSON.stringify(rejectPayload.verdict)}`)
+  assert.equal(rejectPayload.reason, rejectReason.trim(), `The recorded reject reason must be trimmed: ${JSON.stringify(rejectPayload.reason)}`)
+  assert.deepEqual(rejectPayload.criteriaResults, [
+    { criterionId: 'c1', satisfied: false, evidenceIds: [], note: null },
+    { criterionId: 'c2', satisfied: false, evidenceIds: [], note: null }
+  ], `Reject criteria results must cover every criterion once and invent no evidence: ${JSON.stringify(rejectPayload.criteriaResults)}`)
+  assert.equal(rejectWrite.receipt.taskStatus, 'ready', `A rejected review must move the task back to ready: ${JSON.stringify(rejectWrite.receipt.taskStatus)}`)
+  assert.equal(rejectWrite.receipt.candidateAcceptanceStatus, 'rejected', `Reject receipt acceptance status is wrong: ${JSON.stringify(rejectWrite.receipt.candidateAcceptanceStatus)}`)
+  assert.deepEqual(rejectWrite.receipt.releasedDependencyIds, [], `Reject receipt released dependencies it never evaluated: ${JSON.stringify(rejectWrite.receipt.releasedDependencyIds)}`)
+  assert.equal(rejectWrite.receipt.replayed, false, `A first rejection must not claim replay: ${JSON.stringify(rejectWrite.receipt.replayed)}`)
+  assert.equal(rejectState.tasks.find(task => task.taskId === 'task-3').status, 'ready', 'The read-back task status must follow the rejection receipt')
+  assert.equal(rejectState.candidates.find(candidate => candidate.candidateId === 'candidate-2').acceptanceStatus, 'rejected',
+    'The read-back candidate must carry the rejected verdict')
+  assert.equal(rejectState.reviews.filter(review => review.candidateId === 'candidate-2').length, 1, 'The rejection write must add exactly one row')
+  cases.push('驳回 requires a reason but no criterion checks, writes exactly one loom.review.record, reads rejected back and leaves the verification axis untouched')
+
+  stage = 'delivery verification passed'
+  await resetLoom()
+  await openDelivery()
+  const verifyStart = await cardState(TARGET_CANDIDATE)
+  assert.equal(verifyStart.verificationState, 'unverified', `Reset did not restore the unverified axis: ${JSON.stringify(verifyStart.verificationState)}`)
+  assert.equal(verifyStart.acceptanceState, 'pending', `Reset did not restore the pending acceptance axis: ${JSON.stringify(verifyStart.acceptanceState)}`)
+  assert.equal(verifyStart.forms, 0, 'The review form was open before any verification click')
+
+  await clickElement(inCard(TARGET_CANDIDATE, '.loom-btn-verify'))
+  await waitFor("window.loomQA.countOf('loom.verification.record') >= 1", 'Verify never sent loom.verification.record')
+  assert.equal(await script("window.loomQA.countOf('loom.verification.record')"), 1, 'Verify must send exactly one loom.verification.record')
+  const verified = await waitCard(TARGET_CANDIDATE, state => state.verificationState === 'verified',
+    'The verified verdict was never read back into the delivery section')
+  assert.equal(verified.verificationCopy, '已核验', `Verified badge copy is not the recorded verdict: ${JSON.stringify(verified.verificationCopy)}`)
+  assert.deepEqual(verified.actionRow, ['接受', '驳回'],
+    `Both verification buttons must disappear once a verification is recorded: ${JSON.stringify(verified.actionRow)}`)
+  assert.equal(verified.acceptanceState, 'pending', 'Verification must not decide the acceptance axis')
+  assert.equal(verified.acceptanceCopy, '待验收', `Verification moved the acceptance badge copy: ${JSON.stringify(verified.acceptanceCopy)}`)
+  assert.equal(verified.forms, 0, 'Verification must not open the acceptance form')
+  assert.equal(typeof verified.verification, 'string', `The verification was not rendered back: ${JSON.stringify(verified.verification)}`)
+  assert(verified.verification.includes('通过'), `The verification result line is missing: ${JSON.stringify(verified.verification)}`)
+  assert(verified.verification.includes('人工核验'), `The verification method is not the manual one: ${JSON.stringify(verified.verification)}`)
+
+  const verifiedWrites = await writeLog()
+  assert.equal(verifiedWrites.length, 1, `Verify must send exactly one write: ${JSON.stringify(verifiedWrites)}`)
+  const verifiedWrite = verifiedWrites[0]
+  assert.equal(verifiedWrite.method, 'loom.verification.record', `Unexpected verify write method: ${JSON.stringify(verifiedWrite.method)}`)
+  const verifiedPayload = verifiedWrite.params
+  assert.equal(verifiedPayload.missionId, 'mission-loom-018', `Verify payload lost the mission id: ${JSON.stringify(verifiedPayload)}`)
+  assert.equal(verifiedPayload.candidateId, 'candidate-2', `Verify payload must address the clicked candidate: ${JSON.stringify(verifiedPayload.candidateId)}`)
+  assert.equal(verifiedPayload.taskId, 'task-3', `Verify payload must address the clicked candidate task: ${JSON.stringify(verifiedPayload.taskId)}`)
+  assert.equal('executorId' in verifiedPayload, false, 'Clients must not send executorId; Core injects it')
+  assert.match(verifiedPayload.commandId, UUID_PATTERN, `Verify commandId is not a UUID: ${JSON.stringify(verifiedPayload.commandId)}`)
+  assert.equal(verifiedPayload.method, 'manual', `The manual verify button must report the manual method: ${JSON.stringify(verifiedPayload.method)}`)
+  assert.equal(verifiedPayload.result, 'passed', `The verify payload result does not match the clicked button: ${JSON.stringify(verifiedPayload.result)}`)
+  const verifiedState = await script('window.loomQA.state()')
+  assert.equal(verifiedWrite.receipt.planId, verifiedState.plan.planId, `Verify receipt plan does not match the plan projection: ${JSON.stringify(verifiedWrite.receipt)}`)
+  assert.equal(verifiedWrite.receipt.taskId, 'task-3', `Verify receipt lost the task id: ${JSON.stringify(verifiedWrite.receipt)}`)
+  assert.equal(verifiedWrite.receipt.candidateVerificationStatus, 'verified', `Verify receipt status is wrong: ${JSON.stringify(verifiedWrite.receipt.candidateVerificationStatus)}`)
+  assert.deepEqual(verifiedWrite.receipt.releasedDependencyIds, [], `Verify receipt released dependencies it never evaluated: ${JSON.stringify(verifiedWrite.receipt.releasedDependencyIds)}`)
+  assert.equal(verifiedWrite.receipt.replayed, false, `A first verification must not claim replay: ${JSON.stringify(verifiedWrite.receipt.replayed)}`)
+  assert.equal(verifiedState.candidates.find(candidate => candidate.candidateId === 'candidate-2').verificationStatus, 'verified',
+    'The read-back candidate must carry the verified status')
+  assert.equal(verifiedState.candidates.find(candidate => candidate.candidateId === 'candidate-2').acceptanceStatus, 'pending',
+    'Verifying must leave the acceptance axis pending')
+  assert.equal(verifiedState.verifications.filter(verification => verification.candidateId === 'candidate-2').length, 1, 'The verification write must add exactly one row')
+  assert.equal(await script("window.loomQA.countOf('loom.verifications.list')"), 2, 'The verified status must be re-read exactly once after the write')
+  cases.push('通过核验 writes exactly one loom.verification.record with the manual method, reads verified back and keeps the acceptance axis pending with its buttons')
+
+  stage = 'delivery verification failed'
+  await resetLoom()
+  await openDelivery()
+  const failStart = await cardState(TARGET_CANDIDATE)
+  assert.equal(failStart.verificationState, 'unverified', `Reset did not restore the unverified axis before the failed run: ${JSON.stringify(failStart.verificationState)}`)
+  assert.equal(failStart.acceptanceState, 'pending', `The failed run did not start from a pending acceptance axis: ${JSON.stringify(failStart.acceptanceState)}`)
+
+  await clickElement(inCard(TARGET_CANDIDATE, '.loom-btn-verify[data-result="failed"]'))
+  await waitFor("window.loomQA.countOf('loom.verification.record') >= 1", '核验失败 never sent loom.verification.record')
+  assert.equal(await script("window.loomQA.countOf('loom.verification.record')"), 1, '核验失败 must send exactly one loom.verification.record')
+  const failed = await waitCard(TARGET_CANDIDATE, state => state.verificationState === 'failed',
+    'The failed verdict was never read back into the delivery section')
+  assert.equal(failed.verificationCopy, '核验失败', `Failed badge copy is not the recorded verdict: ${JSON.stringify(failed.verificationCopy)}`)
+  assert.deepEqual(failed.actionRow, ['接受', '驳回'],
+    `Both verification buttons must disappear after a failed verification: ${JSON.stringify(failed.actionRow)}`)
+  assert.equal(failed.acceptanceState, 'pending', 'A failed verification must not decide the acceptance axis')
+  assert.equal(failed.forms, 0, 'A failed verification must not open the acceptance form')
+  assert.equal(typeof failed.verification, 'string', `The failed verification was not rendered back: ${JSON.stringify(failed.verification)}`)
+  assert(failed.verification.includes('失败'), `The failed verification line is missing: ${JSON.stringify(failed.verification)}`)
+  assert(failed.verification.includes('人工核验'), `The failed verification method is not the manual one: ${JSON.stringify(failed.verification)}`)
+
+  const failedWrites = await writeLog()
+  assert.equal(failedWrites.length, 1, `核验失败 must send exactly one write: ${JSON.stringify(failedWrites)}`)
+  const failedWrite = failedWrites[0]
+  assert.equal(failedWrite.method, 'loom.verification.record', `Unexpected failed write method: ${JSON.stringify(failedWrite.method)}`)
+  const failedPayload = failedWrite.params
+  assert.equal(failedPayload.candidateId, 'candidate-2', `Failed payload must address the clicked candidate: ${JSON.stringify(failedPayload.candidateId)}`)
+  assert.equal(failedPayload.taskId, 'task-3', `Failed payload must address the clicked candidate task: ${JSON.stringify(failedPayload.taskId)}`)
+  assert.equal('executorId' in failedPayload, false, 'Clients must not send executorId; Core injects it')
+  assert.match(failedPayload.commandId, UUID_PATTERN, `Failed commandId is not a UUID: ${JSON.stringify(failedPayload.commandId)}`)
+  assert.equal(failedPayload.method, 'manual', `The failed button must still report the manual method: ${JSON.stringify(failedPayload.method)}`)
+  assert.equal(failedPayload.result, 'failed', `The failed payload result does not match the clicked button: ${JSON.stringify(failedPayload.result)}`)
+  const failedState = await script('window.loomQA.state()')
+  assert.equal(failedWrite.receipt.planId, failedState.plan.planId, `Failed receipt plan does not match the plan projection: ${JSON.stringify(failedWrite.receipt)}`)
+  assert.equal(failedWrite.receipt.taskId, 'task-3', `Failed receipt lost the task id: ${JSON.stringify(failedWrite.receipt)}`)
+  assert.equal(failedWrite.receipt.candidateVerificationStatus, 'failed', `Failed receipt status is wrong: ${JSON.stringify(failedWrite.receipt.candidateVerificationStatus)}`)
+  assert.deepEqual(failedWrite.receipt.releasedDependencyIds, [], `Failed receipt released dependencies it never evaluated: ${JSON.stringify(failedWrite.receipt.releasedDependencyIds)}`)
+  assert.equal(failedWrite.receipt.replayed, false, `A first failed verification must not claim replay: ${JSON.stringify(failedWrite.receipt.replayed)}`)
+  assert.equal(failedState.candidates.find(candidate => candidate.candidateId === 'candidate-2').verificationStatus, 'failed',
+    'The read-back candidate must carry the failed status')
+  assert.equal(failedState.verifications.filter(verification => verification.candidateId === 'candidate-2').length, 1, 'The failed verification write must add exactly one row')
+  cases.push('核验失败 writes exactly one loom.verification.record from its own initial state, reads the failed badge back and keeps the acceptance axis pending with its buttons')
+
+  assert.deepEqual(await script('window.loomQA.errors'), [], 'The delivery write cases requested a method the fixture did not answer')
 
   console.log(JSON.stringify({ ok: true, cases, shots, counts: final, output }))
   app.exit(0)
