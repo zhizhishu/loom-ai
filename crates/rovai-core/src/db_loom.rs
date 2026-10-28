@@ -484,8 +484,7 @@ pub(super) fn schema_matches(
     let review_recorded = projection_schema_version < 172 || review_schema_matches(connection)?;
     let verification_recorded =
         projection_schema_version < 173 || verification_schema_matches(connection)?;
-    let artifact_recorded =
-        projection_schema_version < 174 || artifact_schema_matches(connection)?;
+    let artifact_recorded = projection_schema_version < 174 || artifact_schema_matches(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[

@@ -3166,12 +3166,7 @@ pub fn verification_record(
     ensure_evidence_artifacts(&transaction, &plan_id, &input.evidence_ids)?;
     if result == LoomVerificationResult::Passed {
         let workspace = mission_workspace(&transaction, &mission_id)?;
-        ensure_evidence_bytes_match(
-            &transaction,
-            &workspace,
-            &plan_id,
-            &input.evidence_ids,
-        )?;
+        ensure_evidence_bytes_match(&transaction, &workspace, &plan_id, &input.evidence_ids)?;
     }
 
     let verification_id = format!("verification_{}", uuid::Uuid::new_v4().simple());
@@ -6511,14 +6506,23 @@ mod tests {
         );
     }
 
-    fn write_workspace_file(database: &OwnedTestDatabase, mission_id: &str, name: &str, body: &str) -> String {
+    fn write_workspace_file(
+        database: &OwnedTestDatabase,
+        mission_id: &str,
+        name: &str,
+        body: &str,
+    ) -> String {
         let workspace = mission_workspace(database.connection(), mission_id).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join(name), body).unwrap();
         name.to_string()
     }
 
-    fn register(database: &mut OwnedTestDatabase, mission_id: &str, relative_path: &str) -> LoomArtifact {
+    fn register(
+        database: &mut OwnedTestDatabase,
+        mission_id: &str,
+        relative_path: &str,
+    ) -> LoomArtifact {
         artifact_register(
             database,
             "local_user",
@@ -6553,13 +6557,29 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!first.replayed, "assertion the first registration writes a row");
-        assert_eq!(first.artifact.size_bytes, 14, "assertion size comes from the bytes");
-        assert_eq!(first.artifact.sha256.len(), 64, "assertion sha256 is a real digest");
+        assert!(
+            !first.replayed,
+            "assertion the first registration writes a row"
+        );
+        assert_eq!(
+            first.artifact.size_bytes, 14,
+            "assertion size comes from the bytes"
+        );
+        assert_eq!(
+            first.artifact.sha256.len(),
+            64,
+            "assertion sha256 is a real digest"
+        );
         assert_eq!(first.artifact.creator_id, "local_user");
         assert_eq!(
             first.artifact.sha256,
-            artifact_digest(&mission_workspace(database.connection(), &mission_id).unwrap().join("report.md")).unwrap().0,
+            artifact_digest(
+                &mission_workspace(database.connection(), &mission_id)
+                    .unwrap()
+                    .join("report.md")
+            )
+            .unwrap()
+            .0,
             "assertion the recorded digest is the one the bytes produce"
         );
 
@@ -6576,7 +6596,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(second.replayed, "assertion the same bytes replay instead of writing");
+        assert!(
+            second.replayed,
+            "assertion the same bytes replay instead of writing"
+        );
         assert_eq!(second.artifact.artifact_id, first.artifact.artifact_id);
         let rows: i64 = database
             .connection()
@@ -6593,7 +6616,12 @@ mod tests {
         write_workspace_file(&database, &mission_id, "report.md", "original");
         register(&mut database, &mission_id, "report.md");
 
-        write_workspace_file(&database, &mission_id, "report.md", "rewritten after the verdict");
+        write_workspace_file(
+            &database,
+            &mission_id,
+            "report.md",
+            "rewritten after the verdict",
+        );
         let error = artifact_register(
             &mut database,
             "local_user",
@@ -6693,9 +6721,14 @@ mod tests {
         );
         let verifications: i64 = database
             .connection()
-            .query_row("SELECT COUNT(*) FROM loom_verification", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM loom_verification", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(verifications, 0, "assertion the refused write stored nothing");
+        assert_eq!(
+            verifications, 0,
+            "assertion the refused write stored nothing"
+        );
     }
 
     #[test]
@@ -6737,18 +6770,27 @@ mod tests {
             "UPDATE loom_artifact SET sha256='0' WHERE artifact_id=?1",
             [&artifact.artifact_id],
         );
-        assert!(update.is_err(), "assertion an artifact digest cannot be rewritten");
+        assert!(
+            update.is_err(),
+            "assertion an artifact digest cannot be rewritten"
+        );
         let delete = database.connection().execute(
             "DELETE FROM loom_artifact WHERE artifact_id=?1",
             [&artifact.artifact_id],
         );
-        assert!(delete.is_err(), "assertion an artifact cannot be deleted while its plan exists");
+        assert!(
+            delete.is_err(),
+            "assertion an artifact cannot be deleted while its plan exists"
+        );
         let replace = database.connection().execute(
             "INSERT OR REPLACE INTO loom_artifact(artifact_id,plan_id,task_id,agent_run_id,
                  relative_path,sha256,size_bytes,content_type,creator_id,created_at)
              VALUES(?1,?2,NULL,NULL,'report.md',?3,1,NULL,'local_user','now')",
             params![&artifact.artifact_id, &artifact.plan_id, &artifact.sha256],
         );
-        assert!(replace.is_err(), "assertion an artifact cannot be replaced in place");
+        assert!(
+            replace.is_err(),
+            "assertion an artifact cannot be replaced in place"
+        );
     }
 }
