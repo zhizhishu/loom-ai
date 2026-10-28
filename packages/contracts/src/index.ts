@@ -4319,6 +4319,8 @@ export type CoreMethod =
   | 'loom.candidates.list'
   | 'loom.reviews.list'
   | 'loom.review.record'
+  | 'loom.verifications.list'
+  | 'loom.verification.record'
   | 'automations.create'
   | 'automations.update'
   | 'automations.configureTimeLimit'

@@ -501,7 +501,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 172;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 173;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -998,6 +998,7 @@ struct CurrentMigrationState {
     v220: bool,
     v221: bool,
     v222: bool,
+    v223: bool,
 }
 
 impl CurrentMigrationState {
@@ -1019,6 +1020,14 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v223 {
+            let mut previous = *self;
+            previous.v223 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 173
+                && self.v222
+                && previous.admits("v1.72", 172, classifier);
+        }
         if self.v222 {
             let mut previous = *self;
             previous.v222 = false;
@@ -3799,6 +3808,7 @@ pub(crate) fn classify_database_contract(
                 | 170
                 | 171
                 | 172
+                | 173
         )
     {
         let expected_migration = marker.projection_schema_version + 50;
@@ -6130,7 +6140,8 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=219),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=220),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=221),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=222)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=222),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=223)
         "#,
         [],
         |row| {
@@ -6288,6 +6299,7 @@ fn load_current_migration_state(
                 v220: row.get(150)?,
                 v221: row.get(151)?,
                 v222: row.get(152)?,
+                v223: row.get(153)?,
             })
         },
     )
@@ -9616,6 +9628,9 @@ impl Database {
             if !self.schema_migration_applied(222)? {
                 migration_step!("migration_222", loom::migrate_review(self));
             }
+            if !self.schema_migration_applied(223)? {
+                migration_step!("migration_223", loom::migrate_verification(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10509,6 +10524,9 @@ impl Database {
         }
         if !self.schema_migration_applied(222)? {
             migration_step!("migration_222", loom::migrate_review(self));
+        }
+        if !self.schema_migration_applied(223)? {
+            migration_step!("migration_223", loom::migrate_verification(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42327,6 +42345,7 @@ mod tests {
             v220: version >= 220,
             v221: version >= 221,
             v222: version >= 222,
+            v223: version >= 223,
         }
     }
 

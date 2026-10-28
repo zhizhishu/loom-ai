@@ -9554,6 +9554,15 @@ impl Core {
             }
             // Review record is the Owner's write: the verdict, the Task transition and the
             // dependency release freeze all happen inside one transaction.
+            // Verification record is the evidence axis: a passing check flips the candidate
+            // to VERIFIED and releases artifact edges once the Owner has also accepted it.
+            "loom.verification.record" => {
+                let input: rovai_core::loom::LoomVerificationRecordInput =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let result = rovai_core::loom::verification_record(&mut database, input)?;
+                Ok(serde_json::to_value(result)?)
+            }
             "loom.review.record" => {
                 let input: rovai_core::loom::LoomReviewRecordInput =
                     serde_json::from_value(request.params.clone())?;
@@ -9562,7 +9571,7 @@ impl Core {
                 Ok(serde_json::to_value(result)?)
             }
             "loom.plan.get" | "loom.tasks.list" | "loom.dependencies.list"
-            | "loom.candidates.list" | "loom.reviews.list" => {
+            | "loom.candidates.list" | "loom.reviews.list" | "loom.verifications.list" => {
                 let params: rovai_core::loom::MissionScopeInput =
                     serde_json::from_value(request.params.clone())?;
                 let database = self.database.lock().await;
@@ -9581,6 +9590,9 @@ impl Core {
                         &database,
                         mission_id,
                     )?)?,
+                    "loom.verifications.list" => serde_json::to_value(
+                        rovai_core::loom::verifications_list(&database, mission_id)?,
+                    )?,
                     _ => serde_json::to_value(rovai_core::loom::dependencies_list(
                         &database,
                         mission_id,

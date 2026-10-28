@@ -9,6 +9,7 @@ const DEPENDENCY_TABLE: &str = "loom_dependency";
 const CLAIM_TABLE: &str = "loom_claim";
 const CANDIDATE_TABLE: &str = "loom_candidate";
 const REVIEW_TABLE: &str = "loom_review";
+const VERIFICATION_TABLE: &str = "loom_verification";
 
 /// Task states follow the LOOM control-plane contract
 /// (DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED).
@@ -22,6 +23,8 @@ const VERIFICATION_STATUS: &str = "CHECK(verification_status IN ('UNVERIFIED','V
 const ACCEPTANCE_STATUS: &str = "CHECK(acceptance_status IN ('PENDING','ACCEPTED','REJECTED'))";
 /// A Review is the Owner's verdict on one Candidate: accepted or rejected, nothing else.
 const REVIEW_VERDICT: &str = "CHECK(verdict IN ('ACCEPTED','REJECTED'))";
+/// Evidence verification is an axis of its own: a Run's claim is not a proof.
+const VERIFICATION_RESULT: &str = "CHECK(result IN ('PASSED','FAILED'))";
 
 fn create_sql() -> String {
     format!(
@@ -249,6 +252,76 @@ fn review_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     Ok(columns == 11 && immutable_triggers == 3 && declared)
 }
 
+/// Migration 223: the evidence verification of one Candidate. Verification answers a
+/// different question than acceptance — can the delivery be reproduced — so it is stored
+/// separately, written once, and never retroactively rewritten.
+fn verification_sql() -> String {
+    format!(
+        r#"
+        CREATE TABLE {VERIFICATION_TABLE} (
+            verification_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            candidate_id TEXT NOT NULL UNIQUE
+                REFERENCES {CANDIDATE_TABLE}(candidate_id) ON DELETE CASCADE,
+            command_id TEXT NOT NULL UNIQUE,
+            method TEXT NOT NULL CHECK(length(method) BETWEEN 1 AND 200),
+            executor_id TEXT NOT NULL CHECK(length(executor_id) BETWEEN 1 AND 200),
+            result TEXT NOT NULL {VERIFICATION_RESULT},
+            evidence_ids_json TEXT NOT NULL
+                CHECK(json_valid(evidence_ids_json) AND json_type(evidence_ids_json)='array'),
+            verified_at TEXT NOT NULL,
+            FOREIGN KEY(plan_id, task_id)
+                REFERENCES {TASK_TABLE}(plan_id, task_id) ON DELETE CASCADE
+        );
+        CREATE INDEX loom_verification_plan_idx ON {VERIFICATION_TABLE}(plan_id, verification_id);
+        CREATE INDEX loom_verification_task_idx ON {VERIFICATION_TABLE}(task_id, verified_at);
+        CREATE TRIGGER loom_verification_immutable
+            BEFORE UPDATE ON {VERIFICATION_TABLE}
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM verification is immutable'); END;
+        CREATE TRIGGER loom_verification_no_replace
+            BEFORE INSERT ON {VERIFICATION_TABLE}
+            WHEN EXISTS(
+                SELECT 1 FROM {VERIFICATION_TABLE}
+                WHERE verification_id=NEW.verification_id
+                   OR candidate_id=NEW.candidate_id
+                   OR command_id=NEW.command_id
+            )
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM verification is immutable'); END;
+        CREATE TRIGGER loom_verification_no_direct_delete
+            BEFORE DELETE ON {VERIFICATION_TABLE}
+            WHEN EXISTS(SELECT 1 FROM {CANDIDATE_TABLE} WHERE candidate_id=OLD.candidate_id)
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM verification is immutable'); END;
+        "#
+    )
+}
+
+fn verification_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('verification_id','plan_id','task_id','candidate_id','command_id','method',
+              'executor_id','result','evidence_ids_json','verified_at')",
+        [VERIFICATION_TABLE],
+        |row| row.get(0),
+    )?;
+    let triggers: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1
+             AND name IN ('loom_verification_immutable','loom_verification_no_replace',
+                          'loom_verification_no_direct_delete')",
+        [VERIFICATION_TABLE],
+        |row| row.get(0),
+    )?;
+    let declared = table_sql(connection, VERIFICATION_TABLE)?.is_some_and(|sql| {
+        let sql = sql.split_whitespace().collect::<String>();
+        sql.contains(&VERIFICATION_RESULT.split_whitespace().collect::<String>())
+            && sql.contains("candidate_idTEXTNOTNULLUNIQUE")
+            && sql.contains("command_idTEXTNOTNULLUNIQUE")
+            && sql.contains("REFERENCESloom_candidate(candidate_id)")
+            && sql.contains("REFERENCESloom_task(plan_id,task_id)")
+    });
+    Ok(columns == 10 && triggers == 3 && declared)
+}
+
 /// The claim projection is part of the LOOM schema from migration 220 on; earlier
 /// markers keep admitting databases that predate the lease table.
 fn claim_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
@@ -300,6 +373,8 @@ pub(super) fn schema_matches(
     let candidate_recorded =
         projection_schema_version < 171 || candidate_schema_matches(connection)?;
     let review_recorded = projection_schema_version < 172 || review_schema_matches(connection)?;
+    let verification_recorded =
+        projection_schema_version < 173 || verification_schema_matches(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -326,7 +401,8 @@ pub(super) fn schema_matches(
         )?
         && claim_recorded
         && candidate_recorded
-        && review_recorded)
+        && review_recorded
+        && verification_recorded)
 }
 
 /// Migration 219 hangs the acceptance criteria version on the Plan; Tasks inherit it.
@@ -536,6 +612,41 @@ pub(super) fn migrate_review(database: &mut Database) -> Result<()> {
     Ok(())
 }
 
+/// Migration 223: the evidence verification of a delivery candidate.
+pub(super) fn migrate_verification(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 172
+        ),
+        "LOOM verification migration requires schema 172"
+    );
+    tx.execute_batch(&verification_sql())?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(223,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=173,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(&tx, &[VERIFICATION_TABLE])?;
+    anyhow::ensure!(
+        verification_schema_matches(&tx)?,
+        "LOOM verification migration did not create the required table"
+    );
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 173
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "LOOM verification schema admission failed");
+    tx.commit()?;
+    Ok(())
+}
+
 /// Only synthetic migration fixtures reverse this projection; product code never drops it.
 #[cfg(test)]
 pub(super) fn downgrade_for_test(connection: &Connection) {
@@ -552,6 +663,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+            DROP TABLE IF EXISTS loom_verification;
             DROP TABLE IF EXISTS loom_review;
             DROP TABLE IF EXISTS loom_candidate;
             DROP TABLE IF EXISTS loom_claim;
@@ -559,7 +671,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
-            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222);
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
@@ -794,6 +906,27 @@ mod tests {
             projection_version(&database),
             172,
             "assertion contract_marker_advances_to_172"
+        );
+        // Migration 223 adds the evidence verification, so the 222 receipt is a source now.
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 172
+        ));
+        migrate_verification(&mut database).unwrap();
+        assert!(
+            verification_schema_matches(database.connection()).unwrap(),
+            "assertion schema_173_creates_the_loom_verification_projection"
+        );
+        assert_eq!(
+            migration_receipts(&database, 223),
+            1,
+            "assertion schema_migration_records_223_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            173,
+            "assertion contract_marker_advances_to_173"
         );
         assert!(matches!(
             classify_database_contract(database.connection()).unwrap(),

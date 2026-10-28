@@ -492,6 +492,7 @@ const LOOM_CANDIDATE_NOT_FOUND: &str = "LOOM_CANDIDATE_NOT_FOUND";
 const LOOM_TASK_NOT_IN_REVIEW: &str = "LOOM_TASK_NOT_IN_REVIEW";
 const LOOM_REVIEW_EXISTS: &str = "LOOM_REVIEW_EXISTS";
 const LOOM_REVIEW_CRITERIA_INCOMPLETE: &str = "LOOM_REVIEW_CRITERIA_INCOMPLETE";
+const LOOM_VERIFICATION_EXISTS: &str = "LOOM_VERIFICATION_EXISTS";
 
 /// Rejection of a LOOM task release or claim; `code` is the stable error code the Host
 /// returns, exactly like [`LoomPlanImportError`].
@@ -1931,48 +1932,87 @@ pub fn reviews_list(database: &Database, mission_id: &str) -> Result<Vec<LoomRev
         .collect()
 }
 
-/// Releasing is one write, never a second evaluation later: an accepted verdict freezes the
-/// trace on every still-open outgoing edge of the Task it accepted.
-fn freeze_released_dependencies(
+/// A `TASK_DONE` edge is released by the completion itself: the trace records when and at
+/// which upstream revision, and names no candidate or review.
+fn freeze_task_done_edges(
     transaction: &rusqlite::Transaction<'_>,
     plan_id: &str,
     task_id: &str,
     task_revision: i64,
-    candidate_id: &str,
-    review_id: &str,
     resolved_at: &str,
 ) -> Result<Vec<String>> {
-    let pending: Vec<(String, String)> = transaction
+    let pending: Vec<String> = transaction
         .prepare(
-            "SELECT dependency_id, condition FROM loom_dependency
-             WHERE plan_id=?1 AND upstream_task_id=?2 AND resolved_at IS NULL
+            "SELECT dependency_id FROM loom_dependency
+             WHERE plan_id=?1 AND upstream_task_id=?2 AND resolved_at IS NULL AND condition=?3
              ORDER BY created_at, dependency_id",
         )?
-        .query_map(params![plan_id, task_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(
+            params![plan_id, task_id, LoomDependencyCondition::TaskDone.as_str()],
+            |row| row.get::<_, String>(0),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    // The evaluator in the TS contract releases an artifact edge only for a candidate that is
-    // both verified and accepted. Freezing it before verification would make storage claim a
-    // release the wire still reports as blocked, so this waits for the verification slice.
-    let verified: bool = transaction.query_row(
-        "SELECT verification_status='VERIFIED' FROM loom_candidate WHERE candidate_id=?1",
+    for dependency_id in &pending {
+        transaction.execute(
+            "UPDATE loom_dependency
+             SET resolved_at=?1, upstream_task_revision=?2
+             WHERE plan_id=?3 AND dependency_id=?4 AND resolved_at IS NULL",
+            params![resolved_at, task_revision, plan_id, dependency_id],
+        )?;
+    }
+    Ok(pending)
+}
+
+/// An `ARTIFACT_ACCEPTED` edge is released only once the candidate is **verified and
+/// accepted** and an accepting review exists — the same three conditions the TS evaluator
+/// requires. Anything less must leave the edge frozen-free, or storage and wire disagree.
+fn freeze_artifact_edges(
+    transaction: &rusqlite::Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+    resolved_at: &str,
+) -> Result<Vec<String>> {
+    let ready: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM loom_candidate AS candidate
+             JOIN loom_review AS review ON review.candidate_id=candidate.candidate_id
+             WHERE candidate.candidate_id=?1
+               AND candidate.verification_status='VERIFIED'
+               AND candidate.acceptance_status='ACCEPTED'
+               AND review.verdict='ACCEPTED')",
         [candidate_id],
         |row| row.get(0),
     )?;
-    let mut released = Vec::new();
-    for (dependency_id, condition) in pending {
-        // A TASK_DONE edge is released by the completion itself; an ARTIFACT_ACCEPTED edge
-        // keeps the candidate and the review that justified it.
-        let artifact = condition != LoomDependencyCondition::TaskDone.as_str();
-        if artifact && !verified {
-            continue;
-        }
-        let trace = if artifact {
-            (Some(candidate_id), Some(review_id))
-        } else {
-            (None::<&str>, None::<&str>)
-        };
+    if !ready {
+        return Ok(vec![]);
+    }
+    let review_id: String = transaction.query_row(
+        "SELECT review_id FROM loom_review WHERE candidate_id=?1",
+        [candidate_id],
+        |row| row.get(0),
+    )?;
+    let task_revision: i64 = transaction.query_row(
+        "SELECT revision FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+        params![plan_id, task_id],
+        |row| row.get(0),
+    )?;
+    let pending: Vec<String> = transaction
+        .prepare(
+            "SELECT dependency_id FROM loom_dependency
+             WHERE plan_id=?1 AND upstream_task_id=?2 AND resolved_at IS NULL AND condition=?3
+             ORDER BY created_at, dependency_id",
+        )?
+        .query_map(
+            params![
+                plan_id,
+                task_id,
+                LoomDependencyCondition::ArtifactAccepted.as_str()
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for dependency_id in &pending {
         transaction.execute(
             "UPDATE loom_dependency
              SET resolved_at=?1, upstream_task_revision=?2, candidate_id=?3, review_id=?4
@@ -1980,15 +2020,14 @@ fn freeze_released_dependencies(
             params![
                 resolved_at,
                 task_revision,
-                trace.0,
-                trace.1,
+                candidate_id,
+                review_id,
                 plan_id,
                 dependency_id
             ],
         )?;
-        released.push(dependency_id);
     }
-    Ok(released)
+    Ok(pending)
 }
 
 fn read_stored_review(
@@ -2265,15 +2304,22 @@ pub fn review_record(
                  WHERE plan_id=?2 AND task_id=?3",
                 params![&reviewed_at, &plan_id, &task_id],
             )?;
-            let released = freeze_released_dependencies(
+            let mut released = freeze_task_done_edges(
                 &transaction,
                 &plan_id,
                 &task_id,
                 task_revision + 1,
-                &candidate_id,
-                &review_id,
                 &reviewed_at,
             )?;
+            // The artifact edges stay closed until a verification is recorded; whichever of
+            // review and verification lands second is the one that releases them.
+            released.extend(freeze_artifact_edges(
+                &transaction,
+                &plan_id,
+                &task_id,
+                &candidate_id,
+                &reviewed_at,
+            )?);
             (LoomTaskStatus::Done, released)
         }
         LoomReviewVerdict::Rejected => {
@@ -2305,6 +2351,327 @@ pub fn review_record(
         task_id,
         task_status: next_status,
         candidate_acceptance_status: acceptance,
+        released_dependency_ids: released,
+        replayed: false,
+    })
+}
+
+/// Evidence verification verdict: can the delivery be reproduced, independently of whether
+/// the Owner accepts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoomVerificationResult {
+    Passed,
+    Failed,
+}
+
+impl LoomVerificationResult {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "PASSED" => Ok(Self::Passed),
+            "FAILED" => Ok(Self::Failed),
+            other => anyhow::bail!("LOOM verification has an unknown result {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "PASSED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// Read model of an immutable Verification. `planId`/`taskId` stay in storage for referential
+/// integrity; the wire shape is the contract's `LoomVerification`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomVerification {
+    pub verification_id: String,
+    pub candidate_id: String,
+    pub method: String,
+    pub executor_id: String,
+    pub result: LoomVerificationResult,
+    pub evidence_ids: Vec<String>,
+    pub verified_at: String,
+}
+
+/// Verification submission: how the delivery was re-checked and by what method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomVerificationRecordInput {
+    pub mission_id: String,
+    pub task_id: String,
+    pub candidate_id: String,
+    pub command_id: String,
+    pub method: String,
+    pub executor_id: String,
+    pub result: LoomVerificationResult,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+}
+
+/// Verification receipt: the recorded check plus what it moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomVerificationRecordResult {
+    pub verification: LoomVerification,
+    pub mission_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub candidate_verification_status: LoomVerificationStatus,
+    /// Dependencies whose release this verification froze, in dependency order.
+    pub released_dependency_ids: Vec<String>,
+    /// True when the same `commandId` replayed and nothing new was written.
+    pub replayed: bool,
+}
+
+/// Every Verification recorded under the Mission's plan, oldest first.
+pub fn verifications_list(database: &Database, mission_id: &str) -> Result<Vec<LoomVerification>> {
+    let mission_id = scoped_mission(mission_id)?;
+    let mut statement = database.connection().prepare(
+        "SELECT verification.verification_id, verification.candidate_id, verification.method,
+                verification.executor_id, verification.result, verification.evidence_ids_json,
+                verification.verified_at
+         FROM loom_verification AS verification
+         JOIN loom_plan AS plan ON plan.plan_id=verification.plan_id
+         WHERE plan.mission_id=?1
+         ORDER BY verification.verified_at, verification.verification_id",
+    )?;
+    type VerificationRow = (String, String, String, String, String, String, String);
+    let rows: Vec<VerificationRow> = statement
+        .query_map([mission_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(
+            |(verification_id, candidate_id, method, executor_id, result, evidence_json, verified_at)| {
+                let evidence_ids: Vec<String> =
+                    serde_json::from_str(&evidence_json).with_context(|| {
+                        format!("LOOM verification {verification_id} has unreadable evidence ids")
+                    })?;
+                Ok(LoomVerification {
+                    verification_id,
+                    candidate_id,
+                    method,
+                    executor_id,
+                    result: LoomVerificationResult::parse(&result)?,
+                    evidence_ids,
+                    verified_at,
+                })
+            },
+        )
+        .collect()
+}
+
+fn read_stored_verification(
+    transaction: &rusqlite::Transaction<'_>,
+    verification_id: &str,
+) -> Result<LoomVerification> {
+    let row = transaction.query_row(
+        "SELECT candidate_id, method, executor_id, result, evidence_ids_json, verified_at
+         FROM loom_verification WHERE verification_id=?1",
+        [verification_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        },
+    )?;
+    let (candidate_id, method, executor_id, result, evidence_json, verified_at) = row;
+    Ok(LoomVerification {
+        verification_id: verification_id.to_string(),
+        candidate_id,
+        method,
+        executor_id,
+        result: LoomVerificationResult::parse(&result)?,
+        evidence_ids: serde_json::from_str(&evidence_json).with_context(|| {
+            format!("LOOM verification {verification_id} has unreadable evidence ids")
+        })?,
+        verified_at,
+    })
+}
+
+/// LOOM verification path: an independent check of one Candidate. A passing check flips the
+/// candidate's verification axis to VERIFIED and releases the artifact edges as soon as the
+/// Owner has also accepted it; whichever of the two lands second does the releasing.
+pub fn verification_record(
+    database: &mut Database,
+    input: LoomVerificationRecordInput,
+) -> Result<LoomVerificationRecordResult> {
+    let mission_id = required_field("verification record", "missionId", &input.mission_id)?;
+    let task_id = required_field("verification record", "taskId", &input.task_id)?;
+    let candidate_id = required_field("verification record", "candidateId", &input.candidate_id)?;
+    let command_id = required_field("verification record", "commandId", &input.command_id)?;
+    let method = required_field("verification record", "method", &input.method)?;
+    let executor_id = required_field("verification record", "executorId", &input.executor_id)?;
+    let result = input.result;
+
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let verified_at = chrono::Utc::now().to_rfc3339();
+
+    let replayed: Option<String> = transaction
+        .query_row(
+            "SELECT verification_id FROM loom_verification WHERE command_id=?1",
+            [&command_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(verification_id) = replayed {
+        let verification = read_stored_verification(&transaction, &verification_id)?;
+        let plan_id: String = transaction.query_row(
+            "SELECT plan_id FROM loom_verification WHERE verification_id=?1",
+            [&verification_id],
+            |row| row.get(0),
+        )?;
+        let status: String = transaction.query_row(
+            "SELECT verification_status FROM loom_candidate WHERE candidate_id=?1",
+            [&verification.candidate_id],
+            |row| row.get(0),
+        )?;
+        let candidate_verification_status = LoomVerificationStatus::parse(&status)?;
+        transaction.commit()?;
+        return Ok(LoomVerificationRecordResult {
+            verification,
+            mission_id,
+            plan_id,
+            task_id,
+            candidate_verification_status,
+            released_dependency_ids: vec![],
+            replayed: true,
+        });
+    }
+
+    let plan = transaction
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(plan_id) = plan else {
+        return Err(LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} has no LOOM plan"),
+        )
+        .into());
+    };
+    let task_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loom_task WHERE plan_id=?1 AND task_id=?2)",
+        params![&plan_id, &task_id],
+        |row| row.get(0),
+    )?;
+    if !task_exists {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_FOUND,
+            format!("task {task_id} is not in the plan for mission {mission_id}"),
+        )
+        .into());
+    }
+    let candidate = transaction
+        .query_row(
+            "SELECT task_id FROM loom_candidate WHERE plan_id=?1 AND candidate_id=?2",
+            params![&plan_id, &candidate_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(candidate_task_id) = candidate else {
+        return Err(LoomCommandError::rejection(
+            LOOM_CANDIDATE_NOT_FOUND,
+            format!("candidate {candidate_id} is not recorded in the plan for mission {mission_id}"),
+        )
+        .into());
+    };
+    if candidate_task_id != task_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CANDIDATE_NOT_FOUND,
+            format!("candidate {candidate_id} belongs to task {candidate_task_id}, not {task_id}"),
+        )
+        .into());
+    }
+    let already: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loom_verification WHERE candidate_id=?1)",
+        [&candidate_id],
+        |row| row.get(0),
+    )?;
+    if already {
+        return Err(LoomCommandError::rejection(
+            LOOM_VERIFICATION_EXISTS,
+            format!("candidate {candidate_id} already carries a verification"),
+        )
+        .into());
+    }
+
+    let verification_id = format!("verification_{}", uuid::Uuid::new_v4().simple());
+    let verification_status = match result {
+        LoomVerificationResult::Passed => LoomVerificationStatus::Verified,
+        LoomVerificationResult::Failed => LoomVerificationStatus::Failed,
+    };
+    transaction.execute(
+        "INSERT INTO loom_verification(verification_id,plan_id,task_id,candidate_id,command_id,
+                                       method,executor_id,result,evidence_ids_json,verified_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            &verification_id,
+            &plan_id,
+            &task_id,
+            &candidate_id,
+            &command_id,
+            &method,
+            &executor_id,
+            result.as_str(),
+            serde_json::to_string(&input.evidence_ids)?,
+            &verified_at,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE loom_candidate SET verification_status=?1 WHERE candidate_id=?2",
+        params![verification_status.as_str(), &candidate_id],
+    )?;
+    // A failed check releases nothing; a passing one closes the artifact edges only if the
+    // Owner has already accepted this candidate.
+    let released = match result {
+        LoomVerificationResult::Passed => freeze_artifact_edges(
+            &transaction,
+            &plan_id,
+            &task_id,
+            &candidate_id,
+            &verified_at,
+        )?,
+        LoomVerificationResult::Failed => vec![],
+    };
+    transaction.commit()?;
+
+    Ok(LoomVerificationRecordResult {
+        verification: LoomVerification {
+            verification_id,
+            candidate_id,
+            method,
+            executor_id,
+            result,
+            evidence_ids: input.evidence_ids,
+            verified_at,
+        },
+        mission_id,
+        plan_id,
+        task_id,
+        candidate_verification_status: verification_status,
         released_dependency_ids: released,
         replayed: false,
     })
