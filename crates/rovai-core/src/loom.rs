@@ -5942,19 +5942,38 @@ mod tests {
     fn claims_list_projects_the_open_lease_against_one_server_clock() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM claims projection");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
 
         let listed = claims_list(&database, &mission_id).unwrap();
 
-        assert_eq!(listed.claims.len(), 1, "assertion claims_list_returns_the_open_claim");
+        assert_eq!(
+            listed.claims.len(),
+            1,
+            "assertion claims_list_returns_the_open_claim"
+        );
         let only = &listed.claims[0];
         assert_eq!(only.claim_id, claim.claim_id);
         assert_eq!(only.task_id, "task_a");
         assert_eq!(only.agent_run_id, "run_one");
-        assert_eq!(only.fence_generation, 1, "assertion claims_list_reports_the_fence");
+        assert_eq!(
+            only.fence_generation, 1,
+            "assertion claims_list_reports_the_fence"
+        );
         assert_eq!(only.claimant_agent_id.as_deref(), Some("agent_1"));
-        assert_eq!(only.released_at, None, "an open claim must not report a release");
-        assert!(!only.expired, "assertion a fresh lease must not read as expired");
+        assert_eq!(
+            only.released_at, None,
+            "an open claim must not report a release"
+        );
+        assert!(
+            !only.expired,
+            "assertion a fresh lease must not read as expired"
+        );
         assert_eq!(only.claimed_at, claim.claimed_at);
         assert_eq!(only.lease_expires_at, claim.lease_expires_at);
         chrono::DateTime::parse_from_rfc3339(&listed.evaluated_at)
@@ -5965,7 +5984,13 @@ mod tests {
     fn claims_list_separates_a_lapsed_lease_from_a_released_one() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM claims expiry");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
 
         let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
         database
@@ -5993,7 +6018,10 @@ mod tests {
             )
             .unwrap();
         let released = claims_list(&database, &mission_id).unwrap();
-        assert_eq!(released.claims[0].released_at.as_deref(), Some(released_at.as_str()));
+        assert_eq!(
+            released.claims[0].released_at.as_deref(),
+            Some(released_at.as_str())
+        );
         assert!(
             !released.claims[0].expired,
             "assertion a released claim must not also read as expired"
@@ -6005,7 +6033,13 @@ mod tests {
         let mut database = fixture();
         let mission_one = create_mission(&mut database, "LOOM claims one");
         let mission_two = create_mission(&mut database, "LOOM claims two");
-        held_task(&mut database, &mission_one, "task_a", "run_one", "command_one");
+        held_task(
+            &mut database,
+            &mission_one,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
 
         let count = |database: &OwnedTestDatabase| -> i64 {
             database
