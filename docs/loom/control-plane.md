@@ -19,7 +19,7 @@
 | 切片 | 内容 | 状态 |
 |---|---|---|
 | 2.1 | 迁移 220 / schema 170：`loom_claim` + `loom.task.release` + `loom.claim.acquire`（原子、fence 单调、commandId 幂等、租约过期接管） | 已收（限"存储与 API 基础"，不含提交端 fencing） |
-| 2.2 | 迁移 221 / schema 171：`loom_candidate`（内容列不可改）+ `loom.candidate.record`，提交端 fence = 锁内取时 + claimId/fenceGeneration 双校验 | 已实现，`cargo test --lib loom` 32 passed；**Astra 终审未过，待复审** |
+| 2.2 | 迁移 221 / schema 171：`loom_candidate`（内容列不可改）+ `loom.candidate.record`，提交端 fence = 锁内取时 + claimId/fenceGeneration 双校验 | **Astra 终审 PASS**（`d360194` 修完 `claim_acquire` 锁前取时的 P2 后复审通过）；`cargo test --lib loom` 32 passed；全量 lib 464 passed / 3 环境失败（与基线 `33f6ded` 一致） |
 | 2.3 → **A1** | Review / 人工验收 / 证据核验 / 依赖首次释放冻结 + 迁移 222/schema 172（`loom_review` 不可变、逐条结论、`loom.candidates.list`/`loom.reviews.list`/`loom.review.record`） | 未开始（`artifact_accepted` 边目前永不释放，属诚实未实现） |
 | 2.3b → **A2** | 判定列防篡改：SQLite 触发器拒绝直接 UPDATE 内容列与判定列 | 未开始 |
 | 2.4 → ~~B1~~ | claim/Candidate 接入 UI | **复核纠正：读路径已接真 RPC**（`LoomWorkspace.tsx:186`），无 mock 回退；仅缺非夹具的真实链路证据 |
