@@ -500,6 +500,11 @@ const LOOM_ARTIFACT_EXISTS: &str = "LOOM_ARTIFACT_EXISTS";
 const LOOM_ARTIFACT_CONTENT_CHANGED: &str = "LOOM_ARTIFACT_CONTENT_CHANGED";
 const LOOM_EVIDENCE_NOT_FOUND: &str = "LOOM_EVIDENCE_NOT_FOUND";
 const LOOM_EVIDENCE_HASH_MISMATCH: &str = "LOOM_EVIDENCE_HASH_MISMATCH";
+/// The bytes behind a registered artifact could not be re-read at all: the path was refused or the
+/// file was gone, so no comparison happened. Deliberately not `LOOM_EVIDENCE_HASH_MISMATCH`, which
+/// means the bytes *were* read and they differ — a caller has to be able to tell "something moved"
+/// from "something changed".
+const LOOM_EVIDENCE_UNREADABLE: &str = "LOOM_EVIDENCE_UNREADABLE";
 
 /// Rejection of a LOOM task release or claim; `code` is the stable error code the Host
 /// returns, exactly like [`LoomPlanImportError`].
@@ -1917,6 +1922,20 @@ fn artifact_digest(path: &std::path::Path) -> Result<(String, i64)> {
             .checked_add(read as i64)
             .context("LOOM artifact size overflowed")?;
     }
+    // The handle is not a snapshot: a file that was appended to or truncated while it was being
+    // read would otherwise be recorded with a digest over a length nobody saw. Compare the bytes
+    // actually read with the size the same handle reports now.
+    let declared_len = file
+        .metadata()
+        .with_context(|| format!("LOOM artifact {} cannot be sized", path.to_string_lossy()))?
+        .len();
+    if declared_len != size_bytes as u64 {
+        anyhow::bail!(
+            "LOOM artifact {} changed while it was being read ({} of {declared_len} bytes)",
+            path.to_string_lossy(),
+            size_bytes
+        );
+    }
     let digest = hasher
         .finalize()
         .iter()
@@ -1929,22 +1948,24 @@ fn artifact_digest(path: &std::path::Path) -> Result<(String, i64)> {
 ///
 /// The swap this guards against happens inside that window, and no test can schedule it from the
 /// outside: by the time the command is called, the file is already whatever the caller left behind.
-/// A test installs a callback here and the next registration takes it exactly once. Compiled out of
-/// every non-test build, so the shipped path carries no hook.
+/// A test installs a callback here and the next registration on the *same thread* takes it exactly
+/// once — thread-local on purpose, because the test binary runs cases in parallel and a shared slot
+/// would let one case steal another case's callback. Compiled out of every non-test build, so the
+/// shipped path carries no hook.
 #[cfg(test)]
 mod artifact_swap_hook {
-    use std::sync::Mutex;
+    use std::cell::RefCell;
 
-    static PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+    thread_local! {
+        static PENDING: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
 
-    pub(super) fn install(callback: Box<dyn FnOnce() + Send>) {
-        if let Ok(mut slot) = PENDING.lock() {
-            *slot = Some(callback);
-        }
+    pub(super) fn install(callback: Box<dyn FnOnce()>) {
+        PENDING.with(|slot| *slot.borrow_mut() = Some(callback));
     }
 
     pub(super) fn run() {
-        let callback = PENDING.lock().ok().and_then(|mut slot| slot.take());
+        let callback = PENDING.with(|slot| slot.borrow_mut().take());
         if let Some(callback) = callback {
             callback();
         }
@@ -2225,13 +2246,18 @@ fn ensure_evidence_bytes_match(
                 format!("evidence {evidence_id} is not a registered artifact of this plan"),
             ));
         };
-        let resolved = resolve_artifact_path(workspace, &relative_path)?;
+        // A refused path or a vanished file is "cannot re-read", not "the bytes differ": the two
+        // call for different repairs, so they must not share an error code.
+        let resolved = resolve_artifact_path(workspace, &relative_path).map_err(|error| {
+            LoomCommandError::rejection(
+                LOOM_EVIDENCE_UNREADABLE,
+                format!("evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"),
+            )
+        })?;
         let (actual, _) = artifact_digest(&resolved).map_err(|error| {
             LoomCommandError::rejection(
-                LOOM_EVIDENCE_HASH_MISMATCH,
-                format!(
-                    "evidence {evidence_id} at {relative_path} cannot be read without following links: {error:#}"
-                ),
+                LOOM_EVIDENCE_UNREADABLE,
+                format!("evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"),
             )
         })?;
         if actual != expected {
@@ -6965,6 +6991,29 @@ mod tests {
             "assertion the projection reports the recorded size"
         );
         assert_eq!(listed_alpha.plan_id, alpha.plan_id);
+
+        // Listing must report the recorded row, not something recomputed from disk: the file is
+        // rewritten underneath and the projection has to keep saying what was registered.
+        write_workspace_file(
+            &database,
+            &first,
+            "alpha.md",
+            "these bytes were never registered",
+        );
+        let after = artifacts_list(&database, &first).unwrap();
+        let listed_after = after
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == alpha.artifact_id)
+            .unwrap();
+        assert_eq!(
+            listed_after.sha256, alpha.sha256,
+            "assertion listing never re-hashes the file"
+        );
+        assert_eq!(
+            listed_after.size_bytes, 11,
+            "assertion listing never re-measures the file"
+        );
     }
 
     #[test]
@@ -7166,6 +7215,90 @@ mod tests {
             LOOM_EVIDENCE_HASH_MISMATCH,
             "assertion omitting evidenceIds must not skip the Candidate's evidence: {error}"
         );
+    }
+
+    /// A file that cannot be re-read is not the same finding as a file whose bytes differ: the
+    /// first says something moved, the second says something changed. They carry different codes
+    /// because they call for different repairs.
+    #[test]
+    fn a_vanished_evidence_file_is_unreadable_rather_than_a_hash_mismatch() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM evidence vanished");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
+        std::fs::remove_file(workspace.join("evidence_one.txt")).unwrap();
+
+        let mut input = verification_input(
+            &mission_id,
+            "task_a",
+            &candidate.candidate_id,
+            "verify_command",
+            LoomVerificationResult::Passed,
+        );
+        input.evidence_ids = Vec::new();
+        let error = verification_record(&mut database, input).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_UNREADABLE,
+            "assertion a missing evidence file is reported as unreadable: {error}"
+        );
+    }
+
+    /// The ancestors matter as much as the leaf: replacing a directory inside the workspace with a
+    /// symlink to an outside directory would redirect the whole resolved path if the open followed
+    /// links anywhere along the way.
+    #[cfg(unix)]
+    #[test]
+    fn a_swapped_parent_directory_is_refused_inside_the_registration_window() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact parent swap");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
+        std::fs::create_dir_all(workspace.join("reports")).unwrap();
+        std::fs::write(workspace.join("reports/report.md"), b"the reviewed bytes").unwrap();
+        let outside = workspace
+            .parent()
+            .expect("workspace has a parent")
+            .join(format!("loom-outside-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("report.md"), b"bytes nobody validated").unwrap();
+
+        let swapped_workspace = workspace.clone();
+        let swapped_outside = outside.clone();
+        artifact_swap_hook::install(Box::new(move || {
+            std::fs::rename(
+                swapped_workspace.join("reports"),
+                swapped_workspace.join("reports-moved"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&swapped_outside, swapped_workspace.join("reports"))
+                .unwrap();
+        }));
+
+        let error = artifact_register(
+            &mut database,
+            "local_user",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: None,
+                agent_run_id: None,
+                relative_path: "reports/report.md".into(),
+                content_type: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_ARTIFACT_PATH_REJECTED,
+            "assertion a swapped parent directory is refused: {error}"
+        );
+        let rows: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "assertion the refused registration writes no row");
+
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 
     #[test]

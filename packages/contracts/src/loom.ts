@@ -168,7 +168,7 @@ export interface LoomArtifact {
   relativePath: string
   /** 登记时 Host 算出的 sha256，核验时用来对账 */
   sha256: string
-  /** 字节数 */
+  /** 登记时算出的字节数，不是现在磁盘上的大小 */
   sizeBytes: number
   /** 内容类型（可空） */
   contentType: string | null

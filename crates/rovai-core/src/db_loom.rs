@@ -365,7 +365,41 @@ fn table_sql(connection: &Connection, table: &str) -> rusqlite::Result<Option<St
 /// sha256 the Host computed when the artifact was registered, so verification can re-read the
 /// bytes and prove they did not change. Rows are immutable: a replaced file is a new artifact,
 /// never an edit, because "the evidence changed" must stay visible instead of being overwritten.
+/// The three triggers that make a recorded artifact immutable, kept as statements of their own.
+///
+/// `artifact_sql` writes them and the schema check compares against them, so there is one text and
+/// not two: a check that only looked at the trigger *names* accepts
+/// `... BEFORE UPDATE ... BEGIN SELECT 1; END;`, and a check that looked for tokens still accepts
+/// the real trigger with `WHEN 0` appended, which keeps every token and fires never.
+fn artifact_trigger_sql() -> [String; 3] {
+    [
+        format!(
+            "CREATE TRIGGER loom_artifact_immutable
+             BEFORE UPDATE ON {ARTIFACT_TABLE}
+             BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END"
+        ),
+        format!(
+            "CREATE TRIGGER loom_artifact_no_replace
+             BEFORE INSERT ON {ARTIFACT_TABLE}
+             WHEN EXISTS(
+                 SELECT 1 FROM {ARTIFACT_TABLE}
+                 WHERE artifact_id=NEW.artifact_id
+                    OR (plan_id=NEW.plan_id AND relative_path=NEW.relative_path)
+                    OR rowid=NEW.rowid
+             )
+             BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END"
+        ),
+        format!(
+            "CREATE TRIGGER loom_artifact_no_direct_delete
+             BEFORE DELETE ON {ARTIFACT_TABLE}
+             WHEN EXISTS(SELECT 1 FROM {PLAN_TABLE} WHERE plan_id=OLD.plan_id)
+             BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END"
+        ),
+    ]
+}
+
 fn artifact_sql() -> String {
+    let [immutable, no_replace, no_direct_delete] = artifact_trigger_sql();
     format!(
         r#"
         CREATE TABLE {ARTIFACT_TABLE} (
@@ -384,72 +418,62 @@ fn artifact_sql() -> String {
         CREATE UNIQUE INDEX loom_artifact_plan_path_idx
             ON {ARTIFACT_TABLE}(plan_id, relative_path);
         CREATE INDEX loom_artifact_plan_idx ON {ARTIFACT_TABLE}(plan_id, artifact_id);
-        CREATE TRIGGER loom_artifact_immutable
-            BEFORE UPDATE ON {ARTIFACT_TABLE}
-            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;
-        CREATE TRIGGER loom_artifact_no_replace
-            BEFORE INSERT ON {ARTIFACT_TABLE}
-            WHEN EXISTS(
-                SELECT 1 FROM {ARTIFACT_TABLE}
-                WHERE artifact_id=NEW.artifact_id
-                   OR (plan_id=NEW.plan_id AND relative_path=NEW.relative_path)
-                   OR rowid=NEW.rowid
-            )
-            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;
-        CREATE TRIGGER loom_artifact_no_direct_delete
-            BEFORE DELETE ON {ARTIFACT_TABLE}
-            WHEN EXISTS(SELECT 1 FROM {PLAN_TABLE} WHERE plan_id=OLD.plan_id)
-            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;
+        {immutable};
+        {no_replace};
+        {no_direct_delete};
         "#
     )
 }
 
-/// The unique index that stops one plan registering the same path twice. Only the columns are
-/// checked: an index with the expected name over different columns admits the duplicates the write
-/// path assumes cannot exist.
+/// The unique index that has to cover exactly `(plan_id, relative_path)`.
+///
+/// Both halves of that matter. An index over other columns does not enforce the path rule, and a
+/// **partial** unique index enforces nothing for the rows its `WHERE` clause excludes — `WHERE 0`
+/// would keep the name, the two columns and the `unique` flag while letting duplicates through.
 fn artifact_path_index_covers_plan_and_path(connection: &Connection) -> rusqlite::Result<bool> {
     // `unique` is a keyword, so it has to be quoted to be read as the pragma's column name.
     let mut list =
-        connection.prepare("SELECT name FROM pragma_index_list(?1) WHERE \"unique\"=1")?;
-    let names: Vec<String> = list
-        .query_map([ARTIFACT_TABLE], |row| row.get(0))?
+        connection.prepare("SELECT name, partial FROM pragma_index_list(?1) WHERE \"unique\"=1")?;
+    let candidates: Vec<(String, i64)> = list
+        .query_map([ARTIFACT_TABLE], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    for name in names {
+    for (name, partial) in candidates {
+        if partial != 0 {
+            continue;
+        }
         let mut info =
             connection.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
-        let columns: Vec<String> = info
+        // An expression index reports a null name for the expressions it covers, so the column has
+        // to be read as optional rather than forced into a string.
+        let columns: Vec<Option<String>> = info
             .query_map([name.as_str()], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        if columns.len() == 2 && columns[0] == "plan_id" && columns[1] == "relative_path" {
+        let names: Vec<&str> = columns.iter().flatten().map(String::as_str).collect();
+        if names.as_slice() == ["plan_id", "relative_path"] {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-/// A trigger is only worth its name when its body raises. Checking the name alone accepts
-/// `CREATE TRIGGER loom_artifact_immutable BEFORE UPDATE ON loom_artifact BEGIN SELECT 1; END;`,
-/// which blocks nothing while still carrying the name the schema check looks for.
-fn trigger_body_blocks(
+/// Compare one trigger with the statement this module builds, ignoring whitespace and case.
+fn trigger_sql_matches(
     connection: &Connection,
     name: &str,
-    header: &str,
-    tokens: &[&str],
+    expected: &str,
 ) -> rusqlite::Result<bool> {
-    let sql: Option<String> = connection
+    let stored: Option<String> = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
             [name],
             |row| row.get(0),
         )
         .optional()?;
-    let Some(sql) = sql else {
+    let Some(stored) = stored else {
         return Ok(false);
     };
-    let compact = sql.split_whitespace().collect::<String>().to_lowercase();
-    Ok(compact.contains(header)
-        && compact.contains("raise(abort")
-        && tokens.iter().all(|token| compact.contains(token)))
+    let normalise = |sql: &str| sql.split_whitespace().collect::<String>().to_lowercase();
+    Ok(normalise(&stored) == normalise(expected))
 }
 
 fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
@@ -460,6 +484,11 @@ fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
         [ARTIFACT_TABLE],
         |row| row.get(0),
     )?;
+    let trigger_names = [
+        "loom_artifact_immutable",
+        "loom_artifact_no_replace",
+        "loom_artifact_no_direct_delete",
+    ];
     let triggers: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1
              AND name IN ('loom_artifact_immutable','loom_artifact_no_replace',
@@ -474,37 +503,14 @@ fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
             && sql.contains("REFERENCESloom_plan(plan_id)ONDELETECASCADE")
     });
     let path_index = artifact_path_index_covers_plan_and_path(connection)?;
-    let header = |event: &str| format!("before{event}on{ARTIFACT_TABLE}");
-    let immutable = trigger_body_blocks(
-        connection,
-        "loom_artifact_immutable",
-        &header("update"),
-        &[],
-    )?;
-    let no_replace = trigger_body_blocks(
-        connection,
-        "loom_artifact_no_replace",
-        &header("insert"),
-        &[
-            "plan_id=new.plan_id",
-            "relative_path=new.relative_path",
-            "rowid=new.rowid",
-        ],
-    )?;
-    let plan_source = format!("from{PLAN_TABLE}");
-    let no_direct_delete = trigger_body_blocks(
-        connection,
-        "loom_artifact_no_direct_delete",
-        &header("delete"),
-        &[plan_source.as_str()],
-    )?;
-    Ok(columns == 10
-        && triggers == 3
-        && declared
-        && path_index
-        && immutable
-        && no_replace
-        && no_direct_delete)
+    let expected = artifact_trigger_sql();
+    let mut triggers_match = true;
+    for (name, expected_sql) in trigger_names.iter().zip(expected.iter()) {
+        if !trigger_sql_matches(connection, name, expected_sql)? {
+            triggers_match = false;
+        }
+    }
+    Ok(columns == 10 && triggers == 3 && declared && path_index && triggers_match)
 }
 
 /// Migration 224: the artifact row an evidence id can point at.
@@ -942,50 +948,82 @@ mod tests {
     /// trigger with an empty body, or a unique index over the wrong columns. Both must be refused,
     /// because either one silently reopens a hole migration 224 was written to close.
     #[test]
-    fn artifact_schema_check_refuses_a_hollow_trigger_and_a_narrow_index() {
+    fn artifact_schema_check_refuses_a_neutered_trigger_and_a_partial_index() {
         let database = crate::test_support::seeded_runtime_database_owned();
+        let triggers = artifact_trigger_sql();
         assert!(
             artifact_schema_matches(database.connection()).unwrap(),
             "assertion the shipped artifact projection passes its own check"
         );
 
-        // Same name, same event, a body that never raises: only the body tells them apart.
+        // The real trigger with `WHEN 0` appended: every token a spot check looks for is still
+        // there, and it never fires. Only comparing the whole statement catches this.
         database
             .connection()
-            .execute_batch(
+            .execute_batch(&format!(
                 "DROP TRIGGER loom_artifact_immutable;
-                 CREATE TRIGGER loom_artifact_immutable BEFORE UPDATE ON loom_artifact
-                 BEGIN SELECT 1; END;",
-            )
+                 CREATE TRIGGER loom_artifact_immutable
+                     BEFORE UPDATE ON {ARTIFACT_TABLE}
+                     WHEN 0
+                     BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;"
+            ))
+            .unwrap();
+        assert!(
+            !artifact_schema_matches(database.connection()).unwrap(),
+            "assertion a trigger gated by WHEN 0 is not accepted"
+        );
+
+        // Same name, same event, a body that never raises.
+        database
+            .connection()
+            .execute_batch(&format!(
+                "DROP TRIGGER loom_artifact_immutable;
+                 CREATE TRIGGER loom_artifact_immutable BEFORE UPDATE ON {ARTIFACT_TABLE}
+                 BEGIN SELECT 1; END;"
+            ))
             .unwrap();
         assert!(
             !artifact_schema_matches(database.connection()).unwrap(),
             "assertion a trigger whose body never raises is not accepted"
         );
+
+        // Restoring the statement this module builds is accepted again.
         database
             .connection()
-            .execute_batch(
-                "DROP TRIGGER loom_artifact_immutable;
-                 CREATE TRIGGER loom_artifact_immutable BEFORE UPDATE ON loom_artifact
-                 BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;",
-            )
+            .execute_batch(&format!(
+                "DROP TRIGGER loom_artifact_immutable; {};",
+                triggers[0]
+            ))
             .unwrap();
         assert!(
             artifact_schema_matches(database.connection()).unwrap(),
             "assertion the restoring trigger is accepted again"
         );
 
-        // A unique index that only covers plan_id admits two rows for the same relative path.
+        // A partial unique index keeps the name, the two columns and the unique flag, while
+        // excluding every row from enforcement.
         database
             .connection()
-            .execute_batch(
+            .execute_batch(&format!(
                 "DROP INDEX loom_artifact_plan_path_idx;
-                 CREATE UNIQUE INDEX loom_artifact_plan_path_idx ON loom_artifact(plan_id);",
-            )
+                 CREATE UNIQUE INDEX loom_artifact_plan_path_idx
+                     ON {ARTIFACT_TABLE}(plan_id, relative_path) WHERE 0;"
+            ))
             .unwrap();
         assert!(
             !artifact_schema_matches(database.connection()).unwrap(),
-            "assertion an index that does not cover the path is not accepted"
+            "assertion a partial unique index is not accepted"
+        );
+
+        // Missing altogether is refused as well: the check is about the schema being what was
+        // migrated, not only about what an attacker could reach.
+        database
+            .connection()
+            .execute_batch("DROP INDEX loom_artifact_plan_path_idx;")
+            .unwrap();
+        assert!(
+            !artifact_schema_matches(database.connection()).unwrap(),
+            "assertion a missing path index is not accepted"
         );
     }
 
