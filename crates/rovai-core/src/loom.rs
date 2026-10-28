@@ -4503,6 +4503,7 @@ mod tests {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate submit");
         plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        seed_evidence(&mut database, &mission_id);
         let plan_id: String = database
             .connection()
             .query_row(
@@ -4677,6 +4678,7 @@ mod tests {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate no claim");
         plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        seed_evidence(&mut database, &mission_id);
         task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
 
         let unclaimed = candidate_record(
@@ -6226,6 +6228,7 @@ mod tests {
             dependencies: vec![edge("task_c", "task_d")],
         };
         plan_import(&mut database, plan_2).unwrap();
+        seed_evidence(&mut database, &mission_id_2);
         task_release(&mut database, release_input(&mission_id_2, "task_c")).unwrap();
         let claim_2 = claim_acquire(
             &mut database,
