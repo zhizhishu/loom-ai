@@ -1,5 +1,5 @@
 import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview } from '@contracts'
+import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification } from '@contracts'
 import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
@@ -303,8 +303,29 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
   </div>
 }
 
-function DeliveryReview({ candidates, reviews }: { candidates: LoomCandidate[]; reviews: LoomReview[] }) {
+/** 一次人工验收的在途表单：勾选集合按 criterionId 记，不依赖数组下标。 */
+type DeliveryDraft = {
+  candidateId: string
+  verdict: 'accepted' | 'rejected'
+  reason: string
+  satisfied: readonly string[]
+}
+
+function DeliveryReview({ candidates, reviews, verifications, plan, missionId, onRefresh }: {
+  candidates: LoomCandidate[]
+  reviews: LoomReview[]
+  verifications: LoomVerification[]
+  plan: LoomPlan | null
+  missionId: string
+  onRefresh: () => void
+}) {
   const t = useUiText()
+  const client = useThreadClient()
+  const [draft, setDraft] = useState<DeliveryDraft | null>(null)
+  // 写入是串行的人工动作：在途时禁用全部操作，避免重复 commandId 之外的并发提交。
+  const [pending, setPending] = useState('')
+  // 错误只挂在出事的候选上：别的卡片不该替它报错。
+  const [failure, setFailure] = useState<{ candidateId: string; message: string } | null>(null)
   // 枚举值是英文标识，不直接展示；data-state 仍保留原值，两个徽章各看各的状态，不合并。
   const verificationLabel = (state: LoomCandidate['verificationStatus']): string =>
     state === 'verified' ? t('已核验') : state === 'failed' ? t('核验失败') : t('未核验')
@@ -313,6 +334,79 @@ function DeliveryReview({ candidates, reviews }: { candidates: LoomCandidate[]; 
   // 新的返工版本在最前；createdAt 相同就保持后端顺序。
   const ordered = [...candidates].sort((a, b) =>
     a.createdAt === b.createdAt ? 0 : a.createdAt < b.createdAt ? 1 : -1)
+  // 验收标准版本与逐条标准一律读计划快照：候选快照只照抄，不在这里另立规则。
+  const criteria = plan?.acceptanceCriteria.criteria ?? []
+  const criteriaVersion = plan?.acceptanceCriteria.version ?? ''
+
+  const closeDraft = (): void => { setDraft(null); setPending(''); setFailure(null) }
+
+  const openDraft = (candidate: LoomCandidate, verdict: 'accepted' | 'rejected'): void => {
+    setFailure(null)
+    setPending('')
+    setDraft({ candidateId: candidate.candidateId, verdict, reason: '', satisfied: [] })
+  }
+
+  const toggleCriterion = (criterionId: string): void => setDraft(current => current === null ? current : {
+    ...current,
+    satisfied: current.satisfied.includes(criterionId)
+      ? current.satisfied.filter(id => id !== criterionId)
+      : [...current.satisfied, criterionId]
+  })
+
+  // 接受必须逐条全勾；驳回只要求写明理由。reviewerId 由 Core 从可信身份注入，客户端不发。
+  const canSubmit = draft !== null && draft.reason.trim() !== ''
+    && (draft.verdict === 'rejected' || criteria.every(criterion => draft.satisfied.includes(criterion.criterionId)))
+
+  const recordReview = async (candidate: LoomCandidate): Promise<void> => {
+    if (draft === null || draft.candidateId !== candidate.candidateId || !canSubmit || pending !== '') return
+    setPending(`${candidate.candidateId}:${draft.verdict}`)
+    setFailure(null)
+    try {
+      await client.request<unknown>('loom.review.record', {
+        missionId,
+        taskId: candidate.taskId,
+        candidateId: candidate.candidateId,
+        commandId: crypto.randomUUID(),
+        acceptanceCriteriaVersion: criteriaVersion,
+        verdict: draft.verdict,
+        reason: draft.reason.trim(),
+        criteriaResults: criteria.map(criterion => ({
+          criterionId: criterion.criterionId,
+          satisfied: draft.satisfied.includes(criterion.criterionId),
+          evidenceIds: [],
+          note: null
+        }))
+      })
+      closeDraft()
+      onRefresh()
+    } catch (e) {
+      setFailure({ candidateId: candidate.candidateId, message: e instanceof Error ? e.message : '验收写入失败' })
+      setPending('')
+    }
+  }
+
+  // executorId 同样由 Core 注入；客户端只报方法（人工核验）与结论。
+  const recordVerification = async (candidate: LoomCandidate, result: 'passed' | 'failed'): Promise<void> => {
+    if (pending !== '') return
+    setPending(`${candidate.candidateId}:${result}`)
+    setFailure(null)
+    try {
+      await client.request<unknown>('loom.verification.record', {
+        missionId,
+        taskId: candidate.taskId,
+        candidateId: candidate.candidateId,
+        commandId: crypto.randomUUID(),
+        method: 'manual',
+        result
+      })
+      setPending('')
+      onRefresh()
+    } catch (e) {
+      setFailure({ candidateId: candidate.candidateId, message: e instanceof Error ? e.message : '核验写入失败' })
+      setPending('')
+    }
+  }
+
   return <div className="loom-delivery-context">
     <header className="loom-section-heading">
       <div><span className="loom-eyebrow">LOOM · {t('交付')}</span><h2>{t('成果与验收')}</h2></div>
@@ -323,6 +417,11 @@ function DeliveryReview({ candidates, reviews }: { candidates: LoomCandidate[]; 
         </LoomEmpty>
       : ordered.map(candidate => {
         const review = reviews.find(entry => entry.candidateId === candidate.candidateId)
+        const verification = verifications.find(entry => entry.candidateId === candidate.candidateId)
+        // 一个候选只有一份评审、一份核验：已有记录就不再给同类写入口。
+        const reviewable = review === undefined
+        const verifiable = candidate.verificationStatus === 'unverified'
+        const open = draft?.candidateId === candidate.candidateId ? draft : null
         return <div key={candidate.candidateId} className="loom-candidate">
           <div className="loom-candidate-header">
             <span className="loom-candidate-title">{t('候选')} {candidate.candidateId.slice(-6)}</span>
@@ -340,6 +439,56 @@ function DeliveryReview({ candidates, reviews }: { candidates: LoomCandidate[]; 
               {result.criterionId} · {result.satisfied ? t('满足') : t('未满足')}
             </div>)}
           </div>}
+          {verification !== undefined && <div className="loom-candidate-verification">
+            <div>{t('核验结论')}：{verification.result === 'passed' ? t('通过') : t('失败')} · {verification.method}</div>
+          </div>}
+          {(reviewable || verifiable) && <div className="loom-delivery-actions">
+            {reviewable && <button
+              type="button" className="loom-btn-accept" disabled={pending !== ''}
+              onClick={() => openDraft(candidate, 'accepted')}>{t('接受')}</button>}
+            {reviewable && <button
+              type="button" className="loom-btn-reject" disabled={pending !== ''}
+              onClick={() => openDraft(candidate, 'rejected')}>{t('驳回')}</button>}
+            {verifiable && <button
+              type="button" className="loom-btn-verify" disabled={pending !== ''}
+              onClick={() => void recordVerification(candidate, 'passed')}>{t('通过核验')}</button>}
+            {verifiable && <button
+              type="button" className="loom-btn-verify" data-result="failed" disabled={pending !== ''}
+              onClick={() => void recordVerification(candidate, 'failed')}>{t('核验失败')}</button>}
+          </div>}
+          {failure !== null && failure.candidateId === candidate.candidateId
+            && <p className="loom-review-failure">{failure.message}</p>}
+          {open !== null && <form className="loom-review-form" onSubmit={event => {
+            event.preventDefault()
+            void recordReview(candidate)
+          }}>
+            <div className="loom-review-criteria">
+              {criteria.map(criterion => <label key={criterion.criterionId} className="loom-review-criterion">
+                <input
+                  type="checkbox" checked={open.satisfied.includes(criterion.criterionId)}
+                  onChange={() => toggleCriterion(criterion.criterionId)}/>
+                <span className="loom-review-criterion-id">{criterion.criterionId}</span>
+                <span className="loom-review-criterion-text">{criterion.text}</span>
+              </label>)}
+            </div>
+            <textarea
+              className="loom-review-reason" rows={3} value={open.reason}
+              aria-label={t('验收理由')} placeholder={t('验收理由（必填）')}
+              onChange={event => {
+                const reason = event.target.value
+                setDraft(current => current === null ? current : { ...current, reason })
+              }}/>
+            <div className="loom-delivery-actions">
+              <button
+                type="submit" className={open.verdict === 'accepted' ? 'loom-btn-accept' : 'loom-btn-reject'}
+                disabled={!canSubmit || pending !== ''}>
+                {open.verdict === 'accepted' ? t('确认接受') : t('确认驳回')}
+              </button>
+              <button type="button" className="loom-btn-cancel" disabled={pending !== ''} onClick={closeDraft}>
+                {t('取消')}
+              </button>
+            </div>
+          </form>}
         </div>
       })}
   </div>
@@ -360,8 +509,23 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
   const [dependencies, setDependencies] = useState<LoomDependency[]>([])
   const [candidates, setCandidates] = useState<LoomCandidate[]>([])
   const [reviews, setReviews] = useState<LoomReview[]>([])
+  const [verifications, setVerifications] = useState<LoomVerification[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+
+  // 写入口（验收 / 核验）成功后重新读一遍六个投影：状态只认控制面回读，不在本地猜。
+  const reload = useCallback((): void => {
+    void Promise.all([
+      client.request<LoomPlan | null>('loom.plan.get', { missionId: mission.missionId }),
+      client.request<LoomTask[]>('loom.tasks.list', { missionId: mission.missionId }),
+      client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId }),
+      client.request<LoomCandidate[]>('loom.candidates.list', { missionId: mission.missionId }),
+      client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId }),
+      client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId })
+    ]).then(([p, t, d, c, r, v]) => {
+      setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v); setError('')
+    }).catch(e => setError(e.message ?? '刷新失败'))
+  }, [client, mission.missionId])
   
   useLayoutEffect(() => {
     if (section === 'plan') return
@@ -378,9 +542,10 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       client.request<LoomTask[]>('loom.tasks.list', { missionId: mission.missionId }),
       client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId }),
       client.request<LoomCandidate[]>('loom.candidates.list', { missionId: mission.missionId }),
-      client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId })
-    ]).then(([p, t, d, c, r]) => {
-      if (alive) { setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setError('') }
+      client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId }),
+      client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId })
+    ]).then(([p, t, d, c, r, v]) => {
+      if (alive) { setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v); setError('') }
     }).catch(e => {
       if (alive) setError(e.message ?? '读取编排数据失败')
     }).finally(() => {
@@ -405,7 +570,7 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
     <div className="loom-section-body">
       {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} loading={loading} error={error}/></div>}
       <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
-        {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews}/></div>}
+        {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews} verifications={verifications} plan={plan} missionId={mission.missionId} onRefresh={reload}/></div>}
         <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>
         <div hidden={section !== 'activity'}><MissionActivityPanel mission={mission} agents={agents} onSource={onSource}/></div>
       </div>

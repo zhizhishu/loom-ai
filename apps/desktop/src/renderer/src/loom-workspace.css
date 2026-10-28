@@ -128,5 +128,27 @@
 .loom-badge-acceptance[data-state='rejected'] { color: var(--attention); }
 .loom-candidate-meta { margin-top: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .loom-candidate-review { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font-size: 11px; line-height: 1.7; }
+/* 写入口：验收与核验是两条独立的人工轴。按钮只提示结论方向，小圆角、无动效。 */
+/* 核验记录用独立 class：验收记录的条数断言不能被核验记录混在一起。 */
+.loom-candidate-verification { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font-size: 11px; line-height: 1.7; }
+.loom-delivery-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.loom-delivery-actions button { padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface); font-size: 12px; line-height: 1.5; cursor: pointer; }
+.loom-delivery-actions button:disabled { opacity: .5; cursor: default; }
+.loom-delivery-actions button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.loom-delivery-actions .loom-btn-accept { border-color: color-mix(in srgb, var(--success) 38%, var(--line)); color: var(--success); background: var(--success-soft); }
+.loom-delivery-actions .loom-btn-reject { border-color: color-mix(in srgb, var(--danger) 38%, var(--line)); color: var(--danger); background: var(--danger-soft); }
+.loom-delivery-actions .loom-btn-verify { border-color: color-mix(in srgb, var(--info) 38%, var(--line)); color: var(--info); background: var(--info-soft); }
+.loom-delivery-actions .loom-btn-verify[data-result='failed'] { border-color: color-mix(in srgb, var(--danger) 38%, var(--line)); color: var(--danger); background: var(--danger-soft); }
+.loom-delivery-actions .loom-btn-cancel { color: var(--muted); }
+/* 逐条验收面板：上边框与卡片内容分开，不加背景色块。 */
+.loom-review-form { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.loom-review-criteria { display: grid; gap: 6px; }
+.loom-review-criterion { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); font-size: 12px; line-height: 1.7; cursor: pointer; }
+.loom-review-criterion input { width: 13px; height: 13px; flex: 0 0 13px; margin: 4px 0 0; accent-color: var(--success); }
+.loom-review-criterion-id { flex: 0 0 auto; color: var(--faint); font: 11px ui-monospace,SFMono-Regular,Menlo,monospace; }
+.loom-review-criterion-text { min-width: 0; overflow-wrap: anywhere; color: var(--ink); }
+.loom-review-reason { display: block; width: 100%; margin-top: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface); font: inherit; font-size: 12px; line-height: 1.7; resize: vertical; }
+.loom-review-reason:focus-visible { border-color: var(--control-line); outline: 2px solid var(--focus-soft); outline-offset: 1px; }
+.loom-review-failure { margin: 8px 0 0; color: var(--danger); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 /* 390px 级移动端：标题与两枚徽章上下排，不靠右挤在窄屏里。 */
 @media(max-width:420px) { .loom-candidate-header { flex-direction: column; align-items: flex-start; gap: 6px; } }

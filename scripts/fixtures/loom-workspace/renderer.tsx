@@ -1,5 +1,5 @@
 import { createRoot } from 'react-dom/client'
-import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomCandidate, LoomReview } from '@contracts'
+import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomCandidate, LoomReview, LoomVerification } from '@contracts'
 import { LoomWorkspace } from '../../../apps/desktop/src/renderer/src/LoomWorkspace'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { applyAppearanceSnapshot } from '../../../apps/desktop/src/renderer/src/theme'
@@ -113,6 +113,10 @@ const reviews: LoomReview[] = [
   { reviewId: 'review-1', candidateId: 'candidate-1', acceptanceCriteriaVersion: loomCriteria.version, verdict: 'accepted', reason: '恢复协议已覆盖保存与恢复两条路径', criteriaResults: loomCriteria.criteria.map((criterion, index) => ({ criterionId: criterion.criterionId, satisfied: true, evidenceIds: [`evidence-${index + 1}`], note: null })), reviewerId: 'user-local', reviewedAt: createdAt }
 ]
 
+const verifications: LoomVerification[] = [
+  { verificationId: 'verification-1', candidateId: 'candidate-1', method: 'manual', executorId: 'user-local', result: 'passed', evidenceIds: ['evidence-1'], verifiedAt: createdAt }
+]
+
 const delivery: MissionDelivery = {
   threadId: mission.threadId, workingDirectory: '/workspace/rovai-ai-mission-018', git: true,
   workspace: {
@@ -153,7 +157,8 @@ const replies: Readonly<Record<string, unknown>> = {
   'loom.tasks.list': tasks,
   'loom.dependencies.list': dependencies,
   'loom.candidates.list': candidates,
-  'loom.reviews.list': reviews
+  'loom.reviews.list': reviews,
+  'loom.verifications.list': verifications
 }
 
 async function request<T>(method: string, params: unknown = {}): Promise<T> {

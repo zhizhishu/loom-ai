@@ -156,7 +156,9 @@ app.whenReady().then(async () => {
     reviewedCandidates: document.querySelectorAll('.loom-candidate-review').length,
     staleCriteria: document.querySelector('.loom-criteria') === null,
     placeholder: document.querySelector('.loom-review-state') === null,
-    controls: [...document.querySelectorAll('.loom-delivery-context button')].map(button => button.innerText),
+    controls: document.querySelectorAll('.loom-delivery-actions button').length,
+    actionLabels: [...document.querySelectorAll('.loom-delivery-actions button')].map(button => button.innerText),
+    reviewForm: document.querySelector('.loom-review-form') === null,
     sharedDelivery: document.querySelector('.loom-workspace .mission-delivery-panel') === window.__loomNodes.delivery,
     sharedActivity: document.querySelector('.loom-workspace .mission-activity-panel') === window.__loomNodes.activity,
     evidenceRows: document.querySelectorAll('.loom-workspace .mission-evidence-row').length,
@@ -168,12 +170,15 @@ app.whenReady().then(async () => {
   assert.equal(review.reviewedCandidates, 1, `Only the reviewed candidate may show a verdict: ${JSON.stringify(review.reviewedCandidates)}`)
   assert.equal(review.staleCriteria, true, 'Delivery section kept the placeholder criteria block after real criteria arrived')
   assert.equal(review.placeholder, true, 'Delivery section still shows the old independent-acceptance placeholder')
-  assert.deepEqual(review.controls, [], `Delivery section offered acceptance controls without a write path: ${JSON.stringify(review.controls)}`)
+  assert.ok(review.controls >= 2, `Delivery section must offer acceptance and verification actions: ${JSON.stringify(review.controls)}`)
+  assert.deepEqual(review.actionLabels, ['接受', '驳回', '通过核验', '核验失败'],
+    `Delivery actions do not match the two independent human axes: ${JSON.stringify(review.actionLabels)}`)
+  assert.equal(review.reviewForm, true, 'Delivery section expanded the review form before any user intent')
   assert.equal(review.sharedDelivery, true, 'Delivery section remounted the shared delivery panel')
   assert.equal(review.sharedActivity, true, 'Delivery section remounted the activity panel')
   assert.ok(review.evidenceRows >= 4, `Shared delivery evidence rows disappeared: ${review.evidenceRows}`)
   assert.equal(review.wrapperClass, 'loom-delivery', `Delivery section reused the wrong container class: ${review.wrapperClass}`)
-  cases.push('交付 section reads real candidates with two independent verdict badges, no controls, and keeps the shared delivery panel mounted')
+  cases.push('交付 section reads real candidates with two independent verdict badges, acceptance and verification actions, no pre-expanded review form, and keeps the shared delivery panel mounted')
 
   stage = 'plan section by keyboard Space'
   await script("document.querySelectorAll('.loom-section-tabs button')[1].focus()")
