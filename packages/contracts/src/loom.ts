@@ -257,25 +257,6 @@ export interface LoomTaskReadyResult {
   error: string | null
 }
 
-/** 验收提交：Owner 专属、IN_REVIEW 才可审、必须最新 attempt。 */
-export interface LoomReviewSubmission {
-  /** Task ID */
-  taskId: string
-  /** Candidate ID（必须是最新的） */
-  candidateId: string
-  /** 判定所依据的验收标准版本（必须与候选快照一致） */
-  acceptanceCriteriaVersion: string
-  /** 验收结论 */
-  verdict: 'accepted' | 'rejected'
-  /** 验收理由 */
-  reason: string
-  /** 逐条结论（accepted 必须覆盖每条 criterionId 且全 true） */
-  criteriaResults: LoomAcceptanceCriterionResult[]
-  /** 验收人 */
-  reviewerId: string
-}
-
-/** 验收提交结果：逐条验收标准全 true 才通过。 */
 /** 核验结论：交付能否被独立复现，与人工验收是两条轴。 */
 export type LoomVerificationResult = 'passed' | 'failed'
 
@@ -354,18 +335,9 @@ export interface LoomReviewRecordReceipt {
 // (second LoomReviewRecordInput declaration removed — merged with the canonical one above;
 //  reviewerId is injected by Core, not sent by clients. The duplicate LoomReviewRecordReceipt
 //  below it was removed for the same reason: TS silently merges repeated interface
-//  declarations, so a stale copy re-imposes fields the canonical one already dropped.)
-
-export interface LoomReviewResult {
-  /** 是否通过 */
-  passed: boolean
-  /** 被判定所依据的验收标准版本 */
-  acceptanceCriteriaVersion: string
-  /** 逐条验收结果（按 criterionId 绑定，不依赖数组顺序） */
-  criteriaResults: LoomAcceptanceCriterionResult[]
-  /** 错误信息（如 STALE_REVIEW、候选非最新等） */
-  error: string | null
-}
+//  declarations, so a stale copy re-imposes fields the canonical one already dropped.
+//  LoomReviewSubmission and LoomReviewResult went the same way: nothing in packages/, apps/
+//  or scripts/ ever constructed them, so they only pretended to be part of the contract.)
 
 /** 依赖求值输入：任务、依赖边、候选、人工验收记录与求值时刻。 */
 export interface LoomDependencyGraph {
