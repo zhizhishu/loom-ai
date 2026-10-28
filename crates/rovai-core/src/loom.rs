@@ -2049,7 +2049,7 @@ pub fn review_record(
     let verdict = input.verdict;
 
     let transaction = database
-        .connection
+        .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     // The clock is read after the write lock, so a verdict cannot be stamped with an instant
     // that predates the state it judged.
