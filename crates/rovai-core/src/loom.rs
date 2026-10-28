@@ -3127,12 +3127,13 @@ pub fn verification_record(
     }
     let candidate = transaction
         .query_row(
-            "SELECT task_id FROM loom_candidate WHERE plan_id=?1 AND candidate_id=?2",
+            "SELECT task_id, evidence_ids_json FROM loom_candidate
+             WHERE plan_id=?1 AND candidate_id=?2",
             params![&plan_id, &candidate_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    let Some(candidate_task_id) = candidate else {
+    let Some((candidate_task_id, candidate_evidence_json)) = candidate else {
         return Err(LoomCommandError::rejection(
             LOOM_CANDIDATE_NOT_FOUND,
             format!(
@@ -3161,12 +3162,32 @@ pub fn verification_record(
         .into());
     }
     // Citing an artifact is only half of verification: the other half is re-reading its bytes.
-    // Both axes stay independent — a mismatch refuses the *passing* claim, it does not accept or
+    // The Candidate's own evidence is always checked, not just whatever the request lists — the
+    // desktop UI sends no evidenceIds at all, so trusting the payload alone would let a delivery
+    // be verified over bytes that were rewritten after the Candidate froze them.
+    // Both axes stay independent: a mismatch refuses the *passing* claim, it does not accept or
     // reject the delivery, and recording a failure is still allowed.
-    ensure_evidence_artifacts(&transaction, &plan_id, &input.evidence_ids)?;
+    let candidate_evidence: Vec<String> = serde_json::from_str(&candidate_evidence_json)
+        .with_context(|| {
+            format!("LOOM candidate {candidate_id} has unreadable evidence ids")
+        })?;
+    let mut checked_evidence = candidate_evidence;
+    for evidence_id in &input.evidence_ids {
+        if !checked_evidence.contains(evidence_id) {
+            checked_evidence.push(evidence_id.clone());
+        }
+    }
+    ensure_evidence_artifacts(&transaction, &plan_id, &checked_evidence)?;
     if result == LoomVerificationResult::Passed {
+        if checked_evidence.is_empty() {
+            return Err(LoomCommandError::rejection(
+                LOOM_EVIDENCE_NOT_FOUND,
+                "a passing verification needs at least one registered artifact to re-read",
+            )
+            .into());
+        }
         let workspace = mission_workspace(&transaction, &mission_id)?;
-        ensure_evidence_bytes_match(&transaction, &workspace, &plan_id, &input.evidence_ids)?;
+        ensure_evidence_bytes_match(&transaction, &workspace, &plan_id, &checked_evidence)?;
     }
 
     let verification_id = format!("verification_{}", uuid::Uuid::new_v4().simple());
@@ -6766,14 +6787,23 @@ mod tests {
         write_workspace_file(&database, &mission_id, "report.md", "original");
         let artifact = register(&mut database, &mission_id, "report.md");
 
+        // A valid but different digest, so the CHECK(length(sha256)=64) cannot be what rejects it:
+        // only the immutability trigger can.
+        let other_digest = "f".repeat(64);
         let update = database.connection().execute(
-            "UPDATE loom_artifact SET sha256='0' WHERE artifact_id=?1",
-            [&artifact.artifact_id],
+            "UPDATE loom_artifact SET sha256=?2 WHERE artifact_id=?1",
+            params![&artifact.artifact_id, &other_digest],
         );
-        assert!(
-            update.is_err(),
-            "assertion an artifact digest cannot be rewritten"
-        );
+        assert!(update.is_err(), "assertion an artifact digest cannot be rewritten");
+        let stored: String = database
+            .connection()
+            .query_row(
+                "SELECT sha256 FROM loom_artifact WHERE artifact_id=?1",
+                [&artifact.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, artifact.sha256, "assertion the refused update changed nothing");
         let delete = database.connection().execute(
             "DELETE FROM loom_artifact WHERE artifact_id=?1",
             [&artifact.artifact_id],
@@ -6791,6 +6821,124 @@ mod tests {
         assert!(
             replace.is_err(),
             "assertion an artifact cannot be replaced in place"
+        );
+    }
+
+    #[test]
+    fn artifact_rowid_collision_cannot_replace_a_recorded_artifact() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact rowid");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "original");
+        let artifact = register(&mut database, &mission_id, "report.md");
+        let rowid: i64 = database
+            .connection()
+            .query_row(
+                "SELECT rowid FROM loom_artifact WHERE artifact_id=?1",
+                [&artifact.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // A different id and a different path, but the same rowid: only the explicit-rowid guard
+        // in the INSERT trigger can refuse this one.
+        let replaced = database.connection().execute(
+            "INSERT INTO loom_artifact(rowid,artifact_id,plan_id,task_id,agent_run_id,
+                 relative_path,sha256,size_bytes,content_type,creator_id,created_at)
+             VALUES(?1,'artifact_other',?2,NULL,NULL,'other.md',?3,10,NULL,'local_user','now')",
+            params![rowid, &artifact.plan_id, "a".repeat(64)],
+        );
+        assert!(
+            replaced.is_err(),
+            "assertion an explicit rowid cannot replace a recorded artifact"
+        );
+        let rows: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "assertion the refused replace wrote nothing");
+    }
+
+    #[test]
+    fn passed_verification_checks_the_candidates_own_evidence_when_the_request_lists_none() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate evidence gate");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        // The desktop UI records a verification without listing evidenceIds; the Candidate's own
+        // evidence is what has to be re-read.
+        write_workspace_file(&database, &mission_id, "evidence_one.txt", "tampered");
+
+        let mut input = verification_input(
+            &mission_id,
+            "task_a",
+            &candidate.candidate_id,
+            "verify_command",
+            LoomVerificationResult::Passed,
+        );
+        input.evidence_ids = Vec::new();
+        let error = verification_record(&mut database, input).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_HASH_MISMATCH,
+            "assertion omitting evidenceIds must not skip the Candidate's evidence: {error}"
+        );
+    }
+
+    #[test]
+    fn passed_verification_cannot_substitute_intact_evidence_for_tampered_evidence() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM evidence substitution");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        write_workspace_file(&database, &mission_id, "clean.txt", "untouched");
+        let clean = register(&mut database, &mission_id, "clean.txt");
+        write_workspace_file(&database, &mission_id, "evidence_one.txt", "tampered");
+
+        // Citing one intact artifact does not excuse the Candidate's tampered one.
+        let mut input = verification_input(
+            &mission_id,
+            "task_a",
+            &candidate.candidate_id,
+            "verify_command",
+            LoomVerificationResult::Passed,
+        );
+        input.evidence_ids = vec![clean.artifact_id.clone()];
+        let error = verification_record(&mut database, input).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_HASH_MISMATCH,
+            "assertion an intact artifact cannot stand in for a tampered one: {error}"
+        );
+    }
+
+    #[test]
+    fn passed_verification_without_any_evidence_is_refused() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM evidence required");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let mut candidate_input =
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim);
+        candidate_input.evidence_ids = Vec::new();
+        let candidate = candidate_record(&mut database, candidate_input).unwrap();
+
+        let mut input = verification_input(
+            &mission_id,
+            "task_a",
+            &candidate.candidate_id,
+            "verify_command",
+            LoomVerificationResult::Passed,
+        );
+        input.evidence_ids = Vec::new();
+        let error = verification_record(&mut database, input).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_NOT_FOUND,
+            "assertion a passing verification needs something to re-read: {error}"
         );
     }
 }

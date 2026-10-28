@@ -44036,8 +44036,10 @@ mod tests {
                         .unwrap();
                 }
                 "current_receipt" => {
+                    // The classifier checks the newest receipt; deleting an older one would leave
+                    // the database looking current and the rejection would never be proven.
                     connection
-                        .execute("DELETE FROM schema_migration WHERE version=221", [])
+                        .execute("DELETE FROM schema_migration WHERE version=224", [])
                         .unwrap();
                 }
                 "steer_identity" => {
