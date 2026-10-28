@@ -4449,6 +4449,37 @@ mod tests {
             .unwrap()
     }
 
+    /// Since migration 224 an evidence id has to name a registered artifact, and a passing
+    /// verification re-reads its bytes. Tests seed the two files the shared input helpers cite,
+    /// so the gate is exercised instead of being bypassed.
+    fn seed_evidence(database: &mut OwnedTestDatabase, mission_id: &str) {
+        let workspace = mission_workspace(database.connection(), mission_id).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        for name in ["evidence_one", "evidence_two"] {
+            let relative = format!("{name}.txt");
+            let path = workspace.join(&relative);
+            std::fs::write(&path, name).unwrap();
+            let (sha256, size_bytes) = artifact_digest(&path).unwrap();
+            database
+                .connection()
+                .execute(
+                    "INSERT OR IGNORE INTO loom_artifact(artifact_id,plan_id,task_id,agent_run_id,
+                         relative_path,sha256,size_bytes,content_type,creator_id,created_at)
+                     SELECT ?1, plan_id, NULL, NULL, ?2, ?3, ?4, NULL, 'local_user', ?5
+                     FROM loom_plan WHERE mission_id=?6",
+                    params![
+                        name,
+                        &relative,
+                        &sha256,
+                        size_bytes,
+                        chrono::Utc::now().to_rfc3339(),
+                        mission_id
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
     /// A released, claimed task: the only state a delivery may be submitted from.
     fn held_task(
         database: &mut OwnedTestDatabase,
@@ -4458,6 +4489,7 @@ mod tests {
         command_id: &str,
     ) -> LoomClaimAcquireResult {
         plan_import(database, plan_input(mission_id)).unwrap();
+        seed_evidence(database, mission_id);
         task_release(database, release_input(mission_id, task_id)).unwrap();
         claim_acquire(
             database,
@@ -5200,6 +5232,7 @@ mod tests {
     ) -> LoomCandidateRecordResult {
         let mission_id = plan.mission_id.clone();
         plan_import(database, plan).unwrap();
+        seed_evidence(database, &mission_id);
         task_release(database, release_input(&mission_id, task_id)).unwrap();
         let claim = claim_acquire(
             database,
