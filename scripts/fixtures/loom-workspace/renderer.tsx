@@ -101,6 +101,18 @@ const dependencies: LoomDependency[] = [
   { dependencyId: 'dep-3', planId: plan.planId, upstreamTaskId: 'task-3', downstreamTaskId: 'task-4', condition: 'artifact_accepted', resolvedArtifactId: null, resolution: null, createdAt }
 ]
 
+// 候选与验收记录：task-1 已核验且已验收，task-3 只有待验收候选，所以 task-4 的
+// artifact_accepted 边仍然未释放，blocked 断言继续成立。
+const loomCriteria = plan.acceptanceCriteria
+const candidates: LoomCandidate[] = [
+  { candidateId: 'candidate-1', taskId: 'task-1', agentRunId: 'run-1', contentHash: 'sha256:restore-protocol', evidenceIds: ['evidence-1', 'evidence-2'], acceptanceCriteria: loomCriteria, previousCandidateId: null, verificationStatus: 'verified', acceptanceStatus: 'accepted', createdAt },
+  { candidateId: 'candidate-2', taskId: 'task-3', agentRunId: 'run-2', contentHash: 'sha256:restore-runtime', evidenceIds: ['evidence-3'], acceptanceCriteria: loomCriteria, previousCandidateId: null, verificationStatus: 'unverified', acceptanceStatus: 'pending', createdAt }
+]
+
+const reviews: LoomReview[] = [
+  { reviewId: 'review-1', candidateId: 'candidate-1', acceptanceCriteriaVersion: loomCriteria.version, verdict: 'accepted', reason: '恢复协议已覆盖保存与恢复两条路径', criteriaResults: loomCriteria.criteria.map((criterion, index) => ({ criterionId: criterion.criterionId, satisfied: true, evidenceIds: [`evidence-${index + 1}`], note: null })), reviewerId: 'user-local', reviewedAt: createdAt }
+]
+
 const delivery: MissionDelivery = {
   threadId: mission.threadId, workingDirectory: '/workspace/rovai-ai-mission-018', git: true,
   workspace: {
@@ -139,7 +151,9 @@ const replies: Readonly<Record<string, unknown>> = {
   'missions.activity': activity,
   'loom.plan.get': plan,
   'loom.tasks.list': tasks,
-  'loom.dependencies.list': dependencies
+  'loom.dependencies.list': dependencies,
+  'loom.candidates.list': candidates,
+  'loom.reviews.list': reviews
 }
 
 async function request<T>(method: string, params: unknown = {}): Promise<T> {
