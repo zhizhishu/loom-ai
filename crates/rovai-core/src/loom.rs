@@ -910,6 +910,37 @@ pub struct LoomClaimAcquireResult {
 const DEFAULT_CLAIM_LEASE_SECONDS: i64 = 300;
 const MAX_CLAIM_LEASE_SECONDS: i64 = 3600;
 
+/// Read projection of one lease claim: who holds the Task, until when, at which fence.
+///
+/// This is deliberately not [`LoomClaimAcquireResult`]: a receipt answers "what did my command
+/// do", a projection answers "who holds this Task right now", so it carries the derived
+/// `expired` verdict instead of making every reader re-implement the lease rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomClaim {
+    pub claim_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    /// Null when the claim was taken without binding an Agent id; readers fall back to
+    /// `agent_run_id` rather than inventing a claimant.
+    pub claimant_agent_id: Option<String>,
+    pub fence_generation: i64,
+    pub claimed_at: String,
+    pub lease_expires_at: String,
+    pub released_at: Option<String>,
+    /// True only for an unreleased claim whose lease is not in the future. A released claim is
+    /// a conclusion, so it is never also reported as expired.
+    pub expired: bool,
+}
+
+/// Claim projection plus the single server clock its `expired` verdicts were judged against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomClaimsListResult {
+    pub evaluated_at: String,
+    pub claims: Vec<LoomClaim>,
+}
+
 fn required_field(operation: &str, field: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1800,6 +1831,79 @@ pub struct LoomReviewRecordResult {
 }
 
 /// Every Candidate the Mission's plan produced, oldest first.
+/// Project the leases of one Mission, released ones included.
+///
+/// Reads only: an expired lease is reported, never released here, because closing a lease is a
+/// write and this is the read path. Every `expired` verdict in one page is judged against the
+/// same server clock, so a reader cannot observe a snapshot that never existed.
+pub fn claims_list(database: &Database, mission_id: &str) -> Result<LoomClaimsListResult> {
+    let mission_id = scoped_mission(mission_id)?;
+    let mut statement = database.connection().prepare(
+        "SELECT claim.claim_id, claim.task_id, claim.agent_run_id, claim.claimant_agent_id,
+                claim.fence_generation, claim.claimed_at, claim.lease_expires_at,
+                claim.released_at
+         FROM loom_claim AS claim
+         JOIN loom_plan AS plan ON plan.plan_id=claim.plan_id
+         WHERE plan.mission_id=?1
+         ORDER BY claim.task_id, claim.fence_generation",
+    )?;
+    type ClaimRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        String,
+        String,
+        Option<String>,
+    );
+    let rows: Vec<ClaimRow> = statement
+        .query_map([mission_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let now = chrono::Utc::now();
+    let claims = rows
+        .into_iter()
+        .map(
+            |(
+                claim_id,
+                task_id,
+                agent_run_id,
+                claimant_agent_id,
+                fence_generation,
+                claimed_at,
+                lease_expires_at,
+                released_at,
+            )| LoomClaim {
+                claim_id,
+                task_id,
+                agent_run_id,
+                claimant_agent_id,
+                fence_generation,
+                claimed_at,
+                lease_expires_at,
+                // A released claim is a conclusion, so it is never also reported as expired.
+                expired: released_at.is_none() && lease_expired(&lease_expires_at, now),
+                released_at,
+            },
+        )
+        .collect();
+    Ok(LoomClaimsListResult {
+        evaluated_at: now.to_rfc3339(),
+        claims,
+    })
+}
+
 pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<LoomCandidate>> {
     let mission_id = scoped_mission(mission_id)?;
     let mut statement = database.connection().prepare(
@@ -5827,6 +5931,121 @@ mod tests {
         assert!(
             error_text.contains("LOOM_VERIFICATION_REPLAY_CONFLICT"),
             "assertion verification_replay_returns_correct_code: {error_text}"
+        );
+    }
+
+    #[test]
+    fn claims_list_projects_the_open_lease_against_one_server_clock() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claims projection");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+
+        let listed = claims_list(&database, &mission_id).unwrap();
+
+        assert_eq!(listed.claims.len(), 1, "assertion claims_list_returns_the_open_claim");
+        let only = &listed.claims[0];
+        assert_eq!(only.claim_id, claim.claim_id);
+        assert_eq!(only.task_id, "task_a");
+        assert_eq!(only.agent_run_id, "run_one");
+        assert_eq!(only.fence_generation, 1, "assertion claims_list_reports_the_fence");
+        assert_eq!(only.claimant_agent_id.as_deref(), Some("agent_1"));
+        assert_eq!(only.released_at, None, "an open claim must not report a release");
+        assert!(!only.expired, "assertion a fresh lease must not read as expired");
+        assert_eq!(only.claimed_at, claim.claimed_at);
+        assert_eq!(only.lease_expires_at, claim.lease_expires_at);
+        chrono::DateTime::parse_from_rfc3339(&listed.evaluated_at)
+            .expect("evaluatedAt must be an RFC3339 server timestamp");
+    }
+
+    #[test]
+    fn claims_list_separates_a_lapsed_lease_from_a_released_one() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claims expiry");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET lease_expires_at=?1 WHERE claim_id=?2",
+                rusqlite::params![past, claim.claim_id],
+            )
+            .unwrap();
+        let lapsed = claims_list(&database, &mission_id).unwrap();
+        assert!(
+            lapsed.claims[0].expired,
+            "assertion a lease that lapsed must read as expired"
+        );
+        assert_eq!(lapsed.claims[0].released_at, None);
+
+        // A released claim is a conclusion about that Run, not a lapsed lease: reporting both
+        // would make the UI say a Task that was handed back is also still being held.
+        let released_at = chrono::Utc::now().to_rfc3339();
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at=?1 WHERE claim_id=?2",
+                rusqlite::params![released_at, claim.claim_id],
+            )
+            .unwrap();
+        let released = claims_list(&database, &mission_id).unwrap();
+        assert_eq!(released.claims[0].released_at.as_deref(), Some(released_at.as_str()));
+        assert!(
+            !released.claims[0].expired,
+            "assertion a released claim must not also read as expired"
+        );
+    }
+
+    #[test]
+    fn claims_list_stays_inside_the_mission_and_never_writes() {
+        let mut database = fixture();
+        let mission_one = create_mission(&mut database, "LOOM claims one");
+        let mission_two = create_mission(&mut database, "LOOM claims two");
+        held_task(&mut database, &mission_one, "task_a", "run_one", "command_one");
+
+        let count = |database: &OwnedTestDatabase| -> i64 {
+            database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM loom_claim", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = count(&database);
+
+        let other = claims_list(&database, &mission_two).unwrap();
+        assert!(
+            other.claims.is_empty(),
+            "assertion another Mission's claims must not leak into the projection"
+        );
+        let listed = claims_list(&database, &mission_one).unwrap();
+        assert_eq!(listed.claims.len(), 1);
+
+        assert_eq!(
+            before,
+            count(&database),
+            "assertion the read path must not write a claim row"
+        );
+    }
+
+    #[test]
+    fn claims_list_keeps_an_unbound_claimant_null_instead_of_inventing_one() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claims unbound");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        claim_acquire(
+            &mut database,
+            LoomClaimAcquireInput {
+                claimant_agent_id: None,
+                ..claim_input(&mission_id, "task_a", "run_one", "command_one")
+            },
+        )
+        .unwrap();
+
+        let listed = claims_list(&database, &mission_id).unwrap();
+
+        assert_eq!(
+            listed.claims[0].claimant_agent_id, None,
+            "assertion an unbound claimant must stay null so readers fall back to the Run"
         );
     }
 }

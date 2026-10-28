@@ -162,14 +162,29 @@ export interface LoomClaim {
   taskId: string
   /** 实际执行的 AgentRun ID */
   agentRunId: string
-  /** 认领者 Agent ID */
-  claimantAgentId: string
-  /** 租约过期时间 */
-  leaseExpiresAt: string
+  /** 认领者 Agent ID（只有绑定了 Run 的认领才有；空值表示只能回退到 agentRunId） */
+  claimantAgentId: string | null
   /** 栅栏代次（防止旧执行者提交） */
   fenceGeneration: number
   /** 认领时间 */
   claimedAt: string
+  /** 租约过期时间 */
+  leaseExpiresAt: string
+  /** 释放时间（未释放为 null） */
+  releasedAt: string | null
+  /**
+   * 租约是否已过期。由 Host 用服务端时钟判定，客户端不得自己拿本地时间推算；
+   * 已释放的认领恒为 false——释放是结论，过期只是没续上。
+   */
+  expired: boolean
+}
+
+/** 认领投影：一批认领 + 判定它们是否过期时所用的那一个服务端时刻。 */
+export interface LoomClaimsListResult {
+  /** 判定 `expired` 时用的服务端时刻（RFC3339）；同一次返回内共用这一个 */
+  evaluatedAt: string
+  /** 该 Mission 下的全部认领，含已释放的历史代次 */
+  claims: LoomClaim[]
 }
 
 /** 依赖未释放原因。 */

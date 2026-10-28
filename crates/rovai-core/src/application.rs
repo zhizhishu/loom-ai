@@ -9580,6 +9580,7 @@ impl Core {
             | "loom.tasks.list"
             | "loom.dependencies.list"
             | "loom.candidates.list"
+            | "loom.claims.list"
             | "loom.reviews.list"
             | "loom.verifications.list" => {
                 let params: rovai_core::loom::MissionScopeInput =
@@ -9595,6 +9596,9 @@ impl Core {
                     }
                     "loom.candidates.list" => serde_json::to_value(
                         rovai_core::loom::candidates_list(&database, mission_id)?,
+                    )?,
+                    "loom.claims.list" => serde_json::to_value(
+                        rovai_core::loom::claims_list(&database, mission_id)?,
                     )?,
                     "loom.reviews.list" => serde_json::to_value(rovai_core::loom::reviews_list(
                         &database, mission_id,
