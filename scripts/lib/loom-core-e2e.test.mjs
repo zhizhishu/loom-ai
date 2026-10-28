@@ -298,8 +298,14 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
 }, async (t) => {
   const fixture = await realpath(await mkdtemp(join(tmpdir(), 'rovai-loom-chain-')))
   // Registered before the build: even a failed build must leave no temporary root behind.
-  // `rm` is idempotent, so the `finally` below can remove it first.
-  t.after(async () => { await rm(fixture, { recursive: true, force: true }) })
+  // `rm` is idempotent, so the `finally` below can remove it first. A Core whose exit could not
+  // be confirmed sets `preserveFixture`, because deleting files a live process still owns would
+  // destroy the only evidence of what went wrong.
+  let preserveFixture = false
+  t.after(async () => {
+    if (preserveFixture) return
+    await rm(fixture, { recursive: true, force: true })
+  })
   const cargoTargetDir = join(fixture, 'cargo-target')
   const isolatedHome = join(fixture, 'home')
   const isolatedTemporary = join(fixture, 'tmp')
@@ -887,13 +893,19 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     database = null
   } finally {
     database?.close()
-    // The walk below and the fixture delete both need Core's pid gone, so the same gate runs
-    // first; its failure is reported after the cleanup rather than left to race the process.
-    let exitFailure = null
+    // The walk below and the fixture delete both need Core's pid gone. If that cannot be
+    // confirmed, the fixture is kept whole and the failure is raised immediately: inspecting or
+    // deleting paths a live Core may still be writing would both race it and destroy the
+    // evidence, so there is nothing safe left to run in this branch.
+    let stopFailure = null
     try {
       await stopCoreOrFail(core, 'before the temporary root is inspected and deleted')
     } catch (error) {
-      exitFailure = error
+      stopFailure = error
+    }
+    if (stopFailure) {
+      preserveFixture = true
+      throw Object.assign(stopFailure, { preservedFixture: fixture })
     }
     try {
       await removeEphemeralRuntimeCampFilesRoot(dataDir, {
@@ -922,7 +934,6 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     } finally {
       await rm(fixture, { recursive: true, force: true })
     }
-    if (exitFailure) throw exitFailure
   }
 })
 
@@ -1060,10 +1071,11 @@ function startIsolatedCore({ dataDir, skillRoot, mcpPath, binaryPath, environmen
         stage = 'sigterm'
         child.kill('SIGTERM')
         if (await waitForExit(Math.min(remaining(), 5_000))) return
-        // 3. The whole tree goes down: killProcessTree throws instead of reporting a kill it
-        //    could not perform, and the wait that follows is trimmed by the budget above.
+        // 3. The whole tree goes down. `killProcessTree` reports only what it could actually
+        //    do; whether the pid then disappears is decided by the bounded wait below, so a
+        //    signal that lands just before the exit event is not mistaken for a failed kill.
         stage = 'sigkill'
-        killProcessTree(child)
+        killProcessTree(child, Math.max(remaining(), 1_000))
         if (await waitForExit(Math.min(remaining(), 15_000))) return
         throw timedOut()
       } catch (error) {
@@ -1115,16 +1127,21 @@ function pidAlive(pid) {
 }
 
 // Windows and POSIX report a failed tree kill differently, so both branches end in a positive
-// statement: either the kill succeeded and the pid is provably gone, or this throws.
-function killProcessTree(child) {
+// statement about the kill itself. Liveness is deliberately NOT judged here: a signal that has
+// been delivered is not a process that has been reaped, so the caller's bounded wait decides
+// whether the pid actually went away (see `close()`), and only then fails.
+function killProcessTree(child, budgetMs = 15_000) {
   const pid = child.pid
   if (!pid || child.exitCode !== null || child.signalCode !== null) return
   if (process.platform === 'win32') {
     // `stdout`/`stderr` used to be discarded, which hid the only reason taskkill ever gives;
-    // its status code and its output are now both captured and both checked.
+    // its status code and its output are now both captured and both checked. The budget keeps
+    // a wedged taskkill from blocking the event loop past the close() cap.
     const outcome = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
       windowsHide: true,
-      encoding: 'utf8'
+      encoding: 'utf8',
+      timeout: budgetMs,
+      killSignal: 'SIGKILL'
     })
     const detail = `${outcome.stderr ?? ''}`.trim()
       || `${outcome.stdout ?? ''}`.trim()
@@ -1134,12 +1151,6 @@ function killProcessTree(child) {
       throw Object.assign(
         new Error(`taskkill.exe /PID ${pid} /T /F failed (status=${outcome.status}, signal=${outcome.signal}): ${detail}`),
         { stage: 'taskkill', pid, status: outcome.status, stderr: detail }
-      )
-    }
-    if (pidAlive(pid)) {
-      throw Object.assign(
-        new Error(`taskkill.exe /PID ${pid} /T /F reported success but pid=${pid} is still alive`),
-        { stage: 'taskkill-verify', pid }
       )
     }
     return
@@ -1155,11 +1166,5 @@ function killProcessTree(child) {
         { stage: 'sigkill-group', pid, code: error?.code }
       )
     }
-  }
-  if (pidAlive(pid)) {
-    throw Object.assign(
-      new Error(`pid=${pid} is still alive after the process-group SIGKILL`),
-      { stage: 'sigkill-verify', pid }
-    )
   }
 }
