@@ -45,21 +45,28 @@
 .loom-flow { margin-top: 24px; }
 .loom-flow-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .loom-flow-stats { display: flex; gap: 16px; color: var(--muted); font-size: 11px; }
-/* 图区横向：depth 0 → n 自左向右排泳道，横向滚动只发生在图区内部。 */
+/* 图区横向：depth 0 → n 自左向右排泳道；泳道可变宽，容器窄于「列数 × 150px + 间距」时才横滚。 */
 .loom-flow-graph { position: relative; display: flex; flex-direction: row; align-items: flex-start; gap: 48px; max-width: 100%; min-width: 0; padding-bottom: 4px; overflow-x: auto; }
-.loom-flow-lane { display: flex; min-width: 220px; flex: 0 0 auto; flex-direction: column; gap: 16px; }
-.loom-flow-node { width: 220px; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 6px; padding: 12px; background: var(--surface); }
-.loom-flow-node.ready { border-color: var(--accent); background: var(--accent-subtle); }
-.loom-flow-node.blocked { border-color: var(--attention); background: var(--attention-subtle); }
+.loom-flow-lane { display: flex; flex: 1 1 0; min-width: 150px; max-width: 240px; flex-direction: column; gap: 14px; }
+/* 列头：泳道第一个子元素；列内 gap 14px，要让列头下沿只占 8px，所以回吐 6px。 */
+.loom-flow-lane-label { margin-bottom: -6px; color: var(--muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+.loom-flow-node { position: relative; z-index: 1; width: 100%; min-width: 0; flex: 0 0 auto; border: 1px solid var(--line); border-left: 2px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / 6%); }
+.loom-flow-node.ready { border-color: var(--accent); border-left-color: var(--accent); background: var(--accent-subtle); }
+.loom-flow-node.blocked { border-color: var(--attention); border-left-color: var(--attention); background: var(--attention-subtle); }
+/* 其余状态只换左侧状态条，不改边框底色。 */
+.loom-flow-node.done { border-left-color: var(--muted); }
+.loom-flow-node.in_review { border-left-color: color-mix(in srgb, var(--attention) 55%, transparent); }
+.loom-flow-node.draft { border-left-color: var(--faint); }
+.loom-flow-node.canceled { border-left-color: var(--faint); }
 .loom-flow-node-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-.loom-flow-node-title { font-size: 12px; font-weight: 550; }
-.loom-flow-node-status { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.loom-flow-node-title { font-size: 13px; font-weight: 600; line-height: 1.35; }
+.loom-flow-node-status { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
 .loom-flow-node-assignee { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
-.loom-flow-node-deps { font-size: 10px; color: var(--faint); margin-bottom: 4px; }
+.loom-flow-node-deps { font-size: 11px; color: var(--faint); margin-bottom: 4px; }
 .loom-flow-node-blocked { font-size: 10px; color: var(--attention); font-style: italic; }
 /* 依赖连线：SVG 绝对定位覆盖整个图区域，不参与命中测试。 */
-.loom-flow-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
-.loom-flow-edge { fill: none; stroke: var(--muted); stroke-width: 1.25; stroke-linecap: round; }
+.loom-flow-edges { position: absolute; top: 0; left: 0; z-index: 0; overflow: visible; pointer-events: none; }
+.loom-flow-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; }
 .loom-flow-edge-task-done { stroke: var(--muted); }
 .loom-flow-edge-artifact-accepted { stroke: var(--accent); stroke-dasharray: 5 3; }
 /* 阻塞态盖过条件色：未释放的 artifact_accepted 边与下游 blocked 的入边都走这一条。 */

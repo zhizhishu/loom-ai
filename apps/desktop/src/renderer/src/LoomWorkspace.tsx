@@ -158,7 +158,7 @@ function LoomFlow({ tasks, dependencies, agents }: {
         <defs>
           {[FLOW_ARROW_MARKER, `${FLOW_ARROW_MARKER}-artifact-accepted`, `${FLOW_ARROW_MARKER}-blocked`].map(id => <marker
             key={id} id={id} className={id} viewBox="0 0 8 8" refX="7.4" refY="4"
-            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0.6 1 L7.4 4 L0.6 7 Z"/>
           </marker>)}
         </defs>
@@ -185,6 +185,7 @@ function LoomFlow({ tasks, dependencies, agents }: {
         })}
       </svg>}
       {lanes.map(lane => <div key={lane.depth} className="loom-flow-lane" data-depth={lane.depth}>
+        <span className="loom-flow-lane-label">{t('阶段')} {lane.depth + 1}</span>
         {lane.tasks.map(task => {
           const upstreams = dependencies.filter(d => d.downstreamTaskId === task.taskId)
           const ready = claimable(task)
