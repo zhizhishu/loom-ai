@@ -111,6 +111,7 @@ app.whenReady().then(async () => {
   await expectPressed(1, 'Pointer activation did not open the 编排 section')
   await waitFor("document.querySelector('.loom-section-body > div:last-child').hidden === true", 'Plan section did not hide the shared activity container')
   await waitFor("!!document.querySelector('.loom-plan .loom-flow')", 'Plan section did not render the task dependency flow')
+  await waitFor("!!document.querySelector('.loom-plan .loom-flow-edge')", 'Plan flow did not draw dependency edges')
   const plan = await script(`(() => {
     const nodes = [...document.querySelectorAll('.loom-plan .loom-flow-node')]
     const blocked = document.querySelector('.loom-plan .loom-flow-node.blocked')
@@ -120,6 +121,9 @@ app.whenReady().then(async () => {
       firstTitle: nodes[0]?.querySelector('.loom-flow-node-title')?.innerText ?? null,
       blockedCopy: blocked?.innerText ?? '',
       stats: document.querySelector('.loom-plan .loom-flow-stats')?.innerText ?? '',
+      edgeCount: document.querySelectorAll('.loom-plan .loom-flow-edge').length,
+      dashedCount: document.querySelectorAll('.loom-plan .loom-flow-edge-artifact-accepted').length,
+      laneCount: document.querySelectorAll('.loom-plan .loom-flow-lane').length,
       controls: document.querySelectorAll('.loom-plan input, .loom-plan button, .loom-plan textarea').length
     }
   })()`)
@@ -128,6 +132,9 @@ app.whenReady().then(async () => {
   assert(plan.firstTitle?.includes('设计恢复协议'), `Plan flow lost its first task title: ${JSON.stringify(plan.firstTitle)}`)
   assert(plan.blockedCopy.includes('等待恢复逻辑完成'), `Plan flow lost the real blocked reason: ${JSON.stringify(plan.blockedCopy)}`)
   assert(plan.stats.includes('总任务: 4'), `Plan flow stats no longer count the real tasks: ${JSON.stringify(plan.stats)}`)
+  assert.equal(plan.edgeCount, 3, `Plan flow must draw one edge per mock dependency: ${JSON.stringify(plan.edgeCount)}`)
+  assert(plan.dashedCount >= 1, `Plan flow lost the dashed artifact_accepted edge: ${JSON.stringify(plan.dashedCount)}`)
+  assert(plan.laneCount >= 2, `Plan flow must layer the DAG into depth lanes: ${JSON.stringify(plan.laneCount)}`)
   assert.equal(plan.controls, 0, 'Plan section must not offer controls for a read-only plan')
   cases.push('编排 section renders the real task dependency flow with four nodes, the blocked task reason, honest stats and no invented controls')
 

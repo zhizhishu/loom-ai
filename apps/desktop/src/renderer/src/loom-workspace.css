@@ -45,8 +45,10 @@
 .loom-flow { margin-top: 24px; }
 .loom-flow-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .loom-flow-stats { display: flex; gap: 16px; color: var(--muted); font-size: 11px; }
-.loom-flow-graph { display: flex; flex-direction: column; gap: 12px; }
-.loom-flow-node { border: 1px solid var(--line); border-radius: 6px; padding: 12px; background: var(--surface); }
+/* 图区横向：depth 0 → n 自左向右排泳道，横向滚动只发生在图区内部。 */
+.loom-flow-graph { position: relative; display: flex; flex-direction: row; align-items: flex-start; gap: 48px; max-width: 100%; min-width: 0; padding-bottom: 4px; overflow-x: auto; }
+.loom-flow-lane { display: flex; min-width: 220px; flex: 0 0 auto; flex-direction: column; gap: 16px; }
+.loom-flow-node { width: 220px; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 6px; padding: 12px; background: var(--surface); }
 .loom-flow-node.ready { border-color: var(--accent); background: var(--accent-subtle); }
 .loom-flow-node.blocked { border-color: var(--attention); background: var(--attention-subtle); }
 .loom-flow-node-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
@@ -55,6 +57,27 @@
 .loom-flow-node-assignee { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
 .loom-flow-node-deps { font-size: 10px; color: var(--faint); margin-bottom: 4px; }
 .loom-flow-node-blocked { font-size: 10px; color: var(--attention); font-style: italic; }
+/* 依赖连线：SVG 绝对定位覆盖整个图区域，不参与命中测试。 */
+.loom-flow-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
+.loom-flow-edge { fill: none; stroke: var(--muted); stroke-width: 1.25; stroke-linecap: round; }
+.loom-flow-edge-task-done { stroke: var(--muted); }
+.loom-flow-edge-artifact-accepted { stroke: var(--accent); stroke-dasharray: 5 3; }
+/* 阻塞态盖过条件色：未释放的 artifact_accepted 边与下游 blocked 的入边都走这一条。 */
+.loom-flow-edge-blocked { stroke: var(--attention); }
+.loom-flow-arrow path { fill: var(--muted); }
+.loom-flow-arrow-artifact-accepted path { fill: var(--accent); }
+.loom-flow-arrow-blocked path { fill: var(--attention); }
+/* 节点状态点：横向排进原有 header，标题让位并允许换行。 */
+.loom-flow-node-header { gap: 7px; }
+.loom-flow-node-header > .loom-flow-node-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.loom-flow-node-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--faint); transition: background-color 140ms ease; }
+.loom-flow-node-dot[data-status='done'] { background: var(--muted); }
+.loom-flow-node-dot[data-status='ready'] { background: var(--accent); }
+.loom-flow-node-dot[data-status='in_review'] { background: color-mix(in srgb, var(--attention) 55%, transparent); }
+.loom-flow-node-dot[data-status='blocked'] { background: var(--attention); }
+.loom-flow-node-dot[data-status='canceled'] { background: var(--faint); opacity: .55; }
+.loom-flow-node-dot[data-status='draft'] { background: transparent; box-shadow: inset 0 0 0 1px var(--faint); }
 
 @media(max-width:640px) { .loom-section-tabs { padding-inline: 18px; }.loom-section-body > .mission-activity-document { padding: 18px; }.loom-plan,.loom-delivery { padding: 24px 20px; }.loom-foundation { grid-template-columns: minmax(0,1fr) 64px 64px; gap: 12px; } }
 @media(prefers-reduced-motion:reduce) { .loom-section-tabs button { transition: none; } }
+@media(prefers-reduced-motion:reduce) { .loom-flow-node-dot { transition: none; } }

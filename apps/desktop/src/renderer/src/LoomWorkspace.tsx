@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency } from '@contracts'
 import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
@@ -14,6 +14,68 @@ function LoomEmpty({ title, children }: { title: string; children: ReactNode }) 
     <h3>{title}</h3>
     <div>{children}</div>
   </div>
+}
+
+type FlowPoint = { x: number; y: number }
+/** 单个节点的四向锚点：泳道图只连 right→left，上下锚点留给同列兜底。 */
+type FlowNodeAnchors = { top: FlowPoint; right: FlowPoint; bottom: FlowPoint; left: FlowPoint }
+type FlowLayout = { width: number; height: number; nodes: ReadonlyMap<string, FlowNodeAnchors> }
+
+const EMPTY_FLOW_LAYOUT: FlowLayout = { width: 0, height: 0, nodes: new Map<string, FlowNodeAnchors>() }
+const FLOW_ARROW_MARKER = 'loom-flow-arrow'
+
+function sameFlowPoint(a: FlowPoint, b: FlowPoint): boolean {
+  return a.x === b.x && a.y === b.y
+}
+
+function sameFlowLayout(a: FlowLayout, b: FlowLayout): boolean {
+  if (a.width !== b.width || a.height !== b.height || a.nodes.size !== b.nodes.size) return false
+  for (const [taskId, anchors] of b.nodes) {
+    const current = a.nodes.get(taskId)
+    if (current === undefined) return false
+    if (!sameFlowPoint(current.top, anchors.top) || !sameFlowPoint(current.right, anchors.right)
+      || !sameFlowPoint(current.bottom, anchors.bottom) || !sameFlowPoint(current.left, anchors.left)) return false
+  }
+  return true
+}
+
+/**
+ * 按依赖深度分泳道：无上游 = 0，其余 = 1 + max(所有上游)。
+ * 防环：迭代轮次上限 tasks.length，环上算不出来的任务不会死循环也不会抛错，
+ * 收尾时统一归到已经算出的最大深度。悬空边（上游不在本次任务集里）直接忽略。
+ */
+function flowDepths(tasks: LoomTask[], dependencies: LoomDependency[]): Map<string, number> {
+  const depths = new Map<string, number>()
+  const known = new Set(tasks.map(task => task.taskId))
+  for (let round = 0; round <= tasks.length; round += 1) {
+    let settled = false
+    for (const task of tasks) {
+      if (depths.has(task.taskId)) continue
+      let depth = 0
+      let pending = false
+      for (const dependency of dependencies) {
+        if (dependency.downstreamTaskId !== task.taskId) continue
+        if (!known.has(dependency.upstreamTaskId)) continue
+        const upstreamDepth = depths.get(dependency.upstreamTaskId)
+        if (upstreamDepth === undefined) { pending = true; break }
+        if (upstreamDepth + 1 > depth) depth = upstreamDepth + 1
+      }
+      if (pending) continue
+      depths.set(task.taskId, depth)
+      settled = true
+    }
+    if (!settled) break
+  }
+  let deepest = 0
+  for (const depth of depths.values()) if (depth > deepest) deepest = depth
+  for (const task of tasks) if (!depths.has(task.taskId)) depths.set(task.taskId, deepest)
+  return depths
+}
+
+/** 上游右侧中点到下游左侧中点的三次贝塞尔：控制点横向居中，箭头落在下游左侧。 */
+function flowEdgePath(upstream: FlowPoint, downstream: FlowPoint): string {
+  const middle = (upstream.x + downstream.x) / 2
+  return `M ${upstream.x} ${upstream.y} C ${middle} ${upstream.y}, ${middle} ${downstream.y}, ${downstream.x} ${downstream.y}`
 }
 
 /** 依赖图渲染：archify 流程视图。就绪判定走控制层契约，不在 UI 里另立规则。 */
@@ -32,6 +94,53 @@ function LoomFlow({ tasks, dependencies, agents }: {
   const readyTasks = tasks.filter(claimable)
   const blockedTasks = tasks.filter(task => task.status === 'blocked')
   
+  // 泳道：depth 0 在最左，往右递增。列内保持 tasks 原顺序，不另排序。
+  const depths = flowDepths(tasks, dependencies)
+  const tasksByDepth = new Map<number, LoomTask[]>()
+  for (const task of tasks) {
+    const depth = depths.get(task.taskId) ?? 0
+    const lane = tasksByDepth.get(depth)
+    if (lane === undefined) tasksByDepth.set(depth, [task])
+    else lane.push(task)
+  }
+  const lanes = [...tasksByDepth.keys()].sort((a, b) => a - b)
+    .map(depth => ({ depth, tasks: tasksByDepth.get(depth) ?? [] }))
+  
+  // 连线坐标靠实测：布局后量一次，容器尺寸变化（缩放、tab 切换、主题）再量。
+  const graphRef = useRef<HTMLDivElement>(null)
+  const nodeRefs = useRef(new Map<string, HTMLDivElement>())
+  const [layout, setLayout] = useState<FlowLayout>(EMPTY_FLOW_LAYOUT)
+  
+  const measure = useCallback((): void => {
+    const container = graphRef.current
+    if (container === null) return
+    const bounds = container.getBoundingClientRect()
+    const nodes = new Map<string, FlowNodeAnchors>()
+    for (const [taskId, element] of nodeRefs.current) {
+      const rect = element.getBoundingClientRect()
+      // 相对图容器的 padding 原点，加回滚动量，跟着内容一起滚。
+      const left = rect.left - bounds.left + container.scrollLeft
+      const top = rect.top - bounds.top + container.scrollTop
+      nodes.set(taskId, {
+        top: { x: left + rect.width / 2, y: top },
+        right: { x: left + rect.width, y: top + rect.height / 2 },
+        bottom: { x: left + rect.width / 2, y: top + rect.height },
+        left: { x: left, y: top + rect.height / 2 }
+      })
+    }
+    const next: FlowLayout = { width: container.scrollWidth, height: container.scrollHeight, nodes }
+    setLayout(current => sameFlowLayout(current, next) ? current : next)
+  }, [])
+  
+  useLayoutEffect(() => {
+    measure()
+    const container = graphRef.current
+    if (container === null) return
+    const observer = new ResizeObserver(() => measure())
+    observer.observe(container)
+    return () => observer.disconnect()
+  }, [measure, tasks, dependencies])
+  
   return <div className="loom-flow">
     <div className="loom-flow-header">
       <span className="loom-eyebrow">{t('任务依赖')}</span>
@@ -42,31 +151,72 @@ function LoomFlow({ tasks, dependencies, agents }: {
       </div>
     </div>
     
-    <div className="loom-flow-graph">
-      {tasks.map(task => {
-        const upstreams = dependencies.filter(d => d.downstreamTaskId === task.taskId)
-        const ready = claimable(task)
-        const assignee = agents.find(a => a.agentId === task.assigneeAgentId)
-        
-        return <div key={task.taskId} className={`loom-flow-node ${ready ? 'ready' : ''} ${task.status}`}>
-          <div className="loom-flow-node-header">
-            <span className="loom-flow-node-title">{task.title}</span>
-            <span className="loom-flow-node-status">{t(task.status)}</span>
-          </div>
-          {assignee && <div className="loom-flow-node-assignee">{assignee.displayName}</div>}
-          {upstreams.length > 0 && (
-            <div className="loom-flow-node-deps">
-              {t('依赖')}: {upstreams.map(d => {
-                const upstream = tasks.find(entry => entry.taskId === d.upstreamTaskId)
-                return upstream?.title ?? d.upstreamTaskId
-              }).join(', ')}
+    <div className="loom-flow-graph" ref={graphRef}>
+      {layout.width > 0 && layout.height > 0 && <svg
+        className="loom-flow-edges" width={layout.width} height={layout.height}
+        aria-hidden="true" focusable="false">
+        <defs>
+          {[FLOW_ARROW_MARKER, `${FLOW_ARROW_MARKER}-artifact-accepted`, `${FLOW_ARROW_MARKER}-blocked`].map(id => <marker
+            key={id} id={id} className={id} viewBox="0 0 8 8" refX="7.4" refY="4"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0.6 1 L7.4 4 L0.6 7 Z"/>
+          </marker>)}
+        </defs>
+        {dependencies.map(dependency => {
+          const upstream = layout.nodes.get(dependency.upstreamTaskId)
+          const downstream = layout.nodes.get(dependency.downstreamTaskId)
+          if (!upstream || !downstream) return null
+          // artifact_accepted 边没有冻结溯源 = 尚未释放（人工验收缺席）。
+          const unreleased = dependency.resolution === null && dependency.condition === 'artifact_accepted'
+          const downstreamTask = tasks.find(task => task.taskId === dependency.downstreamTaskId)
+          const blocked = unreleased || downstreamTask?.status === 'blocked'
+          const conditionClass = dependency.condition === 'task_done'
+            ? 'loom-flow-edge-task-done'
+            : 'loom-flow-edge-artifact-accepted'
+          const marker = blocked
+            ? `${FLOW_ARROW_MARKER}-blocked`
+            : dependency.condition === 'task_done' ? FLOW_ARROW_MARKER : `${FLOW_ARROW_MARKER}-artifact-accepted`
+          return <path
+            key={dependency.dependencyId}
+            className={`loom-flow-edge ${conditionClass}${blocked ? ' loom-flow-edge-blocked' : ''}`}
+            data-edge-id={dependency.dependencyId}
+            markerEnd={`url(#${marker})`}
+            d={flowEdgePath(upstream.right, downstream.left)}/>
+        })}
+      </svg>}
+      {lanes.map(lane => <div key={lane.depth} className="loom-flow-lane" data-depth={lane.depth}>
+        {lane.tasks.map(task => {
+          const upstreams = dependencies.filter(d => d.downstreamTaskId === task.taskId)
+          const ready = claimable(task)
+          const assignee = agents.find(a => a.agentId === task.assigneeAgentId)
+          
+          return <div
+            key={task.taskId}
+            ref={element => {
+              if (element === null) nodeRefs.current.delete(task.taskId)
+              else nodeRefs.current.set(task.taskId, element)
+            }}
+            className={`loom-flow-node ${ready ? 'ready' : ''} ${task.status}`}>
+            <div className="loom-flow-node-header">
+              <span className="loom-flow-node-dot" data-status={task.status}/>
+              <span className="loom-flow-node-title">{task.title}</span>
+              <span className="loom-flow-node-status">{t(task.status)}</span>
             </div>
-          )}
-          {task.blockedReason && (
-            <div className="loom-flow-node-blocked">{task.blockedReason}</div>
-          )}
-        </div>
-      })}
+            {assignee && <div className="loom-flow-node-assignee">{assignee.displayName}</div>}
+            {upstreams.length > 0 && (
+              <div className="loom-flow-node-deps">
+                {t('依赖')}: {upstreams.map(d => {
+                  const upstream = tasks.find(entry => entry.taskId === d.upstreamTaskId)
+                  return upstream?.title ?? d.upstreamTaskId
+                }).join(', ')}
+              </div>
+            )}
+            {task.blockedReason && (
+              <div className="loom-flow-node-blocked">{task.blockedReason}</div>
+            )}
+          </div>
+        })}
+      </div>)}
     </div>
   </div>
 }

@@ -20,9 +20,13 @@
 |---|---|---|
 | 2.1 | 迁移 220 / schema 170：`loom_claim` + `loom.task.release` + `loom.claim.acquire`（原子、fence 单调、commandId 幂等、租约过期接管） | 已收（限"存储与 API 基础"，不含提交端 fencing） |
 | 2.2 | 迁移 221 / schema 171：`loom_candidate`（内容列不可改）+ `loom.candidate.record`，提交端 fence = 锁内取时 + claimId/fenceGeneration 双校验 | 已实现，`cargo test --lib loom` 32 passed；**Astra 终审未过，待复审** |
-| 2.3 | Review / 人工验收 / 证据核验 / 依赖首次释放冻结 | 未开始（`artifact_accepted` 边目前永不释放，属诚实未实现） |
-| 2.4 | claim/Candidate 接入 UI（切掉 fixture mock） | 未开始 |
-| 2.5 | archify 连线拓扑 + LOOM 品牌 | 未开始 |
+| 2.3 → **A1** | Review / 人工验收 / 证据核验 / 依赖首次释放冻结 + 迁移 222/schema 172（`loom_review` 不可变、逐条结论、`loom.candidates.list`/`loom.reviews.list`/`loom.review.record`） | 未开始（`artifact_accepted` 边目前永不释放，属诚实未实现） |
+| 2.3b → **A2** | 判定列防篡改：SQLite 触发器拒绝直接 UPDATE 内容列与判定列 | 未开始 |
+| 2.4 → ~~B1~~ | claim/Candidate 接入 UI | **复核纠正：读路径已接真 RPC**（`LoomWorkspace.tsx:186`），无 mock 回退；仅缺非夹具的真实链路证据 |
+| 2.5 → **B2** | archify 连线拓扑：SVG 连线层、依赖方向箭头、并行泳道、节点固定宽 220、阻塞边标红 | 未开始（现仅竖排卡片 + 依赖文字，无任何连线） |
+| 2.5b → **B3** | LOOM 品牌与视觉：字标、主色、空状态体系、交付 tab 双徽章、移动端底部弹层 | 未开始（仅两处 `LOOM ·` eyebrow） |
+
+> 调整说明（2026-10-28 复核）：原顺序 2.3→2.4→2.5 会让用户长期看不到东西，改为 **A 线（后端）与 B 线（前端）并行**。完整评估、分工、UI 方案与四层验收见 [`handoff-2026-10-28.md`](handoff-2026-10-28.md) 附录。
 
 ## 从 ACCP 直接抄的机制
 
