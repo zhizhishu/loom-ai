@@ -113,3 +113,20 @@
 @media(prefers-reduced-motion:reduce) { .loom-section-tabs button::after { transition: none; } }
 @media(prefers-reduced-motion:reduce) { .loom-flow-node-dot { transition: none; } }
 @media(prefers-reduced-motion:reduce) { .loom-empty-mark i { transition: none; } }
+
+/* 交付候选卡片：核验与验收是两个独立徽章，各自按 data-state 上色，不合并成单一状态。 */
+.loom-candidate { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; background: var(--surface); }
+.loom-candidate-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* 标题让位：长 hash 或长标题不挤走右侧徽章，也不撑破卡片宽度。 */
+.loom-candidate-title { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 600; line-height: 1.35; }
+.loom-badge { display: inline-flex; flex: 0 0 auto; align-items: center; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font-size: 10px; line-height: 1.5; }
+.loom-badge-verification[data-state='unverified'] { color: var(--muted); }
+.loom-badge-verification[data-state='verified'] { color: var(--accent); }
+.loom-badge-verification[data-state='failed'] { color: var(--attention); }
+.loom-badge-acceptance[data-state='pending'] { color: var(--muted); }
+.loom-badge-acceptance[data-state='accepted'] { color: var(--accent); }
+.loom-badge-acceptance[data-state='rejected'] { color: var(--attention); }
+.loom-candidate-meta { margin-top: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.loom-candidate-review { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font-size: 11px; line-height: 1.7; }
+/* 390px 级移动端：标题与两枚徽章上下排，不靠右挤在窄屏里。 */
+@media(max-width:420px) { .loom-candidate-header { flex-direction: column; align-items: flex-start; gap: 6px; } }

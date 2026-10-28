@@ -1,5 +1,5 @@
 import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus } from '@contracts'
+import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview } from '@contracts'
 import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
@@ -79,9 +79,11 @@ function flowEdgePath(upstream: FlowPoint, downstream: FlowPoint): string {
 }
 
 /** 依赖图渲染：archify 流程视图。就绪判定走控制层契约，不在 UI 里另立规则。 */
-function LoomFlow({ tasks, dependencies, agents }: {
+function LoomFlow({ tasks, dependencies, candidates, reviews, agents }: {
   tasks: LoomTask[]
   dependencies: LoomDependency[]
+  candidates: LoomCandidate[]
+  reviews: LoomReview[]
   agents: AgentProfile[]
 }) {
   const t = useUiText()
@@ -89,9 +91,9 @@ function LoomFlow({ tasks, dependencies, agents }: {
   const statusLabels: Record<LoomTaskStatus, string> = {
     draft: '草稿', ready: '就绪', blocked: '阻塞', in_review: '评审中', done: '已完成', canceled: '已取消'
   }
-  // 尚无 Candidate/Review 读取路径，传空集合：artifact_accepted 边因此保持未释放，
-  // 不会被"上游 done"误判为已验收。
-  const graph = { tasks, dependencies, candidates: [], reviews: [], evaluatedAt: new Date(0).toISOString() }
+  // 候选与人工验收记录一律喂真实读取结果：artifact_accepted 边只认 verified + accepted + 同版本 Review，
+  // 不会被"上游 done"误判为已验收。evaluatedAt 固定为纪元，求值是纯规则，不给渲染引入会漂移的输入。
+  const graph = { tasks, dependencies, candidates, reviews, evaluatedAt: new Date(0).toISOString() }
   // 「可执行」= 依赖已释放 且 任务本身处于可领取状态；done/canceled/draft 不算可执行。
   const claimable = (task: LoomTask): boolean =>
     (task.status === 'ready' || task.status === 'in_review') && loomTaskReady(task.taskId, graph).ready
@@ -234,12 +236,14 @@ function LoomFlow({ tasks, dependencies, agents }: {
   </div>
 }
 
-function PlanWorkspace({ mission, agents, plan, tasks, dependencies, loading, error }: {
+function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates, reviews, loading, error }: {
   mission: MissionRecord
   agents: AgentProfile[]
   plan: LoomPlan | null
   tasks: LoomTask[]
   dependencies: LoomDependency[]
+  candidates: LoomCandidate[]
+  reviews: LoomReview[]
   loading?: boolean
   error?: string
 }) {
@@ -295,26 +299,49 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, loading, er
       <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
     </header>
     <p className="loom-intro">{t('把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。')}</p>
-    <LoomFlow tasks={tasks} dependencies={dependencies} agents={agents} />
+    <LoomFlow tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} agents={agents} />
   </div>
 }
 
-function DeliveryReview() {
+function DeliveryReview({ candidates, reviews }: { candidates: LoomCandidate[]; reviews: LoomReview[] }) {
   const t = useUiText()
+  // 枚举值是英文标识，不直接展示；data-state 仍保留原值，两个徽章各看各的状态，不合并。
+  const verificationLabel = (state: LoomCandidate['verificationStatus']): string =>
+    state === 'verified' ? t('已核验') : state === 'failed' ? t('核验失败') : t('未核验')
+  const acceptanceLabel = (state: LoomCandidate['acceptanceStatus']): string =>
+    state === 'accepted' ? t('已验收') : state === 'rejected' ? t('已驳回') : t('待验收')
+  // 新的返工版本在最前；createdAt 相同就保持后端顺序。
+  const ordered = [...candidates].sort((a, b) =>
+    a.createdAt === b.createdAt ? 0 : a.createdAt < b.createdAt ? 1 : -1)
   return <div className="loom-delivery-context">
     <header className="loom-section-heading">
       <div><span className="loom-eyebrow">LOOM · {t('交付')}</span><h2>{t('成果与验收')}</h2></div>
     </header>
-    <section className="loom-review-state" aria-label={uiAttribute('人工验收状态')}>
-      <span className="loom-review-mark" aria-hidden="true"/>
-      <div><strong>{t('独立验收尚未接入')}</strong><p>{t('执行结束或使命完成均不代表验收通过。接入可追溯的验收记录后，才能在这里接受或打回。')}</p></div>
-    </section>
-    <section className="loom-criteria">
-      <h3>{t('验收条件')}</h3>
-      <p>{t('尚未配置独立的验收条件。')}
-        <span>{t('后续由任务合同提供；当前使命描述仍可在对话中查看。')}</span>
-      </p>
-    </section>
+    {ordered.length === 0
+      ? <LoomEmpty title={t('尚无交付')}>
+          <p>{t('任务提交候选成果后，这里会出现待验收的产物。')}</p>
+        </LoomEmpty>
+      : ordered.map(candidate => {
+        const review = reviews.find(entry => entry.candidateId === candidate.candidateId)
+        return <div key={candidate.candidateId} className="loom-candidate">
+          <div className="loom-candidate-header">
+            <span className="loom-candidate-title">{t('候选')} {candidate.candidateId.slice(-6)}</span>
+            <span className="loom-badge loom-badge-verification" data-state={candidate.verificationStatus}>
+              {verificationLabel(candidate.verificationStatus)}
+            </span>
+            <span className="loom-badge loom-badge-acceptance" data-state={candidate.acceptanceStatus}>
+              {acceptanceLabel(candidate.acceptanceStatus)}
+            </span>
+          </div>
+          <div className="loom-candidate-meta">{candidate.contentHash} · {t('证据')} {candidate.evidenceIds.length} {t('条')}</div>
+          {review !== undefined && <div className="loom-candidate-review">
+            <div>{t('验收结论')}：{review.verdict === 'accepted' ? t('通过') : t('驳回')} · {review.reason}</div>
+            {review.criteriaResults.map(result => <div key={result.criterionId}>
+              {result.criterionId} · {result.satisfied ? t('满足') : t('未满足')}
+            </div>)}
+          </div>}
+        </div>
+      })}
   </div>
 }
 
@@ -331,6 +358,8 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
   const [plan, setPlan] = useState<LoomPlan | null>(null)
   const [tasks, setTasks] = useState<LoomTask[]>([])
   const [dependencies, setDependencies] = useState<LoomDependency[]>([])
+  const [candidates, setCandidates] = useState<LoomCandidate[]>([])
+  const [reviews, setReviews] = useState<LoomReview[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   
@@ -347,9 +376,11 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
     void Promise.all([
       client.request<LoomPlan | null>('loom.plan.get', { missionId: mission.missionId }),
       client.request<LoomTask[]>('loom.tasks.list', { missionId: mission.missionId }),
-      client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId })
-    ]).then(([p, t, d]) => {
-      if (alive) { setPlan(p); setTasks(t); setDependencies(d); setError('') }
+      client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId }),
+      client.request<LoomCandidate[]>('loom.candidates.list', { missionId: mission.missionId }),
+      client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId })
+    ]).then(([p, t, d, c, r]) => {
+      if (alive) { setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setError('') }
     }).catch(e => {
       if (alive) setError(e.message ?? '读取编排数据失败')
     }).finally(() => {
@@ -372,9 +403,9 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       </button>)}
     </nav>
     <div className="loom-section-body">
-      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} loading={loading} error={error}/></div>}
+      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} loading={loading} error={error}/></div>}
       <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
-        {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview/></div>}
+        {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews}/></div>}
         <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>
         <div hidden={section !== 'activity'}><MissionActivityPanel mission={mission} agents={agents} onSource={onSource}/></div>
       </div>

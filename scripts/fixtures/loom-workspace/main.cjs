@@ -150,24 +150,30 @@ app.whenReady().then(async () => {
   pressKey('Enter')
   await expectPressed(2, 'Enter did not activate the 交付 section')
   const review = await script(`({
-    heading: document.querySelector('.loom-review-state strong')?.innerText ?? null,
-    copy: document.querySelector('.loom-review-state p')?.innerText ?? '',
-    criteria: document.querySelector('.loom-criteria')?.innerText ?? '',
+    candidates: document.querySelectorAll('.loom-delivery-context .loom-candidate').length,
+    verificationBadges: [...document.querySelectorAll('.loom-badge-verification')].map(node => node.getAttribute('data-state')),
+    acceptanceBadges: [...document.querySelectorAll('.loom-badge-acceptance')].map(node => node.getAttribute('data-state')),
+    reviewedCandidates: document.querySelectorAll('.loom-candidate-review').length,
+    staleCriteria: document.querySelector('.loom-criteria') === null,
+    placeholder: document.querySelector('.loom-review-state') === null,
     controls: [...document.querySelectorAll('.loom-delivery-context button')].map(button => button.innerText),
     sharedDelivery: document.querySelector('.loom-workspace .mission-delivery-panel') === window.__loomNodes.delivery,
     sharedActivity: document.querySelector('.loom-workspace .mission-activity-panel') === window.__loomNodes.activity,
     evidenceRows: document.querySelectorAll('.loom-workspace .mission-evidence-row').length,
     wrapperClass: document.querySelector('.loom-section-body > div:last-child').className
   })`)
-  assert.equal(review.heading, '独立验收尚未接入', `Delivery section reported acceptance it does not have: ${JSON.stringify(review.heading)}`)
-  assert(review.copy.includes('不代表验收通过'), `Delivery section lost its honest acceptance copy: ${review.copy}`)
-  assert(review.criteria.includes('尚未配置独立的验收条件'), `Delivery criteria claimed configured criteria: ${review.criteria}`)
-  assert.deepEqual(review.controls, [], `Delivery section offered acceptance controls without a backend: ${JSON.stringify(review.controls)}`)
+  assert.equal(review.candidates, 2, `Delivery section must list every recorded candidate: ${JSON.stringify(review.candidates)}`)
+  assert.deepEqual(review.verificationBadges, ['verified', 'unverified'], `Verification axis is not read per candidate: ${JSON.stringify(review.verificationBadges)}`)
+  assert.deepEqual(review.acceptanceBadges, ['accepted', 'pending'], `Acceptance axis is not read per candidate: ${JSON.stringify(review.acceptanceBadges)}`)
+  assert.equal(review.reviewedCandidates, 1, `Only the reviewed candidate may show a verdict: ${JSON.stringify(review.reviewedCandidates)}`)
+  assert.equal(review.staleCriteria, true, 'Delivery section kept the placeholder criteria block after real criteria arrived')
+  assert.equal(review.placeholder, true, 'Delivery section still shows the old independent-acceptance placeholder')
+  assert.deepEqual(review.controls, [], `Delivery section offered acceptance controls without a write path: ${JSON.stringify(review.controls)}`)
   assert.equal(review.sharedDelivery, true, 'Delivery section remounted the shared delivery panel')
   assert.equal(review.sharedActivity, true, 'Delivery section remounted the activity panel')
   assert.ok(review.evidenceRows >= 4, `Shared delivery evidence rows disappeared: ${review.evidenceRows}`)
   assert.equal(review.wrapperClass, 'loom-delivery', `Delivery section reused the wrong container class: ${review.wrapperClass}`)
-  cases.push('交付 section states the independent acceptance gap with no accept/reject controls and keeps the shared delivery panel mounted')
+  cases.push('交付 section reads real candidates with two independent verdict badges, no controls, and keeps the shared delivery panel mounted')
 
   stage = 'plan section by keyboard Space'
   await script("document.querySelectorAll('.loom-section-tabs button')[1].focus()")
