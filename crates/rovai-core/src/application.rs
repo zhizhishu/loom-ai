@@ -9542,6 +9542,16 @@ impl Core {
                 let result = rovai_core::loom::claim_acquire(&mut database, input)?;
                 Ok(serde_json::to_value(result)?)
             }
+            // Candidate record is the submit-side write: it re-checks the claim fence and
+            // moves the Task READY → IN_REVIEW inside one transaction, so the lock covers
+            // the fence check and the transition together.
+            "loom.candidate.record" => {
+                let input: rovai_core::loom::LoomCandidateRecordInput =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let result = rovai_core::loom::candidate_record(&mut database, input)?;
+                Ok(serde_json::to_value(result)?)
+            }
             "loom.plan.get" | "loom.tasks.list" | "loom.dependencies.list" => {
                 let params: rovai_core::loom::MissionScopeInput =
                     serde_json::from_value(request.params.clone())?;

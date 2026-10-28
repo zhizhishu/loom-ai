@@ -4313,6 +4313,7 @@ export type CoreMethod =
   | 'loom.plan.import'
   | 'loom.task.release'
   | 'loom.claim.acquire'
+  | 'loom.candidate.record'
   | 'loom.tasks.list'
   | 'loom.dependencies.list'
   | 'automations.create'

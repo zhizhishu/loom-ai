@@ -7,6 +7,7 @@ const PLAN_TABLE: &str = "loom_plan";
 const TASK_TABLE: &str = "loom_task";
 const DEPENDENCY_TABLE: &str = "loom_dependency";
 const CLAIM_TABLE: &str = "loom_claim";
+const CANDIDATE_TABLE: &str = "loom_candidate";
 
 /// Task states follow the LOOM control-plane contract
 /// (DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED).
@@ -14,6 +15,10 @@ const TASK_STATUS: &str =
     "CHECK(status IN ('DRAFT','READY','BLOCKED','IN_REVIEW','DONE','CANCELED'))";
 /// Dependency release conditions come from the same contract.
 const DEPENDENCY_CONDITION: &str = "CHECK(condition IN ('TASK_DONE','ARTIFACT_ACCEPTED'))";
+/// A Candidate carries the two independent verdict axes of the contract: what the Run
+/// itself claims about its delivery, and what the Owner later accepted.
+const VERIFICATION_STATUS: &str = "CHECK(verification_status IN ('UNVERIFIED','VERIFIED','FAILED'))";
+const ACCEPTANCE_STATUS: &str = "CHECK(acceptance_status IN ('PENDING','ACCEPTED','REJECTED'))";
 
 fn create_sql() -> String {
     format!(
@@ -95,6 +100,72 @@ fn claim_sql() -> String {
     )
 }
 
+/// Migration 221: the versioned delivery candidate. A Candidate is written once and never
+/// rewritten, so the delivered content is immutable; `previous_candidate_id` chains rework
+/// versions on the same Task instead of overwriting an earlier verdict.
+fn candidate_sql() -> String {
+    format!(
+        r#"
+        CREATE TABLE {CANDIDATE_TABLE} (
+            candidate_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            agent_run_id TEXT NOT NULL,
+            command_id TEXT NOT NULL UNIQUE,
+            content_hash TEXT NOT NULL CHECK(length(content_hash) BETWEEN 1 AND 200),
+            evidence_ids_json TEXT NOT NULL
+                CHECK(json_valid(evidence_ids_json) AND json_type(evidence_ids_json)='array'),
+            acceptance_criteria_version TEXT NOT NULL
+                CHECK(length(acceptance_criteria_version) BETWEEN 1 AND 200),
+            previous_candidate_id TEXT
+                REFERENCES {CANDIDATE_TABLE}(candidate_id) ON DELETE CASCADE,
+            verification_status TEXT NOT NULL {VERIFICATION_STATUS},
+            acceptance_status TEXT NOT NULL {ACCEPTANCE_STATUS},
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(plan_id, task_id)
+                REFERENCES {TASK_TABLE}(plan_id, task_id) ON DELETE CASCADE
+        );
+        CREATE INDEX loom_candidate_plan_idx ON {CANDIDATE_TABLE}(plan_id, candidate_id);
+        CREATE INDEX loom_candidate_task_idx ON {CANDIDATE_TABLE}(task_id, created_at);
+        CREATE TRIGGER loom_candidate_immutable
+            BEFORE UPDATE OF candidate_id, plan_id, task_id, agent_run_id, command_id,
+                             content_hash, evidence_ids_json, acceptance_criteria_version,
+                             previous_candidate_id, created_at
+            ON {CANDIDATE_TABLE}
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM candidate is immutable'); END;
+        "#
+    )
+}
+
+/// The candidate projection is part of the LOOM schema from migration 221 on; earlier
+/// markers keep admitting databases that predate the delivery table.
+fn candidate_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('candidate_id','plan_id','task_id','agent_run_id','command_id','content_hash',
+              'evidence_ids_json','acceptance_criteria_version','previous_candidate_id',
+              'verification_status','acceptance_status','created_at')",
+        [CANDIDATE_TABLE],
+        |row| row.get(0),
+    )?;
+    let immutable_trigger: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger'
+             AND name='loom_candidate_immutable' AND tbl_name=?1
+             AND sql LIKE '%BEFORE UPDATE%')",
+        [CANDIDATE_TABLE],
+        |row| row.get(0),
+    )?;
+    let declared = table_sql(connection, CANDIDATE_TABLE)?.is_some_and(|sql| {
+        let sql = sql.split_whitespace().collect::<String>();
+        sql.contains(&VERIFICATION_STATUS.split_whitespace().collect::<String>())
+            && sql.contains(&ACCEPTANCE_STATUS.split_whitespace().collect::<String>())
+            && sql.contains("command_idTEXTNOTNULLUNIQUE")
+            && sql.contains("REFERENCESloom_task(plan_id,task_id)")
+            && sql.contains("REFERENCESloom_candidate(candidate_id)")
+    });
+    Ok(columns == 12 && immutable_trigger && declared)
+}
+
 /// The claim projection is part of the LOOM schema from migration 220 on; earlier
 /// markers keep admitting databases that predate the lease table.
 fn claim_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
@@ -143,6 +214,8 @@ pub(super) fn schema_matches(
     let plan_version_recorded =
         projection_schema_version < 169 || plan_holds_acceptance_criteria_version(connection)?;
     let claim_recorded = projection_schema_version < 170 || claim_schema_matches(connection)?;
+    let candidate_recorded =
+        projection_schema_version < 171 || candidate_schema_matches(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -167,7 +240,8 @@ pub(super) fn schema_matches(
                 "REFERENCES loom_task(plan_id, task_id)",
             ],
         )?
-        && claim_recorded)
+        && claim_recorded
+        && candidate_recorded)
 }
 
 /// Migration 219 hangs the acceptance criteria version on the Plan; Tasks inherit it.
@@ -287,13 +361,55 @@ pub(super) fn migrate_claim_lease(database: &mut Database) -> Result<()> {
         claim_schema_matches(&tx)?,
         "LOOM claim lease migration did not create the required table"
     );
+    // 170 is only Current while nothing newer exists; once migration 221 lands this
+    // receipt must stay admissible as a supported source instead of pinning Current.
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 170
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "LOOM claim lease schema admission failed");
+    tx.commit()?;
+    Ok(())
+}
+
+/// Migration 221: the delivery candidate a Run submits while it still holds the Task.
+/// The submit-side fence lives in `loom::candidate_record`; this step only declares the
+/// storage that keeps a recorded candidate immutable.
+pub(super) fn migrate_candidate(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
     anyhow::ensure!(
         matches!(
             classify_database_contract(&tx)?,
-            DatabaseContractClassification::Current(_)
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 170
         ),
-        "LOOM claim lease schema admission failed"
+        "LOOM candidate migration requires schema 170"
     );
+    tx.execute_batch(&candidate_sql())?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(221,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=171,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(&tx, &[CANDIDATE_TABLE])?;
+    anyhow::ensure!(
+        candidate_schema_matches(&tx)?,
+        "LOOM candidate migration did not create the required table"
+    );
+    // 171 is only Current while nothing newer exists; a later migration must leave this
+    // receipt admissible as a supported source instead of pinning Current.
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 171
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "LOOM candidate schema admission failed");
     tx.commit()?;
     Ok(())
 }
@@ -314,12 +430,13 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+            DROP TABLE IF EXISTS loom_candidate;
             DROP TABLE IF EXISTS loom_claim;
             DROP TABLE IF EXISTS loom_dependency;
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
-            DELETE FROM schema_migration WHERE version IN (218,219,220);
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
@@ -511,6 +628,28 @@ mod tests {
             170,
             "assertion contract_marker_advances_to_170"
         );
+        // Migration 221 adds the delivery candidate and advances the marker to 171, so the
+        // claim receipt of 220 has to stay an admitted source instead of pinning Current.
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 170
+        ));
+        migrate_candidate(&mut database).unwrap();
+        assert!(
+            candidate_schema_matches(database.connection()).unwrap(),
+            "assertion schema_171_creates_the_loom_candidate_projection"
+        );
+        assert_eq!(
+            migration_receipts(&database, 221),
+            1,
+            "assertion schema_migration_records_221_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            171,
+            "assertion contract_marker_advances_to_171"
+        );
         assert!(matches!(
             classify_database_contract(database.connection()).unwrap(),
             DatabaseContractClassification::Current(_)
@@ -575,6 +714,111 @@ mod tests {
                 .len(),
             1,
             "assertion loom_dependency_reads_back_the_edge"
+        );
+    }
+
+    /// The candidate table's own guards: both verdict axes are closed sets, a candidate can
+    /// only point at a Task of its own Plan, and a recorded delivery can never be rewritten.
+    #[test]
+    fn candidate_schema_guards_close_verdict_sets_and_freeze_recorded_deliveries() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let mission_id = create_mission(&mut database, &directory, "LOOM candidate guards");
+        let imported = plan_import(
+            &mut database,
+            LoomPlanImportInput {
+                mission_id: mission_id.clone(),
+                goal: "Guard the delivery candidate".into(),
+                acceptance_criteria_version: "ac-v1".into(),
+                criteria: vec![LoomPlanImportCriterion {
+                    criterion_id: "criterion_one".into(),
+                    text: "one".into(),
+                }],
+                tasks: vec![LoomPlanImportTask {
+                    task_id: "task_a".into(),
+                    title: "Task A".into(),
+                    description: String::new(),
+                    assignee_agent_id: None,
+                }],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+        let insert = |candidate_id: &str, task_id: &str, verification: &str, acceptance: &str| {
+            database.connection().execute(
+                "INSERT INTO loom_candidate(candidate_id,plan_id,task_id,agent_run_id,command_id,
+                                            content_hash,evidence_ids_json,acceptance_criteria_version,
+                                            previous_candidate_id,verification_status,acceptance_status,created_at)
+                 VALUES(?1,?2,?3,'run_one',?4,'sha256:guard','[]','ac-v1',NULL,?5,?6,'2026-01-01T00:00:00Z')",
+                rusqlite::params![
+                    candidate_id,
+                    &imported.plan_id,
+                    task_id,
+                    format!("command_{candidate_id}"),
+                    verification,
+                    acceptance,
+                ],
+            )
+        };
+
+        assert_eq!(
+            insert("candidate_ok", "task_a", "VERIFIED", "PENDING").unwrap(),
+            1,
+            "assertion closed_verdicts_stay_writable"
+        );
+        assert!(
+            insert("candidate_bad_verification", "task_a", "MAYBE", "PENDING").is_err(),
+            "assertion verification_status_is_a_closed_set"
+        );
+        assert!(
+            insert("candidate_bad_acceptance", "task_a", "UNVERIFIED", "MAYBE").is_err(),
+            "assertion acceptance_status_is_a_closed_set"
+        );
+        assert!(
+            insert("candidate_orphan", "task_missing", "UNVERIFIED", "PENDING").is_err(),
+            "assertion a_candidate_cannot_reference_a_task_outside_its_plan"
+        );
+
+        let tampered = database.connection().execute(
+            "UPDATE loom_candidate SET content_hash='sha256:tampered' WHERE candidate_id='candidate_ok'",
+            [],
+        );
+        assert!(
+            tampered.is_err(),
+            "assertion a_recorded_delivery_cannot_be_rewritten"
+        );
+        let stored: String = database
+            .connection()
+            .query_row(
+                "SELECT content_hash FROM loom_candidate WHERE candidate_id='candidate_ok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, "sha256:guard",
+            "assertion the_frozen_delivery_keeps_its_content_hash"
+        );
+
+        // Only the delivered content is frozen: the verdict columns belong to Review.
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_candidate SET acceptance_status='ACCEPTED' WHERE candidate_id='candidate_ok'",
+                [],
+            )
+            .unwrap();
+        let verdict: String = database
+            .connection()
+            .query_row(
+                "SELECT acceptance_status FROM loom_candidate WHERE candidate_id='candidate_ok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            verdict, "ACCEPTED",
+            "assertion the_acceptance_axis_stays_writable_for_review"
         );
     }
 }

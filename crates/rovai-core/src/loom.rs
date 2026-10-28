@@ -1,6 +1,7 @@
 //! LOOM orchestration. Plans, tasks and dependency edges are read-only facts for one
 //! Mission; every query is scoped by `missionId`. The write paths are [`plan_import`],
-//! [`task_release`] and [`claim_acquire`], each one Mission, one transaction.
+//! [`task_release`], [`claim_acquire`] and [`candidate_record`], each one Mission, one
+//! transaction.
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
@@ -479,6 +480,13 @@ const LOOM_TASK_NOT_READY: &str = "LOOM_TASK_NOT_READY";
 const LOOM_DEPENDENCY_UNRELEASED: &str = "LOOM_DEPENDENCY_UNRELEASED";
 const LOOM_CLAIM_HELD: &str = "LOOM_CLAIM_HELD";
 const LOOM_CLAIM_COMMAND_REUSED: &str = "LOOM_CLAIM_COMMAND_REUSED";
+const LOOM_CLAIM_ABSENT: &str = "LOOM_CLAIM_ABSENT";
+const LOOM_CLAIM_EXPIRED: &str = "LOOM_CLAIM_EXPIRED";
+const LOOM_CLAIM_AGENT_RUN_MISMATCH: &str = "LOOM_CLAIM_AGENT_RUN_MISMATCH";
+const LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH: &str =
+    "LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH";
+const LOOM_CANDIDATE_COMMAND_REUSED: &str = "LOOM_CANDIDATE_COMMAND_REUSED";
+const LOOM_CANDIDATE_PREVIOUS_INVALID: &str = "LOOM_CANDIDATE_PREVIOUS_INVALID";
 
 /// Rejection of a LOOM task release or claim; `code` is the stable error code the Host
 /// returns, exactly like [`LoomPlanImportError`].
@@ -1241,6 +1249,391 @@ pub fn claim_acquire(
         claimed_at,
         lease_expires_at,
         released_at: None,
+        replayed: false,
+    })
+}
+
+/// What the producing side claims about its own delivery. The persisted literals stay
+/// uppercase; the wire shape is the contract's lowercase one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoomVerificationStatus {
+    Unverified,
+    Verified,
+    Failed,
+}
+
+impl LoomVerificationStatus {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "UNVERIFIED" => Ok(Self::Unverified),
+            "VERIFIED" => Ok(Self::Verified),
+            "FAILED" => Ok(Self::Failed),
+            other => anyhow::bail!("LOOM candidate has an unknown verification status {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unverified => "UNVERIFIED",
+            Self::Verified => "VERIFIED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// What the Owner later decided about the delivery. Independent of the verification axis,
+/// so a candidate can be VERIFIED and still PENDING acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoomAcceptanceStatus {
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+impl LoomAcceptanceStatus {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "PENDING" => Ok(Self::Pending),
+            "ACCEPTED" => Ok(Self::Accepted),
+            "REJECTED" => Ok(Self::Rejected),
+            other => anyhow::bail!("LOOM candidate has an unknown acceptance status {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Accepted => "ACCEPTED",
+            Self::Rejected => "REJECTED",
+        }
+    }
+}
+
+/// Candidate input: the delivery one Run submits for the Task it still holds. `commandId`
+/// is the idempotency key, and `agentRunId` is the fence the Run presents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomCandidateRecordInput {
+    pub mission_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    pub command_id: String,
+    pub content_hash: String,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    pub acceptance_criteria_version: String,
+    #[serde(default)]
+    pub previous_candidate_id: Option<String>,
+}
+
+/// Candidate receipt: the immutable row a submission created, plus the replay flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomCandidateRecordResult {
+    pub candidate_id: String,
+    pub mission_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    pub content_hash: String,
+    pub evidence_ids: Vec<String>,
+    pub acceptance_criteria_version: String,
+    pub previous_candidate_id: Option<String>,
+    pub verification_status: LoomVerificationStatus,
+    pub acceptance_status: LoomAcceptanceStatus,
+    pub created_at: String,
+    /// True when the same `commandId` replayed and no new candidate was written.
+    pub replayed: bool,
+}
+
+/// One persisted candidate; the row is read back whole because it is never rewritten.
+struct StoredCandidate {
+    candidate_id: String,
+    plan_id: String,
+    task_id: String,
+    agent_run_id: String,
+    content_hash: String,
+    evidence_ids_json: String,
+    acceptance_criteria_version: String,
+    previous_candidate_id: Option<String>,
+    verification_status: String,
+    acceptance_status: String,
+    created_at: String,
+}
+
+impl StoredCandidate {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            candidate_id: row.get(0)?,
+            plan_id: row.get(1)?,
+            task_id: row.get(2)?,
+            agent_run_id: row.get(3)?,
+            content_hash: row.get(4)?,
+            evidence_ids_json: row.get(5)?,
+            acceptance_criteria_version: row.get(6)?,
+            previous_candidate_id: row.get(7)?,
+            verification_status: row.get(8)?,
+            acceptance_status: row.get(9)?,
+            created_at: row.get(10)?,
+        })
+    }
+
+    fn into_result(self, mission_id: &str, replayed: bool) -> Result<LoomCandidateRecordResult> {
+        Ok(LoomCandidateRecordResult {
+            candidate_id: self.candidate_id,
+            mission_id: mission_id.to_string(),
+            plan_id: self.plan_id,
+            task_id: self.task_id,
+            agent_run_id: self.agent_run_id,
+            content_hash: self.content_hash,
+            evidence_ids: serde_json::from_str(&self.evidence_ids_json).with_context(|| {
+                format!(
+                    "candidate {} evidenceIds are not a list of references",
+                    self.candidate_id
+                )
+            })?,
+            acceptance_criteria_version: self.acceptance_criteria_version,
+            previous_candidate_id: self.previous_candidate_id,
+            verification_status: LoomVerificationStatus::parse(&self.verification_status)?,
+            acceptance_status: LoomAcceptanceStatus::parse(&self.acceptance_status)?,
+            created_at: self.created_at,
+            replayed,
+        })
+    }
+}
+
+/// The live claim a submitting Run must hold: the fence is the Run identity plus an
+/// unexpired lease, never a task state alone.
+struct LiveClaim {
+    claim_id: String,
+    agent_run_id: String,
+    lease_expires_at: String,
+}
+
+/// LOOM candidate path: a Run submits the delivery for the Task it holds, and the Task
+/// moves `READY` → `IN_REVIEW`. The Run must still hold a live claim whose `agentRunId`
+/// matches the submission (the submit-side fence), the acceptance criteria version must be
+/// the Plan's own, and everything is checked and written in one immediate transaction so a
+/// rejected submission leaves neither a candidate nor a moved Task behind.
+pub fn candidate_record(
+    database: &mut Database,
+    input: LoomCandidateRecordInput,
+) -> Result<LoomCandidateRecordResult> {
+    let mission_id = required_field("candidate record", "missionId", &input.mission_id)?;
+    let task_id = required_field("candidate record", "taskId", &input.task_id)?;
+    let agent_run_id = required_field("candidate record", "agentRunId", &input.agent_run_id)?;
+    let command_id = required_field("candidate record", "commandId", &input.command_id)?;
+    let content_hash = required_field("candidate record", "contentHash", &input.content_hash)?;
+    let acceptance_criteria_version = required_field(
+        "candidate record",
+        "acceptanceCriteriaVersion",
+        &input.acceptance_criteria_version,
+    )?;
+    let mut evidence_ids = Vec::with_capacity(input.evidence_ids.len());
+    for evidence_id in &input.evidence_ids {
+        let evidence_id = evidence_id.trim();
+        if evidence_id.is_empty() {
+            return Err(LoomCommandError::rejection(
+                LOOM_INVALID_INPUT,
+                "every candidate evidenceId must be a non-empty reference",
+            ));
+        }
+        evidence_ids.push(evidence_id.to_string());
+    }
+    let evidence_ids_json = serde_json::to_string(&evidence_ids)?;
+    let previous_candidate_id = input
+        .previous_candidate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|candidate_id| !candidate_id.is_empty())
+        .map(str::to_string);
+    let now = chrono::Utc::now();
+    let created_at = now.to_rfc3339();
+
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mission_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mission WHERE id=?1)",
+        [&mission_id],
+        |row| row.get(0),
+    )?;
+    if !mission_exists {
+        return Err(LoomCommandError::rejection(
+            LOOM_MISSION_NOT_FOUND,
+            format!("mission {mission_id} does not exist"),
+        ));
+    }
+    let plan: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT plan_id, acceptance_criteria_version FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((plan_id, plan_criteria_version)) = plan else {
+        return Err(LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} has no LOOM plan"),
+        ));
+    };
+    let status: Option<String> = transaction
+        .query_row(
+            "SELECT status FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![&plan_id, &task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(status) = status else {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_FOUND,
+            format!("task {task_id} does not belong to the plan of mission {mission_id}"),
+        ));
+    };
+
+    // A replay returns the candidate the command already recorded; it must not depend on
+    // the Task state the first submission moved, and only the same Task and Run may replay.
+    let replay: Option<StoredCandidate> = transaction
+        .query_row(
+            "SELECT candidate_id, plan_id, task_id, agent_run_id, content_hash,
+                    evidence_ids_json, acceptance_criteria_version, previous_candidate_id,
+                    verification_status, acceptance_status, created_at
+             FROM loom_candidate WHERE command_id=?1",
+            [&command_id],
+            StoredCandidate::read,
+        )
+        .optional()?;
+    if let Some(candidate) = replay {
+        if candidate.task_id != task_id || candidate.agent_run_id != agent_run_id {
+            return Err(LoomCommandError::rejection(
+                LOOM_CANDIDATE_COMMAND_REUSED,
+                format!(
+                    "commandId {command_id} already recorded candidate {} for task {} held by agentRun {}",
+                    candidate.candidate_id, candidate.task_id, candidate.agent_run_id
+                ),
+            ));
+        }
+        return candidate.into_result(&mission_id, true);
+    }
+
+    // A verdict binds to a frozen snapshot, so the submission must name the Plan's version.
+    if plan_criteria_version != acceptance_criteria_version {
+        return Err(LoomCommandError::rejection(
+            LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH,
+            format!(
+                "plan {plan_id} is pinned to acceptance criteria version {plan_criteria_version}, not {acceptance_criteria_version}"
+            ),
+        ));
+    }
+    if let Some(previous_candidate_id) = &previous_candidate_id {
+        let owner: Option<String> = transaction
+            .query_row(
+                "SELECT task_id FROM loom_candidate WHERE candidate_id=?1",
+                [previous_candidate_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner.as_deref() != Some(task_id.as_str()) {
+            return Err(LoomCommandError::rejection(
+                LOOM_CANDIDATE_PREVIOUS_INVALID,
+                format!(
+                    "previousCandidateId {previous_candidate_id} is not an earlier candidate of task {task_id}"
+                ),
+            ));
+        }
+    }
+
+    // Submit-side fence: the Task must still be held by this very Run on a live lease.
+    let claim: Option<LiveClaim> = transaction
+        .query_row(
+            "SELECT claim_id, agent_run_id, lease_expires_at FROM loom_claim
+             WHERE plan_id=?1 AND task_id=?2 AND released_at IS NULL",
+            params![&plan_id, &task_id],
+            |row| {
+                Ok(LiveClaim {
+                    claim_id: row.get(0)?,
+                    agent_run_id: row.get(1)?,
+                    lease_expires_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(claim) = claim else {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!("task {task_id} carries no unreleased claim to submit under"),
+        ));
+    };
+    if lease_expired(&claim.lease_expires_at, now) {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_EXPIRED,
+            format!(
+                "claim {} on task {task_id} expired at {}",
+                claim.claim_id, claim.lease_expires_at
+            ),
+        ));
+    }
+    if claim.agent_run_id != agent_run_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_AGENT_RUN_MISMATCH,
+            format!(
+                "task {task_id} is held by claim {} for agentRun {}, not {agent_run_id}",
+                claim.claim_id, claim.agent_run_id
+            ),
+        ));
+    }
+    // Only a READY Task can receive its first delivery; `IN_REVIEW` already has one.
+    if status != "READY" {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_READY,
+            format!("LOOM task {task_id} is {status} and cannot submit a candidate"),
+        ));
+    }
+
+    let candidate_id = format!("candidate_{}", uuid::Uuid::new_v4().simple());
+    transaction.execute(
+        "INSERT INTO loom_candidate(candidate_id,plan_id,task_id,agent_run_id,command_id,
+                                   content_hash,evidence_ids_json,acceptance_criteria_version,
+                                   previous_candidate_id,verification_status,acceptance_status,
+                                   created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![
+            &candidate_id,
+            &plan_id,
+            &task_id,
+            &agent_run_id,
+            &command_id,
+            &content_hash,
+            &evidence_ids_json,
+            &acceptance_criteria_version,
+            previous_candidate_id.as_deref(),
+            LoomVerificationStatus::Unverified.as_str(),
+            LoomAcceptanceStatus::Pending.as_str(),
+            &created_at,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE loom_task SET status='IN_REVIEW', updated_at=?1, revision=revision+1
+         WHERE plan_id=?2 AND task_id=?3",
+        params![&created_at, &plan_id, &task_id],
+    )?;
+    transaction.commit()?;
+
+    Ok(LoomCandidateRecordResult {
+        candidate_id,
+        mission_id,
+        plan_id,
+        task_id,
+        agent_run_id,
+        content_hash,
+        evidence_ids,
+        acceptance_criteria_version,
+        previous_candidate_id,
+        verification_status: LoomVerificationStatus::Unverified,
+        acceptance_status: LoomAcceptanceStatus::Pending,
+        created_at,
         replayed: false,
     })
 }
@@ -2394,6 +2787,508 @@ mod tests {
             claim_rows(&database),
             2,
             "assertion retry_writes_the_takeover_claim"
+        );
+    }
+
+    fn candidate_input(
+        mission_id: &str,
+        task_id: &str,
+        agent_run_id: &str,
+        command_id: &str,
+    ) -> LoomCandidateRecordInput {
+        LoomCandidateRecordInput {
+            mission_id: mission_id.into(),
+            task_id: task_id.into(),
+            agent_run_id: agent_run_id.into(),
+            command_id: command_id.into(),
+            content_hash: "sha256:candidate".into(),
+            evidence_ids: vec!["evidence_one".into(), "evidence_two".into()],
+            acceptance_criteria_version: "ac-v1".into(),
+            previous_candidate_id: None,
+        }
+    }
+
+    fn candidate_rows(database: &Database) -> i64 {
+        database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_candidate", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn task_revision(database: &Database, task_id: &str) -> i64 {
+        database
+            .connection()
+            .query_row(
+                "SELECT revision FROM loom_task WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A released, claimed task: the only state a delivery may be submitted from.
+    fn held_task(
+        database: &mut OwnedTestDatabase,
+        mission_id: &str,
+        task_id: &str,
+        agent_run_id: &str,
+        command_id: &str,
+    ) -> LoomClaimAcquireResult {
+        plan_import(database, plan_input(mission_id)).unwrap();
+        task_release(database, release_input(mission_id, task_id)).unwrap();
+        claim_acquire(
+            database,
+            claim_input(mission_id, task_id, agent_run_id, command_id),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn candidate_record_submits_a_held_task_and_advances_it_to_in_review() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate submit");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        let plan_id: String = database
+            .connection()
+            .query_row(
+                "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+                [&mission_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+
+        let recorded = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded.mission_id, mission_id,
+            "assertion candidate_result_echoes_mission_id"
+        );
+        assert_eq!(
+            recorded.plan_id, plan_id,
+            "assertion candidate_result_names_the_plan"
+        );
+        assert_eq!(
+            recorded.agent_run_id, "run_one",
+            "assertion candidate_result_keeps_the_fenced_run"
+        );
+        assert_eq!(
+            recorded.content_hash, "sha256:candidate",
+            "assertion candidate_result_echoes_content_hash"
+        );
+        assert_eq!(
+            recorded.evidence_ids,
+            vec!["evidence_one".to_string(), "evidence_two".to_string()],
+            "assertion candidate_result_keeps_evidence_order"
+        );
+        assert_eq!(
+            recorded.verification_status,
+            LoomVerificationStatus::Unverified,
+            "assertion submitted_candidate_is_unverified"
+        );
+        assert_eq!(
+            recorded.acceptance_status,
+            LoomAcceptanceStatus::Pending,
+            "assertion submitted_candidate_is_pending_acceptance"
+        );
+        assert!(
+            !recorded.replayed,
+            "assertion first_submission_is_not_a_replay"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "IN_REVIEW",
+            "assertion submission_advances_the_task_to_in_review"
+        );
+        assert_eq!(
+            task_revision(&database, "task_a"),
+            3,
+            "assertion submission_bumps_the_task_revision"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            1,
+            "assertion submission_writes_exactly_one_candidate"
+        );
+        let stored: (String, String, String) = database
+            .connection()
+            .query_row(
+                "SELECT evidence_ids_json, verification_status, acceptance_status
+                 FROM loom_candidate WHERE candidate_id=?1",
+                [&recorded.candidate_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                r#"["evidence_one","evidence_two"]"#.to_string(),
+                "UNVERIFIED".to_string(),
+                "PENDING".to_string()
+            ),
+            "assertion candidate_row_stores_evidence_as_a_json_array_and_both_verdicts"
+        );
+        assert_eq!(
+            task_status(&database, "task_b"),
+            "DRAFT",
+            "assertion submission_leaves_the_other_task_alone"
+        );
+    }
+
+    #[test]
+    fn candidate_record_is_rejected_once_the_lease_expired() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate lease loss");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        expire_lease(&database, &claim.claim_id);
+
+        let error = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_EXPIRED,
+            "assertion an_expired_lease_cannot_submit_a_candidate"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            0,
+            "assertion rejected_submission_writes_no_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion rejected_submission_keeps_the_task_ready"
+        );
+        assert_eq!(
+            task_revision(&database, "task_a"),
+            2,
+            "assertion rejected_submission_does_not_bump_the_task_revision"
+        );
+    }
+
+    #[test]
+    fn candidate_record_is_rejected_when_another_run_holds_the_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate fence");
+        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+
+        let error = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_AGENT_RUN_MISMATCH,
+            "assertion a_run_that_does_not_hold_the_claim_cannot_submit"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            0,
+            "assertion fenced_out_submission_writes_no_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion fenced_out_submission_keeps_the_task_ready"
+        );
+    }
+
+    #[test]
+    fn candidate_record_is_rejected_without_an_unreleased_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate no claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let unclaimed = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&unclaimed),
+            LOOM_CLAIM_ABSENT,
+            "assertion an_unclaimed_task_cannot_submit"
+        );
+
+        // A claim that was already given up is not a licence either: only an unreleased
+        // lease with a live expiry may submit.
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at='2000-01-01T00:00:00+00:00' WHERE claim_id=?1",
+                [&claim.claim_id],
+            )
+            .unwrap();
+        let released = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&released),
+            LOOM_CLAIM_ABSENT,
+            "assertion a_released_claim_cannot_submit"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            0,
+            "assertion claimless_submissions_write_no_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion claimless_submissions_keep_the_task_ready"
+        );
+    }
+
+    #[test]
+    fn candidate_record_is_rejected_when_the_criteria_version_differs() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate criteria");
+        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+
+        let mut input = candidate_input(&mission_id, "task_a", "run_one", "command_two");
+        input.acceptance_criteria_version = "ac-v2".into();
+        let error = candidate_record(&mut database, input).unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH,
+            "assertion a_candidate_must_name_the_plans_criteria_version"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            0,
+            "assertion version_mismatch_writes_no_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion version_mismatch_keeps_the_task_ready"
+        );
+    }
+
+    #[test]
+    fn candidate_record_rejects_a_previous_candidate_of_another_task() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate chain");
+        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let first = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+
+        let mut input = candidate_input(&mission_id, "task_b", "run_two", "command_three");
+        input.previous_candidate_id = Some(first.candidate_id.clone());
+        let error = candidate_record(&mut database, input).unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CANDIDATE_PREVIOUS_INVALID,
+            "assertion a_previous_candidate_must_belong_to_the_same_task"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            1,
+            "assertion rejected_chain_writes_no_candidate"
+        );
+    }
+
+    #[test]
+    fn replayed_candidate_command_returns_the_original_candidate() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate replay");
+        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+
+        let first = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+        let replay = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            replay.candidate_id, first.candidate_id,
+            "assertion replay_returns_the_original_candidate_id"
+        );
+        assert!(
+            replay.replayed,
+            "assertion replay_reports_that_it_replayed"
+        );
+        assert_eq!(
+            replay.content_hash, first.content_hash,
+            "assertion replay_does_not_rewrite_the_delivered_content"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            1,
+            "assertion replay_writes_no_second_candidate"
+        );
+        assert_eq!(
+            task_revision(&database, "task_a"),
+            3,
+            "assertion replay_does_not_bump_the_task_revision"
+        );
+
+        let reused = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_b", "run_one", "command_two"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&reused),
+            LOOM_CANDIDATE_COMMAND_REUSED,
+            "assertion a_candidate_command_id_cannot_be_reused_for_another_task"
+        );
+
+        // The task is already IN_REVIEW, so a fresh command cannot submit a second delivery.
+        let twice = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_three"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&twice),
+            LOOM_TASK_NOT_READY,
+            "assertion a_task_in_review_cannot_take_a_second_delivery"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            1,
+            "assertion the_second_delivery_is_refused"
+        );
+    }
+
+    #[test]
+    fn failed_task_transition_rolls_back_the_candidate() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate rollback");
+        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        database
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_task_update BEFORE UPDATE ON loom_task
+                 BEGIN SELECT RAISE(ABORT, 'loom task update rejected'); END;",
+            )
+            .unwrap();
+
+        let error = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("loom task update rejected"),
+            "unexpected candidate failure: {error:#}"
+        );
+        database
+            .connection()
+            .execute_batch("DROP TRIGGER reject_task_update")
+            .unwrap();
+
+        assert_eq!(
+            candidate_rows(&database),
+            0,
+            "assertion failed_transition_leaves_no_orphan_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion failed_transition_keeps_the_task_ready"
+        );
+
+        // The same command commits as one unit once the fault is gone.
+        let retried = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "IN_REVIEW",
+            "assertion retry_after_the_rolled_back_failure_submits"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            1,
+            "assertion retry_writes_one_candidate"
+        );
+        assert!(!retried.replayed, "assertion retry_is_a_fresh_submission");
+    }
+
+    #[test]
+    fn recorded_candidate_content_cannot_be_rewritten() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate immutable");
+        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let recorded = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+
+        let tampered = database.connection().execute(
+            "UPDATE loom_candidate SET content_hash='sha256:tampered' WHERE candidate_id=?1",
+            [&recorded.candidate_id],
+        );
+        assert!(
+            tampered.is_err(),
+            "assertion a_recorded_candidate_content_is_immutable"
+        );
+        let stored: String = database
+            .connection()
+            .query_row(
+                "SELECT content_hash FROM loom_candidate WHERE candidate_id=?1",
+                [&recorded.candidate_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, "sha256:candidate",
+            "assertion the_immutable_guard_keeps_the_original_content_hash"
+        );
+
+        // Only the delivered content is frozen; the two verdict axes stay writable for the
+        // Review slice that owns them.
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_candidate SET acceptance_status='ACCEPTED' WHERE candidate_id=?1",
+                [&recorded.candidate_id],
+            )
+            .unwrap();
+        let replay = candidate_record(
+            &mut database,
+            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+        assert!(replay.replayed, "assertion replay_reports_that_it_replayed");
+        assert_eq!(
+            replay.acceptance_status,
+            LoomAcceptanceStatus::Accepted,
+            "assertion replay_reads_the_stored_verdict_instead_of_rewriting_it"
         );
     }
 }

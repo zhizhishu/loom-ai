@@ -501,7 +501,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 170;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 171;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -996,6 +996,7 @@ struct CurrentMigrationState {
     v218: bool,
     v219: bool,
     v220: bool,
+    v221: bool,
 }
 
 impl CurrentMigrationState {
@@ -1017,6 +1018,14 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v221 {
+            let mut previous = *self;
+            previous.v221 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 171
+                && self.v220
+                && previous.admits("v1.72", 170, classifier);
+        }
         if self.v220 {
             let mut previous = *self;
             previous.v220 = false;
@@ -3779,6 +3788,7 @@ pub(crate) fn classify_database_contract(
                 | 168
                 | 169
                 | 170
+                | 171
         )
     {
         let expected_migration = marker.projection_schema_version + 50;
@@ -6108,7 +6118,8 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=217),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=218),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=219),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=220)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=220),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=221)
         "#,
         [],
         |row| {
@@ -6264,6 +6275,7 @@ fn load_current_migration_state(
                 v218: row.get(148)?,
                 v219: row.get(149)?,
                 v220: row.get(150)?,
+                v221: row.get(151)?,
             })
         },
     )
@@ -9586,6 +9598,9 @@ impl Database {
             if !self.schema_migration_applied(220)? {
                 migration_step!("migration_220", loom::migrate_claim_lease(self));
             }
+            if !self.schema_migration_applied(221)? {
+                migration_step!("migration_221", loom::migrate_candidate(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10473,6 +10488,9 @@ impl Database {
         }
         if !self.schema_migration_applied(220)? {
             migration_step!("migration_220", loom::migrate_claim_lease(self));
+        }
+        if !self.schema_migration_applied(221)? {
+            migration_step!("migration_221", loom::migrate_candidate(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42289,6 +42307,7 @@ mod tests {
             v218: version >= 218,
             v219: version >= 219,
             v220: version >= 220,
+            v221: version >= 221,
         }
     }
 
@@ -42543,10 +42562,16 @@ mod tests {
                 219,
             ),
             (
+                "v1.72/schema 170 before LOOM candidate delivery",
+                "v1.72",
+                170,
+                220,
+            ),
+            (
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                220,
+                221,
             ),
             (
                 "v1.72/schema 152 before compact operations",
@@ -43122,7 +43147,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(220);
+        let current = migration_state_through(221);
         assert!(current.admits(
             CURRENT_DATA_CONTRACT_VERSION,
             CURRENT_PROJECTION_SCHEMA_VERSION,
@@ -43197,6 +43222,8 @@ mod tests {
         missing_hermes_rules.v217 = false;
         let mut missing_loom = current;
         missing_loom.v218 = false;
+        let mut missing_loom_candidate = current;
+        missing_loom_candidate.v221 = false;
         let mut missing_interruption = current;
         missing_interruption.v209 = false;
         let mut missing_single_chat_facts = current;
@@ -43226,6 +43253,13 @@ mod tests {
             (
                 "current marker without LOOM orchestration projection",
                 missing_loom,
+                CURRENT_DATA_CONTRACT_VERSION,
+                CURRENT_PROJECTION_SCHEMA_VERSION,
+                V147_CLASSIFIER_VERSION,
+            ),
+            (
+                "current marker without LOOM candidate delivery",
+                missing_loom_candidate,
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
                 V147_CLASSIFIER_VERSION,
@@ -43872,7 +43906,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(220));
+        assert_eq!(state, migration_state_through(221));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
@@ -43899,6 +43933,7 @@ mod tests {
             "automation_naming",
             "loom",
             "loom_claim",
+            "loom_candidate",
         ] {
             connection
                 .execute_batch("SAVEPOINT current_admission")
@@ -43936,7 +43971,7 @@ mod tests {
                 }
                 "current_receipt" => {
                     connection
-                        .execute("DELETE FROM schema_migration WHERE version=220", [])
+                        .execute("DELETE FROM schema_migration WHERE version=221", [])
                         .unwrap();
                 }
                 "steer_identity" => {
@@ -43994,6 +44029,11 @@ mod tests {
                         .execute_batch("DROP TABLE loom_claim")
                         .unwrap();
                 }
+                "loom_candidate" => {
+                    connection
+                        .execute_batch("DROP TABLE loom_candidate")
+                        .unwrap();
+                }
                 _ => unreachable!(),
             }
             assert_eq!(
@@ -44013,6 +44053,7 @@ mod tests {
                         | "automation_naming"
                         | "loom"
                         | "loom_claim"
+                        | "loom_candidate"
                 ),
                 "{change}"
             );
@@ -44041,7 +44082,7 @@ mod tests {
         database
             .connection()
             .execute_batch(
-                "DELETE FROM schema_migration WHERE version<220;
+                "DELETE FROM schema_migration WHERE version<221;
              DROP TABLE runtime_usage_run_summary;",
             )
             .unwrap();
@@ -56460,6 +56501,7 @@ mod tests {
                 "loom_task",
                 "loom_dependency",
                 "loom_claim",
+                "loom_candidate",
             ],
             true,
         );
@@ -56469,7 +56511,7 @@ mod tests {
             &[
                 58, 59, 60, 61, 62, 67, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101,
                 102, 103, 104, 105, 106, 107, 108, 145, 146, 147, 205, 206, 207, 208, 209, 210,
-                211, 212, 213, 214, 215, 216, 217, 218, 219, 220,
+                211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221,
             ],
         );
         for table in [
