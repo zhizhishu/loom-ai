@@ -1884,17 +1884,21 @@ pub fn claims_list(database: &Database, mission_id: &str) -> Result<LoomClaimsLi
                 claimed_at,
                 lease_expires_at,
                 released_at,
-            )| LoomClaim {
-                claim_id,
-                task_id,
-                agent_run_id,
-                claimant_agent_id,
-                fence_generation,
-                claimed_at,
-                lease_expires_at,
-                // A released claim is a conclusion, so it is never also reported as expired.
-                expired: released_at.is_none() && lease_expired(&lease_expires_at, now),
-                released_at,
+            )| {
+                // Judged before the fields move into the projection: a released claim is a
+                // conclusion, so it is never also reported as expired.
+                let expired = released_at.is_none() && lease_expired(&lease_expires_at, now);
+                LoomClaim {
+                    claim_id,
+                    task_id,
+                    agent_run_id,
+                    claimant_agent_id,
+                    fence_generation,
+                    claimed_at,
+                    lease_expires_at,
+                    released_at,
+                    expired,
+                }
             },
         )
         .collect();
