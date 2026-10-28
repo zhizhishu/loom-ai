@@ -10,7 +10,7 @@ import { createInterface } from 'node:readline'
 // plan-import seam already owns stays untouched.
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import {
@@ -291,6 +291,8 @@ function startCore(dataDir, skillRoot, mcpPath) {
 // and every replay/conflict fence. The LOOM state machine's own matrix stays in
 // crates/rovai-core/src/loom.rs unit tests; nothing there can prove these wire shapes, the
 // Host-injected identities, or which rows reached storage. No Runtime is launched.
+// Since migration 224 an evidence id must name a real `loom_artifact` row, so every delivery
+// here registers the bytes it wrote into the Mission workspace instead of naming a string.
 test('a real Core carries one LOOM delivery through release, claim, candidate, review and verification before the dependency is released', {
   // The empty CARGO_TARGET_DIR below makes this test compile rovai-core and its whole
   // dependency tree, so the budget belongs to cargo, not to the RPCs.
@@ -442,6 +444,54 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
         `the import receipt must name every edge: ${JSON.stringify(imported)}`)
       return imported
     }
+    // Migration 224 stopped `evidenceId` being a bare string: every id must name a row in
+    // `loom_artifact` for the same plan, and only the Host hashes the bytes. The fixture therefore
+    // writes a real file into the Mission workspace and registers it before anything cites it.
+    // Every chain below uses its own file name, because a Quick Chat Mission's workspace is the
+    // one shared `<dataDir>/quick-chat` directory.
+    const workspaceDirectory = join(dataDir, 'quick-chat')
+    const sha256Of = contents => createHash('sha256').update(contents).digest('hex')
+    const writeWorkspaceFile = async (relativePath, contents) => {
+      await mkdir(workspaceDirectory, { recursive: true })
+      const absolutePath = join(workspaceDirectory, relativePath)
+      await writeFile(absolutePath, contents)
+      return absolutePath
+    }
+    // Registration is the only way an evidence id becomes citable. The assertions pin the wire
+    // shape the Host returns and prove it hashed the bytes on disk rather than a client digest.
+    const registerArtifact = async ({ missionId, planId, relativePath, contents, taskId }) => {
+      const registered = await core.request('loom.artifact.register', {
+        missionId,
+        relativePath,
+        ...(taskId ? { taskId } : {})
+      })
+      const { artifact } = registered
+      assert.equal(registered.replayed, false,
+        `the first registration of ${relativePath} must not be a replay: ${JSON.stringify(registered)}`)
+      assert.equal(typeof artifact.artifactId, 'string',
+        `the registration receipt must carry an artifactId: ${JSON.stringify(artifact)}`)
+      assert.equal(artifact.planId, planId,
+        `the artifact must be bound to the Mission's plan: ${JSON.stringify(artifact)}`)
+      assert.equal(artifact.taskId, taskId ?? null,
+        `the artifact must echo the Task it was registered for: ${JSON.stringify(artifact)}`)
+      assert.equal(artifact.relativePath, relativePath,
+        `the artifact must keep its Mission-relative path: ${JSON.stringify(artifact)}`)
+      assert.equal(artifact.sha256, sha256Of(contents),
+        `the Host must hash the bytes on disk, never a client digest: ${JSON.stringify(artifact)}`)
+      assert.equal(artifact.sizeBytes, Buffer.byteLength(contents),
+        `the Host must record the registered byte count: ${JSON.stringify(artifact)}`)
+      assert.equal(artifact.creatorId, 'local_user',
+        `the Host must inject the creator identity: ${JSON.stringify(artifact)}`)
+      return artifact
+    }
+    // Write and register one evidence file, handing back what a later tamper needs as well.
+    const deliverEvidence = async ({ missionId, planId, version, taskId }) => {
+      const relativePath = `loom-evidence-${version}.txt`
+      const contents = `LOOM delivery evidence for ${version}\n`
+      await writeWorkspaceFile(relativePath, contents)
+      const artifact = await registerArtifact({ missionId, planId, relativePath, contents, taskId })
+      return { relativePath, contents, artifact, artifactId: artifact.artifactId }
+    }
     // Returns the listing too, so every status assertion can print the raw response.
     const taskStatus = async (missionId, taskId) => {
       const listed = await core.request('loom.tasks.list', { missionId })
@@ -455,7 +505,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       assert.equal(listed.length, expected, `${message}: ${JSON.stringify(listed)}`)
     }
     // Both anti-cheat chains submit through the same side; only the verdict differs.
-    const deliverCandidate = async ({ missionId, taskId, downstreamTaskId, version }) => {
+    const deliverCandidate = async ({ missionId, planId, taskId, downstreamTaskId, version }) => {
       for (const releasedTaskId of [taskId, downstreamTaskId]) {
         const released = await core.request('loom.task.release', { missionId, taskId: releasedTaskId })
         assert.equal(released.task.status, 'ready',
@@ -471,6 +521,8 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       assert.equal(claim.replayed, false,
         `the first claim of ${taskId} must not be a replay: ${JSON.stringify(claim)}`)
       claims.add(claim.claimId)
+      // 224: the submission cites a registered artifact, never a bare string.
+      const evidence = await deliverEvidence({ missionId, planId, version, taskId })
       const candidate = await core.request('loom.candidate.record', {
         missionId,
         taskId,
@@ -479,11 +531,13 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
         fenceGeneration: claim.fenceGeneration,
         commandId: randomUUID(),
         contentHash: createHash('sha256').update(`${version} artifact`).digest('hex'),
-        evidenceIds: [`evidence-${version}`],
+        evidenceIds: [evidence.artifactId],
         acceptanceCriteriaVersion: version
       })
       assert.equal(candidate.taskId, taskId, `the candidate must bind its Task: ${JSON.stringify(candidate)}`)
-      return { agentRunId, claim, candidate }
+      assert.deepEqual(candidate.evidenceIds, [evidence.artifactId],
+        `the candidate must keep the registered evidence id: ${JSON.stringify(candidate)}`)
+      return { agentRunId, claim, candidate, evidence }
     }
 
     // ---- The accepted delivery: every step of the chain, in contract order ----
@@ -507,6 +561,14 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     })
     assert.equal(typeof imported.planId, 'string', `the import receipt must carry its planId: ${JSON.stringify(imported)}`)
     const [dependencyId] = imported.dependencyIds
+    // 224: the chain's evidence is a real file in the Mission workspace, registered against this
+    // plan, before either receipt below is allowed to cite it.
+    const chainEvidence = await deliverEvidence({
+      missionId,
+      planId: imported.planId,
+      version,
+      taskId: upstreamTaskId
+    })
 
     // Release is only a DRAFT -> READY move and does not look at the edges, which is why both
     // Tasks can be released before anything upstream was delivered.
@@ -547,7 +609,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       fenceGeneration: claim.fenceGeneration,
       commandId: randomUUID(),
       contentHash,
-      evidenceIds: ['evidence-loom-chain'],
+      evidenceIds: [chainEvidence.artifactId],
       acceptanceCriteriaVersion: version
     }
     const candidate = await core.request('loom.candidate.record', candidateParams)
@@ -615,7 +677,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       commandId: randomUUID(),
       method: 'e2e',
       result: 'passed',
-      evidenceIds: ['evidence-loom-chain'],
+      evidenceIds: [chainEvidence.artifactId],
       // Same spoof on the evidence axis: the Host owns the executor identity too.
       executorId: 'fake'
     }
@@ -754,6 +816,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       `the verification-only plan must keep its edge: ${JSON.stringify(verificationOnlyPlan)}`)
     const verificationOnlyArtifact = await deliverCandidate({
       missionId: verificationOnlyMissionId,
+      planId: verificationOnlyPlan.planId,
       taskId: verificationOnlyUpstreamId,
       downstreamTaskId: verificationOnlyDownstreamId,
       version: 'ac-verify-only'
@@ -765,7 +828,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       commandId: randomUUID(),
       method: 'e2e',
       result: 'passed',
-      evidenceIds: ['evidence-ac-verify-only'],
+      evidenceIds: [verificationOnlyArtifact.evidence.artifactId],
       executorId: 'fake'
     })
     assert.equal(verificationOnly.candidateVerificationStatus, 'verified',
@@ -806,6 +869,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       `the rejected-delivery plan must keep its edge: ${JSON.stringify(rejectedPlan)}`)
     const rejectedArtifact = await deliverCandidate({
       missionId: rejectedMissionId,
+      planId: rejectedPlan.planId,
       taskId: rejectedUpstreamId,
       downstreamTaskId: rejectedDownstreamId,
       version: 'ac-reject'
@@ -836,7 +900,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       commandId: randomUUID(),
       method: 'e2e',
       result: 'passed',
-      evidenceIds: ['evidence-ac-reject'],
+      evidenceIds: [rejectedArtifact.evidence.artifactId],
       executorId: 'fake'
     })
     assert.equal(verificationAfterRejection.candidateVerificationStatus, 'verified',
@@ -848,6 +912,159 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     await expectRejection(core.request('loom.claim.acquire', {
       missionId: rejectedMissionId,
       taskId: rejectedDownstreamId,
+      agentRunId: randomUUID(),
+      commandId: randomUUID()
+    }), 'loom.claim.acquire', 'LOOM_DEPENDENCY_UNRELEASED')
+
+    // ---- Migration 224 anti-cheat: an evidence id must name a registered artifact whose bytes
+    // still match what was registered, and only a *passing* check is held to that standard. These
+    // three chains run after the accepted delivery above, so the release path stays green.
+
+    // (h1) An unregistered evidence id cannot be cited at all. A fresh commandId with an
+    // otherwise valid submission makes the evidence rule the only thing that can refuse it.
+    const unregisteredMissionId = await createMission('LOOM unregistered evidence')
+    const unregisteredTaskId = 'loom-unregistered-task'
+    const unregisteredVersion = 'ac-unregistered'
+    await importPlan({
+      missionId: unregisteredMissionId,
+      version: unregisteredVersion,
+      criteria: [{ criterionId: 'criterion-unregistered', text: 'an unknown evidence id cannot be cited' }],
+      tasks: [{ taskId: unregisteredTaskId, title: 'Cite unknown evidence', description: 'Must be refused' }],
+      dependencies: []
+    })
+    const unregisteredRelease = await core.request('loom.task.release', {
+      missionId: unregisteredMissionId,
+      taskId: unregisteredTaskId
+    })
+    assert.equal(unregisteredRelease.task.status, 'ready',
+      `the unregistered-evidence Task must start ready: ${JSON.stringify(unregisteredRelease)}`)
+    const unregisteredRunId = randomUUID()
+    const unregisteredClaim = await core.request('loom.claim.acquire', {
+      missionId: unregisteredMissionId,
+      taskId: unregisteredTaskId,
+      agentRunId: unregisteredRunId,
+      commandId: randomUUID()
+    })
+    assert.equal(unregisteredClaim.replayed, false,
+      `the unregistered-evidence claim must not be a replay: ${JSON.stringify(unregisteredClaim)}`)
+    claims.add(unregisteredClaim.claimId)
+    const unregisteredEvidenceId = 'evidence-never-registered'
+    await expectRejection(core.request('loom.candidate.record', {
+      missionId: unregisteredMissionId,
+      taskId: unregisteredTaskId,
+      agentRunId: unregisteredRunId,
+      claimId: unregisteredClaim.claimId,
+      fenceGeneration: unregisteredClaim.fenceGeneration,
+      commandId: randomUUID(),
+      contentHash: sha256Of('unregistered evidence artifact'),
+      evidenceIds: [unregisteredEvidenceId],
+      acceptanceCriteriaVersion: unregisteredVersion
+    }), 'loom.candidate.record', 'LOOM_EVIDENCE_NOT_FOUND')
+    const afterUnregistered = await taskStatus(unregisteredMissionId, unregisteredTaskId)
+    assert.equal(afterUnregistered.status, 'ready',
+      `a candidate citing unregistered evidence must leave its Task ready, not in review: ${JSON.stringify(afterUnregistered.listed)}`)
+    await expectListLength('loom.candidates.list', unregisteredMissionId, 0,
+      'a candidate citing unregistered evidence must not be recorded')
+
+    // (h2) Changed bytes cannot pass: the same candidate, checked with result=passed over a file
+    // that was rewritten after registration, must be refused and store nothing.
+    const tamperMissionId = await createMission('LOOM tampered evidence')
+    const tamperUpstreamId = 'loom-tamper-upstream'
+    const tamperDownstreamId = 'loom-tamper-downstream'
+    const tamperVersion = 'ac-tamper'
+    const tamperPlan = await importPlan({
+      missionId: tamperMissionId,
+      version: tamperVersion,
+      criteria: [{ criterionId: 'criterion-tamper', text: 'changed bytes cannot pass a check' }],
+      tasks: [
+        { taskId: tamperUpstreamId, title: 'Produce the artifact', description: 'Registered then rewritten' },
+        { taskId: tamperDownstreamId, title: 'Consume the artifact', description: 'Must stay blocked' }
+      ],
+      dependencies: [{
+        upstreamTaskId: tamperUpstreamId,
+        downstreamTaskId: tamperDownstreamId,
+        condition: 'artifact_accepted'
+      }]
+    })
+    assert.equal(tamperPlan.dependencyIds.length, 1,
+      `the tampered-evidence plan must keep its edge: ${JSON.stringify(tamperPlan)}`)
+    const tamperArtifact = await deliverCandidate({
+      missionId: tamperMissionId,
+      planId: tamperPlan.planId,
+      taskId: tamperUpstreamId,
+      downstreamTaskId: tamperDownstreamId,
+      version: tamperVersion
+    })
+    const tamperedContents = `${tamperArtifact.evidence.contents}rewritten after registration\n`
+    await writeWorkspaceFile(tamperArtifact.evidence.relativePath, tamperedContents)
+    // The tamper has to be real on disk, or the rejection below would prove nothing.
+    assert.equal(
+      sha256Of(await readFile(join(workspaceDirectory, tamperArtifact.evidence.relativePath))),
+      sha256Of(tamperedContents),
+      `the evidence file must hold the rewritten bytes: ${tamperArtifact.evidence.relativePath}`)
+    assert.notEqual(sha256Of(tamperedContents), tamperArtifact.evidence.artifact.sha256,
+      'the rewritten bytes must differ from the registered digest')
+    const tamperedPassedCommandId = randomUUID()
+    await expectRejection(core.request('loom.verification.record', {
+      missionId: tamperMissionId,
+      taskId: tamperUpstreamId,
+      candidateId: tamperArtifact.candidate.candidateId,
+      commandId: tamperedPassedCommandId,
+      method: 'e2e',
+      result: 'passed',
+      evidenceIds: [tamperArtifact.evidence.artifactId],
+      executorId: 'fake'
+    }), 'loom.verification.record', 'LOOM_EVIDENCE_HASH_MISMATCH')
+    await expectListLength('loom.verifications.list', tamperMissionId, 0,
+      'a passing check over changed bytes must not record a verification')
+    const [untouchedCandidate] = await core.request('loom.candidates.list', { missionId: tamperMissionId })
+    assert.equal(untouchedCandidate.candidateId, tamperArtifact.candidate.candidateId,
+      `the refused check must leave its candidate alone: ${JSON.stringify(untouchedCandidate)}`)
+    assert.equal(untouchedCandidate.verificationStatus, 'unverified',
+      `a refused passing check must not verify the candidate: ${JSON.stringify(untouchedCandidate)}`)
+
+    // (h3) The same changed bytes may still be *reported as failing*: a failed check is a
+    // conclusion, not a claim about the bytes, so it records and moves only the check axis.
+    const tamperFailed = await core.request('loom.verification.record', {
+      missionId: tamperMissionId,
+      taskId: tamperUpstreamId,
+      candidateId: tamperArtifact.candidate.candidateId,
+      commandId: randomUUID(),
+      method: 'e2e',
+      result: 'failed',
+      evidenceIds: [tamperArtifact.evidence.artifactId],
+      executorId: 'fake'
+    })
+    assert.equal(tamperFailed.replayed, false,
+      `the failed check must not be a replay: ${JSON.stringify(tamperFailed)}`)
+    assert.equal(tamperFailed.verification.result, 'failed',
+      `the receipt must keep the failed result: ${JSON.stringify(tamperFailed)}`)
+    assert.equal(tamperFailed.verification.executorId, 'local_user',
+      `the Host must overwrite a spoofed executorId on a failed check too: ${JSON.stringify(tamperFailed)}`)
+    assert.equal(tamperFailed.candidateVerificationStatus, 'failed',
+      `a failed check must move the candidate's check axis to failed: ${JSON.stringify(tamperFailed)}`)
+    assert.deepEqual(tamperFailed.releasedDependencyIds, [],
+      `a failed check must release no dependency: ${JSON.stringify(tamperFailed)}`)
+    await expectListLength('loom.verifications.list', tamperMissionId, 1,
+      'the failed check must be the only verification stored for this Mission')
+    const [failedCandidate] = await core.request('loom.candidates.list', { missionId: tamperMissionId })
+    assert.equal(failedCandidate.candidateId, tamperArtifact.candidate.candidateId,
+      `the Mission must list exactly its one candidate: ${JSON.stringify(failedCandidate)}`)
+    assert.equal(failedCandidate.verificationStatus, 'failed',
+      `the listed candidate must carry the failed check axis: ${JSON.stringify(failedCandidate)}`)
+    assert.equal(failedCandidate.acceptanceStatus, 'pending',
+      `a failed check must leave the acceptance axis pending: ${JSON.stringify(failedCandidate)}`)
+    const tamperEdges = await core.request('loom.dependencies.list', { missionId: tamperMissionId })
+    assert.equal(tamperEdges.length, 1,
+      `the tampered-evidence plan must still hold its one edge: ${JSON.stringify(tamperEdges)}`)
+    assert.equal(tamperEdges[0].resolution, null,
+      'a failed check must leave the artifact edge frozen-free')
+    const afterFailedCheck = await taskStatus(tamperMissionId, tamperUpstreamId)
+    assert.equal(afterFailedCheck.status, 'in_review',
+      `a failed check must not move the Task out of review: ${JSON.stringify(afterFailedCheck.listed)}`)
+    await expectRejection(core.request('loom.claim.acquire', {
+      missionId: tamperMissionId,
+      taskId: tamperDownstreamId,
       agentRunId: randomUUID(),
       commandId: randomUUID()
     }), 'loom.claim.acquire', 'LOOM_DEPENDENCY_UNRELEASED')
@@ -874,12 +1091,40 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     const verificationRows = database.prepare(
       'SELECT verification_id, candidate_id, method, result, executor_id FROM loom_verification ORDER BY verified_at, verification_id'
     ).all()
-    assert.equal(verificationRows.length, 3,
-      `every passing check must be stored once: ${JSON.stringify(verificationRows)}`)
+    assert.equal(verificationRows.length, 4,
+      `every recorded check must be stored once: ${JSON.stringify(verificationRows)}`)
     assert.deepEqual([...new Set(verificationRows.map(row => row.executor_id))], ['local_user'],
       `every stored verification must carry the Host identity, never the spoofed executorId: ${JSON.stringify(verificationRows)}`)
-    assert.ok(verificationRows.every(row => row.result === 'PASSED' && row.method === 'e2e'),
-      `every stored verification keeps its stored method and result: ${JSON.stringify(verificationRows)}`)
+    // Three chains pass (the accepted delivery, the verification-only chain and the rejected
+    // chain); the tampered-bytes chain is the one recorded failure.
+    const passedVerificationRows = verificationRows.filter(row => row.result === 'PASSED')
+    assert.equal(passedVerificationRows.length, 3,
+      `each passing chain must store exactly one PASSED check: ${JSON.stringify(verificationRows)}`)
+    assert.ok(passedVerificationRows.every(row => row.method === 'e2e'),
+      `every stored passing verification keeps its stored method: ${JSON.stringify(verificationRows)}`)
+    const failedVerificationRows = verificationRows.filter(row => row.result === 'FAILED')
+    assert.equal(failedVerificationRows.length, 1,
+      `exactly one FAILED check must be stored: ${JSON.stringify(verificationRows)}`)
+    assert.equal(failedVerificationRows[0].candidate_id, tamperArtifact.candidate.candidateId,
+      `the stored FAILED check must be the tampered-bytes one: ${JSON.stringify(verificationRows)}`)
+    assert.equal(failedVerificationRows[0].method, 'e2e',
+      `the stored FAILED check must keep its method: ${JSON.stringify(verificationRows)}`)
+    // 224 evidence: the registered digest is what storage keeps, so the tampered file cannot
+    // silently rewrite the row a PASSED check would have been judged against.
+    const artifactRows = database.prepare(
+      'SELECT artifact_id, relative_path, sha256 FROM loom_artifact ORDER BY created_at, artifact_id'
+    ).all()
+    assert.equal(artifactRows.length, 4,
+      `each of the four delivering chains must register exactly one artifact: ${JSON.stringify(artifactRows)}`)
+    const storedTamperArtifact = artifactRows.find(row => row.artifact_id === tamperArtifact.evidence.artifactId)
+    assert.ok(storedTamperArtifact,
+      `the tampered-bytes artifact must be stored: ${JSON.stringify(artifactRows)}`)
+    assert.equal(storedTamperArtifact.relative_path, tamperArtifact.evidence.relativePath,
+      `the stored artifact must keep its Mission-relative path: ${JSON.stringify(storedTamperArtifact)}`)
+    assert.equal(storedTamperArtifact.sha256, sha256Of(tamperArtifact.evidence.contents),
+      `the stored artifact must keep the digest of the bytes it was registered with, not the rewritten file: ${JSON.stringify(storedTamperArtifact)}`)
+    assert.notEqual(storedTamperArtifact.sha256, sha256Of(tamperedContents),
+      'the stored digest must never follow the rewritten file')
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM loom_review WHERE reviewer_id='fake'").get().count, 0,
       'a spoofed reviewerId must never reach storage')
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM loom_verification WHERE executor_id='fake'").get().count, 0,
@@ -887,8 +1132,8 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     // Row counts, not just receipts: a replay or a rejected attempt writes nothing.
     assert.equal(database.prepare('SELECT COUNT(*) AS count FROM loom_claim').get().count, claims.size,
       `a replayed or rejected claim command must not write a row (expected ${claims.size} accepted claims)`)
-    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM loom_candidate').get().count, 3,
-      'each of the three chains records exactly one candidate')
+    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM loom_candidate').get().count, 4,
+      'each of the four delivering chains records exactly one candidate')
     database.close()
     database = null
   } finally {
