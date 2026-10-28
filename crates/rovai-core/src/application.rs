@@ -9576,8 +9576,12 @@ impl Core {
                 let result = rovai_core::loom::review_record(&mut database, input)?;
                 Ok(serde_json::to_value(result)?)
             }
-            "loom.plan.get" | "loom.tasks.list" | "loom.dependencies.list"
-            | "loom.candidates.list" | "loom.reviews.list" | "loom.verifications.list" => {
+            "loom.plan.get"
+            | "loom.tasks.list"
+            | "loom.dependencies.list"
+            | "loom.candidates.list"
+            | "loom.reviews.list"
+            | "loom.verifications.list" => {
                 let params: rovai_core::loom::MissionScopeInput =
                     serde_json::from_value(request.params.clone())?;
                 let database = self.database.lock().await;
@@ -9593,15 +9597,13 @@ impl Core {
                         rovai_core::loom::candidates_list(&database, mission_id)?,
                     )?,
                     "loom.reviews.list" => serde_json::to_value(rovai_core::loom::reviews_list(
-                        &database,
-                        mission_id,
+                        &database, mission_id,
                     )?)?,
                     "loom.verifications.list" => serde_json::to_value(
                         rovai_core::loom::verifications_list(&database, mission_id)?,
                     )?,
                     _ => serde_json::to_value(rovai_core::loom::dependencies_list(
-                        &database,
-                        mission_id,
+                        &database, mission_id,
                     )?)?,
                 })
             }

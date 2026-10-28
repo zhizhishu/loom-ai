@@ -484,8 +484,7 @@ const LOOM_CLAIM_ABSENT: &str = "LOOM_CLAIM_ABSENT";
 const LOOM_CLAIM_EXPIRED: &str = "LOOM_CLAIM_EXPIRED";
 const LOOM_CLAIM_AGENT_RUN_MISMATCH: &str = "LOOM_CLAIM_AGENT_RUN_MISMATCH";
 const LOOM_CLAIM_FENCE_STALE: &str = "LOOM_CLAIM_FENCE_STALE";
-const LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH: &str =
-    "LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH";
+const LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH: &str = "LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH";
 const LOOM_CANDIDATE_COMMAND_REUSED: &str = "LOOM_CANDIDATE_COMMAND_REUSED";
 const LOOM_CANDIDATE_PREVIOUS_INVALID: &str = "LOOM_CANDIDATE_PREVIOUS_INVALID";
 const LOOM_CANDIDATE_NOT_FOUND: &str = "LOOM_CANDIDATE_NOT_FOUND";
@@ -706,7 +705,10 @@ pub fn plan_import(
         });
     }
 
-    let plan_task_ids = task_rows.iter().map(|task| task.task_id).collect::<Vec<_>>();
+    let plan_task_ids = task_rows
+        .iter()
+        .map(|task| task.task_id)
+        .collect::<Vec<_>>();
     let mut edges: Vec<(&str, &str)> = Vec::with_capacity(input.dependencies.len());
     let mut conditioned_edges: Vec<(&str, &str, LoomDependencyCondition)> =
         Vec::with_capacity(input.dependencies.len());
@@ -738,7 +740,9 @@ pub fn plan_import(
         conditioned_edges.push((
             upstream,
             downstream,
-            dependency.condition.unwrap_or(LoomDependencyCondition::TaskDone),
+            dependency
+                .condition
+                .unwrap_or(LoomDependencyCondition::TaskDone),
         ));
     }
     if let Some(cycle) = find_plan_cycle(&plan_task_ids, &edges) {
@@ -1223,7 +1227,9 @@ pub fn claim_acquire(
         if !lease_expired(&held_lease_expires_at, now) {
             return Err(LoomCommandError::rejection(
                 LOOM_CLAIM_HELD,
-                format!("task {task_id} is held by claim {held_claim_id} until {held_lease_expires_at}"),
+                format!(
+                    "task {task_id} is held by claim {held_claim_id} until {held_lease_expires_at}"
+                ),
             ));
         }
         transaction.execute(
@@ -1398,8 +1404,8 @@ impl StoredCandidate {
 
     fn into_result(self, mission_id: &str, replayed: bool) -> Result<LoomCandidateRecordResult> {
         // Parse before the owning fields move, so the error context can still name the id.
-        let evidence_ids: Vec<String> =
-            serde_json::from_str(&self.evidence_ids_json).with_context(|| {
+        let evidence_ids: Vec<String> = serde_json::from_str(&self.evidence_ids_json)
+            .with_context(|| {
                 format!(
                     "candidate {} evidenceIds are not a list of references",
                     self.candidate_id
@@ -1854,8 +1860,8 @@ pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<Loom
                 created_at,
                 acceptance_criteria_json,
             )| {
-                let evidence_ids: Vec<String> =
-                    serde_json::from_str(&evidence_ids_json).with_context(|| {
+                let evidence_ids: Vec<String> = serde_json::from_str(&evidence_ids_json)
+                    .with_context(|| {
                         format!("LOOM candidate {candidate_id} has unreadable evidence ids")
                     })?;
                 let owner = format!("candidate {candidate_id}");
@@ -1892,7 +1898,16 @@ pub fn reviews_list(database: &Database, mission_id: &str) -> Result<Vec<LoomRev
          WHERE plan.mission_id=?1
          ORDER BY review.reviewed_at, review.review_id",
     )?;
-    type ReviewRow = (String, String, String, String, String, String, String, String);
+    type ReviewRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
     let rows: Vec<ReviewRow> = statement
         .query_map([mission_id], |row| {
             Ok((
@@ -2064,9 +2079,8 @@ fn read_stored_review(
         acceptance_criteria_version: version,
         verdict: LoomReviewVerdict::parse(&verdict)?,
         reason,
-        criteria_results: serde_json::from_str(&criteria_json).with_context(|| {
-            format!("LOOM review {review_id} has unreadable criterion results")
-        })?,
+        criteria_results: serde_json::from_str(&criteria_json)
+            .with_context(|| format!("LOOM review {review_id} has unreadable criterion results"))?,
         reviewer_id,
         reviewed_at,
     })
@@ -2148,9 +2162,7 @@ pub fn review_record(
         {
             return Err(LoomCommandError::rejection(
                 LOOM_REVIEW_REPLAY_CONFLICT,
-                format!(
-                    "command {command_id} was recorded for a different mission/task/candidate"
-                ),
+                format!("command {command_id} was recorded for a different mission/task/candidate"),
             )
             .into());
         }
@@ -2220,7 +2232,9 @@ pub fn review_record(
     let Some((candidate_task_id, candidate_version)) = candidate else {
         return Err(LoomCommandError::rejection(
             LOOM_CANDIDATE_NOT_FOUND,
-            format!("candidate {candidate_id} is not recorded in the plan for mission {mission_id}"),
+            format!(
+                "candidate {candidate_id} is not recorded in the plan for mission {mission_id}"
+            ),
         )
         .into());
     };
@@ -2289,10 +2303,7 @@ pub fn review_record(
         .collect();
     recorded.sort_unstable();
     let covered = recorded == expected;
-    let all_satisfied = input
-        .criteria_results
-        .iter()
-        .all(|result| result.satisfied);
+    let all_satisfied = input.criteria_results.iter().all(|result| result.satisfied);
     if verdict == LoomReviewVerdict::Accepted && !covered {
         return Err(LoomCommandError::rejection(
             LOOM_REVIEW_CRITERIA_INCOMPLETE,
@@ -2500,7 +2511,15 @@ pub fn verifications_list(database: &Database, mission_id: &str) -> Result<Vec<L
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
         .map(
-            |(verification_id, candidate_id, method, executor_id, result, evidence_json, verified_at)| {
+            |(
+                verification_id,
+                candidate_id,
+                method,
+                executor_id,
+                result,
+                evidence_json,
+                verified_at,
+            )| {
                 let evidence_ids: Vec<String> =
                     serde_json::from_str(&evidence_json).with_context(|| {
                         format!("LOOM verification {verification_id} has unreadable evidence ids")
@@ -2605,9 +2624,7 @@ pub fn verification_record(
         {
             return Err(LoomCommandError::rejection(
                 LOOM_VERIFICATION_REPLAY_CONFLICT,
-                format!(
-                    "command {command_id} was recorded for a different mission/task/candidate"
-                ),
+                format!("command {command_id} was recorded for a different mission/task/candidate"),
             )
             .into());
         }
@@ -2665,7 +2682,9 @@ pub fn verification_record(
     let Some(candidate_task_id) = candidate else {
         return Err(LoomCommandError::rejection(
             LOOM_CANDIDATE_NOT_FOUND,
-            format!("candidate {candidate_id} is not recorded in the plan for mission {mission_id}"),
+            format!(
+                "candidate {candidate_id} is not recorded in the plan for mission {mission_id}"
+            ),
         )
         .into());
     };
@@ -2747,7 +2766,6 @@ pub fn verification_record(
         replayed: false,
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3228,7 +3246,9 @@ mod tests {
             "assertion a_to_b_to_c_to_a_cycle_is_rejected"
         );
         assert!(
-            error.to_string().contains("task_a -> task_b -> task_c -> task_a"),
+            error
+                .to_string()
+                .contains("task_a -> task_b -> task_c -> task_a"),
             "assertion cycle_rejection_names_the_task_path: {error}"
         );
         assert!(
@@ -3450,9 +3470,11 @@ mod tests {
     fn task_status(database: &Database, task_id: &str) -> String {
         database
             .connection()
-            .query_row("SELECT status FROM loom_task WHERE task_id=?1", [task_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT status FROM loom_task WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
             .unwrap()
     }
 
@@ -3546,8 +3568,8 @@ mod tests {
             LOOM_PLAN_NOT_FOUND,
             "assertion release_rejects_a_mission_without_a_plan"
         );
-        let error = task_release(&mut database, release_input("mission_missing", "task_a"))
-            .unwrap_err();
+        let error =
+            task_release(&mut database, release_input("mission_missing", "task_a")).unwrap_err();
         assert_eq!(
             command_code(&error),
             LOOM_MISSION_NOT_FOUND,
@@ -3642,10 +3664,7 @@ mod tests {
             replay.claim_id, first.claim_id,
             "assertion replay_returns_the_original_claim_id"
         );
-        assert!(
-            replay.replayed,
-            "assertion replay_reports_that_it_replayed"
-        );
+        assert!(replay.replayed, "assertion replay_reports_that_it_replayed");
         assert_eq!(
             replay.fence_generation, first.fence_generation,
             "assertion replay_does_not_advance_the_fence"
@@ -3760,7 +3779,10 @@ mod tests {
         // The release rule reads the upstream Task state, not a caller assertion.
         database
             .connection()
-            .execute("UPDATE loom_task SET status='DONE' WHERE task_id='task_a'", [])
+            .execute(
+                "UPDATE loom_task SET status='DONE' WHERE task_id='task_a'",
+                [],
+            )
             .unwrap();
         let acquired = claim_acquire(
             &mut database,
@@ -3946,9 +3968,7 @@ mod tests {
     fn candidate_rows(database: &Database) -> i64 {
         database
             .connection()
-            .query_row("SELECT COUNT(*) FROM loom_candidate", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM loom_candidate", [], |row| row.get(0))
             .unwrap()
     }
 
@@ -4084,7 +4104,13 @@ mod tests {
     fn candidate_record_is_rejected_once_the_lease_expired() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate lease loss");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
         expire_lease(&database, &claim.claim_id);
 
         let error = candidate_record(
@@ -4118,7 +4144,13 @@ mod tests {
     fn candidate_record_is_rejected_when_another_run_holds_the_claim() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate fence");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
 
         let error = candidate_record(
             &mut database,
@@ -4214,7 +4246,13 @@ mod tests {
     fn candidate_record_is_rejected_when_the_criteria_version_differs() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate criteria");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
 
         let mut input =
             candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim);
@@ -4241,7 +4279,13 @@ mod tests {
     fn candidate_record_rejects_a_previous_candidate_of_another_task() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate chain");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
         let first = candidate_record(
             &mut database,
             candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
@@ -4276,7 +4320,13 @@ mod tests {
     fn replayed_candidate_command_returns_the_original_candidate() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate replay");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
 
         let first = candidate_record(
             &mut database,
@@ -4292,10 +4342,7 @@ mod tests {
             replay.candidate_id, first.candidate_id,
             "assertion replay_returns_the_original_candidate_id"
         );
-        assert!(
-            replay.replayed,
-            "assertion replay_reports_that_it_replayed"
-        );
+        assert!(replay.replayed, "assertion replay_reports_that_it_replayed");
         assert_eq!(
             replay.content_hash, first.content_hash,
             "assertion replay_does_not_rewrite_the_delivered_content"
@@ -4351,7 +4398,13 @@ mod tests {
     fn failed_task_transition_rolls_back_the_candidate() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate rollback");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
         database
             .connection()
             .execute_batch(
@@ -4408,7 +4461,13 @@ mod tests {
     fn recorded_candidate_content_cannot_be_rewritten() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate immutable");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
         let recorded = candidate_record(
             &mut database,
             candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
@@ -4462,7 +4521,13 @@ mod tests {
     fn candidate_record_rejects_a_submission_from_a_superseded_claim() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate stale fence");
-        let stale = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let stale = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
 
         // The same agentRun takes the Task over with a new commandId once the lease lapsed:
         // the old claim is released, a new claim is written and the fence generation advances,
@@ -4565,7 +4630,13 @@ mod tests {
     fn candidate_record_judges_the_lease_against_the_time_inside_the_transaction() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate clock");
-        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
 
         // The lease is still live when the command starts and lapses while the command waits
         // for the write lock, so a clock read before the lock would still see it as live and

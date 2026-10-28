@@ -19,7 +19,8 @@ const TASK_STATUS: &str =
 const DEPENDENCY_CONDITION: &str = "CHECK(condition IN ('TASK_DONE','ARTIFACT_ACCEPTED'))";
 /// A Candidate carries the two independent verdict axes of the contract: what the Run
 /// itself claims about its delivery, and what the Owner later accepted.
-const VERIFICATION_STATUS: &str = "CHECK(verification_status IN ('UNVERIFIED','VERIFIED','FAILED'))";
+const VERIFICATION_STATUS: &str =
+    "CHECK(verification_status IN ('UNVERIFIED','VERIFIED','FAILED'))";
 const ACCEPTANCE_STATUS: &str = "CHECK(acceptance_status IN ('PENDING','ACCEPTED','REJECTED'))";
 /// A Review is the Owner's verdict on one Candidate: accepted or rejected, nothing else.
 const REVIEW_VERDICT: &str = "CHECK(verdict IN ('ACCEPTED','REJECTED'))";

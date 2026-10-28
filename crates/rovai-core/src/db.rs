@@ -44063,9 +44063,7 @@ mod tests {
                         .unwrap();
                 }
                 "loom_claim" => {
-                    connection
-                        .execute_batch("DROP TABLE loom_claim")
-                        .unwrap();
+                    connection.execute_batch("DROP TABLE loom_claim").unwrap();
                 }
                 "loom_candidate" => {
                     connection
