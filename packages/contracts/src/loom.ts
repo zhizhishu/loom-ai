@@ -230,6 +230,48 @@ export interface LoomReviewSubmission {
 }
 
 /** 验收提交结果：逐条验收标准全 true 才通过。 */
+/** 核验结论：交付能否被独立复现，与人工验收是两条轴。 */
+export type LoomVerificationResult = 'passed' | 'failed'
+
+/** 证据核验记录：不可变，一个候选只能有一份。 */
+export interface LoomVerification {
+  verificationId: string
+  candidateId: string
+  /** 核验方法（跑了什么、怎么跑的） */
+  method: string
+  /** 执行核验的主体 */
+  executorId: string
+  result: LoomVerificationResult
+  /** 支撑结论的证据引用 */
+  evidenceIds: string[]
+  verifiedAt: string
+}
+
+/** 核验提交入参。 */
+export interface LoomVerificationRecordInput {
+  missionId: string
+  taskId: string
+  candidateId: string
+  /** 幂等键：同一 commandId 重放返回既有核验 */
+  commandId: string
+  method: string
+  executorId: string
+  result: LoomVerificationResult
+  evidenceIds?: string[]
+}
+
+/** 核验回执：写入的核验 + 它推进了什么。 */
+export interface LoomVerificationRecordReceipt {
+  verification: LoomVerification
+  missionId: string
+  planId: string
+  taskId: string
+  candidateVerificationStatus: 'unverified' | 'verified' | 'failed'
+  /** 本次核验冻结放行的依赖边 ID */
+  releasedDependencyIds: string[]
+  replayed: boolean
+}
+
 /** 验收提交入参：Owner 对一个 Candidate 的终判。 */
 export interface LoomReviewRecordInput {
   missionId: string
