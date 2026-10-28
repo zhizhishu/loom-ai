@@ -500,6 +500,122 @@ app.whenReady().then(async () => {
   await waitFor(`Math.abs(document.querySelector('.loom-delivery').scrollTop - ${deliveryScrolled.top}) <= 1`, 'Delivery scroll position was not restored after visiting plan')
   cases.push('Delivery owns and restores its scroll position across the short plan section')
 
+  stage = 'wide layout density'
+  // 宽屏信息密度（Astra 方案 B）：三档全部量「工作区实际宽度」的占比与卡片相对位置，
+  // 不用「看起来更满」当证据；既有断言一条不动，这里只加。本段不新增 cases 条目，
+  // 因为 scripts/lib/loom-workspace.test.mjs 的 EXPECTED_CASES = 19 是既有预算。
+  const resizeTo = async (width, height, label) => {
+    window.setContentSize(width, height)
+    await waitFor(`window.innerWidth === ${width} && window.innerHeight === ${height}`,
+      `LOOM fixture did not resize to ${width}x${height} for ${label}`)
+    await settle(200)
+  }
+  const openDensitySection = async (index, label) => {
+    await click(`.loom-section-tabs button:nth-of-type(${index + 1})`)
+    await expectPressed(index, label)
+    await settle(160)
+  }
+  // 图区：占工作区的比例 + 自身横滚量；泳道宽度用来钉住「4×160 + 3×32 = 736」这条预算。
+  const flowDensity = () => script(`(() => {
+    const graph = document.querySelector('.loom-plan .loom-flow-graph')
+    return {
+      workspace: document.querySelector('.loom-workspace')?.clientWidth ?? -1,
+      clientWidth: graph?.clientWidth ?? -1,
+      scrollWidth: graph?.scrollWidth ?? -1,
+      lanes: [...document.querySelectorAll('.loom-plan .loom-flow-lane')]
+        .map(lane => Math.round(lane.getBoundingClientRect().width))
+    }
+  })()`)
+  // 交付：占工作区的比例、侧距、以及每张候选卡片的矩形（top 相等 = 同一行，left 不同 = 并排）。
+  const deliveryDensity = () => script(`(() => {
+    const pane = document.querySelector('.loom-delivery')
+    const context = document.querySelector('.loom-delivery-context')
+    const style = pane === null ? null : getComputedStyle(pane)
+    return {
+      workspace: document.querySelector('.loom-workspace')?.clientWidth ?? -1,
+      pane: pane?.clientWidth ?? -1,
+      context: context?.clientWidth ?? -1,
+      panePaddingLeft: style?.paddingLeft ?? null,
+      panePaddingRight: style?.paddingRight ?? null,
+      cards: [...document.querySelectorAll('.loom-delivery-context .loom-candidate')].map(card => {
+        const box = card.getBoundingClientRect()
+        return { top: Math.round(box.top), left: Math.round(box.left), width: Math.round(box.width) }
+      }),
+      pageScrollWidth: document.documentElement.scrollWidth,
+      pageClientWidth: document.documentElement.clientWidth
+    }
+  })()`)
+
+  // 1440：面板必须撑满可用宽度，交付必须两列等宽同排。
+  await resizeTo(1440, 920, 'the 1440px density check')
+  await openDensitySection(1, '编排 did not open for the 1440px density check')
+  await waitFor("document.querySelectorAll('.loom-plan .loom-flow-lane').length >= 2",
+    '编排 flow lanes did not render for the 1440px density check')
+  const widePlan = await flowDensity()
+  assert(widePlan.workspace >= 1200,
+    `The 1440px LOOM workspace must be at least 1200 wide before the wide layout check: ${JSON.stringify(widePlan)}`)
+  assert(widePlan.clientWidth / widePlan.workspace >= 0.95,
+    `The 编排 flow graph must fill the wide workspace instead of stopping at the 860px cap: ${JSON.stringify(widePlan)}`)
+  assert(widePlan.scrollWidth <= widePlan.clientWidth + 1,
+    `The 编排 flow graph must not overflow its own pane at 1440: ${JSON.stringify(widePlan)}`)
+  assert.equal(widePlan.lanes.length, 4,
+    `编排 must still layer the four-task DAG into four lanes: ${JSON.stringify(widePlan.lanes)}`)
+  assert(widePlan.lanes.every(width => width >= 160),
+    `编排 lanes must keep their 160px floor: ${JSON.stringify(widePlan.lanes)}`)
+  assert(4 * 160 + 3 * 32 <= widePlan.workspace - 56,
+    `The lane width budget (4×160 + 3×32 = 736) must still fit 工作区宽度 − 56: ${JSON.stringify(widePlan)}`)
+
+  await openDensitySection(2, '交付 did not open for the 1440px density check')
+  await waitFor("document.querySelectorAll('.loom-delivery-context .loom-candidate').length === 2",
+    'Delivery section did not list both candidates for the 1440px density check')
+  await script("(() => { const pane = document.querySelector('.loom-delivery'); if (pane) pane.scrollTop = 0; return true })()")
+  await settle(120)
+  const wideDelivery = await deliveryDensity()
+  assert(wideDelivery.context / wideDelivery.workspace >= 0.94,
+    `The 交付 list must fill the wide workspace instead of staying one 860px column: ${JSON.stringify(wideDelivery)}`)
+  assert.equal(wideDelivery.cards.length, 2,
+    `交付 must still list both recorded candidates at 1440: ${JSON.stringify(wideDelivery.cards)}`)
+  assert.equal(wideDelivery.cards[0].top, wideDelivery.cards[1].top,
+    `The two 交付 candidate cards must share one row at 1440 (equal top): ${JSON.stringify(wideDelivery.cards)}`)
+  assert.notEqual(wideDelivery.cards[0].left, wideDelivery.cards[1].left,
+    `The two 交付 candidate cards must sit side by side at 1440 (different left): ${JSON.stringify(wideDelivery.cards)}`)
+  assert(Math.abs(wideDelivery.cards[0].width - wideDelivery.cards[1].width) <= 1,
+    `The two 交付 columns must be equal width: ${JSON.stringify(wideDelivery.cards)}`)
+
+  // 1040：860 上限与单列必须原样保留。
+  await resizeTo(1040, 700, 'the 1040px density check')
+  const mediumDelivery = await deliveryDensity()
+  assert(mediumDelivery.workspace < 1200,
+    `The 1040px LOOM workspace must stay under the wide threshold: ${JSON.stringify(mediumDelivery)}`)
+  assert(mediumDelivery.context <= 805,
+    `The 交付 panel must keep its 860px cap at 1040 (860 − 2×28 = 804): ${JSON.stringify(mediumDelivery)}`)
+  assert.equal(mediumDelivery.cards[0].left, mediumDelivery.cards[1].left,
+    `交付 must stay one column at 1040 (shared left): ${JSON.stringify(mediumDelivery.cards)}`)
+  assert.notEqual(mediumDelivery.cards[0].top, mediumDelivery.cards[1].top,
+    `交付 must stay one column at 1040 (different top): ${JSON.stringify(mediumDelivery.cards)}`)
+
+  // 390：20 侧距、单列、页面本身不横向溢出；编排仍只在自己的图区内横滚。
+  await resizeTo(390, 844, 'the 390px density check')
+  const mobileDelivery = await deliveryDensity()
+  assert.equal(mobileDelivery.panePaddingLeft, '20px',
+    `The 交付 panel must keep its 20px side padding at 390: ${JSON.stringify(mobileDelivery)}`)
+  assert.equal(mobileDelivery.panePaddingRight, '20px',
+    `The 交付 panel must keep its 20px side padding at 390: ${JSON.stringify(mobileDelivery)}`)
+  assert.equal(mobileDelivery.cards[0].left, mobileDelivery.cards[1].left,
+    `交付 must stay one column at 390 (shared left): ${JSON.stringify(mobileDelivery.cards)}`)
+  assert.notEqual(mobileDelivery.cards[0].top, mobileDelivery.cards[1].top,
+    `交付 must stay one column at 390 (different top): ${JSON.stringify(mobileDelivery.cards)}`)
+  assert(mobileDelivery.pageScrollWidth <= mobileDelivery.pageClientWidth + 1,
+    `The 390px page itself must not scroll horizontally: ${JSON.stringify(mobileDelivery)}`)
+  await openDensitySection(1, '编排 did not open for the 390px density check')
+  await waitFor("document.querySelectorAll('.loom-plan .loom-flow-lane').length >= 2",
+    '编排 flow lanes did not render for the 390px density check')
+  const mobilePlan = await flowDensity()
+  assert(mobilePlan.workspace <= 390,
+    `The 390px LOOM workspace must stay at the mobile width: ${JSON.stringify(mobilePlan)}`)
+  assert(mobilePlan.scrollWidth > mobilePlan.clientWidth + 1,
+    `编排 must still scroll the flow graph horizontally inside its own pane at 390: ${JSON.stringify(mobilePlan)}`)
+
   stage = 'screenshots'
   for (const [width, height] of [[1440, 920], [1040, 700], [390, 844]]) {
     window.setContentSize(width, height)
