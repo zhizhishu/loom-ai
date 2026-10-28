@@ -4181,4 +4181,531 @@ mod tests {
             "assertion a_lease_lost_while_waiting_keeps_the_task_ready"
         );
     }
+
+    /// One per-criterion verdict: the criterion it answers plus the evidence the Owner cited.
+    fn criterion_result(criterion_id: &str, satisfied: bool) -> LoomAcceptanceCriterionResult {
+        LoomAcceptanceCriterionResult {
+            criterion_id: criterion_id.into(),
+            satisfied,
+            evidence_ids: vec!["evidence_one".into()],
+            note: None,
+        }
+    }
+
+    /// Review input pinned to the plan's `ac-v1` snapshot and the local user as reviewer.
+    fn review_input(
+        mission_id: &str,
+        task_id: &str,
+        candidate_id: &str,
+        command_id: &str,
+        verdict: LoomReviewVerdict,
+        reason: &str,
+        criteria_results: Vec<LoomAcceptanceCriterionResult>,
+    ) -> LoomReviewRecordInput {
+        LoomReviewRecordInput {
+            mission_id: mission_id.into(),
+            task_id: task_id.into(),
+            candidate_id: candidate_id.into(),
+            command_id: command_id.into(),
+            acceptance_criteria_version: "ac-v1".into(),
+            verdict,
+            reason: reason.into(),
+            criteria_results,
+            reviewer_id: "local_user".into(),
+        }
+    }
+
+    /// A task already delivered: import → release → claim → candidate, so a Review has
+    /// something real to judge. The plan comes in as an argument because a review test may
+    /// need a non-default dependency condition.
+    fn submitted_candidate(
+        database: &mut OwnedTestDatabase,
+        plan: LoomPlanImportInput,
+        task_id: &str,
+    ) -> LoomCandidateRecordResult {
+        let mission_id = plan.mission_id.clone();
+        plan_import(database, plan).unwrap();
+        task_release(database, release_input(&mission_id, task_id)).unwrap();
+        let claim = claim_acquire(
+            database,
+            claim_input(&mission_id, task_id, "run_one", "command_one"),
+        )
+        .unwrap();
+        candidate_record(
+            database,
+            candidate_input_for(&mission_id, task_id, "run_one", "command_two", &claim),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn accepted_review_moves_the_task_to_done_and_frees_the_downstream() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review accept");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "IN_REVIEW",
+            "assertion a_review_starts_from_a_delivered_task"
+        );
+
+        let reviewed = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "both criteria hold",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            reviewed.task_status,
+            LoomTaskStatus::Done,
+            "assertion an_accepted_review_moves_the_task_to_done"
+        );
+        assert_eq!(
+            reviewed.candidate_acceptance_status,
+            LoomAcceptanceStatus::Accepted,
+            "assertion an_accepted_review_marks_the_candidate_accepted"
+        );
+        assert_eq!(
+            reviewed.released_dependency_ids.len(),
+            1,
+            "assertion an_accepted_review_releases_the_one_downstream_edge"
+        );
+        assert!(
+            !reviewed.replayed,
+            "assertion the_first_verdict_is_not_a_replay"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "DONE",
+            "assertion the_accepted_task_reads_back_done"
+        );
+
+        let dependencies = dependencies_list(&database, &mission_id).unwrap();
+        assert_eq!(
+            dependencies.len(),
+            1,
+            "assertion the_plan_still_holds_its_one_edge"
+        );
+        let resolution = dependencies[0]
+            .resolution
+            .as_ref()
+            .expect("an accepted review must freeze the release trace");
+        assert_eq!(
+            resolution.review_id,
+            Some(reviewed.review.review_id.clone()),
+            "assertion the_released_edge_names_the_accepting_review"
+        );
+    }
+
+    #[test]
+    fn accepted_review_over_an_artifact_edge_freezes_the_candidate_and_review() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review artifact edge");
+        let mut artifact_edge = edge("task_a", "task_b");
+        artifact_edge.condition = Some(LoomDependencyCondition::ArtifactAccepted);
+        let mut artifact_plan = plan_input(&mission_id);
+        artifact_plan.dependencies = vec![artifact_edge];
+        let candidate = submitted_candidate(&mut database, artifact_plan, "task_a");
+        // The contract releases an artifact edge only for a verified candidate; the verdict
+        // alone is not enough, so the verification axis is set before the review runs.
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_candidate SET verification_status='VERIFIED' WHERE candidate_id=?1",
+                [&candidate.candidate_id],
+            )
+            .unwrap();
+
+        let reviewed = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "the artifact satisfies both criteria",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            reviewed.released_dependency_ids.len(),
+            1,
+            "assertion an_accepted_artifact_edge_is_released_by_the_verdict"
+        );
+
+        let dependencies = dependencies_list(&database, &mission_id).unwrap();
+        assert_eq!(
+            dependencies[0].condition,
+            LoomDependencyCondition::ArtifactAccepted,
+            "assertion the_edge_keeps_its_artifact_condition"
+        );
+        let resolution = dependencies[0]
+            .resolution
+            .as_ref()
+            .expect("an accepted artifact edge must freeze its release trace");
+        assert_eq!(
+            resolution.candidate_id,
+            Some(candidate.candidate_id.clone()),
+            "assertion an_artifact_edge_freezes_the_accepted_candidate"
+        );
+        assert_eq!(
+            resolution.review_id,
+            Some(reviewed.review.review_id.clone()),
+            "assertion an_artifact_edge_freezes_the_accepting_review"
+        );
+        assert!(
+            resolution.upstream_task_revision >= 2,
+            "assertion the_frozen_trace_records_the_accepting_task_revision"
+        );
+    }
+
+    #[test]
+    fn an_unverified_candidate_does_not_release_an_artifact_edge() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review unverified edge");
+        let mut artifact_edge = edge("task_a", "task_b");
+        artifact_edge.condition = Some(LoomDependencyCondition::ArtifactAccepted);
+        let mut artifact_plan = plan_input(&mission_id);
+        artifact_plan.dependencies = vec![artifact_edge];
+        let candidate = submitted_candidate(&mut database, artifact_plan, "task_a");
+
+        let reviewed = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "the owner accepted the delivery",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(
+            reviewed.released_dependency_ids.is_empty(),
+            "assertion an_unverified_candidate_releases_no_artifact_edge"
+        );
+        let dependencies = dependencies_list(&database, &mission_id).unwrap();
+        assert!(
+            dependencies[0].resolution.is_none(),
+            "assertion the_unreleased_artifact_edge_keeps_no_trace"
+        );
+    }
+
+    #[test]
+    fn accepted_review_must_answer_every_criterion() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review incomplete");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        let error = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "only the first criterion was checked",
+                vec![criterion_result("criterion_one", true)],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_REVIEW_CRITERIA_INCOMPLETE,
+            "assertion an_accepted_review_must_answer_every_criterion"
+        );
+        assert_eq!(
+            reviews_list(&database, &mission_id).unwrap().len(),
+            0,
+            "assertion an_incomplete_acceptance_writes_no_review"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "IN_REVIEW",
+            "assertion an_incomplete_acceptance_keeps_the_task_in_review"
+        );
+    }
+
+    #[test]
+    fn accepted_review_must_satisfy_every_criterion() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review unsatisfied");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        let error = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "the second criterion is answered but unmet",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", false),
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_REVIEW_CRITERIA_INCOMPLETE,
+            "assertion an_accepted_review_must_satisfy_every_criterion"
+        );
+        assert_eq!(
+            reviews_list(&database, &mission_id).unwrap().len(),
+            0,
+            "assertion an_unsatisfied_acceptance_writes_no_review"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "IN_REVIEW",
+            "assertion an_unsatisfied_acceptance_keeps_the_task_in_review"
+        );
+    }
+
+    #[test]
+    fn a_candidate_can_only_carry_one_review() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review once");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        let rejected = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Rejected,
+                "the second criterion is unmet",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", false),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            rejected.review.verdict,
+            LoomReviewVerdict::Rejected,
+            "assertion the_first_verdict_on_the_candidate_is_recorded"
+        );
+
+        // A second verdict on the same Candidate is refused for that reason, not for the
+        // task state: the candidate already carries a review.
+        let error = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_four",
+                LoomReviewVerdict::Accepted,
+                "accepting the same candidate again",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_REVIEW_EXISTS,
+            "assertion a_candidate_cannot_carry_a_second_review"
+        );
+        assert_eq!(
+            reviews_list(&database, &mission_id).unwrap().len(),
+            1,
+            "assertion the_refused_second_verdict_writes_no_review"
+        );
+    }
+
+    #[test]
+    fn rejected_review_returns_the_task_to_ready_and_releases_nothing() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review reject");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        let reviewed = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Rejected,
+                "the delivery proves nothing about criterion two",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", false),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            reviewed.task_status,
+            LoomTaskStatus::Ready,
+            "assertion a_rejected_review_sends_the_task_back_to_ready"
+        );
+        assert_eq!(
+            reviewed.candidate_acceptance_status,
+            LoomAcceptanceStatus::Rejected,
+            "assertion a_rejected_review_marks_the_candidate_rejected"
+        );
+        assert!(
+            reviewed.released_dependency_ids.is_empty(),
+            "assertion a_rejected_review_releases_no_dependency"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion the_rejected_task_reads_back_ready"
+        );
+
+        let dependencies = dependencies_list(&database, &mission_id).unwrap();
+        assert_eq!(
+            dependencies.len(),
+            1,
+            "assertion the_plan_still_holds_its_one_edge"
+        );
+        assert_eq!(
+            dependencies[0].resolution, None,
+            "assertion a_rejected_review_leaves_the_edge_unresolved"
+        );
+    }
+
+    #[test]
+    fn replayed_review_command_returns_the_recorded_verdict() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review replay");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        let first = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "both criteria hold",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        let replay = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "both criteria hold",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(
+            replay.replayed,
+            "assertion the_second_submission_of_one_command_reports_a_replay"
+        );
+        assert_eq!(
+            replay.review.review_id, first.review.review_id,
+            "assertion a_replay_returns_the_recorded_review_id"
+        );
+        assert_eq!(
+            replay.review.verdict, first.review.verdict,
+            "assertion a_replay_returns_the_recorded_verdict"
+        );
+        assert!(
+            replay.released_dependency_ids.is_empty(),
+            "assertion a_replay_releases_nothing_a_second_time"
+        );
+        assert_eq!(
+            reviews_list(&database, &mission_id).unwrap().len(),
+            1,
+            "assertion a_replay_writes_no_second_review"
+        );
+    }
+
+    #[test]
+    fn recorded_review_cannot_be_rewritten() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review immutable");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        let reviewed = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "both criteria hold",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        let review_id = reviewed.review.review_id.clone();
+
+        let tampered = database.connection().execute(
+            "UPDATE loom_review SET verdict='REJECTED' WHERE review_id=?1",
+            [&review_id],
+        );
+        assert!(
+            tampered.is_err(),
+            "assertion a_recorded_review_verdict_cannot_be_rewritten"
+        );
+        let message = format!("{}", tampered.unwrap_err());
+        assert!(
+            message.contains("immutable"),
+            "assertion the_review_immutable_guard_explains_itself: {message}"
+        );
+
+        let stored = reviews_list(&database, &mission_id).unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "assertion the_refused_rewrite_leaves_one_review"
+        );
+        assert_eq!(
+            stored[0].verdict,
+            LoomReviewVerdict::Accepted,
+            "assertion the_immutable_guard_keeps_the_recorded_verdict"
+        );
+    }
 }
