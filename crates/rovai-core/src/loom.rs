@@ -483,6 +483,7 @@ const LOOM_CLAIM_COMMAND_REUSED: &str = "LOOM_CLAIM_COMMAND_REUSED";
 const LOOM_CLAIM_ABSENT: &str = "LOOM_CLAIM_ABSENT";
 const LOOM_CLAIM_EXPIRED: &str = "LOOM_CLAIM_EXPIRED";
 const LOOM_CLAIM_AGENT_RUN_MISMATCH: &str = "LOOM_CLAIM_AGENT_RUN_MISMATCH";
+const LOOM_CLAIM_FENCE_STALE: &str = "LOOM_CLAIM_FENCE_STALE";
 const LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH: &str =
     "LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH";
 const LOOM_CANDIDATE_COMMAND_REUSED: &str = "LOOM_CANDIDATE_COMMAND_REUSED";
@@ -1312,13 +1313,18 @@ impl LoomAcceptanceStatus {
 }
 
 /// Candidate input: the delivery one Run submits for the Task it still holds. `commandId`
-/// is the idempotency key, and `agentRunId` is the fence the Run presents.
+/// is the idempotency key, and the identity of the holding lease — `agentRunId`, `claimId`
+/// and `fenceGeneration` — is the fence the Run presents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoomCandidateRecordInput {
     pub mission_id: String,
     pub task_id: String,
     pub agent_run_id: String,
+    /// The claim the Run believes it holds; a takeover by a later generation replaces it.
+    pub claim_id: String,
+    /// The fence generation of that claim, so a stale lease cannot submit after a takeover.
+    pub fence_generation: i64,
     pub command_id: String,
     pub content_hash: String,
     #[serde(default)]
@@ -1407,19 +1413,22 @@ impl StoredCandidate {
     }
 }
 
-/// The live claim a submitting Run must hold: the fence is the Run identity plus an
-/// unexpired lease, never a task state alone.
+/// The live claim a submitting Run must hold: the fence is the Run identity, the claim
+/// identity, the fence generation and an unexpired lease, never a task state alone.
 struct LiveClaim {
     claim_id: String,
     agent_run_id: String,
+    fence_generation: i64,
     lease_expires_at: String,
 }
 
 /// LOOM candidate path: a Run submits the delivery for the Task it holds, and the Task
-/// moves `READY` → `IN_REVIEW`. The Run must still hold a live claim whose `agentRunId`
-/// matches the submission (the submit-side fence), the acceptance criteria version must be
-/// the Plan's own, and everything is checked and written in one immediate transaction so a
-/// rejected submission leaves neither a candidate nor a moved Task behind.
+/// moves `READY` → `IN_REVIEW`. The Run must still hold a live claim whose `agentRunId`,
+/// `claimId` and `fenceGeneration` match the submission (the submit-side fence), the
+/// acceptance criteria version must be the Plan's own, and everything is checked and
+/// written in one immediate transaction so a rejected submission leaves neither a candidate
+/// nor a moved Task behind. The clock is read after the write lock is held, because a lease
+/// that lapses while the command waits for the lock is expired, not still live.
 pub fn candidate_record(
     database: &mut Database,
     input: LoomCandidateRecordInput,
@@ -1427,6 +1436,8 @@ pub fn candidate_record(
     let mission_id = required_field("candidate record", "missionId", &input.mission_id)?;
     let task_id = required_field("candidate record", "taskId", &input.task_id)?;
     let agent_run_id = required_field("candidate record", "agentRunId", &input.agent_run_id)?;
+    let claim_id = required_field("candidate record", "claimId", &input.claim_id)?;
+    let fence_generation = input.fence_generation;
     let command_id = required_field("candidate record", "commandId", &input.command_id)?;
     let content_hash = required_field("candidate record", "contentHash", &input.content_hash)?;
     let acceptance_criteria_version = required_field(
@@ -1452,12 +1463,16 @@ pub fn candidate_record(
         .map(str::trim)
         .filter(|candidate_id| !candidate_id.is_empty())
         .map(str::to_string);
-    let now = chrono::Utc::now();
-    let created_at = now.to_rfc3339();
 
     let transaction = database
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Read the clock only once the write lock is held: the lease is judged against the time
+    // inside the transaction, so a lease that lapsed while this command waited for the lock
+    // is seen as expired. `created_at` reuses that same instant, so one transaction never
+    // stamps two different times.
+    let now = chrono::Utc::now();
+    let created_at = now.to_rfc3339();
     let mission_exists: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM mission WHERE id=?1)",
         [&mission_id],
@@ -1551,14 +1566,15 @@ pub fn candidate_record(
     // Submit-side fence: the Task must still be held by this very Run on a live lease.
     let claim: Option<LiveClaim> = transaction
         .query_row(
-            "SELECT claim_id, agent_run_id, lease_expires_at FROM loom_claim
+            "SELECT claim_id, agent_run_id, fence_generation, lease_expires_at FROM loom_claim
              WHERE plan_id=?1 AND task_id=?2 AND released_at IS NULL",
             params![&plan_id, &task_id],
             |row| {
                 Ok(LiveClaim {
                     claim_id: row.get(0)?,
                     agent_run_id: row.get(1)?,
-                    lease_expires_at: row.get(2)?,
+                    fence_generation: row.get(2)?,
+                    lease_expires_at: row.get(3)?,
                 })
             },
         )
@@ -1584,6 +1600,27 @@ pub fn candidate_record(
             format!(
                 "task {task_id} is held by claim {} for agentRun {}, not {agent_run_id}",
                 claim.claim_id, claim.agent_run_id
+            ),
+        ));
+    }
+    // The Run identity alone is not the fence: the same agentRun may take the Task over with
+    // a new commandId after its old lease expired, which replaces the claim and advances the
+    // generation. A submission carrying the previous pair is a stale lease and is refused.
+    if claim.claim_id != claim_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_FENCE_STALE,
+            format!(
+                "task {task_id} is held by claim {}, not the stale claim {claim_id}",
+                claim.claim_id
+            ),
+        ));
+    }
+    if claim.fence_generation != fence_generation {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_FENCE_STALE,
+            format!(
+                "claim {} on task {task_id} is at fence generation {}, not the stale generation {fence_generation}",
+                claim.claim_id, claim.fence_generation
             ),
         ));
     }
@@ -2793,22 +2830,46 @@ mod tests {
         );
     }
 
+    /// Candidate input presenting an explicit fence pair; most tests use
+    /// [`candidate_input_for`] instead of naming a claim by hand.
     fn candidate_input(
         mission_id: &str,
         task_id: &str,
         agent_run_id: &str,
         command_id: &str,
+        claim_id: &str,
+        fence_generation: i64,
     ) -> LoomCandidateRecordInput {
         LoomCandidateRecordInput {
             mission_id: mission_id.into(),
             task_id: task_id.into(),
             agent_run_id: agent_run_id.into(),
+            claim_id: claim_id.into(),
+            fence_generation,
             command_id: command_id.into(),
             content_hash: "sha256:candidate".into(),
             evidence_ids: vec!["evidence_one".into(), "evidence_two".into()],
             acceptance_criteria_version: "ac-v1".into(),
             previous_candidate_id: None,
         }
+    }
+
+    /// The same input, fenced to the claim the test actually holds.
+    fn candidate_input_for(
+        mission_id: &str,
+        task_id: &str,
+        agent_run_id: &str,
+        command_id: &str,
+        claim: &LoomClaimAcquireResult,
+    ) -> LoomCandidateRecordInput {
+        candidate_input(
+            mission_id,
+            task_id,
+            agent_run_id,
+            command_id,
+            &claim.claim_id,
+            claim.fence_generation,
+        )
     }
 
     fn candidate_rows(database: &Database) -> i64 {
@@ -2862,7 +2923,7 @@ mod tests {
             )
             .unwrap();
         task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
-        claim_acquire(
+        let claim = claim_acquire(
             &mut database,
             claim_input(&mission_id, "task_a", "run_one", "command_one"),
         )
@@ -2870,7 +2931,7 @@ mod tests {
 
         let recorded = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap();
         assert_eq!(
@@ -2957,7 +3018,7 @@ mod tests {
 
         let error = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap_err();
         assert_eq!(
@@ -2986,11 +3047,11 @@ mod tests {
     fn candidate_record_is_rejected_when_another_run_holds_the_claim() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate fence");
-        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
 
         let error = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_two", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_two", "command_two", &claim),
         )
         .unwrap_err();
         assert_eq!(
@@ -3019,7 +3080,14 @@ mod tests {
 
         let unclaimed = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input(
+                &mission_id,
+                "task_a",
+                "run_one",
+                "command_two",
+                "claim_none",
+                1,
+            ),
         )
         .unwrap_err();
         assert_eq!(
@@ -3044,7 +3112,14 @@ mod tests {
             .unwrap();
         let released = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input(
+                &mission_id,
+                "task_a",
+                "run_one",
+                "command_two",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
         )
         .unwrap_err();
         assert_eq!(
@@ -3068,9 +3143,10 @@ mod tests {
     fn candidate_record_is_rejected_when_the_criteria_version_differs() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate criteria");
-        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
 
-        let mut input = candidate_input(&mission_id, "task_a", "run_one", "command_two");
+        let mut input =
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim);
         input.acceptance_criteria_version = "ac-v2".into();
         let error = candidate_record(&mut database, input).unwrap_err();
         assert_eq!(
@@ -3094,14 +3170,23 @@ mod tests {
     fn candidate_record_rejects_a_previous_candidate_of_another_task() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate chain");
-        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
         let first = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap();
 
-        let mut input = candidate_input(&mission_id, "task_b", "run_two", "command_three");
+        // The previous-candidate check fires before the claim fence, so this submission
+        // names no real claim: the chain is what is under test here.
+        let mut input = candidate_input(
+            &mission_id,
+            "task_b",
+            "run_two",
+            "command_three",
+            "claim_none",
+            1,
+        );
         input.previous_candidate_id = Some(first.candidate_id.clone());
         let error = candidate_record(&mut database, input).unwrap_err();
         assert_eq!(
@@ -3120,16 +3205,16 @@ mod tests {
     fn replayed_candidate_command_returns_the_original_candidate() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate replay");
-        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
 
         let first = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap();
         let replay = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap();
         assert_eq!(
@@ -3157,7 +3242,14 @@ mod tests {
 
         let reused = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_b", "run_one", "command_two"),
+            candidate_input(
+                &mission_id,
+                "task_b",
+                "run_one",
+                "command_two",
+                "claim_none",
+                1,
+            ),
         )
         .unwrap_err();
         assert_eq!(
@@ -3169,7 +3261,7 @@ mod tests {
         // The task is already IN_REVIEW, so a fresh command cannot submit a second delivery.
         let twice = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_three"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_three", &claim),
         )
         .unwrap_err();
         assert_eq!(
@@ -3188,7 +3280,7 @@ mod tests {
     fn failed_task_transition_rolls_back_the_candidate() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate rollback");
-        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
         database
             .connection()
             .execute_batch(
@@ -3199,7 +3291,7 @@ mod tests {
 
         let error = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap_err();
         assert!(
@@ -3225,7 +3317,7 @@ mod tests {
         // The same command commits as one unit once the fault is gone.
         let retried = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap();
         assert_eq!(
@@ -3245,10 +3337,10 @@ mod tests {
     fn recorded_candidate_content_cannot_be_rewritten() {
         let mut database = fixture();
         let mission_id = create_mission(&mut database, "LOOM candidate immutable");
-        held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
         let recorded = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap();
 
@@ -3284,7 +3376,7 @@ mod tests {
             .unwrap();
         let replay = candidate_record(
             &mut database,
-            candidate_input(&mission_id, "task_a", "run_one", "command_two"),
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
         )
         .unwrap();
         assert!(replay.replayed, "assertion replay_reports_that_it_replayed");
@@ -3292,6 +3384,168 @@ mod tests {
             replay.acceptance_status,
             LoomAcceptanceStatus::Accepted,
             "assertion replay_reads_the_stored_verdict_instead_of_rewriting_it"
+        );
+    }
+
+    #[test]
+    fn candidate_record_rejects_a_submission_from_a_superseded_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate stale fence");
+        let stale = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+
+        // The same agentRun takes the Task over with a new commandId once the lease lapsed:
+        // the old claim is released, a new claim is written and the fence generation advances,
+        // so `agentRunId` alone no longer identifies the live lease.
+        expire_lease(&database, &stale.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+        assert_ne!(
+            takeover.claim_id, stale.claim_id,
+            "assertion the_takeover_writes_a_new_claim"
+        );
+        assert_eq!(
+            takeover.fence_generation,
+            stale.fence_generation + 1,
+            "assertion the_takeover_advances_the_fence_generation"
+        );
+
+        // A delayed submission that still presents the superseded claim is refused even
+        // though its agentRunId is unchanged.
+        let superseded = candidate_record(
+            &mut database,
+            candidate_input(
+                &mission_id,
+                "task_a",
+                "run_one",
+                "command_three",
+                &stale.claim_id,
+                stale.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&superseded),
+            LOOM_CLAIM_FENCE_STALE,
+            "assertion a_submission_from_a_superseded_claim_is_refused"
+        );
+
+        // The claim identity alone is not enough either: a stale generation under the live
+        // claim id is the same delayed lease and is refused the same way.
+        let stale_generation = candidate_record(
+            &mut database,
+            candidate_input(
+                &mission_id,
+                "task_a",
+                "run_one",
+                "command_three",
+                &takeover.claim_id,
+                stale.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&stale_generation),
+            LOOM_CLAIM_FENCE_STALE,
+            "assertion a_submission_carrying_a_stale_fence_generation_is_refused"
+        );
+
+        assert_eq!(
+            candidate_rows(&database),
+            0,
+            "assertion a_stale_fence_submission_writes_no_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion a_stale_fence_submission_keeps_the_task_ready"
+        );
+        assert_eq!(
+            task_revision(&database, "task_a"),
+            2,
+            "assertion a_stale_fence_submission_does_not_bump_the_task_revision"
+        );
+
+        // The takeover's own submission still lands, so only the stale pair was refused.
+        let current = candidate_record(
+            &mut database,
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_four", &takeover),
+        )
+        .unwrap();
+        assert!(
+            !current.replayed,
+            "assertion the_live_claim_submits_a_fresh_candidate"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            1,
+            "assertion the_live_claim_writes_exactly_one_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "IN_REVIEW",
+            "assertion the_live_claim_advances_the_task_to_in_review"
+        );
+    }
+
+    #[test]
+    fn candidate_record_judges_the_lease_against_the_time_inside_the_transaction() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM candidate clock");
+        let claim = held_task(&mut database, &mission_id, "task_a", "run_one", "command_one");
+
+        // The lease is still live when the command starts and lapses while the command waits
+        // for the write lock, so a clock read before the lock would still see it as live and
+        // let the submission through. Only a post-lock clock sees it as expired.
+        let short_lease = chrono::Utc::now() + chrono::Duration::milliseconds(300);
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET lease_expires_at=?1 WHERE claim_id=?2",
+                params![short_lease.to_rfc3339(), &claim.claim_id],
+            )
+            .unwrap();
+        database
+            .connection()
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+
+        // A second connection holds the write lock until after that lease lapsed, so the
+        // submission genuinely waits for it instead of being fenced by an aged row.
+        let (locked, waiting) = std::sync::mpsc::channel();
+        let database_path = database.path().to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let connection = rusqlite::Connection::open(&database_path).unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            connection.execute_batch("COMMIT").unwrap();
+        });
+        waiting.recv().unwrap();
+
+        let error = candidate_record(
+            &mut database,
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
+        )
+        .unwrap_err();
+        holder.join().unwrap();
+
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_EXPIRED,
+            "assertion a_lease_that_lapses_while_waiting_for_the_lock_is_expired"
+        );
+        assert_eq!(
+            candidate_rows(&database),
+            0,
+            "assertion a_lease_lost_while_waiting_writes_no_candidate"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion a_lease_lost_while_waiting_keeps_the_task_ready"
         );
     }
 }
