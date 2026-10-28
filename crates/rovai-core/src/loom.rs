@@ -3168,9 +3168,7 @@ pub fn verification_record(
     // Both axes stay independent: a mismatch refuses the *passing* claim, it does not accept or
     // reject the delivery, and recording a failure is still allowed.
     let candidate_evidence: Vec<String> = serde_json::from_str(&candidate_evidence_json)
-        .with_context(|| {
-            format!("LOOM candidate {candidate_id} has unreadable evidence ids")
-        })?;
+        .with_context(|| format!("LOOM candidate {candidate_id} has unreadable evidence ids"))?;
     let mut checked_evidence = candidate_evidence;
     for evidence_id in &input.evidence_ids {
         if !checked_evidence.contains(evidence_id) {
@@ -6794,7 +6792,10 @@ mod tests {
             "UPDATE loom_artifact SET sha256=?2 WHERE artifact_id=?1",
             params![&artifact.artifact_id, &other_digest],
         );
-        assert!(update.is_err(), "assertion an artifact digest cannot be rewritten");
+        assert!(
+            update.is_err(),
+            "assertion an artifact digest cannot be rewritten"
+        );
         let stored: String = database
             .connection()
             .query_row(
@@ -6803,7 +6804,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, artifact.sha256, "assertion the refused update changed nothing");
+        assert_eq!(
+            stored, artifact.sha256,
+            "assertion the refused update changed nothing"
+        );
         let delete = database.connection().execute(
             "DELETE FROM loom_artifact WHERE artifact_id=?1",
             [&artifact.artifact_id],
