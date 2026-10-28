@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -138,6 +140,10 @@ jobs:
           pnpm typecheck
           pnpm exec vitest run
 
+      - name: Run LOOM contract tests
+        if: steps.changes.outputs.node == 'true'
+        run: pnpm exec vitest run packages/contracts/src/loom.test.ts
+
       - name: Run diff-aware documentation governance
         if: steps.changes.outputs.docs == 'true'
         env:
@@ -169,6 +175,10 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo check --workspace
+
+      - name: Run LOOM domain tests
+        if: steps.changes.outputs.rust == 'true'
+        run: cargo test -p rovai-core --lib loom
 
       - name: Report no-op gate
         if: steps.changes.outputs.node != 'true' && steps.changes.outputs.rust != 'true' && steps.changes.outputs.docs != 'true' && steps.changes.outputs.skills != 'true'
