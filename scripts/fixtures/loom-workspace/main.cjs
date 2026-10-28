@@ -116,6 +116,62 @@ app.whenReady().then(async () => {
     return area.value
   })()`)
   const writeLog = () => script('window.loomQA.writes')
+  // 写后回读的精确预算：六个读方法各「挂载 1 次 + 写后刷新 1 次」，多一次少一次都 FAIL。
+  // activity / delivery / tasks 沿用本文件既有计数规则（前两个恒为 1，tasks 只要求被读过）。
+  const expectWriteReadback = async label => {
+    const counts = await script(`({
+      activity: window.loomQA.countOf('missions.activity'),
+      delivery: window.loomQA.countOf('missions.delivery'),
+      tasks: window.loomQA.countOf('preferences.tasks.get'),
+      plan: window.loomQA.countOf('loom.plan.get'),
+      tasksList: window.loomQA.countOf('loom.tasks.list'),
+      dependencies: window.loomQA.countOf('loom.dependencies.list'),
+      candidates: window.loomQA.countOf('loom.candidates.list'),
+      reviews: window.loomQA.countOf('loom.reviews.list'),
+      verifications: window.loomQA.countOf('loom.verifications.list')
+    })`)
+    assert.equal(counts.activity, 1, `${label} repeated the activity read: ${JSON.stringify(counts)}`)
+    assert.equal(counts.delivery, 1, `${label} repeated the delivery read: ${JSON.stringify(counts)}`)
+    assert.ok(counts.tasks >= 1, `${label} never read the task capability snapshot: ${JSON.stringify(counts)}`)
+    for (const method of ['plan', 'tasksList', 'dependencies', 'candidates', 'reviews', 'verifications']) {
+      assert.equal(counts[method], 2,
+        `${label} must re-read ${method} exactly once after the write (1 mount + 1 refresh): ${JSON.stringify(counts)}`)
+    }
+    return counts
+  }
+  // 回读不能只是夹具内存变了：切到「编排」tab 看任务节点是否真的被推进，再切回「交付」看徽章。
+  // 节点没有 data-task-id，用夹具里唯一的任务标题定位。
+  const TARGET_TASK_TITLE = '实现恢复逻辑'
+  const flowNodeState = title => script(`(() => {
+    const node = [...document.querySelectorAll('.loom-plan .loom-flow-node')]
+      .find(entry => (entry.querySelector('.loom-flow-node-title')?.innerText ?? '') === ${JSON.stringify(title)})
+    if (!node) return null
+    return {
+      status: node.querySelector('.loom-flow-node-dot')?.getAttribute('data-status') ?? null,
+      copy: node.querySelector('.loom-flow-node-status')?.innerText ?? null,
+      className: node.className
+    }
+  })()`)
+  const openPlanTab = async label => {
+    await click('.loom-section-tabs button:nth-of-type(2)')
+    await expectPressed(1, `编排 did not open to check ${label}`)
+    await waitFor("document.querySelectorAll('.loom-plan .loom-flow-node').length > 0",
+      `编排 flow nodes did not render to check ${label}`)
+  }
+  const waitFlowNode = async (title, predicate, message) => {
+    const deadline = Date.now() + 8000
+    while (Date.now() < deadline) {
+      const state = await flowNodeState(title)
+      if (state !== null && predicate(state)) return state
+      await sleep(30)
+    }
+    throw new Error(`${message}: ${JSON.stringify(await flowNodeState(title))}`)
+  }
+  const backToDelivery = async label => {
+    await click('.loom-section-tabs button:nth-of-type(3)')
+    await expectPressed(2, `Delivery did not reopen after checking ${label}`)
+    await waitFor(`!!(${cardFor(TARGET_CANDIDATE)})`, `The target candidate card is missing after checking ${label}`)
+  }
   // 逐条结论按 criterionId 绑定：只认渲染出来的「cN · 满足 / 未满足」两行。
   const criterionVerdicts = reviewText => reviewText.split('\n').map(line => line.trim())
     .filter(line => / · (未)?满足$/.test(line))
@@ -221,6 +277,7 @@ app.whenReady().then(async () => {
       nodeCount: nodes.length,
       firstTitle: nodes[0]?.querySelector('.loom-flow-node-title')?.innerText ?? null,
       blockedCopy: blocked?.innerText ?? '',
+      statusCopies: nodes.map(node => node.querySelector('.loom-flow-node-status')?.innerText ?? null),
       stats: document.querySelector('.loom-plan .loom-flow-stats')?.innerText ?? '',
       edgeCount: document.querySelectorAll('.loom-plan .loom-flow-edge').length,
       dashedCount: document.querySelectorAll('.loom-plan .loom-flow-edge-artifact-accepted').length,
@@ -236,6 +293,19 @@ app.whenReady().then(async () => {
   assert(plan.firstTitle?.includes('设计恢复协议'), `Plan flow lost its first task title: ${JSON.stringify(plan.firstTitle)}`)
   assert(plan.blockedCopy.includes('等待恢复逻辑完成'), `Plan flow lost the real blocked reason: ${JSON.stringify(plan.blockedCopy)}`)
   assert(plan.stats.includes('总任务: 4'), `Plan flow stats no longer count the real tasks: ${JSON.stringify(plan.stats)}`)
+  // 可执行 = 依赖已释放且任务处于可领取状态：基线里只有 task-3 可领取（in_review 仍算可领取），
+  // 阻塞只数 blocked，所以两个计数不随 ready→in_review 的修正变化。
+  assert(plan.stats.includes('可执行: 1'), `Plan flow stats lost the one claimable task: ${JSON.stringify(plan.stats)}`)
+  assert(plan.stats.includes('阻塞: 1'), `Plan flow stats lost the one blocked task: ${JSON.stringify(plan.stats)}`)
+  // 节点文案必须是指挥层真实状态机：task-3 的候选已提交，所以是「评审中」而不是「就绪」。
+  assert.equal(plan.statusCopies.filter(copy => copy === '评审中').length, 1,
+    `Plan flow lost the in-review task after the baseline fix: ${JSON.stringify(plan.statusCopies)}`)
+  assert.equal(plan.statusCopies.filter(copy => copy === '就绪').length, 0,
+    `Plan flow must not show a ready task while the reviewed one is in review: ${JSON.stringify(plan.statusCopies)}`)
+  assert.equal(plan.statusCopies.filter(copy => copy === '已完成').length, 2,
+    `Plan flow lost the two finished tasks: ${JSON.stringify(plan.statusCopies)}`)
+  assert.equal(plan.statusCopies.filter(copy => copy === '阻塞').length, 1,
+    `Plan flow lost the blocked task status copy: ${JSON.stringify(plan.statusCopies)}`)
   assert.equal(plan.edgeCount, 3, `Plan flow must draw one edge per mock dependency: ${JSON.stringify(plan.edgeCount)}`)
   assert(plan.dashedCount >= 1, `Plan flow lost the dashed artifact_accepted edge: ${JSON.stringify(plan.dashedCount)}`)
   assert(plan.laneCount >= 2, `Plan flow must layer the DAG into depth lanes: ${JSON.stringify(plan.laneCount)}`)
@@ -509,11 +579,30 @@ app.whenReady().then(async () => {
   assert.equal(reviewWrite.receipt.candidateAcceptanceStatus, 'accepted', `Receipt acceptance status is wrong: ${JSON.stringify(reviewWrite.receipt.candidateAcceptanceStatus)}`)
   assert.deepEqual(reviewWrite.receipt.releasedDependencyIds, [], `Receipt released dependencies it never evaluated: ${JSON.stringify(reviewWrite.receipt.releasedDependencyIds)}`)
   assert.equal(reviewWrite.receipt.replayed, false, `A first acceptance must not claim replay: ${JSON.stringify(reviewWrite.receipt.replayed)}`)
+  // 回执里的身份是 Core 注入的，绝不回显客户端：CURRENT_USER_ID = local_user。
+  assert.equal(reviewWrite.receipt.review.reviewerId, 'local_user',
+    `The review receipt must carry the Core-owned current user identity: ${JSON.stringify(reviewWrite.receipt.review)}`)
   assert.equal(acceptTask.status, 'done', 'The read-back task status must follow the acceptance receipt')
   assert.equal(acceptState.candidates.find(candidate => candidate.candidateId === 'candidate-2').acceptanceStatus, 'accepted',
     'The read-back candidate must carry the accepted verdict')
   assert.equal(acceptState.reviews.filter(review => review.candidateId === 'candidate-2').length, 1, 'The review write must add exactly one row')
-  assert.equal(await script("window.loomQA.countOf('loom.candidates.list')"), 2, 'The accepted verdict must be re-read exactly once after the write')
+  await expectWriteReadback('Accept')
+  // 回读得是 UI 真的换了：编排 tab 的任务节点已经随接受推到完成。
+  await openPlanTab('the accepted review')
+  const acceptedNode = await waitFlowNode(TARGET_TASK_TITLE, state => state.status === 'done',
+    '编排 never showed the accepted task as done')
+  assert.equal(acceptedNode.status, 'done',
+    `An accepted review must show the task node data-status done: ${JSON.stringify(acceptedNode)}`)
+  assert.equal(acceptedNode.copy, '已完成',
+    `An accepted review must show the done status copy: ${JSON.stringify(acceptedNode)}`)
+  assert.equal(acceptedNode.className.split(' ').includes('done'), true,
+    `The accepted task node must carry the done status class: ${JSON.stringify(acceptedNode)}`)
+  await backToDelivery('the accepted review')
+  const acceptedStill = await cardState(TARGET_CANDIDATE)
+  assert.equal(acceptedStill.acceptanceState, 'accepted',
+    `The acceptance badge fell back to stale data after the section round trip: ${JSON.stringify(acceptedStill)}`)
+  assert.equal(acceptedStill.acceptanceCopy, '已验收',
+    `The acceptance badge copy fell back to stale data after the section round trip: ${JSON.stringify(acceptedStill)}`)
   cases.push('接受 stays blocked until every criterion is checked and the reason is non-blank, writes exactly one loom.review.record, reads accepted back and leaves the verification axis untouched')
 
   stage = 'delivery rejection chain'
@@ -576,10 +665,33 @@ app.whenReady().then(async () => {
   assert.equal(rejectWrite.receipt.candidateAcceptanceStatus, 'rejected', `Reject receipt acceptance status is wrong: ${JSON.stringify(rejectWrite.receipt.candidateAcceptanceStatus)}`)
   assert.deepEqual(rejectWrite.receipt.releasedDependencyIds, [], `Reject receipt released dependencies it never evaluated: ${JSON.stringify(rejectWrite.receipt.releasedDependencyIds)}`)
   assert.equal(rejectWrite.receipt.replayed, false, `A first rejection must not claim replay: ${JSON.stringify(rejectWrite.receipt.replayed)}`)
+  assert.equal(rejectWrite.receipt.review.reviewerId, 'local_user',
+    `The rejection receipt must carry the Core-owned current user identity: ${JSON.stringify(rejectWrite.receipt.review)}`)
   assert.equal(rejectState.tasks.find(task => task.taskId === 'task-3').status, 'ready', 'The read-back task status must follow the rejection receipt')
   assert.equal(rejectState.candidates.find(candidate => candidate.candidateId === 'candidate-2').acceptanceStatus, 'rejected',
     'The read-back candidate must carry the rejected verdict')
   assert.equal(rejectState.reviews.filter(review => review.candidateId === 'candidate-2').length, 1, 'The rejection write must add exactly one row')
+  await expectWriteReadback('Reject')
+  // 驳回把任务送回 READY：编排 tab 的节点必须回到可执行（就绪），不是停在评审中。
+  await openPlanTab('the rejected review')
+  const rejectedNode = await waitFlowNode(TARGET_TASK_TITLE, state => state.status === 'ready',
+    '编排 never showed the rejected task back in ready')
+  assert.equal(rejectedNode.status, 'ready',
+    `A rejected review must show the task node data-status ready: ${JSON.stringify(rejectedNode)}`)
+  assert.equal(rejectedNode.copy, '就绪',
+    `A rejected review must show the ready status copy: ${JSON.stringify(rejectedNode)}`)
+  assert.equal(rejectedNode.className.split(' ').includes('ready'), true,
+    `The rejected task node must be claimable again (ready): ${JSON.stringify(rejectedNode)}`)
+  assert.equal(rejectedNode.className.split(' ').includes('in_review'), false,
+    `The rejected task node must leave in_review: ${JSON.stringify(rejectedNode)}`)
+  assert.equal(rejectedNode.className.split(' ').includes('done'), false,
+    `A rejection must not leave the task node in done: ${JSON.stringify(rejectedNode)}`)
+  await backToDelivery('the rejected review')
+  const rejectedStill = await cardState(TARGET_CANDIDATE)
+  assert.equal(rejectedStill.acceptanceState, 'rejected',
+    `The rejection badge fell back to stale data after the section round trip: ${JSON.stringify(rejectedStill)}`)
+  assert.equal(rejectedStill.acceptanceCopy, '已驳回',
+    `The rejection badge copy fell back to stale data after the section round trip: ${JSON.stringify(rejectedStill)}`)
   cases.push('驳回 requires a reason but no criterion checks, writes exactly one loom.review.record, reads rejected back and leaves the verification axis untouched')
 
   stage = 'delivery verification passed'
@@ -623,12 +735,28 @@ app.whenReady().then(async () => {
   assert.equal(verifiedWrite.receipt.candidateVerificationStatus, 'verified', `Verify receipt status is wrong: ${JSON.stringify(verifiedWrite.receipt.candidateVerificationStatus)}`)
   assert.deepEqual(verifiedWrite.receipt.releasedDependencyIds, [], `Verify receipt released dependencies it never evaluated: ${JSON.stringify(verifiedWrite.receipt.releasedDependencyIds)}`)
   assert.equal(verifiedWrite.receipt.replayed, false, `A first verification must not claim replay: ${JSON.stringify(verifiedWrite.receipt.replayed)}`)
+  assert.equal(verifiedWrite.receipt.verification.executorId, 'local_user',
+    `The verification receipt must carry the Core-owned current user identity: ${JSON.stringify(verifiedWrite.receipt.verification)}`)
   assert.equal(verifiedState.candidates.find(candidate => candidate.candidateId === 'candidate-2').verificationStatus, 'verified',
     'The read-back candidate must carry the verified status')
   assert.equal(verifiedState.candidates.find(candidate => candidate.candidateId === 'candidate-2').acceptanceStatus, 'pending',
     'Verifying must leave the acceptance axis pending')
   assert.equal(verifiedState.verifications.filter(verification => verification.candidateId === 'candidate-2').length, 1, 'The verification write must add exactly one row')
-  assert.equal(await script("window.loomQA.countOf('loom.verifications.list')"), 2, 'The verified status must be re-read exactly once after the write')
+  await expectWriteReadback('Verify')
+  // 核验只动核验轴：编排 tab 的任务仍然停在 in_review，徽章在切回来之后仍是新状态。
+  await openPlanTab('the passed verification')
+  const verifiedNode = await waitFlowNode(TARGET_TASK_TITLE, state => state.status === 'in_review',
+    '编排 never showed the verified task still in review')
+  assert.equal(verifiedNode.copy, '评审中',
+    `A verification must not move the task status copy: ${JSON.stringify(verifiedNode)}`)
+  await backToDelivery('the passed verification')
+  const verifiedStill = await cardState(TARGET_CANDIDATE)
+  assert.equal(verifiedStill.verificationState, 'verified',
+    `The verification badge fell back to stale data after the section round trip: ${JSON.stringify(verifiedStill)}`)
+  assert.equal(verifiedStill.verificationCopy, '已核验',
+    `The verification badge copy fell back to stale data after the section round trip: ${JSON.stringify(verifiedStill)}`)
+  assert.equal(verifiedStill.acceptanceState, 'pending',
+    `The acceptance axis must stay pending after the section round trip: ${JSON.stringify(verifiedStill)}`)
   cases.push('通过核验 writes exactly one loom.verification.record with the manual method, reads verified back and keeps the acceptance axis pending with its buttons')
 
   stage = 'delivery verification failed'
@@ -669,9 +797,25 @@ app.whenReady().then(async () => {
   assert.equal(failedWrite.receipt.candidateVerificationStatus, 'failed', `Failed receipt status is wrong: ${JSON.stringify(failedWrite.receipt.candidateVerificationStatus)}`)
   assert.deepEqual(failedWrite.receipt.releasedDependencyIds, [], `Failed receipt released dependencies it never evaluated: ${JSON.stringify(failedWrite.receipt.releasedDependencyIds)}`)
   assert.equal(failedWrite.receipt.replayed, false, `A first failed verification must not claim replay: ${JSON.stringify(failedWrite.receipt.replayed)}`)
+  assert.equal(failedWrite.receipt.verification.executorId, 'local_user',
+    `The failed verification receipt must carry the Core-owned current user identity: ${JSON.stringify(failedWrite.receipt.verification)}`)
   assert.equal(failedState.candidates.find(candidate => candidate.candidateId === 'candidate-2').verificationStatus, 'failed',
     'The read-back candidate must carry the failed status')
   assert.equal(failedState.verifications.filter(verification => verification.candidateId === 'candidate-2').length, 1, 'The failed verification write must add exactly one row')
+  await expectWriteReadback('Failed verification')
+  await openPlanTab('the failed verification')
+  const failedNode = await waitFlowNode(TARGET_TASK_TITLE, state => state.status === 'in_review',
+    '编排 never showed the failed verification task still in review')
+  assert.equal(failedNode.copy, '评审中',
+    `A failed verification must not move the task status copy: ${JSON.stringify(failedNode)}`)
+  await backToDelivery('the failed verification')
+  const failedStill = await cardState(TARGET_CANDIDATE)
+  assert.equal(failedStill.verificationState, 'failed',
+    `The failed badge fell back to stale data after the section round trip: ${JSON.stringify(failedStill)}`)
+  assert.equal(failedStill.verificationCopy, '核验失败',
+    `The failed badge copy fell back to stale data after the section round trip: ${JSON.stringify(failedStill)}`)
+  assert.equal(failedStill.acceptanceState, 'pending',
+    `A failed verification must leave the acceptance axis pending after the round trip: ${JSON.stringify(failedStill)}`)
   cases.push('核验失败 writes exactly one loom.verification.record from its own initial state, reads the failed badge back and keeps the acceptance axis pending with its buttons')
 
   assert.deepEqual(await script('window.loomQA.errors'), [], 'The delivery write cases requested a method the fixture did not answer')

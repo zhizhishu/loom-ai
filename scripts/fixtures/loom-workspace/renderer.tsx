@@ -40,6 +40,9 @@ type LoomQa = {
 declare global { interface Window { loomQA: LoomQa } }
 
 const createdAt = '2026-09-27T08:00:00.000Z'
+// 候选提交把 ready 推进到 in_review：真实 Core 在同一条命令里把任务 updated_at 推到提交时刻、revision +1，
+// 夹具跟着这两个一致性字段走，不造一个「状态变了但时间线没变」的假基线。
+const submittedAt = '2026-09-27T08:30:00.000Z'
 const baseSha = 'a'.repeat(40)
 
 function agentProfile(agentId: string, displayName: string, memberOrder: number): AgentProfile {
@@ -96,12 +99,15 @@ const tasks: LoomTask[] = [
     acceptanceCriteria: plan.acceptanceCriteria,
     blockedReason: null, createdAt, updatedAt: createdAt, revision: 1
   },
+  // task-3 的候选已提交，所以基线状态是 in_review（ready → in_review 由候选提交完成）。
+  // 真实 Core 只允许 in_review 的任务被评审（LOOM_TASK_NOT_IN_REVIEW），夹具不再留一条
+  // 「ready 直接接受评审」的迁移给 UI 走。
   {
     taskId: 'task-3', planId: plan.planId,
     title: '实现恢复逻辑', description: '从快照恢复工作区状态',
-    assigneeAgentId: 'agent-build', status: 'ready',
+    assigneeAgentId: 'agent-build', status: 'in_review',
     acceptanceCriteria: plan.acceptanceCriteria,
-    blockedReason: null, createdAt, updatedAt: createdAt, revision: 1
+    blockedReason: null, createdAt, updatedAt: submittedAt, revision: 2
   },
   {
     taskId: 'task-4', planId: plan.planId,
@@ -118,8 +124,8 @@ const dependencies: LoomDependency[] = [
   { dependencyId: 'dep-3', planId: plan.planId, upstreamTaskId: 'task-3', downstreamTaskId: 'task-4', condition: 'artifact_accepted', resolvedArtifactId: null, resolution: null, createdAt }
 ]
 
-// 候选与验收记录：task-1 已核验且已验收，task-3 只有待验收候选，所以 task-4 的
-// artifact_accepted 边仍然未释放，blocked 断言继续成立。
+// 候选与验收记录：task-1 已核验且已验收，task-3 的候选等待评审（任务处于 in_review），
+// 所以 task-4 的 artifact_accepted 边仍然未释放，blocked 断言继续成立。
 const loomCriteria = plan.acceptanceCriteria
 const candidates: LoomCandidate[] = [
   { candidateId: 'candidate-1', taskId: 'task-1', agentRunId: 'run-1', contentHash: 'sha256:restore-protocol', evidenceIds: ['evidence-1', 'evidence-2'], acceptanceCriteria: loomCriteria, previousCandidateId: null, verificationStatus: 'verified', acceptanceStatus: 'accepted', createdAt },
@@ -127,11 +133,11 @@ const candidates: LoomCandidate[] = [
 ]
 
 const reviews: LoomReview[] = [
-  { reviewId: 'review-1', candidateId: 'candidate-1', acceptanceCriteriaVersion: loomCriteria.version, verdict: 'accepted', reason: '恢复协议已覆盖保存与恢复两条路径', criteriaResults: loomCriteria.criteria.map((criterion, index) => ({ criterionId: criterion.criterionId, satisfied: true, evidenceIds: [`evidence-${index + 1}`], note: null })), reviewerId: 'user-local', reviewedAt: createdAt }
+  { reviewId: 'review-1', candidateId: 'candidate-1', acceptanceCriteriaVersion: loomCriteria.version, verdict: 'accepted', reason: '恢复协议已覆盖保存与恢复两条路径', criteriaResults: loomCriteria.criteria.map((criterion, index) => ({ criterionId: criterion.criterionId, satisfied: true, evidenceIds: [`evidence-${index + 1}`], note: null })), reviewerId: 'local_user', reviewedAt: createdAt }
 ]
 
 const verifications: LoomVerification[] = [
-  { verificationId: 'verification-1', candidateId: 'candidate-1', method: 'manual', executorId: 'user-local', result: 'passed', evidenceIds: ['evidence-1'], verifiedAt: createdAt }
+  { verificationId: 'verification-1', candidateId: 'candidate-1', method: 'manual', executorId: 'local_user', result: 'passed', evidenceIds: ['evidence-1'], verifiedAt: createdAt }
 ]
 
 const delivery: MissionDelivery = {
@@ -153,10 +159,10 @@ const delivery: MissionDelivery = {
 }
 
 const activity: MissionActivity[] = [
-  { id: 4, kind: 'created', actorType: 'user', actorId: 'user-local', changes: {}, createdAt },
+  { id: 4, kind: 'created', actorType: 'user', actorId: 'local_user', changes: {}, createdAt },
   { id: 3, kind: 'started', actorType: 'agent', actorId: agents[0].agentId, changes: {}, createdAt },
   { id: 2, kind: 'status', actorType: 'agent', actorId: agents[0].agentId, changes: { status: 'in_progress' }, createdAt },
-  { id: 1, kind: 'members', actorType: 'user', actorId: 'user-local', changes: {}, createdAt },
+  { id: 1, kind: 'members', actorType: 'user', actorId: 'local_user', changes: {}, createdAt },
   ...Array.from({ length: 80 }, (_, index): MissionActivity => ({
     id: 100 + index, kind: index % 2 ? 'members' : 'lead', actorType: 'agent',
     actorId: agents[index % agents.length].agentId, changes: {}, createdAt
@@ -189,6 +195,11 @@ function recordLoomReview(input: LoomReviewRecordInput): LoomReviewRecordReceipt
   if (task === undefined) throw new Error(`LOOM fixture has no task ${input.taskId}`)
   const candidate = candidates.find(entry => entry.candidateId === input.candidateId)
   if (candidate === undefined) throw new Error(`LOOM fixture has no candidate ${input.candidateId}`)
+  // 真实 Core 只评审 in_review 的任务（crates/rovai-core/src/loom.rs:2271 LOOM_TASK_NOT_IN_REVIEW）。
+  // 夹具不比 Core 宽松：别的状态一律拒绝，免得 UI 测到一条真实 Core 不接受的迁移。
+  if (task.status !== 'in_review') {
+    throw new Error(`LOOM task ${task.taskId} is ${task.status} and cannot be reviewed`)
+  }
   const taskIndex = tasks.indexOf(task)
   const candidateIndex = candidates.indexOf(candidate)
   writeSequence += 1
@@ -199,14 +210,15 @@ function recordLoomReview(input: LoomReviewRecordInput): LoomReviewRecordReceipt
     verdict: input.verdict,
     reason: input.reason,
     criteriaResults: input.criteriaResults.map(result => ({ ...result, evidenceIds: [...result.evidenceIds] })),
-    // 契约里 reviewerId 由 Core 从可信身份注入；fixture 在记录上落一个本地用户。
-    reviewerId: 'user-local',
+    // 契约里 reviewerId 由 Core 从可信身份注入（CURRENT_USER_ID）；fixture 落的就是那个唯一身份。
+    reviewerId: 'local_user',
     reviewedAt: writeStamp
   }
   const taskStatus: LoomTaskStatus = input.verdict === 'accepted' ? 'done' : 'ready'
   reviews.push(review)
   candidates[candidateIndex] = { ...candidate, acceptanceStatus: input.verdict }
-  tasks[taskIndex] = { ...task, status: taskStatus }
+  // Core 在评审落库时一并改写任务 updated_at 与 revision（accepted → DONE，rejected → READY）。
+  tasks[taskIndex] = { ...task, status: taskStatus, updatedAt: writeStamp, revision: task.revision + 1 }
   return {
     review,
     missionId: input.missionId,
@@ -231,8 +243,8 @@ function recordLoomVerification(input: LoomVerificationRecordInput): LoomVerific
     verificationId: `verification-fixture-${writeSequence}`,
     candidateId: candidate.candidateId,
     method: input.method,
-    // 契约里 executorId 由 Core 从可信 Host 身份注入；fixture 在记录上落一个本地用户。
-    executorId: 'user-local',
+    // 契约里 executorId 由 Core 从可信 Host 身份注入；fixture 落的就是那个唯一身份。
+    executorId: 'local_user',
     result: input.result,
     evidenceIds: input.evidenceIds === undefined ? [] : [...input.evidenceIds],
     verifiedAt: writeStamp

@@ -847,8 +847,10 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     }), 'loom.claim.acquire', 'LOOM_DEPENDENCY_UNRELEASED')
 
     // (e) The injected identities are only visible in the authority itself, so the last
-    // assertions read the file directly - read-only, after Core has closed it.
-    await core.close()
+    // assertions read the file directly - read-only, after Core has closed it. A resolved
+    // close() is not proof the pid is gone, so the gate below fails with the pid and stage
+    // that ran out instead of letting the read continue.
+    await stopCoreOrFail(core, 'before the stored LOOM rows are read')
     database = new DatabaseSync(join(dataDir, 'rovai.sqlite'), { readOnly: true })
     const reviewRows = database.prepare(
       'SELECT review_id, candidate_id, verdict, reviewer_id FROM loom_review ORDER BY reviewed_at, review_id'
@@ -885,7 +887,14 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     database = null
   } finally {
     database?.close()
-    await core.close()
+    // The walk below and the fixture delete both need Core's pid gone, so the same gate runs
+    // first; its failure is reported after the cleanup rather than left to race the process.
+    let exitFailure = null
+    try {
+      await stopCoreOrFail(core, 'before the temporary root is inspected and deleted')
+    } catch (error) {
+      exitFailure = error
+    }
     try {
       await removeEphemeralRuntimeCampFilesRoot(dataDir, {
         temporaryDirectory: fixture,
@@ -913,6 +922,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     } finally {
       await rm(fixture, { recursive: true, force: true })
     }
+    if (exitFailure) throw exitFailure
   }
 })
 
@@ -942,7 +952,24 @@ function startIsolatedCore({ dataDir, skillRoot, mcpPath, binaryPath, environmen
   let rejectReady
   const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
   const startupTimeout = setTimeout(() => rejectReady(new Error(`Core ready timeout: ${stderr}`)), 60_000)
-  const closed = new Promise((resolve) => child.once('close', resolve))
+  // 'exit', not 'close', is the event that proves the pid is gone; the stdio streams can
+  // outlive the process, so the close path waits on this and on a liveness probe.
+  const exitEvent = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })))
+  // A bounded wait for the child's disappearance. The pid is re-examined first because a
+  // detached child can be gone before the loop delivers 'exit', and every timer created here
+  // is cleared before it returns, so no stage leaves a stray timer behind.
+  async function waitForExit(milliseconds) {
+    if (child.exitCode !== null || child.signalCode !== null || !pidAlive(child.pid)) return true
+    let timer
+    try {
+      return await Promise.race([
+        exitEvent.then(() => true),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), milliseconds) })
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
   child.stdin.on('error', () => {})
   child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8000) })
   child.on('error', rejectReady)
@@ -1008,32 +1035,131 @@ function startIsolatedCore({ dataDir, skillRoot, mcpPath, binaryPath, environmen
       }
       throw new Error('Optional initialization did not settle')
     },
+    // Staged and bounded: stdin end -> SIGTERM (5s) -> process-group SIGKILL (15s), never past
+    // a 20s total. Every stage either observes the exit event (or a dead pid) or throws with
+    // its own stage name and the pid: a close that quietly returned would let the caller read
+    // Core's SQLite file or delete the fixture while Core still holds the handles.
     async close() {
-      if (!child.stdin.destroyed) child.stdin.end()
-      const graceful = setTimeout(() => child.kill('SIGTERM'), 5_000)
-      const forced = setTimeout(() => killProcessTree(child), 15_000)
+      const pid = child.pid
+      const totalBudget = 20_000
+      const startedAt = Date.now()
+      // Remaining budget, so the last stage is trimmed rather than overshooting the 20s cap.
+      const remaining = () => Math.max(startedAt + totalBudget - Date.now(), 0)
+      let stage = 'stdin-end'
+      const timedOut = (detail = '') => Object.assign(
+        new Error(`Core pid=${pid} did not exit in the ${stage} stage`
+          + ` (waited ${Date.now() - startedAt}ms of ${totalBudget}ms, exitCode=${child.exitCode}, signal=${child.signalCode})`
+          + `${detail}: ${stderr}`),
+        { stage, pid, waitedMs: Date.now() - startedAt, exitCode: child.exitCode, signalCode: child.signalCode }
+      )
       try {
-        await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 20_000))])
+        // 1. Closing stdin is Core's own shutdown; it gets five seconds to take it.
+        if (!child.stdin.destroyed) child.stdin.end()
+        if (await waitForExit(Math.min(remaining(), 5_000))) return
+        // 2. SIGTERM, then five more seconds.
+        stage = 'sigterm'
+        child.kill('SIGTERM')
+        if (await waitForExit(Math.min(remaining(), 5_000))) return
+        // 3. The whole tree goes down: killProcessTree throws instead of reporting a kill it
+        //    could not perform, and the wait that follows is trimmed by the budget above.
+        stage = 'sigkill'
+        killProcessTree(child)
+        if (await waitForExit(Math.min(remaining(), 15_000))) return
+        throw timedOut()
+      } catch (error) {
+        // A failure out of a stage never escapes as a plain rejection: it carries the stage
+        // that ran out of budget, the pid, and (as `cause`) whatever the stage itself threw.
+        if (error?.stage === stage && error?.pid === pid) throw error
+        throw Object.assign(timedOut(` - ${error?.message ?? error}`), { cause: error })
       } finally {
-        clearTimeout(graceful)
-        clearTimeout(forced)
         clearTimeout(startupTimeout)
         lines.close()
       }
+    },
+    // The fresh liveness verdict the tests gate on: `gone` is probed now, never cached.
+    async exited(timeout = 5_000) {
+      const gone = await waitForExit(timeout)
+      return { pid: child.pid, gone, exitCode: child.exitCode, signalCode: child.signalCode }
     }
   }
 }
 
+// A resolved close() is a claim about a process, so this is the gate every storage read and
+// fixture delete waits on: a timed-out stage fails with its pid and stage, and the liveness
+// probe after it is a second, independent confirmation.
+async function stopCoreOrFail(core, when) {
+  try {
+    await core.close()
+  } catch (error) {
+    assert.fail(`Core did not stop ${when}: stage=${error?.stage} pid=${error?.pid}`
+      + ` waited=${error?.waitedMs}ms exitCode=${error?.exitCode} signal=${error?.signalCode} - ${error?.message}`)
+  }
+  const gone = await core.exited()
+  assert.equal(gone.gone, true,
+    `Core must have exited ${when}, before its files are touched: ${JSON.stringify(gone)}`)
+  return gone
+}
+
+// `kill(pid, 0)` is the only portable liveness probe Node exposes: ESRCH is proof of absence,
+// while EPERM means the pid exists and only the signal was refused.
+function pidAlive(pid) {
+  if (!pid) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false
+    if (error?.code === 'EPERM') return true
+    throw error
+  }
+}
+
+// Windows and POSIX report a failed tree kill differently, so both branches end in a positive
+// statement: either the kill succeeded and the pid is provably gone, or this throws.
 function killProcessTree(child) {
-  if (!child.pid || child.exitCode !== null) return
+  const pid = child.pid
+  if (!pid || child.exitCode !== null || child.signalCode !== null) return
   if (process.platform === 'win32') {
-    spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+    // `stdout`/`stderr` used to be discarded, which hid the only reason taskkill ever gives;
+    // its status code and its output are now both captured and both checked.
+    const outcome = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+      windowsHide: true,
+      encoding: 'utf8'
+    })
+    const detail = `${outcome.stderr ?? ''}`.trim()
+      || `${outcome.stdout ?? ''}`.trim()
+      || outcome.error?.message
+      || ''
+    if (outcome.error || outcome.status !== 0) {
+      throw Object.assign(
+        new Error(`taskkill.exe /PID ${pid} /T /F failed (status=${outcome.status}, signal=${outcome.signal}): ${detail}`),
+        { stage: 'taskkill', pid, status: outcome.status, stderr: detail }
+      )
+    }
+    if (pidAlive(pid)) {
+      throw Object.assign(
+        new Error(`taskkill.exe /PID ${pid} /T /F reported success but pid=${pid} is still alive`),
+        { stage: 'taskkill-verify', pid }
+      )
+    }
     return
   }
   try {
     // The detached spawn put Core in its own process group, so the negative pid is the tree.
-    process.kill(-child.pid, 'SIGKILL')
-  } catch {
-    child.kill('SIGKILL')
+    process.kill(-pid, 'SIGKILL')
+  } catch (error) {
+    // ESRCH means the group is already gone; any other error means the tree survived.
+    if (error?.code !== 'ESRCH') {
+      throw Object.assign(
+        new Error(`process.kill(-${pid}, 'SIGKILL') failed: ${error?.message ?? error}`),
+        { stage: 'sigkill-group', pid, code: error?.code }
+      )
+    }
+  }
+  if (pidAlive(pid)) {
+    throw Object.assign(
+      new Error(`pid=${pid} is still alive after the process-group SIGKILL`),
+      { stage: 'sigkill-verify', pid }
+    )
   }
 }
