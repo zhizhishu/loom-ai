@@ -1,28 +1,28 @@
-# LOOM 控制层契约 v0.3
+# LOOM 控制层契约 v0.4
 
-> 状态：阶段一已关闭（2026-10-27，Astra 终审 + 主管独立验证）。
+> 状态：阶段一已关闭（2026-10-27）；阶段二 2.1 已收、2.2 已实现待终审（2026-10-28）。
 > 原则：Rovai 是能用的完整产品，只做 ACCP 补全 + archify 流程视图。
-> 证据：`docs/loom/accp-gap-analysis.md`（Pi 工兵盘点）、Astra 三轮审查结果。
+> **接手请先读 `docs/loom/handoff-2026-10-28.md`**（实测数字、风险坑、认知陷阱都在那里；与本文件冲突以它为准）。
 
 ## 阶段一交付与验证（已关闭）
 
 | 交付 | 验证 | 结果 |
 |---|---|---|
 | TS 契约 `packages/contracts/src/loom.ts` | 本机 `pnpm typecheck`、`vitest` | 7 条契约回归通过 |
-| Rust 只读投影 + 受控导入（迁移 218/219，schema 168/169） | bero `cargo test -p rovai-core --lib loom` | 12 passed / 0 failed |
+| Rust 只读投影 + 受控导入（迁移 218/219，schema 168/169） | bero `cargo test -p rovai-core --lib loom` | 当时 12 passed / 0 failed（现已扩展至 32） |
 | Core 端到端（真实二进制） | bero `node --test scripts/lib/loom-core-e2e.test.mjs` | 1 passed |
-| 编排/交付 UI 接真数据 | 本机 Electron fixture | 8 场景通过 |
-| 全量回归 | bero `cargo test -p rovai-core --lib` | 432 passed / 3 failed（基线 `33f6ded` 复现同样 3 个，属机器环境） |
-
-已知未做：写路径为 `loom.plan.import` / `loom.task.release` / `loom.claim.acquire`；无 Candidate/Review；**claim 的 fence 只生成、尚无提交端校验**（失租防提交未闭环）；UI 仍是顺序卡片不是连线拓扑；品牌未换。
+| 编排/交付 UI（fixture 数据） | 本机 Electron fixture | 8 场景通过（**未接真实 Core**） |
+| 全量回归 | bero `cargo test -p rovai-core --lib` | 464 passed / 3 failed（基线 `33f6ded` 复现同样 3 个，属机器环境） |
 
 ## 阶段二进度
 
 | 切片 | 内容 | 状态 |
 |---|---|---|
 | 2.1 | 迁移 220 / schema 170：`loom_claim` + `loom.task.release` + `loom.claim.acquire`（原子、fence 单调、commandId 幂等、租约过期接管） | 已收（限"存储与 API 基础"，不含提交端 fencing） |
-| 2.2 | Candidate + Review + 提交端 fence 校验 + 依赖首次释放冻结 | 未开始 |
-| 2.3 | claim/Candidate 接入 UI | 未开始 |
+| 2.2 | 迁移 221 / schema 171：`loom_candidate`（内容列不可改）+ `loom.candidate.record`，提交端 fence = 锁内取时 + claimId/fenceGeneration 双校验 | 已实现，`cargo test --lib loom` 32 passed；**Astra 终审未过，待复审** |
+| 2.3 | Review / 人工验收 / 证据核验 / 依赖首次释放冻结 | 未开始（`artifact_accepted` 边目前永不释放，属诚实未实现） |
+| 2.4 | claim/Candidate 接入 UI（切掉 fixture mock） | 未开始 |
+| 2.5 | archify 连线拓扑 + LOOM 品牌 | 未开始 |
 
 ## 从 ACCP 直接抄的机制
 
