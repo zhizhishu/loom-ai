@@ -4407,7 +4407,10 @@ mod tests {
             fence_generation,
             command_id: command_id.into(),
             content_hash: "sha256:candidate".into(),
-            evidence_ids: vec!["evidence_one".into(), "evidence_two".into()],
+            evidence_ids: vec![
+                evidence_id("evidence_one", mission_id),
+                evidence_id("evidence_two", mission_id),
+            ],
             acceptance_criteria_version: "ac-v1".into(),
             previous_candidate_id: None,
         }
@@ -4452,6 +4455,12 @@ mod tests {
     /// Since migration 224 an evidence id has to name a registered artifact, and a passing
     /// verification re-reads its bytes. Tests seed the two files the shared input helpers cite,
     /// so the gate is exercised instead of being bypassed.
+    /// Artifact ids are global, so two Missions cannot share one: each Mission's evidence gets
+    /// its own id and the shared inputs cite the same derivation.
+    fn evidence_id(name: &str, mission_id: &str) -> String {
+        format!("{name}@{mission_id}")
+    }
+
     fn seed_evidence(database: &mut OwnedTestDatabase, mission_id: &str) {
         let workspace = mission_workspace(database.connection(), mission_id).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
@@ -4463,12 +4472,12 @@ mod tests {
             database
                 .connection()
                 .execute(
-                    "INSERT OR IGNORE INTO loom_artifact(artifact_id,plan_id,task_id,agent_run_id,
+                    "INSERT INTO loom_artifact(artifact_id,plan_id,task_id,agent_run_id,
                          relative_path,sha256,size_bytes,content_type,creator_id,created_at)
                      SELECT ?1, plan_id, NULL, NULL, ?2, ?3, ?4, NULL, 'local_user', ?5
                      FROM loom_plan WHERE mission_id=?6",
                     params![
-                        name,
+                        evidence_id(name, mission_id),
                         &relative,
                         &sha256,
                         size_bytes,
@@ -5196,7 +5205,7 @@ mod tests {
         LoomAcceptanceCriterionResult {
             criterion_id: criterion_id.into(),
             satisfied,
-            evidence_ids: vec!["evidence_one".into()],
+            evidence_ids: vec![evidence_id("evidence_one", mission_id)],
             note: None,
         }
     }
@@ -5745,7 +5754,10 @@ mod tests {
             method: "replay the delivery".into(),
             executor_id: "agent_1".into(),
             result,
-            evidence_ids: vec!["evidence_one".into(), "evidence_two".into()],
+            evidence_ids: vec![
+                evidence_id("evidence_one", mission_id),
+                evidence_id("evidence_two", mission_id),
+            ],
         }
     }
 
@@ -6489,5 +6501,246 @@ mod tests {
             listed.claims[0].claimant_agent_id, None,
             "assertion an unbound claimant must stay null so readers fall back to the Run"
         );
+    }
+
+    fn write_workspace_file(database: &OwnedTestDatabase, mission_id: &str, name: &str, body: &str) -> String {
+        let workspace = mission_workspace(database.connection(), mission_id).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join(name), body).unwrap();
+        name.to_string()
+    }
+
+    fn register(database: &mut OwnedTestDatabase, mission_id: &str, relative_path: &str) -> LoomArtifact {
+        artifact_register(
+            database,
+            "local_user",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.into(),
+                task_id: None,
+                agent_run_id: None,
+                relative_path: relative_path.into(),
+                content_type: Some("text/plain".into()),
+            },
+        )
+        .unwrap()
+        .artifact
+    }
+
+    #[test]
+    fn artifact_register_hashes_the_bytes_on_disk_and_replays_the_same_path() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact register");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "hello artifact");
+
+        let first = artifact_register(
+            &mut database,
+            "local_user",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: None,
+                agent_run_id: None,
+                relative_path: "report.md".into(),
+                content_type: Some("text/markdown".into()),
+            },
+        )
+        .unwrap();
+        assert!(!first.replayed, "assertion the first registration writes a row");
+        assert_eq!(first.artifact.size_bytes, 14, "assertion size comes from the bytes");
+        assert_eq!(first.artifact.sha256.len(), 64, "assertion sha256 is a real digest");
+        assert_eq!(first.artifact.creator_id, "local_user");
+        assert_eq!(
+            first.artifact.sha256,
+            artifact_digest(&mission_workspace(database.connection(), &mission_id).unwrap().join("report.md")).unwrap().0,
+            "assertion the recorded digest is the one the bytes produce"
+        );
+
+        // Same path, same bytes: replay instead of a second row, so a retry is not new evidence.
+        let second = artifact_register(
+            &mut database,
+            "local_user",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: None,
+                agent_run_id: None,
+                relative_path: "report.md".into(),
+                content_type: None,
+            },
+        )
+        .unwrap();
+        assert!(second.replayed, "assertion the same bytes replay instead of writing");
+        assert_eq!(second.artifact.artifact_id, first.artifact.artifact_id);
+        let rows: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "assertion a replay writes no second row");
+    }
+
+    #[test]
+    fn artifact_register_refuses_changed_bytes_under_a_used_path() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact changed");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "original");
+        register(&mut database, &mission_id, "report.md");
+
+        write_workspace_file(&database, &mission_id, "report.md", "rewritten after the verdict");
+        let error = artifact_register(
+            &mut database,
+            "local_user",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: None,
+                agent_run_id: None,
+                relative_path: "report.md".into(),
+                content_type: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_ARTIFACT_CONTENT_CHANGED,
+            "assertion changed bytes under a registered path are refused: {error}"
+        );
+    }
+
+    #[test]
+    fn artifact_register_refuses_paths_that_leave_the_workspace() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact escape");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+
+        for relative_path in ["../outside.txt", "/etc/passwd"] {
+            let error = artifact_register(
+                &mut database,
+                "local_user",
+                LoomArtifactRegisterInput {
+                    mission_id: mission_id.clone(),
+                    task_id: None,
+                    agent_run_id: None,
+                    relative_path: relative_path.into(),
+                    content_type: None,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<LoomCommandError>().unwrap().code(),
+                LOOM_ARTIFACT_PATH_REJECTED,
+                "assertion {relative_path} must not resolve outside the workspace: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_record_refuses_evidence_that_is_not_a_registered_artifact() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM evidence gate");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+
+        // No seed_evidence here: the two cited ids exist only as text, which is exactly the
+        // hole migration 224 closes.
+        let error = candidate_record(
+            &mut database,
+            candidate_input_for(&mission_id, "task_a", "run_one", "command_two", &claim),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_NOT_FOUND,
+            "assertion a candidate cannot cite an unregistered evidence id: {error}"
+        );
+    }
+
+    #[test]
+    fn passed_verification_is_refused_once_the_artifact_bytes_changed() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verification drift");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        // The verdict is recorded against the registered digest; rewriting the file afterwards
+        // must not be able to earn a passing verification.
+        write_workspace_file(&database, &mission_id, "evidence_one.txt", "tampered");
+        let error = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "verify_command",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_HASH_MISMATCH,
+            "assertion a passing verification re-reads the bytes: {error}"
+        );
+        let verifications: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_verification", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(verifications, 0, "assertion the refused write stored nothing");
+    }
+
+    #[test]
+    fn failed_verification_is_still_recordable_over_changed_bytes() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verification failed");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        write_workspace_file(&database, &mission_id, "evidence_one.txt", "tampered");
+
+        // The verification axis is the "are the bytes good" axis: recording a failure must stay
+        // possible, otherwise a reviewer could not report the drift it just discovered.
+        let recorded = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "verify_command",
+                LoomVerificationResult::Failed,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded.candidate_verification_status,
+            LoomVerificationStatus::Failed,
+            "assertion a failed verification is recorded as failed"
+        );
+    }
+
+    #[test]
+    fn recorded_artifacts_cannot_be_rewritten_or_deleted() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact immutable");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "original");
+        let artifact = register(&mut database, &mission_id, "report.md");
+
+        let update = database.connection().execute(
+            "UPDATE loom_artifact SET sha256='0' WHERE artifact_id=?1",
+            [&artifact.artifact_id],
+        );
+        assert!(update.is_err(), "assertion an artifact digest cannot be rewritten");
+        let delete = database.connection().execute(
+            "DELETE FROM loom_artifact WHERE artifact_id=?1",
+            [&artifact.artifact_id],
+        );
+        assert!(delete.is_err(), "assertion an artifact cannot be deleted while its plan exists");
+        let replace = database.connection().execute(
+            "INSERT OR REPLACE INTO loom_artifact(artifact_id,plan_id,task_id,agent_run_id,
+                 relative_path,sha256,size_bytes,content_type,creator_id,created_at)
+             VALUES(?1,?2,NULL,NULL,'report.md',?3,1,NULL,'local_user','now')",
+            params![&artifact.artifact_id, &artifact.plan_id, &artifact.sha256],
+        );
+        assert!(replace.is_err(), "assertion an artifact cannot be replaced in place");
     }
 }
