@@ -1381,6 +1381,14 @@ impl StoredCandidate {
     }
 
     fn into_result(self, mission_id: &str, replayed: bool) -> Result<LoomCandidateRecordResult> {
+        // Parse before the owning fields move, so the error context can still name the id.
+        let evidence_ids: Vec<String> =
+            serde_json::from_str(&self.evidence_ids_json).with_context(|| {
+                format!(
+                    "candidate {} evidenceIds are not a list of references",
+                    self.candidate_id
+                )
+            })?;
         Ok(LoomCandidateRecordResult {
             candidate_id: self.candidate_id,
             mission_id: mission_id.to_string(),
@@ -1388,12 +1396,7 @@ impl StoredCandidate {
             task_id: self.task_id,
             agent_run_id: self.agent_run_id,
             content_hash: self.content_hash,
-            evidence_ids: serde_json::from_str(&self.evidence_ids_json).with_context(|| {
-                format!(
-                    "candidate {} evidenceIds are not a list of references",
-                    self.candidate_id
-                )
-            })?,
+            evidence_ids,
             acceptance_criteria_version: self.acceptance_criteria_version,
             previous_candidate_id: self.previous_candidate_id,
             verification_status: LoomVerificationStatus::parse(&self.verification_status)?,
