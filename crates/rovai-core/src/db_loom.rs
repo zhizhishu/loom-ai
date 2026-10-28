@@ -8,6 +8,7 @@ const TASK_TABLE: &str = "loom_task";
 const DEPENDENCY_TABLE: &str = "loom_dependency";
 const CLAIM_TABLE: &str = "loom_claim";
 const CANDIDATE_TABLE: &str = "loom_candidate";
+const REVIEW_TABLE: &str = "loom_review";
 
 /// Task states follow the LOOM control-plane contract
 /// (DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED).
@@ -19,6 +20,8 @@ const DEPENDENCY_CONDITION: &str = "CHECK(condition IN ('TASK_DONE','ARTIFACT_AC
 /// itself claims about its delivery, and what the Owner later accepted.
 const VERIFICATION_STATUS: &str = "CHECK(verification_status IN ('UNVERIFIED','VERIFIED','FAILED'))";
 const ACCEPTANCE_STATUS: &str = "CHECK(acceptance_status IN ('PENDING','ACCEPTED','REJECTED'))";
+/// A Review is the Owner's verdict on one Candidate: accepted or rejected, nothing else.
+const REVIEW_VERDICT: &str = "CHECK(verdict IN ('ACCEPTED','REJECTED'))";
 
 fn create_sql() -> String {
     format!(
@@ -164,6 +167,69 @@ fn candidate_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
             && sql.contains("REFERENCESloom_candidate(candidate_id)")
     });
     Ok(columns == 12 && immutable_trigger && declared)
+}
+
+/// Migration 222: the human review. A Review is written once and never rewritten, so the
+/// verdict that released a downstream dependency keeps pointing at the same evidence.
+/// `command_id` is unique so a retried submission replays instead of stacking verdicts, and
+/// one Candidate can only ever carry one Review.
+fn review_sql() -> String {
+    format!(
+        r#"
+        CREATE TABLE {REVIEW_TABLE} (
+            review_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            candidate_id TEXT NOT NULL UNIQUE
+                REFERENCES {CANDIDATE_TABLE}(candidate_id) ON DELETE CASCADE,
+            command_id TEXT NOT NULL UNIQUE,
+            acceptance_criteria_version TEXT NOT NULL
+                CHECK(length(acceptance_criteria_version) BETWEEN 1 AND 200),
+            verdict TEXT NOT NULL {REVIEW_VERDICT},
+            reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000),
+            criteria_results_json TEXT NOT NULL
+                CHECK(json_valid(criteria_results_json) AND json_type(criteria_results_json)='array'),
+            reviewer_id TEXT NOT NULL CHECK(length(reviewer_id) BETWEEN 1 AND 200),
+            reviewed_at TEXT NOT NULL,
+            FOREIGN KEY(plan_id, task_id)
+                REFERENCES {TASK_TABLE}(plan_id, task_id) ON DELETE CASCADE
+        );
+        CREATE INDEX loom_review_plan_idx ON {REVIEW_TABLE}(plan_id, review_id);
+        CREATE INDEX loom_review_task_idx ON {REVIEW_TABLE}(task_id, reviewed_at);
+        CREATE TRIGGER loom_review_immutable
+            BEFORE UPDATE ON {REVIEW_TABLE}
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM review is immutable'); END;
+        "#
+    )
+}
+
+/// The review projection is part of the LOOM schema from migration 222 on; earlier markers
+/// keep admitting databases that predate the human verdict.
+fn review_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('review_id','plan_id','task_id','candidate_id','command_id',
+              'acceptance_criteria_version','verdict','reason','criteria_results_json',
+              'reviewer_id','reviewed_at')",
+        [REVIEW_TABLE],
+        |row| row.get(0),
+    )?;
+    let immutable_trigger: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger'
+             AND name='loom_review_immutable' AND tbl_name=?1
+             AND sql LIKE '%BEFORE UPDATE%')",
+        [REVIEW_TABLE],
+        |row| row.get(0),
+    )?;
+    let declared = table_sql(connection, REVIEW_TABLE)?.is_some_and(|sql| {
+        let sql = sql.split_whitespace().collect::<String>();
+        sql.contains(&REVIEW_VERDICT.split_whitespace().collect::<String>())
+            && sql.contains("candidate_idTEXTNOTNULLUNIQUE")
+            && sql.contains("command_idTEXTNOTNULLUNIQUE")
+            && sql.contains("REFERENCESloom_candidate(candidate_id)")
+            && sql.contains("REFERENCESloom_task(plan_id,task_id)")
+    });
+    Ok(columns == 11 && immutable_trigger && declared)
 }
 
 /// The claim projection is part of the LOOM schema from migration 220 on; earlier
@@ -414,6 +480,43 @@ pub(super) fn migrate_candidate(database: &mut Database) -> Result<()> {
     Ok(())
 }
 
+/// Migration 222: the human verdict on a delivery candidate.
+pub(super) fn migrate_review(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 171
+        ),
+        "LOOM review migration requires schema 171"
+    );
+    tx.execute_batch(&review_sql())?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(222,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=172,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(&tx, &[REVIEW_TABLE])?;
+    anyhow::ensure!(
+        review_schema_matches(&tx)?,
+        "LOOM review migration did not create the required table"
+    );
+    // 172 is only Current while nothing newer exists; a later migration must leave this
+    // receipt admissible as a supported source instead of pinning Current.
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 172
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "LOOM review schema admission failed");
+    tx.commit()?;
+    Ok(())
+}
+
 /// Only synthetic migration fixtures reverse this projection; product code never drops it.
 #[cfg(test)]
 pub(super) fn downgrade_for_test(connection: &Connection) {
@@ -430,13 +533,14 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+            DROP TABLE IF EXISTS loom_review;
             DROP TABLE IF EXISTS loom_candidate;
             DROP TABLE IF EXISTS loom_claim;
             DROP TABLE IF EXISTS loom_dependency;
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
-            DELETE FROM schema_migration WHERE version IN (218,219,220,221);
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();

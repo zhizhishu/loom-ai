@@ -488,6 +488,10 @@ const LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH: &str =
     "LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH";
 const LOOM_CANDIDATE_COMMAND_REUSED: &str = "LOOM_CANDIDATE_COMMAND_REUSED";
 const LOOM_CANDIDATE_PREVIOUS_INVALID: &str = "LOOM_CANDIDATE_PREVIOUS_INVALID";
+const LOOM_CANDIDATE_NOT_FOUND: &str = "LOOM_CANDIDATE_NOT_FOUND";
+const LOOM_TASK_NOT_IN_REVIEW: &str = "LOOM_TASK_NOT_IN_REVIEW";
+const LOOM_REVIEW_EXISTS: &str = "LOOM_REVIEW_EXISTS";
+const LOOM_REVIEW_CRITERIA_INCOMPLETE: &str = "LOOM_REVIEW_CRITERIA_INCOMPLETE";
 
 /// Rejection of a LOOM task release or claim; `code` is the stable error code the Host
 /// returns, exactly like [`LoomPlanImportError`].
@@ -1679,6 +1683,607 @@ pub fn candidate_record(
         replayed: false,
     })
 }
+/// One per-criterion verdict the Owner recorded. The list is bound by `criterionId`, never by
+/// array order, so a reordered submission cannot silently mark a different criterion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomAcceptanceCriterionResult {
+    pub criterion_id: String,
+    pub satisfied: bool,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// The Owner's verdict on a Candidate. Accepted is the only value that can release an
+/// `ARTIFACT_ACCEPTED` dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoomReviewVerdict {
+    Accepted,
+    Rejected,
+}
+
+impl LoomReviewVerdict {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "ACCEPTED" => Ok(Self::Accepted),
+            "REJECTED" => Ok(Self::Rejected),
+            other => anyhow::bail!("LOOM review has an unknown verdict {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "ACCEPTED",
+            Self::Rejected => "REJECTED",
+        }
+    }
+}
+
+/// Read model of an immutable Review. `planId`/`taskId` stay in storage for referential
+/// integrity; the wire shape is the contract's `LoomReview`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomReview {
+    pub review_id: String,
+    pub candidate_id: String,
+    pub acceptance_criteria_version: String,
+    pub verdict: LoomReviewVerdict,
+    pub reason: String,
+    pub criteria_results: Vec<LoomAcceptanceCriterionResult>,
+    pub reviewer_id: String,
+    pub reviewed_at: String,
+}
+
+/// Read model of a recorded Candidate, carrying the acceptance criteria snapshot it was
+/// pinned to rather than a bare version, so a Review can be checked against it without a
+/// second read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomCandidate {
+    pub candidate_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    pub content_hash: String,
+    pub evidence_ids: Vec<String>,
+    pub acceptance_criteria: LoomAcceptanceCriteriaSnapshot,
+    pub previous_candidate_id: Option<String>,
+    pub verification_status: LoomVerificationStatus,
+    pub acceptance_status: LoomAcceptanceStatus,
+    pub created_at: String,
+}
+
+/// Review submission: the Owner's immutable verdict on one Candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomReviewRecordInput {
+    pub mission_id: String,
+    pub task_id: String,
+    pub candidate_id: String,
+    pub command_id: String,
+    pub acceptance_criteria_version: String,
+    pub verdict: LoomReviewVerdict,
+    pub reason: String,
+    pub criteria_results: Vec<LoomAcceptanceCriterionResult>,
+    pub reviewer_id: String,
+}
+
+/// Review receipt: the recorded verdict plus what it moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomReviewRecordResult {
+    pub review: LoomReview,
+    pub mission_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub task_status: LoomTaskStatus,
+    pub candidate_acceptance_status: LoomAcceptanceStatus,
+    /// Dependencies whose release this verdict froze, in dependency order.
+    pub released_dependency_ids: Vec<String>,
+    /// True when the same `commandId` replayed and nothing new was written.
+    pub replayed: bool,
+}
+
+/// Every Candidate the Mission's plan produced, oldest first.
+pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<LoomCandidate>> {
+    let mission_id = scoped_mission(mission_id)?;
+    let mut statement = database.connection.prepare(
+        "SELECT candidate.candidate_id, candidate.task_id, candidate.agent_run_id,
+                candidate.content_hash, candidate.evidence_ids_json,
+                candidate.acceptance_criteria_version, candidate.previous_candidate_id,
+                candidate.verification_status, candidate.acceptance_status, candidate.created_at,
+                task.acceptance_criteria_json
+         FROM loom_candidate AS candidate
+         JOIN loom_plan AS plan ON plan.plan_id=candidate.plan_id
+         JOIN loom_task AS task
+           ON task.plan_id=candidate.plan_id AND task.task_id=candidate.task_id
+         WHERE plan.mission_id=?1
+         ORDER BY candidate.created_at, candidate.candidate_id",
+    )?;
+    let rows = statement
+        .query_map([mission_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                candidate_id,
+                task_id,
+                agent_run_id,
+                content_hash,
+                evidence_ids_json,
+                acceptance_criteria_version,
+                previous_candidate_id,
+                verification_status,
+                acceptance_status,
+                created_at,
+                acceptance_criteria_json,
+            )| {
+                let evidence_ids: Vec<String> =
+                    serde_json::from_str(&evidence_ids_json).with_context(|| {
+                        format!("LOOM candidate {candidate_id} has unreadable evidence ids")
+                    })?;
+                let owner = format!("candidate {candidate_id}");
+                Ok(LoomCandidate {
+                    candidate_id,
+                    task_id,
+                    agent_run_id,
+                    content_hash,
+                    evidence_ids,
+                    acceptance_criteria: criteria_snapshot(
+                        &acceptance_criteria_json,
+                        &acceptance_criteria_version,
+                        &owner,
+                    )?,
+                    previous_candidate_id,
+                    verification_status: LoomVerificationStatus::parse(&verification_status)?,
+                    acceptance_status: LoomAcceptanceStatus::parse(&acceptance_status)?,
+                    created_at,
+                })
+            },
+        )
+        .collect()
+}
+
+/// Every Review recorded under the Mission's plan, oldest first.
+pub fn reviews_list(database: &Database, mission_id: &str) -> Result<Vec<LoomReview>> {
+    let mission_id = scoped_mission(mission_id)?;
+    let mut statement = database.connection.prepare(
+        "SELECT review.review_id, review.candidate_id, review.acceptance_criteria_version,
+                review.verdict, review.reason, review.criteria_results_json, review.reviewer_id,
+                review.reviewed_at
+         FROM loom_review AS review
+         JOIN loom_plan AS plan ON plan.plan_id=review.plan_id
+         WHERE plan.mission_id=?1
+         ORDER BY review.reviewed_at, review.review_id",
+    )?;
+    let rows = statement
+        .query_map([mission_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                review_id,
+                candidate_id,
+                acceptance_criteria_version,
+                verdict,
+                reason,
+                criteria_results_json,
+                reviewer_id,
+                reviewed_at,
+            )| {
+                let criteria_results: Vec<LoomAcceptanceCriterionResult> =
+                    serde_json::from_str(&criteria_results_json).with_context(|| {
+                        format!("LOOM review {review_id} has unreadable criterion results")
+                    })?;
+                Ok(LoomReview {
+                    review_id,
+                    candidate_id,
+                    acceptance_criteria_version,
+                    verdict: LoomReviewVerdict::parse(&verdict)?,
+                    reason,
+                    criteria_results,
+                    reviewer_id,
+                    reviewed_at,
+                })
+            },
+        )
+        .collect()
+}
+
+/// Releasing is one write, never a second evaluation later: an accepted verdict freezes the
+/// trace on every still-open outgoing edge of the Task it accepted.
+fn freeze_released_dependencies(
+    transaction: &rusqlite::Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+    task_revision: i64,
+    candidate_id: &str,
+    review_id: &str,
+    resolved_at: &str,
+) -> Result<Vec<String>> {
+    let pending: Vec<(String, String)> = transaction
+        .prepare(
+            "SELECT dependency_id, condition FROM loom_dependency
+             WHERE plan_id=?1 AND upstream_task_id=?2 AND resolved_at IS NULL
+             ORDER BY created_at, dependency_id",
+        )?
+        .query_map(params![plan_id, task_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut released = Vec::new();
+    for (dependency_id, condition) in pending {
+        // A TASK_DONE edge is released by the completion itself; an ARTIFACT_ACCEPTED edge
+        // keeps the candidate and the review that justified it.
+        let trace = if condition == LoomDependencyCondition::TaskDone.as_str() {
+            (None::<&str>, None::<&str>)
+        } else {
+            (Some(candidate_id), Some(review_id))
+        };
+        transaction.execute(
+            "UPDATE loom_dependency
+             SET resolved_at=?1, upstream_task_revision=?2, candidate_id=?3, review_id=?4
+             WHERE plan_id=?5 AND dependency_id=?6 AND resolved_at IS NULL",
+            params![
+                resolved_at,
+                task_revision,
+                trace.0,
+                trace.1,
+                plan_id,
+                dependency_id
+            ],
+        )?;
+        released.push(dependency_id);
+    }
+    Ok(released)
+}
+
+fn read_stored_review(
+    transaction: &rusqlite::Transaction<'_>,
+    review_id: &str,
+) -> Result<LoomReview> {
+    let row = transaction.query_row(
+        "SELECT candidate_id, acceptance_criteria_version, verdict, reason,
+                criteria_results_json, reviewer_id, reviewed_at
+         FROM loom_review WHERE review_id=?1",
+        [review_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        },
+    )?;
+    let (candidate_id, version, verdict, reason, criteria_json, reviewer_id, reviewed_at) = row;
+    Ok(LoomReview {
+        review_id: review_id.to_string(),
+        candidate_id,
+        acceptance_criteria_version: version,
+        verdict: LoomReviewVerdict::parse(&verdict)?,
+        reason,
+        criteria_results: serde_json::from_str(&criteria_json).with_context(|| {
+            format!("LOOM review {review_id} has unreadable criterion results")
+        })?,
+        reviewer_id,
+        reviewed_at,
+    })
+}
+
+fn task_status_of(
+    transaction: &rusqlite::Transaction<'_>,
+    plan_id: &str,
+    task_id: &str,
+) -> Result<LoomTaskStatus> {
+    let raw: String = transaction.query_row(
+        "SELECT status FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+        params![plan_id, task_id],
+        |row| row.get(0),
+    )?;
+    LoomTaskStatus::parse(&raw)
+}
+
+/// LOOM review path: the Owner's verdict on one Candidate. Accepting moves the Task to DONE
+/// and freezes the release trace on its outgoing dependencies; rejecting returns the Task to
+/// READY so the same Task can be delivered again under a new Candidate.
+pub fn review_record(
+    database: &mut Database,
+    input: LoomReviewRecordInput,
+) -> Result<LoomReviewRecordResult> {
+    let mission_id = required_field("review record", "missionId", &input.mission_id)?;
+    let task_id = required_field("review record", "taskId", &input.task_id)?;
+    let candidate_id = required_field("review record", "candidateId", &input.candidate_id)?;
+    let command_id = required_field("review record", "commandId", &input.command_id)?;
+    let requested_version = required_field(
+        "review record",
+        "acceptanceCriteriaVersion",
+        &input.acceptance_criteria_version,
+    )?;
+    let reason = required_field("review record", "reason", &input.reason)?;
+    let reviewer_id = required_field("review record", "reviewerId", &input.reviewer_id)?;
+    let verdict = input.verdict;
+
+    let transaction = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // The clock is read after the write lock, so a verdict cannot be stamped with an instant
+    // that predates the state it judged.
+    let reviewed_at = chrono::Utc::now().to_rfc3339();
+
+    // A retried submission replays the recorded verdict instead of stacking a second one.
+    let replayed_review: Option<String> = transaction
+        .query_row(
+            "SELECT review_id FROM loom_review WHERE command_id=?1",
+            [&command_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(review_id) = replayed_review {
+        let review = read_stored_review(&transaction, &review_id)?;
+        let plan_id: String = transaction.query_row(
+            "SELECT plan_id FROM loom_review WHERE review_id=?1",
+            [&review_id],
+            |row| row.get(0),
+        )?;
+        let task_status = task_status_of(&transaction, &plan_id, &task_id)?;
+        let acceptance_status: String = transaction.query_row(
+            "SELECT acceptance_status FROM loom_candidate WHERE candidate_id=?1",
+            [&review.candidate_id],
+            |row| row.get(0),
+        )?;
+        let acceptance = LoomAcceptanceStatus::parse(&acceptance_status)?;
+        transaction.commit()?;
+        return Ok(LoomReviewRecordResult {
+            review,
+            mission_id,
+            plan_id,
+            task_id,
+            task_status,
+            candidate_acceptance_status: acceptance,
+            released_dependency_ids: vec![],
+            replayed: true,
+        });
+    }
+
+    let plan = transaction
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(plan_id) = plan else {
+        return Err(LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} has no LOOM plan"),
+        )
+        .into());
+    };
+    let task = transaction
+        .query_row(
+            "SELECT status, revision, acceptance_criteria_json FROM loom_task
+             WHERE plan_id=?1 AND task_id=?2",
+            params![&plan_id, &task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, task_revision, acceptance_criteria_json)) = task else {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_FOUND,
+            format!("task {task_id} is not in the plan for mission {mission_id}"),
+        )
+        .into());
+    };
+    let candidate = transaction
+        .query_row(
+            "SELECT task_id, acceptance_criteria_version FROM loom_candidate
+             WHERE plan_id=?1 AND candidate_id=?2",
+            params![&plan_id, &candidate_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((candidate_task_id, candidate_version)) = candidate else {
+        return Err(LoomCommandError::rejection(
+            LOOM_CANDIDATE_NOT_FOUND,
+            format!("candidate {candidate_id} is not recorded in the plan for mission {mission_id}"),
+        )
+        .into());
+    };
+    if candidate_task_id != task_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CANDIDATE_NOT_FOUND,
+            format!("candidate {candidate_id} belongs to task {candidate_task_id}, not {task_id}"),
+        )
+        .into());
+    }
+    if candidate_version != requested_version {
+        return Err(LoomCommandError::rejection(
+            LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH,
+            format!(
+                "candidate {candidate_id} is pinned to acceptance criteria version {candidate_version}, not {requested_version}"
+            ),
+        )
+        .into());
+    }
+    let reviewed: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loom_review WHERE candidate_id=?1)",
+        [&candidate_id],
+        |row| row.get(0),
+    )?;
+    if reviewed {
+        return Err(LoomCommandError::rejection(
+            LOOM_REVIEW_EXISTS,
+            format!(
+                "candidate {candidate_id} already carries a review; a rework needs a new candidate"
+            ),
+        )
+        .into());
+    }
+    if status != "IN_REVIEW" {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_IN_REVIEW,
+            format!("LOOM task {task_id} is {status} and cannot be reviewed"),
+        )
+        .into());
+    }
+
+    // Every criterion of the pinned snapshot must carry exactly one verdict, and an accepted
+    // review must have satisfied all of them. Order is irrelevant; identity is not.
+    let snapshot = criteria_snapshot(&acceptance_criteria_json, &candidate_version, "task")?;
+    let mut expected: Vec<&str> = snapshot
+        .criteria
+        .iter()
+        .map(|criterion| criterion.criterion_id.as_str())
+        .collect();
+    expected.sort_unstable();
+    let mut recorded: Vec<&str> = input
+        .criteria_results
+        .iter()
+        .map(|result| result.criterion_id.as_str())
+        .collect();
+    recorded.sort_unstable();
+    let covered = recorded == expected;
+    let all_satisfied = input
+        .criteria_results
+        .iter()
+        .all(|result| result.satisfied);
+    if verdict == LoomReviewVerdict::Accepted && !covered {
+        return Err(LoomCommandError::rejection(
+            LOOM_REVIEW_CRITERIA_INCOMPLETE,
+            format!(
+                "an accepted review of candidate {candidate_id} must answer every criterion of version {candidate_version}"
+            ),
+        )
+        .into());
+    }
+    if verdict == LoomReviewVerdict::Accepted && !all_satisfied {
+        return Err(LoomCommandError::rejection(
+            LOOM_REVIEW_CRITERIA_INCOMPLETE,
+            format!(
+                "an accepted review of candidate {candidate_id} must satisfy every criterion of version {candidate_version}"
+            ),
+        )
+        .into());
+    }
+
+    let review_id = format!("review_{}", uuid::Uuid::new_v4().simple());
+    let acceptance = match verdict {
+        LoomReviewVerdict::Accepted => LoomAcceptanceStatus::Accepted,
+        LoomReviewVerdict::Rejected => LoomAcceptanceStatus::Rejected,
+    };
+    transaction.execute(
+        "INSERT INTO loom_review(review_id,plan_id,task_id,candidate_id,command_id,
+                                 acceptance_criteria_version,verdict,reason,
+                                 criteria_results_json,reviewer_id,reviewed_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            &review_id,
+            &plan_id,
+            &task_id,
+            &candidate_id,
+            &command_id,
+            &candidate_version,
+            verdict.as_str(),
+            &reason,
+            serde_json::to_string(&input.criteria_results)?,
+            &reviewer_id,
+            &reviewed_at,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE loom_candidate SET acceptance_status=?1 WHERE candidate_id=?2",
+        params![acceptance.as_str(), &candidate_id],
+    )?;
+
+    let (next_status, released) = match verdict {
+        LoomReviewVerdict::Accepted => {
+            transaction.execute(
+                "UPDATE loom_task SET status='DONE', updated_at=?1, revision=revision+1
+                 WHERE plan_id=?2 AND task_id=?3",
+                params![&reviewed_at, &plan_id, &task_id],
+            )?;
+            let released = freeze_released_dependencies(
+                &transaction,
+                &plan_id,
+                &task_id,
+                task_revision + 1,
+                &candidate_id,
+                &review_id,
+                &reviewed_at,
+            )?;
+            (LoomTaskStatus::Done, released)
+        }
+        LoomReviewVerdict::Rejected => {
+            // A rejection sends the Task back to READY: the same Task takes another delivery
+            // under a new Candidate, and nothing was released.
+            transaction.execute(
+                "UPDATE loom_task SET status='READY', updated_at=?1, revision=revision+1
+                 WHERE plan_id=?2 AND task_id=?3",
+                params![&reviewed_at, &plan_id, &task_id],
+            )?;
+            (LoomTaskStatus::Ready, vec![])
+        }
+    };
+    transaction.commit()?;
+
+    Ok(LoomReviewRecordResult {
+        review: LoomReview {
+            review_id,
+            candidate_id,
+            acceptance_criteria_version: candidate_version,
+            verdict,
+            reason,
+            criteria_results: input.criteria_results,
+            reviewer_id,
+            reviewed_at,
+        },
+        mission_id,
+        plan_id,
+        task_id,
+        task_status: next_status,
+        candidate_acceptance_status: acceptance,
+        released_dependency_ids: released,
+        replayed: false,
+    })
+}
+
 
 #[cfg(test)]
 mod tests {
