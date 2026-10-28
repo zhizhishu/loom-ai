@@ -756,6 +756,28 @@ mod tests {
             171,
             "assertion contract_marker_advances_to_171"
         );
+        // Migration 222 adds the human review, so the 221 receipt stays an admitted source
+        // instead of pinning Current.
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 171
+        ));
+        migrate_review(&mut database).unwrap();
+        assert!(
+            review_schema_matches(database.connection()).unwrap(),
+            "assertion schema_172_creates_the_loom_review_projection"
+        );
+        assert_eq!(
+            migration_receipts(&database, 222),
+            1,
+            "assertion schema_migration_records_222_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            172,
+            "assertion contract_marker_advances_to_172"
+        );
         assert!(matches!(
             classify_database_contract(database.connection()).unwrap(),
             DatabaseContractClassification::Current(_)
