@@ -280,6 +280,20 @@ const canSubmit = draft !== null && draft.reason.trim() !== ''
 
 ## 五、还缺什么（按优先级）
 
+### ✅ 已补：截图证据曾经整片造假（`c7b8eae` 修）
+
+`scripts/fixtures/loom-workspace/main.cjs` 原本写 `show: process.platform === 'linux'`。
+Windows 上窗口是隐藏的，Electron **不为隐藏窗口产出合成帧**，`capturePage()` 会返回**上一帧**——
+于是 14 张 PNG 整体错位一格：标 `delivery` 的拍的是编排，标 `plan` 的拍的是活动。
+**DOM 断言读实时 DOM 所以一直是对的，只有 PNG 撒谎。**
+
+修法三条：`show: true`、截图前先丢一帧（`await capturePage(); settle(120); writeFileSync(capturePage())`）、
+截图前把 `.loom-delivery` / `.mission-activity-document` 滚回顶部（否则留下滚动测试的 180px 位置，标题被切）。
+
+**教训**：任何"我看了截图"的结论，先确认截图里的内容与文件名对得上。上一轮 B2/B3 的视觉结论都建立在可能错位的图上。
+另外顺手补了 390×844 移动端（P7 的截图半边，此前**从没截过**），并把 `候选 candidate-1` 被切成 `候选 date-1`、
+`核验结论 · manual` 漏英文两个观感问题修掉。
+
 ### ⛔ 缺 1：Astra 对最终提交的复审
 
 Astra 第二轮复审（session `8414f0e059aa400995d630b388c7be89`）判 **BLOCK**，唯一理由就是 `loom.ts:309` 那份重复声明。
