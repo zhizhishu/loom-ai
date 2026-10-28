@@ -4300,10 +4300,19 @@ mod tests {
             .resolution
             .as_ref()
             .expect("an accepted review must freeze the release trace");
+        // A TASK_DONE edge is released by the completion itself: the trace records when and
+        // at which upstream revision, but names no candidate or review.
         assert_eq!(
-            resolution.review_id,
-            Some(reviewed.review.review_id.clone()),
-            "assertion the_released_edge_names_the_accepting_review"
+            resolution.review_id, None,
+            "assertion a_task_done_edge_names_no_review"
+        );
+        assert_eq!(
+            resolution.candidate_id, None,
+            "assertion a_task_done_edge_names_no_candidate"
+        );
+        assert!(
+            resolution.upstream_task_revision >= 2,
+            "assertion a_task_done_edge_records_the_completing_revision"
         );
     }
 
