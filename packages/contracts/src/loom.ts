@@ -154,6 +154,37 @@ export interface LoomReview {
   reviewedAt: string
 }
 
+/** 产物登记：证据 ID 指向的真实文件，hash 由 Host 从字节算出来，客户端不能自报。 */
+export interface LoomArtifact {
+  /** 产物 ID，也就是 Candidate/Verification 的 evidenceId 能引用的那个值 */
+  artifactId: string
+  /** 所属计划 */
+  planId: string
+  /** 生产该产物的任务（可空） */
+  taskId: string | null
+  /** 生产该产物的 AgentRun（可空） */
+  agentRunId: string | null
+  /** 相对 Mission 工作区的路径 */
+  relativePath: string
+  /** 登记时 Host 算出的 sha256，核验时用来对账 */
+  sha256: string
+  /** 字节数 */
+  sizeBytes: number
+  /** 内容类型（可空） */
+  contentType: string | null
+  /** 登记人（Host 注入） */
+  creatorId: string
+  /** 登记时间 */
+  createdAt: string
+}
+
+/** 产物登记回执：行本体 + 是否重放（同路径同字节不重复写）。 */
+export interface LoomArtifactRegisterResult {
+  artifact: LoomArtifact
+  /** 同路径、同 sha256 再次登记时为 true，此时没有新行写入 */
+  replayed: boolean
+}
+
 /** 执行认领：绑定实际 Run、授权主体、租约。 */
 export interface LoomClaim {
   /** Claim ID */
