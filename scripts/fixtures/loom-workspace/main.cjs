@@ -117,8 +117,9 @@ app.whenReady().then(async () => {
   })()`)
   const writeLog = () => script('window.loomQA.writes')
   // 写后回读的精确预算：六个读方法各「挂载 1 次 + 写后刷新 1 次」，多一次少一次都 FAIL。
-  // activity / delivery 沿用本文件既有计数规则（恒为 1）。任务能力快照不在这里验：它是切到
-  // 「编排」tab 时才读的，所以 preferences.tasks.get >= 1 由各写用例在 openPlanTab 之后断言。
+  // activity / delivery 沿用本文件既有计数规则（恒为 1）。任务能力快照不在这里验：各写用例都先
+  // resetLoom() 再重挂载，而能力快照只在首屏挂载那条路径上读，故 preferences.tasks.get 只在
+  // 首屏 / 回切 / 截图后三处断言，写用例里不断言它。
   const expectWriteReadback = async label => {
     const counts = await script(`({
       activity: window.loomQA.countOf('missions.activity'),
@@ -597,8 +598,6 @@ app.whenReady().then(async () => {
     `An accepted review must show the done status copy: ${JSON.stringify(acceptedNode)}`)
   assert.equal(acceptedNode.className.split(' ').includes('done'), true,
     `The accepted task node must carry the done status class: ${JSON.stringify(acceptedNode)}`)
-  assert.ok((await script("window.loomQA.countOf('preferences.tasks.get')")) >= 1,
-    'Accept never read the task capability snapshot even after opening 编排')
   await backToDelivery('the accepted review')
   const acceptedStill = await cardState(TARGET_CANDIDATE)
   assert.equal(acceptedStill.acceptanceState, 'accepted',
@@ -688,8 +687,6 @@ app.whenReady().then(async () => {
     `The rejected task node must leave in_review: ${JSON.stringify(rejectedNode)}`)
   assert.equal(rejectedNode.className.split(' ').includes('done'), false,
     `A rejection must not leave the task node in done: ${JSON.stringify(rejectedNode)}`)
-  assert.ok((await script("window.loomQA.countOf('preferences.tasks.get')")) >= 1,
-    'Reject never read the task capability snapshot even after opening 编排')
   await backToDelivery('the rejected review')
   const rejectedStill = await cardState(TARGET_CANDIDATE)
   assert.equal(rejectedStill.acceptanceState, 'rejected',
@@ -753,8 +750,6 @@ app.whenReady().then(async () => {
     '编排 never showed the verified task still in review')
   assert.equal(verifiedNode.copy, '评审中',
     `A verification must not move the task status copy: ${JSON.stringify(verifiedNode)}`)
-  assert.ok((await script("window.loomQA.countOf('preferences.tasks.get')")) >= 1,
-    'Verify (passed) never read the task capability snapshot even after opening 编排')
   await backToDelivery('the passed verification')
   const verifiedStill = await cardState(TARGET_CANDIDATE)
   assert.equal(verifiedStill.verificationState, 'verified',
@@ -814,8 +809,6 @@ app.whenReady().then(async () => {
     '编排 never showed the failed verification task still in review')
   assert.equal(failedNode.copy, '评审中',
     `A failed verification must not move the task status copy: ${JSON.stringify(failedNode)}`)
-  assert.ok((await script("window.loomQA.countOf('preferences.tasks.get')")) >= 1,
-    'Failed verification never read the task capability snapshot even after opening 编排')
   await backToDelivery('the failed verification')
   const failedStill = await cardState(TARGET_CANDIDATE)
   assert.equal(failedStill.verificationState, 'failed',
