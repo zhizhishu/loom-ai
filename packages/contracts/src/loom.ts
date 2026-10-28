@@ -255,7 +255,8 @@ export interface LoomVerificationRecordInput {
   /** 幂等键：同一 commandId 重放返回既有核验 */
   commandId: string
   method: string
-  executorId: string
+  // executorId is injected by Core from the trusted Host identity.
+  // Clients must not send this field; any value is overwritten.
   result: LoomVerificationResult
   evidenceIds?: string[]
 }
@@ -285,7 +286,8 @@ export interface LoomReviewRecordInput {
   reason: string
   /** accepted 必须恰好覆盖该版本每条 criterionId 且全为 true */
   criteriaResults: LoomAcceptanceCriterionResult[]
-  reviewerId: string
+  // reviewerId is injected by Core from the trusted Host identity.
+  // Clients must not send this field; any value is overwritten.
 }
 
 /** 验收回执：写入的评审 + 它推进了什么。 */

@@ -1771,6 +1771,9 @@ pub struct LoomReviewRecordInput {
     pub verdict: LoomReviewVerdict,
     pub reason: String,
     pub criteria_results: Vec<LoomAcceptanceCriterionResult>,
+    /// Injected by the Host from the trusted identity; clients must not send this field.
+    /// The dispatch layer overwrites whatever the payload carries with CURRENT_USER_ID.
+    #[serde(default)]
     pub reviewer_id: String,
 }
 
@@ -2446,6 +2449,8 @@ pub struct LoomVerificationRecordInput {
     pub candidate_id: String,
     pub command_id: String,
     pub method: String,
+    /// Injected by the Host from the trusted identity; clients must not send this field.
+    #[serde(default)]
     pub executor_id: String,
     pub result: LoomVerificationResult,
     #[serde(default)]

@@ -9557,15 +9557,21 @@ impl Core {
             // Verification record is the evidence axis: a passing check flips the candidate
             // to VERIFIED and releases artifact edges once the Owner has also accepted it.
             "loom.verification.record" => {
-                let input: rovai_core::loom::LoomVerificationRecordInput =
+                let mut input: rovai_core::loom::LoomVerificationRecordInput =
                     serde_json::from_value(request.params.clone())?;
+                // The executor identity is always injected from the trusted Host, never
+                // trusted from the payload.
+                input.executor_id = CURRENT_USER_ID.to_string();
                 let mut database = self.database.lock().await;
                 let result = rovai_core::loom::verification_record(&mut database, input)?;
                 Ok(serde_json::to_value(result)?)
             }
             "loom.review.record" => {
-                let input: rovai_core::loom::LoomReviewRecordInput =
+                let mut input: rovai_core::loom::LoomReviewRecordInput =
                     serde_json::from_value(request.params.clone())?;
+                // The reviewer identity is always injected from the trusted Host, never
+                // trusted from the payload.
+                input.reviewer_id = CURRENT_USER_ID.to_string();
                 let mut database = self.database.lock().await;
                 let result = rovai_core::loom::review_record(&mut database, input)?;
                 Ok(serde_json::to_value(result)?)
