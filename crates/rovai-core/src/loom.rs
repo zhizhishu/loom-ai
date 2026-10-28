@@ -1109,13 +1109,15 @@ pub fn claim_acquire(
             format!("LOOM claim leaseSeconds must be 1 to {MAX_CLAIM_LEASE_SECONDS}"),
         ));
     }
-    let now = chrono::Utc::now();
-    let claimed_at = now.to_rfc3339();
-    let lease_expires_at = (now + chrono::Duration::seconds(lease_seconds)).to_rfc3339();
-
     let transaction = database
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // The clock is read only after the write lock is held. Reading it before would let a
+    // wait across the held claim's expiry judge a live lease as expired, and would stamp a
+    // new lease from a stale instant that may already have run out.
+    let now = chrono::Utc::now();
+    let claimed_at = now.to_rfc3339();
+    let lease_expires_at = (now + chrono::Duration::seconds(lease_seconds)).to_rfc3339();
     let mission_exists: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM mission WHERE id=?1)",
         [&mission_id],
