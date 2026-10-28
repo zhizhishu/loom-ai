@@ -47,3 +47,16 @@
 ## 附录：A9 用户决定
 
 （待填）
+
+## 附录：本轮记录（最终提交 `4787bcd`）
+
+[C0] PASS | ee84bad | fmt✓ check✓ typecheck✓ 全 exit 0 | 2026-10-29
+[C1] PASS | 4787bcd | fmt✓ check✓ | bero `--lib loom` pass 72 fail 0 | Astra 终审 BLOCK→PASS（全局 Mutex、句柄非快照、错误码混淆三条已闭合）| 2026-10-29
+[C2] PASS | 4787bcd | 整条触发器语句全等比较 + 非 partial 唯一索引；反例 4 段全被拒 | Astra 终审 BLOCK→PASS（`WHEN 0` 伪通过、partial 索引两条 P1 已闭合）| 2026-10-29
+[C3a] PASS | 4787bcd | `--lib loom` 72/0；`vitest packages/contracts/src` 15/15；跨 Mission 隔离 + 不重算 | 2026-10-29
+[C3b] PASS | 4787bcd | bero `xvfb-run -a pnpm test:loom-workspace` pass 1 fail 0（22 例、20 截图、errors 空）| 2026-10-29
+[C5] PASS | 4787bcd | bero 全量 504 passed / 3 failed（恰基线）/ 1 ignored；矩阵 1/0；`test:loom-core` 2/0；Actions 40762450263 全绿 | 2026-10-29
+[C4a] PENDING | — | 等用户真机 390px | —
+[C4b] PENDING | — | 等用户书面拍板 A9 两处分歧 | —
+
+**阶段 C 通过项：C0–C3、C5。** 阶段二完成仍差 C4a / C4b 两项用户动作。
