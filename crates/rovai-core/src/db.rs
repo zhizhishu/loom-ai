@@ -3818,6 +3818,7 @@ pub(crate) fn classify_database_contract(
                 | 171
                 | 172
                 | 173
+                | 174
         )
     {
         let expected_migration = marker.projection_schema_version + 50;
