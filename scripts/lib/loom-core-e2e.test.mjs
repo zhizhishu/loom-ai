@@ -1075,8 +1075,13 @@ function startIsolatedCore({ dataDir, skillRoot, mcpPath, binaryPath, environmen
         //    do; whether the pid then disappears is decided by the bounded wait below, so a
         //    signal that lands just before the exit event is not mistaken for a failed kill.
         stage = 'sigkill'
-        killProcessTree(child, Math.max(remaining(), 1_000))
-        if (await waitForExit(Math.min(remaining(), 15_000))) return
+        // The kill gets exactly what is left of the 20s cap, never a padded minimum: an
+        // exhausted budget is already a timeout, and passing `timeout: 0` would disable the
+        // limit altogether instead of bounding it.
+        const killBudget = remaining()
+        if (killBudget <= 0) throw timedOut()
+        killProcessTree(child, killBudget)
+        if (await waitForExit(remaining())) return
         throw timedOut()
       } catch (error) {
         // A failure out of a stage never escapes as a plain rejection: it carries the stage
@@ -1143,10 +1148,13 @@ function killProcessTree(child, budgetMs = 15_000) {
       timeout: budgetMs,
       killSignal: 'SIGKILL'
     })
-    const detail = `${outcome.stderr ?? ''}`.trim()
-      || `${outcome.stdout ?? ''}`.trim()
-      || outcome.error?.message
-      || ''
+    // The spawn error carries the only distinction between "taskkill timed out" and "taskkill
+    // said no", so it is always kept alongside whatever the process printed.
+    const detail = [
+      outcome.error ? `${outcome.error.code ?? 'spawn-error'}: ${outcome.error.message}` : '',
+      `${outcome.stderr ?? ''}`.trim(),
+      `${outcome.stdout ?? ''}`.trim()
+    ].filter(Boolean).join(' | ')
     if (outcome.error || outcome.status !== 0) {
       throw Object.assign(
         new Error(`taskkill.exe /PID ${pid} /T /F failed (status=${outcome.status}, signal=${outcome.signal}): ${detail}`),
