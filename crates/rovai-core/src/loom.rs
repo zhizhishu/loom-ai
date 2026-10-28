@@ -5205,7 +5205,7 @@ mod tests {
         LoomAcceptanceCriterionResult {
             criterion_id: criterion_id.into(),
             satisfied,
-            evidence_ids: vec![evidence_id("evidence_one", mission_id)],
+            evidence_ids: vec!["evidence_one".into()],
             note: None,
         }
     }
