@@ -4598,7 +4598,11 @@ mod tests {
         assert_eq!(
             stored,
             (
-                r#"["evidence_one","evidence_two"]"#.to_string(),
+                serde_json::to_string(&vec![
+                    evidence_id("evidence_one", &mission_id),
+                    evidence_id("evidence_two", &mission_id),
+                ])
+                .unwrap(),
                 "UNVERIFIED".to_string(),
                 "PENDING".to_string()
             ),
