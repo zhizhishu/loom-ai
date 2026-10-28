@@ -4551,7 +4551,10 @@ mod tests {
         );
         assert_eq!(
             recorded.evidence_ids,
-            vec!["evidence_one".to_string(), "evidence_two".to_string()],
+            vec![
+                evidence_id("evidence_one", &mission_id),
+                evidence_id("evidence_two", &mission_id),
+            ],
             "assertion candidate_result_keeps_evidence_order"
         );
         assert_eq!(
@@ -6311,6 +6314,7 @@ mod tests {
             dependencies: vec![edge("task_e", "task_f")],
         };
         plan_import(&mut database, plan_2).unwrap();
+        seed_evidence(&mut database, &mission_id_2);
         task_release(&mut database, release_input(&mission_id_2, "task_e")).unwrap();
         let claim_2 = claim_acquire(
             &mut database,
