@@ -116,7 +116,7 @@ function flowDateTime(value: string): string {
 
 /** 节点认领区：谁占着、租约何时到期、fence 第几代。
  *  claims 为 null = 认领投影没读到，只显示「认领状态未知」，不影响节点其他内容。 */
-function FlowClaimBadge({ claims, taskId }: { claims: LoomClaim[] | null; taskId: string }) {
+function FlowClaimBadge({ claims, taskId, agents }: { claims: LoomClaim[] | null; taskId: string; agents: AgentProfile[] }) {
   const t = useUiText()
   if (claims === null) {
     return <div className="loom-flow-claim">
@@ -133,8 +133,11 @@ function FlowClaimBadge({ claims, taskId }: { claims: LoomClaim[] | null; taskId
       <span className="loom-flow-claim-status">{stateLabel}</span>
     </div>
   }
-  // 认领者优先取绑定的 Agent；没绑定时回退 agentRunId 原值，不编造用户名。
-  const owner = claim.claimantAgentId ?? claim.agentRunId
+  // 认领者三级回退：已知 Agent 显示其显示名 → 未知 Agent 回退原 ID → 都没绑定才回退 agentRunId，不编造用户名。
+  const claimantAgentId = (claim.claimantAgentId ?? '').trim()
+  const claimant = claimantAgentId === '' ? undefined : agents.find(agent => agent.agentId === claimantAgentId)
+  const owner = claimant !== undefined ? claimant.displayName
+    : claimantAgentId !== '' ? claimantAgentId : claim.agentRunId
   return <div className="loom-flow-claim" data-claim-state={state}>
     <span className="loom-flow-claim-status">{stateLabel}</span>
     <span className="loom-flow-claim-owner">{t('认领者：{0} · {1}', owner, flowRunShortId(claim.agentRunId))}</span>
@@ -290,7 +293,7 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims }: 
             {task.blockedReason && (
               <div className="loom-flow-node-blocked">{task.blockedReason}</div>
             )}
-            <FlowClaimBadge claims={claims} taskId={task.taskId}/>
+            <FlowClaimBadge claims={claims} taskId={task.taskId} agents={agents}/>
           </div>
         })}
       </div>)}
