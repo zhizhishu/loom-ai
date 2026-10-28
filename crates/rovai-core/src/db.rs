@@ -501,7 +501,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 173;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 174;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -999,6 +999,7 @@ struct CurrentMigrationState {
     v221: bool,
     v222: bool,
     v223: bool,
+    v224: bool,
 }
 
 impl CurrentMigrationState {
@@ -1020,6 +1021,14 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v224 {
+            let mut previous = *self;
+            previous.v224 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 174
+                && self.v223
+                && previous.admits("v1.72", 173, classifier);
+        }
         if self.v223 {
             let mut previous = *self;
             previous.v223 = false;
@@ -6141,7 +6150,8 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=220),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=221),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=222),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=223)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=223),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=224)
         "#,
         [],
         |row| {
@@ -6300,6 +6310,7 @@ fn load_current_migration_state(
                 v221: row.get(151)?,
                 v222: row.get(152)?,
                 v223: row.get(153)?,
+                v224: row.get(154)?,
             })
         },
     )
@@ -9631,6 +9642,9 @@ impl Database {
             if !self.schema_migration_applied(223)? {
                 migration_step!("migration_223", loom::migrate_verification(self));
             }
+            if !self.schema_migration_applied(224)? {
+                migration_step!("migration_224", loom::migrate_artifact(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10527,6 +10541,9 @@ impl Database {
         }
         if !self.schema_migration_applied(223)? {
             migration_step!("migration_223", loom::migrate_verification(self));
+        }
+        if !self.schema_migration_applied(224)? {
+            migration_step!("migration_224", loom::migrate_artifact(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42346,6 +42363,7 @@ mod tests {
             v221: version >= 221,
             v222: version >= 222,
             v223: version >= 223,
+            v224: version >= 224,
         }
     }
 
@@ -42609,7 +42627,7 @@ mod tests {
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                221,
+                224,
             ),
             (
                 "v1.72/schema 152 before compact operations",
@@ -43185,7 +43203,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(223);
+        let current = migration_state_through(224);
         assert!(current.admits(
             CURRENT_DATA_CONTRACT_VERSION,
             CURRENT_PROJECTION_SCHEMA_VERSION,
@@ -43262,6 +43280,8 @@ mod tests {
         missing_loom.v218 = false;
         let mut missing_loom_candidate = current;
         missing_loom_candidate.v221 = false;
+        let mut missing_loom_artifact = current;
+        missing_loom_artifact.v224 = false;
         let mut missing_interruption = current;
         missing_interruption.v209 = false;
         let mut missing_single_chat_facts = current;
@@ -43291,6 +43311,13 @@ mod tests {
             (
                 "current marker without LOOM orchestration projection",
                 missing_loom,
+                CURRENT_DATA_CONTRACT_VERSION,
+                CURRENT_PROJECTION_SCHEMA_VERSION,
+                V147_CLASSIFIER_VERSION,
+            ),
+            (
+                "current marker without the LOOM artifact migration",
+                missing_loom_artifact,
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
                 V147_CLASSIFIER_VERSION,
@@ -43944,7 +43971,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(223));
+        assert_eq!(state, migration_state_through(224));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")

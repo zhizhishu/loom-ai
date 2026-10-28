@@ -10,6 +10,7 @@ const CLAIM_TABLE: &str = "loom_claim";
 const CANDIDATE_TABLE: &str = "loom_candidate";
 const REVIEW_TABLE: &str = "loom_review";
 const VERIFICATION_TABLE: &str = "loom_verification";
+const ARTIFACT_TABLE: &str = "loom_artifact";
 
 /// Task states follow the LOOM control-plane contract
 /// (DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED).
@@ -359,6 +360,110 @@ fn table_sql(connection: &Connection, table: &str) -> rusqlite::Result<Option<St
         .optional()
 }
 
+/// Migration 224: the artifact an evidence id may point at. Before this table a Candidate's
+/// `evidenceIds` were bare strings — a claim that some artifact existed. The row records the
+/// sha256 the Host computed when the artifact was registered, so verification can re-read the
+/// bytes and prove they did not change. Rows are immutable: a replaced file is a new artifact,
+/// never an edit, because "the evidence changed" must stay visible instead of being overwritten.
+fn artifact_sql() -> String {
+    format!(
+        r#"
+        CREATE TABLE {ARTIFACT_TABLE} (
+            artifact_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            task_id TEXT,
+            agent_run_id TEXT,
+            relative_path TEXT NOT NULL CHECK(length(relative_path) BETWEEN 1 AND 1024),
+            sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+            size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+            content_type TEXT,
+            creator_id TEXT NOT NULL CHECK(length(creator_id) BETWEEN 1 AND 200),
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(plan_id) REFERENCES {PLAN_TABLE}(plan_id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX loom_artifact_plan_path_idx
+            ON {ARTIFACT_TABLE}(plan_id, relative_path);
+        CREATE INDEX loom_artifact_plan_idx ON {ARTIFACT_TABLE}(plan_id, artifact_id);
+        CREATE TRIGGER loom_artifact_immutable
+            BEFORE UPDATE ON {ARTIFACT_TABLE}
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;
+        CREATE TRIGGER loom_artifact_no_replace
+            BEFORE INSERT ON {ARTIFACT_TABLE}
+            WHEN EXISTS(
+                SELECT 1 FROM {ARTIFACT_TABLE}
+                WHERE artifact_id=NEW.artifact_id OR relative_path=NEW.relative_path
+                   OR rowid=NEW.rowid
+            )
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;
+        CREATE TRIGGER loom_artifact_no_direct_delete
+            BEFORE DELETE ON {ARTIFACT_TABLE}
+            WHEN EXISTS(SELECT 1 FROM {PLAN_TABLE} WHERE plan_id=OLD.plan_id)
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;
+        "#
+    )
+}
+
+fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('artifact_id','plan_id','task_id','agent_run_id','relative_path','sha256',
+              'size_bytes','content_type','creator_id','created_at')",
+        [ARTIFACT_TABLE],
+        |row| row.get(0),
+    )?;
+    let triggers: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1
+             AND name IN ('loom_artifact_immutable','loom_artifact_no_replace',
+                          'loom_artifact_no_direct_delete')",
+        [ARTIFACT_TABLE],
+        |row| row.get(0),
+    )?;
+    let declared = table_sql(connection, ARTIFACT_TABLE)?.is_some_and(|sql| {
+        let sql = sql.split_whitespace().collect::<String>();
+        sql.contains("CHECK(length(sha256)=64)")
+            && sql.contains("CHECK(size_bytes>=0)")
+            && sql.contains("REFERENCESloom_plan(plan_id)ONDELETECASCADE")
+    });
+    Ok(columns == 10 && triggers == 3 && declared)
+}
+
+/// Migration 224: the artifact row an evidence id can point at.
+pub(super) fn migrate_artifact(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 173
+        ),
+        "LOOM artifact migration requires schema 173"
+    );
+    tx.execute_batch(&artifact_sql())?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(224,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=174,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(&tx, &[ARTIFACT_TABLE])?;
+    anyhow::ensure!(
+        artifact_schema_matches(&tx)?,
+        "LOOM artifact migration did not create the required table"
+    );
+    // 174 is only Current while nothing newer exists; a later migration must leave this
+    // receipt admissible as a supported source instead of pinning Current.
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 174
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "LOOM artifact schema admission failed");
+    tx.commit()?;
+    Ok(())
+}
+
 pub(super) fn schema_matches(
     connection: &Connection,
     projection_schema_version: i64,
@@ -378,6 +483,8 @@ pub(super) fn schema_matches(
     let review_recorded = projection_schema_version < 172 || review_schema_matches(connection)?;
     let verification_recorded =
         projection_schema_version < 173 || verification_schema_matches(connection)?;
+    let artifact_recorded =
+        projection_schema_version < 174 || artifact_schema_matches(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -405,7 +512,8 @@ pub(super) fn schema_matches(
         && claim_recorded
         && candidate_recorded
         && review_recorded
-        && verification_recorded)
+        && verification_recorded
+        && artifact_recorded)
 }
 
 /// Migration 219 hangs the acceptance criteria version on the Plan; Tasks inherit it.
@@ -666,6 +774,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+            DROP TABLE IF EXISTS loom_artifact;
             DROP TABLE IF EXISTS loom_verification;
             DROP TABLE IF EXISTS loom_review;
             DROP TABLE IF EXISTS loom_candidate;
@@ -674,7 +783,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
-            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223);
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
