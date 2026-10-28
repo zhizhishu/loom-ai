@@ -306,27 +306,9 @@ export interface LoomReviewRecordReceipt {
 }
 
 // (second LoomReviewRecordInput declaration removed — merged with the canonical one above;
-//  reviewerId is injected by Core, not sent by clients.)
-
-/** 验收回执：写入的评审 + 它推进了什么。 */
-export interface LoomReviewRecordReceipt {
-  /** 写入（或重放）的那份评审 */
-  review: LoomReview
-  /** Mission 作用域回显 */
-  missionId: string
-  /** 所属计划 ID */
-  planId: string
-  /** 被判定的 Task ID */
-  taskId: string
-  /** 接受 → done；驳回 → ready */
-  taskStatus: LoomTaskStatus
-  /** 候选的验收轴结论 */
-  candidateAcceptanceStatus: 'pending' | 'accepted' | 'rejected'
-  /** 本次判定冻结放行的依赖边 ID，按依赖顺序 */
-  releasedDependencyIds: string[]
-  /** 同一 commandId 重放且未写新行时为 true */
-  replayed: boolean
-}
+//  reviewerId is injected by Core, not sent by clients. The duplicate LoomReviewRecordReceipt
+//  below it was removed for the same reason: TS silently merges repeated interface
+//  declarations, so a stale copy re-imposes fields the canonical one already dropped.)
 
 export interface LoomReviewResult {
   /** 是否通过 */
