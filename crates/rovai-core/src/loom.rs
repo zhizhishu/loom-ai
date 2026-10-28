@@ -6435,13 +6435,23 @@ mod tests {
             "command_one",
         );
 
-        let count = |database: &OwnedTestDatabase| -> i64 {
-            database
+        // A full row snapshot, not a count: a read that silently rewrote a lease would keep the
+        // row count identical and only this comparison would notice.
+        let snapshot = |database: &OwnedTestDatabase| -> Vec<(String, String, Option<String>)> {
+            let mut statement = database
                 .connection()
-                .query_row("SELECT COUNT(*) FROM loom_claim", [], |row| row.get(0))
+                .prepare(
+                    "SELECT claim_id, lease_expires_at, released_at FROM loom_claim
+                     ORDER BY claim_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
         };
-        let before = count(&database);
+        let before = snapshot(&database);
 
         let other = claims_list(&database, &mission_two).unwrap();
         assert!(
@@ -6453,8 +6463,8 @@ mod tests {
 
         assert_eq!(
             before,
-            count(&database),
-            "assertion the read path must not write a claim row"
+            snapshot(&database),
+            "assertion the read path must not rewrite a claim row"
         );
     }
 

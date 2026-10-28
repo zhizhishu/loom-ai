@@ -391,7 +391,8 @@ fn artifact_sql() -> String {
             BEFORE INSERT ON {ARTIFACT_TABLE}
             WHEN EXISTS(
                 SELECT 1 FROM {ARTIFACT_TABLE}
-                WHERE artifact_id=NEW.artifact_id OR relative_path=NEW.relative_path
+                WHERE artifact_id=NEW.artifact_id
+                   OR (plan_id=NEW.plan_id AND relative_path=NEW.relative_path)
                    OR rowid=NEW.rowid
             )
             BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;
