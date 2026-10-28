@@ -5084,4 +5084,387 @@ mod tests {
             "assertion the_immutable_guard_keeps_the_recorded_verdict"
         );
     }
+
+    /// Verification input presenting a replayable check: the method and the executor are
+    /// fixed facts, so each test only names what it is actually asserting.
+    fn verification_input(
+        mission_id: &str,
+        task_id: &str,
+        candidate_id: &str,
+        command_id: &str,
+        result: LoomVerificationResult,
+    ) -> LoomVerificationRecordInput {
+        LoomVerificationRecordInput {
+            mission_id: mission_id.into(),
+            task_id: task_id.into(),
+            candidate_id: candidate_id.into(),
+            command_id: command_id.into(),
+            method: "replay the delivery".into(),
+            executor_id: "agent_1".into(),
+            result,
+            evidence_ids: vec!["evidence_one".into(), "evidence_two".into()],
+        }
+    }
+
+    #[test]
+    fn accepted_review_then_passed_verification_releases_the_artifact_edge() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verification after review");
+        let mut artifact_edge = edge("task_a", "task_b");
+        artifact_edge.condition = Some(LoomDependencyCondition::ArtifactAccepted);
+        let mut artifact_plan = plan_input(&mission_id);
+        artifact_plan.dependencies = vec![artifact_edge];
+        let candidate = submitted_candidate(&mut database, artifact_plan, "task_a");
+
+        // The verdict lands first: on its own it must leave the artifact edge frozen-free.
+        let reviewed = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "the artifact satisfies both criteria",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(
+            reviewed.released_dependency_ids.is_empty(),
+            "assertion an_accepted_review_without_a_verification_releases_no_artifact_edge"
+        );
+        assert_eq!(
+            reviewed.task_status,
+            LoomTaskStatus::Done,
+            "assertion the_accepted_task_is_done_before_the_verification_lands"
+        );
+
+        // The verification lands second, so it is the one that releases the edge.
+        let verified = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_four",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            verified.released_dependency_ids.len(),
+            1,
+            "assertion a_passed_verification_releases_the_already_accepted_artifact_edge"
+        );
+        assert_eq!(
+            verified.candidate_verification_status,
+            LoomVerificationStatus::Verified,
+            "assertion a_passed_verification_marks_the_candidate_verified"
+        );
+        assert!(
+            !verified.replayed,
+            "assertion the_first_verification_is_not_a_replay"
+        );
+
+        let dependencies = dependencies_list(&database, &mission_id).unwrap();
+        assert_eq!(
+            dependencies.len(),
+            1,
+            "assertion the_plan_still_holds_its_one_edge"
+        );
+        let resolution = dependencies[0]
+            .resolution
+            .as_ref()
+            .expect("a released artifact edge must freeze its release trace");
+        assert_eq!(
+            resolution.candidate_id,
+            Some(candidate.candidate_id.clone()),
+            "assertion the_frozen_trace_names_the_verified_candidate"
+        );
+        assert_eq!(
+            resolution.review_id,
+            Some(reviewed.review.review_id.clone()),
+            "assertion the_frozen_trace_names_the_accepting_review"
+        );
+    }
+
+    #[test]
+    fn passed_verification_then_accepted_review_releases_the_artifact_edge() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM review after verification");
+        let mut artifact_edge = edge("task_a", "task_b");
+        artifact_edge.condition = Some(LoomDependencyCondition::ArtifactAccepted);
+        let mut artifact_plan = plan_input(&mission_id);
+        artifact_plan.dependencies = vec![artifact_edge];
+        let candidate = submitted_candidate(&mut database, artifact_plan, "task_a");
+
+        // The check lands first: verification alone must not release anything.
+        let verified = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_four",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+        assert!(
+            verified.released_dependency_ids.is_empty(),
+            "assertion a_passed_verification_without_an_acceptance_releases_no_artifact_edge"
+        );
+        assert_eq!(
+            verified.candidate_verification_status,
+            LoomVerificationStatus::Verified,
+            "assertion the_candidate_is_verified_before_the_verdict_lands"
+        );
+        assert!(
+            dependencies_list(&database, &mission_id).unwrap()[0]
+                .resolution
+                .is_none(),
+            "assertion the_unreleased_artifact_edge_keeps_no_trace"
+        );
+
+        // The verdict lands second, so it is the one that releases the edge.
+        let reviewed = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomReviewVerdict::Accepted,
+                "the verified artifact satisfies both criteria",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            reviewed.released_dependency_ids.len(),
+            1,
+            "assertion an_accepted_review_releases_the_already_verified_artifact_edge"
+        );
+        assert_eq!(
+            reviewed.task_status,
+            LoomTaskStatus::Done,
+            "assertion the_accepting_verdict_moves_the_task_to_done"
+        );
+
+        let dependencies = dependencies_list(&database, &mission_id).unwrap();
+        let resolution = dependencies[0]
+            .resolution
+            .as_ref()
+            .expect("a released artifact edge must freeze its release trace");
+        assert_eq!(
+            resolution.candidate_id,
+            Some(candidate.candidate_id.clone()),
+            "assertion the_frozen_trace_names_the_verified_candidate"
+        );
+        assert_eq!(
+            resolution.review_id,
+            Some(reviewed.review.review_id.clone()),
+            "assertion the_frozen_trace_names_the_accepting_review"
+        );
+    }
+
+    #[test]
+    fn a_failed_verification_marks_the_candidate_failed_and_releases_nothing() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verification failed");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        let verified = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomVerificationResult::Failed,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            verified.candidate_verification_status,
+            LoomVerificationStatus::Failed,
+            "assertion a_failed_verification_marks_the_candidate_failed"
+        );
+        assert_eq!(
+            verified.verification.result,
+            LoomVerificationResult::Failed,
+            "assertion the_recorded_check_carries_the_failed_result"
+        );
+        assert!(
+            verified.released_dependency_ids.is_empty(),
+            "assertion a_failed_verification_releases_no_dependency"
+        );
+
+        let candidates = candidates_list(&database, &mission_id).unwrap();
+        let stored = candidates
+            .iter()
+            .find(|stored| stored.candidate_id == candidate.candidate_id)
+            .expect("the failed candidate must stay readable");
+        assert_eq!(
+            stored.verification_status,
+            LoomVerificationStatus::Failed,
+            "assertion the_failed_verification_status_reads_back_from_the_candidate"
+        );
+        assert_eq!(
+            dependencies_list(&database, &mission_id).unwrap()[0].resolution,
+            None,
+            "assertion the_failed_verification_leaves_the_edge_unresolved"
+        );
+    }
+
+    #[test]
+    fn a_candidate_can_only_carry_one_verification() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verification once");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        let verified = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            verified.candidate_verification_status,
+            LoomVerificationStatus::Verified,
+            "assertion the_first_check_on_the_candidate_is_recorded"
+        );
+
+        // A second check of the same Candidate is refused for that reason, whatever its
+        // result and whatever command id it arrives under.
+        let error = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_four",
+                LoomVerificationResult::Failed,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_VERIFICATION_EXISTS,
+            "assertion a_candidate_cannot_carry_a_second_verification"
+        );
+        assert_eq!(
+            verifications_list(&database, &mission_id).unwrap().len(),
+            1,
+            "assertion the_refused_second_check_writes_no_verification"
+        );
+    }
+
+    #[test]
+    fn replayed_verification_command_returns_the_recorded_check() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verification replay");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        let first = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+        let replay = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+        assert!(
+            replay.replayed,
+            "assertion the_second_submission_of_one_command_reports_a_replay"
+        );
+        assert_eq!(
+            replay.verification.verification_id, first.verification.verification_id,
+            "assertion a_replay_returns_the_recorded_verification_id"
+        );
+        assert_eq!(
+            replay.verification.result, first.verification.result,
+            "assertion a_replay_returns_the_recorded_result"
+        );
+        assert!(
+            replay.released_dependency_ids.is_empty(),
+            "assertion a_replay_releases_nothing_a_second_time"
+        );
+        assert_eq!(
+            verifications_list(&database, &mission_id).unwrap().len(),
+            1,
+            "assertion a_replay_writes_no_second_verification"
+        );
+    }
+
+    #[test]
+    fn recorded_verification_cannot_be_rewritten() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verification immutable");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        let verified = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_three",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+        let verification_id = verified.verification.verification_id.clone();
+
+        let tampered = database.connection().execute(
+            "UPDATE loom_verification SET result='FAILED' WHERE verification_id=?1",
+            [&verification_id],
+        );
+        assert!(
+            tampered.is_err(),
+            "assertion a_recorded_verification_result_cannot_be_rewritten"
+        );
+        let message = format!("{}", tampered.unwrap_err());
+        assert!(
+            message.contains("immutable"),
+            "assertion the_verification_immutable_guard_explains_itself: {message}"
+        );
+
+        let stored = verifications_list(&database, &mission_id).unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "assertion the_refused_rewrite_leaves_one_verification"
+        );
+        assert_eq!(
+            stored[0].result,
+            LoomVerificationResult::Passed,
+            "assertion the_immutable_guard_keeps_the_recorded_result"
+        );
+    }
 }
