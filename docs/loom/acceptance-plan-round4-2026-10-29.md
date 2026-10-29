@@ -73,4 +73,11 @@
 **阶段 C 通过项：C0–C3、C5、C4a、C4b —— 全部 PASS。**
 
 C4a 原先写成「用户真机目测」，属计划书措辞错误：能机器判的一律不该变成用户关卡。现改为客观判据，由主助手在真 Chromium 上亲跑断言。
-**明确的非声称**：物理 iOS/Safari、真机 dpr 与触摸滚动未验；未验即不声称。阶段二「完成」仍需用户一句产品层面的点头，但不再需要用户替我做测量。
+**明确的非声称**：物理 iOS/Safari 未验；未验即不声称。
+
+用户 2026-10-29 决定「就当作完成了」——**阶段二据此判定完成**。下列两条已知未验随完成一起放行，写在这里而不是忘掉：
+
+1. 物理 iOS / Safari：WebKit 真机引擎、iOS 文本自适应（`-webkit-text-size-adjust`）、安全区（刘海/home indicator）、触摸惯性滚动。Chromium 的设备模拟覆盖布局与尺寸，不覆盖引擎差异。
+2. Windows：`open_resolved_file_without_following` 只接受盘符根，拒 UNC / ADS / 保留名。本机跑不了 Rust 测试，仅 bero 与 GitHub Actions（Linux）有证据。
+
+**阶段二结论：完成（COMPLETE）**，附上述两条放行记录。
