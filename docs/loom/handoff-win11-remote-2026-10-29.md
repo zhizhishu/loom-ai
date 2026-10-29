@@ -48,5 +48,75 @@
 - 隧道选 Tailscale 还是 Cloudflare
 - 是否有代码签名证书（没有则一直发未签名 Preview）
 
-## 8. 记录
+## 8. 阶段 1 执行记录
+
+### 8.1 首次触发的真实结果：Windows 目标根本编译不过（2026-10-29 12:11–12:16 CST）
+
+- run `40871224854`（commit `897af63`）→ **失败**，卡在 `Build and verify unsigned NSIS package`，4m59s
+- 报错（原始输出）：
+  ```
+  error[E0308]: mismatched types
+     --> crates\rovai-core\src\managed_process.rs:642:17
+  642 |   bail!("connection-only Runtime ownership is not admitted on Windows");
+      |   expected `ManagedProcessSpawnFailure`, found `Error`
+  error: could not compile `rovai-core` (lib) due to 1 previous error; 1 warning emitted
+  ```
+
+**根因**：`spawn_owned` 返回 `Result<Self, ManagedProcessSpawnFailure>`，而 `bail!` 展开成
+`return Err(anyhow::Error)`，类型不符。该行位于 `#[cfg(windows)]` 块内，**Linux 的 CI 永远看不见**，
+所以 `main` 一直是绿的、Windows 一直是死的。
+
+**归属**：`git log upstream/main..HEAD -- crates/rovai-core/src/managed_process.rs` 为空，
+该文件自 `7ef7588`（导入 `4ea9cac` 基线）起没被本 fork 改过一个字节——**这是上游继承来的缺陷**，
+不是 LOOM 引入的。也就是说：文档里写的 `Windows x64 Preview` 在快照 `4ea9cac` 上从未真正编译通过。
+
+**修法**（`8a70ce4`，4 行）：照同一函数末尾既有写法，改成
+`return Err(anyhow::anyhow!(...).into())`，走已存在的 `From<anyhow::Error> for ManagedProcessSpawnFailure`。
+
+**为什么这是好消息**：W1 不是「跑一遍确认能出包」，而是真的抓到了一个 blocker。这条修好之前，
+任何「Windows 能用」的说法都是空的。
+
+### 8.2 本机无法自证
+本机没有 Rust 工具链（`cargo` / `rustc` 均 not found），符合 MASTER-HANDOFF「本机 Windows 编不了 Rust」。
+因此 Windows 编译的唯一证人就是 GitHub 的 `windows-2022` 运行器本身——这也是 W2 的判据来源。
+fmt 证人改由 CI 提供：`8a70ce4` 的 CI run 40872203417 全绿，含
+`Run Rust format and compile checks`（`cargo fmt --all --check` + `cargo check --workspace`）。
+
+### 8.3 修完后出包成功（2026-10-29 12:18–12:34 CST）
+
+- run `40872214155`（commit `8a70ce4`）→ **全绿**，用时 15m50s
+- artifact `rovai-windows-x64-unsigned-8a70ce45c2a9642cad101b42c601172f24a60c0b`，148,230,281 字节
+- 本地落盘 `dist/windows-x64-unsigned/`（`dist/` 已 gitignore）：
+
+| 文件 | 大小 |
+|---|---|
+| `Rovai-AI-0.5.1-x64.exe` | 148,057,033 |
+| `Rovai-AI-0.5.1-x64.exe.blockmap` | 155,659 |
+| `latest.yml` | 4,828 |
+| `windows-release-manifest.json` | 4,598 |
+| `windows-verification-report.txt` | 1,053 |
+
+**verifier 原文（`Result: passed`）关键行**：
+```
+NSIS configuration: assisted per-user install, selectable destination, 20s controlled shutdown and bounded force close passed
+App: x64, manifest/resources passed
+rovai-host / rovai-core / rovai: x64, manifest/resources passed
+CLI: rovai 0.5.1 contract-v44 ipc-v3
+Packaged Core: isolated Windows data-root preparation and health.check passed
+NSIS installer: sha256=ba03c2a0ba2d0ffec1aa45493ee46debdfa43d8c3fcd3a0464bd5120b8940655
+Result: passed
+```
+
+- manifest 记载：`commit 8a70ce45…`、`dirty: false`、`rustc 1.97.1 host x86_64-pc-windows-msvc`、
+  runner `win32 10.0.20348`、`signedReleaseRequired: false`
+- 本地 `sha256sum` 与报告一致（`ba03c2a0…90655`），字节数一致 → 下载完整
+
+**这一轮真正证明的事**：Windows 目标**确实能编译并打出 NSIS 安装包**，而且打包后 Core 在隔离的
+Windows data-root 里跑通了 `health.check`。这是本仓第一份 Windows 证据。
+
+**顺带发现（待处理，不阻塞安装）**：`latest.yml` / verifier 记录的升级通道是
+`github/murray17/rovai-ai`——即**应用内升级检查指向的是上游仓库**，不是 `zhizhishu/loom-ai`。
+本 fork 自己发版前必须改通道，否则「检查更新」会去拿上游的包。
+
+## 9. 记录
 每项一行写进 `skill-cli/TASK.md`，格式同第四轮验收书 §3。
