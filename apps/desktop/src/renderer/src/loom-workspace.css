@@ -179,7 +179,9 @@
 @media(max-width:420px) { .loom-candidate-header { flex-direction: column; align-items: flex-start; gap: 6px; } }
 
 /* 宽屏信息密度：工作区实际宽度 ≥1200 时把右侧留白收进内容里。
-   1040 及以下的档位完全不受影响（860 上限、单列、20 侧距都留在原处）。 */
+   1040 及以下的档位完全不受影响（860 上限、单列、20 侧距都留在原处）。
+   阈值量的是**这块面板自己**的宽度，不是视口：外壳是分栏的，右栏 1440 窗口下可能只有 560，
+   两列在那种宽度会比单列更挤。所以面板不够宽就不提升，是刻意的选择，不是漏掉视口查询。 */
 @container loom-workspace (min-width: 1200px) {
   /* 1. 两个面板不再封顶 860，撑满可用宽度；28 的左右内边距与 62ch / 58ch 的行长限制不动。 */
   .loom-plan,.loom-delivery { max-width: none; }

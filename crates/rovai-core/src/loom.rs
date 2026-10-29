@@ -2254,6 +2254,8 @@ fn ensure_evidence_bytes_match(
                 format!("evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"),
             )
         })?;
+        #[cfg(test)]
+        artifact_swap_hook::run();
         let (actual, _) = artifact_digest(&resolved).map_err(|error| {
             LoomCommandError::rejection(
                 LOOM_EVIDENCE_UNREADABLE,
@@ -2864,6 +2866,13 @@ pub fn review_record(
     // review must have satisfied all of them. Order is irrelevant; identity is not.
     // Empty criteria sets must not be accepted — the TS evaluator rejects them outright
     // (loom.ts:400), and the Rust side must agree.
+    //
+    // The content comes from the Task row and the version from the Candidate row, which is only
+    // sound because those two cannot diverge: a Mission accepts one plan import (`LOOM_PLAN_EXISTS`
+    // above), and nothing updates `loom_task.acceptance_criteria_json` afterwards — the transitions
+    // at :1170, :1769, :2942 and :2968 touch status/updated_at/revision only. A future "plan
+    // revision" feature has to freeze this snapshot on the Candidate first, or a review would
+    // start judging old submissions by new text.
     let snapshot = criteria_snapshot(&acceptance_criteria_json, &candidate_version, "task")?;
     if snapshot.criteria.is_empty() && verdict == LoomReviewVerdict::Accepted {
         return Err(LoomCommandError::rejection(
@@ -7325,6 +7334,135 @@ mod tests {
             LOOM_EVIDENCE_HASH_MISMATCH,
             "assertion an intact artifact cannot stand in for a tampered one: {error}"
         );
+    }
+
+    /// The review judges a submission against the criteria the plan was imported with. That is only
+    /// sound while the snapshot cannot move, so pin it: a second import is refused, and the stored
+    /// criteria text is the one the candidate was submitted under.
+    #[test]
+    fn the_acceptance_criteria_snapshot_cannot_drift_under_a_recorded_candidate() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM criteria freeze");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        let before: String = database
+            .connection()
+            .query_row(
+                "SELECT acceptance_criteria_json FROM loom_task WHERE task_id='task_a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // A second plan for the same Mission is the only path that could replace the criteria.
+        let error = plan_import(&mut database, plan_input(&mission_id)).unwrap_err();
+        assert_eq!(
+            rejection_code(&error),
+            LOOM_PLAN_EXISTS,
+            "assertion a Mission keeps exactly one plan: {error}"
+        );
+        let after: String = database
+            .connection()
+            .query_row(
+                "SELECT acceptance_criteria_json FROM loom_task WHERE task_id='task_a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after, "assertion the criteria snapshot never moves");
+
+        // A review recorded after the refused import still answers against the same snapshot.
+        let review = review_record(
+            &mut database,
+            review_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "command_freeze",
+                LoomReviewVerdict::Accepted,
+                "the frozen snapshot still answers both criteria",
+                vec![
+                    criterion_result("criterion_one", true),
+                    criterion_result("criterion_two", true),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(review.review.verdict, LoomReviewVerdict::Accepted);
+    }
+
+    /// A criterion result travels to the browser, where both keys are required. Serialising must
+    /// always emit them, including the empty list and the absent note, or the shared contract
+    /// would be reading undefined where it expects a value.
+    #[test]
+    fn a_criterion_result_always_serialises_its_optional_keys() {
+        let value = serde_json::to_value(LoomAcceptanceCriterionResult {
+            criterion_id: "criterion_one".into(),
+            satisfied: true,
+            evidence_ids: Vec::new(),
+            note: None,
+        })
+        .unwrap();
+        assert_eq!(
+            value["evidenceIds"],
+            serde_json::json!([]),
+            "assertion an empty evidence list is still written"
+        );
+        assert!(
+            value.get("note").is_some_and(serde_json::Value::is_null),
+            "assertion an absent note is written as null, not omitted: {value}"
+        );
+    }
+
+    /// The same swap the registration window guards against, one step later: the file is replaced
+    /// while a passing verification is re-reading it. It has to be reported as unreadable, because
+    /// no comparison over bytes ever happened.
+    #[cfg(unix)]
+    #[test]
+    fn a_swap_inside_the_verification_window_is_unreadable_not_a_mismatch() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM verification window");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+        let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
+        let outside = workspace
+            .parent()
+            .expect("workspace has a parent")
+            .join(format!("loom-verify-window-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, b"bytes nobody validated").unwrap();
+
+        let swapped_workspace = workspace.clone();
+        let swapped_outside = outside.clone();
+        artifact_swap_hook::install(Box::new(move || {
+            let target = swapped_workspace.join("evidence_one.txt");
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(&swapped_outside, &target).unwrap();
+        }));
+
+        let mut input = verification_input(
+            &mission_id,
+            "task_a",
+            &candidate.candidate_id,
+            "verify_command",
+            LoomVerificationResult::Passed,
+        );
+        input.evidence_ids = Vec::new();
+        let error = verification_record(&mut database, input).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_UNREADABLE,
+            "assertion a swap during re-reading is not reported as a hash mismatch: {error}"
+        );
+        let verifications: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_verification", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            verifications, 0,
+            "assertion the refused verification stored nothing"
+        );
+
+        std::fs::remove_file(&outside).unwrap();
     }
 
     #[test]

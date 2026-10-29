@@ -28,6 +28,14 @@ export interface LoomAcceptanceCriteriaSnapshot {
 }
 
 /** 单条标准的验收结论：只记结论与证据引用，不重复保存标准文本。 */
+/**
+ * 逐条标准的验收结论。
+ *
+ * 可空性是刻意的、两端不对称：Rust 侧两个字段都 `#[serde(default)]`，可以整个省略（历史客户端
+ * 只传 criterionId + satisfied）；这里要求键必须存在、`evidenceIds` 不可为 null，`note` 只能为
+ * null。Rust 序列化时两个键都会写出来，所以线上格式永远满足这个接口——放宽的只是「接受什么」，
+ * 不是「发出什么」。
+ */
 export interface LoomAcceptanceCriterionResult {
   criterionId: string
   satisfied: boolean
