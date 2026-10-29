@@ -209,5 +209,53 @@ LOOM 的认领→交付→验收链路在真 Runtime 下跑通」，不是探测
 **现场仍未点的一步**：选 `Claude Code` → `开始对话`。这一步会真的用用户自己的登录跑一次 Agent Run、
 消耗他的额度，因此留给用户亲手点；我不替他花这个钱。
 
+### 8.6 升级通道改到本仓库（2026-10-29 21:29 CST，提交 `2f9c35e`）
+
+既然是产品分支，发布通道就该是自己的。把「查到上游 0.5.3」这件事当普通配置项改掉，不再当外部问题记。
+
+| 位置 | 改动 |
+|---|---|
+| `package.json` `build.publish` | `owner/repo` → `zhizhishu/loom-ai`（打包出的 `resources/app-update.yml` 由它生成） |
+| `scripts/verify-windows-release.mjs` | 校验目标改为 `zhizhishu/loom-ai`，报告行同步 |
+| `scripts/verify-macos-release.mjs` | 同上（macOS 侧同一条门禁） |
+| `apps/desktop/.../AboutUpdatesSettings.tsx` | 「关于与更新」里的 Releases 链接、「获取支持」→ issues，全部指向本仓库 |
+| `apps/desktop/.../AboutUpdatesSettings.test.ts`、`main/package-metadata.test.ts`、`scripts/fixtures/settings-workspace/main.cjs` | 断言跟着改，避免门禁和实现对不上 |
+| `crates/rovai-host/src/server_updates.rs` | 服务端自更新用的 `CHANNEL` / `RELEASES` / `API` 三个常量 → 本仓库 |
+| `scripts/build-server.mjs` | 打包内 README 的文档链接基准 → 本仓库 |
+
+**本机验证**
+- `pnpm exec vitest run AboutUpdatesSettings.test.ts package-metadata.test.ts` → **36 passed / 0 failed**
+- `pnpm typecheck` → exit 0
+- `node --test scripts/lib/settings-workspace.test.mjs` → **跑不起来**：`null !== 0`，Electron 夹具在
+  这个断开会话里起不来（与 §8.4 同因，本地已知抖动）。这条留给 CI / bero 覆盖，不声称通过。
+- CI `40882386926`（`2f9c35e`）**全绿**：fmt / check / typecheck / vitest / LOOM 契约 / 文档门禁
+
+**重打包并实装验证（同日 21:29–21:52 CST）**
+- run `40882395420` 全绿，15m39s；artifact `rovai-windows-x64-unsigned-2f9c35ee…`
+- verifier 报告里那一行变了：
+  ```
+  Packaged updater channel: github/zhizhishu/loom-ai
+  NSIS installer: sha256=6df123106ff859448a9d16093f30c341c61e7e7367db3dc00332f237dcf57f7d
+  Result: passed
+  ```
+- 重装到本机后，安装目录里的 `resources/app-update.yml` 实际内容：
+  ```yaml
+  owner: zhizhishu
+  repo: loom-ai
+  provider: github
+  releaseType: release
+  ```
+- 再次启动的真实日志（这才是修好的证据——不再把别人的版本当自己的新版）：
+  ```
+  Checking for update
+  Error: No published versions on GitHub
+  [rovai] Automatic update check failed (updater_unavailable).
+  ```
+  原因很直白：本仓库**还没发布过 Release**。等第一次发版后这条自然变成「有新版」；
+  在那之前界面走的是 `updater_unavailable` 的回退分支（链接已指向本仓库）。
+- 顺带测到热启动：`[rovai-core] stage=core_ready elapsed_ms=424`（冷启动是 16978ms，库已建好后快 40 倍）
+
+**遗留的一句话**：`package.json` 的 `author` 仍是基线作者，这是 MIT 的来源归属，不是通道配置，保留。
+
 ## 9. 记录
 每项一行写进 `skill-cli/TASK.md`，格式同第四轮验收书 §3。
