@@ -44,9 +44,20 @@
 
 [C1] PASS | commit abc1234 | fmt✓ check✓ | bero cargo test -p rovai-core --lib loom | pass 57 fail 0 | Actions 4071xxxxxxx 绿 | Astra PASS | 2026-10-xx hh:mm CST
 
-## 附录：A9 用户决定
+## 附录：A9 用户决定（2026-10-29，用户「可以 直接继续」= 采纳下列建议）
 
-（待填）
+**① 验收标准「内容」与「版本」同源**：判定为**不是活缺陷**。一个 Mission 只接受一次 `loom.plan.import`（否则 `LOOM_PLAN_EXISTS`），且没有任何产品路径改写 `loom_task.acceptance_criteria_json`（`loom.rs:1170/1769/2942/2968` 只动 status/updated_at/revision）。因此「标准内容取任务快照、版本取候选记录」当前不会分叉。
+落地：在 `review_record` 原地写清这个前提；新增测试 `the_acceptance_criteria_snapshot_cannot_drift_under_a_recorded_candidate` 钉住它（二次导入被拒 + 快照不变 + 评审仍按原快照通过）。若将来做「计划改版」，必须先把快照冻结到候选行（届时需要迁移 225）。
+
+**② `evidenceIds` / `note` 可空性**：保留「Rust 接受省略、TS 要求键存在且 `evidenceIds` 非 null」。理由：Rust 序列化时两个键都会写出，线上格式永远满足 TS；放宽的只是输入接受面。
+落地：契约注释写清不对称是刻意的；新增测试 `a_criterion_result_always_serialises_its_optional_keys` 钉住「空数组与 null 都会被写出」。
+
+**③ 宽屏提升阈值**：保持 `@container loom-workspace (min-width: 1200px)`，不换视口媒体查询。理由：真外壳是分栏的，面板可能永远到不了 1200；两列在 560 宽度下比单列更挤。
+落地：在 CSS 原地注明「量的是面板而非视口，是刻意选择」。
+
+**顺带补上的两项**（同一提交 `c9ea7ba`）：
+- 核验窗口补了与登记窗口同款的确定性换链测试缝：`a_swap_inside_the_verification_window_is_unreadable_not_a_mismatch`，验证读期间换链报 `LOOM_EVIDENCE_UNREADABLE`（而不是 hash 不符），且不写 verification 行。
+- 全量回归：bero `--lib loom` **75/0**、全量 **507 passed / 3 failed（恰基线）/ 1 ignored**。
 
 ## 附录：本轮记录（最终提交 `4787bcd`）
 
