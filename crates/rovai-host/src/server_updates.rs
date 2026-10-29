@@ -15,9 +15,9 @@ use std::{
 use tokio::{io::AsyncWriteExt, sync::Notify};
 
 const CHANNEL: &str =
-    "https://raw.githubusercontent.com/murray17/rovai-ai/main/scripts/server-release-tag.txt";
-const RELEASES: &str = "https://github.com/murray17/rovai-ai/releases/download";
-const API: &str = "https://api.github.com/repos/murray17/rovai-ai/releases/tags";
+    "https://raw.githubusercontent.com/zhizhishu/loom-ai/main/scripts/server-release-tag.txt";
+const RELEASES: &str = "https://github.com/zhizhishu/loom-ai/releases/download";
+const API: &str = "https://api.github.com/repos/zhizhishu/loom-ai/releases/tags";
 const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone)]

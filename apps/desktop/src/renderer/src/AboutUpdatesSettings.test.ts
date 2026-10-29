@@ -73,13 +73,13 @@ describe('AboutUpdatesSettingsView', () => {
       availableRelease: release,
       failureReason: 'network'
     }), { product: 'server' })
-    expect(markup).toContain('https://github.com/murray17/rovai-ai/releases/tag/v0.0.3')
+    expect(markup).toContain('https://github.com/zhizhishu/loom-ai/releases/tag/v0.0.3')
     const bridge = render(snapshot({
       status: 'download_failed',
       availableRelease: { ...release, version: '0.4.1' },
       failureReason: 'network'
     }), { product: 'server' })
-    expect(bridge).toContain('https://github.com/murray17/rovai-ai/releases/tag/server-v0.4.1')
+    expect(bridge).toContain('https://github.com/zhizhishu/loom-ai/releases/tag/server-v0.4.1')
   })
   it('always shows the installed version and keeps all update mutations user initiated', () => {
     const markup = render(snapshot())

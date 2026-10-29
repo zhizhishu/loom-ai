@@ -79,9 +79,9 @@ export function AboutUpdatesSettingsView({
     || (snapshot?.status === 'check_failed' && snapshot.failureReason === 'updater_unavailable')
   const officialReleasesUrl = product === 'server'
     ? availableRelease
-      ? `https://github.com/murray17/rovai-ai/releases/tag/${['0.4.0', '0.4.1'].includes(availableRelease.version) ? 'server-v' : 'v'}${encodeURIComponent(availableRelease.version)}`
-      : 'https://github.com/murray17/rovai-ai/releases'
-    : 'https://github.com/murray17/rovai-ai/releases/latest'
+      ? `https://github.com/zhizhishu/loom-ai/releases/tag/${['0.4.0', '0.4.1'].includes(availableRelease.version) ? 'server-v' : 'v'}${encodeURIComponent(availableRelease.version)}`
+      : 'https://github.com/zhizhishu/loom-ai/releases'
+    : 'https://github.com/zhizhishu/loom-ai/releases/latest'
 
   useEffect(() => {
     setShowCurrentForVersion(null)
@@ -194,7 +194,7 @@ export function AboutUpdatesSettingsView({
             {showFallback && (
               <div className="about-update-fallback">
                 <a href={officialReleasesUrl} target="_blank" rel="noreferrer noopener"><UiText zh={"官方 Releases"} /></a>
-                <a href="https://github.com/murray17/rovai-ai/issues" target="_blank" rel="noreferrer noopener"><UiText zh={"获取支持"} /></a>
+                <a href="https://github.com/zhizhishu/loom-ai/issues" target="_blank" rel="noreferrer noopener"><UiText zh={"获取支持"} /></a>
               </div>
             )}
           </>}

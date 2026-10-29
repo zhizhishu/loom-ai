@@ -262,8 +262,8 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "murray17",
-        "repo": "rovai-ai",
+        "owner": "zhizhishu",
+        "repo": "loom-ai",
         "releaseType": "release"
       }
     ],

@@ -22,8 +22,8 @@ describe('desktop package metadata', () => {
   it('packages GitHub update metadata and a macOS zip beside the install DMG', () => {
     expect(packageMetadata.build.publish).toEqual([{
       provider: 'github',
-      owner: 'murray17',
-      repo: 'rovai-ai',
+      owner: 'zhizhishu',
+      repo: 'loom-ai',
       releaseType: 'release'
     }])
     expect(packageMetadata.build.mac.target).toEqual(['dir', 'dmg', 'zip'])

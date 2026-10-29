@@ -60,7 +60,7 @@ try {
   const dirty = execFileSync('git', ['status', '--porcelain'], { cwd: repository, encoding: 'utf8' }).trim().length > 0
   // The copied guide must also work outside a checkout. Keep its canonical
   // documentation links pinned to the package's recorded source revision.
-  const guideBase = `https://github.com/murray17/rovai-ai/blob/${commit}/docs/development/server-preview.md`
+  const guideBase = `https://github.com/zhizhishu/loom-ai/blob/${commit}/docs/development/server-preview.md`
   const guide = readFileSync(join(repository, 'docs/development/server-preview.md'), 'utf8')
     .replace(/\]\((?!https?:|#)([^)]+)\)/g, (_, target) => `](${new URL(target, guideBase).href})`)
   writeFileSync(join(destination, 'README.md'), guide)
