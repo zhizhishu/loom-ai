@@ -36,6 +36,31 @@ pub enum Operation {
     #[serde(rename = "missions.linkPr")]
     MissionLinkPr,
 
+    // LOOM is a Mission surface, so the workspace a browser opens has to be able to project it.
+    // Reads are the eight projections the workspace renders; the two writes are the verdicts the
+    // Owner records from that page. Registration, claims and task release stay off the network
+    // capability: those belong to the agent side that owns the workspace.
+    #[serde(rename = "loom.plan.get")]
+    LoomPlanGet,
+    #[serde(rename = "loom.tasks.list")]
+    LoomTasksList,
+    #[serde(rename = "loom.dependencies.list")]
+    LoomDependenciesList,
+    #[serde(rename = "loom.candidates.list")]
+    LoomCandidatesList,
+    #[serde(rename = "loom.claims.list")]
+    LoomClaimsList,
+    #[serde(rename = "loom.artifacts.list")]
+    LoomArtifactsList,
+    #[serde(rename = "loom.reviews.list")]
+    LoomReviewsList,
+    #[serde(rename = "loom.verifications.list")]
+    LoomVerificationsList,
+    #[serde(rename = "loom.review.record")]
+    LoomReviewRecord,
+    #[serde(rename = "loom.verification.record")]
+    LoomVerificationRecord,
+
     #[serde(rename = "preferences.tasks.get")]
     TasksGet,
     #[serde(rename = "preferences.tasks.set")]
@@ -469,6 +494,16 @@ impl Operation {
             Self::MissionStatus => "missions.status",
             Self::MissionStart => "missions.start",
             Self::MissionLinkPr => "missions.linkPr",
+            Self::LoomPlanGet => "loom.plan.get",
+            Self::LoomTasksList => "loom.tasks.list",
+            Self::LoomDependenciesList => "loom.dependencies.list",
+            Self::LoomCandidatesList => "loom.candidates.list",
+            Self::LoomClaimsList => "loom.claims.list",
+            Self::LoomArtifactsList => "loom.artifacts.list",
+            Self::LoomReviewsList => "loom.reviews.list",
+            Self::LoomVerificationsList => "loom.verifications.list",
+            Self::LoomReviewRecord => "loom.review.record",
+            Self::LoomVerificationRecord => "loom.verification.record",
             Self::CampRename => "camps.rename",
             Self::CampDelete => "camps.delete",
             Self::CampDeletionIssues => "camps.deletionIssues",
