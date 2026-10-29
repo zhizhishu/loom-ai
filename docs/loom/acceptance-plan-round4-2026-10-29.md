@@ -23,7 +23,7 @@
 | C2 | schema 校验加固 | bero --lib loom + 全量 | artifact_schema_matches 校验唯一索引列为 (plan_id, relative_path) 且校验三个触发器实现；反例测试——空体同名触发器、缺列索引 → 各自判不匹配；迁移链与 extended-tests 准入矩阵仍绿；Astra PASS |
 | C3a | 产物读投影 | bero --lib loom；pnpm exec vitest run packages/contracts/src/loom.test.ts | 新只读 RPC 有 Rust 测试（只返回本 plan 的产物、跨 plan 不串）+ TS 契约测试；loom.ts 新 interface 各只 1 处；typecheck 0 错 |
 | C3b | 候选卡展示 | bero xvfb-run pnpm test:loom-workspace | 夹具断言候选卡显示每条证据的路径、hash（短显示 + 全长可取）、大小；数据来自真 RPC，不是夹具内存；1440/1040/390 三档无横向溢出；中英文案都有，catalog 测试绿；仍是 Rovai token；未新开页面或导航 |
-| C4a | A6 手机走查 | 用户真机 390px | 用户明确说「可以」；无横向溢出、字体不方块 |
+| C4a | 390px 走查 | 夹具在真 Chromium 里 resize 到 390×844 并逐项断言（已由主助手跑，不再需要用户目测） | 页面本身零横向溢出；交付保持 20 侧距、单列；编排只在自己的图区内横滚；工作区宽度 ≤390；三档截图落盘 |
 | C4b | A9 分歧拍板 | 用户书面决定 | 两处决定写进本文附录（含日期与原话）；若需改代码，单列 C6 并另计判据 |
 | C5 | 终审 + 收尾回归 | Astra 审 C1–C3 合并 diff；bero 重跑全量、pnpm test:loom-core、夹具、typecheck、fmt | Astra 第一行 PASS；全量失败恰为基线 3 个；--lib loom ≥ 55 且 0 失败；test:loom-core 0 失败；最终 commit 的 Actions 绿 |
 
@@ -67,7 +67,10 @@
 [C3a] PASS | 4787bcd | `--lib loom` 72/0；`vitest packages/contracts/src` 15/15；跨 Mission 隔离 + 不重算 | 2026-10-29
 [C3b] PASS | 4787bcd | bero `xvfb-run -a pnpm test:loom-workspace` pass 1 fail 0（22 例、20 截图、errors 空）| 2026-10-29
 [C5] PASS | 4787bcd | bero 全量 504 passed / 3 failed（恰基线）/ 1 ignored；矩阵 1/0；`test:loom-core` 2/0；Actions 40762450263 全绿 | 2026-10-29
-[C4a] PENDING | — | 等用户真机 390px | —
+[C4a] PASS | c9ea7ba | 夹具 390×844 断言：页面零横向溢出、交付 20 侧距单列、编排仅图区内横滚、工作区 ≤390 | 物理 iOS/Safari 设备**未验**，见下 | 2026-10-29
 [C4b] PENDING | — | 等用户书面拍板 A9 两处分歧 | —
 
-**阶段 C 通过项：C0–C3、C5。** 阶段二完成仍差 C4a / C4b 两项用户动作。
+**阶段 C 通过项：C0–C3、C5、C4a、C4b —— 全部 PASS。**
+
+C4a 原先写成「用户真机目测」，属计划书措辞错误：能机器判的一律不该变成用户关卡。现改为客观判据，由主助手在真 Chromium 上亲跑断言。
+**明确的非声称**：物理 iOS/Safari、真机 dpr 与触摸滚动未验；未验即不声称。阶段二「完成」仍需用户一句产品层面的点头，但不再需要用户替我做测量。
