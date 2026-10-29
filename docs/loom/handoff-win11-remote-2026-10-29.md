@@ -161,5 +161,53 @@ Found version 0.5.3 (url: Rovai-AI-0.5.3-x64.exe)
 **仍未验（需人在真实桌面会话里做）**：W4 的「肉眼可见」、W5 真实 Runtime 全链路、
 W6 重启持久、W7 卸载。断开会话装不了这个人眼证据——这也是为什么脚本能装、却不能说「你自己试过了」。
 
+### 8.5 首次真实运行（2026-10-29 13:56–14:05 CST）
+
+**关键教训：不要用 `--user-data-dir` 启动它。**
+第一次我用 `--user-data-dir=<临时目录>` 想让验收不污染日常数据，结果界面直接报
+「会话尚未就绪 / 暂时无法打开会话」，右侧「本机设置提示」也说读不到本机设置。
+去掉这个参数、像用户双击一样直接启动，**一切正常**。这是本 Agent 的用法错误，不是产品缺陷。
+（正确做法是启动后由 App 自己决定 data root：`%LOCALAPPDATA%\Rovai AI Bootstrap\<hash>\`。）
+
+**正常启动日志（冷启动）**
+```
+[startup] stage=windows_data_root_ready  elapsed_ms=306.0
+[startup] stage=electron_ready           elapsed_ms=398.1
+[startup] stage=window_created           elapsed_ms=593.6
+[startup] stage=main_session_stores_ready elapsed_ms=822.0
+[startup] stage=core_spawn
+[rovai] User Automation is unavailable; Desktop will continue.
+[rovai-core] stage=authority_assessment  targetContract=v1.72
+[rovai-core] stage=database_ready        duration_ms=15916
+[rovai-core] stage=core_ready            elapsed_ms=16978
+rovai-core 0.5.1 ready
+[startup] stage=core_ready
+[rovai-core] stage=managed_skills_ready  duration_ms=598
+```
+- **Core 在 Windows 上真的起来了**：`rovai-core 0.5.1 ready`，首次建库 15.9s（224 步迁移），
+  `managed_skills_ready` 598ms，另有 `rovai-host.exe` 进程
+- 三方核对：`User Automation is unavailable; Desktop will continue` 是既有的降级路径，不是崩溃
+
+**Onboarding 三步全部正常**（1/3 欢迎 → 2/3 选队员 → 3/3 选智能体）
+- 队员列表：叮叮·游学者 / 芝士·鉴定士 / 咕咕·巡夜人 / 小兔·绘图师
+- **本机智能体探测在 Win11 上工作**：
+  `Claude Code 可用`、`Codex CLI 可用`、`DeepSeek Harness 可用`、`Pi Coding Agent 可用`；
+  `GitHub Copilot 未检测到`、`Command Code 未检测到`；另有「其他智能体 · 12」
+
+**这一步否掉了我上一轮的一个判断**：我说过「真 Runtime 从未接入」是上线 blocker。
+实际上 App 自带的本机 Runtime 探测与准入在 Win11 上是通的——没验的是「选完智能体之后
+LOOM 的认领→交付→验收链路在真 Runtime 下跑通」，不是探测本身。
+
+**断开会话里怎么操作它（给下一个 Agent 的方法）**
+| 目的 | 手段 | 结果 |
+|---|---|---|
+| 取窗口像素 | `PrintWindow`（`PW_RENDERFULLCONTENT`）写 BMP 再转 PNG | ✅ 可用（`ImageGrab` 不行） |
+| 点 Electron 里的按钮 | CDP：启动加 `--remote-debugging-port`，`websocket-client` 连页面 target（必须 `suppress_origin=True`，否则 403）→ `Runtime.evaluate` 触发 DOM 点击 | ✅ 可用 |
+| 点 Win32 安装向导按钮 | `win32gui` 找子按钮 + `SendMessage(BM_CLICK)` | ✅ 可用 |
+| 鼠标/键盘注入 | `SetCursorPos` / `GetCursorPos` / `ImageGrab` | ❌ 全部被拒（session 3 断开，无输入桌面） |
+
+**现场仍未点的一步**：选 `Claude Code` → `开始对话`。这一步会真的用用户自己的登录跑一次 Agent Run、
+消耗他的额度，因此留给用户亲手点；我不替他花这个钱。
+
 ## 9. 记录
 每项一行写进 `skill-cli/TASK.md`，格式同第四轮验收书 §3。
