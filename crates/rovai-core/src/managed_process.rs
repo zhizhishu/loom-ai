@@ -639,7 +639,10 @@ impl ManagedProcess {
         #[cfg(windows)]
         {
             if spec.purpose == ManagedProcessPurpose::RuntimeConnection {
-                bail!("connection-only Runtime ownership is not admitted on Windows");
+                return Err(anyhow::anyhow!(
+                    "connection-only Runtime ownership is not admitted on Windows"
+                )
+                .into());
             }
             let child = windows::WindowsManagedProcess::spawn(&spec)?;
             Ok(Self {
