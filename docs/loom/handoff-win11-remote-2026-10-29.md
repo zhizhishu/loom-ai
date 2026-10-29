@@ -118,5 +118,48 @@ Windows data-root 里跑通了 `health.check`。这是本仓第一份 Windows �
 `github/murray17/rovai-ai`——即**应用内升级检查指向的是上游仓库**，不是 `zhizhishu/loom-ai`。
 本 fork 自己发版前必须改通道，否则「检查更新」会去拿上游的包。
 
+### 8.4 本机实装与首次启动（2026-10-29 13:47–13:55 CST）
+
+**安装方式（有条件才这么做，见下方坑）**：`/S` 静默参数**没被 NSIS 采纳**，仍弹出 assisted 安装向导；
+而本 Agent 所在会话是 **session 3（Disconnected）**，`GetCursorPos` 被拒、`SetCursorPos` 失败、
+ImageGrab 取不到画面——**鼠标键盘注入在断开会话里全部不可用**。
+最终用 `win32gui` 枚举子按钮并发送 `BM_CLICK`（消息驱动，不经输入桌面）走完「安装(I) → 完成(F)」，
+安装器退出码 0。
+
+**落盘结果**
+| 项 | 值 |
+|---|---|
+| 安装目录 | `%LOCALAPPDATA%\Programs\Rovai-ai`，570 MB |
+| 主程序 | `Rovai-ai.exe` 225,476,608 B |
+| sidecar | `resources/bin/{rovai-core.exe 53,363,200 / rovai-host.exe 77,500,416 / rovai.exe 5,902,848}` |
+| 快捷方式 | 开始菜单 `Rovai AI.lnk` + 桌面 `Rovai AI.lnk` |
+| 卸载器 | `Uninstall Rovai-ai.exe` |
+
+**字节级对账**：安装后的三个 sidecar `sha256` 与 verifier 报告**逐字节一致**
+（`34e162ce…` / `2adb70a4…` / `1c3555a7…`）——装上去的确实是 verifier 签过的那三个二进制。
+
+**真机执行证据**
+- `resources/bin/rovai.exe --version` → `rovai 0.5.1 contract-v44 ipc-v3`（与 verifier 记录相同）
+- 以临时 `--user-data-dir` 启动（不碰日常 userData），启动日志：
+  ```
+  [startup] stage=main_module_loaded   elapsed_ms=0.0
+  [startup] stage=electron_ready       elapsed_ms=381.1
+  [startup] stage=window_created       elapsed_ms=610.3
+  [startup] stage=main_session_stores_ready elapsed_ms=840.7
+  ```
+- 枚举窗口得到标题 `Rovai AI`，尺寸 1377×814 → **主窗口真的创建了**
+- 测试后已 `taskkill //T //F` 结束本轮启动的 4 个进程，无遗留
+
+**升级通道问题当场复现（不是理论）**：首次启动日志里写着
+```
+Checking for update
+Found version 0.5.3 (url: Rovai-AI-0.5.3-x64.exe)
+```
+它是去**上游**通道查的，把上游 0.5.3 当成了「有新版」。本 fork 发版前必须改
+`app-update.yml` / 发布通道，否则用户点更新会装成上游版本。
+
+**仍未验（需人在真实桌面会话里做）**：W4 的「肉眼可见」、W5 真实 Runtime 全链路、
+W6 重启持久、W7 卸载。断开会话装不了这个人眼证据——这也是为什么脚本能装、却不能说「你自己试过了」。
+
 ## 9. 记录
 每项一行写进 `skill-cli/TASK.md`，格式同第四轮验收书 §3。
