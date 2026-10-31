@@ -1609,7 +1609,7 @@ fn task_family_help_text() -> &'static str {
 
 /// Confirmed r1 text of `docs/versions/v1.72/model-context-change-loom-accp.md`.
 fn loom_family_help_text() -> &'static str {
-    "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make a planned task claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
+    "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
 }
 
 fn user_automation_available_in_current_process() -> bool {
@@ -2169,10 +2169,10 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
         "mission.status" => &["rovai mission status --status needs_you"],
         "loom.status" => &["rovai loom status"],
         "loom.plan" => &["rovai loom plan --input-file plan.json"],
-        "loom.release" => &["rovai loom release --task-id t1"],
-        "loom.claim" => &["rovai loom claim --task-id t1"],
-        "loom.evidence" => &["rovai loom evidence --relative-path out/report.md --task-id t1"],
-        "loom.submit" => &["rovai loom submit --task-id t1 --evidence-ids <artifactId>"],
+        "loom.release" => &["rovai loom release --task-id report-draft"],
+        "loom.claim" => &["rovai loom claim --task-id report-draft"],
+        "loom.evidence" => &["rovai loom evidence --relative-path out/report.md --task-id report-draft"],
+        "loom.submit" => &["rovai loom submit --task-id report-draft --evidence-ids <artifactId>"],
         "thread.message.send" => &CAMP_MESSAGE_SEND_HELP_EXAMPLES,
         "member.list" => &["rovai member list"],
         "member.get" => &["rovai member get --agent-id agent_27"],
@@ -2556,7 +2556,7 @@ mod tests {
         assert!(!is_family_help(&loom_help));
         assert_eq!(
             loom_family_help_text(),
-            "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make a planned task claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
+            "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
         );
         assert!(root_help_text(true, true).contains(
             "  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit\n\n"

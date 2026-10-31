@@ -1,9 +1,9 @@
 ---
 document_type: model-context-change
 version: v1.72
-revision: 1
+revision: 2
 confirmation_status: confirmed
-confirmed_revision: 1
+confirmed_revision: 2
 confirmed_by: local_user
 confirmed_at: 2026-10-31
 last_updated: 2026-10-31
@@ -193,3 +193,100 @@ User 在 Win11 已装 App 中：开 Mission → 让 Default Lead 规划 → 编�
 `pnpm docs:test` 有 1 项既有失败（`4b5d3a4` 给 `ci.yml` 加了 main push 触发），与本改动无关，未在本次修改。
 
 **真实任务 Gate**：待 User 在 Win11 重装后执行（见上）。
+
+## r2 修订（2026-10-31，已二次确认）
+
+起因：实施后审查（`docs/loom/plan-accp-entry-2026-10-31.md` §9）发现：有先后的任务在上游被 User 验收后无人接力；`loom.release` 描述「once its dependencies allow it」与实际不符（`task_release` 只要求 DRAFT，依赖闸在 `claim_acquire`）；`taskId` 在整个数据库唯一（`plan_import` 撞 `LOOM_TASK_EXISTS`），r1 示例的 `t1` 会让第二个使命导入失败。User 选「A：验收后 User 回一句继续，由 Lead 接上」。
+
+只改模型可见文本，不改工具 schema、权限、身份注入或领域行为。
+
+### `loom.release` description
+
+变更前：
+
+```text
+Make a draft task claimable once its dependencies allow it. Default Lead only.
+```
+
+变更后：
+
+```text
+Make a draft task claimable. Default Lead only. Releasing does not check dependencies; claiming a task whose dependencies are not yet met returns loom.dependency_unreleased.
+```
+
+### `rovai loom --help` 族帮助
+
+只改 `release` 一行：
+
+```text
+  release   Make a planned task claimable (Default Lead only).
+```
+
+变更后：
+
+```text
+  release   Make planned tasks claimable (Default Lead only).
+```
+
+### `operation_help_examples`
+
+变更前 `t1`，变更后用 Mission 专属前缀：
+
+```text
+rovai loom release --task-id report-draft
+rovai loom claim --task-id report-draft
+rovai loom evidence --relative-path out/report.md --task-id report-draft
+rovai loom submit --task-id report-draft --evidence-ids <artifactId>
+```
+
+### `references/loom.md`（r2 完整文本，替换 r1）
+
+```markdown
+# LOOM
+
+LOOM keeps a Mission's plan, task claims, deliveries and the User's verdicts on record. The User sees them in the Mission's Orchestration and Delivery tabs. Every `rovai loom` command targets the current Thread's Mission.
+
+## Who does what
+
+| Step | Who | Command |
+| --- | --- | --- |
+| Check whether a plan exists | Anyone | `rovai loom status` |
+| Import the plan | Default Lead | `rovai loom plan --input-file plan.json` |
+| Make every task claimable | Default Lead | `rovai loom release --task-id <id>` for each task |
+| Ask a member to take a task | Default Lead | `rovai send --to <member>` with the task id |
+| Claim the task before working | Assignee | `rovai loom claim --task-id <id>` |
+| Register each produced file | Assignee | `rovai loom evidence --relative-path <path> --task-id <id>` |
+| Submit the delivery | Assignee | `rovai loom submit --task-id <id> --evidence-ids <artifactId>` |
+| Accept or reject | User only | Delivery tab |
+| Continue after acceptance | Default Lead | `rovai loom status`, then message the next assignees |
+
+## Plan
+
+Read `rovai loom status` first. A Mission accepts one plan and it cannot be replaced, so draft it from the Mission's full definition (`rovai mission get`) before importing. Write 2–8 tasks a member can finish and hand over; give each acceptance criterion a short stable `criterionId`. Task ids are unique across every Mission, so start each with a word from this Mission, such as `report-draft`, never a bare `t1`. Use `task_done` dependencies for ordering and `artifact_accepted` only when the downstream task needs the User-accepted output.
+
+After importing, release every task. Releasing does not wait for dependencies; a task whose dependencies are not met cannot be claimed yet. Message only the assignees whose tasks have no unmet dependencies.
+
+## Deliver
+
+Claim before working; a claim lease expires, so claim again if a long task outlives it. If the claim returns `loom.dependency_unreleased`, do not retry: end the Run and tell the Default Lead the task is waiting. Register only files you produced inside the Mission's working directory, then submit with the returned artifact ids. Submitting proves the delivery is recorded, not that it is accepted. Tell the User in the Thread that a delivery awaits acceptance; do not set the Mission `completed` before the User accepts.
+
+## Continue after acceptance
+
+The User's acceptance does not start anyone. When a dependent task is waiting, ask the User in the Thread to reply after accepting. On that reply, the Default Lead reads `rovai loom status` and messages each assignee whose dependencies are now met.
+
+Follow `error.recovery` on failure; see [Recovery](recovery.md).
+```
+
+### r2 二次确认
+
+开发者（User，`local_user`）于 2026-10-31 在本会话看过 r2 五点要点（放出全部任务、领到未轮到的任务就结束并告知 Lead、验收后回一句「继续」由 Lead 接力、任务编号带 Mission 专属词、改正 release 描述）后，经问答选项明确选择「确认，按 r2 实施」；此前已选「A：你回一句继续就接上」。
+
+### r2 明确不变
+
+`cli-operations` 的 `name` / `description` 与 SKILL.md 两行、根帮助、6 项工具的名称与 inputSchema/outputSchema、身份注入、权限、平台 Skill 集合与 Bootstrap 字节均与 r1 相同。
+
+### r2 验证
+
+- `bin/rovai.rs` 族帮助测试、`references/loom.md` 打包内容与本节逐字一致；`team_tool_catalog` / `builtin_tool` 测试通过。
+- bero `--lib loom` 与全量回归、CI、Windows 出包。
+- 真实任务 Gate 增加：两步依赖计划中，User 验收上游后回一句「继续」，Lead 派出下游任务并完成交付。

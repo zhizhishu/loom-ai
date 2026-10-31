@@ -493,7 +493,7 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": LOOM_RELEASE_TOOL_NAME,
             "title": "Release a planned task",
-            "description": "Make a draft task claimable once its dependencies allow it. Default Lead only.",
+            "description": "Make a draft task claimable. Default Lead only. Releasing does not check dependencies; claiming a task whose dependencies are not yet met returns loom.dependency_unreleased.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false, "required": ["taskId"],
                 "properties": {"taskId": id_schema()}
@@ -762,6 +762,22 @@ mod tests {
             released.get("task").is_none(),
             "canonical results carry no top-level task"
         );
+        // r2 guidance: the Lead releases every task at once; the dependency gate is the claim.
+        invoke(
+            &mut database,
+            &caller(&camp_id, "agent_1", "run_lead", "cmd_release_downstream"),
+            LOOM_RELEASE_TOOL_NAME,
+            json!({"taskId": "t2"}),
+        )
+        .unwrap();
+        let error = invoke(
+            &mut database,
+            &caller(&camp_id, "agent_2", "run_early", "cmd_claim_downstream"),
+            LOOM_CLAIM_TOOL_NAME,
+            json!({"taskId": "t2"}),
+        )
+        .unwrap_err();
+        assert_eq!(code(error), "loom.dependency_unreleased");
 
         // The other Mission has no plan: the same task id is not reachable from there.
         let error = invoke(
