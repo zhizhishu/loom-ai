@@ -31,7 +31,13 @@ export const BUILTIN_CLI_NAMES: Readonly<Record<string, string>> = Object.freeze
   'mission.list': 'rovai mission list',
   'mission.get': 'rovai mission get',
   'mission.update': 'rovai mission update',
-  'mission.status': 'rovai mission status'
+  'mission.status': 'rovai mission status',
+  'loom.status': 'rovai loom status',
+  'loom.plan': 'rovai loom plan',
+  'loom.release': 'rovai loom release',
+  'loom.claim': 'rovai loom claim',
+  'loom.evidence': 'rovai loom evidence',
+  'loom.submit': 'rovai loom submit'
 })
 
 function currentOperation(operation: unknown): unknown {

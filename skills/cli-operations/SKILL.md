@@ -13,6 +13,7 @@ Use `rovai --help` to find an operation and its exact `--help` for syntax. Read 
 | --- | --- |
 | Public answer, progress, question or one-time collaboration | ThreadMessage |
 | Shared objective or whole-Mission status | Mission |
+| Mission plan, task claims, delivery evidence and User acceptance | LOOM |
 | Member identity, avatar or a requested profile edit | Member |
 | Default Lead requests independent work from several members | One ThreadMessage with repeated `--to`; replies return separately |
 | Thread or message evidence | Thread/History |
@@ -39,6 +40,7 @@ A successful operation proves its own commit, not downstream execution, validati
 
 - [Send](references/send.md): public messages, Agent routing, parallel invitations and User attention.
 - [Mission](references/mission.md): objective, status and public explanation.
+- [LOOM](references/loom.md): plan a Mission, claim tasks and submit deliveries for User acceptance.
 - [Thread/History](references/camp-history.md): message reads, addressing, execution state and pagination.
 - [Memory](references/memory.md): route durable information to `memory-stewardship`.
 - [Recovery](references/recovery.md): follow `error.recovery`, especially uncertain outcomes.

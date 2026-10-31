@@ -128,6 +128,10 @@ async fn run() -> Result<u8> {
         print!("{}", task_family_help_text());
         return Ok(0);
     }
+    if args.as_slice() == ["loom", "--help"] {
+        print!("{}", loom_family_help_text());
+        return Ok(0);
+    }
     if let Some(description) = operation_help(&args, tasks_enabled)? {
         print_operation_help(&description);
         return Ok(0);
@@ -1589,7 +1593,7 @@ fn print_root_help() {
 }
 
 fn root_help_text(managed_runtime: bool, tasks_enabled: bool) -> String {
-    let mut text = "Rovai CLI\n\nAgent operations:\n  rovai send\n  rovai member list|get|create|update\n  rovai task create|get|list|update\n  rovai thread list|search|read|runs\n  rovai history search\n  rovai memory view|search|read|write\n  rovai automation list|get|create|run|close|update|delete\n  rovai mission list|get|update|status\n\nRun an Agent operation's exact `--help` for its closed inputs.\n".to_string();
+    let mut text = "Rovai CLI\n\nAgent operations:\n  rovai send\n  rovai member list|get|create|update\n  rovai task create|get|list|update\n  rovai thread list|search|read|runs\n  rovai history search\n  rovai memory view|search|read|write\n  rovai automation list|get|create|run|close|update|delete\n  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit\n\nRun an Agent operation's exact `--help` for its closed inputs.\n".to_string();
     if !tasks_enabled {
         text = text.replace("  rovai task create|get|list|update\n", "");
     }
@@ -1601,6 +1605,11 @@ fn root_help_text(managed_runtime: bool, tasks_enabled: bool) -> String {
 
 fn task_family_help_text() -> &'static str {
     "rovai task\n\nUse Tasks for responsibility that spans Runs and needs independent handoff or acceptance.\nUse messages for one-time coordination. Update Task state before a required handoff, request or result.\n\n  create  Create a durable task.\n  get     Read task details.\n  list    List task summaries.\n  update  Update an existing task.\n\nUse rovai task <command> --help for arguments.\n"
+}
+
+/// Confirmed r1 text of `docs/versions/v1.72/model-context-change-loom-accp.md`.
+fn loom_family_help_text() -> &'static str {
+    "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make a planned task claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
 }
 
 fn user_automation_available_in_current_process() -> bool {
@@ -2158,6 +2167,12 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
         ],
         "mission.update" => &["rovai mission update --title \"Directory navigation\""],
         "mission.status" => &["rovai mission status --status needs_you"],
+        "loom.status" => &["rovai loom status"],
+        "loom.plan" => &["rovai loom plan --input-file plan.json"],
+        "loom.release" => &["rovai loom release --task-id t1"],
+        "loom.claim" => &["rovai loom claim --task-id t1"],
+        "loom.evidence" => &["rovai loom evidence --relative-path out/report.md --task-id t1"],
+        "loom.submit" => &["rovai loom submit --task-id t1 --evidence-ids <artifactId>"],
         "thread.message.send" => &CAMP_MESSAGE_SEND_HELP_EXAMPLES,
         "member.list" => &["rovai member list"],
         "member.get" => &["rovai member get --agent-id agent_27"],
@@ -2536,6 +2551,13 @@ mod tests {
         let task_help = ["task".to_string(), "--help".to_string()];
         assert!(operation_help(&task_help, false).unwrap().is_none());
         assert!(!is_family_help(&task_help));
+        let loom_help = ["loom".to_string(), "--help".to_string()];
+        assert!(operation_help(&loom_help, true).unwrap().is_none());
+        assert!(!is_family_help(&loom_help));
+        assert_eq!(loom_family_help_text(), "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make a planned task claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n");
+        assert!(root_help_text(true, true).contains(
+            "  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit\n\n"
+        ));
         assert_eq!(
             task_family_help_text(),
             "rovai task\n\nUse Tasks for responsibility that spans Runs and needs independent handoff or acceptance.\nUse messages for one-time coordination. Update Task state before a required handoff, request or result.\n\n  create  Create a durable task.\n  get     Read task details.\n  list    List task summaries.\n  update  Update an existing task.\n\nUse rovai task <command> --help for arguments.\n"
@@ -2574,8 +2596,14 @@ mod tests {
             &["mission", "get", "--help"],
             &["mission", "update", "--help"],
             &["mission", "status", "--help"],
+            &["loom", "status", "--help"],
+            &["loom", "plan", "--help"],
+            &["loom", "release", "--help"],
+            &["loom", "claim", "--help"],
+            &["loom", "evidence", "--help"],
+            &["loom", "submit", "--help"],
         ];
-        assert_eq!(exact_paths.len(), 29);
+        assert_eq!(exact_paths.len(), 35);
         for path in exact_paths {
             let args = path
                 .iter()

@@ -138,6 +138,9 @@ pub fn validate_builtin_tool_input(canonical_name: &str, input: &Value) -> Resul
         AUTOMATION_UPDATE_TOOL_NAME => {
             serde_json::from_value::<AutomationUpdateToolInput>(input.clone()).map(|_| ())
         }
+        name if crate::loom_tool::is_loom_tool(name) => {
+            return crate::loom_tool::validate_input(name, input);
+        }
         _ => bail!("unknown built-in operation: {canonical_name}"),
     };
     valid.map_err(|_| anyhow::anyhow!("{canonical_name} input does not match its schema"))
@@ -1018,7 +1021,7 @@ pub fn builtin_tool_definitions() -> &'static [Value] {
 }
 
 fn build_builtin_tool_definitions() -> Vec<Value> {
-    vec![
+    let mut definitions = vec![
         json!({
             "name": "mission.list",
             "title": "List Missions",
@@ -1345,7 +1348,18 @@ fn build_builtin_tool_definitions() -> Vec<Value> {
                 ]
             }
         }),
-    ]
+    ];
+    // LOOM definitions live with their adapter; keep them right after the Mission family so the
+    // catalog order matches `TEAM_TOOL_NAMES`.
+    let after_mission = definitions
+        .iter()
+        .position(|definition| definition["name"] == "mission.status")
+        .map_or(definitions.len(), |index| index + 1);
+    definitions.splice(
+        after_mission..after_mission,
+        crate::loom_tool::tool_definitions(),
+    );
+    definitions
 }
 
 #[cfg(test)]

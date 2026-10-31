@@ -122,6 +122,12 @@ pub fn agent_output_schema(operation: &str) -> Result<Value> {
         | "mission.get"
         | "mission.update"
         | "mission.status"
+        | "loom.status"
+        | "loom.plan"
+        | "loom.release"
+        | "loom.claim"
+        | "loom.evidence"
+        | "loom.submit"
         | "automation.list"
         | "automation.get"
         | "automation.create"
@@ -255,6 +261,12 @@ fn project_success(operation: &str, result: Value) -> Result<Value> {
         | "mission.get"
         | "mission.update"
         | "mission.status"
+        | "loom.status"
+        | "loom.plan"
+        | "loom.release"
+        | "loom.claim"
+        | "loom.evidence"
+        | "loom.submit"
         | "automation.list"
         | "automation.get"
         | "automation.create"
@@ -978,10 +990,10 @@ mod tests {
 
     #[test]
     fn every_operation_has_a_schema_valid_golden_projection() {
-        // v14 changes legacy avatar contents, not v13's JSON shape. Reuse the
-        // same golden; source/framing semantics belong to member_avatar tests.
+        // v15 is v13 plus the six LOOM operations (v14 changed legacy avatar
+        // contents, not the JSON shape); v13 stays as the earlier record.
         let golden: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/builtin-tool-agent-output-v13.json"
+            "../tests/fixtures/builtin-tool-agent-output-v15.json"
         ))
         .unwrap();
         // Old results are projected to current names without content receipts.

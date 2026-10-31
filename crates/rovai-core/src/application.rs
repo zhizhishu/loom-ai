@@ -7446,6 +7446,52 @@ impl Core {
                         command_execution_payload(execution)
                     }
                 }
+                name if rovai_core::loom_tool::is_loom_tool(name) => {
+                    let read_only = rovai_core::loom_tool::is_read_only(name);
+                    if !read_only {
+                        let actor = ActorRef::Agent {
+                            agent_id: authenticated_run.agent_id.clone(),
+                            source_agent_run_id: authenticated_run.agent_run_id.clone(),
+                        };
+                        if !crate::collaboration::actor_can_write_camp(
+                            database.connection(),
+                            &actor,
+                            Some(authenticated_run.execution_epoch),
+                            &authenticated_run.camp_id,
+                        )? {
+                            return Err(automation_tool_error(
+                                "loom.forbidden",
+                                "Current Thread membership is required",
+                            ));
+                        }
+                    }
+                    let caller = rovai_core::loom_tool::LoomToolCaller {
+                        camp_id: &authenticated_run.camp_id,
+                        agent_id: &authenticated_run.agent_id,
+                        agent_run_id: &authenticated_run.agent_run_id,
+                        command_id: &request.runtime_tool_call_id,
+                    };
+                    let tool_name = request.tool_name.clone();
+                    let output = rovai_core::loom_tool::invoke(
+                        &mut database,
+                        &caller,
+                        &tool_name,
+                        request.input,
+                    )
+                    .map_err(map_loom_tool_error)?;
+                    if !read_only {
+                        evidence_replayed = output
+                            .get("replayed")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        emit_missions_invalidated(
+                            &self.output,
+                            "missions.loomUpdated",
+                            Some(&authenticated_run.camp_id),
+                        );
+                    }
+                    Ok(output)
+                }
                 AUTOMATION_LIST_TOOL_NAME => {
                     let input = serde_json::from_value::<AutomationListToolInput>(request.input)
                         .map_err(|_| {
@@ -27586,6 +27632,16 @@ fn automation_tool_error(code: &str, message: &str) -> anyhow::Error {
 
 fn mission_operation_is_read_only(operation: &str) -> bool {
     matches!(operation, "mission.list" | "mission.get")
+}
+
+/// LOOM rejections carry stable `loom.*` codes; they must reach the Agent as operation errors
+/// with recovery guidance, never collapse into an internal error.
+fn map_loom_tool_error(error: anyhow::Error) -> anyhow::Error {
+    if let Some(rejection) = error.downcast_ref::<rovai_core::loom_tool::LoomToolError>() {
+        automation_tool_error(rejection.code(), rejection.message())
+    } else {
+        error
+    }
 }
 
 fn map_mission_agent_input_error(error: anyhow::Error) -> anyhow::Error {

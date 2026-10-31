@@ -178,7 +178,7 @@ pub struct BuiltinToolCliIdentity {
     pub action: &'static str,
 }
 
-pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 30] = [
+pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 36] = [
     BuiltinToolCliIdentity {
         operation: "thread.message.send",
         group: "send",
@@ -293,6 +293,36 @@ pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 30] = [
         operation: "mission.status",
         group: "mission",
         action: "status",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.status",
+        group: "loom",
+        action: "status",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.plan",
+        group: "loom",
+        action: "plan",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.release",
+        group: "loom",
+        action: "release",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.claim",
+        group: "loom",
+        action: "claim",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.evidence",
+        group: "loom",
+        action: "evidence",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.submit",
+        group: "loom",
+        action: "submit",
     },
     BuiltinToolCliIdentity {
         operation: "automation.list",
@@ -1000,6 +1030,61 @@ fn error_contracts(operation: &str) -> Vec<BuiltinToolErrorContract> {
             });
         }
     }
+    if crate::loom_tool::is_loom_tool(operation) {
+        // Stop: the caller cannot fix it by editing input.
+        for code in [
+            "loom.current_unavailable",
+            "loom.forbidden",
+            "loom.lead_required",
+            "loom.mission_not_found",
+        ] {
+            errors.push(BuiltinToolErrorContract {
+                code: code.into(),
+                recovery: BuiltinToolRecovery::Stop,
+            });
+        }
+        // Refresh: the plan moved on; read `rovai loom status` before deciding.
+        for code in [
+            "loom.plan_exists",
+            "loom.plan_not_found",
+            "loom.task_not_draft",
+            "loom.task_not_ready",
+            "loom.dependency_unreleased",
+            "loom.claim_held",
+            "loom.claim_expired",
+            "loom.claim_fence_stale",
+            "loom.claim_agent_run_mismatch",
+            "loom.acceptance_criteria_version_mismatch",
+        ] {
+            errors.push(BuiltinToolErrorContract {
+                code: code.into(),
+                recovery: BuiltinToolRecovery::RefreshThenDecide,
+            });
+        }
+        // Fix input: the request itself is wrong.
+        for code in [
+            "loom.invalid_input",
+            "loom.claim_absent",
+            "loom.task_not_found",
+            "loom.task_duplicate",
+            "loom.task_exists",
+            "loom.criterion_duplicate",
+            "loom.acceptance_criteria_empty",
+            "loom.dag_cycle",
+            "loom.dependency_duplicate",
+            "loom.dependency_self",
+            "loom.dependency_task_missing",
+            "loom.artifact_path_rejected",
+            "loom.artifact_content_changed",
+            "loom.evidence_not_found",
+            "loom.candidate_previous_invalid",
+        ] {
+            errors.push(BuiltinToolErrorContract {
+                code: code.into(),
+                recovery: BuiltinToolRecovery::FixInput,
+            });
+        }
+    }
     errors.sort_by(|left, right| left.code.cmp(&right.code));
     errors
 }
@@ -1029,6 +1114,12 @@ pub fn projection_identity(operation: &str) -> Result<&'static str> {
         | "mission.get"
         | "mission.update"
         | "mission.status"
+        | "loom.status"
+        | "loom.plan"
+        | "loom.release"
+        | "loom.claim"
+        | "loom.evidence"
+        | "loom.submit"
         | "automation.list"
         | "automation.get"
         | "automation.create"
@@ -1167,8 +1258,8 @@ mod tests {
             .iter()
             .map(|identity| (identity.group, identity.action))
             .collect::<BTreeSet<_>>();
-        assert_eq!(operations.len(), 30);
-        assert_eq!(commands.len(), 30);
+        assert_eq!(operations.len(), 36);
+        assert_eq!(commands.len(), 36);
     }
 
     #[test]

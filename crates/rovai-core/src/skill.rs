@@ -125,6 +125,8 @@ const CLI_OPERATIONS_SEND_REFERENCE: &str =
     include_str!("../../../skills/cli-operations/references/send.md");
 const CLI_OPERATIONS_MISSION_REFERENCE: &str =
     include_str!("../../../skills/cli-operations/references/mission.md");
+const CLI_OPERATIONS_LOOM_REFERENCE: &str =
+    include_str!("../../../skills/cli-operations/references/loom.md");
 const CLI_OPERATIONS_TASK_REFERENCE: &str =
     include_str!("../../../skills/cli-operations/references/task.md");
 const CLI_OPERATIONS_CAMP_HISTORY_REFERENCE: &str =
@@ -575,6 +577,7 @@ const CLI_OPERATIONS_FILES: &[(&str, &str, u32)] = &[
         CLI_OPERATIONS_MISSION_REFERENCE,
         0o644,
     ),
+    ("references/loom.md", CLI_OPERATIONS_LOOM_REFERENCE, 0o644),
     (
         "references/camp-history.md",
         CLI_OPERATIONS_CAMP_HISTORY_REFERENCE,

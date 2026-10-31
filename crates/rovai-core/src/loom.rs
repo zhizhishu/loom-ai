@@ -2015,10 +2015,26 @@ fn resolve_artifact_path(
 
 /// The workspace a Mission's artifacts live in. Read from the Camp binding rather than the
 /// payload, so a caller cannot point registration at a directory of its choosing.
+///
+/// A Mission running in its own Git worktree produces files there, so a `ready` Mission
+/// workspace is the root; only a Mission without one falls back to the Camp project path.
+/// Registration and verification share this one function, so they always agree on the root.
 fn mission_workspace(
     connection: &rusqlite::Connection,
     mission_id: &str,
 ) -> Result<std::path::PathBuf> {
+    let isolated: Option<String> = connection
+        .query_row(
+            "SELECT working_directory FROM mission_workspace
+             WHERE mission_id=?1 AND state='ready'
+             ORDER BY generation DESC, updated_at DESC LIMIT 1",
+            [mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(path) = isolated.filter(|path| !path.trim().is_empty()) {
+        return Ok(std::path::PathBuf::from(path));
+    }
     let project_path: Option<String> = connection
         .query_row(
             "SELECT camp.project_path FROM mission JOIN camp ON camp.id=mission.camp_id
@@ -6695,6 +6711,73 @@ mod tests {
         )
         .unwrap()
         .artifact
+    }
+
+    #[test]
+    fn artifact_root_is_the_ready_mission_worktree_when_one_exists() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM worktree evidence");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        let project_root = mission_workspace(database.connection(), &mission_id).unwrap();
+        let worktree = std::env::temp_dir().join(format!("loom-worktree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("only-in-worktree.md"), "worktree bytes").unwrap();
+        let camp_id: String = database
+            .connection()
+            .query_row("SELECT camp_id FROM mission WHERE id=?1", [&mission_id], |row| row.get(0))
+            .unwrap();
+        let insert = |state: &str, id: &str| {
+            database
+                .connection()
+                .execute(
+                    "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,source_directory,
+                         repository_root,git_common_dir,worktree_path,working_directory,branch,base_sha,
+                         preparation_token,state,created_at,updated_at)
+                     VALUES(?1,?2,?3,'host',?4,?4,?5,?6,?6,?7,'0000','tok',?8,'2026-10-31','2026-10-31')",
+                    params![
+                        id,
+                        mission_id,
+                        camp_id,
+                        project_root.to_string_lossy(),
+                        format!("{}/.git-{id}", project_root.to_string_lossy()),
+                        worktree.to_string_lossy(),
+                        format!("loom/{id}"),
+                        state,
+                    ],
+                )
+                .unwrap();
+        };
+        insert("cleanup_pending", "ws-old");
+        assert_eq!(
+            mission_workspace(database.connection(), &mission_id).unwrap(),
+            project_root,
+            "assertion a workspace being cleaned up is not an evidence root"
+        );
+        database
+            .connection()
+            .execute("DELETE FROM mission_workspace WHERE id='ws-old'", [])
+            .unwrap();
+        insert("ready", "ws-ready");
+        assert_eq!(
+            mission_workspace(database.connection(), &mission_id).unwrap(),
+            worktree,
+            "assertion a ready Mission worktree is the evidence root"
+        );
+        let registered = artifact_register(
+            &mut database,
+            "agent-1",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: None,
+                agent_run_id: None,
+                relative_path: "only-in-worktree.md".into(),
+                content_type: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(registered.artifact.size_bytes, 14);
+        assert_eq!(registered.artifact.creator_id, "agent-1");
+        std::fs::remove_dir_all(&worktree).ok();
     }
 
     #[test]

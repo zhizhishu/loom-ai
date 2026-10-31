@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
 import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
@@ -653,6 +653,18 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       setClaims(k === null ? null : k.claims); setArtifacts(a === null ? null : a.artifacts); setError('')
     }).catch(e => setError(e.message ?? '刷新失败'))
   }, [client, mission.missionId])
+
+  // 助手经 `rovai loom` 写入后，Core 发 missions.invalidated(reason=missions.loomUpdated)：同一使命就回读。
+  useEffect(() => {
+    const stop = client.onEvent?.(event => {
+      if (event.method !== 'missions.invalidated') return
+      const params = event.params && typeof event.params === 'object' ? event.params as Record<string, unknown> : {}
+      if (params.reason !== 'missions.loomUpdated') return
+      if (typeof params.threadId === 'string' && params.threadId !== mission.threadId) return
+      reload()
+    })
+    return () => { stop?.() }
+  }, [client, mission.threadId, reload])
   
   useLayoutEffect(() => {
     if (section === 'plan') return

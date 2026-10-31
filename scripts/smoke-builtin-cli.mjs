@@ -69,6 +69,7 @@ const expectedOperations = [
   'mission.get',
   'mission.update',
   'mission.status',
+  'loom.status',
   'memory.read',
   'memory.search',
   'memory.view',
@@ -1164,6 +1165,10 @@ assert_success "$mission_update" 'mission.update'
 STEP=mission_status
 mission_status="$("$CLI" mission status --status needs_you)"
 assert_success "$mission_status" 'mission.status'
+STEP=loom_status
+loom_status="$("$CLI" loom status)"
+assert_success "$loom_status" 'loom.status'
+printf '%s\n' "$loom_status" | "$JQ" -e --arg id ${shellQuote(input.missionId)} '.missionId == $id and .plan == null' >/dev/null
 
 STEP=automation_create
 automation_create="$("$CLI" automation create \

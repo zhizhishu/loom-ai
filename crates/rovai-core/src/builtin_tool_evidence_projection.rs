@@ -123,6 +123,24 @@ fn project_input(operation: &str, input: &Value) -> Result<Value> {
                 input.get("sourceMessageId"),
             );
         }
+        "loom.status" => {}
+        "loom.plan" => {
+            insert_semantic_text(&mut projected, "goal", input.get("goal"));
+            if let Some(tasks) = input.get("tasks").and_then(Value::as_array) {
+                projected.insert("taskCount".into(), json!(tasks.len()));
+            }
+        }
+        "loom.release" | "loom.claim" => {
+            insert_identifier(&mut projected, "taskId", input.get("taskId"));
+        }
+        "loom.evidence" => {
+            insert_identifier(&mut projected, "taskId", input.get("taskId"));
+            insert_semantic_text(&mut projected, "relativePath", input.get("relativePath"));
+        }
+        "loom.submit" => {
+            insert_identifier(&mut projected, "taskId", input.get("taskId"));
+            insert_string_array(&mut projected, "evidenceIds", input.get("evidenceIds"));
+        }
         CAMP_MESSAGE_SEND_TOOL_NAME => {
             insert_string_array(&mut projected, "recipientAgentIds", input.get("to"));
             insert_bool(
@@ -407,6 +425,30 @@ fn project_result(operation: &str, result: &Value) -> Result<Value> {
         "mission.update" | "mission.status" => {
             insert_identifier(&mut projected, "missionId", result.get("missionId"));
             insert_bool(&mut projected, "changed", result.get("changed"));
+        }
+        "loom.status" => {
+            insert_identifier(&mut projected, "missionId", result.get("missionId"));
+        }
+        "loom.plan" => {
+            insert_identifier(&mut projected, "planId", result.get("planId"));
+        }
+        "loom.release" => {
+            insert_identifier(&mut projected, "taskId", result.get("taskId"));
+            insert_enum(&mut projected, "status", result.get("status"));
+        }
+        "loom.claim" => {
+            insert_identifier(&mut projected, "claimId", result.get("claimId"));
+            insert_bool(&mut projected, "replayed", result.get("replayed"));
+        }
+        "loom.evidence" => {
+            if let Some(artifact) = result.get("artifact") {
+                insert_identifier(&mut projected, "artifactId", artifact.get("artifactId"));
+            }
+            insert_bool(&mut projected, "replayed", result.get("replayed"));
+        }
+        "loom.submit" => {
+            insert_identifier(&mut projected, "candidateId", result.get("candidateId"));
+            insert_bool(&mut projected, "replayed", result.get("replayed"));
         }
         CAMP_MESSAGE_SEND_TOOL_NAME => {
             insert_enum(&mut projected, "status", result.get("status"));
