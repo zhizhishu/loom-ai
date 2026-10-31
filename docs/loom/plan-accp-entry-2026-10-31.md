@@ -77,3 +77,14 @@ Host stdio RPC 的 `loom.*` 方法**不动**（桌面 UI 与测试继续用）�
 **权限**：`plan` / `release` 照 `collaboration.rs` 的活跃写权限 + 当前 Default Lead 判定，不只看角色名；`claim` / `evidence` / `submit` 要求当前公开 Mission Run，`submit` 另需本 Run 在该任务上的有效认领（`claims_list` 筛选后由领域事务再核 fence）。
 
 **切片**：flash 做映射 / help / 金样 / 展示 / 冒烟；主管写身份、权限、事务重放、路径与哈希、冻结文件、合同。
+
+## 9. 实施后审查（2026-10-31，Astra 只读 BLOCK，pi-skill session `ad55f3c2`；主管逐条复核）
+
+| # | 级别 | 问题 | 主管裁定 |
+|---|---|---|---|
+| 1 | P1 | 证据根静默漂移：worktree 进入 cleanup 后 `mission_workspace` 回落到项目目录，违反 r1「工作区清理后再核验报 `LOOM_EVIDENCE_UNREADABLE`，不静默换根」 | **属实，已修**：只要该 Mission 有过 workspace 行（清理后行保留，仅删 Camp 时删除），根固定为最新一行；非 `ready` 一律 `LOOM_EVIDENCE_UNREADABLE`；只有从未有过 worktree 的 Mission 用项目目录。测试改为断言 cleanup 时拒绝。残余：worktree 出现前就在项目目录登记的产物，之后核验读 worktree——Git Mission 的 Agent 只在 worktree 就绪后运行，实际不触发，记为已知限制。 |
+| 2 | P1 | 验收后编排无法自行继续：`review_record` 只冻结依赖、不放行下游 DRAFT，也不唤醒 Lead；`references/loom.md` 无后续步骤 | **属实**。补充事实：`task_release` 不检查依赖（只要求 DRAFT），依赖闸在 `claim_acquire`。待用户选：A 文案版（Lead 导入后立即放行全部任务，下游认领在依赖满足前报 `dependency_unreleased`；Lead 告诉 User「验收后回一句继续」，User 的消息唤醒 Lead 再派人）；B 自动唤醒（依赖释放时给 Lead 投递消息，属新调度能力）。两者都改模型可见文本，须 r2 二次确认。 |
+| 3 | P2 | plan/release 重放靠 `LOOM_PLAN_EXISTS` / `LOOM_TASK_NOT_DRAFT` 报错而非回放原回执；偏离 §8 第 1 条「冻结例外接 Gateway 持久回执」 | **属实，接受为有意偏差**：r1 只承诺「不产生第二份」，已满足；错误码恢复指引为 RefreshThenDecide（读 `rovai loom status` 即可确认）。持久回执需改冻结表结构，收益小，暂不做。 |
+| 4 | P2 | `application.rs` LOOM 分发分支（成员校验、事件、错误映射）与 `LoomWorkspace` 自动回读无专项测试 | **属实，待补**：分发层测试需 `extended-tests` 夹具；UI 自动回读进 `scripts/lib/loom-workspace.test.mjs`。 |
+
+其余结论（主管认可）：身份字段全部由认证 / 记录派生、无跨 Mission 通路；status 只读分支依赖认证的活跃成员校验，不泄露；Single Chat 由白名单拒绝；claim / submit 按 commandId 回放；submit 取本 Run 最大 fence 合理，领域事务再核租约 / Run / claimId / fence；帮助与 reference 与 r1 逐字一致。

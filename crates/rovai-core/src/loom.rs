@@ -2016,24 +2016,34 @@ fn resolve_artifact_path(
 /// The workspace a Mission's artifacts live in. Read from the Camp binding rather than the
 /// payload, so a caller cannot point registration at a directory of its choosing.
 ///
-/// A Mission running in its own Git worktree produces files there, so a `ready` Mission
-/// workspace is the root; only a Mission without one falls back to the Camp project path.
+/// A Mission that has ever had its own Git worktree produces files there, so its newest
+/// Mission workspace is the root for good: while that workspace is not `ready` (preparing,
+/// cleaning up or cleaned) the evidence is unreadable rather than silently re-rooted at the
+/// project path. Only a Mission that never had a worktree uses the Camp project path.
 /// Registration and verification share this one function, so they always agree on the root.
 fn mission_workspace(
     connection: &rusqlite::Connection,
     mission_id: &str,
 ) -> Result<std::path::PathBuf> {
-    let isolated: Option<String> = connection
+    let isolated: Option<(String, String)> = connection
         .query_row(
-            "SELECT working_directory FROM mission_workspace
-             WHERE mission_id=?1 AND state='ready'
+            "SELECT working_directory, state FROM mission_workspace
+             WHERE mission_id=?1
              ORDER BY generation DESC, updated_at DESC LIMIT 1",
             [mission_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if let Some(path) = isolated.filter(|path| !path.trim().is_empty()) {
-        return Ok(std::path::PathBuf::from(path));
+    if let Some((path, state)) = isolated {
+        if state == "ready" && !path.trim().is_empty() {
+            return Ok(std::path::PathBuf::from(path));
+        }
+        return Err(LoomCommandError::rejection(
+            LOOM_EVIDENCE_UNREADABLE,
+            format!(
+                "mission {mission_id} works in an isolated workspace that is {state}; its evidence cannot be read until the workspace is ready again"
+            ),
+        ));
     }
     let project_path: Option<String> = connection
         .query_row(
@@ -6752,10 +6762,12 @@ mod tests {
                 .unwrap();
         };
         insert("cleanup_pending", "ws-old");
+        let unreadable = mission_workspace(database.connection(), &mission_id).unwrap_err();
         assert_eq!(
-            mission_workspace(database.connection(), &mission_id).unwrap(),
-            project_root,
-            "assertion a workspace being cleaned up is not an evidence root"
+            unreadable.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_UNREADABLE,
+            "assertion a Mission whose worktree is being cleaned up is unreadable, never re-rooted at {}",
+            project_root.to_string_lossy()
         );
         database
             .connection()
