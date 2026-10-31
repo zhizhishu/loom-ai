@@ -4273,5 +4273,7 @@
   "只能在 App 主窗口中管理远端主机。": "Remote hosts can only be managed in the main App window.",
   "远端主机列表尚未就绪，请重新读取。": "The remote host list is not ready yet. Read it again.",
   "不支持这个远端主机操作。": "This remote host operation is not supported.",
-  "远端主机操作未能完成，请重试。": "The remote host operation did not finish. Please try again."
+  "远端主机操作未能完成，请重试。": "The remote host operation did not finish. Please try again.",
+  "在远端主机打开": "Open on remote host",
+  "在远端主机「{0}」打开": "Open on remote host “{0}”"
 }

@@ -91,6 +91,7 @@ import {
 import { saveMemberIdentity } from './member-identity-save'
 import type { IdentityDraft } from './member-identity-draft'
 import { UiText, uiAttribute } from './interface-language'
+import { OpenOnRemoteHostButton } from './OpenOnRemoteHostButton'
 export { hasDuplicateMemberDisplayName } from './member-identity-draft'
 
 type MembersViewProps = {
@@ -1622,6 +1623,7 @@ export function RuntimeInstallationsPanel({
                 </button>}
                 <button type="button" className="quiet-button runtime-product-settings" aria-label={uiAttribute("{0} 启动设置", String(adapterLabel(runtimeKind)))}
                   title={uiAttribute("启动设置")} disabled={checking || !allowed} onClick={() => setSettingsRuntime(runtimeKind)}><DialogControlIcon name="settings" /></button>
+                {presentation.status === 'not_installed' && <OpenOnRemoteHostButton />}
                 {item?.failure && <RuntimeFailureNotice failure={item.failure} />}
                 {isOpen && guide && expanded ? <RuntimeInstallationGuide
                   id={`${guideId}-${runtimeKind}`} label={adapterLabel(runtimeKind)} guide={guide}

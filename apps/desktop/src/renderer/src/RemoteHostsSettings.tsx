@@ -6,7 +6,7 @@ import { UiText, uiAttribute, useUiText } from './interface-language'
 import './remote-connection.css'
 
 /** One sentence per Main-process failure code; unknown codes fall back. */
-function remoteHostMessage(code: RemoteHostCode): string {
+export function remoteHostMessage(code: RemoteHostCode): string {
   switch (code) {
     case 'remote_host_url_invalid':
       return uiAttribute('地址格式不正确，请填写完整的 http:// 或 https:// 地址。')

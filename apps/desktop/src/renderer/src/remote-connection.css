@@ -64,3 +64,7 @@
   .remote-host-form { grid-template-columns: minmax(0,1fr); }
   .remote-host-form > button { justify-self: start; }
 }
+
+/* Open on remote host: inline beside an unavailable Runtime, menu only for several hosts. */
+.open-on-remote-host { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; position: relative; }
+.open-on-remote-host-menu { display: inline-flex; flex-wrap: wrap; gap: 4px; }

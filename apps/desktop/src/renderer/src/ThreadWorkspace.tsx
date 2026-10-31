@@ -234,6 +234,7 @@ import {
   type ToolProgressItem
 } from './execution-tool-grouping'
 import { UiText, getInterfaceLanguage, uiAttribute, useInterfaceLanguage, useUiText } from './interface-language'
+import { OpenOnRemoteHostButton } from './OpenOnRemoteHostButton'
 
 function localizedAgentRunPresentation(
   run: Parameters<typeof agentRunPresentation>[0],
@@ -8778,6 +8779,7 @@ export function RuntimeRecoveryDock({
                   onClick={() => onConfigure(target.agentId)}
                 ><UiText zh={"去配置"} /></button>
               )}
+              <OpenOnRemoteHostButton />
             </div>
           )
         })}

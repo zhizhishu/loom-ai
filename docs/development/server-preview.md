@@ -166,6 +166,17 @@ Desktop「设置 → 远程连接」控制当前 Host，Web 默认关闭，端�
 当前 Core 和任务继续；重启 Desktop 后默认关闭。开发 Desktop 开启前运行 `pnpm build:web`，打包时则
 随包携带同一 WebUI 构建产物。
 
+## 远端机器：常驻、配齐 Runtime、从 Desktop 打开
+
+Core 不代用户安装 Runtime（安装命令只作为指南展示）。远端机器上由运维者按以下顺序一次配好，之后从本地 Desktop 打开：
+
+1. **专用用户常驻**：建系统用户（例如 `loom`），数据根归它所有、权限 700；systemd `User=` 运行 `rovai-server --data-dir <根> --listen 127.0.0.1:8767`，不以 root 运行（见上文）。程序目录对该用户可读。
+2. **配齐 Runtime**：以该用户运行 `scripts/provision-remote-runtimes.sh --prefix <该用户 home>/.npm-global`，幂等安装 Claude Code 与 Codex CLI，不写凭据、不开端口。Linux 上 Runtime 发现不额外搜用户目录，systemd 单元需 `Environment=PATH=<prefix>/bin:/usr/local/bin:/usr/bin:/bin`，重启 Server 后两个 Runtime 显示可用。
+3. **模型账号**：在该用户下完成各 CLI 自己的登录或 API 配置；凭据只留在远端机器，Rovai 不读取、不复制。
+4. **只经加密通道访问**：loopback 监听，再用 Tailscale（推荐，只自己的设备可达）或出站隧道暴露；隧道地址必须与 `--public-origin` 一致，否则请求以 `origin_not_allowed` 拒绝。
+5. **从 Desktop 打开**：本地「设置 → 能力 → 远端主机」添加该地址后点「打开」，在独立窗口中用该 Server 的 Token 登录。本地队员缺 Runtime 时，「消息未发送」提示与智能体列表的「未安装」行会出现「在远端主机打开」。
+6. **助手配置两端一致**：`node scripts/loom-profile.mjs export --host <源> --token-file <文件>` 导出队员身份 / 规则、MCP 及指派、工具箱选择；`apply --host <目标> … --dry-run` 先看计划再去掉 `--dry-run` 落地。按队员显示名匹配；MCP 密钥被主机打码，不进 profile，需另用 `--mcp-secrets` 提供。
+
 ## 首个真实 Camp 复验
 
 使用源码构建产物进行自动验收，不启动日常 App：
