@@ -77,6 +77,7 @@ import { legacyUserDataPath } from './user-data-path'
 import { deleteRetiredManagedDirectory } from './quick-chat-cutover'
 import { CurrentUserProfileStore } from './current-user-profile'
 import { NavigationPreferencesStore } from './navigation-preferences'
+import { RemoteHostError, RemoteHostsStore, RemoteHostWindows } from './remote-hosts'
 import { isNavigationThreadReadState } from '../shared/navigation-preferences-model'
 import { revealProjectDirectory } from './reveal-project-directory'
 import {
@@ -437,6 +438,8 @@ let currentUserProfile: CurrentUserProfileStore | null = null
 let onboarding: OnboardingStore | null = null
 let restorableLocations: RestorableLocationStore | null = null
 let navigationPreferences: NavigationPreferencesStore | null = null
+let remoteHosts: RemoteHostsStore | null = null
+const remoteHostWindows = new RemoteHostWindows()
 let desktopBackgroundTimer: NodeJS.Timeout | null = null
 let dailyAnalysis: DailyAnalysisService | null = null
 let evaluationHost: EvaluationHostService | null = null
@@ -1007,6 +1010,7 @@ if (primaryInstance) void app.whenReady().then(async () => {
   const onboardingPath = join(userDataPath, 'onboarding.json')
   const restorableLocationPath = join(userDataPath, 'restorable-location.json')
   const navigationPreferencesPath = join(userDataPath, 'navigation.json')
+  const remoteHostsPath = join(userDataPath, 'remote-hosts.json')
   await executionView.start().catch((error) => {
     console.warn('[rovai] Execution Web service did not start; channel execution remains available.', error)
   })
@@ -1083,7 +1087,8 @@ if (primaryInstance) void app.whenReady().then(async () => {
     RestorableLocationStore.load(restorableLocationPath),
     NavigationPreferencesStore.load(navigationPreferencesPath),
     CurrentUserProfileStore.load(currentUserProfilePath),
-    shortcutPreferences.load()
+    shortcutPreferences.load(),
+    RemoteHostsStore.load(remoteHostsPath).then(store => { remoteHosts = store })
   ])
   generalPreferences = loadedGeneralPreferences
   generalPreferences.onInterfaceLanguageChanged(snapshot => {
@@ -1262,6 +1267,36 @@ ipcMain.handle('rovai:request', async (_event, method: CoreMethod, params?: unkn
 })
 
 ipcMain.handle('rovai:supervisor-get-snapshot', () => core.getSnapshot())
+
+// Remote Servers are opened by id only: the main process validated and stored the
+// origin, so the renderer can never make the App load an arbitrary URL.
+ipcMain.handle('rovai:remote-hosts', async (event, operation: unknown, value: unknown) => {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
+      || event.senderFrame !== event.sender.mainFrame) {
+      throw new RemoteHostError('remote_host_forbidden')
+    }
+    const store = remoteHosts
+    if (!store) throw new RemoteHostError('remote_host_unavailable')
+    const input = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+    if (operation === 'list') return { ok: true, value: store.list() }
+    if (operation === 'add') return { ok: true, value: await store.add(input.address, input.label) }
+    if (operation === 'remove') {
+      await store.remove(input.id)
+      if (typeof input.id === 'string') remoteHostWindows.close(input.id)
+      return { ok: true, value: store.list() }
+    }
+    if (operation === 'open') {
+      const entry = typeof input.id === 'string' ? store.get(input.id) : null
+      if (!entry) throw new RemoteHostError('remote_host_not_found')
+      remoteHostWindows.open(entry)
+      return { ok: true, value: null }
+    }
+    throw new RemoteHostError('remote_host_operation_invalid')
+  } catch (error) {
+    return { ok: false, code: error instanceof RemoteHostError ? error.code : 'remote_host_failed' }
+  }
+})
 
 ipcMain.handle('rovai:host-web', async (event, operation: unknown, value: unknown) => {
   try {
