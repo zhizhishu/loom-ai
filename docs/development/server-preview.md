@@ -103,6 +103,8 @@ Windows 同一个参数接口：`rovai-server.exe --data-dir "D:\RovaiData"`。`
 `rovai-server --verbose`（自定义数据根仍传相同 `--data-dir`）。无刷屏不表示服务已转入后台。
 独立 Server 的 Web 默认地址为 `http://127.0.0.1:8767`，配套 UI 从可执行文件真实目录定位，不依赖当前工作目录。
 
+**不要以 root 运行 Server。** 以 root 打开既有数据库时 SQLite 会修改 WAL 的属主元数据，下一次启动会被数据库准入以 `IdentityChanged{stage:Revalidation}` 拒绝。Linux 上请用普通账号或专用系统用户（例如 systemd `User=`）运行，程序目录需对该用户可读。
+
 独立 Server 当前不支持飞书／钉钉渠道。渠道功能请使用 Rovai Desktop。
 Desktop 设置中开启的 Web 服务属于该 Desktop 实例，可以管理已有账号的 Bot 发布、重试和结构化审批人选择；
 它与独立 Server 不自动共享渠道配置或登录态。账号连接、切换和重新登录在运行服务的那台 Desktop 中完成。

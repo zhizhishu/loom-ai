@@ -36,3 +36,16 @@
 
 - 隧道：Tailscale（只自己设备可达）或 Cloudflare Tunnel + Access（有域名、可加邮箱验证）。两者都要一次账号授权。
 - 远端登录 Claude / Codex 账号：凭据只存在远端机器上，需用户本人在远端完成登录。
+
+## 5. M1 执行记录（2026-11-01 CST，bero）
+
+- **部署**：`node scripts/build-server.mjs --output-dir …` 在 bero（Debian 13）构建通过，ABI 门禁因 bero glibc 2.39 > 发行基线 2.35 拒绝出发行包——本机自用不受影响，正式发行包仍走 CI 的 ubuntu-22.04。程序装到 `/opt/loom-server/<commit>`，`current` 软链；systemd `loom-server.service` 以**系统用户 `loom`** 运行，`--listen 127.0.0.1:8767`，数据 `/var/lib/loom-server`（700）。
+- **隧道**：`loom-tunnel.service`（cloudflared quick tunnel，只出站，`User=loom`）。`ss -ltn` 只见 `127.0.0.1:8767`，无公网监听。quick tunnel 地址在 `loom-tunnel` 重启后会变，需同步改 `loom-server` 的 `--public-origin`（否则 API 一律 `origin_not_allowed`）。正式形态换命名隧道 + Access 或 Tailscale。
+- **验收**：经隧道页面 200（标题 `Rovai AI`）；无 Token `session_required` 401；错 Token `invalid_administrator_token` 401；正确 Token 登录 200；本机 Win11 直连同一地址 200 / 401。`loom-server` 连续重启 3 次全部 `active` + 200，`IdentityChanged` 0 次，Token 摘要重启前后一致。
+- **CLI 配齐**：`scripts/provision-remote-runtimes.sh --prefix /home/loom/.npm-global`（以 `loom` 运行）装好 Claude Code 2.1.316、codex-cli 0.166.0；服务端 `adapter_installation` 两条 `path_state=valid`。账号登录未做。
+
+### 根因：`IdentityChanged{stage:Revalidation}`（原 B1，3 个 `database_admission` 基线失败）
+
+以 root 运行时，SQLite 每次打开既有 WAL 都会对其 `fchown` 到主库属主（Unix VFS `robustFchown` 只在 euid 0 时执行），**WAL 的 ctime 改变而 mtime / 大小 / inode 不变**；`database_admission` 的身份戳是 `mtime:mtime_nsec:ctime:ctime_nsec`（`database_admission.rs:1097-1107`），于是 ticket 观察与开库后复核不一致，二次打开必被拒。bero 上插桩实测：`expected_wal …:1793474208:788000000` → `actual_wal …:1793474208:800000000`，仅 ctime 纳秒位变化。GitHub runner 与桌面都不是 root，所以从未复现。
+
+**结论**：不是数据损坏，也不是 bero 文件系统问题；是「以 root 跑 Core」触发的误判。处置：服务端一律非 root 运行（已落 systemd）；bero 上的回归测试也应以非 root 用户跑，基线 3 失败即消失。是否放宽准入（仅 ctime 变化的零长 WAL）属冻结安全逻辑，暂不改。
