@@ -49,3 +49,12 @@
 以 root 运行时，SQLite 每次打开既有 WAL 都会对其 `fchown` 到主库属主（Unix VFS `robustFchown` 只在 euid 0 时执行），**WAL 的 ctime 改变而 mtime / 大小 / inode 不变**；`database_admission` 的身份戳是 `mtime:mtime_nsec:ctime:ctime_nsec`（`database_admission.rs:1097-1107`），于是 ticket 观察与开库后复核不一致，二次打开必被拒。bero 上插桩实测：`expected_wal …:1793474208:788000000` → `actual_wal …:1793474208:800000000`，仅 ctime 纳秒位变化。GitHub runner 与桌面都不是 root，所以从未复现。
 
 **结论**：不是数据损坏，也不是 bero 文件系统问题；是「以 root 跑 Core」触发的误判。处置：服务端一律非 root 运行（已落 systemd）；bero 上的回归测试也应以非 root 用户跑，基线 3 失败即消失。是否放宽准入（仅 ctime 变化的零长 WAL）属冻结安全逻辑，暂不改。
+
+## 6. 远端 ACCP 冒烟（2026-11-01，bero，Lead = Codex + Octopus）
+
+| 轮 | 现象 | 根因 | 处置 |
+|---|---|---|---|
+| 1 | 叮叮第一条 `rovai mission get` 即 `builtin_tool.cli_error`，Run 秒结束 | Codex Linux 沙箱（`workspace-write`）seccomp 拒绝 Unix socket：沙箱内 `connect(/tmp/rovai-builtin-*/core.sock)` = `EPERM`，`danger-full-access` 或 `network_access=true` 才通 | bero `loom` 的 `~/.codex/config.toml` 加 `[sandbox_workspace_write] network_access = true`；写入 `server-preview.md` |
+| 2 | `rovai loom status` 成功、读到 LOOM 指引；`rovai loom plan` 反复 `builtin_tool.invalid_input`，计划未导入 | `--help` 只说三项是数组，reference 无文件样例；CLI 对字段错误只回通用 `invalid_input`（本机复现：`null` / 多字段 / 字段名错 / 大写 condition 全同一句） | 模型上下文变更 r3（加完整计划 JSON 样例 + plan 描述指向 reference），待用户二次确认 |
+
+结论：多主机路线的远端执行链在「CLI ↔ Core」这一层已打通；剩余阻塞是计划文件格式对模型不可见，属文案问题，不是架构问题。
