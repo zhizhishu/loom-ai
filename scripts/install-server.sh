@@ -40,7 +40,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 if [ "$version" = latest ]; then
   [ -z "$from_dir" ] || fail '--from-dir requires --version'
-  download 'https://raw.githubusercontent.com/murray17/rovai-ai/main/scripts/server-release-tag.txt' "$staging/channel"
+  download 'https://raw.githubusercontent.com/zhizhishu/loom-ai/main/scripts/server-release-tag.txt' "$staging/channel"
   release_tag=$(cat "$staging/channel")
   [ "$release_tag" != unpublished ] || fail 'No official native Server release is published yet. The installation was not changed.'
   case "$release_tag" in
@@ -61,7 +61,7 @@ if [ -n "$from_dir" ]; then
   cp "$from_dir/$asset" "$staging/$asset"
   cp "$from_dir/SHA256SUMS" "$staging/SHA256SUMS"
 else
-  release="https://github.com/murray17/rovai-ai/releases/download/$release_tag"
+  release="https://github.com/zhizhishu/loom-ai/releases/download/$release_tag"
   download "$release/$asset" "$staging/$asset"
   download "$release/SHA256SUMS" "$staging/SHA256SUMS"
 fi

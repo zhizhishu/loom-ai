@@ -6,7 +6,7 @@ last_updated: 2026-10-22
 
 # 原生 Server 安装与开发验收
 
-Server 0.5.1 已与 Desktop 一起公开发布于 [`v0.5.1`](https://github.com/murray17/rovai-ai/releases/tag/v0.5.1)，两端使用同一源码提交。普通用户从[官网安装与启动指南](https://rovai.dev/zh/docs/server-install.html)开始，无需克隆或构建源码；本页保留开发构建与资格验收流程。公开发布不代表所有平台与智能体组合均完成真实执行验收。
+Server 0.5.1 已与 Desktop 一起公开发布于 [`v0.5.1`](https://github.com/zhizhishu/loom-ai/releases/tag/v0.5.1)，两端使用同一源码提交。普通用户从[官网安装与启动指南](https://rovai.dev/zh/docs/server-install.html)开始，无需克隆或构建源码；本页保留开发构建与资格验收流程。公开发布不代表所有平台与智能体组合均完成真实执行验收。
 
 2026-09-29 的 macOS arm64 **0.4.0** 发布包实测确认安装、登录与会话可用，但有两个发布包阻碍：快捷命令启动可能找不到 WebUI；直接运行 `current/rovai-server` 后，首次 Agent 执行仍因 `bundled Skill resources are unavailable` 失败，归档缺少内置 Skill 资源。0.4.1 桥接包补齐归档资源与快捷命令路径，包内 Skill 读取和 0.4.0 数据升级已在隔离环境验收；尚不能把旧截图记成端到端执行成功。完整记录见[官网部署素材说明](../../website/deployment-notes.md)。
 

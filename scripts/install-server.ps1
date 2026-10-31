@@ -24,7 +24,7 @@ function Download([string]$Url, [string]$Path) {
 try {
     if ($Version -eq 'latest') {
         if ($FromDirectory) { throw 'FromDirectory requires Version.' }
-        Download 'https://raw.githubusercontent.com/murray17/rovai-ai/main/scripts/server-release-tag.txt' (Join-Path $staging 'channel')
+        Download 'https://raw.githubusercontent.com/zhizhishu/loom-ai/main/scripts/server-release-tag.txt' (Join-Path $staging 'channel')
         $releaseTag = (Get-Content -Raw (Join-Path $staging 'channel')).Trim()
         if ($releaseTag -eq 'unpublished') { throw 'No official native Server release is published yet. Installation was not changed.' }
         if ($releaseTag -cmatch '^(?:server-v|v)([0-9]+\.[0-9]+\.[0-9]+)$') { $Version = $Matches[1] }
@@ -40,7 +40,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $FromDirectory $asset) -Destination $archive
         Copy-Item -LiteralPath (Join-Path $FromDirectory 'SHA256SUMS') -Destination $sums
     } else {
-        $release = "https://github.com/murray17/rovai-ai/releases/download/$releaseTag"
+        $release = "https://github.com/zhizhishu/loom-ai/releases/download/$releaseTag"
         Download "$release/$asset" $archive
         Download "$release/SHA256SUMS" $sums
     }
