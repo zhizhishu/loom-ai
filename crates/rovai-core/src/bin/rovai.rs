@@ -2171,7 +2171,9 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
         "loom.plan" => &["rovai loom plan --input-file plan.json"],
         "loom.release" => &["rovai loom release --task-id report-draft"],
         "loom.claim" => &["rovai loom claim --task-id report-draft"],
-        "loom.evidence" => &["rovai loom evidence --relative-path out/report.md --task-id report-draft"],
+        "loom.evidence" => {
+            &["rovai loom evidence --relative-path out/report.md --task-id report-draft"]
+        }
         "loom.submit" => &["rovai loom submit --task-id report-draft --evidence-ids <artifactId>"],
         "thread.message.send" => &CAMP_MESSAGE_SEND_HELP_EXAMPLES,
         "member.list" => &["rovai member list"],
