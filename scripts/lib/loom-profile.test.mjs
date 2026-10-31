@@ -73,7 +73,7 @@ test('a profile exported from one host applies to another by member name', async
   assert.deepEqual(target.state.toolbox[0].memberIds, ['x9'])
 
   const again = await planApply(target, await exportProfile(target))
-  assert.deepEqual(again.filter(step => step.kind.startsWith('member.') || step.kind === 'mcp.create'), [], 're-applying the same profile changes no member or server')
+  assert.deepEqual(again, [], 're-applying the same profile plans nothing')
 })
 
 test('masked MCP secrets are never sent; a secrets file fills them', async () => {

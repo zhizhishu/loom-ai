@@ -127,6 +127,8 @@ export async function planApply (client, profile, secrets = {}) {
   const plan = []
   const existing = (await client.request('members.list')).filter(member => !member.removedAt)
   const byName = new Map(existing.map(member => [member.displayName, member]))
+  const nameOf = new Map(existing.map(member => [member.agentId, member.displayName]))
+  const sameNames = (ids, names) => JSON.stringify(ids.map(id => nameOf.get(id) ?? id).sort()) === JSON.stringify([...names].sort())
   for (const wanted of profile.members ?? []) {
     const current = byName.get(wanted.displayName)
     const target = memberProfile(wanted)
@@ -143,9 +145,17 @@ export async function planApply (client, profile, secrets = {}) {
       if (containsMask(definition)) throw new ProfileError('secret', `MCP server ${server.name} has masked values; supply them with --mcp-secrets`)
       plan.push({ kind: 'mcp.create', name: server.name, definition })
     }
-    plan.push({ kind: 'mcp.members', name: server.name, members: server.members ?? [] })
+    if (!current || !sameNames(current.assignedAgentIds, server.members ?? [])) {
+      plan.push({ kind: 'mcp.members', name: server.name, members: server.members ?? [] })
+    }
   }
-  for (const entry of profile.toolbox ?? []) plan.push({ kind: 'toolbox.members', name: entry.skill, members: entry.members ?? [] })
+  const skills = await client.request('toolbox.list')
+  for (const entry of profile.toolbox ?? []) {
+    const current = skills.find(skill => skill.name === entry.skill)
+    if (!current || !sameNames(current.memberIds, entry.members ?? [])) {
+      plan.push({ kind: 'toolbox.members', name: entry.skill, members: entry.members ?? [] })
+    }
+  }
   return plan
 }
 
