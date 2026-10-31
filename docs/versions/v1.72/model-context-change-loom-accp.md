@@ -177,4 +177,19 @@ User 在 Win11 已装 App 中：开 Mission → 让 Default Lead 规划 → 编�
 
 ### 实施验收记录
 
-（实施后追加）
+在 `17c28ea` 基线上实施，提交 `e642e26`（实现）+ `8aa8e7e`（rustfmt），快进合入 `main`。实现与 r1 逐项一致：根帮助新增一行、`rovai loom --help` 族帮助逐字等于本稿（`bin/rovai.rs` 测试钉住）、6 项封闭工具合同（定义集中在 `crates/rovai-core/src/loom_tool.rs`）、`cli-operations` 正文两行 + `references/loom.md` 逐字等于本稿；平台 Skill 集合与 `name`/`desc` 未改。合同版本号保持 `contract-v44` / Agent output 14，新增金样 `builtin-tool-agent-output-v15.json`（v13 + 6 项 LOOM），v13 保留。
+
+| 检查 | 结果 |
+| --- | --- |
+| bero `cargo fmt --all -- --check` | 通过 |
+| bero `cargo test -p rovai-core --lib loom` | 82 通过 / 0 失败（含身份注入、Lead 限定、跨 Mission、认领缺失、重放、worktree 证据根） |
+| bero `--lib builtin_tool` / `--lib team_tool` / `--bin rovai` / `--lib skill` | 29 / 10 / 31 / 17 通过，0 失败 |
+| bero 全量 `cargo test -p rovai-core --lib` | 514 通过 / 3 失败（恰为既有 `database_admission` 环境基线）/ 1 ignored |
+| bero `pnpm test:loom-core` | 2 通过 / 0 失败 |
+| 本机 `pnpm typecheck`、builtin-tools vitest、`pnpm docs:check` | 0 错 / 41 通过 / 通过 |
+| GitHub Actions CI（分支 `41220081638`、main `41220601142`） | 全绿 |
+| GitHub Actions Windows 打包 `41220605557` | 通过；`Rovai-AI-0.5.1-x64.exe` sha256 `89882b0a…72e24685`，verifier `Result: passed` |
+
+`pnpm docs:test` 有 1 项既有失败（`4b5d3a4` 给 `ci.yml` 加了 main push 触发），与本改动无关，未在本次修改。
+
+**真实任务 Gate**：待 User 在 Win11 重装后执行（见上）。
