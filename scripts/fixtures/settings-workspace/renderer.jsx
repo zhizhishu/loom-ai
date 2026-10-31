@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { ThreadNavigation } from '@renderer/ThreadNavigation'
 import { WindowDragStrip } from '@renderer/BusinessApp'
 import { HostWebSettings } from '@renderer/HostWebSettings'
+import { RemoteHostsSettings } from '@renderer/RemoteHostsSettings'
 import { GeneralSettings } from '@renderer/GeneralSettings'
 import { AppearanceSettings } from '@renderer/AppearanceSettings'
 import { NotificationSettings } from '@renderer/NotificationSettings'
@@ -23,6 +24,7 @@ let releaseHostStatus
 let hostTokenGeneration = 1
 const state = {
   hostWeb: { enabled: false }, holdHostStatus: false, loseHostStartReply: false,
+  remoteHosts: [{ id: 'host-fixture-1', label: '工作机', origin: 'http://100.64.0.7:8767' }], remoteHostFailure: null,
   preferences: fixture.preferences(), notifications: fixture.notifications(),
   channels: fixture.channelsSnapshot(), executionWeb: fixture.executionWeb(),
   startup: {}, diagnostics: fixture.diagnosticsSnapshot(), scenario: 'normal', failure: null
@@ -89,6 +91,26 @@ Object.assign(window, { rovai: {
     },
     rotate: async () => { await request('hostWeb.rotate'); return { ...clone(state.hostWeb), administratorToken: `fixture-token-${++hostTokenGeneration}` } },
     stop: async () => { await request('hostWeb.stop'); state.hostWeb = { enabled: false }; return clone(state.hostWeb) }
+  },
+  remoteHost: {
+    list: async () => { await request('remoteHost.list'); return { ok: true, value: clone(state.remoteHosts) } },
+    add: async input => {
+      await request('remoteHost.add', input)
+      if (state.remoteHostFailure) {
+        const code = state.remoteHostFailure
+        state.remoteHostFailure = null
+        return { ok: false, code }
+      }
+      const entry = { id: `host-fixture-${state.remoteHosts.length + 1}`, label: input.label || new URL(input.address).host, origin: input.address }
+      state.remoteHosts = [...state.remoteHosts, entry]
+      return { ok: true, value: clone(entry) }
+    },
+    remove: async input => {
+      await request('remoteHost.remove', input)
+      state.remoteHosts = state.remoteHosts.filter(host => host.id !== input.id)
+      return { ok: true, value: clone(state.remoteHosts) }
+    },
+    open: async input => { await request('remoteHost.open', input); return { ok: true, value: null } }
   },
   generalPreferences: {
     get: async () => clone(state.preferences),
@@ -199,6 +221,7 @@ function Fixture() {
       <div className="settings-workbench"><div className={`settings-panel settings-panel-${page}`} key={`${page}-${generation}`}>
         {page === 'general' && <GeneralSettings api={window.rovai.generalPreferences} windowControls={window.rovai.windowControls} agents={roster} initialPreferences={state.preferences} onPreferencesChange={ignore} />}
         {page === 'remote' && <HostWebSettings portDraft={remotePort} onPortDraftChange={setRemotePort} api={window.rovai.hostWeb} />}
+        {page === 'remoteHosts' && <RemoteHostsSettings api={window.rovai.remoteHost} />}
         {page === 'appearance' && <AppearanceSettings appearance={appearance} disabled={false} onChange={async value => { setAppearance(value); return value }} />}
         {page === 'notifications' && <NotificationSettings />}
         {page === 'runtime' && <RuntimeInstallationsPanel health={runtimeHealth} installations={[]} onReload={async () => { await request('runtime.reload') }} />}
@@ -234,6 +257,7 @@ window.settingsTest = {
     emitChannels()
   },
   fail: method => { state.failure = method },
+  failRemoteHost: code => { state.remoteHostFailure = code },
   finishStartupInspection: result => { pendingStartupInspection(result); pendingStartupInspection = null },
   settle: () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 35))))
 }

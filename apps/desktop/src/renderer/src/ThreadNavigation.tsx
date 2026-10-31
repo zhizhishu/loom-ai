@@ -265,6 +265,7 @@ export function ThreadNavigation({
   const quickChatWindow = groupWindow('quick-chat', navigation?.quickChat ?? { recentThreads: [], totalCount: 0 })
   const updateBadge = appUpdateBadgePresentation(updateSnapshot)
   const managed = Boolean(useShortcuts())
+  const remoteHosts = settingsRemoteHostsAvailable()
   const jumpLabel = useShortcutLabel('jump', platform)
   useShortcutAction('jump', () => setPaletteOpen(open => !open), !disabled)
 
@@ -412,7 +413,7 @@ export function ThreadNavigation({
         {view === 'settings' && !mobile
           ? (
               settingsNavigation ?? <SettingsSidebarNavigation
-                groups={SETTINGS_SIDEBAR_GROUPS.map(group => ({ ...group, items: group.items.filter(item => (item.key !== 'channels' || client.channels) && (item.key !== 'shortcuts' || managed)) }))}
+                groups={SETTINGS_SIDEBAR_GROUPS.map(group => ({ ...group, items: group.items.filter(item => (item.key !== 'channels' || client.channels) && (item.key !== 'shortcuts' || managed) && (item.key !== 'remoteHosts' || remoteHosts)) }))}
                 section={settingsSection}
                 updateBadge={updateBadge}
                 pendingMemoryCount={pendingMemoryCount}
@@ -713,6 +714,11 @@ export type SettingsSidebarGroup<Section extends string = NavigationSettingsSect
   items: SettingsSidebarItem<Section>[]
 }
 
+/** Remote hosts live in the App main window only; shared/Web mounts keep the entry hidden. */
+export function settingsRemoteHostsAvailable(): boolean {
+  return Boolean(typeof window === 'undefined' ? undefined : window.rovai?.remoteHost)
+}
+
 export const SETTINGS_SIDEBAR_GROUPS: SettingsSidebarGroup[] = [
   {
     key: 'application',
@@ -734,6 +740,7 @@ export const SETTINGS_SIDEBAR_GROUPS: SettingsSidebarGroup[] = [
       { key: 'skills', icon: 'sparkles', label: 'Skills' },
       { key: 'toolbox', icon: 'briefcase-business', label:"工具箱" },
       { key: 'remote', icon: 'monitor-smartphone', label:"远程连接" },
+      { key: 'remoteHosts', icon: 'server', label:"远端主机" },
       { key: 'channels', icon: 'radio-tower', label:"渠道" }
     ]
   },

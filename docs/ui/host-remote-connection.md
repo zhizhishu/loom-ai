@@ -34,7 +34,7 @@ last_updated: 2026-10-25
 | 部位 | 直接复用的源码 | 本稿处理 |
 | --- | --- | --- |
 | 应用壳层 | `styles.css` 的 `.app-shell`、`WindowDragStrip` | 270px 侧栏，50px 顶部占位；没有第三套壳层 |
-| 分组与选中行 | `CampNavigation`、`SettingsSidebarNavigation`、`SETTINGS_SIDEBAR_GROUPS` | “应用”组内，位于“提醒”之后；能力/支持顺序不变；选中行沿用中性底色 |
+| 分组与选中行 | `CampNavigation`、`SettingsSidebarNavigation`、`SETTINGS_SIDEBAR_GROUPS` | “能力”组内，紧随“远程连接”、位于“渠道”之前；应用/支持顺序不变；选中行沿用中性底色 |
 | 页头 | `SettingsPageHeader`、`settings-workspace.css` | 24px/620 标题、12px 说明、无装饰边线；和通用页同一内容轴 |
 | 内容区 | `.settings-panel-general`、`.general-settings`、`.general-settings-section` | 880px 开放阅读面、24px 分区间距与细分隔线；保留稳定滚动条占位，避免短页标题移动 |
 | 控件 | 通用设置的开关、quiet/primary button、输入边界 | 共享主题操作色、白色关闭态滑块、6px 控件圆角；状态保留独立语义色 |
@@ -80,9 +80,33 @@ Web 的同一菜单显示当前 Host 地址及连接状态，可退出本页登�
 同页重新登录保留编辑身份、Composer 与原命令核对。Web 不需要本机管理密钥读取能力来访问业务页面。
 不构建多租户、强隔离执行或用户可配置的安全平台；范围见 [Host Web v3](../contracts/host-web-v3.md)。
 
+## 远端主机
+
+“设置 → 能力 → 远端主机”紧接“远程连接”，列出这台电脑保存的远端 Rovai Server。列表只保存名称与
+Server 根地址（`http(s)://host[:port]`）：地址由 Main 校验并规范化后才写入 userData 的 `remote-hosts.json`，
+带凭据、路径、查询参数、片段或非 http(s) 协议一律拒绝，最多 16 条。页面覆盖读取中、空列表、读取失败
+（可重新读取）、提交中与逐项操作中；添加失败保留已输入的地址与名称，并按错误码就近说明原因
+（格式／协议／凭据／路径／重复／上限／未找到／仅主窗口／未就绪／不支持／未完成）。
+
+“打开”由 Main 按 id 创建独立窗口：无 preload、`nodeIntegration:false`、`contextIsolation:true`、
+`sandbox:true`、`webviewTag:false`，并使用独立 `persist:rovai-remote-host-<id>` partition。因此远端的
+登录 Cookie 与 App 本机会话、其他远端主机互不可见；`window.open` 一律拒绝，离开该 origin 的外链交给
+系统浏览器；`will-navigate` 与 `will-redirect` 只放行该项 origin；权限请求与权限检查全部拒绝；
+`will-attach-webview` 拒绝。同一主机再次打开只聚焦已有窗口，移除后该窗口关闭。
+
+远端窗口里使用该 Server 自己的登录 Token 登录；Token 只进入该 partition 的会话，既不写入本机列表与
+偏好文件，也不在本页任何字段出现，页面不提供展示或复制入口。本页不改本机 Host 的监听端口、令牌或会话，
+也不是更换 Host 客户端的入口；跨机访问仍取决于网络与防火墙。
+
+Renderer 只能按 id 操作：Main 侧 `ipcMain.handle('rovai:remote-hosts')` 要求发送方是主窗口主框架，
+renderer 无法让 App 加载任意 URL。渲染端能力白名单是 `business-environment.ts` 的 `remoteHost`；
+Web 与独立 Server 不提供该 API，因此桌面侧栏和移动端设置索引只在 API 存在时列出并显示“远端主机”，
+不会出现空面板。隔离夹具断言见 `pnpm test:settings-workspace`。
+
 ## 生产组件与验收
 
 - `HostWebSettings`：Desktop 的实际服务状态、地址选择、令牌读取及生命周期协调。
+- `RemoteHostsSettings`：Desktop 的远端 Server 列表、添加/打开/移除；不保存 Token，不提供凭据入口。
 - `RemoteConnectionStatus`：实际浏览器与离线稿共用的连接状态页面。
 - `SettingsSidebarNavigation`、`SettingsPageHeader`、General/Appearance：原生产导航和对照基准。
 - `HostWorkspacePicker`：浏览器文件系统适配，不复制 Core 的工作区业务规则。

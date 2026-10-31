@@ -279,6 +279,33 @@ app.whenReady().then(async () => {
     await click('[aria-label="远程访问"]')
     assert.equal(await run("document.querySelector('[role=dialog]')===null"), true)
 
+    await navigate('remoteHosts')
+    await waitFor("document.querySelectorAll('[data-remote-host]').length === 1")
+    assert.ok(await run("document.querySelector('[data-remote-host]').textContent.includes('100.64.0.7:8767')"))
+    assert.ok(await run("document.querySelector('[data-remote-host]').textContent.includes('工作机')"))
+    await click('#remote-host-address')
+    await run("document.execCommand('insertText',false,'http://100.64.0.8:8767')"); await settle()
+    await click('#remote-host-label')
+    await run("document.execCommand('insertText',false,'会议机')"); await settle()
+    await click('.remote-host-form button[type=submit]')
+    await waitFor("document.querySelectorAll('[data-remote-host]').length === 2")
+    assert.deepEqual(await run("window.settingsTest.requests.filter(r => r.method === 'remoteHost.add').at(-1).params"), { address: 'http://100.64.0.8:8767', label: '会议机' })
+    assert.equal(await run("document.querySelector('#remote-host-address').value"), '', 'a saved host clears the draft')
+    await run("window.settingsTest.failRemoteHost('remote_host_exists')")
+    await click('#remote-host-address')
+    await run("document.execCommand('insertText',false,'http://100.64.0.8:8767')"); await settle()
+    await click('.remote-host-form button[type=submit]')
+    await waitFor("document.querySelector('#remote-host-error') !== null")
+    assert.ok(await run("document.querySelector('#remote-host-error').textContent.includes('这个地址已经添加过了。')"))
+    assert.equal(await run("document.querySelector('#remote-host-address').value"), 'http://100.64.0.8:8767', 'a failed add keeps the typed address')
+    await click('[data-remote-host] .quiet-button:not(.danger-text)')
+    assert.deepEqual(await run("window.settingsTest.requests.filter(r => r.method === 'remoteHost.open').at(-1).params"), { id: 'host-fixture-1' })
+    await capture('remote-hosts-day')
+    await click('[data-remote-host]:last-child .danger-text')
+    await waitFor("document.querySelectorAll('[data-remote-host]').length === 1")
+    assert.deepEqual(await run("window.settingsTest.requests.filter(r => r.method === 'remoteHost.remove').at(-1).params"), { id: 'host-fixture-2' })
+    assert.equal(await run("document.querySelectorAll('#remote-host-error').length"), 0)
+
     await navigate('appearance')
     assert.deepEqual(await run("[...document.querySelector('#appearance-zoom').options].map(o=>Number(o.value))"), [25,33,50,67,75,80,90,100,110,125,150,175,200,250,300,400,500])
     assert.equal(await run("document.querySelectorAll('.motion-example').length"), 0)
@@ -484,7 +511,7 @@ app.whenReady().then(async () => {
     for (const theme of ['day', 'night']) {
       await run(`document.documentElement.dataset.theme=${JSON.stringify(theme)}`)
       window.setContentSize(1040, 700); window.webContents.setZoomFactor(1)
-      for (const page of ['general','remote','appearance','notifications','runtime','channels','monitoring','diagnostics','about']) {
+      for (const page of ['general','remote','remoteHosts','appearance','notifications','runtime','channels','monitoring','diagnostics','about']) {
         await navigate(page); await noOverflow(`${page}/${theme}/1040`); await capture(`${page}-${theme}-1040`)
         if (page === 'monitoring') {
           await selectMonitoringRange('30d'); await costHistoryFits(`${page}/30d/${theme}/1040`)

@@ -1,7 +1,7 @@
 import { Activity, useLayoutEffect, useRef, type ReactNode, type Ref } from 'react'
 import type { AppearanceSnapshot, SettingsSection } from '@contracts'
 import { useThreadClient } from './camp-client'
-import { SETTINGS_SIDEBAR_GROUPS } from './ThreadNavigation'
+import { SETTINGS_SIDEBAR_GROUPS, settingsRemoteHostsAvailable } from './ThreadNavigation'
 import { MobileBack, MobilePageHeader, useMobileLayout } from './MobileLayout'
 import { NavigationIcon } from './NavigationIcon'
 import { Icon } from './MissionControls'
@@ -25,7 +25,7 @@ export function MobileSettingsLayout({ overview, section, appearance, menuOpen, 
   const index = useRef<HTMLDivElement>(null)
   const wasOverview = useRef(overview)
   const lastSection = useRef(section)
-  const groups = SETTINGS_SIDEBAR_GROUPS.map(group => ({ ...group, items: group.items.filter(item => item.key !== 'channels' || client.channels) }))
+  const groups = SETTINGS_SIDEBAR_GROUPS.map(group => ({ ...group, items: group.items.filter(item => (item.key !== 'channels' || client.channels) && (item.key !== 'remoteHosts' || settingsRemoteHostsAvailable())) }))
   const selected = groups.flatMap(group => group.items).find(item => item.key === section)
   useLayoutEffect(() => {
     if (mobile && overview && !wasOverview.current) {

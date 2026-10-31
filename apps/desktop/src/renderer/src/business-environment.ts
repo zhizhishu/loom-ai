@@ -12,5 +12,5 @@ export interface BusinessEnvironment {
   revealProjectDirectory?: RovaiApi['revealProjectDirectory']
   serverUpdates?: RovaiApi['appUpdates']
   /** Native startup, updates, lifecycle and notification integration are absent on Web. */
-  desktop?: Pick<RovaiApi, 'desktopSession' | 'onboarding' | 'appLifecycle' | 'userAutomation' | 'appUpdates' | 'exportDiagnostics' | 'windowControls' | 'windowClose' | 'hostWeb'>
+  desktop?: Pick<RovaiApi, 'desktopSession' | 'onboarding' | 'appLifecycle' | 'userAutomation' | 'appUpdates' | 'exportDiagnostics' | 'windowControls' | 'windowClose' | 'hostWeb' | 'remoteHost'>
 }

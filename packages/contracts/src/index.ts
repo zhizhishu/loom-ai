@@ -3164,6 +3164,7 @@ export type ExecutionConsolePlacement = 'right' | 'inspector' | 'bottom'
 export type SettingsSection =
   | 'memory'
   | 'remote'
+  | 'remoteHosts'
   | 'general'
   | 'skills'
   | 'toolbox'
@@ -4564,10 +4565,46 @@ export interface HostWebApi {
   rotate(): Promise<HostWebStatus & { administratorToken: string }>
 }
 
+/**
+ * Same shape as `apps/desktop/src/shared/remote-host.ts` `RemoteHostEntry`.
+ * Declared here rather than imported because `packages/contracts` must not
+ * depend on an app; renderer, preload and Main agree structurally, so no cast
+ * is needed anywhere.
+ */
+export type RemoteHostEntry = { id: string; label: string; origin: string }
+
+/** Mirrors the shared origin errors plus the Main-process codes of `rovai:remote-hosts`. */
+export type RemoteHostCode =
+  | 'remote_host_url_invalid'
+  | 'remote_host_url_protocol'
+  | 'remote_host_url_credentials'
+  | 'remote_host_url_path'
+  | 'remote_host_exists'
+  | 'remote_host_limit'
+  | 'remote_host_not_found'
+  | 'remote_host_forbidden'
+  | 'remote_host_unavailable'
+  | 'remote_host_operation_invalid'
+  | 'remote_host_failed'
+
+export type RemoteHostResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; code: RemoteHostCode }
+
+/** Saved remote Rovai Servers; origins only, credentials never live here. */
+export interface RemoteHostApi {
+  list(): Promise<RemoteHostResult<RemoteHostEntry[]>>
+  add(input: { address: string; label?: string }): Promise<RemoteHostResult<RemoteHostEntry>>
+  remove(input: { id: string }): Promise<RemoteHostResult<RemoteHostEntry[]>>
+  open(input: { id: string }): Promise<RemoteHostResult<null>>
+}
+
 export interface RovaiApi {
   shortcuts?: import('./shortcuts').ShortcutPreferencesApi
   /** Local Desktop owner only; absent on the public Web capability. */
   hostWeb?: HostWebApi
+  /** Local Desktop owner only; opens saved remote Servers in isolated windows. */
+  remoteHost?: RemoteHostApi
   request<T>(method: CoreMethod, params?: unknown): Promise<T>
   onEvent(listener: (event: CoreEvent) => void): () => void
   appLifecycle: {

@@ -86,6 +86,14 @@ const api: RovaiApi = {
     stop: () => invokeHostWeb('stop'),
     rotate: () => invokeHostWeb('rotate')
   },
+  // Main answers with its own `{ok,value}` / `{ok,code}` envelope, so the result
+  // crosses the bridge as data instead of a rejected promise.
+  remoteHost: {
+    list: () => ipcRenderer.invoke('rovai:remote-hosts', 'list'),
+    add: (input: { address: string; label?: string }) => ipcRenderer.invoke('rovai:remote-hosts', 'add', input),
+    remove: (input: { id: string }) => ipcRenderer.invoke('rovai:remote-hosts', 'remove', input),
+    open: (input: { id: string }) => ipcRenderer.invoke('rovai:remote-hosts', 'open', input)
+  },
   async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
     const transport = await ipcRenderer.invoke(
       'rovai:request',

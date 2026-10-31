@@ -55,3 +55,12 @@
 }
 .remote-qr-frame { width: 208px; height: 208px; display: grid; place-items: center; }
 .remote-qr-frame p { color: var(--muted); text-align: center; }
+
+/* Remote hosts: same row grid as the connection addresses, plus a monospace origin
+   and one row of address/name/submit fields. */
+.remote-address-value code { color: var(--ink); font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; user-select: text; }
+.remote-host-form { display: grid; grid-template-columns: minmax(0,1.6fr) minmax(0,1fr) auto; gap: 12px; align-items: end; }
+@container remote-settings (max-width: 600px) {
+  .remote-host-form { grid-template-columns: minmax(0,1fr); }
+  .remote-host-form > button { justify-self: start; }
+}

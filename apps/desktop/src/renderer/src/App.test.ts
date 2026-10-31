@@ -1,5 +1,6 @@
 import { languageTestApi } from './interface-language-test-api'
 import { RemoteConnectionStatus } from './RemoteConnectionStatus'
+import { RemoteHostsSettings } from './RemoteHostsSettings'
 import { VISIBLE_PRODUCT_RUNTIMES } from './runtime-products'
 import { DEFAULT_APPEARANCE } from '../../shared/appearance'
 import { DEFAULT_GENERAL_PREFERENCES } from '../../shared/general-preferences-model'
@@ -3390,6 +3391,8 @@ describe('task event projections', () => {
     expect(capabilitiesGroup).toContain('<strong>智能体</strong>')
     expect(capabilitiesGroup).toContain('<strong>远程连接</strong>')
     expect(capabilitiesGroup).toContain('<strong>渠道</strong>')
+    // Remote hosts need the Desktop preload; this mount has no window.rovai.remoteHost.
+    expect(capabilitiesGroup).not.toContain('<strong>远端主机</strong>')
     expect(capabilitiesGroup).toContain('data-navigation-icon="sparkles"')
     expect(capabilitiesGroup).toContain('data-navigation-icon="blocks"')
     expect(capabilitiesGroup).toContain('data-navigation-icon="cpu"')
@@ -3428,6 +3431,7 @@ describe('task event projections', () => {
     }
     const contentBySection: Record<Exclude<NavigationSettingsSection, 'memory'>, string> = {
       remote: '远程连接',
+      remoteHosts: '远端主机',
       general: '通用',
       skills: 'Skills',
       toolbox: '工具箱',
@@ -3441,8 +3445,14 @@ describe('task event projections', () => {
       diagnostics: '诊断与修复',
       about: '关于与更新'
     }
+    const remoteHostTestApi: import('@contracts').RemoteHostApi = {
+      list: async () => ({ ok: true, value: [] }),
+      add: async () => ({ ok: false, code: 'remote_host_failed' }),
+      remove: async () => ({ ok: true, value: [] }),
+      open: async () => ({ ok: true, value: null })
+    }
     for (const [section, heading] of Object.entries(contentBySection) as Array<[NavigationSettingsSection, string]>) {
-      const markup = renderToStaticMarkup(createElement(SettingsView, { remoteConnection: createElement(RemoteConnectionStatus, { origin: 'http://fixture.invalid', state: 'live', onLogout: () => undefined }), preferencesApi: {} as import('@contracts').GeneralPreferencesApi, ...baseProps, section }))
+      const markup = renderToStaticMarkup(createElement(SettingsView, { remoteConnection: createElement(RemoteConnectionStatus, { origin: 'http://fixture.invalid', state: 'live', onLogout: () => undefined }), remoteHosts: createElement(RemoteHostsSettings, { api: remoteHostTestApi }), preferencesApi: {} as import('@contracts').GeneralPreferencesApi, ...baseProps, section }))
       if (section === 'shortcuts') {
         expect(markup).not.toContain('<h1>快捷键</h1>') // Desktop capability is required.
       } else if (section === 'mcp') {

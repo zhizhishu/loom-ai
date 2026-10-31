@@ -4,6 +4,7 @@ const STARTUP_LOCATION_MODES = new Set<StartupLocationMode>(['last_location', 'q
 const EXECUTION_CONSOLE_PLACEMENTS = new Set<ExecutionConsolePlacement>(['right', 'inspector', 'bottom'])
 const SETTINGS_SECTIONS = new Set<SettingsSection>([
   'remote',
+  'remoteHosts',
   'general',
   'memory',
   'skills',
