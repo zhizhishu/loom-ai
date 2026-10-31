@@ -6764,7 +6764,10 @@ mod tests {
         insert("cleanup_pending", "ws-old");
         let unreadable = mission_workspace(database.connection(), &mission_id).unwrap_err();
         assert_eq!(
-            unreadable.downcast_ref::<LoomCommandError>().unwrap().code(),
+            unreadable
+                .downcast_ref::<LoomCommandError>()
+                .unwrap()
+                .code(),
             LOOM_EVIDENCE_UNREADABLE,
             "assertion a Mission whose worktree is being cleaned up is unreadable, never re-rooted at {}",
             project_root.to_string_lossy()
