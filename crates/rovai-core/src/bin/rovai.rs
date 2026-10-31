@@ -2554,7 +2554,10 @@ mod tests {
         let loom_help = ["loom".to_string(), "--help".to_string()];
         assert!(operation_help(&loom_help, true).unwrap().is_none());
         assert!(!is_family_help(&loom_help));
-        assert_eq!(loom_family_help_text(), "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make a planned task claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n");
+        assert_eq!(
+            loom_family_help_text(),
+            "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make a planned task claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
+        );
         assert!(root_help_text(true, true).contains(
             "  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit\n\n"
         ));

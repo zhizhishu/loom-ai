@@ -157,12 +157,24 @@ pub struct LoomSubmitToolInput {
 /// Schema-level validation used by the closed tool catalog.
 pub fn validate_input(name: &str, input: &Value) -> Result<()> {
     match name {
-        LOOM_STATUS_TOOL_NAME => serde_json::from_value::<LoomStatusToolInput>(input.clone()).map(|_| ()),
-        LOOM_PLAN_TOOL_NAME => serde_json::from_value::<LoomPlanToolInput>(input.clone()).map(|_| ()),
-        LOOM_RELEASE_TOOL_NAME => serde_json::from_value::<LoomReleaseToolInput>(input.clone()).map(|_| ()),
-        LOOM_CLAIM_TOOL_NAME => serde_json::from_value::<LoomClaimToolInput>(input.clone()).map(|_| ()),
-        LOOM_EVIDENCE_TOOL_NAME => serde_json::from_value::<LoomEvidenceToolInput>(input.clone()).map(|_| ()),
-        LOOM_SUBMIT_TOOL_NAME => serde_json::from_value::<LoomSubmitToolInput>(input.clone()).map(|_| ()),
+        LOOM_STATUS_TOOL_NAME => {
+            serde_json::from_value::<LoomStatusToolInput>(input.clone()).map(|_| ())
+        }
+        LOOM_PLAN_TOOL_NAME => {
+            serde_json::from_value::<LoomPlanToolInput>(input.clone()).map(|_| ())
+        }
+        LOOM_RELEASE_TOOL_NAME => {
+            serde_json::from_value::<LoomReleaseToolInput>(input.clone()).map(|_| ())
+        }
+        LOOM_CLAIM_TOOL_NAME => {
+            serde_json::from_value::<LoomClaimToolInput>(input.clone()).map(|_| ())
+        }
+        LOOM_EVIDENCE_TOOL_NAME => {
+            serde_json::from_value::<LoomEvidenceToolInput>(input.clone()).map(|_| ())
+        }
+        LOOM_SUBMIT_TOOL_NAME => {
+            serde_json::from_value::<LoomSubmitToolInput>(input.clone()).map(|_| ())
+        }
         _ => anyhow::bail!("unknown LOOM tool {name}"),
     }
     .map_err(|error| LoomToolError::new("loom.invalid_input", error.to_string()))
@@ -257,7 +269,10 @@ pub fn invoke(
             let input: LoomSubmitToolInput = serde_json::from_value(input)?;
             submit(database, caller, &mission_id, input)
         }
-        _ => Err(LoomToolError::new("loom.invalid_input", format!("unknown LOOM tool {name}"))),
+        _ => Err(LoomToolError::new(
+            "loom.invalid_input",
+            format!("unknown LOOM tool {name}"),
+        )),
     }
 }
 
@@ -338,7 +353,10 @@ fn submit(
             )
         })?;
     let plan = loom::plan_get(database, mission_id)?.ok_or_else(|| {
-        LoomToolError::new("loom.plan_not_found", "The current Mission has no LOOM plan")
+        LoomToolError::new(
+            "loom.plan_not_found",
+            "The current Mission has no LOOM plan",
+        )
     })?;
     let content_hash = candidate_content_hash(database, mission_id, &input.evidence_ids)?;
     let result = loom::candidate_record(
@@ -363,7 +381,11 @@ fn submit(
 /// The candidate's content identity: SHA-256 over the sorted (artifactId, sha256) pairs of its
 /// registered evidence. Unregistered ids hash as such and are then refused by the domain, which
 /// owns the "must be a registered artifact of this plan" rule.
-fn candidate_content_hash(database: &Database, mission_id: &str, evidence_ids: &[String]) -> Result<String> {
+fn candidate_content_hash(
+    database: &Database,
+    mission_id: &str,
+    evidence_ids: &[String],
+) -> Result<String> {
     let artifacts = loom::artifacts_list(database, mission_id)?;
     let mut pairs: Vec<(String, String)> = evidence_ids
         .iter()
@@ -621,15 +643,27 @@ mod tests {
                 },
             )
             .unwrap();
-        let mission_id = created.result.payload["missionId"].as_str().unwrap().to_string();
+        let mission_id = created.result.payload["missionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let camp_id: String = database
             .connection()
-            .query_row("SELECT camp_id FROM mission WHERE id=?1", [&mission_id], |row| row.get(0))
+            .query_row(
+                "SELECT camp_id FROM mission WHERE id=?1",
+                [&mission_id],
+                |row| row.get(0),
+            )
             .unwrap();
         (mission_id, camp_id)
     }
 
-    fn caller<'a>(camp_id: &'a str, agent_id: &'a str, run: &'a str, command: &'a str) -> LoomToolCaller<'a> {
+    fn caller<'a>(
+        camp_id: &'a str,
+        agent_id: &'a str,
+        run: &'a str,
+        command: &'a str,
+    ) -> LoomToolCaller<'a> {
         LoomToolCaller {
             camp_id,
             agent_id,
@@ -702,7 +736,11 @@ mod tests {
             plan_json(),
         )
         .unwrap_err();
-        assert_eq!(code(error), "loom.plan_exists", "a second plan is never imported");
+        assert_eq!(
+            code(error),
+            "loom.plan_exists",
+            "a second plan is never imported"
+        );
     }
 
     #[test]
@@ -720,7 +758,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(released["status"], "ready");
-        assert!(released.get("task").is_none(), "canonical results carry no top-level task");
+        assert!(
+            released.get("task").is_none(),
+            "canonical results carry no top-level task"
+        );
 
         // The other Mission has no plan: the same task id is not reachable from there.
         let error = invoke(
@@ -749,7 +790,10 @@ mod tests {
             json!({"taskId": "t1"}),
         )
         .unwrap();
-        assert_eq!(claim["agentRunId"], "run_worker", "the Run comes from authentication");
+        assert_eq!(
+            claim["agentRunId"], "run_worker",
+            "the Run comes from authentication"
+        );
         assert_eq!(claim["claimantAgentId"], "agent_2");
         let replayed = invoke(
             &mut database,
@@ -781,7 +825,10 @@ mod tests {
         .unwrap();
         assert_eq!(evidence["artifact"]["creatorId"], "agent_2");
         assert_eq!(evidence["artifact"]["agentRunId"], "run_worker");
-        let artifact_id = evidence["artifact"]["artifactId"].as_str().unwrap().to_string();
+        let artifact_id = evidence["artifact"]["artifactId"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Another Run cannot submit under the worker's claim.
         let error = invoke(
@@ -801,9 +848,20 @@ mod tests {
             json!({"taskId": "t1", "evidenceIds": [artifact_id]}),
         )
         .unwrap();
-        assert_eq!(candidate["acceptanceStatus"], "pending", "submitting never accepts");
-        assert_eq!(candidate["acceptanceCriteriaVersion"], DEFAULT_ACCEPTANCE_CRITERIA_VERSION);
-        assert!(candidate["contentHash"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(
+            candidate["acceptanceStatus"], "pending",
+            "submitting never accepts"
+        );
+        assert_eq!(
+            candidate["acceptanceCriteriaVersion"],
+            DEFAULT_ACCEPTANCE_CRITERIA_VERSION
+        );
+        assert!(
+            candidate["contentHash"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
         // A retry of the same tool call after the Task moved to review replays, not fails.
         let again = invoke(
             &mut database,
@@ -836,10 +894,22 @@ mod tests {
     fn closed_inputs_refuse_injected_identity() {
         for (name, input) in [
             (LOOM_STATUS_TOOL_NAME, json!({"missionId": "m"})),
-            (LOOM_RELEASE_TOOL_NAME, json!({"taskId": "t", "missionId": "m"})),
-            (LOOM_CLAIM_TOOL_NAME, json!({"taskId": "t", "agentRunId": "r"})),
-            (LOOM_CLAIM_TOOL_NAME, json!({"taskId": "t", "commandId": "c"})),
-            (LOOM_EVIDENCE_TOOL_NAME, json!({"relativePath": "a", "agentRunId": "r"})),
+            (
+                LOOM_RELEASE_TOOL_NAME,
+                json!({"taskId": "t", "missionId": "m"}),
+            ),
+            (
+                LOOM_CLAIM_TOOL_NAME,
+                json!({"taskId": "t", "agentRunId": "r"}),
+            ),
+            (
+                LOOM_CLAIM_TOOL_NAME,
+                json!({"taskId": "t", "commandId": "c"}),
+            ),
+            (
+                LOOM_EVIDENCE_TOOL_NAME,
+                json!({"relativePath": "a", "agentRunId": "r"}),
+            ),
             (
                 LOOM_SUBMIT_TOOL_NAME,
                 json!({"taskId": "t", "evidenceIds": [], "fenceGeneration": 9}),
@@ -857,6 +927,10 @@ mod tests {
             );
         }
         validate_input(LOOM_STATUS_TOOL_NAME, &json!({})).unwrap();
-        validate_input(LOOM_SUBMIT_TOOL_NAME, &json!({"taskId": "t", "evidenceIds": ["a"]})).unwrap();
+        validate_input(
+            LOOM_SUBMIT_TOOL_NAME,
+            &json!({"taskId": "t", "evidenceIds": ["a"]}),
+        )
+        .unwrap();
     }
 }

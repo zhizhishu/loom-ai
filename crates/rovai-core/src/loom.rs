@@ -6724,7 +6724,11 @@ mod tests {
         std::fs::write(worktree.join("only-in-worktree.md"), "worktree bytes").unwrap();
         let camp_id: String = database
             .connection()
-            .query_row("SELECT camp_id FROM mission WHERE id=?1", [&mission_id], |row| row.get(0))
+            .query_row(
+                "SELECT camp_id FROM mission WHERE id=?1",
+                [&mission_id],
+                |row| row.get(0),
+            )
             .unwrap();
         let insert = |state: &str, id: &str| {
             database
