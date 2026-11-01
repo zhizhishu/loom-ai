@@ -621,7 +621,46 @@ rovai-server node-exec --data-dir /tmp/loom-b1/a \
 - B 的数据目录里没有 SQLite 产品库。
 - 把假 `codex` 换成真的 `codex exec` 或 `claude -p`，同一条派发命令能跑完并带回输出。这一条是手工冒烟：没有登录态就记下来，不把 B1 判失败。
 
-两个用户时：`loom-a` 拥有 `/tmp/loom-b1/a`（0700），`loom-b` 拥有 `/tmp/loom-b1/b`，`loom-b` 读不了 A 的数据目录。
+两个用户时：`loom-a` 拥有 `/tmp/loom-b1/a`（0700），`loom-b` 拥有 `/tmp/loom-b1/b`，`loom-b` 读不了 A 的数据目录。这一条比两个进程更硬，自动化验收没有另建系统用户。
+
+#### 实施状态（2026-11-01）
+
+B1 已落地。A 仍是 `rovai-server`（一个 Core、一份 SQLite，默认只听回环）。节点通道是旁边的 `GET /api/v1/nodes/connect`，不进入 `/api/v1/request`。B 是新进程 `loom-node`，只出站。
+
+和上面正文的差别，是为了让这一刀保持最薄：
+
+- 配对码和节点令牌的摘要、以及这一次派发，记在 A 的进程内存里，不写新表。明文节点令牌只在配对成功时经套接字交回一次，A 不保存。重启后的对账是 B2。
+- `node-pair` 和 `node-exec` 是另一次进程。它们读数据目录里的管理员令牌，向正在跑的服务登录后要配对码、下发一次 Run。服务把实际监听地址写在 `loom-node-listener.json`，退出时删掉。
+- 节点启动器继承自己的环境，再盖上 A 发来的环境变量。B1 发的是空列表，这样同一条命令上的真 `codex exec` / `claude -p` 还能看见本机的 HOME 和登录态。完整的 `ManagedProcess` 清环境和进程树所有权留到下一刀。
+- B1 只发现 `codex`（`codex-cli`）和 `claude`（`claude-code-cli`）。其余种类是 B3。
+- 进程字节用 JSON 文本帧，字节是 base64。序号从 1 起，stdout 和 stderr 共用，A 确认到该序号。
+
+自动化验收（两个进程、两个数据目录、假 `codex` 打出 `LOOM_B1_OK` 并以 0 退出；同时断言 A 看到这一行和退出码 0、`loom-node` 没有监听套接字、管理员令牌连不上节点套接字、节点令牌不能当管理员登录、B 的数据目录没有 SQLite）：
+
+```bash
+cargo test -p loom-node --test b1_outbound
+cargo test -p rovai-web --lib nodes::
+cargo test -p loom-node --lib
+cargo test -p rovai-core --lib loom
+```
+
+2026-11-01 在非 root 的 Linux 上复跑：`b1_outbound` 通过；`nodes::` 1 通过；`loom-node --lib` 1 通过；`cargo test -p rovai-core --lib loom` 85 通过。同一棵树上 `cargo fmt --all -- --check`、`cargo check -p rovai-core --all-targets`、`cargo check -p loom-protocol --all-targets`、`cargo check -p loom-node --all-targets`、`cargo check -p rovai-web --all-targets`、`cargo check -p rovai-host --all-targets`、`pnpm typecheck`、`pnpm docs:check` 也通过。没有出现只在 root 下失败的 `database_admission` 用例，因为这些命令不是以 root 跑的。
+
+手工冒烟用真 CLI。没有登录态就记下来，不把 B1 判失败。先按本节开头的准备把 A、B 和假 `codex` 跑通，再把 B 的 `PATH` 换成真的 `codex` / `claude` 所在目录，重新配对后执行：
+
+```bash
+rovai-server node-exec --data-dir /tmp/loom-b1/a \
+  --runtime codex-cli \
+  --cwd /tmp/loom-b1/work \
+  -- exec --skip-git-repo-check 'say hello in one line'
+
+rovai-server node-exec --data-dir /tmp/loom-b1/a \
+  --runtime claude-code-cli \
+  --cwd /tmp/loom-b1/work \
+  -- -p 'say hello in one line'
+```
+
+`node-exec` 的标准输出就是 CLI 的标准输出，进程退出码就是 CLI 的退出码。
 
 ### B2 心跳、掉线、重连、不双开
 
