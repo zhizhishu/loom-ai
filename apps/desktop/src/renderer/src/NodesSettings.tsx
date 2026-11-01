@@ -282,7 +282,7 @@ export function NodesSettingsBody({
               </div>
               <span className="nodes-field-label" id="node-pair-address-label">{t('B 要拨的地址')}</span>
               <p className="nodes-address" aria-labelledby="node-pair-address-label">{ticket.connectUrl}</p>
-              {ticket.reachabilityWarning && <p className="nodes-reach" role="note">{t('B 必须能连上这个地址。回环地址只适合在同一台机器上试。')}</p>}
+              {ticket.reachabilityWarning && <p className="nodes-reach">{t('B 必须能连上这个地址。回环地址只适合在同一台机器上试。')}</p>}
               <span className="nodes-field-label" id="node-pair-command-label">{t('在 B 上执行')}</span>
               <pre className="nodes-command" id="node-pair-command" aria-labelledby="node-pair-command-label">{pairingCommand(ticket)}</pre>
             </>}

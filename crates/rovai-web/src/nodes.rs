@@ -1256,7 +1256,10 @@ fn valid_credential(token: &str) -> bool {
 /// Without one, the listen address is the only target and the caller must
 /// warn that machine B has to be able to reach it.
 pub(crate) fn connect_target(listen: SocketAddr, public_origin: Option<&str>) -> (String, bool) {
-    if let Some(origin) = public_origin.map(str::trim).filter(|origin| !origin.is_empty()) {
+    if let Some(origin) = public_origin
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+    {
         let base = if let Some(rest) = origin.strip_prefix("https://") {
             format!("wss://{rest}")
         } else if let Some(rest) = origin.strip_prefix("http://") {
@@ -1816,10 +1819,7 @@ mod tests {
     fn connect_target_uses_public_origin_and_otherwise_warns() {
         let listen: SocketAddr = "127.0.0.1:8767".parse().unwrap();
         let (tunnel, warn) = connect_target(listen, Some("https://loom.trycloudflare.com"));
-        assert_eq!(
-            tunnel,
-            "wss://loom.trycloudflare.com/api/v1/nodes/connect"
-        );
+        assert_eq!(tunnel, "wss://loom.trycloudflare.com/api/v1/nodes/connect");
         assert!(!warn);
         let (lan, warn) = connect_target(listen, Some("http://10.1.2.3:8443"));
         assert_eq!(lan, "ws://10.1.2.3:8443/api/v1/nodes/connect");

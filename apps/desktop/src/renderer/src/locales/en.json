@@ -4343,5 +4343,11 @@
   "配对码暂时无法生成，请重试。": "Could not create a pairing code. Try again.",
   "本机节点不能作废。": "The local node cannot be revoked.",
   "没有找到这台节点。": "That node was not found.",
-  "作废未完成，请重试。": "Revoke did not finish. Try again."
+  "作废未完成，请重试。": "Revoke did not finish. Try again.",
+  "剩余 {0}，用过即废。这里不显示节点令牌。": "Remaining {0}. It works once. The node token is not shown here.",
+  "配对码已过期。关闭后重新打开会生成新的。": "The pairing code has expired. Close this and open it again for a new one.",
+  "配对码用过即废。这里不显示节点令牌。": "The pairing code works once. The node token is not shown here.",
+  "复制配对码": "Copy code",
+  "B 必须能连上这个地址。回环地址只适合在同一台机器上试。": "Machine B must be able to reach this address. A loopback address only works for a test on this same machine.",
+  "上次见到 {0}": "Last seen {0}"
 }

@@ -969,7 +969,11 @@ mod tests {
         store
             .insert_remote(node_id, "node-abcdef01", &"ab".repeat(32))
             .unwrap();
-        assert!(store.adopt_reported_hostname(node_id, " desk-b.local ").unwrap());
+        assert!(
+            store
+                .adopt_reported_hostname(node_id, " desk-b.local ")
+                .unwrap()
+        );
         let named = store
             .list_nodes()
             .unwrap()
@@ -977,7 +981,11 @@ mod tests {
             .find(|node| node.node_id == node_id)
             .unwrap();
         assert_eq!(named.display_name, "desk-b.local");
-        assert!(!store.adopt_reported_hostname(node_id, "other-host").unwrap());
+        assert!(
+            !store
+                .adopt_reported_hostname(node_id, "other-host")
+                .unwrap()
+        );
         assert!(!store.adopt_reported_hostname(node_id, "bad host").unwrap());
         assert!(!store.adopt_reported_hostname(node_id, "").unwrap());
         assert_eq!(

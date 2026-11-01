@@ -75,8 +75,10 @@ function renderBody(overrides: Partial<Parameters<typeof NodesSettingsBody>[0]> 
     ticket: null,
     pairBusy: false,
     pairError: '',
-    copied: false,
+    copied: null,
+    deadline: null,
     onPairOpenChange: () => undefined,
+    onCopyCode: () => undefined,
     onCopy: () => undefined,
     revokeNode: null,
     typed: '',
@@ -161,21 +163,79 @@ describe('nodes settings', () => {
     expect(markup).not.toContain('路径缺失')
   })
 
-  it('shows the pairing code and a copyable loom-node command', () => {
+  it('shows the pairing code, its countdown, and a copyable loom-node command', () => {
     const ticket = {
       pairingCode: '4f7kq2m9aabbccdd',
-      expiresInSeconds: 600,
-      connectUrl: 'ws://127.0.0.1:8767/api/v1/nodes/connect'
+      expiresInSeconds: 545,
+      connectUrl: 'ws://127.0.0.1:8767/api/v1/nodes/connect',
+      reachabilityWarning: true
     }
-    const markup = renderBody({ pairOpen: true, ticket })
+    const markup = renderBody({ pairOpen: true, ticket, deadline: now + 545_000 })
     expect(markup).toContain('添加节点')
     expect(markup).toContain('4f7kq2m9aabbccdd')
+    expect(markup).toContain('剩余 09:05')
+    expect(markup).toContain('复制配对码')
     expect(markup).toContain('ws://127.0.0.1:8767/api/v1/nodes/connect')
+    expect(markup).toContain('B 必须能连上这个地址')
     expect(markup).toContain('loom-node --data-dir ~/.loom-node')
     expect(markup).toContain('--pair-code 4f7kq2m9aabbccdd')
     expect(markup).toContain('复制命令')
     expect(markup).not.toContain('administratorToken')
     expect(pairingCommand(ticket)).not.toMatch(/token|Bearer/i)
+    const tunnel = renderBody({
+      pairOpen: true,
+      deadline: now + 180_000,
+      ticket: {
+        pairingCode: 'aabbccddeeff0011',
+        expiresInSeconds: 180,
+        connectUrl: 'wss://loom.trycloudflare.com/api/v1/nodes/connect',
+        reachabilityWarning: false
+      }
+    })
+    expect(tunnel).toContain('wss://loom.trycloudflare.com/api/v1/nodes/connect')
+    expect(tunnel).toContain('剩余 03:00')
+    expect(tunnel).not.toContain('回环地址')
+  })
+
+  it('dims a last-seen CLI and warns when the path is missing', () => {
+    const seen = node({
+      nodeId: 'node_seen',
+      displayName: 'studio',
+      role: 'remote',
+      clis: [{
+        adapterKind: 'codex-cli',
+        path: '/opt/codex',
+        version: '0.166.0',
+        pathPresent: true,
+        reportedAt: '2026-11-01T10:17:00.000Z',
+        availability: 'last_seen'
+      }]
+    })
+    const missing = node({
+      nodeId: 'node_missing',
+      displayName: 'lab',
+      role: 'remote',
+      clis: [{
+        adapterKind: 'claude-code-cli',
+        path: '/opt/claude',
+        version: '2.1.316',
+        pathPresent: false,
+        reportedAt: '2026-11-01T10:00:00.000Z',
+        availability: 'path_missing'
+      }]
+    })
+    const markup = renderBody({ list: { nodes: [seen, missing], readError: null, refreshError: null }, expanded: { node_seen: true, node_missing: true } })
+    expect(markup).toContain('nodes-cli is-stale')
+    expect(markup).toContain('上次见到 1 分钟前')
+    expect(markup).toContain('nodes-cli is-warn')
+    expect(markup).toContain('class="is-warn"')
+    expect(markup).toContain('路径缺失')
+  })
+
+  it('hides the role label when it repeats the display name', () => {
+    const markup = renderBody({ list: { nodes: [{ ...local, displayName: '本机' }], readError: null, refreshError: null }, expanded: {} })
+    expect(markup).toContain('>本机</strong>')
+    expect(markup).not.toContain('nodes-role')
   })
 
   it('requires the node name before revoking a node with active runs', () => {
