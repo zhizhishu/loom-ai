@@ -1456,7 +1456,7 @@ fn thread_start_or_resume_request(
     }
 }
 
-fn codex_mcp_session_config(
+pub(crate) fn codex_mcp_session_config(
     external_mcp_servers: &BTreeMap<String, McpServerDefinition>,
 ) -> Result<Value> {
     let mut servers = serde_json::Map::new();

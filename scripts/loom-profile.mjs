@@ -3,7 +3,17 @@
 //
 //   node scripts/loom-profile.mjs export --host <origin> --token-file <path> [--out profile.json]
 //   node scripts/loom-profile.mjs apply  --host <origin> --token-file <path> --profile profile.json [--dry-run]
+//   node scripts/loom-profile.mjs projection --host <origin> --token-file <path> --member <id-or-name> [--runtime codex-cli|claude-code] [--out file.json]
+//   node scripts/loom-profile.mjs projection --compare <left.json> <right.json>
 //
+// projection calls members.runProjection.preview (read-only; no Run). --compare checks two
+// projection files after normalization. These fields are ignored:
+//   - agentId
+//   - absolute filesystem paths (a whole JSON string, or the Bootstrap skill "root")
+//   - UUIDs and agent_<token> ids
+//   - sha256 digests
+//   - ISO-8601 timestamps
+// Display name, runtime, charter text, member rules, MCP commands, and URLs stay.
 // A profile carries each member's identity / rules (the six agent_profile fields), the MCP
 // servers with the members they are assigned to, and the Toolbox Skill selection. Members are
 // matched across hosts by display name, because agent ids differ per database. MCP secrets are
@@ -27,19 +37,47 @@ export class ProfileError extends Error {
 export function parseArguments (argv) {
   const [command, ...rest] = argv
   const options = { command, dryRun: false }
+  if (command !== 'export' && command !== 'apply' && command !== 'projection') {
+    throw new ProfileError('usage', 'command must be export, apply, or projection')
+  }
   for (let index = 0; index < rest.length; index += 1) {
     const flag = rest[index]
     if (flag === '--dry-run') { options.dryRun = true; continue }
+    if (flag === '--compare') {
+      const left = rest[index + 1]
+      const right = rest[index + 2]
+      if (!left || !right || left.startsWith('--') || right.startsWith('--')) throw new ProfileError('usage', '--compare needs two projection files')
+      options.compare = [left, right]
+      index += 2
+      continue
+    }
     const value = rest[index + 1]
     if (!value || value.startsWith('--')) throw new ProfileError('usage', `${flag} needs a value`)
-    const key = { '--host': 'host', '--token-file': 'tokenFile', '--out': 'out', '--profile': 'profile', '--mcp-secrets': 'mcpSecrets' }[flag]
+    const key = {
+      '--host': 'host',
+      '--token-file': 'tokenFile',
+      '--out': 'out',
+      '--profile': 'profile',
+      '--mcp-secrets': 'mcpSecrets',
+      '--member': 'member',
+      '--runtime': 'runtime'
+    }[flag]
     if (!key) throw new ProfileError('usage', `unknown option ${flag}`)
     options[key] = value
     index += 1
   }
-  if (command !== 'export' && command !== 'apply') throw new ProfileError('usage', 'command must be export or apply')
+  if (command === 'projection' && options.compare) {
+    if (options.host || options.tokenFile || options.member || options.runtime || options.out) {
+      throw new ProfileError('usage', '--compare does not take host, member, runtime, or --out')
+    }
+    return options
+  }
   if (!options.host || !options.tokenFile) throw new ProfileError('usage', '--host and --token-file are required')
   if (command === 'apply' && !options.profile) throw new ProfileError('usage', 'apply needs --profile')
+  if (command === 'projection' && !options.member) throw new ProfileError('usage', 'projection needs --member')
+  if (options.runtime && options.runtime !== 'codex-cli' && options.runtime !== 'claude-code') {
+    throw new ProfileError('usage', '--runtime must be codex-cli or claude-code')
+  }
   const url = new URL(options.host)
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new ProfileError('usage', '--host must be http(s)')
   options.host = url.origin
@@ -159,6 +197,60 @@ export async function planApply (client, profile, secrets = {}) {
   return plan
 }
 
+export async function fetchProjection (client, member, runtime) {
+  const params = { member }
+  if (runtime) params.runtime = runtime
+  return client.request('members.runProjection.preview', params)
+}
+
+const UUID_TEXT = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/giu
+const AGENT_TEXT = /\bagent_[A-Za-z0-9]+\b/gu
+const DIGEST_TEXT = /\bsha256:[0-9a-f]+\b/giu
+const TIME_TEXT = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})/gu
+const SKILL_ROOT_TEXT = /("root"\s*:\s*")([^"]*)(")/gu
+
+function isAbsolutePath (value) {
+  return value.startsWith('/') || value.startsWith('\\\\') || /^[A-Za-z]:[\\/]/u.test(value)
+}
+
+export function normalizeProjectionText (text) {
+  return text
+    .replace(SKILL_ROOT_TEXT, '$1<path>$3')
+    .replace(UUID_TEXT, '<id>')
+    .replace(AGENT_TEXT, '<id>')
+    .replace(DIGEST_TEXT, '<digest>')
+    .replace(TIME_TEXT, '<time>')
+}
+
+function normalizeProjectionValue (value) {
+  if (typeof value === 'string') return isAbsolutePath(value) ? '<path>' : normalizeProjectionText(value)
+  if (Array.isArray(value)) return value.map(normalizeProjectionValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, normalizeProjectionValue(value[key])]))
+  }
+  return value
+}
+
+/** Drop host paths, ids, and timestamps. See the file header for the exact fields. */
+export function normalizeProjection (projection) {
+  return {
+    displayName: projection.displayName ?? '',
+    runtime: projection.runtime ?? '',
+    bootstrap: normalizeProjectionText(String(projection.bootstrap ?? '')),
+    mcp: normalizeProjectionValue(projection.mcp ?? {})
+  }
+}
+
+export function compareProjections (left, right) {
+  const normalizedLeft = normalizeProjection(left)
+  const normalizedRight = normalizeProjection(right)
+  return {
+    equal: JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight),
+    left: normalizedLeft,
+    right: normalizedRight
+  }
+}
+
 export async function runPlan (client, plan) {
   const done = []
   for (const step of plan.filter(step => step.kind.startsWith('member.'))) {
@@ -200,10 +292,29 @@ export async function runPlan (client, plan) {
 
 async function main () {
   const options = parseArguments(process.argv.slice(2))
+  if (options.command === 'projection' && options.compare) {
+    let left
+    let right
+    try {
+      left = JSON.parse(readFileSync(options.compare[0], 'utf8'))
+      right = JSON.parse(readFileSync(options.compare[1], 'utf8'))
+    } catch (error) {
+      throw new ProfileError('profile', error.message)
+    }
+    const compared = compareProjections(left, right)
+    if (!compared.equal) throw new ProfileError('drift', 'normalized projections differ')
+    process.stdout.write('projection: normalized match\n')
+    return
+  }
   const client = new HostClient(options.host)
   await client.login(readToken(options.tokenFile))
   if (options.command === 'export') {
     const text = `${JSON.stringify(await exportProfile(client), null, 2)}\n`
+    if (options.out) writeFileSync(options.out, text, { mode: 0o600 }); else process.stdout.write(text)
+    return
+  }
+  if (options.command === 'projection') {
+    const text = `${JSON.stringify(await fetchProjection(client, options.member, options.runtime), null, 2)}\n`
     if (options.out) writeFileSync(options.out, text, { mode: 0o600 }); else process.stdout.write(text)
     return
   }

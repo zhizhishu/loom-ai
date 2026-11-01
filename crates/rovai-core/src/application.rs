@@ -607,6 +607,15 @@ fn request_error_body(error: &anyhow::Error) -> ErrorBody {
             details: json!({}),
         };
     }
+    if let Some(error) = error.downcast_ref::<crate::run_projection::MemberRunProjectionError>() {
+        return ErrorBody {
+            kind: "domain_rejection",
+            code: error.code().to_string(),
+            message: error.message().to_string(),
+            retryable: false,
+            details: json!({}),
+        };
+    }
     if let Some(error) = error.downcast_ref::<CommandGatewayError>() {
         let code = match error {
             CommandGatewayError::InvalidEnvelope(_) => "COMMAND_ENVELOPE_INVALID",
@@ -9902,6 +9911,20 @@ impl Core {
                     .get_profile(&database, &params.agent_id)?
                     .context("AgentProfile does not exist")?;
                 Ok(serde_json::to_value(profile)?)
+            }
+            "members.runProjection.preview" => {
+                self.subsystems.require("mcp")?;
+                let params: crate::run_projection::MemberRunProjectionParams =
+                    serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                Ok(serde_json::to_value(
+                    crate::run_projection::preview_member_run_projection(
+                        &database,
+                        &self.data_dir,
+                        self.mcp_config()?,
+                        &params,
+                    )?,
+                )?)
             }
             "members.camps.list" => {
                 let params: AgentIdParams = serde_json::from_value(request.params.clone())?;

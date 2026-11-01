@@ -30,7 +30,7 @@
 | M2 | 本地 App 内连远端主机发起对话；LOOM 真实任务 Gate 在远端或本地任一主机跑通 | 用户实机：使命 → 规划 → 编排图 → 交付验收 |
 | M3 | 「在哪跑」：按两端 CLI 可用性提示 / 选择主机 | 本地缺 CLI 时一键转到远端主机 |
 | M4 | 远端一键配齐 CLI | ✅ 见 §7。Desktop「远端主机」复制命令；Linux Host「智能体」在 Claude Code / Codex 未检测到时复制同一命令并重新探测，显示「可用」后收起。Core 不代装 |
-| M5 | 每助手规则 / MCP / skill profile 两端生效 | 同一 profile 导入两台主机后，两端 Run 的 Bootstrap / MCP 投射一致 |
+| M5 | 每助手规则 / MCP / skill profile 两端生效 | 同一 profile 导入两台主机后，`members.runProjection.preview` 取出的 Bootstrap 与 MCP 投射经 `projection --compare` 规范化后一致。见 §8 |
 
 ## 4. 待用户决定（不阻塞 M1 前半段）
 
@@ -70,3 +70,52 @@ Core 不代用户安装 Runtime。App 只展示这一行并提供复制，不执
 - Desktop「设置 → 能力 → 远端主机」始终给出该命令。这台电脑探测不到远端 Core，所以这里没有「重新检测」。打开该主机后，到它自己的「智能体」页重新检测。Web 与独立 Server 没有「远端主机」页，因此这条命令也不出现。
 - 当前 Host 为 Linux x64，且 Claude Code 或 Codex 为「未检测到」（含路径缺失）时，「设置 → 能力 → 智能体」给出同一命令、两项当前探测结果和「重新检测」。重新检测调用既有 `runtime.discovery.rescan`。两项都不再缺失后，命令收起；若这次检测由该说明发起且两项都为「可用」，留下探测结果。登录未完成不展示该命令，脚本不负责登录。
 - macOS 与 Windows 的智能体页不展示这条 Server 命令。本机安装仍走原有官方安装指南。systemd 启动的 Server 需把 `$HOME/.npm-global/bin` 加进单元 PATH 并重启后，探测才会看到新安装的 CLI。
+
+## 8. M5 投射预览
+
+不启动 Run、不调用模型，也能读出这个队员下一次 Run 会拿到的引导正文和 MCP 文件。操作名 `members.runProjection.preview`。只读。走现有管理员登录（`/api/v1/login` 的 64-hex Token 换 Session，再 `POST /api/v1/request`）。不写 Bootstrap 证据，不写 `runtime/mcp` 快照，不创建 Run。
+
+参数：
+
+```json
+{ "member": "<agent id 或显示名>", "runtime": "codex-cli" }
+```
+
+`runtime` 可省略。省略时用该队员已选的 Runtime，且只能是 `codex-cli` 或 `claude-code`（内部 id `claude-code-cli` 也接受）。未配置或不是这两项时返回 `runtime_required`。显示名多条命中返回 `member_ambiguous`，没有命中返回 `member_not_found`。精确 agent id 优先于显示名。
+
+返回：
+
+```json
+{
+  "agentId": "agent_1",
+  "displayName": "叮叮",
+  "runtime": "codex-cli",
+  "bootstrap": "[SESSION_CHARTER]\n…",
+  "mcp": { "mcp_servers": { } }
+}
+```
+
+`runtime` 为 `claude-code` 时 `mcp` 是 `{ "mcpServers": { } }`，与 Claude Code 运行包写入的 `--mcp-config` 相同。`codex-cli` 的 `mcp` 是 Codex 会话配置里的 `{ "mcp_servers": { } }`。两边都只含该队员已启用且已指派、适配器支持的服务器。MCP `env`、`headers`、`http_headers` 的每个值都换成 `********`，命令、参数和 URL 保留。
+
+引导正文走 Run 使用的 `render_session_bootstrap`，材料来自同一次 `BootstrapContents::read`。因为请求只给队员、不给会话，这份正文等于一条新的公共 Thread Run：没有团队指引、没有使命、没有渠道文件投递。Claude Code 仍会多出那条「不要把有限命令放后台」的章程句。平台 Skill 索引和这台主机的记忆入口都在正文里。相对 MCP `cwd` 按主机数据目录解析，因为还没有 Run 工作区；真实 Run 会改按该次执行根解析。未探测的 Runtime 版本按「满足 MCP 最低版本」处理，与投影器在版本缺失时的判断相同。Codex 的同名冲突要先拉起 CLI 才能发现，预览不拉起进程，因此不剔除那些名字。
+
+脚本：
+
+```bash
+node scripts/loom-profile.mjs projection --host <源> --token-file <文件> --member <id 或显示名> [--runtime codex-cli|claude-code] [--out 文件.json]
+node scripts/loom-profile.mjs projection --compare <左.json> <右.json>
+```
+
+`--compare` 先规范化再比较，退出码 0 表示一致。规范化丢掉这些字段：
+
+| 字段 | 变成 |
+|---|---|
+| 顶层 `agentId` | 不参与比较 |
+| 整个 JSON 字符串若是绝对路径（POSIX `/…`、盘符、UNC） | `<path>` |
+| Bootstrap 里平台 Skill 的 `"root"` | `<path>` |
+| UUID | `<id>` |
+| `agent_<记号>` | `<id>` |
+| `sha256:<十六进制>` | `<digest>` |
+| ISO-8601 时间戳 | `<time>` |
+
+显示名、runtime、章程、队员六列、MCP 命令与 URL 保留。记忆入口里的检索词属于主机记忆，不是 profile；两边记忆不同时，比较会在这一段分开。
