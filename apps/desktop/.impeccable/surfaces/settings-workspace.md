@@ -1,5 +1,5 @@
 ---
-version: 23
+version: 24
 slug: "settings-workspace"
 primary_target: "apps/desktop/src/renderer/src/SettingsPageHeader.tsx"
 related_targets:
@@ -12,6 +12,8 @@ related_targets:
   - "apps/desktop/src/renderer/src/McpSettings.tsx"
   - "apps/desktop/src/renderer/src/AboutUpdatesSettings.tsx"
   - "apps/desktop/src/renderer/src/RuntimeStartupSettings.tsx"
+  - "apps/desktop/src/renderer/src/RemoteRuntimeProvision.tsx"
+  - "apps/desktop/src/renderer/src/remote-runtime-provision.ts"
 ---
 
 # Settings workspace surface brief
@@ -174,6 +176,8 @@ the selected product. Do not issue a separate frontend rescan first. Failed and 
 failed/incomplete even when historical availability is retained.
 Pending checks preserve focus and the open guide; real status, public failures and retry feedback remain
 in the same row. Guide content and download clicks never imply successful installation or readiness.
+
+On a Linux x64 host, a catalog note appears above the list when Claude Code or Codex is not detected, including a missing path. It shows one copied server command, the two current detection labels, and Rescan. Rescan is the existing discovery rescan; the labels then follow Core. Once neither CLI is missing, the command leaves. If that rescan started from the note and both labels are Available, the note keeps the detection result for the visit. The Renderer never executes the command. Login-only and disabled states keep their existing row actions. macOS and Windows catalogs do not show this server command. The Desktop remote-host page carries the same command without a rescan, and Web and the standalone Server hide that page with the rest of the remote-host UI.
 
 The Agent Runtime catalog displays Pi Coding Agent as “PI” immediately after Antigravity, matching the member Runtime chooser.
 

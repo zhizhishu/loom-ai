@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { RemoteHostApi, RemoteHostCode, RemoteHostEntry } from '@contracts'
 import { REMOTE_HOST_LABEL_LIMIT, REMOTE_HOST_LIMIT } from '../../shared/remote-host'
 import { SettingsPageHeader } from './SettingsPageHeader'
+import { RemoteRuntimeProvision } from './RemoteRuntimeProvision'
 import { UiText, uiAttribute, useUiText } from './interface-language'
 import './remote-connection.css'
 
@@ -187,6 +188,9 @@ export function RemoteHostsSettings({ api }: { api: RemoteHostApi }): React.JSX.
           {t('填写 http:// 或 https:// 开头的 Server 根地址，不要带路径、查询参数或片段。最多保存 {0} 个。', REMOTE_HOST_LIMIT)}
         </p>
         {formError && <p className="remote-error" id="remote-host-error" role="alert">{formError}</p>}
+      </section>
+      <section className="general-settings-section remote-access-fields">
+        <RemoteRuntimeProvision mode="command" />
       </section>
     </div>
   </div>

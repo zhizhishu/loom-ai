@@ -92,6 +92,12 @@ import { saveMemberIdentity } from './member-identity-save'
 import type { IdentityDraft } from './member-identity-draft'
 import { UiText, uiAttribute } from './interface-language'
 import { OpenOnRemoteHostButton } from './OpenOnRemoteHostButton'
+import { RemoteRuntimeProvision } from './RemoteRuntimeProvision'
+import {
+  REMOTE_RUNTIME_PROVISION_KINDS,
+  remoteRuntimeProvisionMode,
+  remoteRuntimeProvisionRows
+} from './remote-runtime-provision'
 export { hasDuplicateMemberDisplayName } from './member-identity-draft'
 
 type MembersViewProps = {
@@ -1479,6 +1485,7 @@ export function RuntimeInstallationsPanel({
   const [checkingKinds, setCheckingKinds] = useState<Set<AdapterKind>>(new Set())
   const pendingChecks = useRef(new Set<AdapterKind>())
   const [rescanning, setRescanning] = useState(false)
+  const [provisionAnnounced, setProvisionAnnounced] = useState(false)
   const rescanPending = useRef(false)
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<{ runtimeKind: AdapterKind; mode: 'install' | 'login' } | null>(null)
@@ -1513,8 +1520,8 @@ export function RuntimeInstallationsPanel({
     }
   }
 
-  const rescan = async (): Promise<void> => {
-    if (rescanPending.current) return
+  const rescan = async (): Promise<boolean> => {
+    if (rescanPending.current) return false
     rescanPending.current = true
     setRescanning(true)
     setError(null)
@@ -1523,12 +1530,32 @@ export function RuntimeInstallationsPanel({
         interactiveShell: true
       })
       await onReload()
+      return true
     } catch (nextError) {
       setError(errorMessage(nextError))
+      return false
     } finally {
       rescanPending.current = false
       setRescanning(false)
     }
+  }
+
+  const provisionRows = remoteRuntimeProvisionRows(
+    health?.hostPlatform ?? null,
+    REMOTE_RUNTIME_PROVISION_KINDS.map((runtimeKind) => {
+      const item = availability.find((candidate) => candidate.runtimeKind === runtimeKind) ?? null
+      const admission = runtimePlatformAdmissionFor(
+        health?.hostPlatform ?? null,
+        health?.runtimePlatformAdmission ?? [],
+        runtimeKind
+      )
+      const presentation = runtimeProductPresentation(admission, item, health === null)
+      return { runtimeKind, status: presentation.status, label: presentation.label }
+    })
+  )
+  const provisionMode = remoteRuntimeProvisionMode(provisionRows, provisionAnnounced)
+  const recheckProvision = async (): Promise<void> => {
+    if (await rescan()) setProvisionAnnounced(true)
   }
 
   if (settingsRuntime) return <RuntimeStartupSettings key={settingsRuntime} runtimeKind={settingsRuntime} health={health} active={active} onLeaveGuardChange={onLeaveGuardChange}
@@ -1564,6 +1591,13 @@ export function RuntimeInstallationsPanel({
           </div>
           {health && <span className="runtime-catalog-platform"><UiText zh={"当前平台："} />{HOST_PLATFORM_LABELS[health.hostPlatform]}</span>}
         </div>
+
+        {provisionMode !== 'hidden' && provisionRows && <RemoteRuntimeProvision
+          mode={provisionMode}
+          rows={provisionRows}
+          busy={rescanning}
+          onRecheck={() => { void recheckProvision() }}
+        />}
 
         <div className="runtime-product-list">
           {VISIBLE_PRODUCT_RUNTIMES.map((runtimeKind) => {

@@ -65,6 +65,17 @@
   .remote-host-form > button { justify-self: start; }
 }
 
+/* Server CLI provisioning: a copied command, never an install action. */
+.remote-runtime-provision { display: grid; gap: 10px; min-width: 0; }
+.remote-runtime-provision h3 { margin: 0; color: var(--ink); font-size: 13px; font-weight: 550; }
+.remote-runtime-provision p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.runtime-installations > .remote-runtime-provision { margin: 2px 7px 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--workspace-surface-raised); }
+.remote-runtime-provision-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.remote-runtime-provision-results { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.remote-runtime-provision-results li { display: flex; justify-content: space-between; gap: 12px; min-width: 0; color: var(--ink); font-size: 12px; line-height: 1.6; }
+.remote-runtime-provision-results li span:last-child { color: var(--muted); }
+.remote-runtime-provision-results li[data-status="available"] span:last-child { color: var(--success); }
+
 /* Open on remote host: inline beside an unavailable Runtime, menu only for several hosts. */
 .open-on-remote-host { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; position: relative; }
 .open-on-remote-host-menu { display: inline-flex; flex-wrap: wrap; gap: 4px; }
