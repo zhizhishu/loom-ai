@@ -1,5 +1,6 @@
 mod desktop_channels;
 mod lifecycle;
+mod node_cli;
 mod server;
 mod server_logs;
 mod server_updates;
@@ -204,7 +205,7 @@ fn run(
     let control = web_control::WebControl::new(
         core.clone(),
         desktop,
-        data_dir,
+        data_dir.clone(),
         updates
             .clone()
             .map(|u| Arc::new(u) as Arc<dyn rovai_web::UpdateHost>),
@@ -229,12 +230,16 @@ fn run(
                     result = signals.wait() => result,
                     () = async { if let Some(updates) = &updates { updates.requested().await } else { std::future::pending::<()>().await } } => Ok(Duration::from_secs(10)),
                 };
+                node_cli::remove_listener(&data_dir);
                 control.shutdown().await;
                 result
             },
             async {
                 if let Some((config, token)) = web {
                     let status = control.start(config, &token).await?;
+                    if let Some(listen) = status["listen"].as_str() {
+                        node_cli::publish_listener(&data_dir, listen)?;
+                    }
                     tracing::info!(
                         origin = status["origin"].as_str().unwrap_or_default(),
                         "Host Web listener started"
@@ -248,6 +253,7 @@ fn run(
             },
         )
         .await;
+        node_cli::remove_listener(&data_dir);
         control.shutdown().await;
         result
     });

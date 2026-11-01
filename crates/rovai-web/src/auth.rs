@@ -577,6 +577,19 @@ impl Sessions {
             .administrator_plaintext
             .clone()
     }
+
+    /// Constant-time check that does not record a login attempt.
+    ///
+    /// The node channel uses this to reject the administrator token without
+    /// sharing the login throttle or the administrator digest kind.
+    pub fn is_administrator(&self, token: &str) -> bool {
+        if !valid_token(token) {
+            return false;
+        }
+        let state = self.state.lock().expect("session registry poisoned");
+        let candidate = digest(b"rovai-administrator-v1\0", token);
+        bool::from(state.administrator.ct_eq(&candidate))
+    }
     pub fn authenticate(&self, token: &str) -> Option<Arc<Session>> {
         if !valid_token(token) {
             return None;
