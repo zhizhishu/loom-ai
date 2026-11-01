@@ -73,7 +73,7 @@ const CATALOG = [
   { id: "member-studio", group: "skill", name: "member-studio", note: "创建队员", source: "工具箱", checked: true },
   { id: "review-duo", group: "skill", name: "review-duo", note: "两名队员独立看一份改动", source: "工具箱", checked: false },
   { id: "mcp-git", group: "mcp", name: "git", note: "样例服务器 · 只读 git", source: "全局定义", checked: true },
-  { id: "mcp-fs", group: "mcp", name: "filesystem", note: "样例服务器 · 占用 read_file", source: "全局定义", checked: true, conflict: "read_file" },
+  { id: "mcp-fs", group: "mcp", name: "filesystem", note: "样例服务器 · 占用 read_file", source: "全局定义", checked: true, conflict: "read_file", lacks: "desk-b 上没有这个 MCP 程序" },
   { id: "mcp-browser", group: "mcp", name: "browser", note: "样例服务器 · 高风险，勾选前要确认", source: "全局定义", checked: false, risk: true },
   { id: "rule-ro", group: "rule", name: "只读工作区", note: "样例片段 · 也要占用 read_file", source: "规则目录", checked: true, conflict: "read_file" },
   { id: "rule-commit", group: "rule", name: "提交前说明", note: "样例片段 · 下次运行包才生效", source: "规则目录", checked: false },
@@ -111,7 +111,10 @@ const TASKS = [
     status: "done",
     workspace: "/var/lib/loom-server/work/protocol",
     why: "这段活只改 A 上的规格，文件主人从一开始就是本机。本机上报了 claude-code-cli，而且人允许它接这个项目。",
+    place: "有 claude-code-cli · 工作区在本机 · 负载 0",
     claim: "已释放 · 织 · fence 2",
+    elapsed: "7 分",
+    progress: 100,
     start: 4,
     end: 38,
   },
@@ -125,7 +128,10 @@ const TASKS = [
     status: "running",
     workspace: "/Users/loom/work/loom-plan-b",
     why: "工作区已经钉在 desk-b。文件在那台机器上，不能改派到 loom-a：两台节点不共享一个目录。desk-b 在线，并且上报了 codex-cli。",
+    place: "有 codex-cli · 拥有工作区 · 负载 1",
     claim: "认领中 · 梭 · 租约 10:24 · fence 3",
+    elapsed: "9 分",
+    progress: 68,
     start: 38,
     end: 92,
   },
@@ -139,7 +145,11 @@ const TASKS = [
     status: "blocked",
     workspace: "A 上的 Run 回放，不打开 B 的目录",
     why: "验收读的是已经回到 A 的输出，不需要 B 的工作区。它等「在 B 上跑通心跳」的产物被人工验收后才放行。",
+    place: "有 claude-code-cli · 回放在 A · 负载 0",
     claim: "还没有认领",
+    elapsed: "—",
+    progress: 0,
+    blockedBy: "impl",
     start: 0,
     end: 0,
   },
@@ -170,8 +180,19 @@ const ui = {
   checks: null,
   riskFor: null,
   extraLog: [],
+  follow: true,
+  stream: "all",
+  feedNode: "all",
+  feedTask: "all",
+  fileQuery: "",
+  revokeId: "desk-b",
+  revokeTyped: "",
 };
 
+if (ui.state === "revoke-idle") {
+  ui.state = "revoke";
+  ui.revokeId = "win-studio";
+}
 if (ui.screen === "catalog" && ui.state === "offline" && !params.get("agent")) ui.agent = "suo";
 if ((ui.screen === "dispatch" || ui.screen === "live") && ui.state === "offline" && !params.get("task")) ui.task = "impl";
 
@@ -534,7 +555,9 @@ function viewProject() {
     </header>
     <div class="split">
       <aside class="tree" aria-label="项目树">
-        <header class="tree-head"><strong>${esc(SAMPLE.root)}</strong><span class="sample-chip">样例</span></header>
+        <header class="tree-head">
+          <input id="file-search" type="search" placeholder="在文件中搜索" value="${esc(ui.fileQuery)}" autocomplete="off" spellcheck="false">
+        </header>
         ${tree}
       </aside>
       ${preview}
@@ -553,7 +576,14 @@ function treeBody() {
     { id: "docs/loom", depth: 1, label: "loom", dir: true },
     { id: "docs/loom/plan-b.md", depth: 2, label: "plan-b.md", git: "" },
   ];
+  const q = ui.fileQuery.trim().toLowerCase();
   const html = rows.filter((row) => {
+    if (q) {
+      const self = `${row.id} ${row.label}`.toLowerCase().includes(q);
+      const child = rows.some((other) => other.id.startsWith(`${row.id}/`) && `${other.id} ${other.label}`.toLowerCase().includes(q));
+      if (!self && !child) return false;
+    }
+    if (q) return true;
     if (row.id !== "src" && row.id.startsWith("src") && !ui.openDirs.src) return false;
     if (row.depth >= 2 && row.id.startsWith("src/node/") && !ui.openDirs["src/node"]) return false;
     if ((row.id === "docs/loom" || row.id.startsWith("docs/loom/")) && !ui.openDirs.docs) return false;
@@ -569,21 +599,29 @@ function treeBody() {
   return `<div class="tree-body" role="tree">${html}</div>`;
 }
 
+function breadcrumb() {
+  const parts = [SAMPLE.root, ...ui.file.split("/")];
+  return `<nav class="crumb" aria-label="路径">${parts.map((part, index) => `<span ${index === parts.length - 1 ? 'class="here"' : ""}>${esc(part)}</span>`).join("")}</nav>`;
+}
+
 function filePreview(stale) {
   const file = FILES[ui.file] || FILES["src/node/heartbeat.ts"];
   const name = ui.file.split("/").pop();
+  const editing = ui.edit && !stale;
   const lines = file.body.replace(/\n$/, "").split("\n");
-  const code = ui.edit
+  const code = editing
     ? `<textarea class="code-edit" id="code-edit" data-act="edit-text">${esc(file.body)}</textarea>`
     : `<div class="code" aria-label="文件预览">${lines.map((line, index) => `<div class="ln"><span class="n">${index + 1}</span><span class="s">${esc(line) || " "}</span></div>`).join("")}</div>`;
   return `<section class="preview" aria-label="文件预览">
+    ${breadcrumb()}
     <header class="preview-head">
-      <div class="tabs"><button class="file-tab" type="button" aria-current="true">${esc(name)}${ui.edit ? " · 未保存" : ""}</button></div>
+      <div class="tabs"><button class="file-tab" type="button" aria-current="true">${esc(name)}${editing ? " · 未保存" : ""}</button></div>
       <div class="top-spacer"></div>
-      <button class="quiet compact" type="button" data-act="toggle-edit" ${stale ? "disabled" : ""}>${ui.edit ? "预览" : "编辑"}</button>
+      ${stale ? `<span class="pill warn">主人离线，不能编辑</span>` : ""}
+      <button class="quiet compact" type="button" data-act="toggle-edit" ${stale ? "disabled" : ""}>${editing ? "预览" : "编辑"}</button>
     </header>
-    ${stale ? `<p class="stale">上次内容 · 10:02 · 主人节点离线。这不是当前磁盘上的文件。</p>` : ""}
-    ${ui.edit ? `<p class="editor-banner">只读为主。样例里的改动停在这页，不会送到节点。</p>` : ""}
+    ${stale ? `<p class="stale">上次内容 · 10:02 · 主人节点离线。这不是当前磁盘上的文件。编辑已停用。</p>` : ""}
+    ${editing ? `<p class="editor-banner">只读为主。样例里的改动停在这页，不会送到节点。</p>` : ""}
     <div class="preview-body">${code}</div>
   </section>`;
 }
@@ -630,7 +668,7 @@ function viewCatalog() {
       </div>
     `;
   }
-  return `${topbar("队员")}<div class="member-split">
+  return `${topbar("队员")}<div class="member-split catalog-page">
     <aside class="roster" aria-label="队员">
       <header class="roster-head"><strong>队员</strong></header>
       ${AGENTS.map((item) => `<button class="member" type="button" data-act="agent" data-id="${item.id}" ${item.id === ui.agent ? 'aria-current="page"' : ""}>
@@ -638,15 +676,29 @@ function viewCatalog() {
         <span><strong>${esc(item.name)}</strong><small>${esc(item.role)}</small></span>
       </button>`).join("")}
     </aside>
-    <div class="detail-pane">
-      <div class="page-head"><div>
-        <p class="eyebrow">队员 · 目录</p>
-        <h2>${esc(agent.name)}</h2>
-        <p class="lede">${esc(agent.role)}。四个分组都在 A 上。样例队员，不是真实的人。</p>
-      </div><span class="sample-chip">样例数据</span></div>
-      ${body}
+    <div class="catalog-col">
+      <div class="detail-pane">
+        <div class="page-head"><div>
+          <p class="eyebrow">队员 · 目录</p>
+          <h2>${esc(agent.name)}</h2>
+          <p class="lede">${esc(agent.role)}。四个分组都在 A 上。样例队员，不是真实的人。</p>
+        </div><span class="sample-chip">样例数据</span></div>
+        ${body}
+      </div>
+      ${catalogFooter(state)}
     </div>
   </div>`;
+}
+
+function catalogFooter(state) {
+  if (state === "loading" || state === "error") return "";
+  const items = CATALOG.map((item) => ({ ...item, checked: state === "empty" ? false : Boolean(checks()[item.id]) }));
+  const count = (group) => items.filter((item) => item.group === group && item.checked).length;
+  const conflicted = state !== "empty" && conflictIds(items).size > 0;
+  return `<footer class="catalog-save">
+    <p>下次运行生效：${count("skill")} 项技能，${count("mcp")} 个 MCP，${count("rule")} 条规则，${count("hook")} 个 hook${conflicted ? " · 1 处冲突" : ""}</p>
+    <button class="primary compact" type="button" data-act="save-catalog" ${conflicted ? "disabled" : ""}>保存</button>
+  </footer>`;
 }
 
 function group(key, title, hint, items, conflicts, emptyCopy, identity) {
@@ -664,7 +716,7 @@ function group(key, title, hint, items, conflicts, emptyCopy, identity) {
   if (!rows.length) return `${head}<p class="hint">${esc(ui.query ? "没有匹配的条目。" : emptyCopy)}</p></section>`;
   return `${head}${rows.map((item) => `<label class="check ${conflicts.has(item.id) ? "conflict" : ""}">
     <input type="checkbox" data-act="check" data-id="${esc(item.id)}" ${item.checked ? "checked" : ""}>
-    <span><strong>${esc(item.name)}</strong>${item.risk ? ` ${pill("warn", "高风险")}` : ""}${conflicts.has(item.id) ? ` ${pill("warn", "冲突")}` : ""}<p>${esc(item.note)}</p></span>
+    <span><strong>${esc(item.name)}</strong>${item.risk ? ` ${pill("warn", "高风险")}` : ""}${conflicts.has(item.id) ? ` ${pill("warn", "冲突")}` : ""}<p>${esc(item.note)}</p>${item.lacks ? `<p class="lack">${esc(item.lacks)}</p>` : ""}</span>
     <span class="src">${esc(item.source)}</span>
   </label>`).join("")}</section>`;
 }
@@ -673,20 +725,26 @@ function statusWord(status) {
   return { done: "已结束", running: "在跑", blocked: "阻塞", ready: "就绪" }[status] || status;
 }
 
-function taskCards(list) {
+function taskCards(list, opts = {}) {
   return `<div class="flow">${[0, 1, 2].map((depth) => {
     const inStage = list.filter((task) => task.depth === depth);
     return `<div class="stage"><span class="stage-label">阶段 ${depth + 1}</span>${inStage.map((task) => {
       const agent = agentById(task.agent);
       const node = nodeById(task.node);
       const selected = ui.task === task.id;
-      return `<button class="card ${esc(task.status)}" type="button" data-act="task" data-id="${task.id}" aria-pressed="${selected ? "true" : "false"}">
+      const blocker = task.blockedBy ? list.find((item) => item.id === task.blockedBy) : null;
+      const offline = !node.online;
+      return `<div class="card ${esc(task.status)}" role="button" tabindex="0" data-act="task" data-id="${task.id}" aria-pressed="${selected ? "true" : "false"}">
         <div class="card-top"><i class="dot ${task.status === "running" ? "run" : task.status === "blocked" ? "block" : task.status === "done" ? "done" : "on"}"></i><strong>${esc(task.title)}</strong></div>
-        <div class="status">${esc(statusWord(task.status))}</div>
+        <div class="status">${esc(statusWord(task.status))}${opts.meter ? ` · ${esc(task.elapsed || "—")}` : ""}</div>
         <p>${esc(agent.name)} · ${esc(task.runtime)}</p>
         <p>${esc(node.name)} · ${node.online ? "在线" : "离线"}</p>
+        ${opts.place ? `<p class="place">${esc(task.place || "")}</p>` : ""}
+        ${offline ? `<p class="warn-line">所选节点离线</p>` : ""}
+        ${opts.meter ? `<div class="meter" aria-hidden="true"><span style="width:${task.progress || 0}%"></span></div>` : ""}
+        ${blocker && task.status === "blocked" ? `<button class="linkish block-link" type="button" data-act="task" data-id="${esc(blocker.id)}">阻塞于 ${esc(blocker.title)}</button>` : ""}
         <div class="claim"><b>${esc(task.claim)}</b></div>
-      </button>`;
+      </div>`;
     }).join("")}</div>`;
   }).join("")}</div>
   <div class="legend"><span><i></i>任务完成即可放行</span><span><i class="dash"></i>需人工验收后放行</span><span><i class="block"></i>当前阻塞</span></div>`;
@@ -708,7 +766,7 @@ function viewDispatch() {
     body = `<header class="flow-title"><div><p class="eyebrow">LOOM · 编排 · 派遣</p><h2>一次使命，分到两台机器</h2></div><span class="sample-chip">${esc(SAMPLE.number)}</span></header>
       <p class="intro">每段活有自己的文件主人。已经钉死的工作区不能改到另一台节点。下面写的是选择，以及为什么不能选别的。</p>
       ${ownerOff ? `<p class="note warn"><strong>desk-b 离线。</strong> 「在 B 上跑通心跳」的文件不在其他机器上，不能改派。进程若还在，就等它重连。</p>` : ""}
-      ${taskCards(list)}
+      ${taskCards(list, { place: true })}
       <section class="inspector" aria-label="放置理由">
         <div>
           <h3>${esc(task.title)}</h3>
@@ -763,9 +821,7 @@ function viewLive() {
   const task = list.find((item) => item.id === ui.task) || list[1];
   const claimsUnknown = ui.state === "claims";
   const waiting = deskOffline() && task.id === "impl";
-  const log = waiting
-    ? LOG.concat([["—", "wait", "连接已断 · 已确认到序号 148 · 进程还在 · 不另起进程"]])
-    : LOG.concat(ui.extraLog);
+  const log = linesFor(task.id, waiting);
   return `${missionChrome("live")}<div class="workspace">
     <header class="modebar">${liveMode()}</header>
     <div class="live">
@@ -774,23 +830,28 @@ function viewLive() {
           <header class="flow-title"><div><p class="eyebrow">LOOM · 编排 · 现场</p><h2>心跳正在 B 上跑</h2></div><span class="sample-chip">样例回放</span></header>
           ${claimsUnknown ? `<p class="note warn"><strong>认领状态未知。</strong> 这不是「没有认领」。其他任务和输出照常显示。</p>` : ""}
           ${waiting ? `<p class="note warn"><strong>desk-b 的连接断了。</strong> 在途 Run 不换机器。重连后从序号 148 之后继续送。</p>` : ""}
-          ${taskCards(list.map((item) => claimsUnknown ? { ...item, claim: "认领状态未知" } : item))}
+          ${taskCards(list.map((item) => claimsUnknown ? { ...item, claim: "认领状态未知" } : item), { meter: true })}
         </div>
         <section class="lanes" aria-label="节点泳道">
-          <h3>节点</h3>
+          <h3>节点 <span class="lane-now">现在 10:18</span></h3>
           <div class="axis"><span>10:02</span><span>10:10</span><span>10:18</span></div>
           ${lane("loom-a", 4, 38, "拆节点协议", "done")}
           ${lane("desk-b", 38, waiting ? 70 : 92, waiting ? "等待重连" : "跑通心跳", waiting ? "wait" : "run")}
           ${lane("win-studio", 0, 0, "", "off")}
         </section>
+        ${eventFeed(waiting || ui.state === "offline")}
       </div>
       <section class="run-pane" aria-label="执行过程">
-        <header class="run-head">
-          <div class="who"><strong>${esc(task.title)}</strong><small>${esc(agentById(task.agent).name)} · ${esc(task.runtime)} · ${esc(nodeById(task.node).name)} · ${waiting && task.id === "impl" ? "等待重连" : statusWord(task.status)}</small></div>
+        <div class="run-tabs" role="tablist">${list.map((item) => runTab(item, waiting)).join("")}</div>
+        <div class="stream-bar">
+          <span class="seg" role="group" aria-label="输出流">
+            ${["all", "stdout", "stderr"].map((stream) => `<button type="button" data-act="stream" data-stream="${stream}" aria-pressed="${ui.stream === stream ? "true" : "false"}">${stream === "all" ? "全部" : stream}</button>`).join("")}
+          </span>
+          <button class="quiet compact" type="button" data-act="follow" aria-pressed="${ui.follow ? "true" : "false"}">跟随最新</button>
           <div class="top-spacer"></div>
           <button class="quiet compact" type="button" data-act="append" ${task.id === "impl" && !waiting ? "" : "disabled"}>追加一帧</button>
-        </header>
-        <pre class="term">${task.id === "impl" ? log.map((row) => `<div class="row"><span class="seq">${esc(row[0])}</span><span class="stream">${esc(row[1])}</span><span class="${row[1] === "wait" ? "frozen" : ""}">${esc(row[2])}</span></div>`).join("") : `<div class="row"><span class="seq">—</span><span class="stream">note</span><span>${esc(task.id === "spec" ? "这段输出已经结束，回放留在 A 上。" : "还没有输出。上游产物验收之后才会启动。")}</span></div>`}</pre>
+        </div>
+        <pre class="term">${log.length ? log.map((row, index) => renderLogRow(row, index === log.length - 1 && ui.extraLog.length > 0)).join("") : `<div class="row"><span class="seq">—</span><span class="stream">note</span><span>还没有输出。上游产物验收之后才会启动。</span></div>`}</pre>
         <div class="artifacts">
           <h3>产物</h3>
           <button class="art" type="button" data-act="open-art" data-file="docs/loom/plan-b.md"><code>docs/loom/plan-b.md</code><span class="add">已验收</span><span>打开</span></button>
@@ -802,6 +863,68 @@ function viewLive() {
       </section>
     </div>
   </div>`;
+}
+
+function runTab(task, waiting) {
+  const node = nodeById(task.node);
+  const age = task.id === "impl" ? (waiting ? "连接已断" : "2 秒前") : task.id === "spec" ? "9 分前" : "还没有输出";
+  const elapsed = task.elapsed || "—";
+  return `<button class="run-tab" type="button" role="tab" data-act="task" data-id="${task.id}" aria-selected="${ui.task === task.id ? "true" : "false"}">
+    <strong>${esc(task.title)}</strong>
+    <small><span class="pill ${node.online ? "ok" : ""}">${esc(node.name)}</span> ${esc(task.runtime)}</small>
+    <small>已进行 ${esc(elapsed)} · 最后输出 ${esc(age)}</small>
+  </button>`;
+}
+
+function linesFor(taskId, waiting) {
+  let rows = [];
+  if (taskId === "spec") {
+    rows = [
+      ["12", "stdout", "样例回放 · 规格已写完"],
+      ["40", "stdout", "退出 0"],
+    ];
+  } else if (taskId === "impl") {
+    rows = [
+      ["141", "stdout", "样例回放 · 已载入运行包 · 工具箱 1 · MCP 1 · hook 0"],
+      ["142", "stdout", "探查 src/node/connect.ts"],
+      ["gap", "gap", "漏了 3 行，正在补齐"],
+      ["146", "stdout", "写入 src/node/heartbeat.ts"],
+      ["147", "stderr", "样例 · 路径提示，不是错误退出"],
+      ["148", "stdout", "心跳已上报 · 等待确认序号"],
+      ...ui.extraLog,
+    ];
+    if (waiting) rows.push(["—", "wait", "连接已断 · 已确认到序号 148 · 进程还在 · 不另起进程"]);
+  }
+  if (ui.stream === "all") return rows;
+  return rows.filter((row) => row[1] === ui.stream || row[1] === "gap" || row[1] === "wait");
+}
+
+function renderLogRow(row, fresh) {
+  if (row[1] === "gap") return `<div class="gap-row">${esc(row[2])}</div>`;
+  return `<div class="row${fresh ? " fresh" : ""}"><span class="seq">${esc(row[0])}</span><span class="stream">${esc(row[1])}</span><span class="${row[1] === "wait" ? "frozen" : ""}">${esc(row[2])}</span></div>`;
+}
+
+function eventFeed(showLoss) {
+  const events = [
+    { t: "10:02:11", node: "loom-a", task: "spec", kind: "认领", text: "织 认领「拆节点协议」 · fence 1" },
+    { t: "10:04:12", node: "loom-a", task: "spec", kind: "心跳", text: "loom-a 心跳恢复" },
+    { t: "10:08:40", node: "loom-a", task: "spec", kind: "产物", text: "docs/loom/plan-b.md 出现" },
+    { t: "10:09:02", node: "loom-a", task: "spec", kind: "评审", text: "验收通过「拆节点协议」" },
+    { t: "10:09:05", node: "loom-a", task: "spec", kind: "fence", text: "fence 2 · 认领已释放" },
+    { t: "10:09:18", node: "desk-b", task: "impl", kind: "认领", text: "梭 认领「在 B 上跑通心跳」 · fence 3" },
+    { t: "10:17:44", node: "desk-b", task: "impl", kind: "心跳", text: "desk-b 心跳" },
+    { t: "10:18:02", node: "desk-b", task: "impl", kind: "产物", text: "src/node/heartbeat.ts 刚刚出现" },
+  ];
+  if (showLoss) events.push({ t: "10:18:21", node: "desk-b", task: "impl", kind: "心跳", text: "desk-b 心跳丢失" });
+  const shown = events.filter((event) => (ui.feedNode === "all" || event.node === ui.feedNode) && (ui.feedTask === "all" || event.task === ui.feedTask));
+  return `<section class="feed" aria-label="现场事件">
+    <header class="feed-head">
+      <strong>事件</strong>
+      <select data-act="feed-node" aria-label="按节点过滤">${[["all", "全部节点"], ["loom-a", "loom-a"], ["desk-b", "desk-b"], ["win-studio", "win-studio"]].map(([id, label]) => `<option value="${id}" ${ui.feedNode === id ? "selected" : ""}>${label}</option>`).join("")}</select>
+      <select data-act="feed-task" aria-label="按任务过滤">${[["all", "全部任务"], ["spec", "拆节点协议"], ["impl", "跑通心跳"], ["review", "对照输出"]].map(([id, label]) => `<option value="${id}" ${ui.feedTask === id ? "selected" : ""}>${label}</option>`).join("")}</select>
+    </header>
+    <div class="feed-list">${shown.map((event) => `<div class="feed-row"><time>${esc(event.t)}</time><span>${esc(event.kind)}</span><span>${esc(event.text)}</span></div>`).join("") || `<p class="hint">没有匹配的事件。</p>`}</div>
+  </section>`;
 }
 
 function dispatchStats() {
@@ -824,8 +947,11 @@ function liveMode() {
 function lane(id, start, end, label, kind) {
   const node = nodeById(id);
   const off = !node.online;
-  const bar = end > start ? `<button class="bar ${kind}" type="button" data-act="task" data-id="${id === "loom-a" ? "spec" : "impl"}" style="left:${start}%;width:${end - start}%">${esc(label)}</button>` : `<span class="lane-note">${off ? "离线 · 不接新活" : "还没开始"}</span>`;
-  return `<div class="lane ${off ? "off" : ""}"><div class="lane-name"><i class="dot ${off ? "off" : "on"}"></i><span>${esc(node.name)}</span></div><div class="track">${bar}</div></div>`;
+  const grow = kind === "run" ? " grow" : "";
+  const bar = end > start
+    ? `<button class="bar ${kind}${grow}" type="button" data-act="task" data-id="${id === "loom-a" ? "spec" : "impl"}" style="left:${start}%;width:${end - start}%">${esc(label)}</button>`
+    : `<span class="lane-note">${off ? "离线 · 不接新活" : "还没开始"}</span>`;
+  return `<div class="lane ${off ? "off" : ""}"><div class="lane-name"><i class="dot ${off ? "off" : "on"}"></i><span>${esc(node.name)}</span></div><div class="track"><i class="now" title="现在 10:18"></i>${bar}</div></div>`;
 }
 
 function reviewControls(task, waiting) {
@@ -858,12 +984,18 @@ function dialogs() {
     </div></div>`;
   }
   if (ui.state === "revoke" && ui.screen === "nodes") {
+    const target = NODES.find((node) => node.id === ui.revokeId) || NODES[1];
+    const busy = target.runs.length > 0;
+    const matched = ui.revokeTyped === target.name;
     return `<div class="overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="revoke-title">
-      <h3 id="revoke-title">作废 desk-b？</h3>
-      <p class="sub">令牌立即作废。下一次心跳失败。在途进程由节点自己杀掉并上报。磁盘上的项目文件还在，只是这份 Core 不再把新 Run 派给它。</p>
+      <h3 id="revoke-title">作废 ${esc(target.name)}？</h3>
+      <p class="sub">${busy
+        ? "这台节点还有在途 Run。输入节点名才能作废。令牌立即失效，在途进程由节点自己杀掉并上报。磁盘上的文件还在。"
+        : "这台节点现在没有在途 Run。确认后令牌失效，不再派新 Run。磁盘上的文件还在。"}样例，没有真的令牌被吊销。</p>
+      ${busy ? `<div class="field"><label for="revoke-name">输入 ${esc(target.name)} 以确认</label><input id="revoke-name" type="text" autocomplete="off" spellcheck="false" value="${esc(ui.revokeTyped)}"></div>` : ""}
       <div class="dialog-foot">
         <button class="quiet" type="button" data-act="close">取消</button>
-        <button class="danger" type="button" data-act="confirm-revoke">作废</button>
+        <button class="danger" type="button" data-act="confirm-revoke" ${busy && !matched ? "disabled" : ""}>作废</button>
       </div>
     </div></div>`;
   }
@@ -958,7 +1090,12 @@ function onClick(event) {
   if (act === "go") go(el.dataset.screen || ui.screen);
   else if (act === "noop") toast("样例 · 这个入口保持现有页面");
   else if (act === "pair") go("nodes", "pair");
-  else if (act === "revoke") go("nodes", "revoke");
+  else if (act === "revoke") {
+    ui.revokeId = el.dataset.id || "desk-b";
+    ui.revokeTyped = "";
+    go("nodes", "revoke");
+    return;
+  }
   else if (act === "close") go(ui.screen, "ready");
   else if (act === "retry") {
     ui.state = "ready";
@@ -969,16 +1106,23 @@ function onClick(event) {
     if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).catch(() => {});
     toast("样例 · 已复制配对命令");
   } else if (act === "confirm-revoke") {
+    const target = NODES.find((node) => node.id === ui.revokeId);
+    if (target && target.runs.length > 0 && ui.revokeTyped !== target.name) return;
     ui.state = "offline";
     writeUrl();
-    toast("样例 · desk-b 已作废，没有真的令牌被吊销");
+    toast(`样例 · ${target ? target.name : "节点"} 已作废，没有真的令牌被吊销`);
   } else if (act === "toggle-node") ui.openNodes[el.dataset.id] = !ui.openNodes[el.dataset.id];
   else if (act === "toggle-dir") ui.openDirs[el.dataset.id] = !ui.openDirs[el.dataset.id];
   else if (act === "file") {
     ui.file = el.dataset.id;
     ui.edit = false;
     writeUrl();
-  } else if (act === "toggle-edit") ui.edit = !ui.edit;
+  } else if (act === "toggle-edit") {
+    if (ui.state === "offline") return;
+    ui.edit = !ui.edit;
+  } else if (act === "stream") ui.stream = el.dataset.stream;
+  else if (act === "follow") ui.follow = !ui.follow;
+  else if (act === "save-catalog") toast("样例 · 已记下，下次 Run 的运行包才带上");
   else if (act === "agent") {
     ui.agent = el.dataset.id;
     writeUrl();
@@ -1040,6 +1184,8 @@ function onChange(event) {
     }
     checks()[el.dataset.id] = el.checked;
   } else if (act === "edit-text") return;
+  else if (act === "feed-node") ui.feedNode = el.value;
+  else if (act === "feed-task") ui.feedTask = el.value;
   else if (act === "runtime" || act === "target-node") toast("样例 · 运行时和节点的改动停在这页");
   render();
 }
@@ -1049,6 +1195,14 @@ document.addEventListener("change", onChange);
 document.addEventListener("input", (event) => {
   if (event.target.id === "catalog-search") {
     ui.query = event.target.value;
+    render();
+  }
+  if (event.target.id === "file-search") {
+    ui.fileQuery = event.target.value;
+    render();
+  }
+  if (event.target.id === "revoke-name") {
+    ui.revokeTyped = event.target.value;
     render();
   }
 });

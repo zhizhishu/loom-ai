@@ -41,6 +41,7 @@ frames=(
   "nodes-offline:screen=nodes&state=offline"
   "nodes-pair:screen=nodes&state=pair"
   "nodes-revoke:screen=nodes&state=revoke"
+  "nodes-revoke-idle:screen=nodes&state=revoke-idle"
   "hosts-ready:screen=hosts&state=ready"
   "project-ready:screen=project&state=ready"
   "project-empty:screen=project&state=empty"
