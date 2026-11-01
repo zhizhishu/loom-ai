@@ -210,7 +210,8 @@ impl WebControlState {
         anyhow::ensure!(self.server.is_none(), "Web service is already running");
         let sessions = self.credentials(data_dir, bootstrap)?;
         let running =
-            WebServer::start_with_services(core, config, sessions, channels, updates).await?;
+            WebServer::start_with_services(core, config, sessions, channels, updates, data_dir)
+                .await?;
         let status = running.status();
         self.server = Some(running);
         Ok(status)

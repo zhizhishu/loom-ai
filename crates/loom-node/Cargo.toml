@@ -25,3 +25,7 @@ tungstenite = "0.29"
 [[test]]
 name = "b1_outbound"
 harness = false
+
+[[test]]
+name = "b2_resume"
+harness = false

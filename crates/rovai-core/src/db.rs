@@ -6,6 +6,8 @@ mod automation_naming;
 mod claim_context;
 #[path = "db_compact_execution.rs"]
 mod compact_execution;
+#[path = "db_execution_node.rs"]
+mod execution_nodes;
 #[path = "db_execution_storage.rs"]
 mod execution_storage;
 #[path = "db_hermes.rs"]
@@ -501,7 +503,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 174;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 175;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -1000,6 +1002,7 @@ struct CurrentMigrationState {
     v222: bool,
     v223: bool,
     v224: bool,
+    v225: bool,
 }
 
 impl CurrentMigrationState {
@@ -1021,6 +1024,14 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v225 {
+            let mut previous = *self;
+            previous.v225 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 175
+                && self.v224
+                && previous.admits("v1.72", 174, classifier);
+        }
         if self.v224 {
             let mut previous = *self;
             previous.v224 = false;
@@ -3819,6 +3830,7 @@ pub(crate) fn classify_database_contract(
                 | 172
                 | 173
                 | 174
+                | 175
         )
     {
         let expected_migration = marker.projection_schema_version + 50;
@@ -3830,6 +3842,8 @@ pub(crate) fn classify_database_contract(
         let valid = completed
             && (marker.projection_schema_version < 168
                 || loom::schema_matches(connection, marker.projection_schema_version)?)
+            && (marker.projection_schema_version < 175
+                || crate::execution_node::schema_matches(connection)?)
             && (marker.projection_schema_version < 167
                 || hermes::rules_schema_matches(connection)?)
             && (marker.projection_schema_version < 166 || hermes::schema_matches(connection)?)
@@ -6152,7 +6166,8 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=221),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=222),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=223),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=224)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=224),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=225)
         "#,
         [],
         |row| {
@@ -6312,6 +6327,7 @@ fn load_current_migration_state(
                 v222: row.get(152)?,
                 v223: row.get(153)?,
                 v224: row.get(154)?,
+                v225: row.get(155)?,
             })
         },
     )
@@ -9646,6 +9662,9 @@ impl Database {
             if !self.schema_migration_applied(224)? {
                 migration_step!("migration_224", loom::migrate_artifact(self));
             }
+            if !self.schema_migration_applied(225)? {
+                migration_step!("migration_225", execution_nodes::migrate(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10545,6 +10564,9 @@ impl Database {
         }
         if !self.schema_migration_applied(224)? {
             migration_step!("migration_224", loom::migrate_artifact(self));
+        }
+        if !self.schema_migration_applied(225)? {
+            migration_step!("migration_225", execution_nodes::migrate(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42365,6 +42387,7 @@ mod tests {
             v222: version >= 222,
             v223: version >= 223,
             v224: version >= 224,
+            v225: version >= 225,
         }
     }
 
@@ -42628,7 +42651,7 @@ mod tests {
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                224,
+                225,
             ),
             (
                 "v1.72/schema 152 before compact operations",
@@ -43204,7 +43227,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(224);
+        let current = migration_state_through(225);
         assert!(current.admits(
             CURRENT_DATA_CONTRACT_VERSION,
             CURRENT_PROJECTION_SCHEMA_VERSION,
@@ -43972,7 +43995,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(224));
+        assert_eq!(state, migration_state_through(225));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
@@ -44039,7 +44062,7 @@ mod tests {
                     // The classifier checks the newest receipt; deleting an older one would leave
                     // the database looking current and the rejection would never be proven.
                     connection
-                        .execute("DELETE FROM schema_migration WHERE version=224", [])
+                        .execute("DELETE FROM schema_migration WHERE version=225", [])
                         .unwrap();
                 }
                 "steer_identity" => {
@@ -44171,7 +44194,9 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM schema_migration", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            1
+            // Receipts at or after 221: the LOOM projection through execution nodes.
+            // Reopening must not reconstruct the deleted history or add another receipt.
+            5
         );
         drop(reopened);
         drop(lease);
@@ -56568,6 +56593,10 @@ mod tests {
                 "loom_dependency",
                 "loom_claim",
                 "loom_candidate",
+                "execution_node",
+                "execution_node_cli",
+                "node_dispatch",
+                "node_dispatch_output",
             ],
             true,
         );
@@ -56577,7 +56606,7 @@ mod tests {
             &[
                 58, 59, 60, 61, 62, 67, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101,
                 102, 103, 104, 105, 106, 107, 108, 145, 146, 147, 205, 206, 207, 208, 209, 210,
-                211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221,
+                211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 225,
             ],
         );
         for table in [

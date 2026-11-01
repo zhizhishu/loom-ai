@@ -6,6 +6,26 @@ use tokio::{io::AsyncReadExt, process::Command};
 /// The rest of the adapter catalog is B3.
 const KNOWN: &[(&str, &str)] = &[("codex-cli", "codex"), ("claude-code-cli", "claude")];
 
+/// The program A asked to run must be the binary this node discovered for that
+/// runtime. The returned path is the one to execute; a server-supplied path that
+/// does not canonicalize to it is refused.
+pub fn resolve_executable(
+    clis: &[CliReport],
+    adapter_kind: &str,
+    program: &str,
+) -> Option<std::path::PathBuf> {
+    let cli = clis
+        .iter()
+        .find(|cli| cli.adapter_kind == adapter_kind && cli.path_present && !cli.path.is_empty())?;
+    let discovered = std::fs::canonicalize(&cli.path).ok()?;
+    let requested = std::fs::canonicalize(program).ok()?;
+    if discovered == requested {
+        Some(discovered)
+    } else {
+        None
+    }
+}
+
 pub async fn installed_clis() -> Vec<CliReport> {
     let mut found = Vec::new();
     for (adapter_kind, command) in KNOWN {
@@ -32,6 +52,43 @@ fn which(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_program_outside_local_discovery_is_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "loom-node-allow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let codex = root.join("codex");
+        let other = root.join("other");
+        std::fs::write(&codex, b"codex").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        let clis = vec![CliReport {
+            adapter_kind: "codex-cli".into(),
+            path: codex.display().to_string(),
+            version: None,
+            path_present: true,
+        }];
+        let resolved = resolve_executable(&clis, "codex-cli", &codex.display().to_string())
+            .expect("discovered binary");
+        assert_eq!(resolved, std::fs::canonicalize(&codex).unwrap());
+        assert!(resolve_executable(&clis, "codex-cli", &other.display().to_string()).is_none());
+        assert!(
+            resolve_executable(&clis, "claude-code-cli", &codex.display().to_string()).is_none()
+        );
+        assert!(resolve_executable(&clis, "codex-cli", "/bin/sh").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 async fn version_of(path: &PathBuf) -> Option<String> {

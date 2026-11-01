@@ -24,6 +24,17 @@ pub struct CliReport {
     pub path_present: bool,
 }
 
+/// One in-flight run the node still knows about when it reconnects.
+/// `sent_seq` is the highest sequence the node has assigned, 0 when none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunReport {
+    pub run_id: String,
+    pub attempt: u32,
+    pub process_alive: bool,
+    pub sent_seq: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -41,6 +52,11 @@ pub enum ClientMessage {
         os: String,
         arch: String,
         clis: Vec<CliReport>,
+        /// Empty on the first connection. On reconnect, every run the node
+        /// still has, including a process that already exited if its exit
+        /// frame has not been acknowledged.
+        #[serde(default)]
+        runs: Vec<RunReport>,
     },
     Heartbeat {
         run_ids: Vec<String>,
@@ -60,6 +76,12 @@ pub enum ClientMessage {
         run_id: String,
         attempt: u32,
         seq: u64,
+    },
+    /// The node refused a start. No process was created.
+    Rejected {
+        run_id: String,
+        attempt: u32,
+        code: String,
     },
 }
 
@@ -91,6 +113,12 @@ pub enum ServerMessage {
         args: Vec<String>,
         cwd: String,
         env: Vec<(String, String)>,
+    },
+    /// Keep the existing process. Retransmit output with `seq > acked_seq`.
+    Resume {
+        run_id: String,
+        attempt: u32,
+        acked_seq: u64,
     },
     Error {
         code: String,
@@ -141,6 +169,19 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ClientMessage>(&json).unwrap(),
             output
+        );
+
+        let resume = ServerMessage::Resume {
+            run_id: "run_1".into(),
+            attempt: 1,
+            acked_seq: 4,
+        };
+        let json = resume.to_json();
+        assert!(json.contains("\"type\":\"resume\""));
+        assert!(json.contains("\"ackedSeq\":4"));
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            resume
         );
     }
 }
