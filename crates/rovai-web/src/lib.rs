@@ -1,5 +1,6 @@
 mod auth;
 mod channels;
+mod nodes;
 pub use channels::{ChannelFuture, ChannelHost, ChannelReply, ChannelRequest};
 mod avatars;
 mod downloads;
@@ -36,7 +37,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-const HOST_WEB_PROTOCOL_VERSION: u32 = 5;
+pub const HOST_WEB_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -64,6 +65,7 @@ struct WebState {
     upload_attempts: Arc<uploads::Attempts>,
     files: Arc<resources::Handles>,
     downloads: Arc<downloads::Downloads>,
+    nodes: Arc<nodes::Hub>,
 }
 
 /// Owns only a network listener and its credentials. Stopping or dropping it
@@ -146,6 +148,7 @@ impl WebServer {
             upload_attempts: Arc::new(uploads::Attempts::default()),
             files: Arc::new(resources::Handles::default()),
             downloads: Arc::new(downloads::Downloads::new()?),
+            nodes: nodes::Hub::start(sessions.clone()),
         };
         sessions.enable();
         let app = routes(state);
@@ -235,9 +238,12 @@ fn routes(state: WebState) -> Router {
         .route("/files", post(resources::files))
         .route("/files/bytes", post(resources::binary))
         .route("/attachments", post(resources::attachment))
+        .route("/nodes/pair", post(nodes::pair))
+        .route("/nodes/exec", post(nodes::exec))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .nest("/api/v1", api)
+        .route("/api/v1/nodes/connect", get(nodes::connect))
         .route("/api/v1/downloads/{token}", get(downloads::file))
         .route("/api/v1/login", post(login))
         .route("/api/v1/login-ticket", post(redeem_login_ticket))

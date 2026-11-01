@@ -42,6 +42,20 @@ enum Command {
     Token,
     /// Show resolved data paths without starting Core or opening a database.
     Paths,
+    /// Print a one-time pairing code for a node that will dial this server.
+    NodePair,
+    /// Run one CLI on a connected node and print its stdout.
+    NodeExec {
+        /// Adapter kind reported by the node, for example `codex-cli`.
+        #[arg(long)]
+        runtime: String,
+        /// Working directory on the node. This server does not open the path.
+        #[arg(long)]
+        cwd: String,
+        /// Arguments after `--` are the remote CLI argv.
+        #[arg(last = true, required = true)]
+        args: Vec<String>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -64,6 +78,12 @@ pub fn run() -> Result<()> {
             serde_json::to_string_pretty(&ServerPaths::from_data_dir(&data_dir)?)?
         );
         return Ok(());
+    }
+    if matches!(cli.command, Some(Command::NodePair)) {
+        return crate::node_cli::pair(&data_dir);
+    }
+    if let Some(Command::NodeExec { runtime, cwd, args }) = &cli.command {
+        return crate::node_cli::exec(&data_dir, runtime, cwd, args);
     }
     // Resolve packaged resources before creating data. A missing WebUI should
     // report a broken installation, not leave a new empty business instance.
