@@ -3,9 +3,11 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { MemberCatalogBody } from './MemberCatalog'
 import {
+  conflictPartners,
   conflictTools,
   highRiskToConfirm,
   isCatalogEmpty,
+  presentProjectionMcp,
   selectionCounts,
   toggleWouldConflict,
   type CapabilityItem,
@@ -98,7 +100,12 @@ describe('member capability catalog', () => {
     expect(markup).toContain('data-projection-state="ready"')
     expect(markup).toContain('[SESSION_CHARTER]')
     expect(markup).toContain('不要写工作区。')
-    expect(markup).toContain('下次运行生效：2 项技能，2 个 MCP，1 条规则，1 个 hook')
+    expect(markup).toContain('下次运行生效：2 项技能，2 个 MCP')
+    expect(markup).toContain('尚未接入运行：1 条规则，1 个 hook')
+    expect(markup).not.toContain('下次运行生效：2 项技能，2 个 MCP，1 条规则')
+    expect(markup).toContain('尚未接入运行')
+    expect(markup).toContain('与 只读工作区 的 read_file 冲突')
+    expect(markup).toContain('与 filesystem 的 read_file 冲突')
     expect(markup).toContain('1 处冲突')
   })
 
@@ -146,8 +153,33 @@ describe('member capability catalog', () => {
     expect(isCatalogEmpty(skills.map((entry) => ({ ...entry, selected: false })))).toBe(true)
     expect(isCatalogEmpty(mixed)).toBe(false)
     expect(highRiskToConfirm(
-      [item({ id: 'browser', kind: 'mcp', name: 'browser', risk: 'high', selected: true })],
-      [item({ id: 'browser', kind: 'mcp', name: 'browser', risk: 'high', selected: false })]
-    ).map((entry) => entry.name)).toEqual(['browser'])
+      [
+        item({ id: 'browser', kind: 'mcp', name: 'browser', risk: 'high', selected: true }),
+        item({ id: 'hook-shell', kind: 'hook', name: 'run-format', risk: 'high', selected: true })
+      ],
+      [
+        item({ id: 'browser', kind: 'mcp', name: 'browser', risk: 'high', selected: false }),
+        item({ id: 'hook-shell', kind: 'hook', name: 'run-format', risk: 'high', selected: false })
+      ]
+    ).map((entry) => entry.name)).toEqual(['browser', 'run-format'])
+    const filesystem = mixed.find((entry) => entry.name === 'filesystem')
+    expect(filesystem && conflictPartners(mixed, filesystem)).toEqual([{ names: '只读工作区', tool: 'read_file' }])
+    expect(presentProjectionMcp({
+      mcp_servers: {
+        local: {
+          command: 'echo',
+          args: ['serve', '--token', 'sk-live-secret-value', 'plain.js'],
+          env: { API_KEY: 'super-secret', PLAIN: 'visible-env' }
+        }
+      }
+    })).toEqual({
+      mcp_servers: {
+        local: {
+          command: 'echo',
+          args: ['serve', '--token', '•••', 'plain.js'],
+          env: { API_KEY: '•••', PLAIN: '•••' }
+        }
+      }
+    })
   })
 })

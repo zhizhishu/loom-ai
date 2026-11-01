@@ -5,7 +5,9 @@ import { AppDialogContent, AppDialogFooter, AppDialogHeader } from './AppDialog'
 import { uiAttribute, useUiText } from './interface-language'
 import {
   conflictingKeys,
+  conflictPartners,
   conflictTools,
+  presentProjectionMcp,
   highRiskToConfirm,
   isCatalogEmpty,
   itemKey,
@@ -37,7 +39,7 @@ function groupCopy(kind: CapabilityKind, t: (text: string, ...values: Array<stri
   }
   if (kind === 'rule') return {
     title: t('规则'),
-    hint: t('身份里的六段文字不在这里勾选。下面是可复用的规则片段，勾上的才会进入这份投影。'),
+    hint: t('身份里的六段文字不在这里勾选。下面是可复用的规则片段。勾上的先记在目录里，还没有接进运行。'),
     empty: t('还没有可勾选的规则片段。身份里的六段文字仍会随下一次运行包出发。')
   }
   return {
@@ -119,7 +121,7 @@ export function MemberCatalogBody({
   const empty = phase === 'ready' && isCatalogEmpty(items)
   const state = phase === 'loading' ? 'loading' : phase === 'error' ? 'error' : conflicts.length ? 'conflict' : empty ? 'empty' : 'ready'
   return <div className="member-catalog" data-catalog-state={state}>
-    <p className="member-catalog-lede">{t('勾选写在这份 Core 上。保存之后，从下一次 Run 的运行包生效。')}</p>
+    <p className="member-catalog-lede">{t('勾选写在这份 Core 上。技能和 MCP 从下一次 Run 生效。规则片段和 hook 尚未接入运行。')}</p>
     {phase === 'loading' && <CatalogEmpty title={t('正在读取目录…')} detail={t('技能、MCP、规则片段和 hook 都在这份 Core 上。勾选结果也在这里。')} />}
     {phase === 'error' && <CatalogEmpty
       title={t('目录读取失败')}
@@ -142,13 +144,15 @@ export function MemberCatalogBody({
         onChange={(event) => onQuery(event.target.value)}
       />
       <div className="member-catalog-layout">
+        <div className="member-catalog-main">
         <div className="member-catalog-groups">
           {GROUPS.map((kind) => {
             const copy = groupCopy(kind, t)
             const rows = items.filter((item) => item.kind === kind && matchesQuery(item, query)).sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'))
             const noneSelected = kind === 'skill' && items.some((item) => item.kind === 'skill') && items.every((item) => item.kind !== 'skill' || !item.selected)
+            const pendingRun = kind === 'rule' || kind === 'hook'
             return <section key={kind} className="member-catalog-group" aria-label={copy.title}>
-              <h3>{copy.title}</h3>
+              <h3>{copy.title}{pendingRun && <span className="member-catalog-mark is-pending">{t('尚未接入运行')}</span>}</h3>
               <p className="member-catalog-hint">{copy.hint}</p>
               {kind === 'rule' && identity && <>
                 <button className="member-catalog-link" type="button" aria-expanded={identityOpen} onClick={onIdentity}>
@@ -178,7 +182,7 @@ export function MemberCatalogBody({
                     <strong>{item.name}</strong>
                     {originMark(item, t)}
                     {item.risk === 'high' && <span className="member-catalog-mark is-warn">{t('高风险')}</span>}
-                    {conflicted.has(itemKey(item)) && <span className="member-catalog-mark is-warn">{t('冲突')}</span>}
+                    {conflictPartners(items, item).map((partner) => <p key={partner.tool} className="member-catalog-conflict-line">{t('与 {0} 的 {1} 冲突', partner.names, partner.tool)}</p>)}
                     {item.note && <p>{item.note}</p>}
                   </span>
                   <span className="member-catalog-source">{item.source}</span>
@@ -188,25 +192,27 @@ export function MemberCatalogBody({
             </section>
           })}
         </div>
+        <footer className="member-catalog-save">
+          <p>
+            {t('下次运行生效：{0} 项技能，{1} 个 MCP', String(counts.skill), String(counts.mcp))}
+            {(counts.rule > 0 || counts.hook > 0) ? ` ${t('尚未接入运行：{0} 条规则，{1} 个 hook', String(counts.rule), String(counts.hook))}` : ''}
+            {counts.conflicts > 0 ? ` ${t('· {0} 处冲突', String(counts.conflicts))}` : ''}
+          </p>
+          <button className="primary-button" type="button" disabled={!dirty || saving || conflicts.length > 0} onClick={onSave}>
+            {saving ? t('正在保存…') : t('保存')}
+          </button>
+        </footer>
+        </div>
         <ProjectionPanel projection={projection} onRetry={onProjectionRetry} />
       </div>
-      <footer className="member-catalog-save">
-        <p>
-          {t('下次运行生效：{0} 项技能，{1} 个 MCP，{2} 条规则，{3} 个 hook', String(counts.skill), String(counts.mcp), String(counts.rule), String(counts.hook))}
-          {counts.conflicts > 0 ? ` ${t('· {0} 处冲突', String(counts.conflicts))}` : ''}
-        </p>
-        <button className="primary-button" type="button" disabled={!dirty || saving || conflicts.length > 0} onClick={onSave}>
-          {saving ? t('正在保存…') : t('保存')}
-        </button>
-      </footer>
     </>}
     <Dialog.Root open={riskNames.length > 0} onOpenChange={(open) => { if (!open) onRiskCancel() }}>
       <Dialog.Portal>
         <Dialog.Overlay className="dialog-overlay app-dialog-overlay" />
         <AppDialogContent aria-describedby="catalog-risk-description">
           <AppDialogHeader
-            title={t('确认勾选高风险 MCP？')}
-            description={t('「{0}」是高风险的。确认之后才会勾上。取消则这次勾选不留下。', riskNames.join('、'))}
+            title={t('确认勾选高风险项？')}
+            description={t('「{0}」是高风险 MCP，或会执行命令的 hook。确认之后才会勾上。取消则这次勾选不留下。', riskNames.join('、'))}
             descriptionId="catalog-risk-description"
           />
           <AppDialogFooter>
@@ -223,7 +229,7 @@ function ProjectionPanel({ projection, onRetry }: { projection: ProjectionState,
   const t = useUiText()
   return <aside className="member-catalog-preview" aria-label={t('运行投影')} data-projection-state={projection.status}>
     <h3>{t('运行投影')}</h3>
-    <p>{t('引导和 MCP 是下一次 Run 会拿到的正文。技能与附加技能用的是同一份勾选。规则片段和 hook 列在这份投影里，不改写已经送出的引导。未保存的勾选要等这次保存之后才出现。')}</p>
+    <p>{t('引导正文和 MCP 文件是下一次 Run 会拿到的内容。技能与附加技能用的是同一份勾选。规则片段和 hook 还没有接进运行。未保存的勾选要等这次保存之后才出现。')}</p>
     {projection.status === 'loading' && <p role="status">{t('正在读取运行投影…')}</p>}
     {projection.status === 'unsupported' && <p role="status">{t('这位队员还没有 Codex 或 Claude Code，还不能预览运行包。')}</p>}
     {projection.status === 'error' && <p className="member-catalog-banner is-error" role="alert">
@@ -244,16 +250,16 @@ function ProjectionPanel({ projection, onRetry }: { projection: ProjectionState,
       </section>
       <section>
         <h3>{t('MCP 文件')}</h3>
-        <pre>{JSON.stringify(projection.preview.mcp, null, 2)}</pre>
+        <pre>{JSON.stringify(presentProjectionMcp(projection.preview.mcp), null, 2)}</pre>
       </section>
       <section>
-        <h3>{t('规则片段')}</h3>
+        <h3>{t('规则片段')}<span className="member-catalog-mark is-pending">{t('尚未接入运行')}</span></h3>
         {projection.preview.rules.length === 0
           ? <p>{t('还没有勾选的规则片段。')}</p>
           : <ul>{projection.preview.rules.map((rule) => <li key={rule.id}><strong>{rule.name}</strong> · {rule.origin === 'inherited' ? t('继承') : t('已选')}<p>{rule.body}</p></li>)}</ul>}
       </section>
       <section>
-        <h3>hook</h3>
+        <h3>hook<span className="member-catalog-mark is-pending">{t('尚未接入运行')}</span></h3>
         {projection.preview.hooks.length === 0
           ? <p>{t('还没有勾选的 hook。')}</p>
           : <ul>{projection.preview.hooks.map((hook) => <li key={hook.id}><strong>{hook.name}</strong> · {hook.origin === 'inherited' ? t('继承') : t('已选')}<p>{hook.body}</p></li>)}</ul>}

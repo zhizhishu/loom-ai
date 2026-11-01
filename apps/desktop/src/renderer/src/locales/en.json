@@ -4400,5 +4400,14 @@
   "确认勾选": "Confirm check",
   "这条会和已勾选的条目占用同一个工具名，勾选已回到原来的状态。": "This would claim a tool name already used by a checked entry, so the check returned to its previous state.",
   "这些勾选刚被别人改过。已重新读取。": "These choices were just changed elsewhere. Read again.",
-  "保存没有写成，勾选已回到上次读到的结果。": "The save did not stick. The checks are back to the last result that loaded."
+  "保存没有写成，勾选已回到上次读到的结果。": "The save did not stick. The checks are back to the last result that loaded.",
+  "勾选写在这份 Core 上。技能和 MCP 从下一次 Run 生效。规则片段和 hook 尚未接入运行。": "Choices are stored on this Core. Skills and MCP take effect on the next run. Rule snippets and hooks are not wired into a run yet.",
+  "身份里的六段文字不在这里勾选。下面是可复用的规则片段。勾上的先记在目录里，还没有接进运行。": "The six identity fields are not checked here. Reusable rule snippets are below. Checked ones are stored in the catalog and are not wired into a run yet.",
+  "尚未接入运行": "Not wired into a run yet",
+  "与 {0} 的 {1} 冲突": "Conflicts with {0} on {1}",
+  "下次运行生效：{0} 项技能，{1} 个 MCP": "Effective next run: {0} skills, {1} MCP servers",
+  "尚未接入运行：{0} 条规则，{1} 个 hook": "Not wired into a run yet: {0} rules, {1} hooks",
+  "确认勾选高风险项？": "Check this high-risk item?",
+  "「{0}」是高风险 MCP，或会执行命令的 hook。确认之后才会勾上。取消则这次勾选不留下。": "“{0}” is a high-risk MCP server, or a hook that runs a command. It stays checked only after you confirm. Cancel leaves this check off.",
+  "引导正文和 MCP 文件是下一次 Run 会拿到的内容。技能与附加技能用的是同一份勾选。规则片段和 hook 还没有接进运行。未保存的勾选要等这次保存之后才出现。": "The charter and MCP file are what the next run receives. Skills use the same choices as the additional-skill section. Rule snippets and hooks are not wired into a run yet. Unsaved choices appear after this save."
 }

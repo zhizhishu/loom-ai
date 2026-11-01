@@ -585,6 +585,7 @@ fn catalog_pieces(
             .as_ref()
             .map(|choice| choice.selected)
             .unwrap_or_else(|| default_selected(&kind, &scope, &id));
+        let risk = hook_runs_shell(&kind, &body).then_some("high".to_string());
         pieces.push(CatalogPiece {
             tool_names: claims
                 .get(&(kind.clone(), id.clone()))
@@ -597,7 +598,7 @@ fn catalog_pieces(
             source,
             scope,
             body,
-            risk: None,
+            risk,
             selected,
             stored_origin: stored.map(|choice| choice.origin),
         });
@@ -968,13 +969,21 @@ fn was_selected(current: &[CatalogPiece], piece: &CatalogPiece) -> bool {
 }
 
 fn risk_error(piece: &CatalogPiece) -> anyhow::Error {
-    MemberCapabilityError::with_details(
-        "capability.risk_acknowledgement_required",
+    let message = if piece.kind == "hook" {
+        format!(
+            "hook「{}」会执行命令。确认之后才会勾给这位队员。",
+            piece.name
+        )
+    } else {
         format!(
             "MCP「{}」是高风险的。确认之后才会勾给这位队员。",
             piece.name
-        ),
-        json!({ "serverId": piece.id, "name": piece.name }),
+        )
+    };
+    MemberCapabilityError::with_details(
+        "capability.risk_acknowledgement_required",
+        message,
+        json!({ "kind": piece.kind, "id": piece.id, "name": piece.name }),
     )
 }
 
@@ -986,6 +995,32 @@ fn kind_rank(kind: &str) -> u8 {
         "hook" => 3,
         _ => 4,
     }
+}
+
+fn hook_runs_shell(kind: &str, body: &str) -> bool {
+    if kind != "hook" {
+        return false;
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    body.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        line.starts_with("command:")
+            || line.starts_with("command ")
+            || line.starts_with("bash ")
+            || line.starts_with("sh ")
+            || line.starts_with("zsh ")
+            || line.starts_with("/bin/")
+            || line.starts_with("cmd.exe")
+            || line.starts_with("powershell")
+            || line.starts_with("pwsh ")
+    }) || lower.contains("bash -c")
+        || lower.contains("sh -c")
+        || lower.contains("/bin/sh")
+        || lower.contains("/bin/bash")
 }
 
 fn skill_note(name: &str) -> &'static str {
@@ -1360,6 +1395,81 @@ mod tests {
             .find(|item| item.name == "browser")
             .unwrap();
         assert!(browser.selected && browser.origin.as_deref() == Some("explicit"));
+
+        put_capability_item(
+            &database,
+            &store,
+            &MemberCapabilityPutParams {
+                item_id: Some("hook_shell".to_string()),
+                kind: "hook".to_string(),
+                name: Some("run-format".to_string()),
+                note: Some("执行本机命令".to_string()),
+                scope: Some("cloud".to_string()),
+                body: Some("command: bash -c 'echo hi'".to_string()),
+                source_label: None,
+                tool_names: Vec::new(),
+            },
+        )
+        .unwrap();
+        let with_hook = get_member_capability_catalog(&database, &store, &agent_id).unwrap();
+        let shell = with_hook
+            .items
+            .iter()
+            .find(|item| item.id == "hook_shell")
+            .unwrap();
+        assert_eq!(shell.risk.as_deref(), Some("high"));
+        assert!(!shell.selected);
+        let mut hook_selections = with_hook
+            .items
+            .iter()
+            .map(|item| MemberCapabilitySelection {
+                kind: item.kind.clone(),
+                id: item.id.clone(),
+                selected: item.selected || item.id == "hook_shell",
+            })
+            .collect::<Vec<_>>();
+        let refused_hook = set_member_capability_catalog(
+            &mut database,
+            &store,
+            &MemberCapabilitySetParams {
+                agent_id: agent_id.clone(),
+                expected_revision: with_hook.revision.clone(),
+                acknowledge_high_risk: false,
+                selections: hook_selections.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            capability_code(refused_hook),
+            "capability.risk_acknowledgement_required"
+        );
+        hook_selections = get_member_capability_catalog(&database, &store, &agent_id)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| MemberCapabilitySelection {
+                selected: item.selected || item.id == "hook_shell",
+                kind: item.kind,
+                id: item.id,
+            })
+            .collect();
+        let current = get_member_capability_catalog(&database, &store, &agent_id).unwrap();
+        let kept = set_member_capability_catalog(
+            &mut database,
+            &store,
+            &MemberCapabilitySetParams {
+                agent_id,
+                expected_revision: current.revision,
+                acknowledge_high_risk: true,
+                selections: hook_selections,
+            },
+        )
+        .unwrap();
+        assert!(
+            kept.items
+                .iter()
+                .any(|item| item.id == "hook_shell" && item.selected)
+        );
 
         drop(database);
         fs::remove_dir_all(directory).unwrap();
