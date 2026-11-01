@@ -1,7 +1,7 @@
 ---
 document_type: development-guide
 authority: standalone-server-preview-operation
-last_updated: 2026-10-22
+last_updated: 2026-11-01
 ---
 
 # 原生 Server 安装与开发验收
@@ -171,11 +171,11 @@ Desktop「设置 → 远程连接」控制当前 Host，Web 默认关闭，端�
 Core 不代用户安装 Runtime（安装命令只作为指南展示）。远端机器上由运维者按以下顺序一次配好，之后从本地 Desktop 打开：
 
 1. **专用用户常驻**：建系统用户（例如 `loom`），数据根归它所有、权限 700；systemd `User=` 运行 `rovai-server --data-dir <根> --listen 127.0.0.1:8767`，不以 root 运行（见上文）。程序目录对该用户可读。
-2. **配齐 Runtime**：以该用户运行 `scripts/provision-remote-runtimes.sh --prefix <该用户 home>/.npm-global`，幂等安装 Claude Code 与 Codex CLI，不写凭据、不开端口。Linux 上 Runtime 发现不额外搜用户目录，systemd 单元需 `Environment=PATH=<prefix>/bin:/usr/local/bin:/usr/bin:/bin`，重启 Server 后两个 Runtime 显示可用。
+2. **配齐 Runtime**：以该用户、在含有脚本的目录中运行 `scripts/provision-remote-runtimes.sh --prefix "$HOME/.npm-global"`（即 `<该用户 home>/.npm-global`），幂等安装 Claude Code 与 Codex CLI，不写凭据、不开端口。Linux 上 Runtime 发现不额外搜用户目录，systemd 单元需 `Environment=PATH=<prefix>/bin:/usr/local/bin:/usr/bin:/bin`，重启 Server 后两个 Runtime 显示可用。Desktop「设置 → 能力 → 远端主机」展示可复制的同一行，不执行安装。当前 Host 为 Linux x64 且 Claude Code 或 Codex 为「未检测到」时，「设置 → 能力 → 智能体」给出同一命令和「重新检测」；重新检测只重跑这台 Host 的 Runtime 探测，两项都变为「可用」后命令收起并留下探测结果。Web 与独立 Server 不提供「远端主机」页。macOS 与 Windows 的智能体页不展示这条 Server 命令。
 3. **模型账号**：在该用户下完成各 CLI 自己的登录或 API 配置；凭据只留在远端机器，Rovai 不读取、不复制。
    **Linux + Codex 必配**：Codex 的 Linux 沙箱（`workspace-write` / `read-only`）用 seccomp 拒绝 Unix socket，`rovai` 内置命令连不上 Core，所有 `rovai …` 一律返回 `builtin_tool.cli_error`。在该用户 `~/.codex/config.toml` 加 `[sandbox_workspace_write]` `network_access = true`（同时放开出网，按需评估），或给该队员用 `danger-full-access`。bero 实测：默认沙箱 `connect` 得 `EPERM`，加该项后连通。
 4. **只经加密通道访问**：loopback 监听，再用 Tailscale（推荐，只自己的设备可达）或出站隧道暴露；隧道地址必须与 `--public-origin` 一致，否则请求以 `origin_not_allowed` 拒绝。
-5. **从 Desktop 打开**：本地「设置 → 能力 → 远端主机」添加该地址后点「打开」，在独立窗口中用该 Server 的 Token 登录。本地队员缺 Runtime 时，「消息未发送」提示与智能体列表的「未安装」行会出现「在远端主机打开」。
+5. **从 Desktop 打开**：本地「设置 → 能力 → 远端主机」添加该地址后点「打开」，在独立窗口中用该 Server 的 Token 登录。该窗口是 Server 自己的页面；Claude Code 或 Codex 未检测到时，智能体页有配齐命令和重新检测。本地队员缺 Runtime 时，「消息未发送」提示与智能体列表的「未安装」行会出现「在远端主机打开」。
 6. **助手配置两端一致**：`node scripts/loom-profile.mjs export --host <源> --token-file <文件>` 导出队员身份 / 规则、MCP 及指派、工具箱选择；`apply --host <目标> … --dry-run` 先看计划再去掉 `--dry-run` 落地。按队员显示名匹配；MCP 密钥被主机打码，不进 profile，需另用 `--mcp-secrets` 提供。
 
 ## 首个真实 Camp 复验

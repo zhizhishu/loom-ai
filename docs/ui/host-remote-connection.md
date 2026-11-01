@@ -3,7 +3,7 @@ document_type: ui-interaction-draft
 authority: host-remote-connection-settings-review
 status: implemented
 target_version: v1.59
-last_updated: 2026-10-25
+last_updated: 2026-11-01
 ---
 
 # 设置 · 远程连接交互稿
@@ -98,6 +98,8 @@ Server 根地址（`http(s)://host[:port]`）：地址由 Main 校验并规范�
 偏好文件，也不在本页任何字段出现，页面不提供展示或复制入口。本页不改本机 Host 的监听端口、令牌或会话，
 也不是更换 Host 客户端的入口；跨机访问仍取决于网络与防火墙。
 
+同一页在主机列表之外给出配齐命令 `scripts/provision-remote-runtimes.sh --prefix "$HOME/.npm-global"` 和复制按钮。命令只作为指南：页面不执行安装、不写入账号、不开端口。这里不重新探测，因为列表里的 Server 各有自己的 Core。操作者在该 Server 上执行命令后打开它，到「智能体」点「重新检测」。Web 与独立 Server 没有 `remoteHost`，因此整页包括这条命令都不出现。
+
 Renderer 只能按 id 操作：Main 侧 `ipcMain.handle('rovai:remote-hosts')` 要求发送方是主窗口主框架，
 renderer 无法让 App 加载任意 URL。渲染端能力白名单是 `business-environment.ts` 的 `remoteHost`；
 Web 与独立 Server 不提供该 API，因此桌面侧栏和移动端设置索引只在 API 存在时列出并显示“远端主机”，
@@ -106,7 +108,7 @@ Web 与独立 Server 不提供该 API，因此桌面侧栏和移动端设置索�
 ## 生产组件与验收
 
 - `HostWebSettings`：Desktop 的实际服务状态、地址选择、令牌读取及生命周期协调。
-- `RemoteHostsSettings`：Desktop 的远端 Server 列表、添加/打开/移除；不保存 Token，不提供凭据入口。
+- `RemoteHostsSettings`：Desktop 的远端 Server 列表、添加/打开/移除；不保存 Token，不提供凭据入口。配齐命令由 `RemoteRuntimeProvision` 展示，只复制、不安装。
 - `RemoteConnectionStatus`：实际浏览器与离线稿共用的连接状态页面。
 - `SettingsSidebarNavigation`、`SettingsPageHeader`、General/Appearance：原生产导航和对照基准。
 - `HostWorkspacePicker`：浏览器文件系统适配，不复制 Core 的工作区业务规则。

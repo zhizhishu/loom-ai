@@ -29,7 +29,7 @@
 | M1 | bero 跑 `rovai-server`（只监听回环）+ 常驻；经加密隧道访问；不裸开公网端口 | 本机浏览器经隧道登录成功；bero `ss` 只见 127.0.0.1 监听；重启后数据与 Token 仍在 |
 | M2 | 本地 App 内连远端主机发起对话；LOOM 真实任务 Gate 在远端或本地任一主机跑通 | 用户实机：使命 → 规划 → 编排图 → 交付验收 |
 | M3 | 「在哪跑」：按两端 CLI 可用性提示 / 选择主机 | 本地缺 CLI 时一键转到远端主机 |
-| M4 | 远端一键配齐 CLI | `scripts/provision-remote-runtimes.sh` + App 内按钮；探测显示可用 |
+| M4 | 远端一键配齐 CLI | ✅ 见 §7。Desktop「远端主机」复制命令；Linux Host「智能体」在 Claude Code / Codex 未检测到时复制同一命令并重新探测，显示「可用」后收起。Core 不代装 |
 | M5 | 每助手规则 / MCP / skill profile 两端生效 | 同一 profile 导入两台主机后，两端 Run 的 Bootstrap / MCP 投射一致 |
 
 ## 4. 待用户决定（不阻塞 M1 前半段）
@@ -58,3 +58,15 @@
 | 2 | `rovai loom status` 成功、读到 LOOM 指引；`rovai loom plan` 反复 `builtin_tool.invalid_input`，计划未导入 | `--help` 只说三项是数组，reference 无文件样例；CLI 对字段错误只回通用 `invalid_input`（本机复现：`null` / 多字段 / 字段名错 / 大写 condition 全同一句） | 模型上下文变更 r3（加完整计划 JSON 样例 + plan 描述指向 reference），待用户二次确认 |
 
 结论：多主机路线的远端执行链在「CLI ↔ Core」这一层已打通；剩余阻塞是计划文件格式对模型不可见，属文案问题，不是架构问题。
+
+## 7. M4 执行记录
+
+Core 不代用户安装 Runtime。App 只展示这一行并提供复制，不执行它：
+
+`scripts/provision-remote-runtimes.sh --prefix "$HOME/.npm-global"`
+
+操作者在含有该脚本的目录中，以 Server 的运行用户执行。脚本幂等安装 Claude Code 与 Codex，不写凭据、不开端口。
+
+- Desktop「设置 → 能力 → 远端主机」始终给出该命令。这台电脑探测不到远端 Core，所以这里没有「重新检测」。打开该主机后，到它自己的「智能体」页重新检测。Web 与独立 Server 没有「远端主机」页，因此这条命令也不出现。
+- 当前 Host 为 Linux x64，且 Claude Code 或 Codex 为「未检测到」（含路径缺失）时，「设置 → 能力 → 智能体」给出同一命令、两项当前探测结果和「重新检测」。重新检测调用既有 `runtime.discovery.rescan`。两项都不再缺失后，命令收起；若这次检测由该说明发起且两项都为「可用」，留下探测结果。登录未完成不展示该命令，脚本不负责登录。
+- macOS 与 Windows 的智能体页不展示这条 Server 命令。本机安装仍走原有官方安装指南。systemd 启动的 Server 需把 `$HOME/.npm-global/bin` 加进单元 PATH 并重启后，探测才会看到新安装的 CLI。
