@@ -57,6 +57,10 @@ pub enum ClientMessage {
         /// frame has not been acknowledged.
         #[serde(default)]
         runs: Vec<RunReport>,
+        /// Host name of machine B. Empty when the node could not read one.
+        /// Older nodes omit it; the server keeps the generated display name.
+        #[serde(default)]
+        hostname: String,
     },
     Heartbeat {
         run_ids: Vec<String>,

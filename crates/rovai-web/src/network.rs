@@ -94,6 +94,11 @@ impl Network {
         Ok(addresses)
     }
 
+    /// Configured `--public-origin`, already checked as an http(s) origin with no path.
+    pub fn public_origin(&self) -> Option<&str> {
+        self.external.as_deref()
+    }
+
     pub fn allows(&self, host: Option<&str>, origin: Option<&str>) -> bool {
         // Each request must use one actual Host interface (or explicit proxy)
         // and its own same origin. Choosing another displayed address grants nothing.

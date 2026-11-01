@@ -71,9 +71,19 @@ export function runSummary(node: ExecutionNodeRecord): string {
   return uiAttribute('在跑 {0}', count)
 }
 
-export function cliPathStatus(node: ExecutionNodeRecord, cli: ExecutionNodeCli): string {
-  if (node.status !== 'online') return uiAttribute('上次见到')
-  return cli.pathPresent ? uiAttribute('路径有效') : uiAttribute('路径缺失')
+export type CliTone = 'ok' | 'stale' | 'warn'
+
+export function cliPresentation(node: ExecutionNodeRecord, cli: ExecutionNodeCli, now: number): { tone: CliTone; status: string } {
+  if (cli.availability === 'last_seen') {
+    const age = relativeAge(cli.reportedAt, now)
+    return { tone: 'stale', status: age ? uiAttribute('上次见到 {0}', age) : uiAttribute('上次见到') }
+  }
+  if (cli.availability === 'path_missing') return { tone: 'warn', status: uiAttribute('路径缺失') }
+  if (cli.availability === 'reported') return { tone: 'ok', status: uiAttribute('路径有效') }
+  if (node.status !== 'online') return { tone: 'stale', status: uiAttribute('上次见到') }
+  return cli.pathPresent
+    ? { tone: 'ok', status: uiAttribute('路径有效') }
+    : { tone: 'warn', status: uiAttribute('路径缺失') }
 }
 
 export function offlineRunBanner(nodes: ExecutionNodeRecord[]): string | null {
@@ -92,9 +102,16 @@ export function pairingCommand(ticket: ExecutionNodePairing): string {
   ].join('\n')
 }
 
-export function pairExpiryCopy(seconds: number): string {
-  const minutes = Math.max(1, Math.ceil(seconds / 60))
-  return uiAttribute('配对码约 {0} 分钟内有效，用过即废。这里不显示节点令牌。', minutes)
+export function formatRemaining(deadlineMs: number, now: number): string {
+  const total = Math.max(0, Math.ceil((deadlineMs - now) / 1000))
+  const minutes = Math.floor(total / 60)
+  const seconds = total % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+export function pairLifetimeCopy(deadlineMs: number, now: number): string {
+  if (deadlineMs <= now) return uiAttribute('配对码已过期。关闭后重新打开会生成新的。')
+  return uiAttribute('剩余 {0}，用过即废。这里不显示节点令牌。', formatRemaining(deadlineMs, now))
 }
 
 /** Idle nodes confirm immediately. A node with active runs must match its display name. */

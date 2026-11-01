@@ -207,8 +207,28 @@
   font-style: normal;
 }
 
-.nodes-cli.is-stale {
+.nodes-cli.is-stale,
+.nodes-cli.is-stale i,
+.nodes-cli.is-stale em {
   color: var(--muted);
+}
+
+.nodes-cli em {
+  font-style: normal;
+}
+
+.nodes-cli.is-warn,
+.nodes-cli.is-warn i,
+.nodes-cli.is-warn em {
+  color: var(--attention);
+}
+
+.nodes-detail tr.is-stale td {
+  color: var(--muted);
+}
+
+.nodes-detail td.is-warn {
+  color: var(--attention);
 }
 
 .nodes-actions {
@@ -261,11 +281,25 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+.nodes-code-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .nodes-pair-code {
   margin: 0;
   color: var(--ink);
   font: 620 22px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
   letter-spacing: 0.04em;
+}
+
+.nodes-reach {
+  margin: 8px 0 0;
+  color: var(--attention);
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .nodes-command,

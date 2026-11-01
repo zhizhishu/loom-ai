@@ -1050,6 +1050,7 @@ impl Hub {
                             arch,
                             clis,
                             runs,
+                            hostname,
                         } => {
                             if runs.len() > 32
                                 || runs.iter().any(|run| {
@@ -1095,6 +1096,9 @@ impl Hub {
                                         .await
                                     {
                                         Ok(generation) => {
+                                            let _ = self
+                                                .store
+                                                .adopt_reported_hostname(&node_id, &hostname);
                                             attached = Some((node_id.clone(), generation));
                                             let resumes = self.reconcile(&node_id, &runs).await;
                                             welcomed = true;
@@ -1248,6 +1252,24 @@ fn valid_credential(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Public origin wins, as `wss://` or `ws://` plus the connect path.
+/// Without one, the listen address is the only target and the caller must
+/// warn that machine B has to be able to reach it.
+pub(crate) fn connect_target(listen: SocketAddr, public_origin: Option<&str>) -> (String, bool) {
+    if let Some(origin) = public_origin.map(str::trim).filter(|origin| !origin.is_empty()) {
+        let base = if let Some(rest) = origin.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = origin.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            origin.to_owned()
+        };
+        let base = base.trim_end_matches('/');
+        return (format!("{base}{CONNECT_PATH}"), false);
+    }
+    (format!("ws://{listen}{CONNECT_PATH}"), true)
+}
+
 fn random_hex(nbytes: usize) -> String {
     let mut buf = vec![0u8; nbytes];
     getrandom::fill(&mut buf).expect("system random source");
@@ -1284,10 +1306,13 @@ pub(crate) async fn pair(
         return error(StatusCode::FORBIDDEN, "node_channel_requires_loopback");
     }
     let (code, expires_in_seconds) = state.nodes.issue_pairing().await;
+    let (connect_url, reachability_warning) =
+        connect_target(state.network.listen, state.network.public_origin());
     Json(json!({
         "pairingCode": code,
         "expiresInSeconds": expires_in_seconds,
-        "connectUrl": format!("ws://{}{CONNECT_PATH}", state.network.listen),
+        "connectUrl": connect_url,
+        "reachabilityWarning": reachability_warning,
     }))
     .into_response()
 }
@@ -1785,5 +1810,26 @@ mod tests {
         assert_ne!(third, first);
         assert!(hub.redeem(&first, peer).await.is_err());
         assert!(hub.redeem(&third, peer).await.is_ok());
+    }
+
+    #[test]
+    fn connect_target_uses_public_origin_and_otherwise_warns() {
+        let listen: SocketAddr = "127.0.0.1:8767".parse().unwrap();
+        let (tunnel, warn) = connect_target(listen, Some("https://loom.trycloudflare.com"));
+        assert_eq!(
+            tunnel,
+            "wss://loom.trycloudflare.com/api/v1/nodes/connect"
+        );
+        assert!(!warn);
+        let (lan, warn) = connect_target(listen, Some("http://10.1.2.3:8443"));
+        assert_eq!(lan, "ws://10.1.2.3:8443/api/v1/nodes/connect");
+        assert!(!warn);
+        let (fallback, warn) = connect_target(listen, None);
+        assert_eq!(fallback, "ws://127.0.0.1:8767/api/v1/nodes/connect");
+        assert!(warn);
+        let v6: SocketAddr = "[::1]:8767".parse().unwrap();
+        let (loopback, warn) = connect_target(v6, Some("  "));
+        assert_eq!(loopback, "ws://[::1]:8767/api/v1/nodes/connect");
+        assert!(warn);
     }
 }

@@ -4572,6 +4572,8 @@ export interface ExecutionNodeCli {
   version: string | null
   pathPresent: boolean
   reportedAt: string
+  /** `reported`, `last_seen`, or `path_missing` once the node list includes it. */
+  availability?: string
 }
 
 export interface ExecutionNodeRun {
@@ -4607,6 +4609,8 @@ export interface ExecutionNodePairing {
   pairingCode: string
   expiresInSeconds: number
   connectUrl: string
+  /** True when the URL is the listen address, not a configured public origin. */
+  reachabilityWarning?: boolean
 }
 
 export interface ExecutionNodeRevocation {

@@ -14,12 +14,12 @@ import { NODE_LIST_POLL_MS, nodeErrorCode, type NodeApi } from './nodes-api'
 import {
   applyListResult,
   canConfirmRevoke,
-  cliPathStatus,
+  cliPresentation,
   listFailureDetail,
   nodeMeta,
   offlineRunBanner,
-  pairExpiryCopy,
   pairFailure,
+  pairLifetimeCopy,
   pairingCommand,
   remoteNodes,
   revokeFailure,
@@ -52,14 +52,21 @@ export function NodesSettings({ api, onOpenRemoteHosts, now }: {
   const [ticket, setTicket] = useState<ExecutionNodePairing | null>(null)
   const [pairBusy, setPairBusy] = useState(false)
   const [pairError, setPairError] = useState('')
-  const [copied, setCopied] = useState(false)
+  const [copied, setCopied] = useState<'code' | 'command' | null>(null)
+  const [deadline, setDeadline] = useState<number | null>(null)
+  const [tick, setTick] = useState(() => Date.now())
   const [revokeId, setRevokeId] = useState<string | null>(null)
   const [typed, setTyped] = useState('')
   const [revokeBusy, setRevokeBusy] = useState(false)
   const [revokeError, setRevokeError] = useState('')
   const listRef = useRef(list)
   listRef.current = list
-  const clock = now ?? Date.now()
+  useEffect(() => {
+    if (now !== undefined || !pairOpen) return
+    const timer = window.setInterval(() => setTick(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [now, pairOpen])
+  const clock = now ?? tick
 
   useEffect(() => {
     let active = true
@@ -94,25 +101,29 @@ export function NodesSettings({ api, onOpenRemoteHosts, now }: {
   async function openPair(): Promise<void> {
     setPairOpen(true)
     setTicket(null)
+    setDeadline(null)
     setPairError('')
-    setCopied(false)
+    setCopied(null)
     setPairBusy(true)
     try {
-      setTicket(await api.pair())
+      const next = await api.pair()
+      setTicket(next)
+      setDeadline((now ?? Date.now()) + next.expiresInSeconds * 1000)
     } catch (error) {
       setTicket(null)
+      setDeadline(null)
       setPairError(pairFailure(nodeErrorCode(error)))
     } finally {
       setPairBusy(false)
     }
   }
 
-  async function copyCommand(): Promise<void> {
+  async function copyText(kind: 'code' | 'command'): Promise<void> {
     if (!ticket) return
-    const copiedOk = await writeClipboardText(pairingCommand(ticket))
+    const copiedOk = await writeClipboardText(kind === 'code' ? ticket.pairingCode : pairingCommand(ticket))
     if (copiedOk) {
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 1600)
+      setCopied(kind)
+      window.setTimeout(() => setCopied(current => current === kind ? null : current), 1600)
       return
     }
     setPairError(uiAttribute('未能复制命令，请手动选择。'))
@@ -154,11 +165,13 @@ export function NodesSettings({ api, onOpenRemoteHosts, now }: {
       pairBusy={pairBusy}
       pairError={pairError}
       copied={copied}
+      deadline={deadline}
       onPairOpenChange={open => {
         setPairOpen(open)
-        if (!open) setCopied(false)
+        if (!open) setCopied(null)
       }}
-      onCopy={() => void copyCommand()}
+      onCopyCode={() => void copyText('code')}
+      onCopy={() => void copyText('command')}
       revokeNode={revokeNode}
       typed={typed}
       revokeBusy={revokeBusy}
@@ -184,7 +197,9 @@ export function NodesSettingsBody({
   pairBusy,
   pairError,
   copied,
+  deadline,
   onPairOpenChange,
+  onCopyCode,
   onCopy,
   revokeNode,
   typed,
@@ -206,8 +221,10 @@ export function NodesSettingsBody({
   ticket: ExecutionNodePairing | null
   pairBusy: boolean
   pairError: string
-  copied: boolean
+  copied: 'code' | 'command' | null
+  deadline: number | null
   onPairOpenChange(open: boolean): void
+  onCopyCode(): void
   onCopy(): void
   revokeNode: ExecutionNodeRecord | null
   typed: string
@@ -253,15 +270,19 @@ export function NodesSettingsBody({
         <AppDialogContent width="wide" aria-labelledby="node-pair-title">
           <AppDialogHeader
             title={<span id="node-pair-title">{t('添加节点')}</span>}
-            description={ticket ? pairExpiryCopy(ticket.expiresInSeconds) : t('配对码约 {0} 分钟内有效，用过即废。这里不显示节点令牌。', 10)}
+            description={deadline !== null ? pairLifetimeCopy(deadline, now) : t('配对码用过即废。这里不显示节点令牌。')}
           />
           <AppDialogBody>
             {pairBusy && <p className="nodes-meta" role="status">{t('正在生成配对码…')}</p>}
             {ticket && <>
               <span className="nodes-field-label" id="node-pair-code-label">{t('配对码')}</span>
-              <p className="nodes-pair-code" aria-labelledby="node-pair-code-label">{ticket.pairingCode}</p>
+              <div className="nodes-code-row">
+                <p className="nodes-pair-code" aria-labelledby="node-pair-code-label">{ticket.pairingCode}</p>
+                <button className="quiet-button compact" type="button" onClick={onCopyCode} disabled={pairBusy}>{copied === 'code' ? t('已复制') : t('复制配对码')}</button>
+              </div>
               <span className="nodes-field-label" id="node-pair-address-label">{t('B 要拨的地址')}</span>
               <p className="nodes-address" aria-labelledby="node-pair-address-label">{ticket.connectUrl}</p>
+              {ticket.reachabilityWarning && <p className="nodes-reach" role="note">{t('B 必须能连上这个地址。回环地址只适合在同一台机器上试。')}</p>}
               <span className="nodes-field-label" id="node-pair-command-label">{t('在 B 上执行')}</span>
               <pre className="nodes-command" id="node-pair-command" aria-labelledby="node-pair-command-label">{pairingCommand(ticket)}</pre>
             </>}
@@ -269,7 +290,7 @@ export function NodesSettingsBody({
           </AppDialogBody>
           <AppDialogFooter>
             <Dialog.Close asChild><button className="quiet-button" type="button" data-dialog-autofocus>{t('关闭')}</button></Dialog.Close>
-            <button className="primary-button" type="button" onClick={onCopy} disabled={!ticket || pairBusy}>{copied ? t('已复制') : t('复制命令')}</button>
+            <button className="primary-button" type="button" onClick={onCopy} disabled={!ticket || pairBusy}>{copied === 'command' ? t('已复制') : t('复制命令')}</button>
           </AppDialogFooter>
         </AppDialogContent>
     </NodeDialog>
@@ -333,14 +354,18 @@ function NodeRow({ node, now, open, onToggle, onRevoke }: {
       <div className="nodes-title">
         <i className={`nodes-dot${status.kind === 'ok' ? ' is-on' : ''}`} aria-hidden="true" />
         <strong>{node.displayName}</strong>
-        <em className="nodes-role">{roleLabel(node)}</em>
+        {node.displayName !== roleLabel(node) && <em className="nodes-role">{roleLabel(node)}</em>}
         <span className={`nodes-pill${status.kind === 'ok' ? ' is-ok' : ''}`}>{status.text}</span>
       </div>
       <p className="nodes-meta">{nodeMeta(node, now)}</p>
       {node.clis.length > 0 && <div className="nodes-cli-line">
-        {node.clis.map(cli => <span className={`nodes-cli${node.status === 'online' ? '' : ' is-stale'}`} key={`${cli.adapterKind}:${cli.path}`}>
-          {cli.adapterKind} <i>{cli.version || t('未知')}</i>
-        </span>)}
+        {node.clis.map(cli => {
+          const presented = cliPresentation(node, cli, now)
+          return <span className={`nodes-cli is-${presented.tone}`} key={`${cli.adapterKind}:${cli.path}`}>
+            {cli.adapterKind} <i>{cli.version || t('未知')}</i>
+            {presented.tone !== 'ok' && <em>{presented.status}</em>}
+          </span>
+        })}
       </div>}
       <p className="nodes-meta">{runSummary(node)}</p>
     </div>
@@ -356,12 +381,15 @@ function NodeRow({ node, now, open, onToggle, onRevoke }: {
         : <table>
           <thead><tr><th>{t('CLI')}</th><th>{t('版本')}</th><th>{t('节点上的路径')}</th><th>{t('状态')}</th></tr></thead>
           <tbody>
-            {node.clis.map(cli => <tr key={`${cli.adapterKind}:${cli.path}`}>
-              <td className="nodes-mono">{cli.adapterKind}</td>
-              <td className="nodes-mono">{cli.version || t('未知')}</td>
-              <td className="nodes-path">{cli.path}</td>
-              <td>{cliPathStatus(node, cli)}</td>
-            </tr>)}
+            {node.clis.map(cli => {
+              const presented = cliPresentation(node, cli, now)
+              return <tr className={presented.tone === 'stale' ? 'is-stale' : undefined} key={`${cli.adapterKind}:${cli.path}`}>
+                <td className="nodes-mono">{cli.adapterKind}</td>
+                <td className="nodes-mono">{cli.version || t('未知')}</td>
+                <td className="nodes-path">{cli.path}</td>
+                <td className={presented.tone === 'warn' ? 'is-warn' : undefined}>{presented.status}</td>
+              </tr>
+            })}
           </tbody>
         </table>}
     </div>}

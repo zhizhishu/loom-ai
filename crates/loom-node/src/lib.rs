@@ -150,6 +150,42 @@ fn read_credentials(data_dir: &Path) -> Result<Credentials> {
     Ok(credentials)
 }
 
+/// Host name reported in Hello. Empty when it is missing or not a plain host label.
+pub fn machine_hostname() -> String {
+    let raw = raw_hostname();
+    let name = raw.trim();
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with(['-', '.'])
+        || name.ends_with(['-', '.'])
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    {
+        return String::new();
+    }
+    name.to_owned()
+}
+
+fn raw_hostname() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+        if rc != 0 {
+            return String::new();
+        }
+        let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+        return String::from_utf8_lossy(&buf[..end]).into_owned();
+    }
+    #[cfg(windows)]
+    {
+        return std::env::var("COMPUTERNAME").unwrap_or_default();
+    }
+    #[cfg(not(any(unix, windows)))]
+    String::new()
+}
+
 /// Plain WebSocket is only for a loopback B1. Anywhere else the URL must be `wss`.
 pub fn ensure_transport(server: &str) -> Result<()> {
     let Some(rest) = server
@@ -191,6 +227,19 @@ mod tests {
         assert!(ensure_transport("ws://10.1.2.3:8767/api/v1/nodes/connect").is_err());
         assert!(ensure_transport("ws://example.com/api/v1/nodes/connect").is_err());
         assert!(ensure_transport("wss://example.com/api/v1/nodes/connect").is_ok());
+        assert!(ensure_transport("wss://loom.trycloudflare.com/api/v1/nodes/connect").is_ok());
         assert!(ensure_transport("http://127.0.0.1:8767/api/v1/nodes/connect").is_err());
+    }
+
+    #[test]
+    fn reported_hostname_is_a_plain_label_or_empty() {
+        let name = machine_hostname();
+        assert!(name.len() <= 64);
+        assert!(
+            name.is_empty()
+                || name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_')
+                })
+        );
     }
 }
