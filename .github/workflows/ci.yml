@@ -180,6 +180,10 @@ jobs:
         if: steps.changes.outputs.rust == 'true'
         run: cargo test -p rovai-core --lib loom
 
+      - name: Run loom-node acceptance tests
+        if: steps.changes.outputs.rust == 'true'
+        run: cargo test -p loom-node --test b1_outbound --test b2_resume --test b3_capability --test b4_shim
+
       - name: Report no-op gate
         if: steps.changes.outputs.node != 'true' && steps.changes.outputs.rust != 'true' && steps.changes.outputs.docs != 'true' && steps.changes.outputs.skills != 'true'
         run: echo "No relevant fast checks were required."

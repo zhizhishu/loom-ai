@@ -808,6 +808,8 @@ rovai-server node-exec --data-dir /tmp/loom-b4/a \
 
 已知限制：垫片只实现 `rovai loom status`，不转发 `plan` / `claim` / `candidate`。令牌绑的是这次 `node-exec` 的使命和队员，不是一次完整的 AgentRun 租约。远程节点仍不会变成默认执行主机，那是 B10。真 Codex 沙箱若拦出站，仍要在节点用户的 `~/.codex/config.toml` 里打开 `network_access`。
 
+垫片目前只在 POSIX 上安装（`#!/bin/sh` 的 `rovai` 启动器，以及用进程组收孙子进程）。Windows 节点还没有，留到以后。同一系统用户下的子进程读得到节点数据目录里的 `node.json`。这是 B1 就有的限制：节点令牌不进子进程环境，但文件权限仍是同一个用户。以后用单独的系统用户把节点凭据和 Run 隔开。
+
 ### B5 本机节点 + 一台远端，一次使命两段活
 
 - A 的本机执行登记为 `local` 节点，走 `ManagedProcess::spawn`，不经过 WebSocket。

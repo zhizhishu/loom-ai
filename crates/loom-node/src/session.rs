@@ -396,6 +396,17 @@ async fn accept_start(
     env: Vec<(String, String)>,
     shim_token: String,
 ) -> Result<()> {
+    if crate::shim::check_run_identity(&run_id, attempt).is_err() {
+        try_control(
+            shared,
+            &ClientMessage::Rejected {
+                run_id,
+                attempt,
+                code: "invalid_run_id".into(),
+            },
+        );
+        return Ok(());
+    }
     let choice = {
         let resolved = resolve_executable(&shared.clis, &adapter_kind, &program);
         let mut runs = shared.runs.lock().expect("node runs lock");
@@ -625,6 +636,9 @@ async fn drive_process(
             return Ok(());
         }
     };
+    // Dropped on cancel, revoke, disconnect, and normal return. The signal
+    // goes to the whole group, so a grandchild is not left behind.
+    let _group = ChildGroup::arm(&child);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let out_shared = Arc::clone(&shared);
@@ -745,6 +759,35 @@ async fn send_failure(shared: &Shared, run_id: &str, error: &anyhow::Error) -> R
     Ok(())
 }
 
+struct ChildGroup {
+    pid: u32,
+}
+
+impl ChildGroup {
+    fn arm(child: &tokio::process::Child) -> Self {
+        Self {
+            pid: child.id().unwrap_or(0),
+        }
+    }
+}
+
+impl Drop for ChildGroup {
+    fn drop(&mut self) {
+        kill_process_group(self.pid);
+    }
+}
+
+fn kill_process_group(pid: u32) {
+    // `kill(-1)` signals every process this one may signal. Never do that.
+    if pid <= 1 || pid == std::process::id() {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
 fn contains_secret(value: &str, secrets: &[&str]) -> bool {
     secrets
         .iter()
@@ -758,6 +801,86 @@ fn child_path(shim_bin: &std::path::Path, base: Option<String>) -> std::ffi::OsS
         path.push(base);
     }
     path
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::ChildGroup;
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    #[tokio::test]
+    async fn cancelling_the_child_kills_the_grandchild_process_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "loom-group-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("cli.sh");
+        let grandchild = dir.join("grandchild.pid");
+        let mut file = fs::File::create(&script).unwrap();
+        writeln!(file, "#!/bin/sh\nsleep 40 &\necho $! > \"$1\"\nwait\n").unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o755))
+            .unwrap();
+        drop(file);
+        let mut command = tokio::process::Command::new(&script);
+        command
+            .arg(&grandchild)
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn().unwrap();
+        let group = ChildGroup::arm(&child);
+        let started = Instant::now();
+        let pid = loop {
+            if let Ok(text) = fs::read_to_string(&grandchild)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid > 1
+            {
+                break pid;
+            }
+            if started.elapsed() > Duration::from_secs(3) {
+                drop(group);
+                drop(child);
+                panic!("grandchild pid was not written");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(process_running(pid), "grandchild was not running");
+        drop(group);
+        drop(child);
+        let started = Instant::now();
+        while process_running(pid) && started.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_running(pid),
+            "grandchild {pid} was still running after the process group was killed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn process_running(pid: u32) -> bool {
+        let Ok(text) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, rest)) = text.rsplit_once(')') else {
+            return false;
+        };
+        matches!(rest.split_whitespace().next(), Some("R" | "S" | "D"))
+    }
 }
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {

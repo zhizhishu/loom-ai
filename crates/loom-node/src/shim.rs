@@ -36,8 +36,46 @@ pub(crate) struct Installed {
 
 impl Drop for Installed {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if run_directory_is_owned(&self.root) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
+}
+
+/// `run_id` and the decimal `attempt` must be a single path component.
+/// Anything else is refused before a directory is created or removed.
+pub(crate) fn check_run_identity(run_id: &str, attempt: u32) -> Result<()> {
+    ensure!(
+        safe_path_component(run_id),
+        "run id is not a safe path component"
+    );
+    ensure!(
+        safe_path_component(&attempt.to_string()),
+        "attempt is not a safe path component"
+    );
+    Ok(())
+}
+
+fn safe_path_component(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn run_directory_is_owned(root: &Path) -> bool {
+    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((run_id, attempt)) = name.rsplit_once('-') else {
+        return false;
+    };
+    let Some(parent) = root.parent() else {
+        return false;
+    };
+    parent.file_name().and_then(|name| name.to_str()) == Some("runs")
+        && safe_path_component(run_id)
+        && safe_path_component(attempt)
 }
 
 pub(crate) fn http_url(server: &str) -> Result<String> {
@@ -63,6 +101,7 @@ pub(crate) fn install(
     server: &str,
 ) -> Result<Installed> {
     ensure!(token.len() == 64, "shim token is invalid");
+    check_run_identity(run_id, attempt)?;
     let root = data_dir.join("runs").join(format!("{run_id}-{attempt}"));
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir)
@@ -201,6 +240,31 @@ mod tests {
         assert_eq!(credential["url"], "http://127.0.0.1:8767/api/v1/nodes/shim");
         drop(installed);
         assert!(!root.join("runs").join("run_1-1").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unsafe_run_identity_is_rejected_before_a_directory_is_created() {
+        let root = std::env::temp_dir().join(format!("loom-shim-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let token = "ab".repeat(32);
+        let long = "a".repeat(129);
+        let cases = ["../outside", "", "run/nested", long.as_str(), ".", ".."];
+        for run_id in cases {
+            let Err(error) = install(&root, run_id, 1, &token, "ws://127.0.0.1:9/x") else {
+                panic!("unsafe run id was accepted");
+            };
+            assert!(
+                error.to_string().contains("safe path component"),
+                "{run_id}: {error:#}"
+            );
+        }
+        assert!(
+            !root.join("runs").exists(),
+            "rejected run id still created a directory"
+        );
+        assert!(check_run_identity("run_OK-1", 2).is_ok());
         let _ = fs::remove_dir_all(&root);
     }
 }

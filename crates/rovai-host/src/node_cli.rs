@@ -269,7 +269,8 @@ async fn expect_json<T: for<'de> Deserialize<'de>>(response: reqwest::Response) 
 fn node_command_rejection(code: &str) -> String {
     match code {
         "node_cli_unreported" => {
-            "这台节点没有上报这个 CLI，或只留下上次见到的路径。没有启动进程。".into()
+            "这台节点没有上报这个 CLI，或只留下上次见到的路径。没有启动进程。（node_cli_unreported）"
+                .into()
         }
         other => format!("server rejected the node command ({other})"),
     }
@@ -280,10 +281,10 @@ mod tests {
     use super::node_command_rejection;
 
     #[test]
-    fn unreported_cli_is_explained_instead_of_left_as_a_code() {
+    fn unreported_cli_explains_the_refusal_and_keeps_the_code() {
         let text = node_command_rejection("node_cli_unreported");
         assert!(text.contains("没有上报这个 CLI"));
-        assert!(!text.contains("node_cli_unreported"));
+        assert!(text.contains("（node_cli_unreported）"));
         assert!(node_command_rejection("node_not_found").contains("node_not_found"));
     }
 }
