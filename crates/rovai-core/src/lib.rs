@@ -107,6 +107,7 @@ pub mod planned_shutdown;
 pub mod platform;
 pub mod read_model;
 pub mod run_continuation;
+mod run_projection;
 pub mod runtime;
 pub mod runtime_activity_mapping;
 pub mod runtime_basis;

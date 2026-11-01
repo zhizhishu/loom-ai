@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
-import { exportProfile, parseArguments, planApply, readToken, runPlan } from '../loom-profile.mjs'
+import { compareProjections, exportProfile, fetchProjection, normalizeProjection, parseArguments, planApply, readToken, runPlan } from '../loom-profile.mjs'
 
 /** An in-memory host that answers the six operations the profile tool uses. */
 function fakeHost ({ members = [], servers = [], toolbox = [] } = {}) {
@@ -41,6 +41,14 @@ function fakeHost ({ members = [], servers = [], toolbox = [] } = {}) {
           assert.equal(params.command.expectedVersion, skill.version)
           skill.memberIds = params.command.memberIds; skill.version = `${skill.version}+`; return {}
         }
+        case 'members.runProjection.preview':
+          return {
+            agentId: 'a1',
+            displayName: params.member,
+            runtime: params.runtime ?? 'codex-cli',
+            bootstrap: `[MEMBER_IDENTITY]\n${params.member}\n[/MEMBER_IDENTITY]\n{"root":"/var/lib/loom/skills"}`,
+            mcp: { mcpServers: { docs: { command: 'docs-mcp', env: { TOKEN: '********' }, cwd: '/var/lib/loom' } } }
+          }
         default: throw new Error(`unexpected ${operation}`)
       }
     }
@@ -97,4 +105,32 @@ test('arguments, tokens and profile validation fail closed', async () => {
   assert.throws(() => readToken(tokenFile), { code: 'token' })
   await assert.rejects(planApply(fakeHost(), { version: 2 }), { code: 'profile' })
   await assert.rejects(planApply(fakeHost(), { version: 1, members: [{ displayName: 'a' }, { displayName: 'a' }] }), { code: 'profile' })
+  assert.throws(() => parseArguments(['projection', '--host', 'https://h', '--token-file', 't']), { code: 'usage' })
+  assert.equal(parseArguments(['projection', '--host', 'https://h.example/x', '--token-file', 't', '--member', '叮叮', '--runtime', 'claude-code']).member, '叮叮')
+  assert.throws(() => parseArguments(['projection', '--host', 'https://h', '--token-file', 't', '--member', '叮叮', '--runtime', 'pi']), { code: 'usage' })
+})
+
+test('projection fetches the preview and compare ignores host paths, ids, and timestamps', async () => {
+  const host = fakeHost()
+  const projection = await fetchProjection(host, '叮叮', 'codex-cli')
+  assert.equal(host.state.calls.at(-1), 'members.runProjection.preview')
+  const otherHost = {
+    ...projection,
+    agentId: 'agent_99',
+    bootstrap: `${projection.bootstrap.replace('/var/lib/loom/skills', '/home/loom/skills')}\nsee https://example.com/mcp\nmem 11111111-1111-4111-8111-111111111111 at 2026-11-01T00:00:00Z agent_9 sha256:cd`,
+    mcp: { mcpServers: { docs: { command: 'docs-mcp', env: { TOKEN: '********' }, cwd: 'C:\\loom\\data' } } }
+  }
+  const left = { ...projection, bootstrap: `${projection.bootstrap}\nsee https://example.com/mcp\nmem 22222222-2222-4222-8222-222222222222 at 2026-11-01T03:04:05+08:00 agent_1 sha256:ab` }
+  assert.equal(compareProjections(left, otherHost).equal, true)
+  assert.equal(normalizeProjection(left).agentId, undefined)
+  assert.equal(compareProjections(left, { ...otherHost, displayName: '芝士' }).equal, false)
+  assert.equal(compareProjections(left, { ...otherHost, mcp: { mcpServers: { docs: { command: 'other' } } } }).equal, false)
+  const kept = normalizeProjection(left).bootstrap
+  assert.equal(kept.includes('[/MEMBER_IDENTITY]'), true)
+  assert.equal(kept.includes('https://example.com/mcp'), true)
+  assert.equal(kept.includes('/var/lib/loom'), false)
+  assert.equal(kept.includes('<path>'), true)
+  assert.equal(kept.includes('<id>'), true)
+  assert.equal(kept.includes('<time>'), true)
+  assert.equal(kept.includes('<digest>'), true)
 })

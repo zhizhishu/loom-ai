@@ -1029,6 +1029,17 @@ impl McpConfigStore {
         Ok((view, loaded.config))
     }
 
+    /// Same bytes as [`Self::get_with_raw`] when the file already exists.
+    /// A missing library stays missing: no default file and no permission repair.
+    pub(crate) fn get_with_raw_readonly(
+        &self,
+        known_agent_ids: &BTreeSet<String>,
+    ) -> Result<(McpConfigView, Option<McpConfigFile>)> {
+        let loaded = self.load()?;
+        let view = self.view(&loaded, known_agent_ids)?;
+        Ok((view, loaded.config))
+    }
+
     fn mutate(
         &self,
         expected_digest: &str,

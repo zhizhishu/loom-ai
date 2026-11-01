@@ -172,6 +172,7 @@ export const WEB_OPERATIONS = [
   'thread.messages.find',
   'members.list',
   'members.get',
+  'members.runProjection.preview',
   'tasks.list',
   'tasks.get',
   'memory.list',

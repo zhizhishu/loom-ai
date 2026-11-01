@@ -87,6 +87,23 @@ pub(crate) fn write_ephemeral_grok_mcp_plugin(
     })
 }
 
+/// JSON document Claude Code receives as `--mcp-config`. The file writer
+/// persists these exact bytes.
+pub(crate) fn additive_mcp_config_document(
+    external_servers: &BTreeMap<String, McpServerDefinition>,
+) -> Value {
+    let servers = external_servers
+        .iter()
+        .map(|(name, definition)| {
+            (
+                name.clone(),
+                native_file_server(definition, NativeFileDialect::Standard),
+            )
+        })
+        .collect::<Map<_, _>>();
+    json!({"mcpServers": servers})
+}
+
 fn write_ephemeral_mcp_config(
     private_runtime_dir: &Path,
     prefix: &str,
@@ -102,11 +119,16 @@ fn write_ephemeral_mcp_config(
     })?;
     set_private_directory_permissions(&directory)?;
     let path = directory.join(format!("{prefix}{}{CONFIG_SUFFIX}", uuid::Uuid::new_v4()));
-    let servers = external_servers
-        .iter()
-        .map(|(name, definition)| (name.clone(), native_file_server(definition, dialect)))
-        .collect::<Map<_, _>>();
-    let document = json!({"mcpServers": servers});
+    let document = match dialect {
+        NativeFileDialect::Standard => additive_mcp_config_document(external_servers),
+        NativeFileDialect::Copilot => {
+            let servers = external_servers
+                .iter()
+                .map(|(name, definition)| (name.clone(), native_file_server(definition, dialect)))
+                .collect::<Map<_, _>>();
+            json!({"mcpServers": servers})
+        }
+    };
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

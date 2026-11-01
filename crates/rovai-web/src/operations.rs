@@ -268,6 +268,8 @@ pub enum Operation {
     Members,
     #[serde(rename = "members.get")]
     Member,
+    #[serde(rename = "members.runProjection.preview")]
+    MemberRunProjection,
     #[serde(rename = "navigation.snapshot")]
     Navigation,
     #[serde(rename = "navigation.threads", alias = "navigation.camps")]
@@ -418,6 +420,10 @@ impl Operation {
         use serde_json::json;
         match self {
             Self::AppInfo => json!({"name":value["name"],"version":value["version"]}),
+            Self::MemberRunProjection => select_fields(
+                &value,
+                &["agentId", "displayName", "runtime", "bootstrap", "mcp"],
+            ),
             // Core owns credential redaction and digest-CAS. These projections
             // admit the fields used by the shared editor, never future fields.
             Self::Mcp | Self::McpRepair => project_mcp_config(value),
@@ -628,6 +634,7 @@ impl Operation {
             Self::AppInfo => "app.info",
             Self::Members => "members.list",
             Self::Member => "members.get",
+            Self::MemberRunProjection => "members.runProjection.preview",
             Self::Navigation => "navigation.snapshot",
             Self::NavigationCamps => "navigation.camps",
             Self::GroupCamps => "navigation.groupCamps",
@@ -783,6 +790,10 @@ mod tests {
         assert_eq!(withdraw.method(), "camp.messages.withdraw");
         for (public, internal) in [
             ("runtime.status.get", "runtime.status.get"),
+            (
+                "members.runProjection.preview",
+                "members.runProjection.preview",
+            ),
             ("thread.messages.anchors", "camp.messages.anchors"),
             ("thread.messages.replies", "camp.messages.replies"),
             (

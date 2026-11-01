@@ -289,7 +289,7 @@ struct PreparedBootstrapEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MemberIdentityBootstrapProjection {
+pub(crate) struct MemberIdentityBootstrapProjection {
     name: String,
     team_role: String,
     professional_responsibilities: String,
@@ -3599,7 +3599,7 @@ fn load_latest_member_identity<R: ContextReadConnection>(
     })
 }
 
-fn render_session_bootstrap(
+pub(crate) fn render_session_bootstrap(
     charter: &str,
     member_identity: &MemberIdentityBootstrapProjection,
     team_guidance: Option<&str>,
@@ -3627,6 +3627,67 @@ fn render_session_bootstrap(
         ));
     }
     Ok(bootstrap)
+}
+
+/// Pieces of the session bootstrap a new public-thread Run renders for this
+/// member when that thread has no team guidance, no mission, and no channel
+/// file binding. `format_session_bootstrap_for_snapshot` renders a real Run
+/// with [`render_session_bootstrap`]; the preview uses the same renderer on
+/// these pieces, which come from [`claim::BootstrapContents::read`].
+pub(crate) struct MemberProjectionBootstrap {
+    pub charter: String,
+    pub identity: MemberIdentityBootstrapProjection,
+    pub team_guidance: Option<String>,
+    pub platform_skills: Option<String>,
+    pub memory_entrypoint: String,
+}
+
+pub(crate) fn member_projection_bootstrap(
+    database: &Database,
+    data_dir: &std::path::Path,
+    agent_id: &str,
+    adapter: AdapterKind,
+) -> Result<MemberProjectionBootstrap> {
+    let snapshot = RunSnapshot {
+        agent_run_id: "member-run-projection".to_string(),
+        camp_id: "member-run-projection".to_string(),
+        camp_turn_id: "member-run-projection".to_string(),
+        conversation_id: "member-run-projection".to_string(),
+        agent_id: agent_id.to_string(),
+        task_id: None,
+        execution_epoch: 1,
+        invocation_kind: "batch".to_string(),
+        a2a_parent_agent_run_id: None,
+        a2a_root_agent_run_id: None,
+        a2a_depth: 0,
+        camp_message_boundary_sequence: 0,
+        conversation_message_boundary_sequence: 0,
+        trigger_camp_message_id: None,
+        trigger_message_delivery_id: None,
+        trigger_conversation_message_id: None,
+        effective_config: json!({ "runtimeAdapter": adapter.as_str() }),
+        workspace: json!({}),
+        native_session_id: None,
+        native_binding_id: None,
+        native_binding_generation: 0,
+        last_accepted_public_boundary_sequence: 0,
+        claim_previous_public_boundary_sequence: None,
+        claim_has_additional_public_messages: None,
+        native_charter_digest: None,
+        native_collaboration_state_digest: None,
+        default_lead_agent_id: None,
+        skill_selection_snapshot: SkillSelectionSnapshot::default(),
+        skill_selection_snapshot_digest: "member-run-projection".to_string(),
+    };
+    let contents = claim::BootstrapContents::read(database, data_dir, &snapshot)?;
+    let identity = load_latest_member_identity(database, agent_id)?;
+    Ok(MemberProjectionBootstrap {
+        charter: contents.session_charter,
+        identity,
+        team_guidance: contents.team_guidance,
+        platform_skills: Some(contents.platform_skills),
+        memory_entrypoint: contents.memory_entrypoint,
+    })
 }
 
 fn compose_first_payload(bootstrap: &str, dynamic_context: &str) -> String {

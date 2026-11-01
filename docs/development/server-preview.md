@@ -176,7 +176,7 @@ Core 不代用户安装 Runtime（安装命令只作为指南展示）。远端�
    **Linux + Codex 必配**：Codex 的 Linux 沙箱（`workspace-write` / `read-only`）用 seccomp 拒绝 Unix socket，`rovai` 内置命令连不上 Core，所有 `rovai …` 一律返回 `builtin_tool.cli_error`。在该用户 `~/.codex/config.toml` 加 `[sandbox_workspace_write]` `network_access = true`（同时放开出网，按需评估），或给该队员用 `danger-full-access`。bero 实测：默认沙箱 `connect` 得 `EPERM`，加该项后连通。
 4. **只经加密通道访问**：loopback 监听，再用 Tailscale（推荐，只自己的设备可达）或出站隧道暴露；隧道地址必须与 `--public-origin` 一致，否则请求以 `origin_not_allowed` 拒绝。
 5. **从 Desktop 打开**：本地「设置 → 能力 → 远端主机」添加该地址后点「打开」，在独立窗口中用该 Server 的 Token 登录。该窗口是 Server 自己的页面；Claude Code 或 Codex 未检测到时，智能体页有配齐命令和重新检测。本地队员缺 Runtime 时，「消息未发送」提示与智能体列表的「未安装」行会出现「在远端主机打开」。
-6. **助手配置两端一致**：`node scripts/loom-profile.mjs export --host <源> --token-file <文件>` 导出队员身份 / 规则、MCP 及指派、工具箱选择；`apply --host <目标> … --dry-run` 先看计划再去掉 `--dry-run` 落地。按队员显示名匹配；MCP 密钥被主机打码，不进 profile，需另用 `--mcp-secrets` 提供。
+6. **助手配置两端一致**：`node scripts/loom-profile.mjs export --host <源> --token-file <文件>` 导出队员身份 / 规则、MCP 及指派、工具箱选择；`apply --host <目标> … --dry-run` 先看计划再去掉 `--dry-run` 落地。按队员显示名匹配；MCP 密钥被主机打码，不进 profile，需另用 `--mcp-secrets` 提供。落地后不必开 Run：`projection --host <主机> --token-file <文件> --member <id 或显示名> [--runtime codex-cli|claude-code] --out <文件.json>` 读取该队员下一次 Run 的 Bootstrap 正文和 MCP 投射（只读，密钥打码）。两端各出一份后 `projection --compare <左.json> <右.json>`，比较前去掉绝对路径、`agentId`、UUID、`agent_<记号>`、`sha256` 摘要和 ISO-8601 时间戳。显示名、章程、队员规则、MCP 命令和 URL 仍参与比较。
 
 ## 首个真实 Camp 复验
 

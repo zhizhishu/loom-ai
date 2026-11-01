@@ -478,8 +478,30 @@ fn materialize_projection(
     config_store: &McpConfigStore,
     request: &McpProjectionRequest<'_>,
 ) -> Result<ProjectionFile> {
+    materialize_projection_reading(config_store, request, true)
+}
+
+/// Servers a Run would place in its bundle. `initialize_missing` is the Run
+/// path (create an empty library). The preview passes false and does not write.
+pub(crate) fn materialize_member_servers(
+    config_store: &McpConfigStore,
+    request: &McpProjectionRequest<'_>,
+    initialize_missing: bool,
+) -> Result<BTreeMap<String, McpServerDefinition>> {
+    Ok(materialize_projection_reading(config_store, request, initialize_missing)?.servers)
+}
+
+fn materialize_projection_reading(
+    config_store: &McpConfigStore,
+    request: &McpProjectionRequest<'_>,
+    initialize_missing: bool,
+) -> Result<ProjectionFile> {
     let known = [request.agent_id.to_string()].into_iter().collect();
-    let (view, config) = config_store.get_with_raw(&known)?;
+    let (view, config) = if initialize_missing {
+        config_store.get_with_raw(&known)?
+    } else {
+        config_store.get_with_raw_readonly(&known)?
+    };
     let capability = AgentRuntimeAdapterRegistry::default().mcp_projection(request.adapter_kind);
     let mut exposure = McpExposureSnapshot {
         schema_version: MCP_PROJECTION_SCHEMA_VERSION,
