@@ -1,9 +1,9 @@
 ---
 document_type: model-context-change
 version: v1.72
-revision: 2
+revision: 3
 confirmation_status: confirmed
-confirmed_revision: 2
+confirmed_revision: 3
 confirmed_by: local_user
 confirmed_at: 2026-10-31
 last_updated: 2026-10-31
@@ -290,3 +290,61 @@ Follow `error.recovery` on failure; see [Recovery](recovery.md).
 - `bin/rovai.rs` 族帮助测试、`references/loom.md` 打包内容与本节逐字一致；`team_tool_catalog` / `builtin_tool` 测试通过。
 - bero `--lib loom` 与全量回归、CI、Windows 出包。
 - 真实任务 Gate 增加：两步依赖计划中，User 验收上游后回一句「继续」，Lead 派出下游任务并完成交付。
+
+## r3 修订（2026-11-01，已二次确认，未实施）
+
+起因：bero 远端真实冒烟（Mission `rvm_01a193ed…`，Lead 用 Codex + Octopus）中，叮叮已能执行 `rovai loom status` 并读到 LOOM 指引，但 `rovai loom plan` 连续返回 `builtin_tool.invalid_input`：`--help` 只列出 `criteria` / `tasks` / `dependencies` 是数组，没有每一项的字段；reference 也没有计划文件样例。本机用已装 `rovai.exe` 复现：正确样例通过校验；带 `assigneeAgentId: null`、多一个字段、字段名写错、`condition` 写大写，全部只得到同一句通用 `invalid_input`。
+
+只改模型可见文本，不改 schema、权限、身份注入或领域行为。
+
+### `loom.plan` description
+
+变更前：
+
+```text
+Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Does not start work; release tasks and message members separately.
+```
+
+变更后：
+
+```text
+Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Does not start work; release tasks and message members separately. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.
+```
+
+### `references/loom.md` 的 `## Plan` 节末尾追加（完整文本）
+
+````markdown
+Plan file shape (`rovai loom plan --input-file plan.json`). Every object has exactly these fields; leave an optional field out instead of sending `null`, and add no other fields:
+
+```json
+{
+  "goal": "Write a short project report",
+  "criteria": [
+    { "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }
+  ],
+  "tasks": [
+    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md" },
+    { "taskId": "report-review", "title": "Review the report" }
+  ],
+  "dependencies": [
+    { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-review", "condition": "task_done" }
+  ]
+}
+```
+
+Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAgentId` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself.
+````
+
+### r3 二次确认
+
+开发者（User，`local_user`）于 2026-11-01 在本会话看过 r3 要点（编排说明书加完整计划文件 JSON 样例；样例后注明「可选项省略、不要写 null、condition 用小写」；`loom.plan` 描述指向该 reference）后，经问答选项明确选择「确认，按 r3 实施」。实施尚未开始：本稿 r3 只落文案与样例，未改 schema、权限、身份注入或领域行为。
+
+### r3 明确不变
+
+工具名称与 inputSchema / outputSchema、身份注入、权限、`cli-operations` 的 `name` / `description`、平台 Skill 集合与 Bootstrap 字节、其余 reference 文本均与 r2 相同。
+
+### r3 验证
+
+- `--help` 与 reference 与本节逐字一致（`bin/rovai.rs`、`team_tool_catalog` 测试；reference 打包内容）。
+- reference 里的 JSON 样例原样过 `loom.plan` 封闭 schema（新增测试）。
+- bero 远端冒烟：同一个使命描述下，Lead 成功导入计划、放行、认领、登记证据并提交交付。
