@@ -741,6 +741,7 @@ export const SETTINGS_SIDEBAR_GROUPS: SettingsSidebarGroup[] = [
       { key: 'toolbox', icon: 'briefcase-business', label:"工具箱" },
       { key: 'remote', icon: 'monitor-smartphone', label:"远程连接" },
       { key: 'remoteHosts', icon: 'server', label:"远端主机" },
+      { key: 'nodes', icon: 'server', label:"节点" },
       { key: 'channels', icon: 'radio-tower', label:"渠道" }
     ]
   },

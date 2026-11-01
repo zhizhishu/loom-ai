@@ -5,6 +5,7 @@ const EXECUTION_CONSOLE_PLACEMENTS = new Set<ExecutionConsolePlacement>(['right'
 const SETTINGS_SECTIONS = new Set<SettingsSection>([
   'remote',
   'remoteHosts',
+  'nodes',
   'general',
   'memory',
   'skills',

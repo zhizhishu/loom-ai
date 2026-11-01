@@ -103,7 +103,7 @@ Server 根地址（`http(s)://host[:port]`）：地址由 Main 校验并规范�
 Renderer 只能按 id 操作：Main 侧 `ipcMain.handle('rovai:remote-hosts')` 要求发送方是主窗口主框架，
 renderer 无法让 App 加载任意 URL。渲染端能力白名单是 `business-environment.ts` 的 `remoteHost`；
 Web 与独立 Server 不提供该 API，因此桌面侧栏和移动端设置索引只在 API 存在时列出并显示“远端主机”，
-不会出现空面板。隔离夹具断言见 `pnpm test:settings-workspace`。
+不会出现空面板。「节点」紧接在它后面，Desktop、Web 和独立 Server 都显示。节点属于当前这份 Core，没有自己的库。隔离夹具断言见 `pnpm test:settings-workspace`。
 
 ## 生产组件与验收
 

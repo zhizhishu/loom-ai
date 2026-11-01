@@ -78,6 +78,7 @@ import { deleteRetiredManagedDirectory } from './quick-chat-cutover'
 import { CurrentUserProfileStore } from './current-user-profile'
 import { NavigationPreferencesStore } from './navigation-preferences'
 import { RemoteHostError, RemoteHostsStore, RemoteHostWindows } from './remote-hosts'
+import { nodeChannelCall, type NodeChannelSession } from './node-channel'
 import { isNavigationThreadReadState } from '../shared/navigation-preferences-model'
 import { revealProjectDirectory } from './reveal-project-directory'
 import {
@@ -440,6 +441,7 @@ let restorableLocations: RestorableLocationStore | null = null
 let navigationPreferences: NavigationPreferencesStore | null = null
 let remoteHosts: RemoteHostsStore | null = null
 const remoteHostWindows = new RemoteHostWindows()
+const nodeChannelSession: NodeChannelSession = { current: null }
 let desktopBackgroundTimer: NodeJS.Timeout | null = null
 let dailyAnalysis: DailyAnalysisService | null = null
 let evaluationHost: EvaluationHostService | null = null
@@ -1336,6 +1338,24 @@ ipcMain.handle('rovai:host-web', async (event, operation: unknown, value: unknow
       message: '远程连接操作未完成，请稍后重试。', retryable: false,
       generation: core.getSnapshot().generation, details: {}
     } }
+  }
+})
+
+ipcMain.handle('rovai:nodes', async (event, operation: unknown, value: unknown) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
+    || event.senderFrame !== event.sender.mainFrame) {
+    return { ok: false, code: 'nodes_unavailable' }
+  }
+  if (operation !== 'list' && operation !== 'pair' && operation !== 'revoke') {
+    return { ok: false, code: 'nodes_unavailable' }
+  }
+  const nodeId = value && typeof value === 'object' && typeof (value as { nodeId?: unknown }).nodeId === 'string'
+    ? (value as { nodeId: string }).nodeId
+    : undefined
+  try {
+    return await nodeChannelCall(core, nodeChannelSession, operation, nodeId, fetch)
+  } catch {
+    return { ok: false, code: 'nodes_unavailable' }
   }
 })
 

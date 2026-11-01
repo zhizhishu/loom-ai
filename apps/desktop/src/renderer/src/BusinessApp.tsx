@@ -21,6 +21,7 @@ import { AppHeader } from './AppHeader'
 import { MobileLayoutProvider, MobilePageHeader, useMobilePageTransition, useMobileViewport } from './MobileLayout'
 import { MobileSettingsLayout } from './MobileSettingsLayout'
 import { RemoteHostsSettings } from './RemoteHostsSettings'
+import { NodesSettings } from './NodesSettings'
 export { AppHeader } from './AppHeader'
 import { CurrentUserProfileProvider } from './CurrentUserProfile'
 import { readErrorMessage } from './error-message'
@@ -4606,6 +4607,7 @@ export function BusinessApp({
             nativeSettings={environment.desktop && { windowControls: environment.desktop.windowControls, windowClose: environment.desktop.windowClose }}
             remoteConnection={environment.desktop?.hostWeb ? <HostWebSettings portDraft={remotePort} onPortDraftChange={setRemotePort} api={environment.desktop.hostWeb} /> : remoteConnection}
             remoteHosts={environment.desktop?.remoteHost ? <RemoteHostsSettings api={environment.desktop.remoteHost} /> : undefined}
+            nodes={<NodesSettings api={environment.nodes} onOpenRemoteHosts={environment.desktop?.remoteHost ? () => chooseSettingsSection('remoteHosts') : undefined} />}
             zoomManagedBy={environment.desktop ? 'desktop' : 'browser'}
             platform={client.platform}
             appearance={appearance}
@@ -4907,6 +4909,7 @@ export function SettingsView({
   preferencesApi,
   remoteConnection,
   remoteHosts,
+  nodes,
   nativeSettings,
   zoomManagedBy = 'desktop',
   platform = 'darwin',
@@ -4929,6 +4932,7 @@ export function SettingsView({
   teams?: Team[]
   remoteConnection?: React.ReactNode
   remoteHosts?: React.ReactNode
+  nodes?: React.ReactNode
   preferencesApi: import('@contracts').GeneralPreferencesApi
   nativeSettings?: { windowControls: import('@contracts').WindowControlsApi; windowClose?: import('@contracts').WindowCloseApi; browserAccess?: React.ReactNode }
   zoomManagedBy?: 'desktop' | 'browser'
@@ -4954,6 +4958,7 @@ export function SettingsView({
       <div className={`settings-panel settings-panel-${section}${section === 'shortcuts' ? ' settings-panel-general' : ''}`}>
         {section === 'remote' && remoteConnection}
         {section === 'remoteHosts' && remoteHosts}
+        {section === 'nodes' && nodes}
         {section === 'general' && (
           <GeneralSettings
             api={preferencesApi}

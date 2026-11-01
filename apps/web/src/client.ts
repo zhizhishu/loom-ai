@@ -5,7 +5,7 @@ import { fileDigest } from './file-digest'
 import { uploadRequest } from './upload-request'
 import { newCommandId } from '../../desktop/src/shared/command-id'
 import { recoverLocalThreadSend } from '../../desktop/src/renderer/src/camp-composer-send-recovery'
-import type { ThreadReadInvalidation, ChannelKind, ChannelSettingsSnapshot, FilePreviewBinaryContent, FilePreviewOperationResult, LocalAttachmentSourceView } from '@contracts'
+import type { ThreadReadInvalidation, ChannelKind, ChannelSettingsSnapshot, ExecutionNodeList, ExecutionNodePairing, ExecutionNodeRevocation, FilePreviewBinaryContent, FilePreviewOperationResult, LocalAttachmentSourceView } from '@contracts'
 
 const HOST_WEB_PROTOCOL_VERSION = 5
 
@@ -1061,6 +1061,41 @@ export class ConsoleClient {
               : '渠道操作结果暂时无法确认。请重新读取发布状态，再继续原发布流程。'
       throw new CoreRequestError(error.code, message)
     }
+  }
+
+  /** Node routes stay off the domain-command allowlist and do not flip the app connection. */
+  async listNodes(): Promise<ExecutionNodeList> {
+    return this.#node('nodes', 'GET')
+  }
+
+  async pairNode(): Promise<ExecutionNodePairing> {
+    return this.#node('nodes/pair', 'POST')
+  }
+
+  async revokeNode(nodeId: string): Promise<ExecutionNodeRevocation> {
+    return this.#node(`nodes/${encodeURIComponent(nodeId)}/revoke`, 'POST')
+  }
+
+  async #node<T>(path: string, method: 'GET' | 'POST'): Promise<T> {
+    if (!path.startsWith('nodes')) throw new HttpRequestError(400, 'nodes_unavailable')
+    if (!this.#token) throw new SessionRequired()
+    this.#assertConnected(true)
+    if (this.#localExpiry !== null && this.#localExpiry - this.#now() <= this.#renewalWindow) await this.renewIfNeeded()
+    let response: Response
+    try {
+      response = await this.#fetch(`${this.origin}/api/v1/${path}`, {
+        method, credentials: 'omit', redirect: 'error', cache: 'no-store',
+        headers: { Accept: 'application/json', ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}), Authorization: `Bearer ${this.#token}` },
+        signal: this.#lifetime.signal
+      })
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      throw new HttpRequestError(0, 'nodes_unavailable')
+    }
+    if (response.status === 401) { await this.#forgetAuthentication(); throw new SessionRequired() }
+    const body = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } }
+    if (!response.ok) throw new HttpRequestError(response.status, body.error?.code ?? 'nodes_unavailable', sessionStorageMessage(body))
+    return body as T
   }
 
   async getWorkspaces(path?: string, offset = 0): Promise<WorkspaceListing> {

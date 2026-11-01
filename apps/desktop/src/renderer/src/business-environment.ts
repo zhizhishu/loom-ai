@@ -1,6 +1,7 @@
 import type { RovaiApi } from '@contracts'
 import type { ThreadClient } from './camp-client'
 import type { FilePreviewApi } from '@contracts'
+import type { NodeApi } from './nodes-api'
 
 /** Only dependencies the production business shell uses; never a replacement window.rovai. */
 export interface BusinessEnvironment {
@@ -9,6 +10,7 @@ export interface BusinessEnvironment {
   files: FilePreviewApi
   preferences: Pick<RovaiApi, 'appearance' | 'generalPreferences' | 'navigationPreferences'>
   selectWorkspaceDirectory: RovaiApi['selectWorkspaceDirectory']
+  nodes: NodeApi
   revealProjectDirectory?: RovaiApi['revealProjectDirectory']
   serverUpdates?: RovaiApi['appUpdates']
   /** Native startup, updates, lifecycle and notification integration are absent on Web. */
