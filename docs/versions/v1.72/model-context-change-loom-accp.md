@@ -6,7 +6,7 @@ confirmation_status: confirmed
 confirmed_revision: 3
 confirmed_by: local_user
 confirmed_at: 2026-10-31
-last_updated: 2026-10-31
+last_updated: 2026-11-01
 ---
 
 # LOOM 编排入口：Agent CLI `rovai loom` 与 cli-operations 参考
@@ -291,7 +291,7 @@ Follow `error.recovery` on failure; see [Recovery](recovery.md).
 - bero `--lib loom` 与全量回归、CI、Windows 出包。
 - 真实任务 Gate 增加：两步依赖计划中，User 验收上游后回一句「继续」，Lead 派出下游任务并完成交付。
 
-## r3 修订（2026-11-01，已二次确认，未实施）
+## r3 修订（2026-11-01，已二次确认，已实施）
 
 起因：bero 远端真实冒烟（Mission `rvm_01a193ed…`，Lead 用 Codex + Octopus）中，叮叮已能执行 `rovai loom status` 并读到 LOOM 指引，但 `rovai loom plan` 连续返回 `builtin_tool.invalid_input`：`--help` 只列出 `criteria` / `tasks` / `dependencies` 是数组，没有每一项的字段；reference 也没有计划文件样例。本机用已装 `rovai.exe` 复现：正确样例通过校验；带 `assigneeAgentId: null`、多一个字段、字段名写错、`condition` 写大写，全部只得到同一句通用 `invalid_input`。
 
@@ -337,7 +337,16 @@ Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAg
 
 ### r3 二次确认
 
-开发者（User，`local_user`）于 2026-11-01 在本会话看过 r3 要点（编排说明书加完整计划文件 JSON 样例；样例后注明「可选项省略、不要写 null、condition 用小写」；`loom.plan` 描述指向该 reference）后，经问答选项明确选择「确认，按 r3 实施」。实施尚未开始：本稿 r3 只落文案与样例，未改 schema、权限、身份注入或领域行为。
+开发者（User，`local_user`）于 2026-11-01 在本会话看过 r3 要点（编排说明书加完整计划文件 JSON 样例；样例后注明「可选项省略、不要写 null、condition 用小写」；`loom.plan` 描述指向该 reference）后，经问答选项明确选择「确认，按 r3 实施」。
+
+### r3 实施
+
+按确认稿落地，未再改语义，因此未递增 revision。
+
+- `loom.plan` 的 description 改为本节「变更后」全文（`crates/rovai-core/src/loom_tool.rs`）。`rovai loom plan --help` 仍由既有 formatter 生成，这段 description 打在帮助开头。
+- `skills/cli-operations/references/loom.md` 的 `## Plan` 节末追加本节样例与说明。打包字节仍是 `skill.rs` 的 `CLI_OPERATIONS_LOOM_REFERENCE`（`include_str!` 同一文件）。
+- 封闭 inputSchema / outputSchema、权限、身份注入、领域行为未改。
+- 未让 `builtin_tool.invalid_input` 点名出错字段。该通用句来自共享 CLI 解释器：它只检查顶层字段；`criteria` / `tasks` / `dependencies` 数组内部的 `null`、多余字段、字段名错误、大写 `condition` 产生不出 issue，于是落回同一句。要报出字段就得让这个解释器走入数组元素，那会改变所有封闭工具的模型可见报错，超出本稿「只改模型可见文本」的范围。
 
 ### r3 明确不变
 
@@ -346,5 +355,20 @@ Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAg
 ### r3 验证
 
 - `--help` 与 reference 与本节逐字一致（`bin/rovai.rs`、`team_tool_catalog` 测试；reference 打包内容）。
-- reference 里的 JSON 样例原样过 `loom.plan` 封闭 schema（新增测试）。
-- bero 远端冒烟：同一个使命描述下，Lead 成功导入计划、放行、认领、登记证据并提交交付。
+- reference 里的 JSON 样例原样过 `loom.plan` 封闭 schema（新增测试）。同一测试确认 `null`、多余字段、错字段名、大写 `condition` 仍被封闭 schema 拒绝。
+- bero 远端冒烟：同一个使命描述下，Lead 成功导入计划、放行、认领、登记证据并提交交付。尚未在本提交重跑。
+
+### r3 实施验收记录
+
+在 r3 确认稿（`c907b97`）之后实施。schema、权限、身份注入与领域行为未改。`builtin_tool.invalid_input` 仍是共享 CLI 的通用句，原因见上。远端冒烟未在本提交重跑。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过（rustc 1.97.1） |
+| `cargo check -p rovai-core --all-targets` | 通过，exit 0（既有 warning，无 error） |
+| `cargo test -p rovai-core --lib loom` | 85 passed / 0 failed / 0 ignored |
+| `cargo test -p rovai-core --bin rovai loom_plan_help` | 1 passed / 0 failed（`loom.plan --help` 描述逐字钉住） |
+| `pnpm typecheck` | 通过，exit 0 |
+| `pnpm docs:check` | 通过 |
+
+以 root 跑全量 `rovai-core` 时，3 个 `database_admission` 测试会因 SQLite WAL ctime 失败；本轮过滤未包含它们，未复跑。
