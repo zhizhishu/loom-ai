@@ -44,6 +44,8 @@ enum Command {
     Paths,
     /// Print a one-time pairing code for a node that will dial this server.
     NodePair,
+    /// Print connected and offline nodes, including the last CLI report.
+    NodeList,
     /// Run one CLI on a connected node and print its stdout.
     NodeExec {
         /// Adapter kind reported by the node, for example `codex-cli`.
@@ -81,6 +83,9 @@ pub fn run() -> Result<()> {
     }
     if matches!(cli.command, Some(Command::NodePair)) {
         return crate::node_cli::pair(&data_dir);
+    }
+    if matches!(cli.command, Some(Command::NodeList)) {
+        return crate::node_cli::list(&data_dir);
     }
     if let Some(Command::NodeExec { runtime, cwd, args }) = &cli.command {
         return crate::node_cli::exec(&data_dir, runtime, cwd, args);

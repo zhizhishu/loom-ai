@@ -1,4 +1,4 @@
-//! `node-pair` and `node-exec` talk to the already running server.
+//! `node-pair`, `node-list`, and `node-exec` talk to the already running server.
 //! They do not start a second Core.
 
 use anyhow::{Context, Result, bail};
@@ -66,6 +66,13 @@ pub(crate) fn pair(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn list(data_dir: &Path) -> Result<()> {
+    let runtime = command_runtime()?;
+    let body = runtime.block_on(list_async(data_dir))?;
+    println!("{body}");
+    Ok(())
+}
+
 pub(crate) fn exec(data_dir: &Path, runtime_kind: &str, cwd: &str, args: &[String]) -> Result<()> {
     let runtime = command_runtime()?;
     let outcome = runtime.block_on(exec_async(data_dir, runtime_kind, cwd, args))?;
@@ -114,6 +121,28 @@ async fn pair_async(data_dir: &Path) -> Result<(String, String)> {
         body.connect_url
     };
     Ok((body.pairing_code, connect_url))
+}
+
+async fn list_async(data_dir: &Path) -> Result<String> {
+    let (origin, client, session) = connect_admin(data_dir).await?;
+    let response = client
+        .get(format!("{origin}/api/v1/nodes"))
+        .bearer_auth(session)
+        .send()
+        .await
+        .context("node list request failed")?;
+    let status = response.status();
+    let bytes = response.bytes().await.context("empty server response")?;
+    if !status.is_success() {
+        let code = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value["error"]["code"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| status.to_string());
+        bail!("server rejected the node command ({code})");
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("node list was not JSON")?;
+    serde_json::to_string_pretty(&value).context("node list")
 }
 
 async fn exec_async(

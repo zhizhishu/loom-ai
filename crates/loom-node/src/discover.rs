@@ -1,10 +1,32 @@
 use crate::CliReport;
-use std::{path::PathBuf, time::Duration};
+use std::{ffi::OsStr, path::PathBuf, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
 
-/// B1 reports the two one-shot CLIs the milestone can dispatch.
-/// The rest of the adapter catalog is B3.
-const KNOWN: &[(&str, &str)] = &[("codex-cli", "codex"), ("claude-code-cli", "claude")];
+/// Adapter kinds the node can report, with the executable names it looks for
+/// on `PATH`. This is the same catalog the desktop discovers. Cursor's generic
+/// `agent` alias is intentionally absent: other products ship that name.
+const CATALOG: &[(&str, &[&str])] = &[
+    ("codex-cli", &["codex"]),
+    ("pi", &["pi"]),
+    ("opencode-cli", &["opencode"]),
+    ("copilot-cli", &["copilot"]),
+    ("claude-code-cli", &["claude"]),
+    ("cline-cli", &["cline"]),
+    ("command-code-cli", &["command-code", "cmdc"]),
+    ("kiro-cli", &["kiro-cli"]),
+    ("qoder-cli", &["qodercli"]),
+    ("codebuddy-cli", &["codebuddy"]),
+    ("qwen-code", &["qwen"]),
+    ("trae-cn-cli", &["traecli"]),
+    ("cursor-agent", &["cursor-agent"]),
+    ("kimi-code-cli", &["kimi"]),
+    ("minimax-code-cli", &["mcode"]),
+    ("hermes-cli", &["hermes"]),
+    ("grok-build", &["grok"]),
+    ("deepseek-harness", &["dsh"]),
+    ("zcode-app", &["ZCode"]),
+    ("antigravity-app", &["agy"]),
+];
 
 /// The program A asked to run must be the binary this node discovered for that
 /// runtime. The returned path is the one to execute; a server-supplied path that
@@ -27,9 +49,16 @@ pub fn resolve_executable(
 }
 
 pub async fn installed_clis() -> Vec<CliReport> {
+    match std::env::var_os("PATH") {
+        Some(path) => installed_clis_in(&path).await,
+        None => Vec::new(),
+    }
+}
+
+async fn installed_clis_in(path_env: &OsStr) -> Vec<CliReport> {
     let mut found = Vec::new();
-    for (adapter_kind, command) in KNOWN {
-        let Some(path) = which(command) else {
+    for (adapter_kind, commands) in CATALOG {
+        let Some(path) = which_in(path_env, commands) else {
             continue;
         };
         let version = version_of(&path).await;
@@ -43,12 +72,13 @@ pub async fn installed_clis() -> Vec<CliReport> {
     found
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+fn which_in(path_env: &OsStr, names: &[&str]) -> Option<PathBuf> {
+    for name in names {
+        for dir in std::env::split_paths(path_env) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+            }
         }
     }
     None
@@ -87,6 +117,52 @@ mod tests {
             resolve_executable(&clis, "claude-code-cli", &codex.display().to_string()).is_none()
         );
         assert!(resolve_executable(&clis, "codex-cli", "/bin/sh").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn discovery_reports_the_rest_of_the_catalog_and_not_a_generic_agent() {
+        assert!(CATALOG.iter().any(|(kind, _)| *kind == "claude-code-cli"));
+        assert!(
+            CATALOG
+                .iter()
+                .any(|(kind, names)| { *kind == "cursor-agent" && *names == ["cursor-agent"] })
+        );
+        assert!(!CATALOG.iter().any(|(_, names)| names.contains(&"agent")));
+        let root = std::env::temp_dir().join(format!(
+            "loom-node-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["codex", "pi", "cmdc", "agent"] {
+            let path = root.join(name);
+            std::fs::write(
+                &path,
+                b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo b3; exit 0; fi\nexit 0\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let found = installed_clis_in(root.as_os_str()).await;
+        let kinds: Vec<_> = found.iter().map(|cli| cli.adapter_kind.as_str()).collect();
+        assert!(kinds.contains(&"codex-cli"), "{kinds:?}");
+        assert!(kinds.contains(&"pi"), "{kinds:?}");
+        assert!(kinds.contains(&"command-code-cli"), "{kinds:?}");
+        assert!(!kinds.contains(&"cursor-agent"), "{kinds:?}");
+        assert!(!kinds.contains(&"claude-code-cli"), "{kinds:?}");
+        assert!(
+            found
+                .iter()
+                .all(|cli| cli.path_present && cli.path != "path_missing")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
