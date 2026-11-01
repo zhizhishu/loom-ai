@@ -616,6 +616,15 @@ fn request_error_body(error: &anyhow::Error) -> ErrorBody {
             details: json!({}),
         };
     }
+    if let Some(error) = error.downcast_ref::<crate::member_capability::MemberCapabilityError>() {
+        return ErrorBody {
+            kind: "domain_rejection",
+            code: error.code().to_string(),
+            message: error.message().to_string(),
+            retryable: false,
+            details: error.details().clone(),
+        };
+    }
     if let Some(error) = error.downcast_ref::<CommandGatewayError>() {
         let code = match error {
             CommandGatewayError::InvalidEnvelope(_) => "COMMAND_ENVELOPE_INVALID",
@@ -9921,6 +9930,45 @@ impl Core {
                     crate::run_projection::preview_member_run_projection(
                         &database,
                         &self.data_dir,
+                        self.mcp_config()?,
+                        &params,
+                    )?,
+                )?)
+            }
+            "members.capabilityCatalog.get" => {
+                self.subsystems.require("mcp")?;
+                let params: crate::member_capability::MemberCapabilityGetParams =
+                    serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                Ok(serde_json::to_value(
+                    crate::member_capability::get_member_capability_catalog(
+                        &database,
+                        self.mcp_config()?,
+                        &params.agent_id,
+                    )?,
+                )?)
+            }
+            "members.capabilityCatalog.set" => {
+                self.subsystems.require("mcp")?;
+                let params: crate::member_capability::MemberCapabilitySetParams =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                Ok(serde_json::to_value(
+                    crate::member_capability::set_member_capability_catalog(
+                        &mut database,
+                        self.mcp_config()?,
+                        &params,
+                    )?,
+                )?)
+            }
+            "members.capabilityCatalog.putItem" => {
+                self.subsystems.require("mcp")?;
+                let params: crate::member_capability::MemberCapabilityPutParams =
+                    serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                Ok(serde_json::to_value(
+                    crate::member_capability::put_capability_item(
+                        &database,
                         self.mcp_config()?,
                         &params,
                     )?,

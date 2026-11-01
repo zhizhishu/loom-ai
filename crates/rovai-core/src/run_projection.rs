@@ -68,6 +68,12 @@ pub(crate) struct MemberRunProjection {
     pub runtime: String,
     pub bootstrap: String,
     pub mcp: Value,
+    /// Toolbox skills the next Run's additional-skill section will carry.
+    pub skills: Vec<crate::member_capability::ProjectedCapability>,
+    /// Selected rule snippets. They are not written into the session bootstrap.
+    pub rules: Vec<crate::member_capability::ProjectedCapability>,
+    /// Selected hooks. They are not written into the session bootstrap.
+    pub hooks: Vec<crate::member_capability::ProjectedCapability>,
 }
 
 pub(crate) fn preview_member_run_projection(
@@ -106,12 +112,17 @@ pub(crate) fn preview_member_run_projection(
         },
         false,
     )?;
+    let (skills, rules, hooks) =
+        crate::member_capability::projection_additions(database, config_store, &profile.agent_id)?;
     Ok(MemberRunProjection {
         agent_id: profile.agent_id,
         display_name: profile.display_name,
         runtime: runtime_name(adapter)?.to_string(),
         bootstrap,
         mcp: redact_run_mcp_document(&run_bundle_mcp_document(adapter, &servers)?),
+        skills,
+        rules,
+        hooks,
     })
 }
 
