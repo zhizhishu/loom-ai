@@ -94,6 +94,11 @@ const api: RovaiApi = {
     remove: (input: { id: string }) => ipcRenderer.invoke('rovai:remote-hosts', 'remove', input),
     open: (input: { id: string }) => ipcRenderer.invoke('rovai:remote-hosts', 'open', input)
   },
+  nodes: {
+    list: () => ipcRenderer.invoke('rovai:nodes', 'list'),
+    pair: () => ipcRenderer.invoke('rovai:nodes', 'pair'),
+    revoke: (nodeId: string) => ipcRenderer.invoke('rovai:nodes', 'revoke', { nodeId })
+  },
   async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
     const transport = await ipcRenderer.invoke(
       'rovai:request',

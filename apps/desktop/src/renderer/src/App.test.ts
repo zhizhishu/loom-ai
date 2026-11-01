@@ -1,6 +1,7 @@
 import { languageTestApi } from './interface-language-test-api'
 import { RemoteConnectionStatus } from './RemoteConnectionStatus'
 import { RemoteHostsSettings } from './RemoteHostsSettings'
+import { NodesSettings } from './NodesSettings'
 import { VISIBLE_PRODUCT_RUNTIMES } from './runtime-products'
 import { DEFAULT_APPEARANCE } from '../../shared/appearance'
 import { DEFAULT_GENERAL_PREFERENCES } from '../../shared/general-preferences-model'
@@ -3401,7 +3402,9 @@ describe('task event projections', () => {
     expect(capabilitiesGroup.indexOf('<strong>MCP</strong>')).toBeLessThan(capabilitiesGroup.indexOf('<strong>Skills</strong>'))
     expect(capabilitiesGroup.indexOf('<strong>Skills</strong>')).toBeLessThan(capabilitiesGroup.indexOf('<strong>工具箱</strong>'))
     expect(capabilitiesGroup.indexOf('<strong>工具箱</strong>')).toBeLessThan(capabilitiesGroup.indexOf('<strong>远程连接</strong>'))
-    expect(capabilitiesGroup.indexOf('<strong>远程连接</strong>')).toBeLessThan(capabilitiesGroup.indexOf('<strong>渠道</strong>'))
+    expect(capabilitiesGroup).toContain('<strong>节点</strong>')
+    expect(capabilitiesGroup.indexOf('<strong>远程连接</strong>')).toBeLessThan(capabilitiesGroup.indexOf('<strong>节点</strong>'))
+    expect(capabilitiesGroup.indexOf('<strong>节点</strong>')).toBeLessThan(capabilitiesGroup.indexOf('<strong>渠道</strong>'))
     expect(supportGroup).toContain('<strong>诊断与修复</strong>')
     expect(supportGroup).toContain('<strong>运行监控</strong>')
     expect(supportGroup).toContain('<strong>关于与更新</strong>')
@@ -3432,6 +3435,7 @@ describe('task event projections', () => {
     const contentBySection: Record<Exclude<NavigationSettingsSection, 'memory'>, string> = {
       remote: '远程连接',
       remoteHosts: '远端主机',
+      nodes: '节点',
       general: '通用',
       skills: 'Skills',
       toolbox: '工具箱',
@@ -3452,7 +3456,7 @@ describe('task event projections', () => {
       open: async () => ({ ok: true, value: null })
     }
     for (const [section, heading] of Object.entries(contentBySection) as Array<[NavigationSettingsSection, string]>) {
-      const markup = renderToStaticMarkup(createElement(SettingsView, { remoteConnection: createElement(RemoteConnectionStatus, { origin: 'http://fixture.invalid', state: 'live', onLogout: () => undefined }), remoteHosts: createElement(RemoteHostsSettings, { api: remoteHostTestApi }), preferencesApi: {} as import('@contracts').GeneralPreferencesApi, ...baseProps, section }))
+      const markup = renderToStaticMarkup(createElement(SettingsView, { remoteConnection: createElement(RemoteConnectionStatus, { origin: 'http://fixture.invalid', state: 'live', onLogout: () => undefined }), remoteHosts: createElement(RemoteHostsSettings, { api: remoteHostTestApi }), nodes: createElement(NodesSettings, { api: { list: async () => ({ nodes: [] }), pair: async () => ({ pairingCode: 'code', expiresInSeconds: 600, connectUrl: 'ws://127.0.0.1:9/api/v1/nodes/connect' }), revoke: async () => ({ nodeId: 'node', revokedAt: '', status: 'offline' }) } }), preferencesApi: {} as import('@contracts').GeneralPreferencesApi, ...baseProps, section }))
       if (section === 'shortcuts') {
         expect(markup).not.toContain('<h1>快捷键</h1>') // Desktop capability is required.
       } else if (section === 'mcp') {

@@ -1,5 +1,5 @@
 ---
-version: 24
+version: 25
 slug: "settings-workspace"
 primary_target: "apps/desktop/src/renderer/src/SettingsPageHeader.tsx"
 related_targets:
@@ -13,6 +13,8 @@ related_targets:
   - "apps/desktop/src/renderer/src/AboutUpdatesSettings.tsx"
   - "apps/desktop/src/renderer/src/RuntimeStartupSettings.tsx"
   - "apps/desktop/src/renderer/src/RemoteRuntimeProvision.tsx"
+  - "apps/desktop/src/renderer/src/NodesSettings.tsx"
+  - "apps/desktop/src/renderer/src/nodes-settings.css"
   - "apps/desktop/src/renderer/src/remote-runtime-provision.ts"
 ---
 
@@ -367,3 +369,13 @@ runtime checks. Preserve failed drafts and field conflict recovery. Behavior is 
 输入不改写草稿，保存成功才展示字符串形式。
 由队员进入时使用具名返回入口，保留其草稿和位置；直接进入保留原返回。精确数据规则见
 [Runtime Launch v69](../../../../docs/contracts/runtime-launch-and-verification-v69.md)。
+
+## 节点
+
+能力组在远端主机后面放「节点」。Desktop、Web 和独立 Server 都显示；远端主机仍只在 Desktop。
+页首说明本机和拨入的机器都是这一份 Core 的执行节点，并链到远端主机（那一页不存在时只保留说明）。
+本机行不能作废。远端行显示在线或离线、心跳、操作系统和架构、上报的 CLI 与版本、在跑的 Run。
+展开后才是那台机器上的路径；离线行保留上次上报，状态写「上次见到」。空列表仍留下本机，文案是「还没有拨入的节点」。
+首次读取失败不画节点。已经读到的列表在后来的刷新失败时留下来，并在上方报错。
+添加节点给出一次性配对码和可复制的 `loom-node` 命令，不显示节点令牌。未使用且未过期的码再次打开仍是同一条。
+空闲节点作废是普通确认。还有在途 Run 时必须输入节点名。两种确认都写明令牌失效、在途进程由节点自己杀掉并上报、磁盘上的文件还在。

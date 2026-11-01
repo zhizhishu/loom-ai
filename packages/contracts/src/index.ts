@@ -3165,6 +3165,7 @@ export type SettingsSection =
   | 'memory'
   | 'remote'
   | 'remoteHosts'
+  | 'nodes'
   | 'general'
   | 'skills'
   | 'toolbox'
@@ -4565,6 +4566,68 @@ export interface HostWebApi {
   rotate(): Promise<HostWebStatus & { administratorToken: string }>
 }
 
+export interface ExecutionNodeCli {
+  adapterKind: string
+  path: string
+  version: string | null
+  pathPresent: boolean
+  reportedAt: string
+  /** `reported`, `last_seen`, or `path_missing` once the node list includes it. */
+  availability?: string
+}
+
+export interface ExecutionNodeRun {
+  runId: string
+  attempt: number
+  runtime: string
+  status: string
+  ackedSeq: number
+}
+
+/** One row of `GET /api/v1/nodes`. The node token is never included. */
+export interface ExecutionNodeRecord {
+  nodeId: string
+  displayName: string
+  role: string
+  revocable: boolean
+  status: string
+  os: string | null
+  arch: string | null
+  pairedAt: string
+  revokedAt: string | null
+  lastHeartbeat: string | null
+  activeRunCount: number
+  activeRuns: ExecutionNodeRun[]
+  clis: ExecutionNodeCli[]
+}
+
+export interface ExecutionNodeList {
+  nodes: ExecutionNodeRecord[]
+}
+
+export interface ExecutionNodePairing {
+  pairingCode: string
+  expiresInSeconds: number
+  connectUrl: string
+  /** True when the URL is the listen address, not a configured public origin. */
+  reachabilityWarning?: boolean
+}
+
+export interface ExecutionNodeRevocation {
+  nodeId: string
+  revokedAt: string
+  status: string
+}
+
+export type NodeChannelResult<T> = { ok: true; value: T } | { ok: false; code: string }
+
+/** Desktop bridge. The renderer never receives the administrator or node token. */
+export interface NodeChannelApi {
+  list(): Promise<NodeChannelResult<ExecutionNodeList>>
+  pair(): Promise<NodeChannelResult<ExecutionNodePairing>>
+  revoke(nodeId: string): Promise<NodeChannelResult<ExecutionNodeRevocation>>
+}
+
 /**
  * Same shape as `apps/desktop/src/shared/remote-host.ts` `RemoteHostEntry`.
  * Declared here rather than imported because `packages/contracts` must not
@@ -4605,6 +4668,8 @@ export interface RovaiApi {
   hostWeb?: HostWebApi
   /** Local Desktop owner only; opens saved remote Servers in isolated windows. */
   remoteHost?: RemoteHostApi
+  /** Local Desktop owner only; proxies the node HTTP API through Main. */
+  nodes?: NodeChannelApi
   request<T>(method: CoreMethod, params?: unknown): Promise<T>
   onEvent(listener: (event: CoreEvent) => void): () => void
   appLifecycle: {

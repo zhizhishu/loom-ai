@@ -140,6 +140,7 @@ async fn connect_once(
             arch: std::env::consts::ARCH.to_owned(),
             clis: shared.clis.clone(),
             runs,
+            hostname: crate::machine_hostname(),
         },
     )
     .await?;

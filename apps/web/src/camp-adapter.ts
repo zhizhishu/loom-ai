@@ -2,6 +2,7 @@ import { createBrowserHtmlPreview } from './html-preview'
 import { browserMemberAvatars } from './member-avatars'
 import type { ThreadClient } from '../../desktop/src/renderer/src/camp-client'
 import type { BusinessEnvironment } from '../../desktop/src/renderer/src/business-environment'
+import type { NodeApi } from '../../desktop/src/renderer/src/nodes-api'
 import type { ThreadReadInvalidation, SingleChatSnapshot, CoreMethod, FilePreviewApi, FilePreviewExternalUpdateEvent, FilePreviewOperationResult, OpenFilePreviewResult, RestoreFilePreviewRequest, LocalAttachmentSourceView } from '@contracts'
 import { ConsoleClient, HttpRequestError, WEB_OPERATIONS, type WebOperation } from './client'
 import { createBrowserNavigationHistory } from './navigation-history'
@@ -223,7 +224,12 @@ export function createThreadAdapter(transport: ConsoleClient, selectWorkspaceDir
     } catch (error) { throw error instanceof Error ? error : new Error('下载申请失败，请重试。') }
   } }
   const { preferences, profile } = browserPreferences(transport.presentationScope, transport)
-  const environment: BusinessEnvironment = { navigationHistory: createBrowserNavigationHistory(transport.editingScope), client, preferences, files, selectWorkspaceDirectory,
+  const nodes: NodeApi = {
+    list: () => transport.listNodes(),
+    pair: () => transport.pairNode(),
+    revoke: nodeId => transport.revokeNode(nodeId)
+  }
+  const environment: BusinessEnvironment = { navigationHistory: createBrowserNavigationHistory(transport.editingScope), client, preferences, files, selectWorkspaceDirectory, nodes,
     serverUpdates: transport.channels === 'desktop' ? undefined : createServerUpdates(transport) }
   return { environment, profile, invalidate: (change: ThreadReadInvalidation = { resync: true }) => { for (const listener of listeners) listener(change); void refreshUpdates() } }
 }

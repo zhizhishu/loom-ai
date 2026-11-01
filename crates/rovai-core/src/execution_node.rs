@@ -116,6 +116,30 @@ pub fn schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     )? && local_index)
 }
 
+fn generated_remote_name(node_id: &str) -> Option<String> {
+    let tail = node_id.get(5..13)?;
+    if tail.len() == 8 && tail.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(format!("node-{tail}"))
+    } else {
+        None
+    }
+}
+
+fn usable_hostname(hostname: &str) -> Option<&str> {
+    let hostname = hostname.trim();
+    if hostname.is_empty()
+        || hostname.len() > 64
+        || hostname.starts_with(['-', '.'])
+        || hostname.ends_with(['-', '.'])
+        || !hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    {
+        return None;
+    }
+    Some(hostname)
+}
+
 fn now_stamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -340,6 +364,24 @@ impl NodeStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Replace the generated `node-xxxxxxxx` name with the host name from Hello.
+    /// A name that is no longer that generated label is left alone.
+    pub fn adopt_reported_hostname(&self, node_id: &str, hostname: &str) -> Result<bool> {
+        let Some(hostname) = usable_hostname(hostname) else {
+            return Ok(false);
+        };
+        let Some(generated) = generated_remote_name(node_id) else {
+            return Ok(false);
+        };
+        let connection = self.lock()?;
+        let updated = connection.execute(
+            "UPDATE execution_node SET display_name=?3
+              WHERE node_id=?1 AND role='remote' AND revoked_at IS NULL AND display_name=?2",
+            params![node_id, generated, hostname],
+        )?;
+        Ok(updated == 1)
     }
 
     pub fn record_heartbeat(&self, node_id: &str) -> Result<bool> {
@@ -918,5 +960,43 @@ mod tests {
             .into_iter()
             .find_map(|node| node.clis.into_iter().find(|cli| cli.adapter_kind == kind))
             .unwrap_or_else(|| panic!("missing {kind}"))
+    }
+
+    #[test]
+    fn reported_hostname_replaces_only_the_generated_name() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        let node_id = "node_abcdef0123456789abcdef012345";
+        store
+            .insert_remote(node_id, "node-abcdef01", &"ab".repeat(32))
+            .unwrap();
+        assert!(
+            store
+                .adopt_reported_hostname(node_id, " desk-b.local ")
+                .unwrap()
+        );
+        let named = store
+            .list_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .unwrap();
+        assert_eq!(named.display_name, "desk-b.local");
+        assert!(
+            !store
+                .adopt_reported_hostname(node_id, "other-host")
+                .unwrap()
+        );
+        assert!(!store.adopt_reported_hostname(node_id, "bad host").unwrap());
+        assert!(!store.adopt_reported_hostname(node_id, "").unwrap());
+        assert_eq!(
+            store
+                .list_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.node_id == node_id)
+                .unwrap()
+                .display_name,
+            "desk-b.local"
+        );
     }
 }

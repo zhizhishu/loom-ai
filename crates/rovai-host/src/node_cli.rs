@@ -138,7 +138,7 @@ async fn list_async(data_dir: &Path) -> Result<String> {
             .ok()
             .and_then(|value| value["error"]["code"].as_str().map(str::to_owned))
             .unwrap_or_else(|| status.to_string());
-        bail!("server rejected the node command ({code})");
+        bail!("{}", node_command_rejection(&code));
     }
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).context("node list was not JSON")?;
@@ -238,9 +238,31 @@ async fn expect_json<T: for<'de> Deserialize<'de>>(response: reqwest::Response) 
             .ok()
             .and_then(|value| value["error"]["code"].as_str().map(str::to_owned))
             .unwrap_or_else(|| status.to_string());
-        bail!("server rejected the node command ({code})");
+        bail!("{}", node_command_rejection(&code));
     }
     serde_json::from_slice(&bytes).context("server response was not the expected JSON")
+}
+
+fn node_command_rejection(code: &str) -> String {
+    match code {
+        "node_cli_unreported" => {
+            "这台节点没有上报这个 CLI，或只留下上次见到的路径。没有启动进程。".into()
+        }
+        other => format!("server rejected the node command ({other})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::node_command_rejection;
+
+    #[test]
+    fn unreported_cli_is_explained_instead_of_left_as_a_code() {
+        let text = node_command_rejection("node_cli_unreported");
+        assert!(text.contains("没有上报这个 CLI"));
+        assert!(!text.contains("node_cli_unreported"));
+        assert!(node_command_rejection("node_not_found").contains("node_not_found"));
+    }
 }
 
 fn ws_url(origin: &str) -> String {

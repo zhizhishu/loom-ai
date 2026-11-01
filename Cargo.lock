@@ -1125,6 +1125,7 @@ dependencies = [
  "base64",
  "clap",
  "futures-util",
+ "libc",
  "loom-protocol",
  "rovai-host",
  "rovai-web",

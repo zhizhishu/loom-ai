@@ -157,8 +157,16 @@ impl PairingLimiter {
     }
 }
 
+struct OpenPairing {
+    code: String,
+    digest: [u8; 32],
+}
+
 struct Inner {
     pairings: HashMap<[u8; 32], Instant>,
+    /// Plaintext of the code an administrator may open again. Redeeming or
+    /// expiry drops it from `pairings`; the next issue replaces it.
+    open_pairing: Option<OpenPairing>,
     pairing_failures: PairingLimiter,
     nodes: HashMap<String, Node>,
     runs: HashMap<String, Run>,
@@ -203,6 +211,7 @@ impl Hub {
             store,
             inner: Mutex::new(Inner {
                 pairings: HashMap::new(),
+                open_pairing: None,
                 pairing_failures: PairingLimiter {
                     by_address: HashMap::new(),
                     global: VecDeque::new(),
@@ -216,14 +225,29 @@ impl Hub {
         }
     }
 
-    async fn issue_pairing(&self) -> String {
-        let code = random_hex(8);
-        let digest = keyed_digest(PAIRING_KIND, &code);
+    /// The same unused, unexpired code is returned until it is redeemed or
+    /// expires. A used or expired code is replaced and is not shown again.
+    async fn issue_pairing(&self) -> (String, u64) {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         inner.pairings.retain(|_, expiry| *expiry > now);
-        inner.pairings.insert(digest, now + PAIRING_TTL);
-        code
+        if let Some(open) = &inner.open_pairing {
+            if let Some(expiry) = inner.pairings.get(&open.digest).copied() {
+                if expiry > now {
+                    let remaining = expiry.saturating_duration_since(now).as_secs().max(1);
+                    return (open.code.clone(), remaining);
+                }
+            }
+        }
+        let code = random_hex(8);
+        let digest = keyed_digest(PAIRING_KIND, &code);
+        let expiry = now + PAIRING_TTL;
+        inner.pairings.insert(digest, expiry);
+        inner.open_pairing = Some(OpenPairing {
+            code: code.clone(),
+            digest,
+        });
+        (code, PAIRING_TTL.as_secs())
     }
 
     async fn redeem(&self, code: &str, peer: IpAddr) -> Result<Issued, &'static str> {
@@ -1026,6 +1050,7 @@ impl Hub {
                             arch,
                             clis,
                             runs,
+                            hostname,
                         } => {
                             if runs.len() > 32
                                 || runs.iter().any(|run| {
@@ -1071,6 +1096,9 @@ impl Hub {
                                         .await
                                     {
                                         Ok(generation) => {
+                                            let _ = self
+                                                .store
+                                                .adopt_reported_hostname(&node_id, &hostname);
                                             attached = Some((node_id.clone(), generation));
                                             let resumes = self.reconcile(&node_id, &runs).await;
                                             welcomed = true;
@@ -1224,6 +1252,27 @@ fn valid_credential(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Public origin wins, as `wss://` or `ws://` plus the connect path.
+/// Without one, the listen address is the only target and the caller must
+/// warn that machine B has to be able to reach it.
+pub(crate) fn connect_target(listen: SocketAddr, public_origin: Option<&str>) -> (String, bool) {
+    if let Some(origin) = public_origin
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+    {
+        let base = if let Some(rest) = origin.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = origin.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            origin.to_owned()
+        };
+        let base = base.trim_end_matches('/');
+        return (format!("{base}{CONNECT_PATH}"), false);
+    }
+    (format!("ws://{listen}{CONNECT_PATH}"), true)
+}
+
 fn random_hex(nbytes: usize) -> String {
     let mut buf = vec![0u8; nbytes];
     getrandom::fill(&mut buf).expect("system random source");
@@ -1259,11 +1308,14 @@ pub(crate) async fn pair(
     if !state.network.listen.ip().is_loopback() {
         return error(StatusCode::FORBIDDEN, "node_channel_requires_loopback");
     }
-    let code = state.nodes.issue_pairing().await;
+    let (code, expires_in_seconds) = state.nodes.issue_pairing().await;
+    let (connect_url, reachability_warning) =
+        connect_target(state.network.listen, state.network.public_origin());
     Json(json!({
         "pairingCode": code,
-        "expiresInSeconds": PAIRING_TTL.as_secs(),
-        "connectUrl": format!("ws://{}{CONNECT_PATH}", state.network.listen),
+        "expiresInSeconds": expires_in_seconds,
+        "connectUrl": connect_url,
+        "reachabilityWarning": reachability_warning,
     }))
     .into_response()
 }
@@ -1436,7 +1488,7 @@ mod tests {
         let sessions = Arc::new(Sessions::new(&admin).unwrap());
         let hub = Hub::new(sessions.clone(), NodeStore::open_ephemeral().unwrap());
         let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let code = hub.issue_pairing().await;
+        let (code, _) = hub.issue_pairing().await;
         match hub.redeem(&admin, peer).await {
             Err("administrator_rejected") => {}
             Err(code) => panic!("unexpected pairing error {code}"),
@@ -1480,7 +1532,7 @@ mod tests {
                 Err("pairing_invalid")
             ));
         }
-        let kept = hub.issue_pairing().await;
+        let (kept, _) = hub.issue_pairing().await;
         assert!(matches!(
             hub.redeem(&kept, local).await,
             Err("pairing_rate_limited")
@@ -1659,7 +1711,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_between_hello_and_register_does_not_leave_the_socket() {
         let hub = Arc::new(test_hub());
-        let code = hub.issue_pairing().await;
+        let (code, _) = hub.issue_pairing().await;
         let issued = hub
             .redeem(&code, IpAddr::V4(Ipv4Addr::LOCALHOST))
             .await
@@ -1706,7 +1758,7 @@ mod tests {
     }
 
     async fn attach_reports(hub: &Hub, clis: Vec<CliReport>) -> (String, mpsc::Receiver<Outbound>) {
-        let code = hub.issue_pairing().await;
+        let (code, _) = hub.issue_pairing().await;
         let issued = hub
             .redeem(&code, IpAddr::V4(Ipv4Addr::LOCALHOST))
             .await
@@ -1745,5 +1797,39 @@ mod tests {
             .iter()
             .find(|node| node["nodeId"] == node_id)
             .unwrap_or_else(|| panic!("missing {node_id} in {listed}"))
+    }
+
+    #[tokio::test]
+    async fn unused_pairing_code_is_shown_again_until_it_is_redeemed() {
+        let hub = test_hub();
+        let (first, first_ttl) = hub.issue_pairing().await;
+        assert_eq!(first_ttl, PAIRING_TTL.as_secs());
+        let (second, second_ttl) = hub.issue_pairing().await;
+        assert_eq!(first, second);
+        assert!(second_ttl <= first_ttl);
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        hub.redeem(&first, peer).await.expect("pairing code");
+        let (third, _) = hub.issue_pairing().await;
+        assert_ne!(third, first);
+        assert!(hub.redeem(&first, peer).await.is_err());
+        assert!(hub.redeem(&third, peer).await.is_ok());
+    }
+
+    #[test]
+    fn connect_target_uses_public_origin_and_otherwise_warns() {
+        let listen: SocketAddr = "127.0.0.1:8767".parse().unwrap();
+        let (tunnel, warn) = connect_target(listen, Some("https://loom.trycloudflare.com"));
+        assert_eq!(tunnel, "wss://loom.trycloudflare.com/api/v1/nodes/connect");
+        assert!(!warn);
+        let (lan, warn) = connect_target(listen, Some("http://10.1.2.3:8443"));
+        assert_eq!(lan, "ws://10.1.2.3:8443/api/v1/nodes/connect");
+        assert!(!warn);
+        let (fallback, warn) = connect_target(listen, None);
+        assert_eq!(fallback, "ws://127.0.0.1:8767/api/v1/nodes/connect");
+        assert!(warn);
+        let v6: SocketAddr = "[::1]:8767".parse().unwrap();
+        let (loopback, warn) = connect_target(v6, Some("  "));
+        assert_eq!(loopback, "ws://[::1]:8767/api/v1/nodes/connect");
+        assert!(warn);
     }
 }
