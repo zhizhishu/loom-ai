@@ -1,8 +1,9 @@
-//! Execution nodes for milestone B2.
+//! Execution nodes for milestones B2 and B3.
 //!
 //! Node tokens are stored as digests in SQLite, so they survive a server
 //! restart. Pairing codes stay in memory. A remote node is only used when
-//! `node-exec` targets it; it is not the mission execution host.
+//! `node-exec` targets it; it is not the mission execution host. A CLI the
+//! connected node did not report is refused before a process is started.
 
 use crate::auth::{Session, Sessions};
 use crate::{WebState, error};
@@ -17,13 +18,15 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
-use loom_protocol::{CONNECT_PATH, ClientMessage, OutputStream, RunReport, ServerMessage};
+use loom_protocol::{
+    CONNECT_PATH, CliReport, ClientMessage, OutputStream, RunReport, ServerMessage,
+};
 use rovai_core::execution_node::{CliRecord, NextAttempt, NodeStore, OutputWrite, RevokeResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -159,12 +162,24 @@ struct Inner {
     pairing_failures: PairingLimiter,
     nodes: HashMap<String, Node>,
     runs: HashMap<String, Run>,
+    /// Node ids whose token was revoked in this process. Registration checks
+    /// this under the same lock that `revoke` uses to drop a live socket.
+    revoked: HashSet<String>,
+}
+
+#[cfg(test)]
+struct AttachGate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 pub struct Hub {
     sessions: Arc<Sessions>,
     store: NodeStore,
     inner: Mutex<Inner>,
+    /// Test-only pause after a hello is accepted and before the socket is registered.
+    #[cfg(test)]
+    attach_gate: Mutex<Option<Arc<AttachGate>>>,
 }
 
 impl Hub {
@@ -194,7 +209,10 @@ impl Hub {
                 },
                 nodes: HashMap::new(),
                 runs: HashMap::new(),
+                revoked: HashSet::new(),
             }),
+            #[cfg(test)]
+            attach_gate: Mutex::new(None),
         }
     }
 
@@ -209,23 +227,21 @@ impl Hub {
     }
 
     async fn redeem(&self, code: &str, peer: IpAddr) -> Result<Issued, &'static str> {
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.pairing_failures.limited(peer, Instant::now()) {
-                return Err("pairing_rate_limited");
+        let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        if inner.pairing_failures.limited(peer, now) {
+            return Err("pairing_rate_limited");
+        }
+        match self.redeem_code(&mut inner, code) {
+            Ok(issued) => Ok(issued),
+            Err(code) => {
+                inner.pairing_failures.record(peer, now);
+                Err(code)
             }
         }
-        let failed = self.redeem_code(code).await;
-        if let Err(code) = &failed {
-            if *code != "pairing_rate_limited" {
-                let mut inner = self.inner.lock().await;
-                inner.pairing_failures.record(peer, Instant::now());
-            }
-        }
-        failed
     }
 
-    async fn redeem_code(&self, code: &str) -> Result<Issued, &'static str> {
+    fn redeem_code(&self, inner: &mut Inner, code: &str) -> Result<Issued, &'static str> {
         if self.sessions.is_administrator(code) {
             return Err("administrator_rejected");
         }
@@ -234,14 +250,11 @@ impl Hub {
         let display_name = format!("node-{}", &node_id[5..13]);
         let token = crate::new_token().map_err(|_| "token_unavailable")?;
         let token_digest = digest_hex(&token);
-        {
-            let mut inner = self.inner.lock().await;
-            let Some(expiry) = inner.pairings.remove(&digest) else {
-                return Err("pairing_invalid");
-            };
-            if expiry <= Instant::now() {
-                return Err("pairing_invalid");
-            }
+        let Some(expiry) = inner.pairings.remove(&digest) else {
+            return Err("pairing_invalid");
+        };
+        if expiry <= Instant::now() {
+            return Err("pairing_invalid");
         }
         self.store
             .insert_remote(&node_id, &display_name, &token_digest)
@@ -285,13 +298,15 @@ impl Hub {
             return Err("invalid_hello");
         }
         for cli in &clis {
-            if cli.adapter_kind.len() > 64
+            if cli.adapter_kind.is_empty()
+                || cli.adapter_kind.len() > 64
                 || cli.path.len() > 4096
                 || cli.path.contains('\0')
                 || cli
                     .version
                     .as_ref()
-                    .is_some_and(|version| version.len() > 200)
+                    .is_some_and(|version| version.is_empty() || version.len() > 200)
+                || (cli.path_present && is_path_sentinel(&cli.path))
             {
                 return Err("invalid_hello");
             }
@@ -309,21 +324,51 @@ impl Hub {
         self.store
             .record_hello(node_id, os, arch, &records)
             .map_err(|_| "token_rejected")?;
-        let mut inner = self.inner.lock().await;
-        let node = inner.nodes.entry(node_id.to_owned()).or_insert(Node {
-            generation: 0,
-            outbound: None,
-            cancel: None,
-            clis: Vec::new(),
-        });
-        if let Some(previous) = node.cancel.take() {
-            let _ = previous.send(());
+        #[cfg(test)]
+        self.wait_attach_gate().await;
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            if inner.revoked.contains(node_id) {
+                return Err("token_revoked");
+            }
+            let node = inner.nodes.entry(node_id.to_owned()).or_insert(Node {
+                generation: 0,
+                outbound: None,
+                cancel: None,
+                clis: Vec::new(),
+            });
+            if let Some(previous) = node.cancel.take() {
+                let _ = previous.send(());
+            }
+            node.generation = node.generation.saturating_add(1);
+            node.clis = clis;
+            node.outbound = Some(outbound);
+            node.cancel = Some(cancel);
+            node.generation
+        };
+        let still_active = self
+            .store
+            .token_state(node_id)
+            .ok()
+            .flatten()
+            .is_some_and(|state| !state.revoked);
+        if !still_active {
+            self.detach(node_id, generation).await;
+            return Err("token_revoked");
         }
-        node.generation = node.generation.saturating_add(1);
-        node.clis = clis;
-        node.outbound = Some(outbound);
-        node.cancel = Some(cancel);
-        Ok(node.generation)
+        Ok(generation)
+    }
+
+    #[cfg(test)]
+    async fn wait_attach_gate(&self) {
+        let gate = self.attach_gate.lock().await.clone();
+        let Some(gate) = gate else {
+            return;
+        };
+        let release = gate.release.notified();
+        tokio::pin!(release);
+        gate.reached.notify_one();
+        release.await;
     }
 
     async fn reconcile(&self, node_id: &str, reports: &[RunReport]) -> Vec<ServerMessage> {
@@ -440,14 +485,23 @@ impl Hub {
                 .map(Some);
         }
         let mut inner = self.inner.lock().await;
-        let Some((node_id, program, outbound)) = inner.nodes.iter().find_map(|(id, node)| {
-            let cli = node.clis.iter().find(|cli| {
-                cli.adapter_kind == runtime && cli.path_present && !cli.path.is_empty()
-            })?;
-            let outbound = node.outbound.clone();
-            let outbound = outbound?;
-            Some((id.clone(), cli.path.clone(), outbound))
-        }) else {
+        let mut connected = false;
+        let mut selected = None;
+        for (id, node) in &inner.nodes {
+            let Some(outbound) = node.outbound.clone() else {
+                continue;
+            };
+            connected = true;
+            let Some(cli) = node.clis.iter().find(|cli| cli_is_runnable(cli, runtime)) else {
+                continue;
+            };
+            selected = Some((id.clone(), cli.path.clone(), outbound));
+            break;
+        }
+        let Some((node_id, program, outbound)) = selected else {
+            if connected {
+                return Err("node_cli_unreported");
+            }
             return Ok(None);
         };
         let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
@@ -512,17 +566,24 @@ impl Hub {
             let _ = self.store.interrupt(run_id, attempt);
             return Err("node_runtime_unavailable");
         };
-        let Some(program) = node
+        let connected = node.outbound.is_some();
+        let program = node
             .clis
             .iter()
-            .find(|cli| cli.adapter_kind == runtime && cli.path_present)
-            .map(|cli| cli.path.clone())
-        else {
+            .find(|cli| cli_is_runnable(cli, runtime))
+            .map(|cli| cli.path.clone());
+        let outbound = node.outbound.clone();
+        if !connected || outbound.is_none() {
             drop(inner);
             let _ = self.store.interrupt(run_id, attempt);
             return Err("node_runtime_unavailable");
+        }
+        let Some(program) = program else {
+            drop(inner);
+            let _ = self.store.interrupt(run_id, attempt);
+            return Err("node_cli_unreported");
         };
-        let Some(outbound) = node.outbound.clone() else {
+        let Some(outbound) = outbound else {
             drop(inner);
             let _ = self.store.interrupt(run_id, attempt);
             return Err("node_runtime_unavailable");
@@ -713,14 +774,34 @@ impl Hub {
         self.fail_run(run_id, code).await;
     }
 
-    fn list_nodes(&self) -> Result<Value, &'static str> {
+    async fn list_nodes(&self) -> Result<Value, &'static str> {
         let nodes = self
             .store
             .list_nodes()
             .map_err(|_| "node_store_unavailable")?;
+        let live = {
+            let inner = self.inner.lock().await;
+            inner
+                .nodes
+                .iter()
+                .filter_map(|(id, node)| {
+                    if node.outbound.is_none() {
+                        return None;
+                    }
+                    let kinds = node
+                        .clis
+                        .iter()
+                        .filter(|cli| cli_is_runnable(cli, &cli.adapter_kind))
+                        .map(|cli| cli.adapter_kind.clone())
+                        .collect::<HashSet<_>>();
+                    Some((id.clone(), kinds))
+                })
+                .collect::<HashMap<_, _>>()
+        };
         let rows: Vec<Value> = nodes
             .into_iter()
             .map(|node| {
+                let live_kinds = live.get(&node.node_id);
                 json!({
                     "nodeId": node.node_id,
                     "displayName": node.display_name,
@@ -740,13 +821,17 @@ impl Hub {
                         "status": run.status,
                         "ackedSeq": run.acked_seq,
                     })).collect::<Vec<_>>(),
-                    "clis": node.clis.iter().map(|cli| json!({
-                        "adapterKind": cli.adapter_kind,
-                        "path": cli.path,
-                        "version": cli.version,
-                        "pathPresent": cli.path_present,
-                        "reportedAt": cli.reported_at,
-                    })).collect::<Vec<_>>(),
+                    "clis": node.clis.iter().map(|cli| {
+                        let live = live_kinds.is_some_and(|kinds| kinds.contains(&cli.adapter_kind));
+                        json!({
+                            "adapterKind": cli.adapter_kind,
+                            "path": cli.path,
+                            "version": cli.version,
+                            "pathPresent": cli.path_present,
+                            "reportedAt": cli.reported_at,
+                            "availability": cli_availability(node.status == "online", cli.path_present, live),
+                        })
+                    }).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -804,6 +889,7 @@ impl Hub {
             let _ = self.store.interrupt(&run.run_id, run.attempt);
         }
         let mut inner = self.inner.lock().await;
+        inner.revoked.insert(node_id.to_owned());
         if let Some(node) = inner.nodes.get_mut(node_id) {
             if let Some(outbound) = &node.outbound {
                 outbound.try_text(
@@ -1186,7 +1272,7 @@ pub(crate) async fn list(
     State(state): State<WebState>,
     Extension(_session): Extension<Arc<Session>>,
 ) -> Response {
-    match state.nodes.list_nodes() {
+    match state.nodes.list_nodes().await {
         Ok(body) => Json(body).into_response(),
         Err(code) => error(StatusCode::SERVICE_UNAVAILABLE, code),
     }
@@ -1296,13 +1382,34 @@ fn validate_exec(body: &ExecRequest) -> Result<(), &'static str> {
 fn exec_error(code: &'static str) -> Response {
     let status = match code {
         "invalid_node_exec" => StatusCode::BAD_REQUEST,
-        "node_runtime_unavailable" | "node_run_still_active" | "node_run_not_interrupted" => {
-            StatusCode::CONFLICT
-        }
+        "node_runtime_unavailable"
+        | "node_run_still_active"
+        | "node_run_not_interrupted"
+        | "node_cli_unreported" => StatusCode::CONFLICT,
         "node_run_not_found" => StatusCode::NOT_FOUND,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     error(status, code)
+}
+
+fn cli_is_runnable(cli: &CliReport, runtime: &str) -> bool {
+    cli.adapter_kind == runtime && cli.path_present && !is_path_sentinel(&cli.path)
+}
+
+fn is_path_sentinel(path: &str) -> bool {
+    path.is_empty() || path == "path_missing"
+}
+
+/// `path_missing` only when the node itself said the path was gone.
+/// Offline, or a path the latest hello did not repeat, stays `last_seen`.
+fn cli_availability(online: bool, path_present: bool, live: bool) -> &'static str {
+    if !path_present {
+        "path_missing"
+    } else if online && live {
+        "reported"
+    } else {
+        "last_seen"
+    }
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -1401,5 +1508,242 @@ mod tests {
             global.redeem("not-a-code", fresh).await,
             Err("pairing_rate_limited")
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pairing_failures_cannot_exceed_the_limit() {
+        let hub = Arc::new(test_hub());
+        let peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        let burst = PAIRING_FAILURES_PER_ADDRESS + 16;
+        let mut tasks = Vec::with_capacity(burst);
+        for _ in 0..burst {
+            let hub = Arc::clone(&hub);
+            tasks.push(tokio::spawn(
+                async move { hub.redeem("not-a-code", peer).await },
+            ));
+        }
+        let mut invalid = 0;
+        let mut limited = 0;
+        for task in tasks {
+            match task.await.expect("pairing task") {
+                Err("pairing_invalid") => invalid += 1,
+                Err("pairing_rate_limited") => limited += 1,
+                Ok(_) => panic!("invalid pairing code was accepted"),
+                Err(code) => panic!("unexpected pairing result {code}"),
+            }
+        }
+        assert_eq!(invalid, PAIRING_FAILURES_PER_ADDRESS);
+        assert_eq!(limited, burst - PAIRING_FAILURES_PER_ADDRESS);
+    }
+
+    #[test]
+    fn availability_keeps_a_present_path_as_last_seen_when_offline() {
+        assert_eq!(cli_availability(false, true, false), "last_seen");
+        assert_eq!(cli_availability(false, true, true), "last_seen");
+        assert_eq!(cli_availability(true, true, false), "last_seen");
+        assert_eq!(cli_availability(true, true, true), "reported");
+        assert_eq!(cli_availability(true, false, true), "path_missing");
+        assert_eq!(cli_availability(false, false, false), "path_missing");
+    }
+
+    #[tokio::test]
+    async fn a_missing_node_is_still_waited_for() {
+        let hub = test_hub();
+        let started = Instant::now();
+        let pending = hub
+            .try_dispatch("codex-cli", "/work", &[], None)
+            .await
+            .unwrap();
+        assert!(pending.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn unreported_cli_is_refused_before_node_wait() {
+        let hub = test_hub();
+        let (node_id, mut frames) =
+            attach_reports(&hub, vec![cli_report("codex-cli", "/opt/codex", true)]).await;
+        let started = Instant::now();
+        let err = match hub
+            .dispatch("claude-code-cli", "/work", &["-p".into()], None)
+            .await
+        {
+            Err(code) => code,
+            Ok(_) => panic!("unreported CLI was launched"),
+        };
+        assert_eq!(err, "node_cli_unreported");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refusing an unreported CLI waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "refused launch still queued a frame"
+        );
+        let listed = hub.list_nodes().await.unwrap();
+        let node = remote_node(&listed, &node_id);
+        assert_eq!(node["activeRunCount"], 0);
+        assert_eq!(node["clis"][0]["adapterKind"], "codex-cli");
+        assert_eq!(node["clis"][0]["path"], "/opt/codex");
+        assert_eq!(node["clis"][0]["availability"], "reported");
+        assert!(node["clis"][0]["reportedAt"].as_str().unwrap().len() > 10);
+    }
+
+    #[tokio::test]
+    async fn omitted_cli_stays_last_seen_with_its_report_time() {
+        let hub = test_hub();
+        let (node_id, _frames) =
+            attach_reports(&hub, vec![cli_report("codex-cli", "/opt/codex", true)]).await;
+        let listed = hub.list_nodes().await.unwrap();
+        let reported_at = remote_node(&listed, &node_id)["clis"][0]["reportedAt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (tx, _rx) = mpsc::channel(2);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        hub.attach(
+            &node_id,
+            Outbox {
+                tx,
+                acks: Arc::new(StdMutex::new(HashMap::new())),
+            },
+            cancel_tx,
+            "linux",
+            "x86_64",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let listed = hub.list_nodes().await.unwrap();
+        let cli = &remote_node(&listed, &node_id)["clis"][0];
+        assert_eq!(cli["adapterKind"], "codex-cli");
+        assert_eq!(cli["path"], "/opt/codex");
+        assert_eq!(cli["pathPresent"], true);
+        assert_eq!(cli["reportedAt"], reported_at);
+        assert_eq!(cli["availability"], "last_seen");
+        assert_ne!(cli["path"], "path_missing");
+        let started = Instant::now();
+        match hub
+            .dispatch("codex-cli", "/work", &["exec".into()], None)
+            .await
+        {
+            Err(code) => assert_eq!(code, "node_cli_unreported"),
+            Ok(_) => panic!("omitted CLI was launched"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn node_saying_the_path_is_gone_keeps_the_path_string() {
+        let hub = test_hub();
+        let (node_id, _frames) =
+            attach_reports(&hub, vec![cli_report("codex-cli", "/opt/codex", false)]).await;
+        let listed = hub.list_nodes().await.unwrap();
+        let cli = &remote_node(&listed, &node_id)["clis"][0];
+        assert_eq!(cli["path"], "/opt/codex");
+        assert_eq!(cli["pathPresent"], false);
+        assert_eq!(cli["availability"], "path_missing");
+        assert_ne!(cli["path"], "path_missing");
+        assert!(cli["reportedAt"].as_str().unwrap().len() > 10);
+        match hub
+            .dispatch("codex-cli", "/work", &["exec".into()], None)
+            .await
+        {
+            Err(code) => assert_eq!(code, "node_cli_unreported"),
+            Ok(_) => panic!("missing path was launched"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_between_hello_and_register_does_not_leave_the_socket() {
+        let hub = Arc::new(test_hub());
+        let code = hub.issue_pairing().await;
+        let issued = hub
+            .redeem(&code, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap();
+        let gate = Arc::new(AttachGate {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *hub.attach_gate.lock().await = Some(Arc::clone(&gate));
+        let node_id = issued.node_id.clone();
+        let attaching = Arc::clone(&hub);
+        let reached = gate.reached.notified();
+        tokio::pin!(reached);
+        let join = tokio::spawn(async move {
+            let (tx, _rx) = mpsc::channel(2);
+            let (cancel_tx, _cancel_rx) = oneshot::channel();
+            attaching
+                .attach(
+                    &node_id,
+                    Outbox {
+                        tx,
+                        acks: Arc::new(StdMutex::new(HashMap::new())),
+                    },
+                    cancel_tx,
+                    "linux",
+                    "x86_64",
+                    vec![cli_report("codex-cli", "/opt/codex", true)],
+                )
+                .await
+        });
+        reached.await;
+        hub.revoke(&issued.node_id).await.unwrap();
+        gate.release.notify_one();
+        assert_eq!(join.await.unwrap(), Err("token_revoked"));
+        let inner = hub.inner.lock().await;
+        assert!(
+            inner
+                .nodes
+                .get(&issued.node_id)
+                .and_then(|node| node.outbound.as_ref())
+                .is_none(),
+            "revoked hello stayed registered"
+        );
+    }
+
+    async fn attach_reports(hub: &Hub, clis: Vec<CliReport>) -> (String, mpsc::Receiver<Outbound>) {
+        let code = hub.issue_pairing().await;
+        let issued = hub
+            .redeem(&code, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .expect("pair");
+        let (tx, rx) = mpsc::channel(4);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        hub.attach(
+            &issued.node_id,
+            Outbox {
+                tx,
+                acks: Arc::new(StdMutex::new(HashMap::new())),
+            },
+            cancel_tx,
+            "linux",
+            "x86_64",
+            clis,
+        )
+        .await
+        .expect("attach");
+        (issued.node_id, rx)
+    }
+
+    fn cli_report(kind: &str, path: &str, path_present: bool) -> CliReport {
+        CliReport {
+            adapter_kind: kind.to_owned(),
+            path: path.to_owned(),
+            version: Some("b3".into()),
+            path_present,
+        }
+    }
+
+    fn remote_node<'a>(listed: &'a Value, node_id: &str) -> &'a Value {
+        listed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["nodeId"] == node_id)
+            .unwrap_or_else(|| panic!("missing {node_id} in {listed}"))
     }
 }

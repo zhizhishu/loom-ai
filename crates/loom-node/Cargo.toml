@@ -29,3 +29,7 @@ harness = false
 [[test]]
 name = "b2_resume"
 harness = false
+
+[[test]]
+name = "b3_capability"
+harness = false

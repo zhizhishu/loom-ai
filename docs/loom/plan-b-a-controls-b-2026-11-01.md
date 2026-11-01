@@ -716,6 +716,26 @@ B3 从这里接着做：节点没上报的 CLI 在启动前就拒绝，不要为
 - A 上对该节点派 `claude-code-cli` 时，在启动前拒绝，B 上不出现进程。
 - 界面或 CLI 能读到「上次上报」的种类列表。节点离线后列表还在，并带时间。
 
+#### 实施状态（2026-11-01）
+
+B3 已落地。节点按本机 `PATH` 上报目录里的 CLI：`codex-cli`、`claude-code-cli`，以及 Pi、OpenCode 等其余已接入种类。Cursor 的泛名 `agent` 不上报，避免把别的产品认成 Cursor。远程节点仍然不是默认执行主机：`mission_execution_host` 还是本机那一行，本机节点仍不可作废。
+
+- 已经连上的节点没有上报这次要的 `adapter_kind`，或者只留下上次见到的路径时，`node-exec` 在发出 `Start` 之前就回 `node_cli_unreported`（HTTP 409）。不耗 `NODE_WAIT`，B 上不出现进程。一个节点都还没连上时，仍会等它出现。
+- `GET /api/v1/nodes` 的每个 CLI 带 `reportedAt` 和 `availability`。`rovai-server node-list` 打印同一份 JSON。节点离线后上次上报还在，时间不变，`availability` 为 `last_seen`。这次 hello 没再提到的种类同样留着上次的路径和时间，不删，也不改成路径缺失。路径字符串不会被写成 `path_missing`。只有节点自己给出原来的路径并报 `pathPresent: false` 时，`availability` 才是 `path_missing`。
+- 作废和登记接在同一把锁上。Hello 已被接受之后、套接字登记之前若令牌被作废，登记时先看这把锁里的作废标记，登记后再读 `revoked_at`。对不上就拆掉连接，不留到对方自己断开。
+- 配对失败的检查和计数在同一把锁里完成。并发失败不超过每个地址 8 次、全局 32 次。
+
+```bash
+cargo test -p loom-node --test b3_capability
+cargo test -p loom-node --test b2_resume
+cargo test -p loom-node --test b1_outbound
+cargo test -p rovai-web --lib nodes::
+cargo test -p rovai-core --lib execution_node
+cargo test -p rovai-core --lib loom
+```
+
+B4 从这里接着做：节点为这次 Run 准备的 `PATH` 里放 `rovai` 垫片。在 B 上执行 `rovai loom status`（或一个只读的现有 RPC）读写的是 A 的库。垫片呈上管理员令牌时要被拒绝。仍然不要把远程节点写成默认执行主机。
+
 ### B4 内置 rovai 从 B 回到 A
 
 - 节点为这次 Run 准备的 `PATH` 里，`rovai` 是垫片。

@@ -120,6 +120,11 @@ fn now_stamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// An empty path, or the words `path_missing`, is not a location the node saw.
+fn is_path_sentinel(path: &str) -> bool {
+    path.is_empty() || path == "path_missing"
+}
+
 fn fresh_heartbeat(stamp: Option<&str>, now: DateTime<Utc>) -> bool {
     let Some(stamp) = stamp else {
         return false;
@@ -293,12 +298,36 @@ impl NodeStore {
         if updated != 1 {
             bail!("node is not an active remote");
         }
-        tx.execute("DELETE FROM execution_node_cli WHERE node_id=?1", [node_id])?;
+        // Kinds omitted from this hello stay as last seen. Going offline does not
+        // write a row either. `path_missing` is only stored when the node names a
+        // real path and says it is gone; the sentinel string is never written.
         for cli in clis {
+            if cli.adapter_kind.is_empty()
+                || cli.adapter_kind.len() > 64
+                || cli.path.len() > 4096
+                || cli.path.contains('\0')
+                || cli
+                    .version
+                    .as_ref()
+                    .is_some_and(|version| version.is_empty() || version.len() > 200)
+            {
+                bail!("invalid cli report");
+            }
+            if is_path_sentinel(&cli.path) {
+                if cli.path_present {
+                    bail!("invalid cli report");
+                }
+                continue;
+            }
             tx.execute(
                 "INSERT INTO execution_node_cli(
                     node_id, adapter_kind, path, version, path_present, reported_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(node_id, adapter_kind) DO UPDATE SET
+                    path=excluded.path,
+                    version=excluded.version,
+                    path_present=excluded.path_present,
+                    reported_at=excluded.reported_at",
                 params![
                     node_id,
                     cli.adapter_kind,
@@ -749,5 +778,145 @@ mod tests {
         assert!(!remote.revocable);
         assert_eq!(remote.status, "offline");
         assert!(remote.revoked_at.is_some());
+        let locals: Vec<_> = listed.iter().filter(|node| node.role == "local").collect();
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0].node_id, "host");
+        assert!(
+            listed
+                .iter()
+                .any(|node| node.node_id == "node_b" && node.role == "remote")
+        );
+    }
+
+    #[test]
+    fn a_missing_path_stays_last_seen_and_is_not_rewritten_to_path_missing() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        store
+            .insert_remote("node_a", "desk", &"ab".repeat(32))
+            .unwrap();
+        store
+            .record_hello(
+                "node_a",
+                "linux",
+                "x86_64",
+                &[CliRecord {
+                    adapter_kind: "codex-cli".into(),
+                    path: "/opt/codex".into(),
+                    version: Some("b3".into()),
+                    path_present: true,
+                    reported_at: String::new(),
+                }],
+            )
+            .unwrap();
+        let reported_at = listed_cli(&store, "codex-cli").reported_at;
+        assert!(!reported_at.is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        store
+            .record_hello("node_a", "linux", "x86_64", &[])
+            .unwrap();
+        let kept = listed_cli(&store, "codex-cli");
+        assert_eq!(kept.path, "/opt/codex");
+        assert!(kept.path_present);
+        assert_ne!(kept.path, "path_missing");
+        assert_eq!(kept.reported_at, reported_at);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store
+            .record_hello(
+                "node_a",
+                "linux",
+                "x86_64",
+                &[CliRecord {
+                    adapter_kind: "codex-cli".into(),
+                    path: "path_missing".into(),
+                    version: None,
+                    path_present: false,
+                    reported_at: String::new(),
+                }],
+            )
+            .unwrap();
+        let kept = listed_cli(&store, "codex-cli");
+        assert_eq!(kept.path, "/opt/codex");
+        assert!(kept.path_present);
+        assert_eq!(kept.reported_at, reported_at);
+
+        store
+            .record_hello(
+                "node_a",
+                "linux",
+                "x86_64",
+                &[CliRecord {
+                    adapter_kind: "codex-cli".into(),
+                    path: "/opt/codex".into(),
+                    version: Some("b3".into()),
+                    path_present: false,
+                    reported_at: String::new(),
+                }],
+            )
+            .unwrap();
+        let missing = listed_cli(&store, "codex-cli");
+        assert_eq!(missing.path, "/opt/codex");
+        assert!(!missing.path_present);
+        assert_ne!(missing.path, "path_missing");
+    }
+
+    #[test]
+    fn offline_listing_keeps_the_last_cli_report_and_its_time() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        store
+            .insert_remote("node_a", "desk", &"ab".repeat(32))
+            .unwrap();
+        store
+            .record_hello(
+                "node_a",
+                "linux",
+                "x86_64",
+                &[CliRecord {
+                    adapter_kind: "codex-cli".into(),
+                    path: "/node/bin/codex".into(),
+                    version: Some("b3-codex 0".into()),
+                    path_present: true,
+                    reported_at: String::new(),
+                }],
+            )
+            .unwrap();
+        let before = listed_cli(&store, "codex-cli");
+        let stale = (Utc::now() - chrono::Duration::seconds(120))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE execution_node SET last_heartbeat=?1 WHERE node_id='node_a'",
+                [stale],
+            )
+            .unwrap();
+        let listed = store.list_nodes().unwrap();
+        let node = listed.iter().find(|node| node.node_id == "node_a").unwrap();
+        assert_eq!(node.status, "offline");
+        assert_eq!(node.clis.len(), 1);
+        assert_eq!(node.clis[0].path, before.path);
+        assert_eq!(node.clis[0].reported_at, before.reported_at);
+        assert!(node.clis[0].path_present);
+        assert_ne!(node.clis[0].path, "path_missing");
+        let again = store.list_nodes().unwrap();
+        let cli = &again
+            .iter()
+            .find(|node| node.node_id == "node_a")
+            .unwrap()
+            .clis[0];
+        assert_eq!(cli.path, before.path);
+        assert_eq!(cli.reported_at, before.reported_at);
+        assert!(cli.path_present);
+    }
+
+    fn listed_cli(store: &NodeStore, kind: &str) -> CliRecord {
+        store
+            .list_nodes()
+            .unwrap()
+            .into_iter()
+            .find_map(|node| node.clis.into_iter().find(|cli| cli.adapter_kind == kind))
+            .unwrap_or_else(|| panic!("missing {kind}"))
     }
 }
