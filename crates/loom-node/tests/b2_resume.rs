@@ -398,7 +398,8 @@ fn fake_dispatch(listener: std::net::TcpListener, evil: PathBuf, cwd: PathBuf) -
             "program": evil,
             "args": [],
             "cwd": cwd,
-            "env": []
+            "env": [],
+            "shimToken": "cd".repeat(32),
         })
         .to_string()
         .into(),
@@ -416,7 +417,8 @@ fn fake_dispatch(listener: std::net::TcpListener, evil: PathBuf, cwd: PathBuf) -
             "program": discovered,
             "args": [],
             "cwd": cwd,
-            "env": []
+            "env": [],
+            "shimToken": "cd".repeat(32),
         })
         .to_string()
         .into(),

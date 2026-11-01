@@ -57,6 +57,12 @@ enum Command {
         /// Arguments after `--` are the remote CLI argv.
         #[arg(last = true, required = true)]
         args: Vec<String>,
+        /// Mission on A that the run's `rovai` shim may read.
+        #[arg(long)]
+        mission: Option<String>,
+        /// Member the shim credential is scoped to.
+        #[arg(long)]
+        member: Option<String>,
     },
 }
 
@@ -87,8 +93,22 @@ pub fn run() -> Result<()> {
     if matches!(cli.command, Some(Command::NodeList)) {
         return crate::node_cli::list(&data_dir);
     }
-    if let Some(Command::NodeExec { runtime, cwd, args }) = &cli.command {
-        return crate::node_cli::exec(&data_dir, runtime, cwd, args);
+    if let Some(Command::NodeExec {
+        runtime,
+        cwd,
+        args,
+        mission,
+        member,
+    }) = &cli.command
+    {
+        return crate::node_cli::exec(
+            &data_dir,
+            runtime,
+            cwd,
+            args,
+            mission.as_deref(),
+            member.as_deref(),
+        );
     }
     // Resolve packaged resources before creating data. A missing WebUI should
     // report a broken installation, not leave a new empty business instance.

@@ -113,6 +113,8 @@ pub enum ServerMessage {
         args: Vec<String>,
         cwd: String,
         env: Vec<(String, String)>,
+        /// Per-run credential for the `rovai` shim. Not the node token.
+        shim_token: String,
     },
     /// Keep the existing process. Retransmit output with `seq > acked_seq`.
     Resume {
@@ -151,10 +153,12 @@ mod tests {
             args: vec!["exec".into(), "hello".into()],
             cwd: "/work".into(),
             env: vec![],
+            shim_token: "run-token".into(),
         };
         let json = start.to_json();
         assert!(json.contains("\"type\":\"start\""));
         assert!(json.contains("\"adapterKind\":\"codex-cli\""));
+        assert!(json.contains("\"shimToken\":\"run-token\""));
         assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), start);
 
         let output = ClientMessage::Output {
@@ -176,6 +180,38 @@ mod tests {
             attempt: 1,
             acked_seq: 4,
         };
+        for frame in [
+            resume.to_json(),
+            ServerMessage::HeartbeatAck.to_json(),
+            ServerMessage::Welcome {
+                node_id: "node_1".into(),
+            }
+            .to_json(),
+            ServerMessage::Ack {
+                run_id: "run_1".into(),
+                seq: 1,
+            }
+            .to_json(),
+            ServerMessage::Error {
+                code: "token_revoked".into(),
+            }
+            .to_json(),
+        ] {
+            serde_json::from_str::<ServerMessage>(&frame)
+                .unwrap_or_else(|error| panic!("{error} in {frame}"));
+        }
+
+        let heartbeat = ClientMessage::Heartbeat {
+            run_ids: vec!["run_1".into()],
+        }
+        .to_json();
+        let parsed = serde_json::from_str::<ServerMessage>(&heartbeat);
+        let message = parsed.expect_err("client heartbeat must not decode as a server frame");
+        assert!(
+            !message.to_string().contains("shimToken"),
+            "heartbeat parse blamed shimToken: {message} in {heartbeat}"
+        );
+
         let json = resume.to_json();
         assert!(json.contains("\"type\":\"resume\""));
         assert!(json.contains("\"ackedSeq\":4"));

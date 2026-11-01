@@ -1,8 +1,9 @@
 //! Persisted execution nodes and the runs A has dispatched to them.
 //!
-//! The tables are created by schema migration 225. This module only reads and
-//! writes them. It does not choose the mission execution host: a remote node is
-//! never the default place a mission runs.
+//! The node tables are created by schema migration 225. Migration 226 adds the
+//! per-run shim credential. This module only reads and writes them. It does not
+//! choose the mission execution host: a remote node is never the default place
+//! a mission runs.
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -63,6 +64,46 @@ CREATE TABLE node_dispatch_output (
     FOREIGN KEY (run_id, attempt) REFERENCES node_dispatch(run_id, attempt) ON DELETE CASCADE
 );
 "#;
+
+/// Migration 226. A digest of a per-run shim token. The plaintext is not stored.
+pub const SHIM_SCHEMA_SQL: &str = r#"
+CREATE TABLE node_run_credential (
+    token_digest TEXT PRIMARY KEY CHECK(length(token_digest) = 64 AND token_digest NOT GLOB '*[^0-9a-f]*'),
+    run_id TEXT NOT NULL CHECK(length(run_id) BETWEEN 1 AND 80),
+    attempt INTEGER NOT NULL CHECK(attempt >= 1),
+    node_id TEXT NOT NULL CHECK(length(node_id) BETWEEN 1 AND 80),
+    member_id TEXT CHECK(member_id IS NULL OR length(member_id) BETWEEN 1 AND 80),
+    mission_id TEXT CHECK(mission_id IS NULL OR length(mission_id) BETWEEN 1 AND 200),
+    revoked_at TEXT,
+    FOREIGN KEY (run_id, attempt) REFERENCES node_dispatch(run_id, attempt) ON DELETE CASCADE
+);
+CREATE INDEX node_run_credential_run_idx ON node_run_credential(run_id, attempt);
+CREATE INDEX node_run_credential_node_idx ON node_run_credential(node_id);
+"#;
+
+pub fn shim_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let compact = |sql: &str| sql.split_whitespace().collect::<String>();
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='node_run_credential'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(false);
+    };
+    let sql = compact(&sql);
+    Ok([
+        "token_digest TEXT PRIMARY KEY",
+        "member_id TEXT",
+        "mission_id TEXT",
+        "revoked_at TEXT",
+        "REFERENCES node_dispatch(run_id, attempt)",
+    ]
+    .iter()
+    .all(|token| sql.contains(&compact(token))))
+}
 
 pub fn schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     let compact = |sql: &str| sql.split_whitespace().collect::<String>();
@@ -195,6 +236,13 @@ pub enum OutputWrite {
 }
 
 #[derive(Debug)]
+pub struct RunGrant {
+    pub member_id: Option<String>,
+    pub mission_id: Option<String>,
+    pub usable: bool,
+}
+
+#[derive(Debug)]
 pub enum RevokeResult {
     Revoked { revoked_at: String },
     Already { revoked_at: String },
@@ -236,6 +284,7 @@ impl NodeStore {
         let connection = Connection::open_in_memory().context("ephemeral node store")?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         connection.execute_batch(SCHEMA_SQL)?;
+        connection.execute_batch(SHIM_SCHEMA_SQL)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -354,8 +403,9 @@ impl NodeStore {
     }
 
     pub fn revoke(&self, node_id: &str) -> Result<RevokeResult> {
-        let connection = self.lock()?;
-        let row = connection
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+        let row = tx
             .query_row(
                 "SELECT role, revoked_at FROM execution_node WHERE node_id=?1",
                 [node_id],
@@ -372,11 +422,97 @@ impl NodeStore {
             return Ok(RevokeResult::Already { revoked_at });
         }
         let now = now_stamp();
-        connection.execute(
+        tx.execute(
             "UPDATE execution_node SET revoked_at=?2 WHERE node_id=?1 AND role='remote' AND revoked_at IS NULL",
             params![node_id, now],
         )?;
+        tx.execute(
+            "UPDATE node_run_credential SET revoked_at=?2
+              WHERE node_id=?1 AND revoked_at IS NULL",
+            params![node_id, now],
+        )?;
+        tx.commit()?;
         Ok(RevokeResult::Revoked { revoked_at: now })
+    }
+
+    /// Remember a digest for one attempt. The plaintext token never enters this store.
+    pub fn issue_run_credential(
+        &self,
+        digest_hex: &str,
+        run_id: &str,
+        attempt: u32,
+        node_id: &str,
+        member_id: Option<&str>,
+        mission_id: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO node_run_credential(
+                token_digest, run_id, attempt, node_id, member_id, mission_id, revoked_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![digest_hex, run_id, attempt, node_id, member_id, mission_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn remote_digest_exists(&self, digest_hex: &str) -> Result<bool> {
+        let connection = self.lock()?;
+        let found: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM execution_node WHERE role='remote' AND token_digest=?1)",
+            [digest_hex],
+            |row| row.get(0),
+        )?;
+        Ok(found)
+    }
+
+    /// Scope bound to a shim digest. `usable` is false once the attempt has
+    /// ended or the node has been revoked.
+    pub fn run_grant(&self, digest_hex: &str) -> Result<Option<RunGrant>> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT c.member_id, c.mission_id, c.revoked_at, n.revoked_at, d.status
+                   FROM node_run_credential AS c
+                   JOIN execution_node AS n ON n.node_id = c.node_id
+                   JOIN node_dispatch AS d ON d.run_id = c.run_id AND d.attempt = c.attempt
+                  WHERE c.token_digest = ?1",
+                [digest_hex],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.map(
+            |(member_id, mission_id, credential_revoked, node_revoked, status)| RunGrant {
+                usable: credential_revoked.is_none()
+                    && node_revoked.is_none()
+                    && status == "running",
+                member_id,
+                mission_id,
+            },
+        ))
+    }
+
+    pub fn latest_run_scope(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT member_id, mission_id FROM node_run_credential
+                  WHERE run_id=?1 ORDER BY attempt DESC LIMIT 1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn list_nodes(&self) -> Result<Vec<NodeRecord>> {
@@ -561,19 +697,25 @@ impl NodeStore {
               WHERE run_id=?1 AND attempt=?2",
             params![run_id, attempt, seq as i64, exit_code, now],
         )?;
+        revoke_run_credential(&tx, run_id, attempt, &now)?;
         tx.commit()?;
         Ok(OutputWrite::Stored)
     }
 
     pub fn interrupt(&self, run_id: &str, attempt: u32) -> Result<bool> {
         let now = now_stamp();
-        let connection = self.lock()?;
-        let updated = connection.execute(
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+        let updated = tx.execute(
             "UPDATE node_dispatch
                 SET status='interrupted', finished_at=?3
               WHERE run_id=?1 AND attempt=?2 AND status='running'",
             params![run_id, attempt, now],
         )?;
+        if updated == 1 {
+            revoke_run_credential(&tx, run_id, attempt, &now)?;
+        }
+        tx.commit()?;
         Ok(updated == 1)
     }
 
@@ -659,6 +801,20 @@ impl NodeStore {
             runtime,
         })
     }
+}
+
+fn revoke_run_credential(
+    connection: &Connection,
+    run_id: &str,
+    attempt: u32,
+    now: &str,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE node_run_credential SET revoked_at=?3
+          WHERE run_id=?1 AND attempt=?2 AND revoked_at IS NULL",
+        params![run_id, attempt, now],
+    )?;
+    Ok(())
 }
 
 fn dispatch_cursor(
@@ -909,6 +1065,45 @@ mod tests {
         assert_eq!(cli.path, before.path);
         assert_eq!(cli.reported_at, before.reported_at);
         assert!(cli.path_present);
+    }
+
+    #[test]
+    fn shim_credential_is_scoped_and_dies_with_the_attempt_or_the_node() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        store
+            .insert_remote("node_a", "desk", &"ab".repeat(32))
+            .unwrap();
+        store
+            .begin_dispatch("run_1", 1, "node_a", "codex-cli")
+            .unwrap();
+        store
+            .issue_run_credential(
+                &"12".repeat(32),
+                "run_1",
+                1,
+                "node_a",
+                Some("member_b4"),
+                Some("mission_b4"),
+            )
+            .unwrap();
+        let grant = store.run_grant(&"12".repeat(32)).unwrap().unwrap();
+        assert!(grant.usable);
+        assert_eq!(grant.member_id.as_deref(), Some("member_b4"));
+        assert_eq!(grant.mission_id.as_deref(), Some("mission_b4"));
+        assert!(store.remote_digest_exists(&"ab".repeat(32)).unwrap());
+        assert!(!store.remote_digest_exists(&"12".repeat(32)).unwrap());
+        store.finish("run_1", 1, 1, 0).unwrap();
+        assert!(!store.run_grant(&"12".repeat(32)).unwrap().unwrap().usable);
+
+        store
+            .begin_dispatch("run_2", 1, "node_a", "codex-cli")
+            .unwrap();
+        store
+            .issue_run_credential(&"34".repeat(32), "run_2", 1, "node_a", None, None)
+            .unwrap();
+        assert!(store.run_grant(&"34".repeat(32)).unwrap().unwrap().usable);
+        store.revoke("node_a").unwrap();
+        assert!(!store.run_grant(&"34".repeat(32)).unwrap().unwrap().usable);
     }
 
     fn listed_cli(store: &NodeStore, kind: &str) -> CliRecord {

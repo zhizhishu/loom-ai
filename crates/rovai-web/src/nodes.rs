@@ -1,9 +1,11 @@
-//! Execution nodes for milestones B2 and B3.
+//! Execution nodes for milestones B2, B3, and B4.
 //!
 //! Node tokens are stored as digests in SQLite, so they survive a server
 //! restart. Pairing codes stay in memory. A remote node is only used when
 //! `node-exec` targets it; it is not the mission execution host. A CLI the
 //! connected node did not report is refused before a process is started.
+//! Each dispatched run gets a separate shim credential, scoped to that run
+//! and member, which dies when the run ends or the node is revoked.
 
 use crate::auth::{Session, Sessions};
 use crate::{WebState, error};
@@ -43,6 +45,7 @@ const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const OUTPUT_PAGE: usize = 1000;
 const OUTBOUND_QUEUE: usize = 64;
 const NODE_KIND: &[u8] = b"rovai-node-v1\0";
+const RUN_KIND: &[u8] = b"rovai-node-run-v1\0";
 const PAIRING_KIND: &[u8] = b"rovai-node-pairing-v1\0";
 
 /// Failed pairing attempts allowed from one TCP peer inside [`PAIRING_WINDOW`].
@@ -106,6 +109,12 @@ struct Run {
     node_id: String,
     attempt: u32,
     done: Option<oneshot::Sender<Result<RunOutcome, &'static str>>>,
+}
+
+#[derive(Clone, Default)]
+struct RunScope {
+    mission_id: Option<String>,
+    member_id: Option<String>,
 }
 
 struct RunOutcome {
@@ -450,10 +459,14 @@ impl Hub {
         cwd: &str,
         args: &[String],
         existing_run: Option<&str>,
+        scope: &RunScope,
     ) -> Result<(String, RunOutcome), &'static str> {
         let deadline = Instant::now() + NODE_WAIT;
         let (run_id, rx) = loop {
-            match self.try_dispatch(runtime, cwd, args, existing_run).await? {
+            match self
+                .try_dispatch(runtime, cwd, args, existing_run, scope)
+                .await?
+            {
                 Some(started) => break started,
                 None if Instant::now() >= deadline => return Err("node_runtime_unavailable"),
                 None => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -476,11 +489,12 @@ impl Hub {
         cwd: &str,
         args: &[String],
         existing_run: Option<&str>,
+        scope: &RunScope,
     ) -> Result<Option<(String, oneshot::Receiver<Result<RunOutcome, &'static str>>)>, &'static str>
     {
         if let Some(run_id) = existing_run {
             return self
-                .try_redispatch(run_id, runtime, cwd, args)
+                .try_redispatch(run_id, runtime, cwd, args, scope)
                 .await
                 .map(Some);
         }
@@ -508,6 +522,13 @@ impl Hub {
         self.store
             .begin_dispatch(&run_id, 1, &node_id, runtime)
             .map_err(|_| "node_runtime_unavailable")?;
+        let shim_token = match self.bind_shim(&run_id, 1, &node_id, scope) {
+            Ok(token) => token,
+            Err(code) => {
+                let _ = self.store.interrupt(&run_id, 1);
+                return Err(code);
+            }
+        };
         let start = ServerMessage::Start {
             run_id: run_id.clone(),
             attempt: 1,
@@ -516,6 +537,7 @@ impl Hub {
             args: args.to_vec(),
             cwd: cwd.to_owned(),
             env: Vec::new(),
+            shim_token,
         }
         .to_json();
         let (tx, rx) = oneshot::channel();
@@ -541,6 +563,7 @@ impl Hub {
         runtime: &str,
         cwd: &str,
         args: &[String],
+        scope: &RunScope,
     ) -> Result<(String, oneshot::Receiver<Result<RunOutcome, &'static str>>), &'static str> {
         let opened = self
             .store
@@ -588,6 +611,14 @@ impl Hub {
             let _ = self.store.interrupt(run_id, attempt);
             return Err("node_runtime_unavailable");
         };
+        let scope = self.scope_for_attempt(run_id, scope)?;
+        let shim_token = match self.bind_shim(run_id, attempt, &node_id, &scope) {
+            Ok(token) => token,
+            Err(code) => {
+                let _ = self.store.interrupt(run_id, attempt);
+                return Err(code);
+            }
+        };
         let start = ServerMessage::Start {
             run_id: run_id.to_owned(),
             attempt,
@@ -596,6 +627,7 @@ impl Hub {
             args: args.to_vec(),
             cwd: cwd.to_owned(),
             env: Vec::new(),
+            shim_token,
         }
         .to_json();
         let (tx, rx) = oneshot::channel();
@@ -613,6 +645,49 @@ impl Hub {
             return Err("node_disconnected");
         }
         Ok((run_id.to_owned(), rx))
+    }
+
+    fn scope_for_attempt(
+        &self,
+        run_id: &str,
+        requested: &RunScope,
+    ) -> Result<RunScope, &'static str> {
+        if requested.mission_id.is_some() || requested.member_id.is_some() {
+            return Ok(requested.clone());
+        }
+        match self
+            .store
+            .latest_run_scope(run_id)
+            .map_err(|_| "node_store_unavailable")?
+        {
+            Some((member_id, mission_id)) => Ok(RunScope {
+                member_id,
+                mission_id,
+            }),
+            None => Ok(requested.clone()),
+        }
+    }
+
+    fn bind_shim(
+        &self,
+        run_id: &str,
+        attempt: u32,
+        node_id: &str,
+        scope: &RunScope,
+    ) -> Result<String, &'static str> {
+        let token = random_hex(32);
+        let digest = digest_hex_kind(RUN_KIND, &token);
+        self.store
+            .issue_run_credential(
+                &digest,
+                run_id,
+                attempt,
+                node_id,
+                scope.member_id.as_deref(),
+                scope.mission_id.as_deref(),
+            )
+            .map_err(|_| "node_runtime_unavailable")?;
+        Ok(token)
     }
 
     async fn abandon(&self, run_id: &str) {
@@ -1214,7 +1289,11 @@ fn keyed_digest(kind: &[u8], token: &str) -> [u8; 32] {
 }
 
 fn digest_hex(token: &str) -> String {
-    keyed_digest(NODE_KIND, token)
+    digest_hex_kind(NODE_KIND, token)
+}
+
+fn digest_hex_kind(kind: &[u8], token: &str) -> String {
+    keyed_digest(kind, token)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -1317,6 +1396,12 @@ pub(crate) struct ExecRequest {
     args: Vec<String>,
     #[serde(default)]
     run_id: Option<String>,
+    /// Mission the shim's `rovai loom status` reads on A. Absent means no mission.
+    #[serde(default)]
+    mission_id: Option<String>,
+    /// Member the shim credential acts as. The child cannot choose another one.
+    #[serde(default)]
+    member_id: Option<String>,
 }
 
 pub(crate) async fn exec(
@@ -1330,9 +1415,19 @@ pub(crate) async fn exec(
     if let Err(code) = validate_exec(&body) {
         return error(StatusCode::BAD_REQUEST, code);
     }
+    let scope = RunScope {
+        mission_id: body.mission_id.clone(),
+        member_id: body.member_id.clone(),
+    };
     match state
         .nodes
-        .dispatch(&body.runtime, &body.cwd, &body.args, body.run_id.as_deref())
+        .dispatch(
+            &body.runtime,
+            &body.cwd,
+            &body.args,
+            body.run_id.as_deref(),
+            &scope,
+        )
         .await
     {
         Ok((run_id, outcome)) => Json(json!({
@@ -1376,7 +1471,24 @@ fn validate_exec(body: &ExecRequest) -> Result<(), &'static str> {
     {
         return Err("invalid_node_exec");
     }
+    if let Some(mission_id) = &body.mission_id
+        && !valid_scope_id(mission_id, 200)
+    {
+        return Err("invalid_node_exec");
+    }
+    if let Some(member_id) = &body.member_id
+        && !valid_scope_id(member_id, 80)
+    {
+        return Err("invalid_node_exec");
+    }
     Ok(())
+}
+
+fn valid_scope_id(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && !value.contains('\0')
+        && !value.chars().any(char::is_control)
 }
 
 fn exec_error(code: &'static str) -> Response {
@@ -1410,6 +1522,120 @@ fn cli_availability(online: bool, path_present: bool, live: bool) -> &'static st
     } else {
         "last_seen"
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ShimRequest {
+    args: Vec<String>,
+}
+
+/// The `rovai` shim on a node calls this with its per-run token. Administrator
+/// tokens and node tokens are rejected. The mission and member come from the
+/// credential, not from the request.
+pub(crate) async fn shim(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    body: Result<Json<ShimRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Some(token) = bearer(&headers) else {
+        return error(StatusCode::UNAUTHORIZED, "shim_token_invalid");
+    };
+    if state.sessions.is_administrator(token) {
+        return error(StatusCode::FORBIDDEN, "administrator_rejected");
+    }
+    if !valid_credential(token) {
+        return error(StatusCode::UNAUTHORIZED, "shim_token_invalid");
+    }
+    match state.nodes.store.remote_digest_exists(&digest_hex(token)) {
+        Ok(true) => return error(StatusCode::FORBIDDEN, "node_token_rejected"),
+        Ok(false) => {}
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable"),
+    }
+    let grant = match state
+        .nodes
+        .store
+        .run_grant(&digest_hex_kind(RUN_KIND, token))
+    {
+        Ok(grant) => grant,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable"),
+    };
+    let Some(grant) = grant.filter(|grant| grant.usable) else {
+        return error(StatusCode::UNAUTHORIZED, "shim_token_invalid");
+    };
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_shim_request");
+    };
+    if body.args.len() > 8
+        || body
+            .args
+            .iter()
+            .any(|arg| arg.len() > 256 || arg.contains('\0'))
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_shim_request");
+    }
+    if body.args != ["loom".to_owned(), "status".to_owned()] {
+        return error(StatusCode::FORBIDDEN, "shim_operation_denied");
+    }
+    // `grant.member_id` is the caller. The request cannot name a different one.
+    let Some(mission_id) = grant
+        .mission_id
+        .filter(|mission_id| !mission_id.trim().is_empty())
+    else {
+        return Json(json!({
+            "exitCode": 1,
+            "stdout": "{\"error\":{\"code\":\"loom.current_unavailable\",\"message\":\"The current Thread has no Mission; LOOM works inside a Mission Thread\",\"recovery\":\"stop\"}}\n",
+            "stderr": "",
+        }))
+        .into_response();
+    };
+    match read_loom_status(&state.core, &mission_id).await {
+        Ok(stdout) => Json(json!({
+            "exitCode": 0,
+            "stdout": stdout,
+            "stderr": "",
+        }))
+        .into_response(),
+        Err(code) => error(StatusCode::SERVICE_UNAVAILABLE, code),
+    }
+}
+
+async fn read_loom_status(
+    core: &rovai_core::application::CoreService,
+    mission_id: &str,
+) -> Result<String, &'static str> {
+    let plan = core_value(core, "loom.plan.get", mission_id).await?;
+    let tasks = core_value(core, "loom.tasks.list", mission_id).await?;
+    let dependencies = core_value(core, "loom.dependencies.list", mission_id).await?;
+    let claims = core_value(core, "loom.claims.list", mission_id).await?;
+    let evaluated_at = claims.get("evaluatedAt").cloned().unwrap_or(Value::Null);
+    let claim_rows = claims.get("claims").cloned().unwrap_or_else(|| json!([]));
+    let document = json!({
+        "missionId": mission_id,
+        "plan": plan,
+        "tasks": tasks,
+        "dependencies": dependencies,
+        "claims": claim_rows,
+        "evaluatedAt": evaluated_at,
+    });
+    let mut text = serde_json::to_string(&document).map_err(|_| "shim_unavailable")?;
+    text.push('\n');
+    Ok(text)
+}
+
+async fn core_value(
+    core: &rovai_core::application::CoreService,
+    method: &str,
+    mission_id: &str,
+) -> Result<Value, &'static str> {
+    let reply = core
+        .request(method, json!({"missionId": mission_id}))
+        .await
+        .map_err(|_| "shim_unavailable")?;
+    if reply.error.is_some() {
+        return Err("shim_unavailable");
+    }
+    Ok(reply.result.unwrap_or(Value::Null))
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -1551,7 +1777,7 @@ mod tests {
         let hub = test_hub();
         let started = Instant::now();
         let pending = hub
-            .try_dispatch("codex-cli", "/work", &[], None)
+            .try_dispatch("codex-cli", "/work", &[], None, &RunScope::default())
             .await
             .unwrap();
         assert!(pending.is_none());
@@ -1565,7 +1791,13 @@ mod tests {
             attach_reports(&hub, vec![cli_report("codex-cli", "/opt/codex", true)]).await;
         let started = Instant::now();
         let err = match hub
-            .dispatch("claude-code-cli", "/work", &["-p".into()], None)
+            .dispatch(
+                "claude-code-cli",
+                "/work",
+                &["-p".into()],
+                None,
+                &RunScope::default(),
+            )
             .await
         {
             Err(code) => code,
@@ -1626,7 +1858,13 @@ mod tests {
         assert_ne!(cli["path"], "path_missing");
         let started = Instant::now();
         match hub
-            .dispatch("codex-cli", "/work", &["exec".into()], None)
+            .dispatch(
+                "codex-cli",
+                "/work",
+                &["exec".into()],
+                None,
+                &RunScope::default(),
+            )
             .await
         {
             Err(code) => assert_eq!(code, "node_cli_unreported"),
@@ -1648,7 +1886,13 @@ mod tests {
         assert_ne!(cli["path"], "path_missing");
         assert!(cli["reportedAt"].as_str().unwrap().len() > 10);
         match hub
-            .dispatch("codex-cli", "/work", &["exec".into()], None)
+            .dispatch(
+                "codex-cli",
+                "/work",
+                &["exec".into()],
+                None,
+                &RunScope::default(),
+            )
             .await
         {
             Err(code) => assert_eq!(code, "node_cli_unreported"),

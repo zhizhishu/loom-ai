@@ -73,9 +73,23 @@ pub(crate) fn list(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn exec(data_dir: &Path, runtime_kind: &str, cwd: &str, args: &[String]) -> Result<()> {
+pub(crate) fn exec(
+    data_dir: &Path,
+    runtime_kind: &str,
+    cwd: &str,
+    args: &[String],
+    mission_id: Option<&str>,
+    member_id: Option<&str>,
+) -> Result<()> {
     let runtime = command_runtime()?;
-    let outcome = runtime.block_on(exec_async(data_dir, runtime_kind, cwd, args))?;
+    let outcome = runtime.block_on(exec_async(
+        data_dir,
+        runtime_kind,
+        cwd,
+        args,
+        mission_id,
+        member_id,
+    ))?;
     io::stdout().write_all(&outcome.stdout)?;
     io::stdout().flush()?;
     io::stderr().write_all(&outcome.stderr)?;
@@ -150,16 +164,25 @@ async fn exec_async(
     runtime_kind: &str,
     cwd: &str,
     args: &[String],
+    mission_id: Option<&str>,
+    member_id: Option<&str>,
 ) -> Result<ExecOutcome> {
     let (origin, client, session) = connect_admin(data_dir).await?;
+    let mut body = json!({
+        "runtime": runtime_kind,
+        "cwd": cwd,
+        "args": args,
+    });
+    if let Some(mission_id) = mission_id {
+        body["missionId"] = json!(mission_id);
+    }
+    if let Some(member_id) = member_id {
+        body["memberId"] = json!(member_id);
+    }
     let response = client
         .post(format!("{origin}/api/v1/nodes/exec"))
         .bearer_auth(session)
-        .json(&json!({
-            "runtime": runtime_kind,
-            "cwd": cwd,
-            "args": args,
-        }))
+        .json(&body)
         .send()
         .await
         .context("dispatch request failed")?;

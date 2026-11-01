@@ -68,3 +68,39 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+
+/// Migration 226: per-run shim credentials. Remote nodes stay off the default
+/// execution host; this table only records digests for runs already dispatched.
+pub(super) fn migrate_run_credential(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 175
+        ),
+        "shim credential migration requires schema 175"
+    );
+    tx.execute_batch(crate::execution_node::SHIM_SCHEMA_SQL)?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(226,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=176,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(&tx, &["node_run_credential"])?;
+    anyhow::ensure!(
+        crate::execution_node::shim_schema_matches(&tx)?,
+        "shim credential migration did not create the required table"
+    );
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 176
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "shim credential schema admission failed");
+    tx.commit()?;
+    Ok(())
+}

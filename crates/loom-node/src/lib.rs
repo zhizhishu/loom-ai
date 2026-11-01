@@ -1,5 +1,6 @@
 mod discover;
 mod session;
+mod shim;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
@@ -39,6 +40,13 @@ struct Credentials {
 }
 
 pub fn run() -> Result<()> {
+    let mut args = std::env::args();
+    let _argv0 = args.next();
+    if args.next().as_deref() == Some("--shim") {
+        let path = args.next().context("shim credential path")?;
+        let forwarded: Vec<String> = args.collect();
+        return shim::forward(std::path::Path::new(&path), &forwarded);
+    }
     let cli = Cli::parse();
     ensure_transport(&cli.server)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -68,7 +76,14 @@ async fn run_async(cli: Cli) -> Result<()> {
         credentials.server = cli.server.clone();
         write_credentials(&cli.data_dir, &credentials)?;
     }
-    session::serve(&cli.server, &credentials.node_id, &credentials.token, clis).await
+    session::serve(
+        &cli.data_dir,
+        &cli.server,
+        &credentials.node_id,
+        &credentials.token,
+        clis,
+    )
+    .await
 }
 
 fn prepare_data_dir(path: &Path) -> Result<()> {
