@@ -64,6 +64,7 @@ pub mod dsh;
 pub mod execution_budget;
 pub mod execution_evidence;
 pub(crate) mod execution_input;
+pub mod execution_node;
 #[cfg(all(test, feature = "slow-tests"))]
 mod execution_storage_probe;
 pub(crate) mod execution_text;

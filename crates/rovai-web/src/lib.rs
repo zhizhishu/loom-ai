@@ -78,8 +78,13 @@ pub struct WebServer {
 }
 
 impl WebServer {
-    pub async fn start(core: CoreService, config: WebConfig, administrator: &str) -> Result<Self> {
-        Self::start_with_channels(core, config, administrator, None).await
+    pub async fn start(
+        core: CoreService,
+        config: WebConfig,
+        administrator: &str,
+        data_dir: &std::path::Path,
+    ) -> Result<Self> {
+        Self::start_with_channels(core, config, administrator, None, data_dir).await
     }
 
     pub async fn start_with_channels(
@@ -87,12 +92,14 @@ impl WebServer {
         config: WebConfig,
         administrator: &str,
         channels: Option<Arc<dyn ChannelHost>>,
+        data_dir: &std::path::Path,
     ) -> Result<Self> {
         Self::start_with_sessions(
             core,
             config,
             Arc::new(Sessions::new(administrator)?),
             channels,
+            data_dir,
         )
         .await
     }
@@ -102,8 +109,9 @@ impl WebServer {
         config: WebConfig,
         sessions: Arc<Sessions>,
         channels: Option<Arc<dyn ChannelHost>>,
+        data_dir: &std::path::Path,
     ) -> Result<Self> {
-        Self::start_with_services(core, config, sessions, channels, None).await
+        Self::start_with_services(core, config, sessions, channels, None, data_dir).await
     }
 
     pub async fn start_with_services(
@@ -112,6 +120,7 @@ impl WebServer {
         sessions: Arc<Sessions>,
         channels: Option<Arc<dyn ChannelHost>>,
         updates: Option<Arc<dyn UpdateHost>>,
+        data_dir: &std::path::Path,
     ) -> Result<Self> {
         ensure!(
             config.listen.ip().is_loopback() || config.allow_insecure_lan,
@@ -148,17 +157,24 @@ impl WebServer {
             upload_attempts: Arc::new(uploads::Attempts::default()),
             files: Arc::new(resources::Handles::default()),
             downloads: Arc::new(downloads::Downloads::new()?),
-            nodes: nodes::Hub::start(sessions.clone()),
+            nodes: nodes::Hub::start(
+                sessions.clone(),
+                rovai_core::execution_node::NodeStore::open(&data_dir.join("rovai.sqlite"))
+                    .context("node store is unavailable")?,
+            ),
         };
         sessions.enable();
         let app = routes(state);
         let (shutdown, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
         });
         Ok(Self {
             network,
@@ -238,8 +254,11 @@ fn routes(state: WebState) -> Router {
         .route("/files", post(resources::files))
         .route("/files/bytes", post(resources::binary))
         .route("/attachments", post(resources::attachment))
+        .route("/nodes", get(nodes::list))
         .route("/nodes/pair", post(nodes::pair))
         .route("/nodes/exec", post(nodes::exec))
+        .route("/nodes/runs/{run_id}/output/{from}", get(nodes::output))
+        .route("/nodes/{node_id}/revoke", post(nodes::revoke))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .nest("/api/v1", api)

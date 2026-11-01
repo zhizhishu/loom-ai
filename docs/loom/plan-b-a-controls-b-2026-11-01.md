@@ -675,6 +675,41 @@ pid=$(pgrep -f 'loom-node --data-dir /tmp/loom-b1/b')
 if ss -ltnp | grep -q "pid=${pid},"; then echo 'node is listening'; exit 1; fi
 ```
 
+#### 实施状态（2026-11-01）
+
+B2 已落地。派发和节点身份写在 A 的 SQLite 里，走迁移 225，投影版本 175。远程节点不会变成默认执行主机：`mission_execution_host` 仍是本机那一行，本机节点只是列表里不可作废的 `local` 条目。
+
+表：
+
+| 表 | 内容 |
+|---|---|
+| `execution_node` | `node_id`、显示名、`local`/`remote`、操作系统、架构、令牌摘要、`paired_at`、`revoked_at`、`last_heartbeat`。本机行没有令牌，也不能作废 |
+| `execution_node_cli` | 该节点上次上报的 `adapter_kind`、路径、版本、路径是否还在、上报时间 |
+| `node_dispatch` | `run_id`、`attempt`、节点、运行时、`running`/`exited`/`interrupted`、已确认序号、退出码、开始和结束时间 |
+| `node_dispatch_output` | 同一序号空间里的 stdout/stderr 字节。主键是 `(run_id, attempt, seq)` |
+
+管理员会话（和 `node-pair` 同一条登录）可以读：
+
+- `GET /api/v1/nodes`：每个节点的角色、在线或离线、心跳、CLI、`activeRunCount` 和 `activeRuns`。离线约在最后一次心跳 30 秒之后；重连的 Hello 立刻把心跳写回来。本机行 `revocable` 为 false。
+- `GET /api/v1/nodes/runs/{runId}/output/{from}`：最新一次尝试里序号 ≥ `from` 的帧，以及 `status`、`ackedSeq`、`exitCode`。序号放在路径里，因为现有 Web 边界拒绝查询字符串。
+- `POST /api/v1/nodes/{nodeId}/revoke`：写下 `revoked_at`，正在跑的尝试记为中断，活着的套接字关掉。之后这个令牌的 Hello 得到 `token_revoked`。本机返回 409 `node_not_revocable`。
+
+重连时节点在 Hello 里带上每个未结束 Run 的进程是否还在、以及自己已经发出的序号。进程还在，或者还有没确认的帧，A 发 `Resume`（已确认序号），不发第二次 `Start`。节点把未确认的帧再送一遍；已经确认的序号只回 Ack，不另存一行。进程没了而且没有未确认的帧，这一尝试标成 `interrupted`。只有这时 `node-exec` 带上同一个 `runId` 才会打开下一尝试。退出了的尝试不会悄悄再开。
+
+节点只执行自己发现过的运行时：`adapter_kind` 必须对上，程序路径规范化之后必须就是那次发现的二进制。对不上就回 `program_not_allowed`，不起进程。出站队列有上限：节点的输出通道满了就停读子进程的管道；A 的确认号按 Run 合并，读循环不因为确认而堵住。
+
+配对失败按接受连接时的 TCP 对端地址计数，同时有一个全局上限。这只看本进程 `accept` 到的地址，不看 `X-Forwarded-For`。套接字还没配对，客户端可以伪造转发头。前面若有反向代理，所有尝试都像来自代理那一个地址，按地址的限制会叠到代理身上，只剩全局限制还罩得住进程。代理自己也要限制这条预配对套接字。
+
+```bash
+cargo test -p loom-node --test b2_resume
+cargo test -p loom-node --test b1_outbound
+cargo test -p rovai-web --lib nodes::
+cargo test -p loom-node --lib
+cargo test -p rovai-core --lib loom
+```
+
+B3 从这里接着做：节点没上报的 CLI 在启动前就拒绝，不要为了等一个不会出现的运行时耗掉整段 `NODE_WAIT`；离线节点的「上次上报」已经在 `GET /api/v1/nodes` 里，B3 把它接到 CLI 或界面，并锁住「离线后列表还在、时间还在、不改成路径缺失」。仍然不要把远程节点写成默认执行主机。
+
 ### B3 能力上报，没有的 CLI 不派
 
 - 节点上报 `codex-cli` 或明确不上报。

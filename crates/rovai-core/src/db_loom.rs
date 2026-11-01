@@ -868,7 +868,11 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
-            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224);
+            DROP TABLE IF EXISTS node_dispatch_output;
+            DROP TABLE IF EXISTS node_dispatch;
+            DROP TABLE IF EXISTS execution_node_cli;
+            DROP TABLE IF EXISTS execution_node;
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
@@ -1228,6 +1232,39 @@ mod tests {
             projection_version(&database),
             174,
             "assertion contract_marker_advances_to_174"
+        );
+        // Migration 225 records execution nodes, so the 174 receipt is a source now.
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 174
+        ));
+        super::execution_nodes::migrate(&mut database).unwrap();
+        assert!(
+            crate::execution_node::schema_matches(database.connection()).unwrap(),
+            "assertion schema_175_creates_the_execution_node_projection"
+        );
+        assert_eq!(
+            migration_receipts(&database, 225),
+            1,
+            "assertion schema_migration_records_225_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            175,
+            "assertion contract_marker_advances_to_175"
+        );
+        let local: i64 = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM execution_node WHERE role='local' AND revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, 1,
+            "assertion the local node is recorded and not revocable"
         );
         assert!(matches!(
             classify_database_contract(database.connection()).unwrap(),
