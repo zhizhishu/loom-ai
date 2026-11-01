@@ -743,6 +743,71 @@ B4 从这里接着做：节点为这次 Run 准备的 `PATH` 里放 `rovai` 垫�
 - 垫片呈上管理员令牌时被拒绝。
 - 真 Codex 若仍因沙箱连不上网络，沿用方案 A 的配置：节点用户的 `~/.codex/config.toml` 里 `[sandbox_workspace_write] network_access = true`。垫片走的是连向 A 的出站，不是 Unix socket。
 
+#### 实施状态（2026-11-01）
+
+B4 已落地。A 派一次 Run 时签发一份只属于这次尝试的凭据，摘要写在迁移 226 的 `node_run_credential` 里，明文只放进该 Run 的 `0600` 凭据文件。B 把一个 `rovai` 垫片放在这次子进程 `PATH` 的最前面。垫片是 `loom-node --shim`，向 A 的 `POST /api/v1/nodes/shim` 出站，不在 B 上听端口。节点令牌不进子进程环境。
+
+垫片目前只放行 `rovai loom status`。这次 Run 若绑了 `missionId`，读的是 A 上该使命的计划；调用方不能在请求里改使命或队员。别的子命令回 `shim_operation_denied`。呈上管理员令牌回 `administrator_rejected`，呈上节点令牌回 `node_token_rejected`。尝试结束（退出或中断）或节点被作废后，这份凭据不再可用，应答是 `shim_token_invalid`。
+
+远程节点仍然不是默认执行主机。`node-exec` 可以带 `--mission` 和 `--member` 把这次垫片收成那一个使命、那一个队员；不带时 `rovai loom status` 得到和本机 CLI 一样的「当前线程没有使命」。
+
+```bash
+cargo test -p loom-node --test b4_shim
+cargo test -p loom-node --test b3_capability
+cargo test -p loom-node --test b2_resume
+cargo test -p loom-node --test b1_outbound
+cargo test -p rovai-web --lib nodes::
+cargo test -p rovai-core --lib execution_node
+cargo test -p rovai-core --lib loom
+```
+
+手工冒烟（一台 Linux，两个进程，两个数据目录）。先准备假 `codex`，它在 Run 里调用垫片上的 `rovai loom status`：
+
+```bash
+mkdir -p /tmp/loom-b4/a /tmp/loom-b4/b /tmp/loom-b4/bin /tmp/loom-b4/work /tmp/loom-b4/ui
+printf '%s\n' '<!doctype html><title>loom-b4</title>' > /tmp/loom-b4/ui/index.html
+cat > /tmp/loom-b4/bin/codex << 'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then echo b4-codex; exit 0; fi
+rovai loom status
+EOF
+chmod +x /tmp/loom-b4/bin/codex
+
+rovai-server --data-dir /tmp/loom-b4/a --listen 127.0.0.1:8767 --web-ui /tmp/loom-b4/ui
+# 另一个终端
+rovai-server node-pair --data-dir /tmp/loom-b4/a
+PATH=/tmp/loom-b4/bin:$PATH \
+  loom-node --data-dir /tmp/loom-b4/b \
+  --server ws://127.0.0.1:8767/api/v1/nodes/connect \
+  --pair-code "$CODE"
+```
+
+要让 `loom status` 读到一份看得见的计划，在 A 的库里写一行（外键关掉，因为这里不建完整使命）：
+
+```bash
+python3 - << 'PY'
+import sqlite3
+con = sqlite3.connect("/tmp/loom-b4/a/rovai.sqlite")
+con.execute("PRAGMA foreign_keys=OFF")
+con.execute(
+    "INSERT INTO loom_plan(plan_id, mission_id, goal, acceptance_criteria_json, acceptance_criteria_version, created_at, revision) "
+    "VALUES ('plan_b4', 'mission_b4', 'LOOM_B4_GOAL_FROM_A', '[]', 'ac-v1', '2026-11-01T00:00:00.000Z', 1)"
+)
+con.commit()
+PY
+
+rovai-server node-exec --data-dir /tmp/loom-b4/a \
+  --runtime codex-cli \
+  --cwd /tmp/loom-b4/work \
+  --mission mission_b4 \
+  --member member_b4 \
+  -- exec status
+```
+
+标准输出里有 `LOOM_B4_GOAL_FROM_A` 和 `mission_b4`，这是 A 的库，不是 B。`ss -ltnp` 里只有 `127.0.0.1:8767`，没有 `loom-node`。用管理员令牌或 `b/node.json` 里的节点令牌去 `POST /api/v1/nodes/shim` 会被拒绝。Run 结束后，或 `POST /api/v1/nodes/{nodeId}/revoke` 之后，同一份垫片令牌返回 `shim_token_invalid`。
+
+已知限制：垫片只实现 `rovai loom status`，不转发 `plan` / `claim` / `candidate`。令牌绑的是这次 `node-exec` 的使命和队员，不是一次完整的 AgentRun 租约。远程节点仍不会变成默认执行主机，那是 B10。真 Codex 沙箱若拦出站，仍要在节点用户的 `~/.codex/config.toml` 里打开 `network_access`。
+
 ### B5 本机节点 + 一台远端，一次使命两段活
 
 - A 的本机执行登记为 `local` 节点，走 `ManagedProcess::spawn`，不经过 WebSocket。

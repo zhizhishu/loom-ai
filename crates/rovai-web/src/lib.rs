@@ -263,6 +263,7 @@ fn routes(state: WebState) -> Router {
     Router::new()
         .nest("/api/v1", api)
         .route("/api/v1/nodes/connect", get(nodes::connect))
+        .route("/api/v1/nodes/shim", post(nodes::shim))
         .route("/api/v1/downloads/{token}", get(downloads::file))
         .route("/api/v1/login", post(login))
         .route("/api/v1/login-ticket", post(redeem_login_ticket))

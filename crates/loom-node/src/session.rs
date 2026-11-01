@@ -1,5 +1,5 @@
-use crate::CliReport;
 use crate::discover::resolve_executable;
+use crate::{CliReport, shim};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
@@ -47,6 +47,9 @@ struct LiveRun {
 }
 
 struct Shared {
+    data_dir: std::path::PathBuf,
+    server: String,
+    node_token: String,
     clis: Vec<CliReport>,
     runs: Mutex<HashMap<String, LiveRun>>,
     control: Mutex<Option<mpsc::Sender<Wire>>>,
@@ -79,12 +82,16 @@ pub(crate) async fn pair(server: &str, pairing_code: &str) -> Result<Issued> {
 }
 
 pub(crate) async fn serve(
+    data_dir: &std::path::Path,
     server: &str,
     node_id: &str,
     token: &str,
     clis: Vec<CliReport>,
 ) -> Result<()> {
     let shared = Arc::new(Shared {
+        data_dir: data_dir.to_path_buf(),
+        server: server.to_owned(),
+        node_token: token.to_owned(),
         clis,
         runs: Mutex::new(HashMap::new()),
         control: Mutex::new(None),
@@ -325,6 +332,7 @@ async fn read_loop(
                         args,
                         cwd,
                         env,
+                        shim_token,
                     } => {
                         accept_start(
                             shared,
@@ -335,6 +343,7 @@ async fn read_loop(
                             args,
                             cwd,
                             env,
+                            shim_token,
                         )
                         .await?;
                     }
@@ -385,6 +394,7 @@ async fn accept_start(
     args: Vec<String>,
     cwd: String,
     env: Vec<(String, String)>,
+    shim_token: String,
 ) -> Result<()> {
     let choice = {
         let resolved = resolve_executable(&shared.clis, &adapter_kind, &program);
@@ -431,8 +441,17 @@ async fn accept_start(
         StartChoice::Spawn(path) => {
             let shared = Arc::clone(shared);
             tokio::spawn(async move {
-                if let Err(error) =
-                    drive_process(shared.clone(), run_id.clone(), path, args, cwd, env).await
+                if let Err(error) = drive_process(
+                    shared.clone(),
+                    run_id.clone(),
+                    attempt,
+                    path,
+                    args,
+                    cwd,
+                    env,
+                    shim_token,
+                )
+                .await
                 {
                     let _ = send_failure(&shared, &run_id, &error).await;
                 }
@@ -546,11 +565,29 @@ fn rewind_queued(shared: &Shared) {
 async fn drive_process(
     shared: Arc<Shared>,
     run_id: String,
+    attempt: u32,
     program: std::path::PathBuf,
     args: Vec<String>,
     cwd: String,
     env: Vec<(String, String)>,
+    shim_token: String,
 ) -> Result<()> {
+    let installed = match shim::install(
+        &shared.data_dir,
+        &run_id,
+        attempt,
+        &shim_token,
+        &shared.server,
+    ) {
+        Ok(installed) => installed,
+        Err(error) => {
+            let message = format!("could not install the rovai shim: {error:#}\n");
+            enqueue(&shared, &run_id, OutputStream::Stderr, message.as_bytes()).await?;
+            enqueue_exit(&shared, &run_id, 127).await?;
+            mark_dead(&shared, &run_id);
+            return Ok(());
+        }
+    };
     let mut command = Command::new(&program);
     command
         .args(&args)
@@ -559,9 +596,23 @@ async fn drive_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let secrets = [shared.node_token.as_str(), shim_token.as_str()];
     for (key, value) in &env {
-        command.env(key, value);
+        if !contains_secret(value, &secrets) {
+            command.env(key, value);
+        }
     }
+    for (key, value) in std::env::vars() {
+        if contains_secret(&value, &secrets) {
+            command.env_remove(key);
+        }
+    }
+    let base_path = env
+        .iter()
+        .find(|(key, value)| key == "PATH" && !contains_secret(value, &secrets))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("PATH").ok());
+    command.env("PATH", child_path(&installed.bin_dir, base_path));
     #[cfg(unix)]
     command.process_group(0);
     let mut child = match command.spawn() {
@@ -692,6 +743,21 @@ async fn send_failure(shared: &Shared, run_id: &str, error: &anyhow::Error) -> R
     enqueue_exit(shared, run_id, 1).await?;
     mark_dead(shared, run_id);
     Ok(())
+}
+
+fn contains_secret(value: &str, secrets: &[&str]) -> bool {
+    secrets
+        .iter()
+        .any(|secret| !secret.is_empty() && value.contains(secret))
+}
+
+fn child_path(shim_bin: &std::path::Path, base: Option<String>) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(shim_bin);
+    if let Some(base) = base.filter(|value| !value.is_empty()) {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(base);
+    }
+    path
 }
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {

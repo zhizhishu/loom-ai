@@ -868,11 +868,12 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
+            DROP TABLE IF EXISTS node_run_credential;
             DROP TABLE IF EXISTS node_dispatch_output;
             DROP TABLE IF EXISTS node_dispatch;
             DROP TABLE IF EXISTS execution_node_cli;
             DROP TABLE IF EXISTS execution_node;
-            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225);
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225,226);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
@@ -1253,6 +1254,26 @@ mod tests {
             projection_version(&database),
             175,
             "assertion contract_marker_advances_to_175"
+        );
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 175
+        ));
+        super::execution_nodes::migrate_run_credential(&mut database).unwrap();
+        assert!(
+            crate::execution_node::shim_schema_matches(database.connection()).unwrap(),
+            "assertion schema_176_creates_the_shim_credential_projection"
+        );
+        assert_eq!(
+            migration_receipts(&database, 226),
+            1,
+            "assertion schema_migration_records_226_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            176,
+            "assertion contract_marker_advances_to_176"
         );
         let local: i64 = database
             .connection()
