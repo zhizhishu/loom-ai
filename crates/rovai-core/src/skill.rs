@@ -5397,3 +5397,30 @@ mod slow_tests {
         remove_directory_if_present(&data).unwrap();
     }
 }
+
+#[cfg(test)]
+mod loom_reference_tests {
+    use super::CLI_OPERATIONS_LOOM_REFERENCE;
+
+    #[test]
+    fn packaged_cli_operations_loom_reference_includes_the_plan_file_shape() {
+        assert_eq!(
+            CLI_OPERATIONS_LOOM_REFERENCE,
+            include_str!("../../../skills/cli-operations/references/loom.md")
+        );
+        let plan = CLI_OPERATIONS_LOOM_REFERENCE
+            .split_once("## Plan")
+            .expect("Plan section")
+            .1
+            .split_once("## Deliver")
+            .expect("Deliver follows Plan")
+            .0;
+        assert!(plan.contains(
+            "Plan file shape (`rovai loom plan --input-file plan.json`). Every object has exactly these fields; leave an optional field out instead of sending `null`, and add no other fields:"
+        ));
+        assert!(plan.contains(
+            "Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAgentId` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself."
+        ));
+        assert!(plan.contains("\"condition\": \"task_done\""));
+    }
+}

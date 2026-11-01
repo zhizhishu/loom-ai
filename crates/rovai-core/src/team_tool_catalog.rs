@@ -1415,6 +1415,28 @@ mod tests {
     }
 
     #[test]
+    fn loom_plan_description_names_the_cli_operations_reference() {
+        let plan = builtin_tool_definitions()
+            .iter()
+            .find(|definition| definition["name"] == "loom.plan")
+            .unwrap();
+        assert_eq!(
+            plan["description"],
+            "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Does not start work; release tasks and message members separately. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference."
+        );
+        assert_eq!(plan["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            plan["inputSchema"]["required"],
+            json!(["goal", "criteria", "tasks"])
+        );
+        assert!(plan["inputSchema"]["properties"].get("missionId").is_none());
+        assert_eq!(
+            plan["inputSchema"]["properties"]["dependencies"]["items"]["properties"]["condition"]["enum"],
+            json!(["task_done", "artifact_accepted"])
+        );
+    }
+
+    #[test]
     fn retired_context_operations_are_not_accepted() {
         assert!(
             validate_builtin_tool_input(

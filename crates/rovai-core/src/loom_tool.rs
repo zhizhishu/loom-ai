@@ -420,8 +420,9 @@ fn open_object() -> Value {
     json!({"type": "object"})
 }
 
-/// The six closed tool definitions, in `TEAM_TOOL_NAMES` order. Text is the confirmed r1 of
-/// `docs/versions/v1.72/model-context-change-loom-accp.md`; edit it only through a new revision.
+/// The six closed tool definitions, in `TEAM_TOOL_NAMES` order. Model-visible text follows the
+/// confirmed revision of `docs/versions/v1.72/model-context-change-loom-accp.md` (the `loom.plan`
+/// description is r3). Edit that text only through a new revision.
 pub fn tool_definitions() -> Vec<Value> {
     let criterion = json!({
         "type": "object", "additionalProperties": false, "required": ["criterionId", "text"],
@@ -466,7 +467,7 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": LOOM_PLAN_TOOL_NAME,
             "title": "Import the current Mission's plan",
-            "description": "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Does not start work; release tasks and message members separately.",
+            "description": "Import the current Mission's one LOOM plan. Default Lead only. A Mission accepts one plan; it cannot be replaced. Does not start work; release tasks and message members separately. Pass the plan as JSON with --input-file; the exact file shape is in the cli-operations LOOM reference.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
                 "required": ["goal", "criteria", "tasks"],
@@ -948,5 +949,105 @@ mod tests {
             &json!({"taskId": "t", "evidenceIds": ["a"]}),
         )
         .unwrap();
+    }
+
+    /// Bytes packaged as `skills/cli-operations/references/loom.md`.
+    const LOOM_REFERENCE: &str = include_str!("../../../skills/cli-operations/references/loom.md");
+
+    const PLAN_FILE_SHAPE: &str = r#"Plan file shape (`rovai loom plan --input-file plan.json`). Every object has exactly these fields; leave an optional field out instead of sending `null`, and add no other fields:
+
+```json
+{
+  "goal": "Write a short project report",
+  "criteria": [
+    { "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }
+  ],
+  "tasks": [
+    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md" },
+    { "taskId": "report-review", "title": "Review the report" }
+  ],
+  "dependencies": [
+    { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-review", "condition": "task_done" }
+  ]
+}
+```
+
+Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAgentId` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself."#;
+
+    fn reference_plan_example(reference: &str) -> Value {
+        let plan = reference
+            .split_once("## Plan")
+            .expect("Plan section")
+            .1
+            .split_once("## Deliver")
+            .expect("Deliver follows Plan")
+            .0;
+        assert!(
+            plan.contains(PLAN_FILE_SHAPE),
+            "the Plan section must end with the confirmed file shape"
+        );
+        let marker = "```json\n";
+        let start = plan
+            .find(marker)
+            .expect("the Plan section has one JSON example");
+        assert_eq!(plan.matches(marker).count(), 1);
+        let body = &plan[start + marker.len()..];
+        let end = body.find("\n```").expect("the JSON example is fenced");
+        serde_json::from_str(&body[..end]).expect("the plan example is JSON")
+    }
+
+    #[test]
+    fn reference_plan_example_passes_the_closed_plan_schema_unchanged() {
+        let example = reference_plan_example(LOOM_REFERENCE);
+        assert_eq!(
+            example,
+            json!({
+                "goal": "Write a short project report",
+                "criteria": [
+                    {
+                        "criterionId": "report-exists",
+                        "text": "out/report.md exists and covers the three points"
+                    }
+                ],
+                "tasks": [
+                    {
+                        "taskId": "report-draft",
+                        "title": "Draft the report",
+                        "description": "Write out/report.md"
+                    },
+                    { "taskId": "report-review", "title": "Review the report" }
+                ],
+                "dependencies": [
+                    {
+                        "upstreamTaskId": "report-draft",
+                        "downstreamTaskId": "report-review",
+                        "condition": "task_done"
+                    }
+                ]
+            })
+        );
+        crate::team_tool_catalog::validate_builtin_tool_input(LOOM_PLAN_TOOL_NAME, &example)
+            .unwrap();
+        validate_input(LOOM_PLAN_TOOL_NAME, &example).unwrap();
+
+        let mut with_null = example.clone();
+        with_null["tasks"][0]["assigneeAgentId"] = Value::Null;
+        let mut extra_field = example.clone();
+        extra_field["tasks"][0]["notes"] = json!("extra");
+        let mut wrong_name = example.clone();
+        let text = wrong_name["criteria"][0]["text"].take();
+        wrong_name["criteria"][0]["body"] = text;
+        let mut uppercase = example.clone();
+        uppercase["dependencies"][0]["condition"] = json!("TASK_DONE");
+        for invalid in [with_null, extra_field, wrong_name, uppercase] {
+            assert!(
+                crate::team_tool_catalog::validate_builtin_tool_input(
+                    LOOM_PLAN_TOOL_NAME,
+                    &invalid
+                )
+                .is_err(),
+                "closed schema still rejects {invalid}"
+            );
+        }
     }
 }

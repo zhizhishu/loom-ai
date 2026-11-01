@@ -22,6 +22,26 @@ Read `rovai loom status` first. A Mission accepts one plan and it cannot be repl
 
 After importing, release every task. Releasing does not wait for dependencies; a task whose dependencies are not met cannot be claimed yet. Message only the assignees whose tasks have no unmet dependencies.
 
+Plan file shape (`rovai loom plan --input-file plan.json`). Every object has exactly these fields; leave an optional field out instead of sending `null`, and add no other fields:
+
+```json
+{
+  "goal": "Write a short project report",
+  "criteria": [
+    { "criterionId": "report-exists", "text": "out/report.md exists and covers the three points" }
+  ],
+  "tasks": [
+    { "taskId": "report-draft", "title": "Draft the report", "description": "Write out/report.md" },
+    { "taskId": "report-review", "title": "Review the report" }
+  ],
+  "dependencies": [
+    { "upstreamTaskId": "report-draft", "downstreamTaskId": "report-review", "condition": "task_done" }
+  ]
+}
+```
+
+Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAgentId` (per task), `condition` (per dependency, `task_done` or `artifact_accepted`, lowercase), `dependencies` itself.
+
 ## Deliver
 
 Claim before working; a claim lease expires, so claim again if a long task outlives it. If the claim returns `loom.dependency_unreleased`, do not retry: end the Run and tell the Default Lead the task is waiting. Register only files you produced inside the Mission's working directory, then submit with the returned artifact ids. Submitting proves the delivery is recorded, not that it is accepted. Tell the User in the Thread that a delivery awaits acceptance; do not set the Mission `completed` before the User accepts.
