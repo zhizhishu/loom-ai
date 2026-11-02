@@ -1314,11 +1314,12 @@ app.whenReady().then(async () => {
   const live = await script(`(() => {
     const text = value => (value ?? '').replace(/\\s+/gu, ' ').trim()
     const item = title => [...document.querySelectorAll('.loom-live-strip-item')].find(node => (node.querySelector('.loom-live-strip-title')?.innerText ?? '').includes(title))
+    const lane = role => document.querySelector('.loom-live-lane[data-live-role="' + role + '"]')
     const row = role => document.querySelector('.loom-live-row[data-live-role="' + role + '"]')
     return {
       done: text(item('设计恢复协议')?.innerText),
-      local: text(item('实现恢复逻辑')?.innerText),
-      remote: text(item('验收测试')?.innerText),
+      local: text(lane('local')?.innerText),
+      remote: text(lane('remote')?.innerText),
       localRole: row('local')?.getAttribute('data-live-role') ?? null,
       localPhase: row('local')?.getAttribute('data-live-phase') ?? null,
       remoteRole: row('remote')?.getAttribute('data-live-role') ?? null,
@@ -1335,6 +1336,16 @@ app.whenReady().then(async () => {
     `The remote run lost its badge, machine or offline state on the strip: ${JSON.stringify(live.remote)}`)
   assert(live.localCopy.includes('codex-cli'), `The local card lost its CLI: ${JSON.stringify(live.localCopy)}`)
   assert(live.remoteCopy.includes('claude-code-cli'), `The remote card lost its CLI: ${JSON.stringify(live.remoteCopy)}`)
+  assert(live.remoteCopy.includes('最后心跳') && live.remoteCopy.includes('秒前'), `An offline card must show how long since the last heartbeat: ${JSON.stringify(live.remoteCopy)}`)
+  const lanes = await script(`({
+    roles: [...document.querySelectorAll('.loom-live-lane')].map(node => node.getAttribute('data-live-role')),
+    localStatus: [...document.querySelectorAll('.loom-flow-node')].find(node => (node.innerText || '').includes('实现恢复逻辑'))?.querySelector('.loom-flow-node-status')?.innerText ?? ''
+  })`)
+  assert.deepEqual(lanes.roles, ['local', 'remote', 'none'], `Lanes must be one row per node, local first: ${JSON.stringify(lanes.roles)}`)
+  assert.equal(lanes.localStatus.trim(), '在跑', `A running task must not keep a contradictory workflow status: ${JSON.stringify(lanes.localStatus)}`)
+  const pins = await script(`[...document.querySelectorAll('.loom-flow-node-pin')].map(node => node.innerText.trim())`)
+  assert(pins.some(text => text.includes('钉在') && text.includes('loom-a')), `The local task did not show its pinned node: ${JSON.stringify(pins)}`)
+  assert(pins.some(text => text.includes('钉在') && text.includes('desk-b')), `The remote task did not show its pinned node: ${JSON.stringify(pins)}`)
   assert.equal(live.localRole, 'local')
   assert.equal(live.localPhase, 'running')
   assert.equal(live.remoteRole, 'remote')
@@ -1361,12 +1372,16 @@ app.whenReady().then(async () => {
     'Paused output stopped receiving frames')
   const paused = await script(`(() => {
     const node = document.querySelector('.loom-live-output')
-    return { follow: node.getAttribute('data-follow'), top: node.scrollTop, text: node.innerText }
+    const pill = document.querySelector('.loom-live-pill')
+    const header = document.querySelector('.loom-live-process header')?.innerText ?? ''
+    return { follow: node.getAttribute('data-follow'), top: node.scrollTop, text: node.innerText, pill: pill?.innerText ?? '', header }
   })()`)
   assert.equal(paused.follow, 'false', `Follow resumed on its own: ${JSON.stringify(paused)}`)
   assert.equal(paused.top, 0, `A paused reader was pulled back to the latest line: ${JSON.stringify(paused)}`)
   assert(paused.text.includes('帧 1') && paused.text.includes('帧 3'), `The stream did not resume from the lines already shown: ${JSON.stringify(paused.text)}`)
-  cases.push('点开卡片后执行过程按序号追加，读者往上滚时停止自动跟随，新的一帧仍接在后面')
+  assert(/^新输出 \d+/u.test(paused.pill.trim()), `Scrolling up did not show a new-output count: ${JSON.stringify(paused.pill)}`)
+  assert(paused.header.includes('共') && paused.header.includes('行'), `The process header lost its line count: ${JSON.stringify(paused.header)}`)
+  cases.push('点开卡片后执行过程按序号追加，读者往上滚时停止自动跟随，并标出新输出的行数')
 
   stage = 'claims failure keeps node names off the cards'
   await afterRemount('window.loomQA.failClaimsWithNodes()')

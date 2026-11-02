@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ExecutionNodeRecord } from '@contracts'
-import { appendOutputLines, formatElapsed, livePlacements, type LiveClaimRef, type LiveTaskRef } from './loom-live-model'
+import { appendOutputLines, elapsedClock, formatElapsed, liveLanes, livePlacements, type LiveClaimRef, type LiveTaskRef } from './loom-live-model'
 
 const tasks: LiveTaskRef[] = [
   { taskId: 'task-1', title: '设计恢复协议', status: 'done' },
@@ -61,6 +61,23 @@ describe('loom live placements', () => {
     expect(livePlacements(tasks, null, nodes).find(entry => entry.taskId === 'task-3')?.phase).toBe('queued')
   })
 
+  it('shows the pinned node once claims have loaded, and hides it when they have not', () => {
+    const pinnedTasks: LiveTaskRef[] = [
+      { taskId: 'task-9', title: '等待开工', status: 'ready', executionHostId: 'node_desk' },
+      { taskId: 'task-8', title: '没钉住', status: 'ready', executionHostId: null }
+    ]
+    const placed = livePlacements(pinnedTasks, [], nodes)
+    expect(placed[0]).toMatchObject({ nodeName: 'desk-b', remote: true, phase: 'queued', runId: null, pinnedName: 'desk-b' })
+    expect(placed[1].nodeName).toBeNull()
+    expect(livePlacements(pinnedTasks, null, nodes).every(entry => entry.nodeName === null && entry.pinnedName === null)).toBe(true)
+    const running = livePlacements(
+      [{ taskId: 'task-3', title: '实现恢复逻辑', status: 'ready', executionHostId: 'node_local' }],
+      claims,
+      nodes
+    )
+    expect(running[0]).toMatchObject({ phase: 'running', nodeName: 'loom-a', pinnedName: 'loom-a' })
+  })
+
   it('reads a finished dispatch as exited or failed', () => {
     const finished = [
       node({
@@ -88,5 +105,21 @@ describe('loom live placements', () => {
     expect(second.lines[1]).toEqual({ kind: 'gap', seq: 2, missed: 2 })
     expect(second.lines[2]).toMatchObject({ kind: 'frame', seq: 4, text: 'later' })
     expect(second.cursor).toBe(5)
+  })
+
+  it('groups tasks onto one lane per node and freezes an offline clock at the heartbeat', () => {
+    const placed = livePlacements(tasks, claims, nodes)
+    const lanes = liveLanes(placed)
+    expect(lanes.map(lane => [lane.remote, lane.nodeName, lane.segments.map(entry => entry.title)])).toEqual([
+      [false, 'loom-a', ['实现恢复逻辑']],
+      [true, 'desk-b', ['验收测试']],
+      [false, '', ['设计恢复协议']]
+    ])
+    const remote = placed.find(entry => entry.taskId === 'task-4')!
+    const frozen = elapsedClock(remote, Date.parse('2026-11-01T12:00:00.000Z'))
+    expect(frozen).toBe(Date.parse('2026-11-01T00:00:00.000Z'))
+    expect(elapsedClock(remote, Date.parse('2026-11-01T12:05:00.000Z'))).toBe(frozen)
+    const local = placed.find(entry => entry.taskId === 'task-3')!
+    expect(elapsedClock(local, Date.parse('2026-11-01T12:00:00.000Z'))).toBe(Date.parse('2026-11-01T12:00:00.000Z'))
   })
 })

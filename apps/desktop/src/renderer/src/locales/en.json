@@ -4421,5 +4421,11 @@
   "执行过程读取失败": "Could not read the execution process",
   "还没有这一路的输出。": "This run has no output yet.",
   "漏了 {0} 行，正在补齐": "Missed {0} lines; filling them in",
-  "节点列表没有读到。编排仍在。": "The node list did not load. The orchestration is still here."
+  "节点列表没有读到。编排仍在。": "The node list did not load. The orchestration is still here.",
+  "尚未派到节点": "Not sent to a node yet",
+  "最后心跳 {0} 秒前": "Last heartbeat {0}s ago",
+  "最后心跳 {0} 分钟前": "Last heartbeat {0} min ago",
+  "共 {0} 行": "{0} lines",
+  "新输出 {0}": "New output {0}",
+  "钉在 {0}": "Pinned to {0}"
 }

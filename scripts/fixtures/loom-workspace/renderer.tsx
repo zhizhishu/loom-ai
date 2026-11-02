@@ -115,14 +115,14 @@ const tasks: LoomTask[] = [
     title: '实现恢复逻辑', description: '从快照恢复工作区状态',
     assigneeAgentId: 'agent-build', status: 'in_review',
     acceptanceCriteria: plan.acceptanceCriteria,
-    blockedReason: null, createdAt, updatedAt: submittedAt, revision: 2
+    blockedReason: null, executionHostId: 'node_local', createdAt, updatedAt: submittedAt, revision: 2
   },
   {
     taskId: 'task-4', planId: plan.planId,
     title: '验收测试', description: '验证恢复正确性',
     assigneeAgentId: 'agent-lead', status: 'blocked',
     acceptanceCriteria: plan.acceptanceCriteria,
-    blockedReason: '等待恢复逻辑完成', createdAt, updatedAt: createdAt, revision: 1
+    blockedReason: '等待恢复逻辑完成', executionHostId: 'node_desk', createdAt, updatedAt: createdAt, revision: 1
   }
 ]
 
@@ -205,7 +205,8 @@ let liveLines: string[] = []
 let planHidden = false
 
 function mixedNodes(): ExecutionNodeRecord[] {
-  const startedAt = new Date(Date.now() - 65_000).toISOString()
+  const startedAt = new Date(Date.now() - 90_000).toISOString()
+  const heartbeat = new Date(Date.now() - 40_000).toISOString()
   return [
     {
       nodeId: 'node_local', displayName: 'loom-a', role: 'local', revocable: false, status: 'online',
@@ -216,7 +217,7 @@ function mixedNodes(): ExecutionNodeRecord[] {
     },
     {
       nodeId: 'node_desk', displayName: 'desk-b', role: 'remote', revocable: true, status: 'offline',
-      os: 'linux', arch: 'x64', pairedAt: startedAt, revokedAt: null, lastHeartbeat: startedAt,
+      os: 'linux', arch: 'x64', pairedAt: startedAt, revokedAt: null, lastHeartbeat: heartbeat,
       activeRunCount: 1,
       activeRuns: [{ runId: 'run-remote-1', attempt: 1, runtime: 'claude-code-cli', status: 'running', ackedSeq: 8, startedAt }],
       clis: []

@@ -6,7 +6,7 @@ import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
 import { UiText, uiAttribute, useUiText, getInterfaceLanguage } from './interface-language'
 import { useThreadClient } from './camp-client'
 import { LoomLiveProcess, LoomLiveRow, LoomLiveStrip } from './LoomLive'
-import { livePlacements } from './loom-live-model'
+import { livePhaseText, livePlacements } from './loom-live-model'
 import type { NodeApi } from './nodes-api'
 
 export type LoomSection = 'activity' | 'plan' | 'delivery'
@@ -282,11 +282,19 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims, pl
             }}
             className={`loom-flow-node ${ready ? 'ready' : ''} ${task.status}`}>
             <div className="loom-flow-node-header">
-              <span className="loom-flow-node-dot" data-status={task.status}/>
+              <span className="loom-flow-node-dot" data-status={task.status} data-live={placements.find(entry => entry.taskId === task.taskId)?.phase ?? ''}/>
               <span className="loom-flow-node-title">{task.title}</span>
             </div>
             <div className="loom-flow-node-meta">
-              <span className="loom-flow-node-status">{statusLabels[task.status]}</span>
+              <span className="loom-flow-node-status">{(() => {
+                const placement = placements.find(entry => entry.taskId === task.taskId)
+                if (placement?.runId && placement.phase !== 'queued' && placement.phase !== 'done') return t(livePhaseText(placement.phase))
+                return statusLabels[task.status]
+              })()}</span>
+              {(() => {
+                const pinned = placements.find(entry => entry.taskId === task.taskId)?.pinnedName
+                return pinned ? <span className="loom-flow-node-pin">{t('钉在 {0}', pinned)}</span> : null
+              })()}
             </div>
             {assignee && <div className="loom-flow-node-assignee">{assignee.displayName}</div>}
             {upstreams.length > 0 && (
@@ -400,7 +408,7 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
     </header>
     <p className="loom-intro">{t('把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。')}</p>
     {nodeError && <p className="loom-live-note" role="status">{t('节点列表没有读到。编排仍在。')}</p>}
-    <LoomLiveStrip placements={placements} />
+    <LoomLiveStrip placements={placements} now={now} />
     <LoomFlow
       tasks={tasks}
       dependencies={dependencies}
