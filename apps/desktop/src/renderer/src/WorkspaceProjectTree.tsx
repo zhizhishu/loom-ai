@@ -82,7 +82,7 @@ export function WorkspaceProjectPane({
   const offlineEmpty = !online && !everLoaded
   return <div className={`workspace-project-pane${offlineCached ? ' is-offline-cached' : ''}${offlineEmpty ? ' is-offline-empty' : ''}`}>
     {offlineCached && <p className="workspace-offline-banner" role="status">
-      <UiText zh={`这台机器不在线 · 最后心跳 ${heartbeatAgo(lastHeartbeat)} 前 · 显示的是离线前的内容`} />
+      {uiAttribute('这台机器不在线 · 最后心跳 {0} 前 · 显示的是离线前的内容', heartbeatAgo(lastHeartbeat))}
     </p>}
     <div className="workspace-project-body">
       <nav className="workspace-project-tree" aria-label={uiAttribute('项目文件')}>
@@ -161,7 +161,7 @@ export function WorkspaceFilePreview({ ownerName, file, error, offlineEmpty }: {
     return <section className="workspace-file-preview" aria-label={uiAttribute('文件预览')}>
       <header className="workspace-file-header">
         <span className="workspace-file-path">{error.path}</span>
-        {ownerName && <span className="workspace-owner-badge"><UiText zh={`在 ${ownerName} 上`} /></span>}
+        {ownerName && <span className="workspace-owner-badge">{uiAttribute('在 {0} 上', ownerName)}</span>}
       </header>
       <div className="workspace-file-error" role="alert">
         <p>{error.message}</p>
@@ -180,7 +180,7 @@ export function WorkspaceFilePreview({ ownerName, file, error, offlineEmpty }: {
     <header className="workspace-file-header">
       <span className="workspace-file-path">{file.path}</span>
       <span className="workspace-file-size">{formatSize(file.size)}</span>
-      {ownerName && <span className="workspace-owner-badge"><UiText zh={`在 ${ownerName} 上`} /></span>}
+      {ownerName && <span className="workspace-owner-badge">{uiAttribute('在 {0} 上', ownerName)}</span>}
       {file.truncated && <span className="workspace-file-truncated"><UiText zh="已截断，只显示前 1 MiB" /></span>}
     </header>
     <div className="workspace-file-body">

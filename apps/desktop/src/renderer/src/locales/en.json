@@ -4409,5 +4409,13 @@
   "尚未接入运行：{0} 条规则，{1} 个 hook": "Not wired into a run yet: {0} rules, {1} hooks",
   "确认勾选高风险项？": "Check this high-risk item?",
   "「{0}」是高风险 MCP，或会执行命令的 hook。确认之后才会勾上。取消则这次勾选不留下。": "“{0}” is a high-risk MCP server, or a hook that runs a command. It stays checked only after you confirm. Cancel leaves this check off.",
-  "引导正文和 MCP 文件是下一次 Run 会拿到的内容。技能与附加技能用的是同一份勾选。规则片段和 hook 还没有接进运行。未保存的勾选要等这次保存之后才出现。": "The charter and MCP file are what the next run receives. Skills use the same choices as the additional-skill section. Rule snippets and hooks are not wired into a run yet. Unsaved choices appear after this save."
+  "引导正文和 MCP 文件是下一次 Run 会拿到的内容。技能与附加技能用的是同一份勾选。规则片段和 hook 还没有接进运行。未保存的勾选要等这次保存之后才出现。": "The charter and MCP file are what the next run receives. Skills use the same choices as the additional-skill section. Rule snippets and hooks are not wired into a run yet. Unsaved choices appear after this save.",
+  "项目文件": "Project files",
+  "正在从主人节点读取…": "Reading from the owner node…",
+  "这台机器不在线，上线后自动加载文件列表": "This machine is offline. The file list loads when it is back.",
+  "这是空目录": "This directory is empty",
+  "已截断，只显示前 200 项": "Truncated. Showing the first 200 entries",
+  "已截断，只显示前 1 MiB": "Truncated. Showing the first 1 MiB",
+  "在 {0} 上": "On {0}",
+  "这台机器不在线 · 最后心跳 {0} 前 · 显示的是离线前的内容": "This machine is offline · last heartbeat {0} ago · showing the content from before it went offline"
 }
