@@ -873,7 +873,10 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS node_dispatch;
             DROP TABLE IF EXISTS execution_node_cli;
             DROP TABLE IF EXISTS execution_node;
-            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225,226);
+            DROP TABLE IF EXISTS member_capability_tool_claim;
+            DROP TABLE IF EXISTS member_capability_choice;
+            DROP TABLE IF EXISTS member_capability_item;
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225,226,227);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
@@ -1274,6 +1277,26 @@ mod tests {
             projection_version(&database),
             176,
             "assertion contract_marker_advances_to_176"
+        );
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 176
+        ));
+        super::member_capability_migration::migrate(&mut database).unwrap();
+        assert!(
+            crate::member_capability::schema_matches(database.connection()).unwrap(),
+            "assertion schema_177_creates_the_member_capability_catalog"
+        );
+        assert_eq!(
+            migration_receipts(&database, 227),
+            1,
+            "assertion schema_migration_records_227_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            177,
+            "assertion contract_marker_advances_to_177"
         );
         let local: i64 = database
             .connection()

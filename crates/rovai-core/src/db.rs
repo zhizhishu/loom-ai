@@ -16,6 +16,8 @@ mod hermes;
 mod live_directory;
 #[path = "db_loom.rs"]
 mod loom;
+#[path = "db_member_capability.rs"]
+mod member_capability_migration;
 #[path = "db_member_creation.rs"]
 mod member_creation;
 #[path = "db_member_environment.rs"]
@@ -503,7 +505,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 176;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 177;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -1004,6 +1006,7 @@ struct CurrentMigrationState {
     v224: bool,
     v225: bool,
     v226: bool,
+    v227: bool,
 }
 
 impl CurrentMigrationState {
@@ -1025,6 +1028,14 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v227 {
+            let mut previous = *self;
+            previous.v227 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 177
+                && self.v226
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 176, classifier);
+        }
         if self.v226 {
             let mut previous = *self;
             previous.v226 = false;
@@ -3841,6 +3852,7 @@ pub(crate) fn classify_database_contract(
                 | 174
                 | 175
                 | 176
+                | 177
         )
     {
         let expected_migration = marker.projection_schema_version + 50;
@@ -3856,6 +3868,8 @@ pub(crate) fn classify_database_contract(
                 || crate::execution_node::schema_matches(connection)?)
             && (marker.projection_schema_version < 176
                 || crate::execution_node::shim_schema_matches(connection)?)
+            && (marker.projection_schema_version < 177
+                || crate::member_capability::schema_matches(connection)?)
             && (marker.projection_schema_version < 167
                 || hermes::rules_schema_matches(connection)?)
             && (marker.projection_schema_version < 166 || hermes::schema_matches(connection)?)
@@ -6180,7 +6194,8 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=223),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=224),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=225),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=226)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=226),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=227)
         "#,
         [],
         |row| {
@@ -6342,6 +6357,7 @@ fn load_current_migration_state(
                 v224: row.get(154)?,
                 v225: row.get(155)?,
                 v226: row.get(156)?,
+                v227: row.get(157)?,
             })
         },
     )
@@ -9685,6 +9701,9 @@ impl Database {
                     execution_nodes::migrate_run_credential(self)
                 );
             }
+            if !self.schema_migration_applied(227)? {
+                migration_step!("migration_227", member_capability_migration::migrate(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10593,6 +10612,9 @@ impl Database {
                 "migration_226",
                 execution_nodes::migrate_run_credential(self)
             );
+        }
+        if !self.schema_migration_applied(227)? {
+            migration_step!("migration_227", member_capability_migration::migrate(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42415,6 +42437,7 @@ mod tests {
             v224: version >= 224,
             v225: version >= 225,
             v226: version >= 226,
+            v227: version >= 227,
         }
     }
 
@@ -42678,7 +42701,7 @@ mod tests {
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                225,
+                227,
             ),
             (
                 "v1.72/schema 152 before compact operations",
@@ -43254,7 +43277,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(226);
+        let current = migration_state_through(227);
         assert!(current.admits(
             CURRENT_DATA_CONTRACT_VERSION,
             CURRENT_PROJECTION_SCHEMA_VERSION,
@@ -44022,7 +44045,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(226));
+        assert_eq!(state, migration_state_through(227));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
@@ -44089,7 +44112,7 @@ mod tests {
                     // The classifier checks the newest receipt; deleting an older one would leave
                     // the database looking current and the rejection would never be proven.
                     connection
-                        .execute("DELETE FROM schema_migration WHERE version=226", [])
+                        .execute("DELETE FROM schema_migration WHERE version=227", [])
                         .unwrap();
                 }
                 "steer_identity" => {
@@ -56625,6 +56648,9 @@ mod tests {
                 "node_dispatch",
                 "node_dispatch_output",
                 "node_run_credential",
+                "member_capability_item",
+                "member_capability_choice",
+                "member_capability_tool_claim",
             ],
             true,
         );
@@ -56634,7 +56660,7 @@ mod tests {
             &[
                 58, 59, 60, 61, 62, 67, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101,
                 102, 103, 104, 105, 106, 107, 108, 145, 146, 147, 205, 206, 207, 208, 209, 210,
-                211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 225, 226,
+                211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 225, 226, 227,
             ],
         );
         for table in [

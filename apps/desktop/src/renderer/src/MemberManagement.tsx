@@ -88,6 +88,7 @@ import {
   MemberIdentityEditor,
   type MemberIdentityEditorHandle
 } from './MemberIdentityEditor'
+import { MemberCatalog } from './MemberCatalog'
 import { saveMemberIdentity } from './member-identity-save'
 import type { IdentityDraft } from './member-identity-draft'
 import { UiText, uiAttribute } from './interface-language'
@@ -516,12 +517,18 @@ const MemberEditor = forwardRef<
   const [notice, setNotice] = useState<string | null>(null)
   const [identityDirty, setIdentityDirty] = useState(false)
   const [runtimeDirty, setRuntimeDirty] = useState(false)
+  const [catalogDirty, setCatalogDirty] = useState(false)
+  const [pane, setPane] = useState<'profile' | 'catalog'>('profile')
   const [draftAvatar, setDraftAvatar] = useState(
     selectedAgent?.avatarRef ?? null
   )
   const identityRef = useRef<MemberIdentityEditorHandle>(null)
   const runtimeRef = useRef<MemberRuntimeFormHandle>(null)
   const pageRef = useRef<HTMLDivElement>(null)
+  const profileTabId = `member-pane-profile-${selectedAgentId ?? 'new'}`
+  const catalogTabId = `member-pane-catalog-${selectedAgentId ?? 'new'}`
+  const profilePanelId = `member-pane-panel-profile-${selectedAgentId ?? 'new'}`
+  const catalogPanelId = `member-pane-panel-catalog-${selectedAgentId ?? 'new'}`
   useImperativeHandle(ref, () => ({
     discard: () => {
       identityRef.current?.discard()
@@ -531,11 +538,11 @@ const MemberEditor = forwardRef<
   useEffect(() => {
     onStateChange(
       selectedAgentId ?? 'new-member',
-      identityDirty || runtimeDirty,
+      identityDirty || runtimeDirty || catalogDirty,
       busy !== null,
       runtimeDirty
     )
-  }, [selectedAgentId, identityDirty, runtimeDirty, busy, onStateChange])
+  }, [selectedAgentId, identityDirty, runtimeDirty, catalogDirty, busy, onStateChange])
   const openRuntime = (): void => {
     onTabChange('runtime')
     requestAnimationFrame(() => {
@@ -778,7 +785,7 @@ const MemberEditor = forwardRef<
   return (
     <>
       <div className="member-detail-scroll" ref={pageRef}>
-        <div className="member-detail-page">
+        <div className={`member-detail-page${pane === 'catalog' ? ' is-catalog' : ''}`}>
           {selectedAgent ? (
             <MemberDetailHeader
               agent={{ ...selectedAgent, avatarRef: draftAvatar }}
@@ -814,6 +821,33 @@ const MemberEditor = forwardRef<
               {error}
             </div>
           )}
+          <div
+            className="member-catalog-tabs"
+            role="group"
+            aria-label={uiAttribute('队员页面')}
+            onKeyDown={(event) => {
+              if (!selectedAgent || (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft')) return
+              event.preventDefault()
+              const next = pane === 'profile' ? 'catalog' : 'profile'
+              setPane(next)
+              const buttonId = next === 'profile' ? profileTabId : catalogTabId
+              pageRef.current?.querySelector<HTMLButtonElement>(`#${CSS.escape(buttonId)}`)?.focus()
+            }}
+          >
+            <button
+              id={profileTabId}
+              type="button"
+              aria-pressed={pane === 'profile'}
+              onClick={() => setPane('profile')}
+            ><UiText zh={'资料'} /></button>
+            {selectedAgent && <button
+              id={catalogTabId}
+              type="button"
+              aria-pressed={pane === 'catalog'}
+              onClick={() => setPane('catalog')}
+            ><UiText zh={'队员目录'} /></button>}
+          </div>
+          <div id={profilePanelId} hidden={pane !== 'profile'}>
           <MemberIdentityEditor
             ref={identityRef}
             agent={selectedAgent}
@@ -855,6 +889,15 @@ const MemberEditor = forwardRef<
               <p className="member-editor-new-runtime"><UiText zh={"创建队员后，可在这里选择智能体、模型与权限。"} /></p>
             )}
           </section>
+          </div>
+          {selectedAgent && <div id={catalogPanelId} hidden={pane !== 'catalog'}>
+            <MemberCatalog
+              agentId={selectedAgent.agentId}
+              active={active && pane === 'catalog'}
+              onDirtyChange={setCatalogDirty}
+              onOpenProfile={() => setPane('profile')}
+            />
+          </div>}
         </div>
       </div>
       <Dialog.Root

@@ -85,6 +85,7 @@ pub mod mcp;
 pub mod mcp_import;
 pub mod mcp_projection;
 pub mod member_avatar;
+mod member_capability;
 pub mod member_environment;
 pub mod member_studio;
 pub mod member_tool;

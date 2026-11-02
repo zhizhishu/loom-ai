@@ -356,6 +356,10 @@ fn toolbox_member_ids(connection: &Connection, name: &str) -> Result<Vec<String>
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+pub(crate) fn toolbox_skill_version(connection: &Connection, name: &str) -> Result<String> {
+    toolbox_members_version(&toolbox_member_ids(connection, name)?)
+}
+
 fn toolbox_members_version(member_ids: &[String]) -> Result<String> {
     canonical_json_digest(&json!(member_ids))
 }

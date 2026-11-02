@@ -68,6 +68,12 @@ pub(crate) struct MemberRunProjection {
     pub runtime: String,
     pub bootstrap: String,
     pub mcp: Value,
+    /// Toolbox skills the next Run's additional-skill section will carry.
+    pub skills: Vec<crate::member_capability::ProjectedCapability>,
+    /// Selected rule snippets. They are not written into the session bootstrap.
+    pub rules: Vec<crate::member_capability::ProjectedCapability>,
+    /// Selected hooks. They are not written into the session bootstrap.
+    pub hooks: Vec<crate::member_capability::ProjectedCapability>,
 }
 
 pub(crate) fn preview_member_run_projection(
@@ -106,12 +112,17 @@ pub(crate) fn preview_member_run_projection(
         },
         false,
     )?;
+    let (skills, rules, hooks) =
+        crate::member_capability::projection_additions(database, config_store, &profile.agent_id)?;
     Ok(MemberRunProjection {
         agent_id: profile.agent_id,
         display_name: profile.display_name,
         runtime: runtime_name(adapter)?.to_string(),
         bootstrap,
         mcp: redact_run_mcp_document(&run_bundle_mcp_document(adapter, &servers)?),
+        skills,
+        rules,
+        hooks,
     })
 }
 
@@ -154,9 +165,71 @@ pub(crate) fn redact_run_mcp_document(document: &Value) -> Value {
                     }
                 }
             }
+            if let Some(args) = server.get_mut("args").and_then(Value::as_array_mut) {
+                redact_token_like_args(args);
+            }
         }
     }
     document
+}
+
+fn redact_token_like_args(args: &mut [Value]) {
+    let mut mask_next = false;
+    for arg in args.iter_mut() {
+        let Some(text) = arg.as_str() else {
+            mask_next = false;
+            continue;
+        };
+        if mask_next {
+            *arg = json!(SECRET_MASK);
+            mask_next = false;
+            continue;
+        }
+        if let Some((flag, _)) = text.split_once('=') {
+            if token_flag(flag) {
+                *arg = json!(format!("{flag}={SECRET_MASK}"));
+                continue;
+            }
+        }
+        if token_flag(text) {
+            mask_next = true;
+            continue;
+        }
+        if token_like(text) {
+            *arg = json!(SECRET_MASK);
+        }
+    }
+}
+
+fn token_flag(arg: &str) -> bool {
+    let flag = arg.trim_start_matches('-').to_ascii_lowercase();
+    matches!(
+        flag.as_str(),
+        "token"
+            | "api-key"
+            | "apikey"
+            | "api_key"
+            | "password"
+            | "secret"
+            | "access-token"
+            | "auth"
+    ) || flag.ends_with("-token")
+        || flag.ends_with("-key")
+        || flag.ends_with("-secret")
+        || flag.ends_with("-password")
+}
+
+fn token_like(arg: &str) -> bool {
+    let value = arg.trim();
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("sk-")
+        || lower.starts_with("sk_")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("github_pat_")
+        || lower.starts_with("xox")
+        || lower.starts_with("bearer ")
+        || lower.starts_with("akia")
+        || (value.len() >= 32 && value.chars().all(|character| character.is_ascii_hexdigit()))
 }
 
 fn resolve_member(database: &Database, member: &str) -> Result<AgentProfileView> {
@@ -268,6 +341,39 @@ mod tests {
             .downcast_ref::<MemberRunProjectionError>()
             .unwrap_or_else(|| panic!("{error:#}"))
             .code()
+    }
+
+    #[test]
+    fn preview_mcp_keeps_env_keys_and_masks_token_like_args() {
+        let document = json!({
+            "mcp_servers": {
+                "local": {
+                    "command": "echo",
+                    "args": ["serve", "--token", "sk-live-secret-value", "--api-key=plain-looking", "plain.js"],
+                    "env": { "API_KEY": "super-secret", "PLAIN": "visible-env" },
+                    "headers": { "Authorization": "Bearer fixture-header-secret" }
+                }
+            }
+        });
+        let redacted = redact_run_mcp_document(&document);
+        let server = &redacted["mcp_servers"]["local"];
+        let env = server["env"].as_object().unwrap();
+        assert!(env.contains_key("API_KEY") && env.contains_key("PLAIN"));
+        assert_eq!(env["API_KEY"], SECRET_MASK);
+        assert_eq!(env["PLAIN"], SECRET_MASK);
+        assert_eq!(server["headers"]["Authorization"], SECRET_MASK);
+        let args = server["args"].as_array().unwrap();
+        assert_eq!(args[0], "serve");
+        assert_eq!(args[1], "--token");
+        assert_eq!(args[2], SECRET_MASK);
+        assert_eq!(args[3], format!("--api-key={SECRET_MASK}"));
+        assert_eq!(args[4], "plain.js");
+        let rendered = serde_json::to_string(&redacted).unwrap();
+        assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("visible-env"));
+        assert!(!rendered.contains("sk-live-secret-value"));
+        assert!(!rendered.contains("fixture-header-secret"));
+        assert!(!rendered.contains("plain-looking"));
     }
 
     #[test]

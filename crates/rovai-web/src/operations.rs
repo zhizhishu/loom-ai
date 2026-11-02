@@ -270,6 +270,12 @@ pub enum Operation {
     Member,
     #[serde(rename = "members.runProjection.preview")]
     MemberRunProjection,
+    #[serde(rename = "members.capabilityCatalog.get")]
+    MemberCapabilityGet,
+    #[serde(rename = "members.capabilityCatalog.set")]
+    MemberCapabilitySet,
+    #[serde(rename = "members.capabilityCatalog.putItem")]
+    MemberCapabilityPut,
     #[serde(rename = "navigation.snapshot")]
     Navigation,
     #[serde(rename = "navigation.threads", alias = "navigation.camps")]
@@ -422,7 +428,16 @@ impl Operation {
             Self::AppInfo => json!({"name":value["name"],"version":value["version"]}),
             Self::MemberRunProjection => select_fields(
                 &value,
-                &["agentId", "displayName", "runtime", "bootstrap", "mcp"],
+                &[
+                    "agentId",
+                    "displayName",
+                    "runtime",
+                    "bootstrap",
+                    "mcp",
+                    "skills",
+                    "rules",
+                    "hooks",
+                ],
             ),
             // Core owns credential redaction and digest-CAS. These projections
             // admit the fields used by the shared editor, never future fields.
@@ -635,6 +650,9 @@ impl Operation {
             Self::Members => "members.list",
             Self::Member => "members.get",
             Self::MemberRunProjection => "members.runProjection.preview",
+            Self::MemberCapabilityGet => "members.capabilityCatalog.get",
+            Self::MemberCapabilitySet => "members.capabilityCatalog.set",
+            Self::MemberCapabilityPut => "members.capabilityCatalog.putItem",
             Self::Navigation => "navigation.snapshot",
             Self::NavigationCamps => "navigation.camps",
             Self::GroupCamps => "navigation.groupCamps",
