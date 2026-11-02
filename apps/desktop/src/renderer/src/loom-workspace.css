@@ -11,12 +11,15 @@
 .loom-section-tabs button[aria-pressed='true']::after { background: var(--loom-accent); }
 .loom-section-tabs .mission-icon { width: 14px; height: 14px; }
 .loom-section-body { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
-.loom-section-body > :is(.loom-delivery,.mission-activity-document) { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.loom-section-body > :is(.loom-delivery,.mission-activity-document,.loom-plan-host) { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.loom-section-body > .loom-plan-host { display: flex; flex-direction: column; overflow: hidden; }
 .loom-section-body > .mission-activity-document { padding: 24px; }
 .loom-section-body > [hidden] { display: none; }
 .loom-section-body > .mission-activity-document > .mission-delivery-panel { padding: 0; overflow: visible; }
 .loom-section-body > .mission-activity-document > div > .mission-activity-panel { margin-top: 28px; padding: 0; overflow: visible; }
 .loom-plan,.loom-delivery { max-width: 860px; padding: 30px 28px 36px; }
+.loom-plan { display: flex; flex: 1; min-height: 0; flex-direction: column; overflow: auto; }
+.loom-plan > :not(.loom-live-process) { flex: 0 0 auto; }
 .loom-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 /* 标题层级：eyebrow 与 h2 之间留 6px。 */
 .loom-section-heading h2 { margin: 6px 0 0; font-size: 19px; font-weight: 600; letter-spacing: -.01em; line-height: 1.5; }
@@ -113,6 +116,71 @@
 .loom-flow-legend-item::before { content: ''; width: 18px; height: 0; border-top: 1.5px solid var(--muted); }
 .loom-flow-legend-artifact-accepted::before { border-top-color: var(--accent); border-top-style: dashed; }
 .loom-flow-legend-blocked::before { border-top-color: var(--attention); }
+
+/* 现场：每个节点一行。段的颜色是状态，底下的条跟着已进行的时间走。 */
+.loom-live-strip { display: grid; gap: 8px; margin: 16px 0 4px; }
+.loom-live-lane { display: grid; grid-template-columns: 108px minmax(0, 1fr); gap: 10px; align-items: stretch; min-width: 0; }
+.loom-live-lane-name { display: flex; flex-direction: column; justify-content: center; gap: 2px; min-width: 0; color: var(--ink); font-size: 11px; font-weight: 620; }
+.loom-live-lane-name em { color: var(--muted); font-style: normal; font-weight: 500; overflow-wrap: anywhere; }
+.loom-live-lane[data-offline='true'] .loom-live-lane-name { color: var(--attention); }
+.loom-live-lane-track { display: flex; gap: 6px; min-width: 0; }
+.loom-live-strip-item { display: grid; flex: 1 1 0; gap: 3px; min-width: 0; padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.loom-live-strip-item[data-phase='running'] { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+.loom-live-strip-item[data-phase='offline'],
+.loom-live-strip-item[data-phase='failed'] { border-color: color-mix(in srgb, var(--attention) 50%, var(--line)); background: color-mix(in srgb, var(--attention) 8%, var(--surface)); }
+.loom-live-strip-item[data-phase='done'],
+.loom-live-strip-item[data-phase='exited'] { background: var(--surface-subtle, var(--surface)); }
+.loom-live-strip-title { display: flex; gap: 6px; align-items: center; min-width: 0; overflow: hidden; color: var(--ink); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.loom-live-strip-meta { overflow: hidden; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.loom-live-strip-track { display: block; height: 3px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.loom-live-strip-track i { display: block; width: 100%; height: 100%; transform: scaleX(0); transform-origin: left center; background: var(--muted); }
+.loom-live-strip-track i[data-phase='done'],
+.loom-live-strip-track i[data-phase='exited'] { background: var(--accent); }
+.loom-live-strip-track i[data-phase='running'] { background: var(--accent); }
+.loom-live-strip-track i[data-phase='offline'],
+.loom-live-strip-track i[data-phase='failed'] { background: var(--attention); }
+.loom-live-pulse { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: var(--accent); animation: loom-live-pulse 1.8s ease-in-out infinite; }
+.loom-live-row { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; min-width: 0; margin-top: 8px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.loom-live-badge { padding: 0 6px; border: 1px solid var(--line); border-radius: 999px; color: var(--ink); font-weight: 600; }
+.loom-live-badge.is-remote { border-color: var(--attention); color: var(--attention); }
+.loom-live-node,.loom-live-cli { min-width: 0; overflow-wrap: anywhere; }
+.loom-live-phase { display: inline-flex; gap: 4px; align-items: center; color: var(--ink); }
+.loom-live-phase i { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+.loom-live-phase i[data-phase='running'] { background: var(--accent); animation: loom-live-pulse 1.8s ease-in-out infinite; }
+.loom-live-phase i[data-phase='offline'],
+.loom-live-phase i[data-phase='failed'] { background: var(--attention); }
+.loom-live-phase i[data-phase='exited'],
+.loom-live-phase i[data-phase='done'] { background: var(--muted); }
+.loom-live-elapsed { font-variant-numeric: tabular-nums; }
+.loom-live-open { margin-left: auto; padding: 0; border: 0; color: var(--resource-link, var(--accent)); background: transparent; font: inherit; cursor: pointer; }
+.loom-live-open:focus-visible { outline: 2px solid var(--conversation-action); outline-offset: 2px; }
+.loom-live-note { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
+.loom-live-process { position: relative; display: flex; flex: 1 1 0; flex-direction: column; gap: 8px; min-height: 372px; margin-top: 18px; padding: 12px 14px 14px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.loom-live-process header { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.loom-live-process header strong { font-size: 13px; }
+.loom-live-process header span { color: var(--muted); font-size: 11px; }
+.loom-live-process header button:last-child { margin-left: auto; }
+.loom-live-count { color: var(--faint); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.loom-live-output { flex: 1 1 260px; min-height: 260px; overflow: auto; padding: 8px 10px; border-radius: 8px; background: var(--surface-subtle, var(--surface)); font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.loom-live-process:has(.loom-live-pill) .loom-live-output { margin-bottom: 44px; }
+.loom-live-pill { position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%); min-height: 28px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--ink); background: var(--surface-raised, var(--surface)); box-shadow: var(--shadow-float, 0 4px 14px rgb(0 0 0 / 16%)); font: inherit; font-size: 12px; cursor: pointer; }
+.loom-live-output:focus-visible { outline: 2px solid var(--conversation-action); outline-offset: 2px; }
+.loom-live-line { display: grid; grid-template-columns: 3.2em minmax(0, 1fr); gap: 8px; min-height: 1.55em; margin: 0; animation: loom-live-fade 180ms ease; overflow-wrap: anywhere; }
+.loom-live-line span { color: var(--faint); }
+.loom-live-line[data-stream='stderr'] { color: var(--attention); }
+.loom-live-gap { margin: 4px 0; color: var(--attention); font-size: 11px; }
+@keyframes loom-live-pulse { 50% { opacity: .45; } }
+@keyframes loom-live-grow { 50% { transform: scaleX(.9); } }
+@keyframes loom-live-fade { from { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .loom-live-phase i,
+  .loom-live-pulse,
+  .loom-flow-node-dot,
+  .loom-live-strip-track i,
+  .loom-live-line { animation: none; }
+}
+.loom-flow-node-dot[data-live='running'] { background: var(--accent); animation: loom-live-pulse 1.8s ease-in-out infinite; }
+.loom-flow-node-pin { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; letter-spacing: 0; text-transform: none; }
 
 @media(max-width:640px) { .loom-section-tabs { padding-inline: 18px; }.loom-section-body > .mission-activity-document { padding: 18px; }.loom-plan,.loom-delivery { padding: 24px 20px; } }
 /* 390px 级移动端：tab 横滚收在本条内，横向滚动只留给流程图画布。 */

@@ -103,6 +103,10 @@ pub struct LoomTask {
     pub status: LoomTaskStatus,
     pub acceptance_criteria: LoomAcceptanceCriteriaSnapshot,
     pub blocked_reason: Option<String>,
+    /// Node this task is pinned to. Empty means it is not pinned and must not
+    /// be treated as assigned to a remote machine.
+    #[serde(default)]
+    pub execution_host_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub revision: i64,
@@ -253,7 +257,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
             "SELECT task.task_id, task.plan_id, task.title, task.description,
                     task.assignee_agent_id, task.status, task.acceptance_criteria_json,
                     plan.acceptance_criteria_version, task.blocked_reason, task.created_at,
-                    task.updated_at, task.revision
+                    task.updated_at, task.revision, task.execution_host_id
              FROM loom_task AS task
              JOIN loom_plan AS plan ON plan.plan_id=task.plan_id
              WHERE plan.mission_id=?1
@@ -273,6 +277,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, i64>(11)?,
+                row.get::<_, Option<String>>(12)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -291,6 +296,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
                 created_at,
                 updated_at,
                 revision,
+                execution_host_id,
             )| {
                 Ok(LoomTask {
                     status: LoomTaskStatus::parse(&status)?,
@@ -305,6 +311,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
                     description,
                     assignee_agent_id,
                     blocked_reason,
+                    execution_host_id,
                     created_at,
                     updated_at,
                     revision,
@@ -3635,6 +3642,10 @@ mod tests {
                 "assertion imported_draft_task_has_no_blocked_reason"
             );
             assert_eq!(
+                task.execution_host_id, None,
+                "assertion imported_task_starts_unpinned"
+            );
+            assert_eq!(
                 task.acceptance_criteria, plan.acceptance_criteria,
                 "assertion every_task_inherits_the_plan_criteria_snapshot"
             );
@@ -3656,6 +3667,33 @@ mod tests {
                 "assertion task_acceptance_criteria_wire_shape_is_version_and_criteria"
             );
         }
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_task SET execution_host_id=?1 WHERE task_id='task_a'",
+                ["node_desk"],
+            )
+            .unwrap();
+        let pinned = tasks_list(&database, &mission_id).unwrap();
+        assert_eq!(
+            pinned
+                .iter()
+                .find(|task| task.task_id == "task_a")
+                .unwrap()
+                .execution_host_id
+                .as_deref(),
+            Some("node_desk"),
+            "assertion tasks_list_returns_the_pinned_execution_host"
+        );
+        assert_eq!(
+            pinned
+                .iter()
+                .find(|task| task.task_id == "task_b")
+                .unwrap()
+                .execution_host_id,
+            None,
+            "assertion an_unpinned_task_stays_unpinned"
+        );
 
         let dependencies = dependencies_list(&database, &mission_id).unwrap();
         assert_eq!(

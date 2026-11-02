@@ -8,6 +8,7 @@ import { missionCommand, missionError } from './useMissions'
 import { readErrorMessage } from './error-message'
 import { missionDate } from './MissionBoard'
 import { LoomWorkspace } from './LoomWorkspace'
+import type { NodeApi } from './nodes-api'
 import { useFilePreview } from './FilePreviewContext'
 import { useOptionalFilePreviewLayout } from './FilePreviewLayout'
 import { splitterScale, useCollapsibleSplitter } from './useCollapsibleSplitter'
@@ -17,12 +18,13 @@ import { writeClipboardText } from './clipboard'
 import { displayProjectPath } from '../../shared/project-display-name'
 import { UiText, getInterfaceLanguage, uiAttribute, useUiText } from './interface-language'
 
-export function MissionActivityDocument({ mission, agents, onSource, onNotify, onWorkspaceCleanupRequested }: {
+export function MissionActivityDocument({ mission, agents, onSource, onNotify, onWorkspaceCleanupRequested, nodes = null }: {
   mission: MissionRecord; agents: AgentProfile[]; onSource(id: string): void; onNotify(message: string): void; onWorkspaceCleanupRequested(threadId: string): Promise<void>
+  nodes?: NodeApi | null
 }) {
   const preview = useFilePreview(), layout = useOptionalFilePreviewLayout()
   const source = (id: string) => { if (layout?.compact) preview.hidePane(); onSource(id) }
-  return <LoomWorkspace mission={mission} agents={agents} onSource={source} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>
+  return <LoomWorkspace mission={mission} agents={agents} onSource={source} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested} nodes={nodes}/>
 }
 
 const kinds: Record<MissionChangedFile['kind'], string> = { added: '新增', deleted: '删除', renamed: '重命名', copied: '复制', type_changed: '类型变化', unmerged: '冲突', modified: '修改' }

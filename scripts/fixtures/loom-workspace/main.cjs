@@ -1298,6 +1298,135 @@ app.whenReady().then(async () => {
     'A forced artifacts read failure was misreported as an unanswered fixture method')
   cases.push('loom.artifacts.list 读失败时只有候选卡产物区降级成「产物信息读取失败」（不冒充未登记），其余七个投影照常渲染')
 
+  const afterRemount = async (expression) => {
+    const before = await script('document.querySelector("[data-loom-generation]")?.getAttribute("data-loom-generation")')
+    await script(expression)
+    await waitFor(`document.querySelector("[data-loom-generation]")?.getAttribute("data-loom-generation") !== ${JSON.stringify(before)}`,
+      `LOOM workspace did not remount after ${expression}`)
+  }
+
+  stage = 'live placements'
+  await resetLoom()
+  await afterRemount('window.loomQA.setLive("mixed")')
+  await openPlanTab('the live placements')
+  await waitFor("(document.querySelector('.loom-live-strip')?.innerText ?? '').includes('loom-a') && (document.querySelector('.loom-live-strip')?.innerText ?? '').includes('desk-b')",
+    'The mission strip did not name both the local node and the remote node')
+  const live = await script(`(() => {
+    const text = value => (value ?? '').replace(/\\s+/gu, ' ').trim()
+    const item = title => [...document.querySelectorAll('.loom-live-strip-item')].find(node => (node.querySelector('.loom-live-strip-title')?.innerText ?? '').includes(title))
+    const lane = role => document.querySelector('.loom-live-lane[data-live-role="' + role + '"]')
+    const row = role => document.querySelector('.loom-live-row[data-live-role="' + role + '"]')
+    return {
+      done: text(item('设计恢复协议')?.innerText),
+      local: text(lane('local')?.innerText),
+      remote: text(lane('remote')?.innerText),
+      localRole: row('local')?.getAttribute('data-live-role') ?? null,
+      localPhase: row('local')?.getAttribute('data-live-phase') ?? null,
+      remoteRole: row('remote')?.getAttribute('data-live-role') ?? null,
+      remotePhase: row('remote')?.getAttribute('data-live-phase') ?? null,
+      localCopy: text(row('local')?.innerText),
+      remoteCopy: text(row('remote')?.innerText),
+      claims: [...document.querySelectorAll('.loom-flow-claim-status')].map(node => text(node.innerText))
+    }
+  })()`)
+  assert(live.done.includes('已完成') && !live.done.includes('loom-a'), `A finished task without a run must stay done and unassigned: ${JSON.stringify(live.done)}`)
+  assert(live.local.includes('本机') && live.local.includes('loom-a') && live.local.includes('在跑'),
+    `The local run lost its machine or running state on the strip: ${JSON.stringify(live.local)}`)
+  assert(live.remote.includes('远端') && live.remote.includes('desk-b') && live.remote.includes('离线'),
+    `The remote run lost its badge, machine or offline state on the strip: ${JSON.stringify(live.remote)}`)
+  assert(live.localCopy.includes('codex-cli'), `The local card lost its CLI: ${JSON.stringify(live.localCopy)}`)
+  assert(live.remoteCopy.includes('claude-code-cli'), `The remote card lost its CLI: ${JSON.stringify(live.remoteCopy)}`)
+  assert(live.remoteCopy.includes('最后心跳') && live.remoteCopy.includes('秒前'), `An offline card must show how long since the last heartbeat: ${JSON.stringify(live.remoteCopy)}`)
+  const lanes = await script(`({
+    roles: [...document.querySelectorAll('.loom-live-lane')].map(node => node.getAttribute('data-live-role')),
+    localStatus: [...document.querySelectorAll('.loom-flow-node')].find(node => (node.innerText || '').includes('实现恢复逻辑'))?.querySelector('.loom-flow-node-status')?.innerText ?? ''
+  })`)
+  assert.deepEqual(lanes.roles, ['local', 'remote', 'none'], `Lanes must be one row per node, local first: ${JSON.stringify(lanes.roles)}`)
+  assert.equal(lanes.localStatus.trim(), '在跑', `A running task must not keep a contradictory workflow status: ${JSON.stringify(lanes.localStatus)}`)
+  const pins = await script(`[...document.querySelectorAll('.loom-flow-node-pin')].map(node => node.innerText.trim())`)
+  assert(pins.some(text => text.includes('钉在') && text.includes('loom-a')), `The local task did not show its pinned node: ${JSON.stringify(pins)}`)
+  assert(pins.some(text => text.includes('钉在') && text.includes('desk-b')), `The remote task did not show its pinned node: ${JSON.stringify(pins)}`)
+  assert.equal(live.localRole, 'local')
+  assert.equal(live.localPhase, 'running')
+  assert.equal(live.remoteRole, 'remote')
+  assert.equal(live.remotePhase, 'offline')
+  assert(live.localCopy.includes('已进行'), `A running card did not show elapsed time: ${JSON.stringify(live.localCopy)}`)
+  assert(live.claims.includes('已认领'), `Live node rows replaced the claim block: ${JSON.stringify(live.claims)}`)
+  await expectPlanWidths('live placements')
+  cases.push('编排卡片和使命进度条写出本机与远端、CLI、在跑或离线、已进行，完成的任务不编造节点，认领行还在')
+
+  stage = 'live output follows until the reader scrolls up'
+  await click('.loom-live-row[data-live-role="local"] .loom-live-open')
+  await waitFor("(document.querySelector('.loom-live-output')?.innerText ?? '').includes('帧 2')",
+    'Opening a card did not grow the node output')
+  await waitFor("(() => { const node = document.querySelector('.loom-live-output'); return !!node && node.clientHeight >= 260 && node.scrollHeight > node.clientHeight + 24 })()",
+    'The execution log did not grow to a scrolling viewport', 20000)
+  await script(`(() => {
+    const node = document.querySelector('.loom-live-output')
+    node.scrollTop = 0
+    node.dispatchEvent(new Event('scroll', { bubbles: true }))
+    return true
+  })()`)
+  const linesBeforePause = await script("document.querySelectorAll('.loom-live-line').length")
+  await waitFor("document.querySelector('.loom-live-output')?.getAttribute('data-follow') === 'false'",
+    'Scrolling the output up did not pause follow')
+  await waitFor(`document.querySelectorAll('.loom-live-line').length > ${linesBeforePause} && !!document.querySelector('.loom-live-pill')`,
+    'Paused output stopped receiving frames', 15000)
+  const paused = await script(`(() => {
+    const node = document.querySelector('.loom-live-output')
+    const pill = document.querySelector('.loom-live-pill')
+    const header = document.querySelector('.loom-live-process header')?.innerText ?? ''
+    const output = node.getBoundingClientRect()
+    const pillBox = pill?.getBoundingClientRect()
+    return { follow: node.getAttribute('data-follow'), top: node.scrollTop, height: node.clientHeight, text: node.innerText, pill: pill?.innerText ?? '', header, pillClears: !!pillBox && pillBox.top >= output.bottom - 1 }
+  })()`)
+  assert.equal(paused.follow, 'false', `Follow resumed on its own: ${JSON.stringify(paused)}`)
+  assert.equal(paused.top, 0, `A paused reader was pulled back to the latest line: ${JSON.stringify(paused)}`)
+  assert(paused.height >= 260, `The execution log is shorter than the reading viewport: ${JSON.stringify(paused.height)}`)
+  assert.equal(paused.pillClears, true, `The new-output pill covers the log: ${JSON.stringify(paused)}`)
+  assert(paused.text.includes('帧 1') && paused.text.includes('帧 3'), `The stream did not resume from the lines already shown: ${JSON.stringify(paused.text)}`)
+  assert(/^新输出 \d+/u.test(paused.pill.trim()), `Scrolling up did not show a new-output count: ${JSON.stringify(paused.pill)}`)
+  assert(paused.header.includes('共') && paused.header.includes('行'), `The process header lost its line count: ${JSON.stringify(paused.header)}`)
+  cases.push('点开卡片后执行过程按序号追加，读者往上滚时停止自动跟随，并标出新输出的行数')
+
+  stage = 'claims failure keeps node names off the cards'
+  await afterRemount('window.loomQA.failClaimsWithNodes()')
+  await openPlanTab('claims failed while nodes are known')
+  await waitFor("(document.querySelector('.loom-plan')?.innerText ?? '').includes('认领状态未知')",
+    'A failed claims read with a node list stopped saying 认领状态未知')
+  const unknownLive = await script(`(() => {
+    const text = document.querySelector('.loom-plan')?.innerText ?? ''
+    return {
+      desk: text.includes('desk-b'),
+      rows: document.querySelectorAll('.loom-live-row').length,
+      states: [...document.querySelectorAll('.loom-flow-claim')].map(node => node.getAttribute('data-claim-state')),
+      strip: document.querySelectorAll('.loom-live-strip-item').length
+    }
+  })()`)
+  assert.equal(unknownLive.desk, false, `A failed claims read still named a node: ${JSON.stringify(unknownLive)}`)
+  assert.equal(unknownLive.rows, 0, `A failed claims read still drew a run row: ${JSON.stringify(unknownLive)}`)
+  assert.deepEqual(unknownLive.states, [null, null, null, null], `A failed claims read stamped a claim state: ${JSON.stringify(unknownLive.states)}`)
+  assert.equal(unknownLive.strip, 4, `A failed claims read removed the progress strip: ${JSON.stringify(unknownLive)}`)
+  cases.push('认领读失败时即使节点列表在，也不把 Run 安到卡片上，认领状态未知保持，进度条只剩任务本身')
+
+  stage = 'no plan keeps the empty orchestration'
+  await afterRemount('window.loomQA.setPlanHidden(true)')
+  await click('.loom-section-tabs button:nth-of-type(2)')
+  await expectPressed(1, '编排 did not open for the empty plan')
+  await waitFor("(document.querySelector('.loom-plan')?.innerText ?? '').includes('尚未配置编排')",
+    'Hiding the plan did not restore 尚未配置编排')
+  const emptyPlan = await script(`({
+    strip: document.querySelectorAll('.loom-live-strip').length,
+    nodes: document.querySelectorAll('.loom-flow-node').length,
+    foundation: document.querySelectorAll('.loom-foundation').length,
+    title: document.querySelector('.loom-empty h3')?.innerText ?? ''
+  })`)
+  assert.equal(emptyPlan.strip, 0, `An unplanned mission still drew the live strip: ${JSON.stringify(emptyPlan)}`)
+  assert.equal(emptyPlan.nodes, 0, `An unplanned mission still drew flow nodes: ${JSON.stringify(emptyPlan)}`)
+  assert.equal(emptyPlan.foundation, 1, `An unplanned mission lost the foundation counts: ${JSON.stringify(emptyPlan)}`)
+  assert.equal(emptyPlan.title, '尚未配置编排', `The empty title changed: ${JSON.stringify(emptyPlan.title)}`)
+  cases.push('没有计划时仍是尚未配置编排和三格基础计数，不画进度条，也不画节点行')
+
   console.log(JSON.stringify({ ok: true, cases, shots, counts: final, output }))
   app.exit(0)
 }).catch(async error => {

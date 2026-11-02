@@ -227,6 +227,7 @@ pub struct DispatchRecord {
     pub status: String,
     pub acked_seq: u64,
     pub exit_code: Option<i32>,
+    pub started_at: String,
 }
 
 pub struct NodeRecord {
@@ -242,6 +243,9 @@ pub struct NodeRecord {
     pub last_heartbeat: Option<String>,
     pub clis: Vec<CliRecord>,
     pub active_runs: Vec<DispatchRecord>,
+    /// Latest dispatches, including ones that already finished. The live view
+    /// reads these. `active_runs` stays the running set the node list counts.
+    pub recent_runs: Vec<DispatchRecord>,
 }
 
 pub struct OutputFrame {
@@ -639,6 +643,7 @@ impl NodeStore {
                 last_heartbeat,
                 clis: Vec::new(),
                 active_runs: Vec::new(),
+                recent_runs: Vec::new(),
             });
         }
         drop(statement);
@@ -659,12 +664,22 @@ impl NodeStore {
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             let mut runs = connection.prepare(
-                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code
+                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
                    FROM node_dispatch
                   WHERE node_id=?1 AND status='running'
                   ORDER BY started_at, run_id",
             )?;
             node.active_runs = runs
+                .query_map([&node.node_id], read_dispatch)?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut recent = connection.prepare(
+                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
+                   FROM node_dispatch
+                  WHERE node_id=?1
+                  ORDER BY started_at DESC, run_id
+                  LIMIT 8",
+            )?;
+            node.recent_runs = recent
                 .query_map([&node.node_id], read_dispatch)?
                 .collect::<Result<Vec<_>, _>>()?;
         }
@@ -692,7 +707,7 @@ impl NodeStore {
     pub fn running_for_node(&self, node_id: &str) -> Result<Vec<DispatchRecord>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code
+            "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
                FROM node_dispatch
               WHERE node_id=?1 AND status='running'
               ORDER BY started_at, run_id",
@@ -807,7 +822,7 @@ impl NodeStore {
         let connection = self.lock()?;
         let dispatch = connection
             .query_row(
-                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code
+                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
                    FROM node_dispatch
                   WHERE run_id=?1
                   ORDER BY attempt DESC
@@ -920,6 +935,7 @@ fn read_dispatch(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchRecord> {
         status: row.get(4)?,
         acked_seq: row.get::<_, i64>(5)? as u64,
         exit_code: row.get(6)?,
+        started_at: row.get(7)?,
     })
 }
 

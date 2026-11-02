@@ -3,7 +3,8 @@ import type {
   ExecutionNodePairing,
   ExecutionNodeRevocation,
   NodeChannelApi,
-  NodeChannelResult
+  NodeChannelResult,
+  NodeOutputPage
 } from '@contracts'
 
 /** Renderer-facing node API. Web calls the session directly; Desktop unwraps the Main envelope. */
@@ -11,6 +12,7 @@ export interface NodeApi {
   list(): Promise<ExecutionNodeList>
   pair(): Promise<ExecutionNodePairing>
   revoke(nodeId: string): Promise<ExecutionNodeRevocation>
+  output(runId: string, from: number): Promise<NodeOutputPage>
 }
 
 export function nodeFailure(code: string): Error & { code: string } {
@@ -42,6 +44,10 @@ export function nodeApiFromChannel(channel: NodeChannelApi | undefined): NodeApi
     async revoke(nodeId) {
       if (!channel) throw nodeFailure('nodes_unavailable')
       return unwrap(await channel.revoke(nodeId))
+    },
+    async output(runId, from) {
+      if (!channel) throw nodeFailure('nodes_unavailable')
+      return unwrap(await channel.output(runId, from))
     }
   }
 }
