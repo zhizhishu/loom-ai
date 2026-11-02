@@ -16,7 +16,8 @@ import { createRoot } from 'react-dom/client'
 import { BusinessApp } from '../../desktop/src/renderer/src/BusinessApp'
 import { ThreadClientProvider } from '../../desktop/src/renderer/src/camp-client'
 import { CurrentUserProfileProvider } from '../../desktop/src/renderer/src/CurrentUserProfile'
-import { ConsoleClient, type ConnectionState } from './client'
+import { ConsoleClient, HttpRequestError, type ConnectionState } from './client'
+import { registerWorkspaceTreeLoader, type WorkspaceTreeModel } from '../../desktop/src/renderer/src/WorkspaceProjectTree'
 import { UploadStatus } from './UploadStatus'
 import { createThreadAdapter, browserPlatform } from './camp-adapter'
 import '../../desktop/src/renderer/src/styles.css'
@@ -25,6 +26,25 @@ import './styles.css'
 import './mobile.css'
 
 const transport = new ConsoleClient(window.location.origin, fetch, sessionStorage, browserAuthStorage(window.location.origin))
+registerWorkspaceTreeLoader(async (threadId, relative): Promise<WorkspaceTreeModel | null> => {
+  try {
+    const page = await transport.workspaceFiles({ threadId, relative, op: 'list' })
+    const entries = page.entries ?? []
+    return {
+      ownerName: page.ownerName ?? '',
+      status: entries.length === 0 ? 'empty' : 'ready',
+      relative,
+      entries,
+      truncated: page.truncated,
+    }
+  } catch (error) {
+    if (error instanceof HttpRequestError && error.code === 'workspace_not_found') return null
+    if (error instanceof HttpRequestError && error.code === 'node_offline') {
+      return { ownerName: '', status: 'offline', relative, entries: [], message: '这台机器不在线' }
+    }
+    return { ownerName: '', status: 'error', relative, entries: [], message: '列出文件失败' }
+  }
+})
 const entryKind = document.querySelector<HTMLMetaElement>('meta[name="rovai-host-kind"]')?.content
 const hostKind = entryKind === 'desktop' || entryKind === 'server' ? entryKind : null
 document.documentElement.dataset.platform = browserPlatform()
