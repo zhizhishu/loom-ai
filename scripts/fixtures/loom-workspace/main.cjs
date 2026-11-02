@@ -1359,25 +1359,31 @@ app.whenReady().then(async () => {
   await click('.loom-live-row[data-live-role="local"] .loom-live-open')
   await waitFor("(document.querySelector('.loom-live-output')?.innerText ?? '').includes('帧 2')",
     'Opening a card did not grow the node output')
+  await waitFor("(() => { const node = document.querySelector('.loom-live-output'); return !!node && node.clientHeight >= 260 && node.scrollHeight > node.clientHeight + 24 })()",
+    'The execution log did not grow to a scrolling viewport', 20000)
   await script(`(() => {
     const node = document.querySelector('.loom-live-output')
-    node.style.maxHeight = '28px'
     node.scrollTop = 0
     node.dispatchEvent(new Event('scroll', { bubbles: true }))
     return true
   })()`)
+  const linesBeforePause = await script("document.querySelectorAll('.loom-live-line').length")
   await waitFor("document.querySelector('.loom-live-output')?.getAttribute('data-follow') === 'false'",
     'Scrolling the output up did not pause follow')
-  await waitFor("(document.querySelector('.loom-live-output')?.innerText ?? '').includes('帧 3')",
-    'Paused output stopped receiving frames')
+  await waitFor(`document.querySelectorAll('.loom-live-line').length > ${linesBeforePause} && !!document.querySelector('.loom-live-pill')`,
+    'Paused output stopped receiving frames', 15000)
   const paused = await script(`(() => {
     const node = document.querySelector('.loom-live-output')
     const pill = document.querySelector('.loom-live-pill')
     const header = document.querySelector('.loom-live-process header')?.innerText ?? ''
-    return { follow: node.getAttribute('data-follow'), top: node.scrollTop, text: node.innerText, pill: pill?.innerText ?? '', header }
+    const output = node.getBoundingClientRect()
+    const pillBox = pill?.getBoundingClientRect()
+    return { follow: node.getAttribute('data-follow'), top: node.scrollTop, height: node.clientHeight, text: node.innerText, pill: pill?.innerText ?? '', header, pillClears: !!pillBox && pillBox.top >= output.bottom - 1 }
   })()`)
   assert.equal(paused.follow, 'false', `Follow resumed on its own: ${JSON.stringify(paused)}`)
   assert.equal(paused.top, 0, `A paused reader was pulled back to the latest line: ${JSON.stringify(paused)}`)
+  assert(paused.height >= 260, `The execution log is shorter than the reading viewport: ${JSON.stringify(paused.height)}`)
+  assert.equal(paused.pillClears, true, `The new-output pill covers the log: ${JSON.stringify(paused)}`)
   assert(paused.text.includes('帧 1') && paused.text.includes('帧 3'), `The stream did not resume from the lines already shown: ${JSON.stringify(paused.text)}`)
   assert(/^新输出 \d+/u.test(paused.pill.trim()), `Scrolling up did not show a new-output count: ${JSON.stringify(paused.pill)}`)
   assert(paused.header.includes('共') && paused.header.includes('行'), `The process header lost its line count: ${JSON.stringify(paused.header)}`)

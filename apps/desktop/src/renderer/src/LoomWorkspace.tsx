@@ -791,7 +791,7 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       </button>)}
     </nav>
     <div className="loom-section-body">
-      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} claims={claims} loading={loading} error={error} nodeRecords={nodeRecords} nodeError={nodeError} nodes={nodes}/></div>}
+      {visited.has('plan') && <div className="loom-plan-host" hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} claims={claims} loading={loading} error={error} nodeRecords={nodeRecords} nodeError={nodeError} nodes={nodes}/></div>}
       <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
         {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews} verifications={verifications} artifacts={artifacts} plan={plan} missionId={mission.missionId} onRefresh={reload}/></div>}
         <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>

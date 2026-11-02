@@ -230,7 +230,7 @@ const fixtureNodes: NodeApi = {
   pair: async () => { throw new Error('LOOM fixture does not pair nodes') },
   revoke: async () => { throw new Error('LOOM fixture does not revoke nodes') },
   output: async (runId, from): Promise<NodeOutputPage> => {
-    if (runId === 'run-local-1' && liveLines.length < 8) liveLines.push(`帧 ${liveLines.length + 1}`)
+    if (runId === 'run-local-1' && liveLines.length < 40) liveLines.push(`帧 ${liveLines.length + 1}`)
     const source = runId === 'run-local-1' ? liveLines : ['远端停在断线前']
     const frames = source.map((text, index) => ({ seq: index + 1, stream: 'stdout', data: encodeFrame(text) }))
       .filter(frame => frame.seq >= from)

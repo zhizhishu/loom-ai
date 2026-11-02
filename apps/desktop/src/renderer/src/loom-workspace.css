@@ -11,12 +11,15 @@
 .loom-section-tabs button[aria-pressed='true']::after { background: var(--loom-accent); }
 .loom-section-tabs .mission-icon { width: 14px; height: 14px; }
 .loom-section-body { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
-.loom-section-body > :is(.loom-delivery,.mission-activity-document) { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.loom-section-body > :is(.loom-delivery,.mission-activity-document,.loom-plan-host) { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.loom-section-body > .loom-plan-host { display: flex; flex-direction: column; overflow: hidden; }
 .loom-section-body > .mission-activity-document { padding: 24px; }
 .loom-section-body > [hidden] { display: none; }
 .loom-section-body > .mission-activity-document > .mission-delivery-panel { padding: 0; overflow: visible; }
 .loom-section-body > .mission-activity-document > div > .mission-activity-panel { margin-top: 28px; padding: 0; overflow: visible; }
 .loom-plan,.loom-delivery { max-width: 860px; padding: 30px 28px 36px; }
+.loom-plan { display: flex; flex: 1; min-height: 0; flex-direction: column; overflow: auto; }
+.loom-plan > :not(.loom-live-process) { flex: 0 0 auto; }
 .loom-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 /* 标题层级：eyebrow 与 h2 之间留 6px。 */
 .loom-section-heading h2 { margin: 6px 0 0; font-size: 19px; font-weight: 600; letter-spacing: -.01em; line-height: 1.5; }
@@ -152,14 +155,15 @@
 .loom-live-open { margin-left: auto; padding: 0; border: 0; color: var(--resource-link, var(--accent)); background: transparent; font: inherit; cursor: pointer; }
 .loom-live-open:focus-visible { outline: 2px solid var(--conversation-action); outline-offset: 2px; }
 .loom-live-note { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
-.loom-live-process { position: relative; display: grid; gap: 8px; margin-top: 18px; padding: 12px 14px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.loom-live-process { position: relative; display: flex; flex: 1 1 0; flex-direction: column; gap: 8px; min-height: 372px; margin-top: 18px; padding: 12px 14px 14px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .loom-live-process header { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
 .loom-live-process header strong { font-size: 13px; }
 .loom-live-process header span { color: var(--muted); font-size: 11px; }
 .loom-live-process header button:last-child { margin-left: auto; }
 .loom-live-count { color: var(--faint); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
-.loom-live-output { max-height: 220px; overflow: auto; padding: 8px 10px; border-radius: 8px; background: var(--surface-subtle, var(--surface)); font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.loom-live-pill { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); min-height: 28px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--ink); background: var(--surface-raised, var(--surface)); box-shadow: var(--shadow-float, 0 4px 14px rgb(0 0 0 / 16%)); font: inherit; font-size: 12px; cursor: pointer; }
+.loom-live-output { flex: 1 1 260px; min-height: 260px; overflow: auto; padding: 8px 10px; border-radius: 8px; background: var(--surface-subtle, var(--surface)); font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.loom-live-process:has(.loom-live-pill) .loom-live-output { margin-bottom: 44px; }
+.loom-live-pill { position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%); min-height: 28px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--ink); background: var(--surface-raised, var(--surface)); box-shadow: var(--shadow-float, 0 4px 14px rgb(0 0 0 / 16%)); font: inherit; font-size: 12px; cursor: pointer; }
 .loom-live-output:focus-visible { outline: 2px solid var(--conversation-action); outline-offset: 2px; }
 .loom-live-line { display: grid; grid-template-columns: 3.2em minmax(0, 1fr); gap: 8px; min-height: 1.55em; margin: 0; animation: loom-live-fade 180ms ease; overflow-wrap: anywhere; }
 .loom-live-line span { color: var(--faint); }
