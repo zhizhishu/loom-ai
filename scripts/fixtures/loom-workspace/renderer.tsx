@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
+import type { AgentProfile, ExecutionNodeRecord, MissionActivity, MissionDelivery, MissionRecord, NodeOutputPage, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
 import { LoomWorkspace } from '../../../apps/desktop/src/renderer/src/LoomWorkspace'
+import type { NodeApi } from '../../../apps/desktop/src/renderer/src/nodes-api'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { applyAppearanceSnapshot } from '../../../apps/desktop/src/renderer/src/theme'
 import { DEFAULT_APPEARANCE } from '../../../apps/desktop/src/shared/appearance'
@@ -28,7 +29,7 @@ type LoomState = {
   verifications: LoomVerification[]
 }
 // 认领回读的六种回包形态：空 / held / 同任务多代次 / 租约过期 / 已释放 / 认领者为空。
-type LoomClaimsScenario = 'empty' | 'held' | 'multiGeneration' | 'expired' | 'released' | 'anonymous'
+type LoomClaimsScenario = 'empty' | 'held' | 'multiGeneration' | 'expired' | 'released' | 'anonymous' | 'live'
 type LoomQa = {
   calls: LoomCall[]
   writes: LoomWrite[]
@@ -40,6 +41,9 @@ type LoomQa = {
   setTheme(theme: 'day' | 'night'): void
   setClaims(scenario: LoomClaimsScenario, options?: { fail?: boolean }): void
   setArtifacts(options?: { fail?: boolean }): void
+  setLive(mode: 'mixed' | 'none'): void
+  failClaimsWithNodes(): void
+  setPlanHidden(hidden: boolean): void
 }
 declare global { interface Window { loomQA: LoomQa } }
 
@@ -182,7 +186,67 @@ const claimsByScenario: Readonly<Record<LoomClaimsScenario, LoomClaim[]>> = {
   // e. 已释放（且刻意让 expired 也为 true）：释放是结论，过期只是没续上，UI 必须先认释放。
   released: [makeClaim({ claimId: 'claim-task-1-fence-1', taskId: 'task-1', agentRunId: 'run-2b2b2b22', claimantAgentId: 'agent-build', releasedAt: claimReleasedAt, expired: true })],
   // f. claimantAgentId 为 null：没有绑定 Agent 的认领只能回退到 agentRunId 原值。
-  anonymous: [makeClaim({ claimId: 'claim-task-2-fence-1', taskId: 'task-2', agentRunId: 'run-7f7f7f7f', claimantAgentId: null })]
+  anonymous: [makeClaim({ claimId: 'claim-task-2-fence-1', taskId: 'task-2', agentRunId: 'run-7f7f7f7f', claimantAgentId: null })],
+  live: [
+    makeClaim({ claimId: 'claim-live-local', taskId: 'task-3', agentRunId: 'run-local-1', claimantAgentId: 'agent-build' }),
+    makeClaim({ claimId: 'claim-live-remote', taskId: 'task-4', agentRunId: 'run-remote-1', claimantAgentId: 'agent-lead' })
+  ]
+}
+
+function encodeFrame(text: string): string {
+  const bytes = new TextEncoder().encode(text)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
+
+let liveNodes: ExecutionNodeRecord[] = []
+let liveLines: string[] = []
+let planHidden = false
+
+function mixedNodes(): ExecutionNodeRecord[] {
+  const startedAt = new Date(Date.now() - 65_000).toISOString()
+  return [
+    {
+      nodeId: 'node_local', displayName: 'loom-a', role: 'local', revocable: false, status: 'online',
+      os: 'linux', arch: 'x64', pairedAt: startedAt, revokedAt: null, lastHeartbeat: new Date().toISOString(),
+      activeRunCount: 1,
+      activeRuns: [{ runId: 'run-local-1', attempt: 1, runtime: 'codex-cli', status: 'running', ackedSeq: 1, startedAt }],
+      clis: []
+    },
+    {
+      nodeId: 'node_desk', displayName: 'desk-b', role: 'remote', revocable: true, status: 'offline',
+      os: 'linux', arch: 'x64', pairedAt: startedAt, revokedAt: null, lastHeartbeat: startedAt,
+      activeRunCount: 1,
+      activeRuns: [{ runId: 'run-remote-1', attempt: 1, runtime: 'claude-code-cli', status: 'running', ackedSeq: 8, startedAt }],
+      clis: []
+    }
+  ]
+}
+
+const fixtureNodes: NodeApi = {
+  list: async () => ({ nodes: structuredClone(liveNodes) }),
+  pair: async () => { throw new Error('LOOM fixture does not pair nodes') },
+  revoke: async () => { throw new Error('LOOM fixture does not revoke nodes') },
+  output: async (runId, from): Promise<NodeOutputPage> => {
+    if (runId === 'run-local-1' && liveLines.length < 8) liveLines.push(`帧 ${liveLines.length + 1}`)
+    const source = runId === 'run-local-1' ? liveLines : ['远端停在断线前']
+    const frames = source.map((text, index) => ({ seq: index + 1, stream: 'stdout', data: encodeFrame(text) }))
+      .filter(frame => frame.seq >= from)
+    const last = frames.at(-1)
+    return {
+      runId,
+      attempt: 1,
+      nodeId: runId === 'run-remote-1' ? 'node_desk' : 'node_local',
+      runtime: runId === 'run-remote-1' ? 'claude-code-cli' : 'codex-cli',
+      status: 'running',
+      ackedSeq: source.length,
+      exitCode: null,
+      frames,
+      truncated: false,
+      nextFrom: last ? last.seq + 1 : from
+    }
+  }
 }
 
 let claimsScenario: LoomClaimsScenario = 'empty'
@@ -373,6 +437,8 @@ async function request<T>(method: string, params: unknown = {}): Promise<T> {
   } else if (method === 'loom.claims.list') {
     // 认领投影按场景生成；读失败开关在这里抛错，让 UI 走「认领状态未知」分支。
     reply = readClaims()
+  } else if (planHidden && (method === 'loom.plan.get' || method === 'loom.tasks.list' || method === 'loom.dependencies.list')) {
+    reply = method === 'loom.plan.get' ? null : []
   } else if (method === 'loom.artifacts.list') {
     // 产物投影固定两条；读失败开关在这里抛错，让 UI 只降级候选卡的产物区。
     reply = readArtifacts()
@@ -414,14 +480,17 @@ function LoomFixture() {
   const [generation, setGeneration] = useState(0)
   remountWorkspace = () => setGeneration(current => current + 1)
   return <ThreadClientProvider client={client}>
+    <div data-loom-generation={generation} style={{ display: 'contents' }}>
     <LoomWorkspace
       key={generation}
       mission={mission}
       agents={agents}
+      nodes={fixtureNodes}
       onSource={messageId => { selections.push(messageId) }}
       onNotify={() => undefined}
       onWorkspaceCleanupRequested={async () => undefined}
     />
+    </div>
   </ThreadClientProvider>
 }
 
@@ -437,6 +506,9 @@ window.loomQA = {
     // 认领回读也回初始态：空列表、读成功，下一条用例自己切形态。
     claimsScenario = 'empty'
     claimsReadFails = false
+    liveNodes = []
+    liveLines = []
+    planHidden = false
     // 产物回读同样回初始态：两条已登记产物、读成功。
     artifactsReadFails = false
     calls.length = 0
@@ -453,6 +525,31 @@ window.loomQA = {
   // 产物回读只有「读成功 / 读失败」两个开关（没有场景维度），切换后同样重挂载。
   setArtifacts: options => {
     artifactsReadFails = options?.fail === true
+    remountWorkspace()
+  },
+  setLive: mode => {
+    planHidden = false
+    liveLines = []
+    claimsReadFails = false
+    if (mode === 'none') {
+      liveNodes = []
+      claimsScenario = 'empty'
+    } else {
+      liveNodes = mixedNodes()
+      claimsScenario = 'live'
+    }
+    remountWorkspace()
+  },
+  failClaimsWithNodes: () => {
+    planHidden = false
+    liveLines = []
+    liveNodes = mixedNodes()
+    claimsScenario = 'live'
+    claimsReadFails = true
+    remountWorkspace()
+  },
+  setPlanHidden: hidden => {
+    planHidden = hidden
     remountWorkspace()
   }
 }

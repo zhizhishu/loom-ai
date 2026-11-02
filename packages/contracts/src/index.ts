@@ -4586,6 +4586,28 @@ export interface ExecutionNodeRun {
   runtime: string
   status: string
   ackedSeq: number
+  exitCode?: number | null
+  startedAt?: string | null
+}
+
+/** One page of `GET /api/v1/nodes/runs/{runId}/output/{from}`. Frame bytes are standard base64. */
+export interface NodeOutputFrame {
+  seq: number
+  stream: string
+  data: string
+}
+
+export interface NodeOutputPage {
+  runId: string
+  attempt: number
+  nodeId: string
+  runtime: string
+  status: string
+  ackedSeq: number
+  exitCode: number | null
+  frames: NodeOutputFrame[]
+  truncated: boolean
+  nextFrom: number | null
 }
 
 /** One row of `GET /api/v1/nodes`. The node token is never included. */
@@ -4602,6 +4624,8 @@ export interface ExecutionNodeRecord {
   lastHeartbeat: string | null
   activeRunCount: number
   activeRuns: ExecutionNodeRun[]
+  /** Newest dispatches, finished ones included. Absent on an older Host. */
+  recentRuns?: ExecutionNodeRun[]
   clis: ExecutionNodeCli[]
 }
 
@@ -4630,6 +4654,7 @@ export interface NodeChannelApi {
   list(): Promise<NodeChannelResult<ExecutionNodeList>>
   pair(): Promise<NodeChannelResult<ExecutionNodePairing>>
   revoke(nodeId: string): Promise<NodeChannelResult<ExecutionNodeRevocation>>
+  output(runId: string, from: number): Promise<NodeChannelResult<NodeOutputPage>>
 }
 
 /**

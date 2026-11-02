@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import type { AgentProfile, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
+import type { AgentProfile, ExecutionNodeRecord, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
 import { loomTaskReady } from '@contracts'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
 import { UiText, uiAttribute, useUiText, getInterfaceLanguage } from './interface-language'
 import { useThreadClient } from './camp-client'
+import { LoomLiveProcess, LoomLiveRow, LoomLiveStrip } from './LoomLive'
+import { livePlacements } from './loom-live-model'
+import type { NodeApi } from './nodes-api'
 
 export type LoomSection = 'activity' | 'plan' | 'delivery'
 
@@ -147,13 +150,17 @@ function FlowClaimBadge({ claims, taskId, agents }: { claims: LoomClaim[] | null
 }
 
 /** 依赖图渲染：archify 流程视图。就绪判定走控制层契约，不在 UI 里另立规则。 */
-function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims }: {
+function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims, placements, now, openRunId, onOpen }: {
   tasks: LoomTask[]
   dependencies: LoomDependency[]
   candidates: LoomCandidate[]
   reviews: LoomReview[]
   agents: AgentProfile[]
   claims: LoomClaim[] | null
+  placements: ReturnType<typeof livePlacements>
+  now: number
+  openRunId: string | null
+  onOpen(taskId: string): void
 }) {
   const t = useUiText()
   // 界面文案：契约里的枚举值是英文标识，不直接展示给用户。
@@ -294,6 +301,16 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims }: 
               <div className="loom-flow-node-blocked">{task.blockedReason}</div>
             )}
             <FlowClaimBadge claims={claims} taskId={task.taskId} agents={agents}/>
+            {(() => {
+              const placement = placements.find(entry => entry.taskId === task.taskId)
+              if (!placement) return null
+              return <LoomLiveRow
+                placement={placement}
+                now={now}
+                open={placement.runId !== null && placement.runId === openRunId}
+                onOpen={() => onOpen(task.taskId)}
+              />
+            })()}
           </div>
         })}
       </div>)}
@@ -307,7 +324,7 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims }: 
   </div>
 }
 
-function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates, reviews, claims, loading, error }: {
+function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates, reviews, claims, loading, error, nodeRecords, nodeError, nodes }: {
   mission: MissionRecord
   agents: AgentProfile[]
   plan: LoomPlan | null
@@ -318,8 +335,19 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
   claims: LoomClaim[] | null
   loading?: boolean
   error?: string
+  nodeRecords: ExecutionNodeRecord[] | null
+  nodeError: boolean
+  nodes: NodeApi | null
 }) {
   const t = useUiText()
+  const [now, setNow] = useState(() => Date.now())
+  const [openTaskId, setOpenTaskId] = useState<string | null>(null)
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const placements = livePlacements(tasks, claims, nodeError ? null : nodeRecords)
+  const openPlacement = placements.find(entry => entry.taskId === openTaskId && entry.runId) ?? null
   
   if (loading) {
     return <div className="loom-plan">
@@ -371,7 +399,21 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
       <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
     </header>
     <p className="loom-intro">{t('把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。')}</p>
-    <LoomFlow tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} agents={agents} claims={claims} />
+    {nodeError && <p className="loom-live-note" role="status">{t('节点列表没有读到。编排仍在。')}</p>}
+    <LoomLiveStrip placements={placements} />
+    <LoomFlow
+      tasks={tasks}
+      dependencies={dependencies}
+      candidates={candidates}
+      reviews={reviews}
+      agents={agents}
+      claims={claims}
+      placements={placements}
+      now={now}
+      openRunId={openPlacement?.runId ?? null}
+      onOpen={taskId => setOpenTaskId(current => current === taskId ? null : taskId)}
+    />
+    {openPlacement && nodes && <LoomLiveProcess placement={openPlacement} api={nodes} onClose={() => setOpenTaskId(null)} />}
   </div>
 }
 
@@ -610,9 +652,10 @@ function DeliveryReview({ candidates, reviews, verifications, artifacts, plan, m
   </div>
 }
 
-export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspaceCleanupRequested }: {
+export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspaceCleanupRequested, nodes = null }: {
   mission: MissionRecord; agents: AgentProfile[]; onSource(id: string): void
   onNotify(message: string): void; onWorkspaceCleanupRequested(threadId: string): Promise<void>
+  nodes?: NodeApi | null
 }) {
   const [section, setSection] = useState<LoomSection>('activity')
   const [visited, setVisited] = useState<ReadonlySet<LoomSection>>(() => new Set(['activity']))
@@ -632,6 +675,8 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
   const [artifacts, setArtifacts] = useState<LoomArtifact[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [nodeRecords, setNodeRecords] = useState<ExecutionNodeRecord[] | null>(null)
+  const [nodeError, setNodeError] = useState(false)
 
   // 写入口（验收 / 核验）成功后重新读一遍八个投影：状态只认控制面回读，不在本地猜。
   const reload = useCallback((): void => {
@@ -673,6 +718,30 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
     if (node && saved) { node.scrollTop = saved.top; node.scrollLeft = saved.left }
   }, [section])
   
+  useEffect(() => {
+    if (!nodes) {
+      setNodeRecords(null)
+      setNodeError(false)
+      return
+    }
+    let alive = true
+    const load = (): void => {
+      void nodes.list().then(result => {
+        if (!alive) return
+        setNodeRecords(result.nodes)
+        setNodeError(false)
+      }).catch(() => {
+        if (alive) setNodeError(true)
+      })
+    }
+    load()
+    const timer = window.setInterval(load, 5000)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [nodes])
+
   useLayoutEffect(() => {
     let alive = true
     setLoading(true)
@@ -714,7 +783,7 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       </button>)}
     </nav>
     <div className="loom-section-body">
-      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} claims={claims} loading={loading} error={error}/></div>}
+      {visited.has('plan') && <div hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} claims={claims} loading={loading} error={error} nodeRecords={nodeRecords} nodeError={nodeError} nodes={nodes}/></div>}
       <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
         {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews} verifications={verifications} artifacts={artifacts} plan={plan} missionId={mission.missionId} onRefresh={reload}/></div>}
         <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>

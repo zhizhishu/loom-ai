@@ -94,7 +94,8 @@ function renderBody(overrides: Partial<Parameters<typeof NodesSettingsBody>[0]> 
 const api: NodeApi = {
   list: async () => ({ nodes: [] }),
   pair: async () => ({ pairingCode: 'unused', expiresInSeconds: 600, connectUrl: 'ws://127.0.0.1:9/api/v1/nodes/connect' }),
-  revoke: async () => ({ nodeId: 'node_desk', revokedAt: '2026-11-01T10:19:00.000Z', status: 'offline' })
+  revoke: async () => ({ nodeId: 'node_desk', revokedAt: '2026-11-01T10:19:00.000Z', status: 'offline' }),
+  output: async () => ({ runId: 'run_1', attempt: 1, nodeId: 'node_local', runtime: 'codex-cli', status: 'running', ackedSeq: 0, exitCode: null, frames: [], truncated: false, nextFrom: null })
 }
 
 describe('nodes settings', () => {

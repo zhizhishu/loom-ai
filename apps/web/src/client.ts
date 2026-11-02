@@ -5,7 +5,7 @@ import { fileDigest } from './file-digest'
 import { uploadRequest } from './upload-request'
 import { newCommandId } from '../../desktop/src/shared/command-id'
 import { recoverLocalThreadSend } from '../../desktop/src/renderer/src/camp-composer-send-recovery'
-import type { ThreadReadInvalidation, ChannelKind, ChannelSettingsSnapshot, ExecutionNodeList, ExecutionNodePairing, ExecutionNodeRevocation, FilePreviewBinaryContent, FilePreviewOperationResult, LocalAttachmentSourceView } from '@contracts'
+import type { ThreadReadInvalidation, ChannelKind, ChannelSettingsSnapshot, ExecutionNodeList, ExecutionNodePairing, ExecutionNodeRevocation, FilePreviewBinaryContent, FilePreviewOperationResult, LocalAttachmentSourceView, NodeOutputPage } from '@contracts'
 
 const HOST_WEB_PROTOCOL_VERSION = 5
 
@@ -1077,6 +1077,10 @@ export class ConsoleClient {
 
   async revokeNode(nodeId: string): Promise<ExecutionNodeRevocation> {
     return this.#node(`nodes/${encodeURIComponent(nodeId)}/revoke`, 'POST')
+  }
+
+  async nodeOutput(runId: string, from: number): Promise<NodeOutputPage> {
+    return this.#node(`nodes/runs/${encodeURIComponent(runId)}/output/${from}`, 'GET')
   }
 
   async #node<T>(path: string, method: 'GET' | 'POST'): Promise<T> {

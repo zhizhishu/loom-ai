@@ -94,14 +94,22 @@ async function ensureSession(core: NodeCore, session: NodeChannelSession, fetchI
   return session.current
 }
 
+export function isRunId(value: string | undefined): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value)
+}
+
 export async function nodeChannelCall(
   core: NodeCore,
   session: NodeChannelSession,
-  operation: 'list' | 'pair' | 'revoke',
+  operation: 'list' | 'pair' | 'revoke' | 'output',
   nodeId: string | undefined,
-  fetchImpl: NodeFetch
+  fetchImpl: NodeFetch,
+  output?: { runId: string; from: number }
 ): Promise<{ ok: true; value: unknown } | { ok: false; code: string }> {
   if (operation === 'revoke' && !isNodeId(nodeId)) return { ok: false, code: 'node_not_found' }
+  if (operation === 'output' && (!isRunId(output?.runId) || !Number.isInteger(output?.from) || (output?.from ?? 0) < 1)) {
+    return { ok: false, code: 'node_run_not_found' }
+  }
   let authed: NodeSession
   try {
     authed = await ensureSession(core, session, fetchImpl)
@@ -113,9 +121,11 @@ export async function nodeChannelCall(
     ? '/api/v1/nodes'
     : operation === 'pair'
       ? '/api/v1/nodes/pair'
-      : `/api/v1/nodes/${nodeId}/revoke`
+      : operation === 'output'
+        ? `/api/v1/nodes/runs/${output?.runId}/output/${output?.from}`
+        : `/api/v1/nodes/${nodeId}/revoke`
   const request = (token: string) => fetchImpl(`${authed.origin}${path}`, {
-    method: operation === 'list' ? 'GET' : 'POST',
+    method: operation === 'list' || operation === 'output' ? 'GET' : 'POST',
     headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }
   })
   try {

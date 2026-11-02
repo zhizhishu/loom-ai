@@ -24,7 +24,7 @@ use loom_protocol::{
     CONNECT_PATH, CliReport, ClientMessage, OutputStream, RunReport, ServerMessage,
 };
 use rovai_core::execution_node::{
-    CliRecord, NextAttempt, NodeStore, OutputWrite, RevokeResult, TaskHost,
+    CliRecord, DispatchRecord, NextAttempt, NodeStore, OutputWrite, RevokeResult, TaskHost,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1050,13 +1050,8 @@ impl Hub {
                     "revokedAt": node.revoked_at,
                     "lastHeartbeat": node.last_heartbeat,
                     "activeRunCount": node.active_runs.len(),
-                    "activeRuns": node.active_runs.iter().map(|run| json!({
-                        "runId": run.run_id,
-                        "attempt": run.attempt,
-                        "runtime": run.runtime,
-                        "status": run.status,
-                        "ackedSeq": run.acked_seq,
-                    })).collect::<Vec<_>>(),
+                    "activeRuns": node.active_runs.iter().map(run_json).collect::<Vec<_>>(),
+                    "recentRuns": node.recent_runs.iter().map(run_json).collect::<Vec<_>>(),
                     "clis": node.clis.iter().map(|cli| {
                         let live = live_kinds.is_some_and(|kinds| kinds.contains(&cli.adapter_kind));
                         json!({
@@ -1428,6 +1423,18 @@ async fn flush_acks(
             .map_err(|_| ())?;
     }
     Ok(())
+}
+
+fn run_json(run: &DispatchRecord) -> Value {
+    json!({
+        "runId": run.run_id,
+        "attempt": run.attempt,
+        "runtime": run.runtime,
+        "status": run.status,
+        "ackedSeq": run.acked_seq,
+        "exitCode": run.exit_code,
+        "startedAt": run.started_at,
+    })
 }
 
 fn fail_node_waiters(inner: &mut Inner, node_id: &str) {
