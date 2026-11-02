@@ -63,6 +63,9 @@ enum Command {
         /// Member the shim credential is scoped to.
         #[arg(long)]
         member: Option<String>,
+        /// LOOM task whose `execution_host_id` chooses the node.
+        #[arg(long)]
+        task: Option<String>,
     },
 }
 
@@ -99,6 +102,7 @@ pub fn run() -> Result<()> {
         args,
         mission,
         member,
+        task,
     }) = &cli.command
     {
         return crate::node_cli::exec(
@@ -108,6 +112,7 @@ pub fn run() -> Result<()> {
             args,
             mission.as_deref(),
             member.as_deref(),
+            task.as_deref(),
         );
     }
     // Resolve packaged resources before creating data. A missing WebUI should

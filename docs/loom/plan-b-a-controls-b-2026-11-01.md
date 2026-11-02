@@ -817,6 +817,98 @@ rovai-server node-exec --data-dir /tmp/loom-b4/a \
 - 两边的输出都回到 A，run id 不同。
 - 把本机任务的 `execution_host_id` 改成 B 的 id 时，进程出现在 B 上，不出现在 A 上。
 
+#### 实施状态（2026-11-01）
+
+B5 已落地。迁移 228 给 `loom_task` 加了可空的 `execution_host_id`。空着表示没钉住，不会改派到远程节点，远程节点仍然不是默认执行主机。`rovai-server node-exec --task` 读这一列：角色是 `local` 时，A 在本进程里用 `ManagedProcess::spawn` 起 CLI，不发 WebSocket `Start`；角色是 `remote` 时，只派给这一台已连接的节点。
+
+```bash
+cargo test -p loom-node --test b5_split
+```
+
+手工冒烟（一台 Linux，A 听 `127.0.0.1:8767`，B 只出站）。A 和 B 各放一个假 `codex`，用不同的标记文件区分进程落在哪一台：
+
+```bash
+mkdir -p /tmp/loom-b5/{a,b,a-bin,b-bin,work,ui}
+printf '%s\n' '<!doctype html><title>loom-b5</title>' > /tmp/loom-b5/ui/index.html
+cat > /tmp/loom-b5/a-bin/codex << 'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then echo local; exit 0; fi
+printf 'a\n' >> /tmp/loom-b5/a-spawn
+printf 'LOOM_B5_LOCAL\n'
+EOF
+cat > /tmp/loom-b5/b-bin/codex << 'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then echo remote; exit 0; fi
+printf 'b\n' >> /tmp/loom-b5/b-spawn
+printf 'LOOM_B5_REMOTE\n'
+EOF
+chmod +x /tmp/loom-b5/a-bin/codex /tmp/loom-b5/b-bin/codex
+
+PATH=/tmp/loom-b5/a-bin:$PATH \
+  rovai-server --data-dir /tmp/loom-b5/a --listen 127.0.0.1:8767 --web-ui /tmp/loom-b5/ui
+```
+
+第二个终端只出站跑节点。先在第三个终端拿配对码：
+
+```bash
+rovai-server node-pair --data-dir /tmp/loom-b5/a
+```
+
+```bash
+PATH=/tmp/loom-b5/b-bin:$PATH \
+  loom-node --data-dir /tmp/loom-b5/b \
+  --server ws://127.0.0.1:8767/api/v1/nodes/connect \
+  --pair-code "$CODE"
+```
+
+节点在线之后，回到第三个终端，从 A 的库读出本机节点 id 和远程节点 id，写成两个任务，再派两次：
+
+```bash
+python3 - << 'PY'
+import sqlite3
+con = sqlite3.connect("/tmp/loom-b5/a/rovai.sqlite")
+con.execute("PRAGMA foreign_keys=OFF")
+now = "2026-11-01T00:00:00.000Z"
+local_id, remote_id = con.execute(
+    "SELECT node_id FROM execution_node WHERE role='local'"
+).fetchone()[0], con.execute(
+    "SELECT node_id FROM execution_node WHERE role='remote'"
+).fetchone()[0]
+con.execute(
+    "INSERT INTO loom_plan(plan_id, mission_id, goal, acceptance_criteria_json, acceptance_criteria_version, created_at, revision) VALUES ('plan_b5','mission_b5','B5 two hosts','[]','ac-v1',?,1)",
+    (now,),
+)
+con.execute(
+    "INSERT INTO loom_task(task_id, plan_id, title, description, assignee_agent_id, status, acceptance_criteria_json, created_at, updated_at, revision, execution_host_id) VALUES ('task_local','plan_b5','local half','',NULL,'DRAFT','[]',?,?,1,?)",
+    (now, now, local_id),
+)
+con.execute(
+    "INSERT INTO loom_task(task_id, plan_id, title, description, assignee_agent_id, status, acceptance_criteria_json, created_at, updated_at, revision, execution_host_id) VALUES ('task_remote','plan_b5','remote half','',NULL,'DRAFT','[]',?,?,1,?)",
+    (now, now, remote_id),
+)
+con.commit()
+print(local_id, remote_id)
+PY
+
+rovai-server node-exec --data-dir /tmp/loom-b5/a --task task_local --runtime codex-cli --cwd /tmp/loom-b5/work -- exec local
+rovai-server node-exec --data-dir /tmp/loom-b5/a --task task_remote --runtime codex-cli --cwd /tmp/loom-b5/work -- exec remote
+```
+
+第一次标准输出是 `LOOM_B5_LOCAL`，第二次是 `LOOM_B5_REMOTE`，标准错误里的 run id 不同。`/tmp/loom-b5/a-spawn` 一行，`b-spawn` 一行。然后把本机任务改钉到 B 再跑：
+
+```bash
+python3 - << 'PY'
+import sqlite3
+con = sqlite3.connect("/tmp/loom-b5/a/rovai.sqlite")
+remote_id = con.execute("SELECT node_id FROM execution_node WHERE role='remote'").fetchone()[0]
+con.execute("UPDATE loom_task SET execution_host_id=? WHERE task_id='task_local'", (remote_id,))
+con.commit()
+PY
+rovai-server node-exec --data-dir /tmp/loom-b5/a --task task_local --runtime codex-cli --cwd /tmp/loom-b5/work -- exec local
+```
+
+这次标准输出变成 `LOOM_B5_REMOTE`，run id 又是新的。`a-spawn` 仍是一行，`b-spawn` 变成两行。`mission_execution_host` 仍是本机那一行。
+
 ### B6 工作区主人与文件读
 
 - 创建工作区时 `execution_host_id` 写成主人节点。worktree 建在那台机器上。

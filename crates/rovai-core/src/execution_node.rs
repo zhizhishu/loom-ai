@@ -260,6 +260,13 @@ pub enum OutputWrite {
 }
 
 #[derive(Debug)]
+pub enum TaskHost {
+    Missing,
+    Unpinned,
+    Pinned(String),
+}
+
+#[derive(Debug)]
 pub struct RunGrant {
     pub member_id: Option<String>,
     pub mission_id: Option<String>,
@@ -555,6 +562,37 @@ impl NodeStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn node_role(&self, node_id: &str) -> Result<Option<String>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT role FROM execution_node WHERE node_id=?1",
+                [node_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The host pin on one LOOM task. NULL is unpinned and must not fall
+    /// through to a remote node.
+    pub fn task_execution_host(&self, task_id: &str) -> Result<TaskHost> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT execution_host_id FROM loom_task WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(match row {
+            None => TaskHost::Missing,
+            Some(None) => TaskHost::Unpinned,
+            Some(Some(host)) if host.is_empty() => TaskHost::Unpinned,
+            Some(Some(host)) => TaskHost::Pinned(host),
+        })
     }
 
     pub fn list_nodes(&self) -> Result<Vec<NodeRecord>> {

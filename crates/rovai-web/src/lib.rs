@@ -257,6 +257,7 @@ fn routes(state: WebState) -> Router {
         .route("/nodes", get(nodes::list))
         .route("/nodes/pair", post(nodes::pair))
         .route("/nodes/exec", post(nodes::exec))
+        .route("/nodes/tasks/exec", post(nodes::task_exec))
         .route("/nodes/runs/{run_id}/output/{from}", get(nodes::output))
         .route("/nodes/{node_id}/revoke", post(nodes::revoke))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
