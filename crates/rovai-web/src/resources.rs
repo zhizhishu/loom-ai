@@ -2,6 +2,7 @@
 //! handles never authorize another source or another editing client.
 use super::*;
 mod content;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use content::Selection;
 use rovai_core::draft_client::DraftClient;
 use sha2::{Digest, Sha256};
@@ -49,6 +50,9 @@ struct Handle {
     token: String,
     version: Value,
     analysis: Option<Arc<content::Analysis>>,
+    /// Bytes copied from the owner node. Reauthorization checks this cache
+    /// instead of the camp directory on A.
+    cached: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +66,7 @@ fn failure(code: &str) -> Value {
         "file_too_large" | "decode_failed" => "此文件暂不支持在线预览，可下载到本机查看。",
         "outside_authorized_root" => "此引用超出当前预览来源的文件范围。",
         "source_not_authorized" => "当前来源已失效或未获授权。",
+        "node_offline" => "这台机器不在线",
         "file_not_found" | "attachment_missing" => "源文件已不可用，可能已被系统清理。",
         "file_unreadable" | "attachment_unreadable" => "服务器暂时无法读取此文件，请检查文件权限后重试。",
         "not_regular_file" | "attachment_kind_changed" => "此来源当前不是可下载的普通文件。",
@@ -338,7 +343,124 @@ async fn resolve(state: &WebState, client: &DraftClient, source: &Value) -> Resu
     })
 }
 
+async fn cached_remote_workspace(
+    state: &WebState,
+    client: &DraftClient,
+    session: &Arc<Session>,
+    request: &Value,
+    _permit: &Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Option<Handle>> {
+    let Some(thread_id) = request["threadId"].as_str() else {
+        return Ok(None);
+    };
+    let raw = request["rawReference"].as_str().unwrap_or(".");
+    let relative = raw.split(['#', ':']).next().unwrap_or(raw);
+    if relative.is_empty() || relative == "." {
+        return Ok(None);
+    }
+    let Some(record) = state
+        .nodes
+        .store
+        .workspace_by_camp(thread_id)
+        .context("node_offline")?
+    else {
+        return Ok(None);
+    };
+    if record.owner_role != "remote" {
+        return Ok(None);
+    }
+    let relative = loom_protocol::workspace_relative(&record.worktree_path, relative)
+        .map_err(|_| anyhow::anyhow!("outside_authorized_root"))?;
+    let request_id = new_token()?;
+    let reply = state
+        .nodes
+        .call_fs(
+            &record.execution_host_id,
+            &request_id,
+            loom_protocol::ServerMessage::ReadFile {
+                request_id: request_id.clone(),
+                root: record.worktree_path.clone(),
+                relative: relative.clone(),
+            },
+        )
+        .await
+        .map_err(|code| anyhow::anyhow!(code))?;
+    let loom_protocol::ClientMessage::FsResult { code, data, .. } = reply else {
+        anyhow::bail!("node_offline");
+    };
+    if code == "node_offline" {
+        anyhow::bail!("node_offline");
+    }
+    if code == "path_rejected" {
+        anyhow::bail!("outside_authorized_root");
+    }
+    if !code.is_empty() {
+        anyhow::bail!("file_not_found");
+    }
+    let bytes = STANDARD
+        .decode(data)
+        .map_err(|_| anyhow::anyhow!("file_unreadable"))?;
+    let directory = state
+        .nodes
+        .store
+        .sqlite_directory()
+        .context("node_offline")?;
+    let cache_root = directory.join("workspace-preview").join(&record.mission_id);
+    let cache_path = cache_root.join(&relative);
+    if let Some(parent) = cache_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("file_unreadable")?;
+    }
+    tokio::fs::write(&cache_path, &bytes)
+        .await
+        .context("file_unreadable")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o600));
+    }
+    let path = tokio::fs::canonicalize(&cache_path)
+        .await
+        .context("file_not_found")?;
+    let root = tokio::fs::canonicalize(&cache_root)
+        .await
+        .context("file_not_found")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("source_not_authorized")?
+        .to_owned();
+    Ok(Some(Handle {
+        client: client.id().to_owned(),
+        session: session.clone(),
+        preview_token: new_token()?,
+        source: request.clone(),
+        path: path.clone(),
+        anchor_path: path,
+        root: root.clone(),
+        allow_children: false,
+        restore: Some(request.clone()),
+        project_root: Some(root),
+        name,
+        token: new_token()?,
+        version: Value::Null,
+        analysis: None,
+        cached: true,
+    }))
+}
+
 async fn reauthorize(state: &WebState, client: &DraftClient, handle: &Handle) -> Result<()> {
+    if handle.cached {
+        let path = tokio::fs::canonicalize(&handle.path)
+            .await
+            .context("file_not_found")?;
+        ensure!(
+            path == handle.path && path.starts_with(&handle.root),
+            "outside_authorized_root"
+        );
+        return Ok(());
+    }
     let source = resolve(state, client, &handle.source).await?;
     ensure!(
         source.path == handle.anchor_path && source.root == handle.root,
@@ -485,6 +607,7 @@ pub async fn files(
             "outside_authorized_root" => "outside_authorized_root",
             "file_not_found" => "file_not_found",
             "source_not_authorized" => "source_not_authorized",
+            "node_offline" => "node_offline",
             _ => "read_failed",
         })
     }))
@@ -565,6 +688,20 @@ async fn file_operation(
         return Ok(
             json!({"ok":true,"value":updates.into_iter().map(|(camp_id,preview_keys)|json!({"threadId":camp_id,"previewKeys":preview_keys})).collect::<Vec<_>>()}),
         );
+    }
+    if matches!(body.action.as_str(), "open" | "restore")
+        && request["kind"] == "camp_workspace"
+        && let Some(mut handle) =
+            cached_remote_workspace(state, client, session, &request, &permit).await?
+    {
+        let id = new_token()?;
+        let (file, analysis) = metadata(&handle, &id, &permit).await?;
+        handle.analysis = Some(analysis);
+        handle.version = file["contentVersion"].clone();
+        let mut handles = state.files.0.lock().expect("file registry poisoned");
+        ensure!(handles.len() < 128, "too_many_open_files");
+        handles.insert(id, handle);
+        return Ok(json!({"ok":true,"value":{"kind":"file_preview","file":file}}));
     }
     if matches!(body.action.as_str(), "open" | "restore") {
         if request["kind"] == "run_evidence" && request["action"] == "review" {
@@ -656,6 +793,7 @@ async fn file_operation(
                 token: new_token()?,
                 version: Value::Null,
                 analysis: None,
+                cached: false,
             }
         };
         let (file, analysis) = metadata(&handle, &id, &permit).await?;
@@ -917,6 +1055,7 @@ pub async fn binary(
             "outside_authorized_root" => "outside_authorized_root",
             "file_not_found" => "file_not_found",
             "source_not_authorized" => "source_not_authorized",
+            "node_offline" => "node_offline",
             _ => "read_failed",
         }))
         .into_response()

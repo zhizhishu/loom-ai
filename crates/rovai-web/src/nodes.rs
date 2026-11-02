@@ -24,7 +24,7 @@ use loom_protocol::{
     CONNECT_PATH, CliReport, ClientMessage, OutputStream, RunReport, ServerMessage,
 };
 use rovai_core::execution_node::{
-    CliRecord, NextAttempt, NodeStore, OutputWrite, RevokeResult, TaskHost,
+    CliRecord, NextAttempt, NodeStore, OutputWrite, RevokeResult, TaskHost, WorkspaceRecord,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -42,7 +42,7 @@ pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 const NODE_WAIT: Duration = Duration::from_secs(30);
 const RUN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const HELLO_DEADLINE: Duration = Duration::from_secs(10);
-const MAX_FRAME: usize = 1024 * 1024;
+const MAX_FRAME: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const OUTPUT_PAGE: usize = 1000;
 const OUTBOUND_QUEUE: usize = 64;
@@ -113,6 +113,11 @@ struct Run {
     done: Option<oneshot::Sender<Result<RunOutcome, &'static str>>>,
 }
 
+struct FsWait {
+    node_id: String,
+    done: oneshot::Sender<ClientMessage>,
+}
+
 #[derive(Clone, Default)]
 struct RunScope {
     mission_id: Option<String>,
@@ -181,6 +186,7 @@ struct Inner {
     pairing_failures: PairingLimiter,
     nodes: HashMap<String, Node>,
     runs: HashMap<String, Run>,
+    fs_waiters: HashMap<String, FsWait>,
     /// Node ids whose token was revoked in this process. Registration checks
     /// this under the same lock that `revoke` uses to drop a live socket.
     revoked: HashSet<String>,
@@ -194,7 +200,7 @@ struct AttachGate {
 
 pub struct Hub {
     sessions: Arc<Sessions>,
-    store: NodeStore,
+    pub(crate) store: NodeStore,
     inner: Mutex<Inner>,
     /// Test-only pause after a hello is accepted and before the socket is registered.
     #[cfg(test)]
@@ -229,6 +235,7 @@ impl Hub {
                 },
                 nodes: HashMap::new(),
                 runs: HashMap::new(),
+                fs_waiters: HashMap::new(),
                 revoked: HashSet::new(),
             }),
             #[cfg(test)]
@@ -459,6 +466,45 @@ impl Hub {
             node.cancel = None;
         }
         fail_node_waiters(&mut inner, node_id);
+    }
+
+    pub(crate) async fn call_fs(
+        &self,
+        node_id: &str,
+        request_id: &str,
+        message: ServerMessage,
+    ) -> Result<ClientMessage, &'static str> {
+        let (tx, rx) = oneshot::channel();
+        let outbound = {
+            let mut inner = self.inner.lock().await;
+            let Some(node) = inner.nodes.get(node_id) else {
+                return Err("node_offline");
+            };
+            let Some(outbound) = node.outbound.clone() else {
+                return Err("node_offline");
+            };
+            inner.fs_waiters.insert(
+                request_id.to_owned(),
+                FsWait {
+                    node_id: node_id.to_owned(),
+                    done: tx,
+                },
+            );
+            outbound
+        };
+        if !outbound.send_text(message.to_json()).await {
+            let mut inner = self.inner.lock().await;
+            inner.fs_waiters.remove(request_id);
+            return Err("node_offline");
+        }
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(message)) => Ok(message),
+            _ => {
+                let mut inner = self.inner.lock().await;
+                inner.fs_waiters.remove(request_id);
+                Err("node_offline")
+            }
+        }
     }
 
     async fn heartbeat(&self, node_id: &str, generation: u64) {
@@ -756,9 +802,7 @@ impl Hub {
         cwd: &str,
         args: &[String],
     ) -> Result<(String, RunOutcome), &'static str> {
-        let Some(program) = local_program(runtime) else {
-            return Err("node_cli_unreported");
-        };
+        let program = discovered_local_program(runtime)?;
         if !std::path::Path::new(cwd).is_dir() {
             return Err("invalid_node_exec");
         }
@@ -766,7 +810,19 @@ impl Hub {
         self.store
             .begin_dispatch(&run_id, 1, node_id, runtime)
             .map_err(|_| "node_runtime_unavailable")?;
-        let outcome = match run_managed(&program, args, cwd, &run_id).await {
+        let outcome = match tokio::time::timeout(
+            RUN_TIMEOUT,
+            run_managed(&program, args, cwd, &run_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self.store.interrupt(&run_id, 1);
+                return Err("node_run_timeout");
+            }
+        };
+        let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(code) => {
                 let _ = self.store.interrupt(&run_id, 1);
@@ -1376,6 +1432,16 @@ impl Hub {
                                     .await;
                             }
                         }
+                        message @ ClientMessage::FsResult { .. } => {
+                            let ClientMessage::FsResult { request_id, .. } = &message else {
+                                continue;
+                            };
+                            let request_id = request_id.clone();
+                            let mut inner = self.inner.lock().await;
+                            if let Some(wait) = inner.fs_waiters.remove(&request_id) {
+                                let _ = wait.done.send(message);
+                            }
+                        }
                         ClientMessage::AlreadyRunning { .. } => {}
                         ClientMessage::Rejected {
                             run_id,
@@ -1443,6 +1509,15 @@ fn fail_node_waiters(inner: &mut Inner, node_id: &str) {
         {
             let _ = done.send(Err("node_disconnected"));
         }
+    }
+    let fs_ids: Vec<String> = inner
+        .fs_waiters
+        .iter()
+        .filter(|(_, wait)| wait.node_id == node_id)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in fs_ids {
+        inner.fs_waiters.remove(&id);
     }
 }
 
@@ -1639,6 +1714,322 @@ pub(crate) struct TaskExecRequest {
     args: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PrepareWorkspaceRequest {
+    mission_id: String,
+    camp_id: String,
+    node_id: String,
+    source: String,
+}
+
+pub(crate) async fn prepare_workspace(
+    State(state): State<WebState>,
+    Extension(_session): Extension<Arc<Session>>,
+    body: Result<Json<PrepareWorkspaceRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
+    };
+    if !valid_scope_id(&body.mission_id, 80)
+        || !valid_scope_id(&body.camp_id, 80)
+        || !valid_scope_id(&body.node_id, 80)
+        || body.source.len() > 4096
+        || body.source.contains('\0')
+        || !std::path::Path::new(&body.source).is_absolute()
+    {
+        return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
+    }
+    if let Ok(Some(existing)) = state.nodes.store.workspace_by_mission(&body.mission_id) {
+        return Json(workspace_json(&existing)).into_response();
+    }
+    let role = match state.nodes.store.node_role(&body.node_id) {
+        Ok(Some(role)) => role,
+        Ok(None) => return workspace_error(StatusCode::NOT_FOUND, "node_not_found"),
+        Err(_) => {
+            return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
+        }
+    };
+    let branch = match loom_protocol::safe_branch(&body.mission_id) {
+        Ok(branch) => branch,
+        Err(code) => return workspace_error(StatusCode::BAD_REQUEST, code),
+    };
+    let prepared = if role == "local" {
+        let directory = match state.nodes.store.sqlite_directory() {
+            Ok(directory) => directory,
+            Err(_) => {
+                return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
+            }
+        };
+        let worktree = directory.join("worktrees").join(branch.replace('/', "_"));
+        match loom_protocol::prepare_git_worktree(
+            std::path::Path::new(&body.source),
+            &worktree,
+            &branch,
+        ) {
+            Ok(prepared) => prepared,
+            Err(code) => return workspace_error(StatusCode::CONFLICT, code),
+        }
+    } else {
+        let request_id = format!("fs_{}", uuid::Uuid::new_v4().simple());
+        let message = match state
+            .nodes
+            .call_fs(
+                &body.node_id,
+                &request_id,
+                ServerMessage::PrepareWorktree {
+                    request_id: request_id.clone(),
+                    source: body.source.clone(),
+                    worktree: String::new(),
+                    branch: branch.clone(),
+                },
+            )
+            .await
+        {
+            Ok(message) => message,
+            Err(code) => return workspace_error(StatusCode::CONFLICT, code),
+        };
+        let ClientMessage::FsResult {
+            code,
+            worktree,
+            source,
+            common_dir,
+            base_sha,
+            branch,
+            ..
+        } = message
+        else {
+            return workspace_error(StatusCode::CONFLICT, "node_offline");
+        };
+        if !code.is_empty() {
+            return workspace_error(StatusCode::CONFLICT, leak_code(&code));
+        }
+        loom_protocol::PreparedWorktree {
+            worktree,
+            source,
+            common_dir,
+            base_sha,
+            branch,
+        }
+    };
+    let record = WorkspaceRecord {
+        id: format!("ws_{}", uuid::Uuid::new_v4().simple()),
+        mission_id: body.mission_id,
+        camp_id: body.camp_id,
+        execution_host_id: body.node_id,
+        source_directory: prepared.source.clone(),
+        repository_root: prepared.source,
+        git_common_dir: prepared.common_dir,
+        worktree_path: prepared.worktree,
+        branch: prepared.branch,
+        base_sha: prepared.base_sha,
+        owner_name: String::new(),
+        owner_role: role,
+        last_heartbeat: None,
+    };
+    if state.nodes.store.save_workspace(&record).is_err() {
+        return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
+    }
+    let Some(saved) = state
+        .nodes
+        .store
+        .workspace_by_mission(&record.mission_id)
+        .ok()
+        .flatten()
+    else {
+        return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
+    };
+    Json(workspace_json(&saved)).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFilesQuery {
+    mission_id: Option<String>,
+    thread_id: Option<String>,
+    #[serde(default)]
+    relative: String,
+    #[serde(default)]
+    op: String,
+}
+
+pub(crate) async fn workspace_files(
+    State(state): State<WebState>,
+    Extension(_session): Extension<Arc<Session>>,
+    body: Result<Json<WorkspaceFilesQuery>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(query)) = body else {
+        return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
+    };
+    let record = if let Some(mission_id) = query.mission_id.as_deref() {
+        if !valid_scope_id(mission_id, 80) {
+            return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
+        }
+        state.nodes.store.workspace_by_mission(mission_id)
+    } else if let Some(thread_id) = query.thread_id.as_deref() {
+        if !valid_scope_id(thread_id, 80) {
+            return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
+        }
+        state.nodes.store.workspace_by_camp(thread_id)
+    } else {
+        return workspace_error(StatusCode::BAD_REQUEST, "invalid_workspace");
+    };
+    let record = match record {
+        Ok(Some(record)) => record,
+        Ok(None) => return workspace_error(StatusCode::NOT_FOUND, "workspace_not_found"),
+        Err(_) => {
+            return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
+        }
+    };
+    if loom_protocol::workspace_relative(&record.worktree_path, &query.relative).is_err() {
+        return workspace_error(StatusCode::BAD_REQUEST, "path_rejected");
+    }
+    let read = query.op == "read";
+    if record.owner_role == "local" {
+        let root = std::path::Path::new(&record.worktree_path);
+        return if read {
+            match loom_protocol::read_file(root, &query.relative) {
+                Ok((bytes, truncated)) => {
+                    let size = bytes.len();
+                    Json(json!({
+                        "ownerName": record.owner_name,
+                        "lastHeartbeat": record.last_heartbeat,
+                        "relative": query.relative,
+                        "data": STANDARD.encode(bytes),
+                        "size": size,
+                        "truncated": truncated,
+                    }))
+                    .into_response()
+                }
+                Err(code) => workspace_failure(StatusCode::BAD_REQUEST, code, Some(&record)),
+            }
+        } else {
+            match loom_protocol::list_directory(root, &query.relative) {
+                Ok((entries, truncated)) => Json(json!({
+                    "ownerName": record.owner_name,
+                    "ownerRole": record.owner_role,
+                    "lastHeartbeat": record.last_heartbeat,
+                    "online": true,
+                    "relative": query.relative,
+                    "entries": entries,
+                    "truncated": truncated,
+                }))
+                .into_response(),
+                Err(code) => workspace_failure(StatusCode::BAD_REQUEST, code, Some(&record)),
+            }
+        };
+    }
+    let request_id = format!("fs_{}", uuid::Uuid::new_v4().simple());
+    let message = if read {
+        ServerMessage::ReadFile {
+            request_id: request_id.clone(),
+            root: record.worktree_path.clone(),
+            relative: query.relative.clone(),
+        }
+    } else {
+        ServerMessage::ListDir {
+            request_id: request_id.clone(),
+            root: record.worktree_path.clone(),
+            relative: query.relative.clone(),
+        }
+    };
+    let reply = match state
+        .nodes
+        .call_fs(&record.execution_host_id, &request_id, message)
+        .await
+    {
+        Ok(reply) => reply,
+        Err(code) => return workspace_failure(StatusCode::CONFLICT, code, Some(&record)),
+    };
+    let ClientMessage::FsResult {
+        code,
+        entries,
+        data,
+        truncated,
+        ..
+    } = reply
+    else {
+        return workspace_failure(StatusCode::CONFLICT, "node_offline", Some(&record));
+    };
+    if !code.is_empty() {
+        return workspace_failure(StatusCode::BAD_REQUEST, leak_code(&code), Some(&record));
+    }
+    if read {
+        let size = STANDARD.decode(&data).map(|bytes| bytes.len()).unwrap_or(0);
+        Json(json!({
+            "ownerName": record.owner_name,
+            "lastHeartbeat": record.last_heartbeat,
+            "relative": query.relative,
+            "data": data,
+            "size": size,
+            "truncated": truncated,
+        }))
+        .into_response()
+    } else {
+        Json(json!({
+            "ownerName": record.owner_name,
+            "ownerRole": record.owner_role,
+            "lastHeartbeat": record.last_heartbeat,
+            "online": true,
+            "relative": query.relative,
+            "entries": entries,
+            "truncated": truncated,
+        }))
+        .into_response()
+    }
+}
+
+fn workspace_json(record: &WorkspaceRecord) -> Value {
+    json!({
+        "missionId": record.mission_id,
+        "campId": record.camp_id,
+        "nodeId": record.execution_host_id,
+        "ownerName": record.owner_name,
+        "ownerRole": record.owner_role,
+        "worktree": record.worktree_path,
+        "source": record.source_directory,
+        "branch": record.branch,
+        "baseSha": record.base_sha,
+    })
+}
+
+fn workspace_error(status: StatusCode, code: &'static str) -> Response {
+    workspace_failure(status, code, None)
+}
+
+fn workspace_failure(
+    status: StatusCode,
+    code: &'static str,
+    record: Option<&WorkspaceRecord>,
+) -> Response {
+    let message = match code {
+        "node_offline" => "这台机器不在线",
+        "path_rejected" => "路径超出工作区",
+        "not_found" | "not_file" => "文件读取失败",
+        _ => "",
+    };
+    let mut body = json!({"error":{"code":code,"message":message}});
+    if let Some(record) = record {
+        body["error"]["ownerName"] = json!(record.owner_name);
+        if let Some(heartbeat) = &record.last_heartbeat {
+            body["error"]["lastHeartbeat"] = json!(heartbeat);
+        }
+    }
+    (status, Json(body)).into_response()
+}
+
+fn leak_code(code: &str) -> &'static str {
+    match code {
+        "path_rejected" => "path_rejected",
+        "not_found" => "not_found",
+        "not_directory" => "not_directory",
+        "not_file" => "not_file",
+        "invalid_workspace" => "invalid_workspace",
+        "node_offline" => "node_offline",
+        _ => "node_rejected",
+    }
+}
+
 pub(crate) async fn task_exec(
     State(state): State<WebState>,
     Extension(_session): Extension<Arc<Session>>,
@@ -1741,24 +2132,53 @@ fn exec_error(code: &'static str) -> Response {
     error(status, code)
 }
 
-fn local_program(runtime: &str) -> Option<std::path::PathBuf> {
-    let names: &[&str] = match runtime {
-        "codex-cli" => &["codex"],
-        "claude-code-cli" => &["claude"],
-        "pi" => &["pi"],
-        "opencode-cli" => &["opencode"],
-        _ => return None,
+fn discovered_local_program(runtime: &str) -> Result<std::path::PathBuf, &'static str> {
+    let path = std::env::var_os("PATH").ok_or("node_cli_unreported")?;
+    let Some((_, names)) = loom_protocol::CLI_CATALOG
+        .iter()
+        .find(|(kind, _)| *kind == runtime)
+    else {
+        return Err("node_cli_unreported");
     };
-    let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        for name in names {
+        for name in *names {
             let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+            if !candidate.is_file() {
+                continue;
+            }
+            let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+            let report = CliReport {
+                adapter_kind: (*runtime).to_owned(),
+                path: canonical.display().to_string(),
+                version: None,
+                path_present: true,
+            };
+            if cli_is_runnable(&report, runtime) {
+                return Ok(canonical);
             }
         }
     }
-    None
+    Err("node_cli_unreported")
+}
+
+async fn read_capped(pipe: Option<impl tokio::io::AsyncRead + Unpin>, cap: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        let room = cap.saturating_sub(kept.len());
+        if room > 0 {
+            kept.extend_from_slice(&chunk[..count.min(room)]);
+        }
+    }
+    kept
 }
 
 async fn run_managed(
@@ -1767,7 +2187,6 @@ async fn run_managed(
     cwd: &str,
     run_id: &str,
 ) -> Result<RunOutcome, &'static str> {
-    use tokio::io::AsyncReadExt;
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
@@ -1785,20 +2204,8 @@ async fn run_managed(
         .map_err(|_| "node_runtime_unavailable")?;
     let stdout_pipe = child.take_stdout();
     let stderr_pipe = child.take_stderr();
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stderr_pipe {
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
+    let stdout_task = tokio::spawn(async move { read_capped(stdout_pipe, MAX_OUTPUT).await });
+    let stderr_task = tokio::spawn(async move { read_capped(stderr_pipe, MAX_OUTPUT).await });
     let status = child.wait().await.map_err(|_| "node_runtime_unavailable")?;
     let stdout = stdout_task.await.unwrap_or_default();
     let stderr = stderr_task.await.unwrap_or_default();

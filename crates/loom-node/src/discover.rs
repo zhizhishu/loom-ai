@@ -1,32 +1,7 @@
 use crate::CliReport;
+use loom_protocol::CLI_CATALOG;
 use std::{ffi::OsStr, path::PathBuf, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
-
-/// Adapter kinds the node can report, with the executable names it looks for
-/// on `PATH`. This is the same catalog the desktop discovers. Cursor's generic
-/// `agent` alias is intentionally absent: other products ship that name.
-const CATALOG: &[(&str, &[&str])] = &[
-    ("codex-cli", &["codex"]),
-    ("pi", &["pi"]),
-    ("opencode-cli", &["opencode"]),
-    ("copilot-cli", &["copilot"]),
-    ("claude-code-cli", &["claude"]),
-    ("cline-cli", &["cline"]),
-    ("command-code-cli", &["command-code", "cmdc"]),
-    ("kiro-cli", &["kiro-cli"]),
-    ("qoder-cli", &["qodercli"]),
-    ("codebuddy-cli", &["codebuddy"]),
-    ("qwen-code", &["qwen"]),
-    ("trae-cn-cli", &["traecli"]),
-    ("cursor-agent", &["cursor-agent"]),
-    ("kimi-code-cli", &["kimi"]),
-    ("minimax-code-cli", &["mcode"]),
-    ("hermes-cli", &["hermes"]),
-    ("grok-build", &["grok"]),
-    ("deepseek-harness", &["dsh"]),
-    ("zcode-app", &["ZCode"]),
-    ("antigravity-app", &["agy"]),
-];
 
 /// The program A asked to run must be the binary this node discovered for that
 /// runtime. The returned path is the one to execute; a server-supplied path that
@@ -57,7 +32,7 @@ pub async fn installed_clis() -> Vec<CliReport> {
 
 async fn installed_clis_in(path_env: &OsStr) -> Vec<CliReport> {
     let mut found = Vec::new();
-    for (adapter_kind, commands) in CATALOG {
+    for (adapter_kind, commands) in CLI_CATALOG {
         let Some(path) = which_in(path_env, commands) else {
             continue;
         };
