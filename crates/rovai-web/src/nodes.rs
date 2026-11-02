@@ -1825,6 +1825,7 @@ pub(crate) async fn prepare_workspace(
         base_sha: prepared.base_sha,
         owner_name: String::new(),
         owner_role: role,
+        last_heartbeat: None,
     };
     if state.nodes.store.save_workspace(&record).is_err() {
         return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
@@ -1888,27 +1889,33 @@ pub(crate) async fn workspace_files(
         let root = std::path::Path::new(&record.worktree_path);
         return if read {
             match loom_protocol::read_file(root, &query.relative) {
-                Ok((bytes, truncated)) => Json(json!({
-                    "ownerName": record.owner_name,
-                    "relative": query.relative,
-                    "data": STANDARD.encode(bytes),
-                    "truncated": truncated,
-                }))
-                .into_response(),
-                Err(code) => workspace_error(StatusCode::BAD_REQUEST, code),
+                Ok((bytes, truncated)) => {
+                    let size = bytes.len();
+                    Json(json!({
+                        "ownerName": record.owner_name,
+                        "lastHeartbeat": record.last_heartbeat,
+                        "relative": query.relative,
+                        "data": STANDARD.encode(bytes),
+                        "size": size,
+                        "truncated": truncated,
+                    }))
+                    .into_response()
+                }
+                Err(code) => workspace_failure(StatusCode::BAD_REQUEST, code, Some(&record)),
             }
         } else {
             match loom_protocol::list_directory(root, &query.relative) {
                 Ok((entries, truncated)) => Json(json!({
                     "ownerName": record.owner_name,
                     "ownerRole": record.owner_role,
+                    "lastHeartbeat": record.last_heartbeat,
                     "online": true,
                     "relative": query.relative,
                     "entries": entries,
                     "truncated": truncated,
                 }))
                 .into_response(),
-                Err(code) => workspace_error(StatusCode::BAD_REQUEST, code),
+                Err(code) => workspace_failure(StatusCode::BAD_REQUEST, code, Some(&record)),
             }
         };
     }
@@ -1932,7 +1939,7 @@ pub(crate) async fn workspace_files(
         .await
     {
         Ok(reply) => reply,
-        Err(code) => return workspace_error(StatusCode::CONFLICT, code),
+        Err(code) => return workspace_failure(StatusCode::CONFLICT, code, Some(&record)),
     };
     let ClientMessage::FsResult {
         code,
@@ -1942,16 +1949,19 @@ pub(crate) async fn workspace_files(
         ..
     } = reply
     else {
-        return workspace_error(StatusCode::CONFLICT, "node_offline");
+        return workspace_failure(StatusCode::CONFLICT, "node_offline", Some(&record));
     };
     if !code.is_empty() {
-        return workspace_error(StatusCode::BAD_REQUEST, leak_code(&code));
+        return workspace_failure(StatusCode::BAD_REQUEST, leak_code(&code), Some(&record));
     }
     if read {
+        let size = STANDARD.decode(&data).map(|bytes| bytes.len()).unwrap_or(0);
         Json(json!({
             "ownerName": record.owner_name,
+            "lastHeartbeat": record.last_heartbeat,
             "relative": query.relative,
             "data": data,
+            "size": size,
             "truncated": truncated,
         }))
         .into_response()
@@ -1959,6 +1969,7 @@ pub(crate) async fn workspace_files(
         Json(json!({
             "ownerName": record.owner_name,
             "ownerRole": record.owner_role,
+            "lastHeartbeat": record.last_heartbeat,
             "online": true,
             "relative": query.relative,
             "entries": entries,
@@ -1983,16 +1994,28 @@ fn workspace_json(record: &WorkspaceRecord) -> Value {
 }
 
 fn workspace_error(status: StatusCode, code: &'static str) -> Response {
+    workspace_failure(status, code, None)
+}
+
+fn workspace_failure(
+    status: StatusCode,
+    code: &'static str,
+    record: Option<&WorkspaceRecord>,
+) -> Response {
     let message = match code {
         "node_offline" => "这台机器不在线",
         "path_rejected" => "路径超出工作区",
+        "not_found" | "not_file" => "文件读取失败",
         _ => "",
     };
-    (
-        status,
-        Json(json!({"error":{"code":code,"message":message}})),
-    )
-        .into_response()
+    let mut body = json!({"error":{"code":code,"message":message}});
+    if let Some(record) = record {
+        body["error"]["ownerName"] = json!(record.owner_name);
+        if let Some(heartbeat) = &record.last_heartbeat {
+            body["error"]["lastHeartbeat"] = json!(heartbeat);
+        }
+    }
+    (status, Json(body)).into_response()
 }
 
 fn leak_code(code: &str) -> &'static str {

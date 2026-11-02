@@ -1,36 +1,63 @@
 import { createRoot } from 'react-dom/client'
-import { WorkspaceProjectTree, type WorkspaceTreeModel } from '../../../apps/desktop/src/renderer/src/WorkspaceProjectTree'
+import { WorkspaceProjectPane, type WorkspaceFileContent, type WorkspaceTreeEntry } from '../../../apps/desktop/src/renderer/src/WorkspaceProjectTree'
 import '../../../packages/ui/src/theme.css'
 import '../../../apps/desktop/src/renderer/src/styles.css'
 
 const params = new URLSearchParams(location.search)
 const night = params.get('theme') === 'night'
-const offline = params.get('state') === 'offline'
+const state = params.get('state') ?? 'ready'
 document.documentElement.dataset.theme = night ? 'night' : 'day'
 document.documentElement.style.colorScheme = night ? 'dark' : 'light'
 document.body.style.margin = '0'
 document.body.style.background = 'var(--canvas)'
 
-const ready: WorkspaceTreeModel = {
-  ownerName: 'desk-b',
-  status: 'ready',
-  relative: '',
-  entries: [
-    { name: 'src', kind: 'dir', children: [{ name: 'main.rs', kind: 'file' }] },
-    { name: 'hello.txt', kind: 'file' },
-  ],
+const heartbeat = new Date(Date.now() - 125_000).toISOString()
+const entries: WorkspaceTreeEntry[] = [
+  {
+    name: 'src',
+    kind: 'dir',
+    children: [{ name: 'main.rs', kind: 'file' }],
+  },
+  { name: 'hello.txt', kind: 'file' },
+  { name: 'notes.log', kind: 'file' },
+]
+const hello: WorkspaceFileContent = {
+  path: 'hello.txt',
+  size: 48,
+  truncated: false,
+  text: 'from-b\nowner: desk-b\nworktree: /home/b/loom/mission_b6\n',
 }
-const model: WorkspaceTreeModel = offline
-  ? { ownerName: 'desk-b', status: 'offline', relative: '', entries: [] }
-  : ready
+const notes: WorkspaceFileContent = {
+  path: 'notes.log',
+  size: 1024 * 1024 + 8,
+  truncated: true,
+  text: [
+    '2026-11-02T00:00:01Z build started',
+    '2026-11-02T00:00:02Z compiled protocol',
+    '2026-11-02T00:00:04Z worktree ready',
+    '2026-11-02T00:00:05Z reading hello.txt',
+    '2026-11-02T00:00:06Z listed 3 entries',
+    '2026-11-02T00:00:08Z output exceeded 1 MiB',
+    '…',
+  ].join('\n'),
+}
+const cached = state === 'offline-cached'
+const empty = state === 'offline-empty'
+const truncated = state === 'truncated'
+const file = empty ? null : truncated ? notes : hello
 
 createRoot(document.getElementById('root')!).render(
   <div className="file-preview-retained-host" style={{ position: 'relative', width: '1040px', height: '700px' }}>
-    <WorkspaceProjectTree model={model} selected={offline ? undefined : 'hello.txt'} />
-    <section className="file-preview-pane" aria-label="文件预览">
-      {offline
-        ? <div className="file-preview-empty"><h2>这台机器不在线</h2><p>已经打开的内容留在这里，不能再向主人要新的字节。</p></div>
-        : <div className="file-preview-content"><pre>from-b</pre></div>}
-    </section>
+    <WorkspaceProjectPane
+      ownerName="desk-b"
+      online={!cached && !empty}
+      lastHeartbeat={heartbeat}
+      entries={empty ? [] : entries}
+      rootTruncated={truncated}
+      selected={empty ? undefined : file?.path}
+      file={file}
+      everLoaded={!empty}
+      onRefresh={() => undefined}
+    />
   </div>
 )

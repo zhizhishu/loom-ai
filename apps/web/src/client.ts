@@ -1081,8 +1081,12 @@ export class ConsoleClient {
 
   async workspaceFiles(body: { threadId?: string; missionId?: string; relative?: string; op?: 'list' | 'read' }): Promise<{
     ownerName?: string
+    lastHeartbeat?: string | null
+    online?: boolean
     entries?: { name: string; kind: 'file' | 'dir' }[]
     truncated?: boolean
+    data?: string
+    size?: number
   }> {
     return this.#node('nodes/workspaces/files', 'POST', body)
   }
@@ -1106,7 +1110,7 @@ export class ConsoleClient {
     }
     if (response.status === 401) { await this.#forgetAuthentication(); throw new SessionRequired() }
     const payload = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } }
-    if (!response.ok) throw new HttpRequestError(response.status, payload.error?.code ?? 'nodes_unavailable', sessionStorageMessage(payload))
+    if (!response.ok) throw new HttpRequestError(response.status, payload.error?.code ?? 'nodes_unavailable', payload.error?.message || sessionStorageMessage(payload))
     return payload as T
   }
 

@@ -17,7 +17,7 @@ import { BusinessApp } from '../../desktop/src/renderer/src/BusinessApp'
 import { ThreadClientProvider } from '../../desktop/src/renderer/src/camp-client'
 import { CurrentUserProfileProvider } from '../../desktop/src/renderer/src/CurrentUserProfile'
 import { ConsoleClient, HttpRequestError, type ConnectionState } from './client'
-import { registerWorkspaceTreeLoader, type WorkspaceTreeModel } from '../../desktop/src/renderer/src/WorkspaceProjectTree'
+import { registerWorkspaceFileReader, registerWorkspaceTreeLoader, type WorkspaceTreeModel } from '../../desktop/src/renderer/src/WorkspaceProjectTree'
 import { UploadStatus } from './UploadStatus'
 import { createThreadAdapter, browserPlatform } from './camp-adapter'
 import '../../desktop/src/renderer/src/styles.css'
@@ -32,6 +32,8 @@ registerWorkspaceTreeLoader(async (threadId, relative): Promise<WorkspaceTreeMod
     const entries = page.entries ?? []
     return {
       ownerName: page.ownerName ?? '',
+      online: page.online !== false,
+      lastHeartbeat: page.lastHeartbeat,
       status: entries.length === 0 ? 'empty' : 'ready',
       relative,
       entries,
@@ -40,10 +42,17 @@ registerWorkspaceTreeLoader(async (threadId, relative): Promise<WorkspaceTreeMod
   } catch (error) {
     if (error instanceof HttpRequestError && error.code === 'workspace_not_found') return null
     if (error instanceof HttpRequestError && error.code === 'node_offline') {
-      return { ownerName: '', status: 'offline', relative, entries: [], message: '这台机器不在线' }
+      const detail = error as HttpRequestError & { ownerName?: string }
+      return { ownerName: detail.ownerName ?? '', online: false, status: 'offline', relative, entries: [], message: error.message }
     }
-    return { ownerName: '', status: 'error', relative, entries: [], message: '列出文件失败' }
+    return { ownerName: '', online: false, status: 'error', relative, entries: [], message: '列出文件失败' }
   }
+})
+registerWorkspaceFileReader(async (threadId, relative) => {
+  const page = await transport.workspaceFiles({ threadId, relative, op: 'read' })
+  const encoded = page.data ?? ''
+  const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0))
+  return { path: relative, text: new TextDecoder().decode(bytes), size: page.size ?? bytes.length, truncated: Boolean(page.truncated) }
 })
 const entryKind = document.querySelector<HTMLMetaElement>('meta[name="rovai-host-kind"]')?.content
 const hostKind = entryKind === 'desktop' || entryKind === 'server' ? entryKind : null

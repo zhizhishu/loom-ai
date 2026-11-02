@@ -273,6 +273,7 @@ pub struct WorkspaceRecord {
     pub base_sha: String,
     pub owner_name: String,
     pub owner_role: String,
+    pub last_heartbeat: Option<String>,
 }
 
 #[derive(Debug)]
@@ -645,7 +646,7 @@ impl NodeStore {
         let sql = format!(
             "SELECT w.id, w.mission_id, w.camp_id, w.execution_host_id, w.source_directory,
                     w.repository_root, w.git_common_dir, w.worktree_path, w.branch, w.base_sha,
-                    n.display_name, n.role
+                    n.display_name, n.role, n.last_heartbeat
              FROM mission_workspace w
              JOIN execution_node n ON n.node_id = w.execution_host_id
              WHERE {clause} AND w.state='ready' AND n.revoked_at IS NULL
@@ -666,6 +667,7 @@ impl NodeStore {
                     base_sha: row.get(9)?,
                     owner_name: row.get(10)?,
                     owner_role: row.get(11)?,
+                    last_heartbeat: row.get(12)?,
                 })
             })
             .optional()
