@@ -80,6 +80,7 @@ pub(crate) fn exec(
     args: &[String],
     mission_id: Option<&str>,
     member_id: Option<&str>,
+    task_id: Option<&str>,
 ) -> Result<()> {
     let runtime = command_runtime()?;
     let outcome = runtime.block_on(exec_async(
@@ -89,6 +90,7 @@ pub(crate) fn exec(
         args,
         mission_id,
         member_id,
+        task_id,
     ))?;
     io::stdout().write_all(&outcome.stdout)?;
     io::stdout().flush()?;
@@ -166,21 +168,39 @@ async fn exec_async(
     args: &[String],
     mission_id: Option<&str>,
     member_id: Option<&str>,
+    task_id: Option<&str>,
 ) -> Result<ExecOutcome> {
     let (origin, client, session) = connect_admin(data_dir).await?;
-    let mut body = json!({
-        "runtime": runtime_kind,
-        "cwd": cwd,
-        "args": args,
-    });
-    if let Some(mission_id) = mission_id {
-        body["missionId"] = json!(mission_id);
-    }
-    if let Some(member_id) = member_id {
-        body["memberId"] = json!(member_id);
+    let (path, mut body) = if let Some(task_id) = task_id {
+        (
+            format!("{origin}/api/v1/nodes/tasks/exec"),
+            json!({
+                "taskId": task_id,
+                "runtime": runtime_kind,
+                "cwd": cwd,
+                "args": args,
+            }),
+        )
+    } else {
+        (
+            format!("{origin}/api/v1/nodes/exec"),
+            json!({
+                "runtime": runtime_kind,
+                "cwd": cwd,
+                "args": args,
+            }),
+        )
+    };
+    if task_id.is_none() {
+        if let Some(mission_id) = mission_id {
+            body["missionId"] = json!(mission_id);
+        }
+        if let Some(member_id) = member_id {
+            body["memberId"] = json!(member_id);
+        }
     }
     let response = client
-        .post(format!("{origin}/api/v1/nodes/exec"))
+        .post(path)
         .bearer_auth(session)
         .json(&body)
         .send()

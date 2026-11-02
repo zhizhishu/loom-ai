@@ -41,3 +41,7 @@ harness = false
 [[test]]
 name = "b4_shim"
 harness = false
+
+[[test]]
+name = "b5_split"
+harness = false

@@ -23,7 +23,9 @@ use futures_util::{SinkExt, StreamExt};
 use loom_protocol::{
     CONNECT_PATH, CliReport, ClientMessage, OutputStream, RunReport, ServerMessage,
 };
-use rovai_core::execution_node::{CliRecord, NextAttempt, NodeStore, OutputWrite, RevokeResult};
+use rovai_core::execution_node::{
+    CliRecord, NextAttempt, NodeStore, OutputWrite, RevokeResult, TaskHost,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -488,7 +490,7 @@ impl Hub {
         let deadline = Instant::now() + NODE_WAIT;
         let (run_id, rx) = loop {
             match self
-                .try_dispatch(runtime, cwd, args, existing_run, scope)
+                .try_dispatch(runtime, cwd, args, existing_run, scope, None)
                 .await?
             {
                 Some(started) => break started,
@@ -514,6 +516,7 @@ impl Hub {
         args: &[String],
         existing_run: Option<&str>,
         scope: &RunScope,
+        only_node: Option<&str>,
     ) -> Result<Option<(String, oneshot::Receiver<Result<RunOutcome, &'static str>>)>, &'static str>
     {
         if let Some(run_id) = existing_run {
@@ -525,7 +528,26 @@ impl Hub {
         let mut inner = self.inner.lock().await;
         let mut connected = false;
         let mut selected = None;
+        // Unpinned dispatch never chooses the local node. It has no socket.
+        // A remote node is only the target when this call pins it, or when
+        // it is a connected remote that reported the CLI. B10 still owns
+        // making a remote the default mission host.
+        if let Some(only) = only_node {
+            let Some(node) = inner.nodes.get(only) else {
+                return Err("node_runtime_unavailable");
+            };
+            let Some(outbound) = node.outbound.clone() else {
+                return Err("node_runtime_unavailable");
+            };
+            let Some(cli) = node.clis.iter().find(|cli| cli_is_runnable(cli, runtime)) else {
+                return Err("node_cli_unreported");
+            };
+            selected = Some((only.to_owned(), cli.path.clone(), outbound));
+        }
         for (id, node) in &inner.nodes {
+            if only_node.is_some() {
+                break;
+            }
             let Some(outbound) = node.outbound.clone() else {
                 continue;
             };
@@ -669,6 +691,121 @@ impl Hub {
             return Err("node_disconnected");
         }
         Ok((run_id.to_owned(), rx))
+    }
+
+    async fn dispatch_task(
+        &self,
+        task_id: &str,
+        runtime: &str,
+        cwd: &str,
+        args: &[String],
+    ) -> Result<(String, RunOutcome), &'static str> {
+        let host = match self
+            .store
+            .task_execution_host(task_id)
+            .map_err(|_| "node_store_unavailable")?
+        {
+            TaskHost::Missing => return Err("task_not_found"),
+            TaskHost::Unpinned => return Err("task_host_unpinned"),
+            TaskHost::Pinned(host) => host,
+        };
+        self.dispatch_pinned(&host, runtime, cwd, args, &RunScope::default())
+            .await
+    }
+
+    /// Run on the node named by a task pin. The local node uses
+    /// `ManagedProcess::spawn` in this process. A remote node is used only
+    /// when the task names it.
+    async fn dispatch_pinned(
+        &self,
+        node_id: &str,
+        runtime: &str,
+        cwd: &str,
+        args: &[String],
+        scope: &RunScope,
+    ) -> Result<(String, RunOutcome), &'static str> {
+        let role = self
+            .store
+            .node_role(node_id)
+            .map_err(|_| "node_store_unavailable")?
+            .ok_or("node_not_found")?;
+        if role == "local" {
+            return self.spawn_local(node_id, runtime, cwd, args).await;
+        }
+        let Some((run_id, rx)) = self
+            .try_dispatch(runtime, cwd, args, None, scope, Some(node_id))
+            .await?
+        else {
+            return Err("node_runtime_unavailable");
+        };
+        match tokio::time::timeout(RUN_TIMEOUT, rx).await {
+            Ok(Ok(Ok(outcome))) => Ok((run_id, outcome)),
+            Ok(Ok(Err(code))) => Err(code),
+            Ok(Err(_)) => Err("node_disconnected"),
+            Err(_) => {
+                self.abandon(&run_id).await;
+                Err("node_run_timeout")
+            }
+        }
+    }
+
+    async fn spawn_local(
+        &self,
+        node_id: &str,
+        runtime: &str,
+        cwd: &str,
+        args: &[String],
+    ) -> Result<(String, RunOutcome), &'static str> {
+        let Some(program) = local_program(runtime) else {
+            return Err("node_cli_unreported");
+        };
+        if !std::path::Path::new(cwd).is_dir() {
+            return Err("invalid_node_exec");
+        }
+        let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+        self.store
+            .begin_dispatch(&run_id, 1, node_id, runtime)
+            .map_err(|_| "node_runtime_unavailable")?;
+        let outcome = match run_managed(&program, args, cwd, &run_id).await {
+            Ok(outcome) => outcome,
+            Err(code) => {
+                let _ = self.store.interrupt(&run_id, 1);
+                return Err(code);
+            }
+        };
+        let mut seq = 0u64;
+        if !outcome.stdout.is_empty() {
+            seq += 1;
+            if self
+                .store
+                .append_output(&run_id, 1, seq, "stdout", &outcome.stdout, MAX_OUTPUT)
+                .is_err()
+            {
+                let _ = self.store.interrupt(&run_id, 1);
+                return Err("node_store_unavailable");
+            }
+        }
+        if !outcome.stderr.is_empty() {
+            seq += 1;
+            if self
+                .store
+                .append_output(&run_id, 1, seq, "stderr", &outcome.stderr, MAX_OUTPUT)
+                .is_err()
+            {
+                let _ = self.store.interrupt(&run_id, 1);
+                return Err("node_store_unavailable");
+            }
+        }
+        seq += 1;
+        if self
+            .store
+            .finish(&run_id, 1, seq, outcome.exit_code)
+            .is_err()
+        {
+            let _ = self.store.interrupt(&run_id, 1);
+            return Err("node_store_unavailable");
+        }
+        Ok((run_id, outcome))
     }
 
     fn scope_for_attempt(
@@ -1493,6 +1630,53 @@ pub(crate) async fn exec(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TaskExecRequest {
+    task_id: String,
+    runtime: String,
+    cwd: String,
+    args: Vec<String>,
+}
+
+pub(crate) async fn task_exec(
+    State(state): State<WebState>,
+    Extension(_session): Extension<Arc<Session>>,
+    body: Result<Json<TaskExecRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_node_exec");
+    };
+    if !valid_scope_id(&body.task_id, 200) {
+        return error(StatusCode::BAD_REQUEST, "invalid_node_exec");
+    }
+    let probe = ExecRequest {
+        runtime: body.runtime.clone(),
+        cwd: body.cwd.clone(),
+        args: body.args.clone(),
+        run_id: None,
+        mission_id: None,
+        member_id: None,
+    };
+    if let Err(code) = validate_exec(&probe) {
+        return error(StatusCode::BAD_REQUEST, code);
+    }
+    match state
+        .nodes
+        .dispatch_task(&body.task_id, &body.runtime, &body.cwd, &body.args)
+        .await
+    {
+        Ok((run_id, outcome)) => Json(json!({
+            "runId": run_id,
+            "exitCode": outcome.exit_code,
+            "stdout": STANDARD.encode(outcome.stdout),
+            "stderr": STANDARD.encode(outcome.stderr),
+        }))
+        .into_response(),
+        Err(code) => exec_error(code),
+    }
+}
+
 fn validate_exec(body: &ExecRequest) -> Result<(), &'static str> {
     if body.runtime.is_empty()
         || body.runtime.len() > 64
@@ -1549,11 +1733,80 @@ fn exec_error(code: &'static str) -> Response {
         "node_runtime_unavailable"
         | "node_run_still_active"
         | "node_run_not_interrupted"
-        | "node_cli_unreported" => StatusCode::CONFLICT,
-        "node_run_not_found" => StatusCode::NOT_FOUND,
+        | "node_cli_unreported"
+        | "task_host_unpinned" => StatusCode::CONFLICT,
+        "node_run_not_found" | "task_not_found" | "node_not_found" => StatusCode::NOT_FOUND,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     error(status, code)
+}
+
+fn local_program(runtime: &str) -> Option<std::path::PathBuf> {
+    let names: &[&str] = match runtime {
+        "codex-cli" => &["codex"],
+        "claude-code-cli" => &["claude"],
+        "pi" => &["pi"],
+        "opencode-cli" => &["opencode"],
+        _ => return None,
+    };
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+async fn run_managed(
+    program: &std::path::Path,
+    args: &[String],
+    cwd: &str,
+    run_id: &str,
+) -> Result<RunOutcome, &'static str> {
+    use tokio::io::AsyncReadExt;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null());
+    let spec = rovai_core::managed_process::ManagedProcessLaunchSpec::capture(
+        &command,
+        rovai_core::managed_process::ManagedProcessPurpose::RuntimeOneShot,
+        rovai_core::managed_process::ManagedStdinPolicy::Null,
+        rovai_core::managed_process::ManagedWindowsArgvDialect::MicrosoftCrt,
+        format!("node-run:{run_id}"),
+    )
+    .map_err(|_| "node_runtime_unavailable")?;
+    let mut child = rovai_core::managed_process::ManagedProcess::spawn(spec)
+        .map_err(|_| "node_runtime_unavailable")?;
+    let stdout_pipe = child.take_stdout();
+    let stderr_pipe = child.take_stderr();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let status = child.wait().await.map_err(|_| "node_runtime_unavailable")?;
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    Ok(RunOutcome {
+        exit_code: status.code().unwrap_or(1),
+        stdout,
+        stderr,
+    })
 }
 
 fn cli_is_runnable(cli: &CliReport, runtime: &str) -> bool {
@@ -1829,7 +2082,7 @@ mod tests {
         let hub = test_hub();
         let started = Instant::now();
         let pending = hub
-            .try_dispatch("codex-cli", "/work", &[], None, &RunScope::default())
+            .try_dispatch("codex-cli", "/work", &[], None, &RunScope::default(), None)
             .await
             .unwrap();
         assert!(pending.is_none());

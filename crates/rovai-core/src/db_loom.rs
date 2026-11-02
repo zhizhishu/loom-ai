@@ -570,6 +570,8 @@ pub(super) fn schema_matches(
     let verification_recorded =
         projection_schema_version < 173 || verification_schema_matches(connection)?;
     let artifact_recorded = projection_schema_version < 174 || artifact_schema_matches(connection)?;
+    let task_host_recorded =
+        projection_schema_version < 178 || task_holds_execution_host(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -598,7 +600,54 @@ pub(super) fn schema_matches(
         && candidate_recorded
         && review_recorded
         && verification_recorded
-        && artifact_recorded)
+        && artifact_recorded
+        && task_host_recorded)
+}
+
+fn task_holds_execution_host(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='execution_host_id')",
+        [TASK_TABLE],
+        |row| row.get(0),
+    )
+}
+
+/// Migration 228: a LOOM task may name the execution node that runs it.
+/// NULL stays unpinned. A remote node is not the default host.
+pub(super) fn migrate_task_execution_host(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 177
+        ),
+        "task execution host migration requires schema 177"
+    );
+    tx.execute_batch(
+        "ALTER TABLE loom_task ADD COLUMN execution_host_id TEXT
+             CHECK(execution_host_id IS NULL OR length(execution_host_id) BETWEEN 1 AND 80);",
+    )?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(228,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=178,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    anyhow::ensure!(
+        task_holds_execution_host(&tx)?,
+        "task execution host migration did not add the column"
+    );
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 178
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "task execution host schema admission failed");
+    tx.commit()?;
+    Ok(())
 }
 
 /// Migration 219 hangs the acceptance criteria version on the Plan; Tasks inherit it.
@@ -876,7 +925,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS member_capability_tool_claim;
             DROP TABLE IF EXISTS member_capability_choice;
             DROP TABLE IF EXISTS member_capability_item;
-            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225,226,227);
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225,226,227,228);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
@@ -1297,6 +1346,26 @@ mod tests {
             projection_version(&database),
             177,
             "assertion contract_marker_advances_to_177"
+        );
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 177
+        ));
+        migrate_task_execution_host(&mut database).unwrap();
+        assert!(
+            task_holds_execution_host(database.connection()).unwrap(),
+            "assertion schema_178_pins_a_task_to_an_execution_host"
+        );
+        assert_eq!(
+            migration_receipts(&database, 228),
+            1,
+            "assertion schema_migration_records_228_once"
+        );
+        assert_eq!(
+            projection_version(&database),
+            178,
+            "assertion contract_marker_advances_to_178"
         );
         let local: i64 = database
             .connection()
