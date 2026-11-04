@@ -45,3 +45,7 @@ harness = false
 [[test]]
 name = "b5_split"
 harness = false
+
+[[test]]
+name = "b6_files"
+harness = false

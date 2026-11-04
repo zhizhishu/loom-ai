@@ -4,6 +4,13 @@
 //! text frames so one codec covers heartbeat, dispatch, and process output.
 //! Sequence numbers are per run, starting at 1, shared by stdout and stderr.
 
+mod workspace;
+
+pub use workspace::{
+    CLI_CATALOG, FsEntry, MAX_LIST_ENTRIES, MAX_READ_BYTES, PreparedWorktree, list_directory,
+    prepare_git_worktree, read_file, resolve_inside, safe_branch, workspace_relative,
+};
+
 use serde::{Deserialize, Serialize};
 
 pub const CONNECT_PATH: &str = "/api/v1/nodes/connect";
@@ -87,6 +94,28 @@ pub enum ClientMessage {
         attempt: u32,
         code: String,
     },
+    /// Result of a workspace list, read, or worktree prepare. `code` is empty
+    /// on success. File bytes are base64 in `data`.
+    FsResult {
+        request_id: String,
+        code: String,
+        #[serde(default)]
+        entries: Vec<FsEntry>,
+        #[serde(default)]
+        data: String,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        worktree: String,
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        common_dir: String,
+        #[serde(default)]
+        base_sha: String,
+        #[serde(default)]
+        branch: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +157,22 @@ pub enum ServerMessage {
     },
     Error {
         code: String,
+    },
+    ListDir {
+        request_id: String,
+        root: String,
+        relative: String,
+    },
+    ReadFile {
+        request_id: String,
+        root: String,
+        relative: String,
+    },
+    PrepareWorktree {
+        request_id: String,
+        source: String,
+        worktree: String,
+        branch: String,
     },
 }
 

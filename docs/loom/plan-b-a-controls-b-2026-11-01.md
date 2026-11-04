@@ -911,11 +911,23 @@ rovai-server node-exec --data-dir /tmp/loom-b5/a --task task_local --runtime cod
 
 ### B6 工作区主人与文件读
 
+B6 已落地。`rovai-server workspace-prepare` 把工作区的 `execution_host_id` 写成主人节点，并在那台机器上 `git worktree add`。列出和读取只走主人：本机直接读磁盘，远端经节点连接转发。读上限 1 MiB，超出在结果里标 `truncated`；一个目录最多列出 200 项。没有写文件的接口。`../`、根以外的绝对路径、以及解析后离开根的符号链接，在 A 和节点上都会被拒绝。主人不在线时列出返回「不在线」，不是空目录。网页预览分栏的前导列是项目树，点文件仍进现有 `FilePreviewPane`。远程节点仍然不是默认执行主机。
+
 - 创建工作区时 `execution_host_id` 写成主人节点。worktree 建在那台机器上。
 - 从 A 列出并读一个工作区里的文件，内容与 B 磁盘上的一致。
 - `../` 和绝对路径跳出根目录时，A 和节点都拒绝。
 - 主人离线时，列出操作返回「不在线」，不是空列表。
 - 网页里的项目树能点开，预览走现有 `FilePreviewPane`。
+
+在 B 上准备一个 git 仓库，A 上起 `rovai-server`，B 上 `loom-node` 配对。然后：
+
+```bash
+rovai-server workspace-prepare --data-dir /tmp/loom-b6/a --mission mission_b6 --camp camp_b6 --node "$REMOTE_ID" --source /tmp/loom-b6/b/repo
+rovai-server workspace-files --data-dir /tmp/loom-b6/a --mission mission_b6 list
+rovai-server workspace-files --data-dir /tmp/loom-b6/a --mission mission_b6 read hello.txt
+```
+
+`list` 打出仓库里的文件名。`read` 的标准输出与 B 上 worktree 里的字节一致。`read ../secret` 和根以外的绝对路径以 `（path_rejected）` 失败。停掉 `loom-node` 后再 `list`，标准错误含「不在线」，进程非 0，标准输出里没有文件名。`node-exec --task` 再带 `--mission` 或 `--member` 以 `（task_scope_conflict）` 失败，不会发请求。
 
 ### B7 运行包：身份、工具箱、MCP
 

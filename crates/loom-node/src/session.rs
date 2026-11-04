@@ -353,6 +353,25 @@ async fn read_loop(
                         acked_seq,
                     } => on_resume(shared, &run_id, attempt, acked_seq),
                     ServerMessage::Ack { run_id, seq } => on_ack(shared, &run_id, seq),
+                    ServerMessage::ListDir {
+                        request_id,
+                        root,
+                        relative,
+                    } => reply_fs(shared, workspace_list(&request_id, &root, &relative)),
+                    ServerMessage::ReadFile {
+                        request_id,
+                        root,
+                        relative,
+                    } => reply_fs(shared, workspace_read(&request_id, &root, &relative)),
+                    ServerMessage::PrepareWorktree {
+                        request_id,
+                        source,
+                        branch,
+                        ..
+                    } => reply_fs(
+                        shared,
+                        workspace_prepare(&shared.data_dir, &request_id, &source, &branch),
+                    ),
                     ServerMessage::Error { code } if token_is_dead(&code) => {
                         return Ok(Stop::Revoked);
                     }
@@ -370,6 +389,83 @@ async fn read_loop(
         }
     }
     Ok(Stop::Closed)
+}
+
+fn reply_fs(shared: &Arc<Shared>, message: ClientMessage) {
+    try_control(shared, &message);
+}
+
+fn workspace_list(request_id: &str, root: &str, relative: &str) -> ClientMessage {
+    match loom_protocol::list_directory(std::path::Path::new(root), relative) {
+        Ok((entries, truncated)) => fs_ok(request_id, entries, String::new(), truncated),
+        Err(code) => fs_err(request_id, code),
+    }
+}
+
+fn workspace_read(request_id: &str, root: &str, relative: &str) -> ClientMessage {
+    match loom_protocol::read_file(std::path::Path::new(root), relative) {
+        Ok((bytes, truncated)) => fs_ok(request_id, Vec::new(), STANDARD.encode(bytes), truncated),
+        Err(code) => fs_err(request_id, code),
+    }
+}
+
+fn workspace_prepare(
+    data_dir: &std::path::Path,
+    request_id: &str,
+    source: &str,
+    branch: &str,
+) -> ClientMessage {
+    let worktree = data_dir.join("worktrees").join(branch.replace('/', "_"));
+    match loom_protocol::prepare_git_worktree(std::path::Path::new(source), &worktree, branch) {
+        Ok(prepared) => ClientMessage::FsResult {
+            request_id: request_id.to_owned(),
+            code: String::new(),
+            entries: Vec::new(),
+            data: String::new(),
+            truncated: false,
+            worktree: prepared.worktree,
+            source: prepared.source,
+            common_dir: prepared.common_dir,
+            base_sha: prepared.base_sha,
+            branch: prepared.branch,
+        },
+        Err(code) => fs_err(request_id, code),
+    }
+}
+
+fn fs_ok(
+    request_id: &str,
+    entries: Vec<loom_protocol::FsEntry>,
+    data: String,
+    truncated: bool,
+) -> ClientMessage {
+    ClientMessage::FsResult {
+        request_id: request_id.to_owned(),
+        code: String::new(),
+        entries,
+        data,
+        truncated,
+        worktree: String::new(),
+        source: String::new(),
+        common_dir: String::new(),
+        base_sha: String::new(),
+        branch: String::new(),
+    }
+}
+
+fn fs_err(request_id: &str, code: &str) -> ClientMessage {
+    ClientMessage::FsResult {
+        request_id: request_id.to_owned(),
+        code: code.to_owned(),
+        entries: Vec::new(),
+        data: String::new(),
+        truncated: false,
+        worktree: String::new(),
+        source: String::new(),
+        common_dir: String::new(),
+        base_sha: String::new(),
+        branch: String::new(),
+    }
 }
 
 fn token_is_dead(code: &str) -> bool {

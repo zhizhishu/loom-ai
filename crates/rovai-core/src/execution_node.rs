@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -257,6 +257,23 @@ pub enum OutputWrite {
     Gap,
     TooLarge,
     Missing,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceRecord {
+    pub id: String,
+    pub mission_id: String,
+    pub camp_id: String,
+    pub execution_host_id: String,
+    pub source_directory: String,
+    pub repository_root: String,
+    pub git_common_dir: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub base_sha: String,
+    pub owner_name: String,
+    pub owner_role: String,
+    pub last_heartbeat: Option<String>,
 }
 
 #[derive(Debug)]
@@ -572,6 +589,87 @@ impl NodeStore {
                 [node_id],
                 |row| row.get(0),
             )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn sqlite_directory(&self) -> Result<PathBuf> {
+        let connection = self.lock()?;
+        let path = connection
+            .path()
+            .context("node store has no file path")?
+            .to_owned();
+        Ok(Path::new(&path)
+            .parent()
+            .context("node store path has no parent")?
+            .to_path_buf())
+    }
+
+    pub fn save_workspace(&self, record: &WorkspaceRecord) -> Result<()> {
+        let now = now_stamp();
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO mission_workspace(
+                id, mission_id, camp_id, execution_host_id, source_directory,
+                repository_root, git_common_dir, worktree_path, working_directory,
+                base_branch, branch, base_sha, preparation_token, preparation_kind,
+                generation, state, created_at, updated_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,NULL,?9,?10,?11,'create',1,'ready',?12,?12)",
+            params![
+                record.id,
+                record.mission_id,
+                record.camp_id,
+                record.execution_host_id,
+                record.source_directory,
+                record.repository_root,
+                record.git_common_dir,
+                record.worktree_path,
+                record.branch,
+                record.base_sha,
+                record.id,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn workspace_by_mission(&self, mission_id: &str) -> Result<Option<WorkspaceRecord>> {
+        self.workspace_where("w.mission_id=?1", mission_id)
+    }
+
+    pub fn workspace_by_camp(&self, camp_id: &str) -> Result<Option<WorkspaceRecord>> {
+        self.workspace_where("w.camp_id=?1", camp_id)
+    }
+
+    fn workspace_where(&self, clause: &str, value: &str) -> Result<Option<WorkspaceRecord>> {
+        let connection = self.lock()?;
+        let sql = format!(
+            "SELECT w.id, w.mission_id, w.camp_id, w.execution_host_id, w.source_directory,
+                    w.repository_root, w.git_common_dir, w.worktree_path, w.branch, w.base_sha,
+                    n.display_name, n.role, n.last_heartbeat
+             FROM mission_workspace w
+             JOIN execution_node n ON n.node_id = w.execution_host_id
+             WHERE {clause} AND w.state='ready' AND n.revoked_at IS NULL
+             ORDER BY w.created_at DESC LIMIT 1"
+        );
+        connection
+            .query_row(&sql, [value], |row| {
+                Ok(WorkspaceRecord {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    camp_id: row.get(2)?,
+                    execution_host_id: row.get(3)?,
+                    source_directory: row.get(4)?,
+                    repository_root: row.get(5)?,
+                    git_common_dir: row.get(6)?,
+                    worktree_path: row.get(7)?,
+                    branch: row.get(8)?,
+                    base_sha: row.get(9)?,
+                    owner_name: row.get(10)?,
+                    owner_role: row.get(11)?,
+                    last_heartbeat: row.get(12)?,
+                })
+            })
             .optional()
             .map_err(Into::into)
     }

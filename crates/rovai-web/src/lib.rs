@@ -258,6 +258,8 @@ fn routes(state: WebState) -> Router {
         .route("/nodes/pair", post(nodes::pair))
         .route("/nodes/exec", post(nodes::exec))
         .route("/nodes/tasks/exec", post(nodes::task_exec))
+        .route("/nodes/workspaces", post(nodes::prepare_workspace))
+        .route("/nodes/workspaces/files", post(nodes::workspace_files))
         .route("/nodes/runs/{run_id}/output/{from}", get(nodes::output))
         .route("/nodes/{node_id}/revoke", post(nodes::revoke))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));

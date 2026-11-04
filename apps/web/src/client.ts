@@ -1079,7 +1079,19 @@ export class ConsoleClient {
     return this.#node(`nodes/${encodeURIComponent(nodeId)}/revoke`, 'POST')
   }
 
-  async #node<T>(path: string, method: 'GET' | 'POST'): Promise<T> {
+  async workspaceFiles(body: { threadId?: string; missionId?: string; relative?: string; op?: 'list' | 'read' }): Promise<{
+    ownerName?: string
+    lastHeartbeat?: string | null
+    online?: boolean
+    entries?: { name: string; kind: 'file' | 'dir' }[]
+    truncated?: boolean
+    data?: string
+    size?: number
+  }> {
+    return this.#node('nodes/workspaces/files', 'POST', body)
+  }
+
+  async #node<T>(path: string, method: 'GET' | 'POST', body?: unknown): Promise<T> {
     if (!path.startsWith('nodes')) throw new HttpRequestError(400, 'nodes_unavailable')
     if (!this.#token) throw new SessionRequired()
     this.#assertConnected(true)
@@ -1089,6 +1101,7 @@ export class ConsoleClient {
       response = await this.#fetch(`${this.origin}/api/v1/${path}`, {
         method, credentials: 'omit', redirect: 'error', cache: 'no-store',
         headers: { Accept: 'application/json', ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}), Authorization: `Bearer ${this.#token}` },
+        body: body === undefined ? undefined : JSON.stringify(body),
         signal: this.#lifetime.signal
       })
     } catch (error) {
@@ -1096,9 +1109,9 @@ export class ConsoleClient {
       throw new HttpRequestError(0, 'nodes_unavailable')
     }
     if (response.status === 401) { await this.#forgetAuthentication(); throw new SessionRequired() }
-    const body = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } }
-    if (!response.ok) throw new HttpRequestError(response.status, body.error?.code ?? 'nodes_unavailable', sessionStorageMessage(body))
-    return body as T
+    const payload = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } }
+    if (!response.ok) throw new HttpRequestError(response.status, payload.error?.code ?? 'nodes_unavailable', payload.error?.message || sessionStorageMessage(payload))
+    return payload as T
   }
 
   async getWorkspaces(path?: string, offset = 0): Promise<WorkspaceListing> {
