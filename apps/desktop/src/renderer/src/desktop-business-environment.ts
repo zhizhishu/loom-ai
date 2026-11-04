@@ -12,7 +12,8 @@ export const desktopBusinessEnvironment: BusinessEnvironment = {
   nodes: nodeApiFromChannel({
     list: () => desktopNodeChannel()?.list() ?? Promise.resolve(unavailable),
     pair: () => desktopNodeChannel()?.pair() ?? Promise.resolve(unavailable),
-    revoke: nodeId => desktopNodeChannel()?.revoke(nodeId) ?? Promise.resolve(unavailable)
+    revoke: nodeId => desktopNodeChannel()?.revoke(nodeId) ?? Promise.resolve(unavailable),
+    output: (runId, from) => desktopNodeChannel()?.output(runId, from) ?? Promise.resolve(unavailable)
   }),
   get preferences() { return window.rovai },
   get desktop() { return window.rovai },

@@ -1350,14 +1350,16 @@ ipcMain.handle('rovai:nodes', async (event, operation: unknown, value: unknown) 
     || event.senderFrame !== event.sender.mainFrame) {
     return { ok: false, code: 'nodes_unavailable' }
   }
-  if (operation !== 'list' && operation !== 'pair' && operation !== 'revoke') {
+  if (operation !== 'list' && operation !== 'pair' && operation !== 'revoke' && operation !== 'output') {
     return { ok: false, code: 'nodes_unavailable' }
   }
-  const nodeId = value && typeof value === 'object' && typeof (value as { nodeId?: unknown }).nodeId === 'string'
-    ? (value as { nodeId: string }).nodeId
+  const record = value && typeof value === 'object' ? value as { nodeId?: unknown; runId?: unknown; from?: unknown } : {}
+  const nodeId = typeof record.nodeId === 'string' ? record.nodeId : undefined
+  const output = operation === 'output' && typeof record.runId === 'string' && typeof record.from === 'number'
+    ? { runId: record.runId, from: record.from }
     : undefined
   try {
-    return await nodeChannelCall(core, nodeChannelSession, operation, nodeId, fetch)
+    return await nodeChannelCall(core, nodeChannelSession, operation, nodeId, fetch, output)
   } catch {
     return { ok: false, code: 'nodes_unavailable' }
   }

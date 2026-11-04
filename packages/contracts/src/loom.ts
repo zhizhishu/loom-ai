@@ -110,6 +110,8 @@ export interface LoomTask {
   acceptanceCriteria: LoomAcceptanceCriteriaSnapshot
   /** 真实阻塞原因（从 Run 失败或人工标记来） */
   blockedReason: string | null
+  /** 钉住的执行节点。空着表示没钉住，不能当成已经派到某台远程机器。 */
+  executionHostId?: string | null
   /** 创建时间 */
   createdAt: string
   /** 更新时间 */
