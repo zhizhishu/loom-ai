@@ -1,6 +1,27 @@
 export type CapabilityKind = 'skill' | 'mcp' | 'rule' | 'hook'
 export type CapabilityOrigin = 'inherited' | 'explicit' | null
 
+/** Core-owned review scope. It carries ids, never a caller-supplied label or digest. */
+export type HookReviewScope = {
+  memberId: string
+  missionId: string
+  campId: string
+  workspaceId: string
+  nodeId: string
+  workspaceRoot: string
+  workspaceGeneration: number
+  workspaceTokenDigest: string
+  adapterKind: string
+}
+
+export type HookDefinition = {
+  body: string
+  definitionDigest: string
+  reviewed: boolean
+  reviewScope: HookReviewScope
+  scopeDigest: string
+}
+
 export type CapabilityItem = {
   id: string
   kind: CapabilityKind
@@ -12,6 +33,10 @@ export type CapabilityItem = {
   origin: CapabilityOrigin
   toolNames: readonly string[]
   risk: 'high' | null
+  /** Present for hooks whose member has a remote run scope. Core owns both digests. */
+  hookDefinition?: HookDefinition | null
+  /** Read-model stamp failure. It only blocks a new check, never removing an existing one. */
+  sourceError?: string | null
 }
 
 export type CapabilityIdentity = {
@@ -136,6 +161,84 @@ export function previewRuntime(runtime: string | null): string | null {
 export function highRiskToConfirm(draft: readonly CapabilityItem[], saved: readonly CapabilityItem[]): CapabilityItem[] {
   const savedOn = new Set(saved.filter((item) => item.selected).map(itemKey))
   return draft.filter((item) => item.risk === 'high' && item.selected && !savedOn.has(itemKey(item)))
+}
+
+export type HookApproval = { id: string, definitionDigest: string, scopeDigest: string }
+
+export type HookReviewEntry = {
+  id: string
+  name: string
+  body: string
+  scope: HookReviewScope
+  definitionDigest: string
+  scopeDigest: string
+}
+
+/** Everything the confirmation sends. It is frozen when the dialog opens. */
+export type HookReviewSnapshot = {
+  agentId: string
+  revision: string
+  token: number
+  acknowledgeHighRisk: boolean
+  selections: CapabilitySelection[]
+  approvals: HookApproval[]
+  entries: HookReviewEntry[]
+}
+
+/** A hook needs exact approval only when it is selected and Core reports it unreviewed. */
+export function pendingHookReview(items: readonly CapabilityItem[]): CapabilityItem[] {
+  return items.filter((item) => item.kind === 'hook' && item.selected
+    && !!item.hookDefinition && !item.hookDefinition.reviewed)
+}
+
+/** Off to on only. A broken source never blocks unchecking; Core fails closed on its own. */
+export function selectRefusal(item: CapabilityItem): '' | 'source' {
+  if (item.selected) return ''
+  return item.sourceError ? 'source' : ''
+}
+
+/** Returns null when a pending hook has no readable definition, so nothing can send an empty approval. */
+export function hookReviewSnapshot(input: {
+  agentId: string
+  revision: string
+  token: number
+  acknowledgeHighRisk: boolean
+  selections: readonly CapabilitySelection[]
+  pending: readonly CapabilityItem[]
+}): HookReviewSnapshot | null {
+  const entries: HookReviewEntry[] = []
+  for (const item of input.pending) {
+    const definition = item.hookDefinition
+    if (!definition) return null
+    entries.push({
+      id: item.id,
+      name: item.name,
+      body: definition.body,
+      scope: definition.reviewScope,
+      definitionDigest: definition.definitionDigest,
+      scopeDigest: definition.scopeDigest
+    })
+  }
+  entries.sort((left, right) => left.id.localeCompare(right.id))
+  return {
+    agentId: input.agentId,
+    revision: input.revision,
+    token: input.token,
+    acknowledgeHighRisk: input.acknowledgeHighRisk,
+    selections: input.selections.map((selection) => ({ ...selection })),
+    approvals: entries.map((entry) => ({ id: entry.id, definitionDigest: entry.definitionDigest, scopeDigest: entry.scopeDigest })),
+    entries
+  }
+}
+
+/** A snapshot dies with its member or its request generation, not just its revision. */
+export function snapshotApplies(snapshot: HookReviewSnapshot, agentId: string, token: number): boolean {
+  return snapshot.agentId === agentId && snapshot.token === token
+}
+
+/** Cancel and stale-dialog recovery: drop only the keys that were never saved. */
+export function revertPending(items: readonly CapabilityItem[], keys: ReadonlySet<string>): CapabilityItem[] {
+  return items.map((item) => keys.has(itemKey(item)) ? { ...item, selected: false } : item)
 }
 
 export function conflictPartners(items: readonly CapabilityItem[], item: CapabilityItem): Array<{ names: string, tool: string }> {

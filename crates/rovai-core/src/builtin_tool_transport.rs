@@ -10,12 +10,12 @@ use serde_json::{Map, Value, json};
 
 use crate::team_tool_catalog::builtin_tool_definitions;
 
-pub const BUILTIN_TOOL_CONTRACT_VERSION: u32 = 44;
+pub const BUILTIN_TOOL_CONTRACT_VERSION: u32 = 45;
 pub const BUILTIN_TOOL_IPC_PROTOCOL_VERSION: u32 = 3;
 pub const BUILTIN_TOOL_ENVELOPE_VERSION: u32 = 2;
-pub const BUILTIN_TOOL_CLI_COMMAND_VERSION: u32 = 44;
-pub const BUILTIN_TOOL_AGENT_OUTPUT_CONTRACT_VERSION: u32 = 14;
-pub const BUILTIN_TOOL_RUNTIME_CAPABILITY: &str = "builtin_cli.transport.v44";
+pub const BUILTIN_TOOL_CLI_COMMAND_VERSION: u32 = 45;
+pub const BUILTIN_TOOL_AGENT_OUTPUT_CONTRACT_VERSION: u32 = 15;
+pub const BUILTIN_TOOL_RUNTIME_CAPABILITY: &str = "builtin_cli.transport.v45";
 pub const ROVAI_AGENT_CLI_ENV: &str = "ROVAI_AGENT_CLI";
 pub const ROVAI_CLI_CONTEXT_ENV: &str = "ROVAI_CLI_CONTEXT";
 pub const ROVAI_RUN_TMP_ENV: &str = "ROVAI_RUN_TMP";
@@ -23,44 +23,7 @@ pub const COMPACTION_HOOK_IPC_PROTOCOL_VERSION: u32 = 1;
 pub const COMPACTION_OBSERVATION_IPC_KIND: &str = "compaction_observation";
 pub const COMPACTION_OBSERVATION_OUTBOX_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "transport", rename_all = "snake_case")]
-pub enum LocalIpcEndpoint {
-    UnixSocket { path: String },
-    WindowsNamedPipe { name: String },
-}
-
-impl LocalIpcEndpoint {
-    pub fn validate(&self) -> Result<()> {
-        match self {
-            Self::UnixSocket { path } => {
-                if path.trim().is_empty() || !Path::new(path).is_absolute() {
-                    bail!("Built-in Tool Unix socket endpoint must be absolute");
-                }
-            }
-            Self::WindowsNamedPipe { name } => {
-                let Some(suffix) = name.strip_prefix(r"\\.\pipe\rovai-ai-") else {
-                    bail!("Built-in Tool Windows named pipe endpoint is invalid");
-                };
-                let Some((process_id, instance_id)) = suffix.split_once('-') else {
-                    bail!("Built-in Tool Windows named pipe endpoint is invalid");
-                };
-                if process_id.is_empty()
-                    || !process_id.bytes().all(|byte| byte.is_ascii_digit())
-                    || process_id
-                        .parse::<u32>()
-                        .ok()
-                        .filter(|value| *value > 0)
-                        .is_none()
-                    || uuid::Uuid::parse_str(instance_id).is_err()
-                {
-                    bail!("Built-in Tool Windows named pipe endpoint is invalid");
-                }
-            }
-        }
-        Ok(())
-    }
-}
+pub use rovai_local_ipc::LocalIpcEndpoint;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -178,7 +141,7 @@ pub struct BuiltinToolCliIdentity {
     pub action: &'static str,
 }
 
-pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 36] = [
+pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 43] = [
     BuiltinToolCliIdentity {
         operation: "thread.message.send",
         group: "send",
@@ -323,6 +286,41 @@ pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 36] = [
         operation: "loom.submit",
         group: "loom",
         action: "submit",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.inspect",
+        group: "loom",
+        action: "inspect",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.stage-review",
+        group: "loom",
+        action: "stage-review",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.workspace.list",
+        group: "workspace",
+        action: "list",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.workspace.read",
+        group: "workspace",
+        action: "read",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.workspace.run",
+        group: "workspace",
+        action: "run",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.workspace.poll",
+        group: "workspace",
+        action: "poll",
+    },
+    BuiltinToolCliIdentity {
+        operation: "loom.workspace.cancel",
+        group: "workspace",
+        action: "cancel",
     },
     BuiltinToolCliIdentity {
         operation: "automation.list",
@@ -530,7 +528,7 @@ impl BuiltinToolInvocationEnvelope {
             .context("Built-in Tool envelope requestId must be a UUID")?;
         match (self.ok, self.result.as_ref(), self.error.as_ref()) {
             (true, Some(result), None) => {
-                validate_canonical_operation_result(result)?;
+                validate_canonical_operation_result(result, Some(&self.operation))?;
             }
             (false, None, Some(error)) => {
                 if error.code.trim().is_empty() || error.message.trim().is_empty() {
@@ -745,15 +743,18 @@ fn build_catalog_operations() -> Result<Vec<CatalogOperation>> {
 }
 
 pub fn canonical_operation_result(value: Value) -> Result<Value> {
-    validate_canonical_operation_result(&value)?;
+    validate_canonical_operation_result(&value, None)?;
     Ok(value)
 }
 
-fn validate_canonical_operation_result(value: &Value) -> Result<()> {
+fn validate_canonical_operation_result(value: &Value, operation: Option<&str>) -> Result<()> {
     let result = value
         .as_object()
         .context("Canonical Operation Result must be an object")?;
     for forbidden in ["rovaiTeamTool", "rovaiTeamReceipt", "task"] {
+        if forbidden == "task" && operation == Some("loom.inspect") {
+            continue;
+        }
         if result.contains_key(forbidden) {
             bail!("Canonical Operation Result contains forbidden field {forbidden}");
         }
@@ -1037,6 +1038,19 @@ fn error_contracts(operation: &str) -> Vec<BuiltinToolErrorContract> {
             "loom.forbidden",
             "loom.lead_required",
             "loom.mission_not_found",
+            // Authority, pause, expiry and the approved task/reviewer set are the User's to
+            // change; a reviewer that loops on them only burns Runs.
+            "loom.control_not_authorized",
+            "loom.control_disabled",
+            "loom.control_paused",
+            "loom.control_expired",
+            "loom.control_task_invalid",
+            "loom.control_reviewer_invalid",
+            "loom.control_reviewer_self",
+            "loom.control_command_reused",
+            "loom.stage_review_exists",
+            "loom.stage_review_replay_conflict",
+            "loom.stage_reviewer_run_invalid",
         ] {
             errors.push(BuiltinToolErrorContract {
                 code: code.into(),
@@ -1055,6 +1069,11 @@ fn error_contracts(operation: &str) -> Vec<BuiltinToolErrorContract> {
             "loom.claim_fence_stale",
             "loom.claim_agent_run_mismatch",
             "loom.acceptance_criteria_version_mismatch",
+            // The approval or the candidate moved on: inspect again before deciding.
+            "loom.control_policy_not_found",
+            "loom.control_revision_conflict",
+            "loom.stage_manifest_mismatch",
+            "loom.stage_candidate_stale",
         ] {
             errors.push(BuiltinToolErrorContract {
                 code: code.into(),
@@ -1078,10 +1097,48 @@ fn error_contracts(operation: &str) -> Vec<BuiltinToolErrorContract> {
             "loom.artifact_content_changed",
             "loom.evidence_not_found",
             "loom.candidate_previous_invalid",
+            "loom.stage_criteria_incomplete",
         ] {
             errors.push(BuiltinToolErrorContract {
                 code: code.into(),
                 recovery: BuiltinToolRecovery::FixInput,
+            });
+        }
+    }
+    if matches!(
+        operation,
+        "loom.workspace.list"
+            | "loom.workspace.read"
+            | "loom.workspace.run"
+            | "loom.workspace.poll"
+            | "loom.workspace.cancel"
+    ) {
+        for (code, recovery) in [
+            ("unsupported_version", BuiltinToolRecovery::Stop),
+            ("invalid_request", BuiltinToolRecovery::FixInput),
+            ("path_rejected", BuiltinToolRecovery::FixInput),
+            ("unauthorized", BuiltinToolRecovery::Stop),
+            ("wrong_node", BuiltinToolRecovery::Stop),
+            ("policy_mismatch", BuiltinToolRecovery::Stop),
+            ("tool_denied", BuiltinToolRecovery::Stop),
+            ("deadline_exceeded", BuiltinToolRecovery::ConfirmOutcome),
+            ("request_conflict", BuiltinToolRecovery::Stop),
+            ("not_found", BuiltinToolRecovery::FixInput),
+            ("not_directory", BuiltinToolRecovery::FixInput),
+            ("not_file", BuiltinToolRecovery::FixInput),
+            ("node_offline", BuiltinToolRecovery::RetrySameRequest),
+            ("busy", BuiltinToolRecovery::RetrySameRequest),
+            ("output_limit", BuiltinToolRecovery::FixInput),
+            ("sequence_conflict", BuiltinToolRecovery::Stop),
+            ("unknown_outcome", BuiltinToolRecovery::ConfirmOutcome),
+            ("spawn_failed", BuiltinToolRecovery::Stop),
+            ("cancelled", BuiltinToolRecovery::Stop),
+            ("storage_unavailable", BuiltinToolRecovery::Stop),
+            ("unsupported_platform", BuiltinToolRecovery::Stop),
+        ] {
+            errors.push(BuiltinToolErrorContract {
+                code: code.into(),
+                recovery,
             });
         }
     }
@@ -1120,6 +1177,13 @@ pub fn projection_identity(operation: &str) -> Result<&'static str> {
         | "loom.claim"
         | "loom.evidence"
         | "loom.submit"
+        | "loom.inspect"
+        | "loom.stage-review"
+        | "loom.workspace.list"
+        | "loom.workspace.read"
+        | "loom.workspace.run"
+        | "loom.workspace.poll"
+        | "loom.workspace.cancel"
         | "automation.list"
         | "automation.get"
         | "automation.create"
@@ -1245,10 +1309,10 @@ mod tests {
 
     #[test]
     fn cli_mapping_is_complete_unique_and_contract_valid() {
-        assert_eq!(BUILTIN_TOOL_CONTRACT_VERSION, 44);
-        assert_eq!(BUILTIN_TOOL_CLI_COMMAND_VERSION, 44);
-        assert_eq!(BUILTIN_TOOL_AGENT_OUTPUT_CONTRACT_VERSION, 14);
-        assert_eq!(BUILTIN_TOOL_RUNTIME_CAPABILITY, "builtin_cli.transport.v44");
+        assert_eq!(BUILTIN_TOOL_CONTRACT_VERSION, 45);
+        assert_eq!(BUILTIN_TOOL_CLI_COMMAND_VERSION, 45);
+        assert_eq!(BUILTIN_TOOL_AGENT_OUTPUT_CONTRACT_VERSION, 15);
+        assert_eq!(BUILTIN_TOOL_RUNTIME_CAPABILITY, "builtin_cli.transport.v45");
         validate_builtin_tool_contract().unwrap();
         let operations = BUILTIN_TOOL_CLI_IDENTITIES
             .iter()
@@ -1258,8 +1322,8 @@ mod tests {
             .iter()
             .map(|identity| (identity.group, identity.action))
             .collect::<BTreeSet<_>>();
-        assert_eq!(operations.len(), 36);
-        assert_eq!(commands.len(), 36);
+        assert_eq!(operations.len(), BUILTIN_TOOL_CLI_IDENTITIES.len());
+        assert_eq!(commands.len(), BUILTIN_TOOL_CLI_IDENTITIES.len());
     }
 
     #[test]
@@ -1314,6 +1378,22 @@ mod tests {
         result.validate().unwrap();
         assert_eq!(result.result.as_ref().unwrap()["taskId"], "task-1");
         assert!(result.result.as_ref().unwrap().get("task").is_none());
+        for identity in BUILTIN_TOOL_CLI_IDENTITIES {
+            let with_task = BuiltinToolInvocationEnvelope::success(
+                identity.operation,
+                "7b5db24c-4a43-4cab-9217-d982b08f7691",
+                json!({"task": {"taskId": "task-1"}}),
+            );
+            assert_eq!(with_task.is_ok(), identity.operation == "loom.inspect");
+        }
+        assert!(canonical_operation_result(json!({"task": {}})).is_err());
+        for forbidden in ["rovaiTeamTool", "rovaiTeamReceipt"] {
+            assert!(BuiltinToolInvocationEnvelope::success(
+                "loom.inspect",
+                "7b5db24c-4a43-4cab-9217-d982b08f7691",
+                json!({"task": {}, forbidden: {}}),
+            ).is_err());
+        }
     }
 
     #[test]
@@ -1344,6 +1424,41 @@ mod tests {
 
     #[test]
     fn list_and_describe_share_the_current_catalog() {
+        // Narrow contract regression: every real CLI identity the Node/Core
+        // builtin transport can carry must pass `BuiltinCallV1::validate`.
+        // The count is not pinned; the hyphenated real name must be present.
+        let mut identities_seen = 0usize;
+        let mut saw_stage_review = false;
+        for identity in BUILTIN_TOOL_CLI_IDENTITIES {
+            identities_seen += 1;
+            if identity.operation == "loom.stage-review" {
+                saw_stage_review = true;
+            }
+            let call = loom_protocol::builtin_pipe::BuiltinCallV1 {
+                version: loom_protocol::builtin_pipe::BUILTIN_PIPE_VERSION,
+                key: loom_protocol::process_pipe::RemoteProcessKey {
+                    node_id: "node".into(),
+                    process_id: "process".into(),
+                    process_epoch: 1,
+                },
+                owner: loom_protocol::process_pipe::AgentRunOwner {
+                    agent_run_id: "run".into(),
+                    execution_epoch: 1,
+                },
+                binding_seq: 0,
+                request_id: "request".into(),
+                operation: identity.operation.to_owned(),
+                input: json!({}),
+                send_input_file_path: None,
+            };
+            call.validate()
+                .unwrap_or_else(|error| panic!("{}: {error}", identity.operation));
+        }
+        assert!(identities_seen > 0, "the CLI identity table must not be empty");
+        assert!(
+            saw_stage_review,
+            "loom.stage-review is missing from the CLI identity table"
+        );
         let list = builtin_tool_list(true).unwrap();
         assert!(
             serde_json::to_value(&list)

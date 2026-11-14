@@ -2,6 +2,17 @@
 //! Mission; every query is scoped by `missionId`. The write paths are [`plan_import`],
 //! [`task_release`], [`claim_acquire`] and [`candidate_record`], each one Mission, one
 //! transaction.
+pub(crate) mod remote_artifact;
+/// The bytes of a registered local artifact, archived so a later verification re-reads what was
+/// registered instead of whatever the workspace file holds now.
+pub(crate) mod snapshot;
+/// The persistent automation authority of one Plan: the approved policy, the assistant stage
+/// verdicts, and the dispatch/budget ledger. Split out of this module because nothing in it may
+/// set the Owner's own `ACCEPTED` verdict — that stays in [`review_record`].
+pub mod control;
+#[cfg(all(test, feature = "extended-tests"))]
+mod control_tests;
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
@@ -9,6 +20,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
+use crate::managed_blob::{GC_OWNER_EXECUTION_LIFECYCLE, ManagedBlobStore, attach_gc_candidate};
 
 /// LOOM control-plane task state machine: DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED.
 /// The persisted literals stay uppercase; the wire shape is the contract's lowercase one.
@@ -487,6 +499,7 @@ const LOOM_TASK_NOT_READY: &str = "LOOM_TASK_NOT_READY";
 const LOOM_DEPENDENCY_UNRELEASED: &str = "LOOM_DEPENDENCY_UNRELEASED";
 const LOOM_CLAIM_HELD: &str = "LOOM_CLAIM_HELD";
 const LOOM_CLAIM_COMMAND_REUSED: &str = "LOOM_CLAIM_COMMAND_REUSED";
+const LOOM_REMOTE_TARGET_UNAVAILABLE: &str = "LOOM_REMOTE_TARGET_UNAVAILABLE";
 const LOOM_CLAIM_ABSENT: &str = "LOOM_CLAIM_ABSENT";
 const LOOM_CLAIM_EXPIRED: &str = "LOOM_CLAIM_EXPIRED";
 const LOOM_CLAIM_AGENT_RUN_MISMATCH: &str = "LOOM_CLAIM_AGENT_RUN_MISMATCH";
@@ -495,6 +508,10 @@ const LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH: &str = "LOOM_ACCEPTANCE_CRITERI
 const LOOM_CANDIDATE_COMMAND_REUSED: &str = "LOOM_CANDIDATE_COMMAND_REUSED";
 const LOOM_CANDIDATE_PREVIOUS_INVALID: &str = "LOOM_CANDIDATE_PREVIOUS_INVALID";
 const LOOM_CANDIDATE_NOT_FOUND: &str = "LOOM_CANDIDATE_NOT_FOUND";
+/// A verdict — human or internal — can only judge the Task's newest Candidate. An older one was
+/// already superseded by a rework, so finishing the Task on it would settle evidence that the
+/// rework replaced.
+const LOOM_CANDIDATE_STALE: &str = "LOOM_CANDIDATE_STALE";
 const LOOM_TASK_NOT_IN_REVIEW: &str = "LOOM_TASK_NOT_IN_REVIEW";
 const LOOM_REVIEW_EXISTS: &str = "LOOM_REVIEW_EXISTS";
 const LOOM_REVIEW_CRITERIA_INCOMPLETE: &str = "LOOM_REVIEW_CRITERIA_INCOMPLETE";
@@ -1009,6 +1026,36 @@ pub struct LoomArtifactsListResult {
     pub artifacts: Vec<LoomArtifact>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomArtifactPreviewInput {
+    pub mission_id: String,
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoomArtifactPreviewUnavailableReason {
+    TooLarge,
+    Binary,
+    NotArchived,
+}
+
+/// Bounded archive text for Owner inspection; reading it records no verification or review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomArtifactPreviewResult {
+    pub artifact_id: String,
+    pub relative_path: String,
+    pub content_type: Option<String>,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub text: Option<String>,
+    pub unavailable_reason: Option<LoomArtifactPreviewUnavailableReason>,
+}
+
+const MAX_ARTIFACT_PREVIEW_BYTES: i64 = 256 * 1024;
+
 fn required_field(operation: &str, field: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1080,7 +1127,7 @@ fn lease_expired(lease_expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> 
 /// review, which this projection does not hold yet, so an unresolved artifact edge stays
 /// unreleased.
 fn blocking_dependencies(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     plan_id: &str,
     task_id: &str,
 ) -> Result<Vec<String>> {
@@ -1308,6 +1355,21 @@ pub fn claim_acquire(
         ));
     }
 
+    // Freeze the same real Run/epoch/Task/Node authority as the claim itself.
+    // Reject before releasing a previous lease; a failed binding rolls back all writes.
+    let remote_admission = crate::remote_execution::validate_loom_claim(
+        &transaction,
+        &agent_run_id,
+        &mission_id,
+        &task_id,
+        claimant_agent_id.as_deref(),
+    )
+    .map_err(|_| {
+        LoomCommandError::rejection(
+            LOOM_REMOTE_TARGET_UNAVAILABLE,
+            "The current Run, Task and frozen remote execution target do not authorize this claim",
+        )
+    })?;
     let open_claim: Option<(String, String)> = transaction
         .query_row(
             "SELECT claim_id, lease_expires_at FROM loom_claim
@@ -1353,6 +1415,16 @@ pub fn claim_acquire(
             &claimed_at,
         ],
     )?;
+    if let Some(admission) = remote_admission.as_ref() {
+        crate::remote_execution::record_loom_claim(&transaction, &claim_id, admission).map_err(
+            |_| {
+                LoomCommandError::rejection(
+                    LOOM_REMOTE_TARGET_UNAVAILABLE,
+                    "The remote claim binding could not be recorded",
+                )
+            },
+        )?;
+    }
     transaction.commit()?;
     Ok(LoomClaimAcquireResult {
         claim_id,
@@ -1750,6 +1822,48 @@ pub fn candidate_record(
         ));
     }
 
+    // A rework has to chain. Once a Task carries a Candidate, the next submission must name the
+    // newest one as `previousCandidateId`: skipping the link (or pointing at an older version)
+    // would let two deliveries both claim to be the current version, and a verdict could then be
+    // attached to a lineage that never happened. This is judged after the Task-state fence, so a
+    // Task that cannot take a delivery at all still reports its state rather than a chain error.
+    let newest_candidate: Option<String> = transaction
+        .query_row(
+            "SELECT candidate_id FROM loom_candidate WHERE plan_id=?1 AND task_id=?2
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![&plan_id, &task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match (newest_candidate.as_deref(), previous_candidate_id.as_deref()) {
+        (None, None) => {}
+        (Some(newest), Some(previous)) if previous == newest => {}
+        (Some(newest), Some(previous)) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_CANDIDATE_PREVIOUS_INVALID,
+                format!(
+                    "task {task_id} is at candidate {newest}; previousCandidateId must name it, not {previous}"
+                ),
+            ));
+        }
+        (Some(newest), None) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_CANDIDATE_PREVIOUS_INVALID,
+                format!(
+                    "task {task_id} already carries candidate {newest}; a rework must name it as previousCandidateId"
+                ),
+            ));
+        }
+        (None, Some(previous)) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_CANDIDATE_PREVIOUS_INVALID,
+                format!(
+                    "task {task_id} carries no earlier candidate, so {previous} cannot be its previous version"
+                ),
+            ));
+        }
+    }
+
     let candidate_id = format!("candidate_{}", uuid::Uuid::new_v4().simple());
     transaction.execute(
         "INSERT INTO loom_candidate(candidate_id,plan_id,task_id,agent_run_id,command_id,
@@ -2036,6 +2150,7 @@ fn mission_workspace(
         .query_row(
             "SELECT working_directory, state FROM mission_workspace
              WHERE mission_id=?1
+               AND execution_host_id=(SELECT id FROM mission_execution_host WHERE singleton=1)
              ORDER BY generation DESC, updated_at DESC LIMIT 1",
             [mission_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2071,9 +2186,13 @@ fn mission_workspace(
 
 /// Register one artifact for the Mission's plan and return the immutable row.
 ///
-/// Registering the same path again with the same bytes replays the original row; the same path
-/// with different bytes is refused, because changed evidence must arrive as a new artifact rather
-/// than silently rewriting what an earlier verdict was based on.
+/// The bytes are archived in the Managed Blob store before the artifact row commits, so a later
+/// verification re-reads what was registered instead of whatever the workspace file holds then.
+///
+/// Registering the same path again with the same bytes replays the original row (and gives an
+/// artifact registered before archiving existed its snapshot); the same path with different bytes
+/// is refused, because changed evidence must arrive as a new artifact rather than silently
+/// rewriting what an earlier verdict was based on.
 pub fn artifact_register(
     database: &mut Database,
     creator_id: &str,
@@ -2101,50 +2220,94 @@ pub fn artifact_register(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let transaction = database
-        .connection_mut()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let workspace = mission_workspace(&transaction, &mission_id)?;
-    let plan_id: Option<String> = transaction
-        .query_row(
-            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
-            [&mission_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(plan_id) = plan_id else {
-        return Err(LoomCommandError::rejection(
-            LOOM_PLAN_NOT_FOUND,
-            format!("mission {mission_id} has no LOOM plan"),
-        ));
+    // Phase one is read-only. Everything registration needs to know about the Mission, its plan,
+    // the Task and the file is proven before a single byte leaves the workspace, because copying
+    // those bytes happens outside the artifact transaction.
+    let (workspace, plan_id) = {
+        let connection = database.connection();
+        refuse_remote_artifact_producer(connection, agent_run_id.as_deref())?;
+        let workspace = mission_workspace(connection, &mission_id)?;
+        let plan_id = artifact_plan(connection, &mission_id)?;
+        ensure_artifact_task(connection, &plan_id, &mission_id, task_id.as_deref())?;
+        (workspace, plan_id)
     };
-    if let Some(task_id) = task_id.as_deref() {
-        let known: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM loom_task WHERE plan_id=?1 AND task_id=?2)",
-            params![&plan_id, task_id],
-            |row| row.get(0),
-        )?;
-        if !known {
-            return Err(LoomCommandError::rejection(
-                LOOM_TASK_NOT_FOUND,
-                format!("task {task_id} does not belong to the plan of mission {mission_id}"),
-            ));
-        }
-    }
+    let data_dir = snapshot::data_directory(database)?;
 
     let resolved = resolve_artifact_path(&workspace, &relative_path)?;
     #[cfg(test)]
     artifact_swap_hook::run();
-    let (sha256, size_bytes) = artifact_digest(&resolved).map_err(|error| {
+    let (bytes, sha256, size_bytes) = snapshot::read_artifact_bytes(&resolved).map_err(|error| {
         LoomCommandError::rejection(
             LOOM_ARTIFACT_PATH_REJECTED,
             format!("artifact {relative_path} cannot be read without following links: {error:#}"),
         )
     })?;
 
+    // The bytes are frozen in the Managed Blob store before the artifact row exists. The candidate
+    // marker makes that safe without a second transaction: a crash, or any refusal below, leaves a
+    // Blob the GC collects instead of an artifact pointing at bytes nobody wrote down.
+    let media_type = content_type
+        .as_deref()
+        .filter(|value| !value.is_empty() && value.len() <= 127 && value.contains('/'))
+        .unwrap_or("application/octet-stream");
+    let candidate = ManagedBlobStore::new(&data_dir).put_bytes_candidate(
+        database,
+        &bytes,
+        media_type,
+        "sensitive",
+        // Archived artifact bytes are Run execution-lifecycle content: the historical managed_blob
+        // owner CHECK admits only these owners, a candidate whose registration failed before its
+        // artifact row committed stays collectable, and a committed snapshot protects the Blob
+        // through its Foreign Key.
+        GC_OWNER_EXECUTION_LIFECYCLE,
+    )?;
+    if candidate.sha256 != sha256 || candidate.byte_size != size_bytes as u64 {
+        anyhow::bail!("Managed Blob candidate does not hold the bytes that were read");
+    }
+
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Every fact phase one proved is proved again under the write lock: the archive is only sound
+    // while the Mission, its plan, the Task and the file are still the facts it was built from.
+    refuse_remote_artifact_producer(&transaction, agent_run_id.as_deref())?;
+    let plan_id_now = artifact_plan(&transaction, &mission_id)?;
+    if plan_id_now != plan_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} changed its LOOM plan while the artifact was archived"),
+        ));
+    }
+    ensure_artifact_task(&transaction, &plan_id, &mission_id, task_id.as_deref())?;
+    let workspace_now = mission_workspace(&transaction, &mission_id)?;
+    let resolved_now = resolve_artifact_path(&workspace_now, &relative_path).map_err(|error| {
+        LoomCommandError::rejection(
+            LOOM_ARTIFACT_PATH_REJECTED,
+            format!("artifact {relative_path} cannot be read without following links: {error:#}"),
+        )
+    })?;
+    let (_, sha256_now, size_bytes_now) = snapshot::read_artifact_bytes(&resolved_now).map_err(
+        |error| {
+            LoomCommandError::rejection(
+                LOOM_ARTIFACT_PATH_REJECTED,
+                format!(
+                    "artifact {relative_path} cannot be read without following links: {error:#}"
+                ),
+            )
+        },
+    )?;
+    if sha256_now != sha256 || size_bytes_now != size_bytes {
+        return Err(LoomCommandError::rejection(
+            LOOM_ARTIFACT_CONTENT_CHANGED,
+            format!(
+                "artifact {relative_path} changed while it was being archived; nothing was recorded"
+            ),
+        ));
+    }
+
     let existing: Option<(String, String)> = transaction
         .query_row(
-            "SELECT artifact_id, sha256 FROM loom_artifact WHERE plan_id=?1 AND relative_path=?2",
+            "SELECT artifact_id, sha256 FROM loom_artifact WHERE plan_id=?1 AND origin_key='local' AND relative_path=?2",
             params![&plan_id, &relative_path],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -2158,6 +2321,10 @@ pub fn artifact_register(
                 ),
             ));
         }
+        // Same bytes: replay the row. An artifact registered before archiving existed gets its
+        // snapshot here, and only because the file still has the digest that row recorded.
+        snapshot::record(&transaction, &artifact_id, &candidate.id, &sha256, size_bytes)?;
+        attach_gc_candidate(&transaction, &candidate.id)?;
         let artifact = read_stored_artifact(&transaction, &artifact_id)?;
         transaction.commit()?;
         return Ok(LoomArtifactRegisterResult {
@@ -2195,11 +2362,77 @@ pub fn artifact_register(
             &artifact.created_at,
         ],
     )?;
+    snapshot::record(
+        &transaction,
+        &artifact.artifact_id,
+        &candidate.id,
+        &artifact.sha256,
+        artifact.size_bytes,
+    )?;
+    attach_gc_candidate(&transaction, &candidate.id)?;
     transaction.commit()?;
     Ok(LoomArtifactRegisterResult {
         artifact,
         replayed: false,
     })
+}
+
+/// Remote producers own their own archive path; a local registration may not stand in for one.
+fn refuse_remote_artifact_producer(
+    connection: &rusqlite::Connection,
+    agent_run_id: Option<&str>,
+) -> Result<()> {
+    let Some(run_id) = agent_run_id else {
+        return Ok(());
+    };
+    if crate::remote_execution::authority_table_available(connection, "agent_run_execution_target")?
+        && crate::remote_execution::load_run_target(connection, run_id)?.is_some()
+    {
+        return Err(LoomCommandError::rejection(
+            LOOM_ARTIFACT_PATH_REJECTED,
+            "Remote producer evidence must use its authenticated archive registration path",
+        ));
+    }
+    Ok(())
+}
+
+fn artifact_plan(connection: &rusqlite::Connection, mission_id: &str) -> Result<String> {
+    let plan_id: Option<String> = connection
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    plan_id.ok_or_else(|| {
+        LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} has no LOOM plan"),
+        )
+    })
+}
+
+fn ensure_artifact_task(
+    connection: &rusqlite::Connection,
+    plan_id: &str,
+    mission_id: &str,
+    task_id: Option<&str>,
+) -> Result<()> {
+    let Some(task_id) = task_id else {
+        return Ok(());
+    };
+    let known: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loom_task WHERE plan_id=?1 AND task_id=?2)",
+        params![plan_id, task_id],
+        |row| row.get(0),
+    )?;
+    if !known {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_FOUND,
+            format!("task {task_id} does not belong to the plan of mission {mission_id}"),
+        ));
+    }
+    Ok(())
 }
 
 fn read_stored_artifact(
@@ -2259,47 +2492,113 @@ fn ensure_evidence_artifacts(
 
 /// Re-read the bytes behind every referenced artifact and compare them with the digest recorded
 /// at registration. A passing verification cannot be recorded over changed or missing bytes.
+///
+/// A local artifact whose registration archived its bytes is judged on those bytes; only an
+/// artifact registered before archiving existed is re-read from the workspace file.
 fn ensure_evidence_bytes_match(
     connection: &rusqlite::Connection,
-    workspace: &std::path::Path,
+    mission_id: &str,
+    archive_root: Option<&std::path::Path>,
+    snapshot_root: Option<&std::path::Path>,
     plan_id: &str,
     evidence_ids: &[String],
 ) -> Result<()> {
+    use sha2::Digest;
+    let mut local_workspace = None;
     for evidence_id in evidence_ids {
-        let stored: Option<(String, String)> = connection
-            .query_row(
-                "SELECT relative_path, sha256 FROM loom_artifact WHERE plan_id=?1 AND artifact_id=?2",
-                params![plan_id, evidence_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((relative_path, expected)) = stored else {
+        let stored: Option<(String,String,String)> = connection.query_row(
+            "SELECT relative_path,sha256,origin_key FROM loom_artifact WHERE plan_id=?1 AND artifact_id=?2",
+            params![plan_id,evidence_id],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        let Some((relative_path, expected, origin)) = stored else {
             return Err(LoomCommandError::rejection(
                 LOOM_EVIDENCE_NOT_FOUND,
                 format!("evidence {evidence_id} is not a registered artifact of this plan"),
             ));
         };
-        // A refused path or a vanished file is "cannot re-read", not "the bytes differ": the two
-        // call for different repairs, so they must not share an error code.
-        let resolved = resolve_artifact_path(workspace, &relative_path).map_err(|error| {
-            LoomCommandError::rejection(
-                LOOM_EVIDENCE_UNREADABLE,
-                format!("evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"),
-            )
-        })?;
-        #[cfg(test)]
-        artifact_swap_hook::run();
-        let (actual, _) = artifact_digest(&resolved).map_err(|error| {
-            LoomCommandError::rejection(
-                LOOM_EVIDENCE_UNREADABLE,
-                format!("evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"),
-            )
-        })?;
+        let actual = if origin == "local" {
+            let remote_locator: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM loom_artifact_archive WHERE artifact_id=?1)",
+                [evidence_id],
+                |r| r.get(0),
+            )?;
+            if remote_locator {
+                return Err(LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    "Local evidence cannot carry a remote archive locator",
+                ));
+            }
+            let data_dir = snapshot_root.ok_or_else(|| {
+                LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    "Local evidence snapshots require Core's data directory",
+                )
+            })?;
+            // The archived bytes are what was registered. A row that names a Blob that is
+            // missing, unreadable or no longer the recorded content fails here; it is never
+            // answered with whatever the workspace file holds now.
+            match snapshot::read_verified_bytes(connection, data_dir, plan_id, evidence_id)
+                .map_err(|error| {
+                    LoomCommandError::rejection(
+                        LOOM_EVIDENCE_UNREADABLE,
+                        format!("evidence {evidence_id} archived bytes cannot be read: {error:#}"),
+                    )
+                })?
+            {
+                Some(bytes) => format!("{:x}", sha2::Sha256::digest(&bytes)),
+                None => {
+                    // Artifacts registered before archiving existed keep their historical read.
+                    if local_workspace.is_none() {
+                        local_workspace = Some(mission_workspace(connection, mission_id)?);
+                    }
+                    let workspace = local_workspace
+                        .as_deref()
+                        .expect("local workspace was resolved");
+                    let resolved =
+                        resolve_artifact_path(workspace, &relative_path).map_err(|error| {
+                            LoomCommandError::rejection(
+                                LOOM_EVIDENCE_UNREADABLE,
+                                format!(
+                                    "evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"
+                                ),
+                            )
+                        })?;
+                    #[cfg(test)]
+                    artifact_swap_hook::run();
+                    artifact_digest(&resolved)
+                        .map_err(|error| {
+                            LoomCommandError::rejection(
+                                LOOM_EVIDENCE_UNREADABLE,
+                                format!(
+                                    "evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"
+                                ),
+                            )
+                        })?
+                        .0
+                }
+            }
+        } else {
+            let root = archive_root.ok_or_else(|| {
+                LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    "Remote evidence verification requires Core's private archive service",
+                )
+            })?;
+            let bytes =
+                remote_artifact::read_verified_bytes(connection, root, plan_id, evidence_id)?
+                    .ok_or_else(|| {
+                        LoomCommandError::rejection(
+                            LOOM_EVIDENCE_UNREADABLE,
+                            "Remote evidence cannot fall back to a local workspace path",
+                        )
+                    })?;
+            format!("{:x}", sha2::Sha256::digest(&bytes))
+        };
         if actual != expected {
             return Err(LoomCommandError::rejection(
                 LOOM_EVIDENCE_HASH_MISMATCH,
                 format!(
-                    "evidence {evidence_id} at {relative_path} no longer matches its recorded sha256; the bytes changed after registration"
+                    "evidence {evidence_id} at {relative_path} no longer matches its recorded sha256"
                 ),
             ));
         }
@@ -2417,6 +2716,92 @@ pub fn artifacts_list(database: &Database, mission_id: &str) -> Result<LoomArtif
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(LoomArtifactsListResult { artifacts })
+}
+
+/// Preview only the immutable bytes registered for this Mission, never the mutable workspace.
+pub fn artifact_preview(
+    database: &Database,
+    data_dir: &std::path::Path,
+    input: LoomArtifactPreviewInput,
+) -> Result<LoomArtifactPreviewResult> {
+    let mission_id = scoped_mission(&input.mission_id)?;
+    let artifact_id = required_field("artifact.preview", "artifactId", &input.artifact_id)?;
+    let connection = database.connection();
+    let stored = connection
+        .query_row(
+            "SELECT artifact.plan_id, artifact.origin_key, artifact.artifact_id,
+                    artifact.relative_path, artifact.content_type, artifact.size_bytes,
+                    artifact.sha256,
+                    EXISTS(SELECT 1 FROM loom_artifact_archive WHERE artifact_id=artifact.artifact_id)
+             FROM loom_artifact AS artifact
+             JOIN loom_plan AS plan ON plan.plan_id=artifact.plan_id
+             WHERE plan.mission_id=?1 AND artifact.artifact_id=?2",
+            params![mission_id, artifact_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(7)?,
+                    LoomArtifactPreviewResult {
+                        artifact_id: row.get(2)?,
+                        relative_path: row.get(3)?,
+                        content_type: row.get(4)?,
+                        size_bytes: row.get(5)?,
+                        sha256: row.get(6)?,
+                        text: None,
+                        unavailable_reason: None,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    let Some((plan_id, origin, remote_locator, mut preview)) = stored else {
+        return Err(LoomCommandError::rejection(
+            LOOM_EVIDENCE_NOT_FOUND,
+            "The artifact does not belong to this Mission",
+        ));
+    };
+    if origin == "local" && remote_locator {
+        return Err(LoomCommandError::rejection(
+            LOOM_EVIDENCE_UNREADABLE,
+            "Local evidence cannot carry a remote archive locator",
+        ));
+    }
+    // Refuse by recorded size before either store opens or allocates the archived content.
+    if preview.size_bytes > MAX_ARTIFACT_PREVIEW_BYTES {
+        preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::TooLarge);
+        return Ok(preview);
+    }
+    let bytes = if origin == "local" {
+        snapshot::read_verified_bytes(connection, data_dir, &plan_id, &artifact_id).map_err(
+            |error| {
+                LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    format!("evidence {artifact_id} archived bytes cannot be read: {error:#}"),
+                )
+            },
+        )?
+    } else {
+        Some(
+            remote_artifact::read_verified_bytes(connection, data_dir, &plan_id, &artifact_id)?
+                .ok_or_else(|| {
+                    LoomCommandError::rejection(
+                        LOOM_EVIDENCE_UNREADABLE,
+                        "Remote evidence cannot fall back to a local workspace path",
+                    )
+                })?,
+        )
+    };
+    match bytes {
+        None => {
+            preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::NotArchived);
+        }
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(text) if !text.contains('\0') => preview.text = Some(text),
+            _ => preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::Binary),
+        },
+    }
+    Ok(preview)
 }
 
 pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<LoomCandidate>> {
@@ -2873,6 +3258,25 @@ pub fn review_record(
         )
         .into());
     }
+    // Only the newest Candidate of the Task can be judged. An older one was already replaced by a
+    // rework, and accepting it would finish the Task on delivery evidence the rework superseded.
+    let newest_candidate: Option<String> = transaction
+        .query_row(
+            "SELECT candidate_id FROM loom_candidate WHERE plan_id=?1 AND task_id=?2
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![&plan_id, &task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if newest_candidate.as_deref() != Some(candidate_id.as_str()) {
+        return Err(LoomCommandError::rejection(
+            LOOM_CANDIDATE_STALE,
+            format!(
+                "candidate {candidate_id} is not the newest candidate of task {task_id}; a superseded delivery cannot be accepted or rejected"
+            ),
+        )
+        .into());
+    }
     let reviewed: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM loom_review WHERE candidate_id=?1)",
         [&candidate_id],
@@ -3204,6 +3608,24 @@ pub fn verification_record(
     database: &mut Database,
     input: LoomVerificationRecordInput,
 ) -> Result<LoomVerificationRecordResult> {
+    verification_record_internal(database, None, input)
+}
+
+/// The application supplies its trusted data directory; no request field can
+/// choose a local archive root or convert a Node filename into an A path.
+pub fn verification_record_with_archives(
+    database: &mut Database,
+    data_dir: &std::path::Path,
+    input: LoomVerificationRecordInput,
+) -> Result<LoomVerificationRecordResult> {
+    verification_record_internal(database, Some(data_dir), input)
+}
+
+fn verification_record_internal(
+    database: &mut Database,
+    archive_root: Option<&std::path::Path>,
+    input: LoomVerificationRecordInput,
+) -> Result<LoomVerificationRecordResult> {
     let mission_id = required_field("verification record", "missionId", &input.mission_id)?;
     let task_id = required_field("verification record", "taskId", &input.task_id)?;
     let candidate_id = required_field("verification record", "candidateId", &input.candidate_id)?;
@@ -3211,6 +3633,12 @@ pub fn verification_record(
     let method = required_field("verification record", "method", &input.method)?;
     let executor_id = required_field("verification record", "executorId", &input.executor_id)?;
     let result = input.result;
+    // Where the archived bytes live: the trusted data directory the caller supplied, or the
+    // directory the open database itself sits in. A process working directory is never an answer
+    // here, so an unknown root stays `None` rather than turning into a relative path.
+    let snapshot_root = archive_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| database.path().parent().map(std::path::Path::to_path_buf));
 
     let transaction = database
         .connection_mut()
@@ -3357,8 +3785,14 @@ pub fn verification_record(
             )
             .into());
         }
-        let workspace = mission_workspace(&transaction, &mission_id)?;
-        ensure_evidence_bytes_match(&transaction, &workspace, &plan_id, &checked_evidence)?;
+        ensure_evidence_bytes_match(
+            &transaction,
+            &mission_id,
+            archive_root,
+            snapshot_root.as_deref(),
+            &plan_id,
+            &checked_evidence,
+        )?;
     }
 
     let verification_id = format!("verification_{}", uuid::Uuid::new_v4().simple());
@@ -6785,7 +7219,7 @@ mod tests {
                     "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,source_directory,
                          repository_root,git_common_dir,worktree_path,working_directory,branch,base_sha,
                          preparation_token,state,created_at,updated_at)
-                     VALUES(?1,?2,?3,'host',?4,?4,?5,?6,?6,?7,'0000','tok',?8,'2026-10-31','2026-10-31')",
+                     VALUES(?1,?2,?3,(SELECT id FROM mission_execution_host WHERE singleton=1),?4,?4,?5,?6,?6,?7,'0000','tok',?8,'2026-10-31','2026-10-31')",
                     params![
                         id,
                         mission_id,
@@ -6815,6 +7249,15 @@ mod tests {
             .execute("DELETE FROM mission_workspace WHERE id='ws-old'", [])
             .unwrap();
         insert("ready", "ws-ready");
+        database.connection().execute_batch(
+            "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,source_directory,
+                repository_root,git_common_dir,worktree_path,working_directory,branch,base_sha,
+                preparation_token,state,generation,created_at,updated_at)
+             SELECT 'ws-remote-shadow',mission_id,camp_id,'fixture-other-node',source_directory,
+                repository_root,git_common_dir,worktree_path,'Z:/must-not-read-on-core',branch,
+                base_sha,'remote-fixture-token','ready',99,created_at,updated_at
+             FROM mission_workspace WHERE id='ws-ready';",
+        ).unwrap();
         assert_eq!(
             mission_workspace(database.connection(), &mission_id).unwrap(),
             worktree,
@@ -6905,6 +7348,286 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM loom_artifact", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1, "assertion a replay writes no second row");
+    }
+
+    /// Registration archives the bytes it hashed. The workspace file is then rewritten, and the
+    /// archived copy still holds what was registered; a second path in the same plan keeps its own
+    /// snapshot instead of replacing the first.
+    #[test]
+    fn artifact_register_archives_the_bytes_it_hashed() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact archive");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "archived bytes");
+        let first = register(&mut database, &mission_id, "report.md");
+        let preview_input = json!({"missionId":mission_id,"artifactId":first.artifact_id});
+        assert!(serde_json::from_value::<LoomArtifactPreviewInput>(preview_input.clone()).is_ok());
+        for field in ["relativePath", "path", "dataDir"] {
+            let mut unknown = preview_input.clone();
+            unknown[field] = json!("../untrusted");
+            assert!(serde_json::from_value::<LoomArtifactPreviewInput>(unknown).is_err());
+        }
+        let preview = |database: &OwnedTestDatabase, mission_id: &str, artifact_id: &str| {
+            artifact_preview(
+                database,
+                database.directory(),
+                LoomArtifactPreviewInput {
+                    mission_id: mission_id.into(),
+                    artifact_id: artifact_id.into(),
+                },
+            )
+        };
+        let expected = LoomArtifactPreviewResult {
+            artifact_id: first.artifact_id.clone(),
+            relative_path: first.relative_path.clone(),
+            content_type: first.content_type.clone(),
+            size_bytes: first.size_bytes,
+            sha256: first.sha256.clone(),
+            text: Some("archived bytes".into()),
+            unavailable_reason: None,
+        };
+        assert_eq!(preview(&database, &mission_id, &first.artifact_id).unwrap(), expected);
+        let other_mission = create_mission(&mut database, "LOOM preview other mission");
+        let other_plan = LoomPlanImportInput {
+            tasks: vec![task("other_task_a", "Task A"), task("other_task_b", "Task B")],
+            dependencies: vec![edge("other_task_a", "other_task_b")],
+            ..plan_input(&other_mission)
+        };
+        plan_import(&mut database, other_plan).unwrap();
+        let error = preview(&database, &other_mission, &first.artifact_id).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_NOT_FOUND
+        );
+
+        let archived = |database: &OwnedTestDatabase, artifact_id: &str| {
+            database
+                .connection()
+                .query_row(
+                    "SELECT blob_id, sha256, size_bytes FROM loom_artifact_snapshot
+                     WHERE artifact_id=?1",
+                    [artifact_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let before = archived(&database, &first.artifact_id);
+        assert_eq!(
+            before.1, first.sha256,
+            "assertion the archived digest is the one the artifact recorded"
+        );
+        assert_eq!(before.2, first.size_bytes);
+
+        write_workspace_file(&database, &mission_id, "report.md", "rewritten after register");
+        assert_eq!(preview(&database, &mission_id, &first.artifact_id).unwrap(), expected);
+        assert_eq!(
+            archived(&database, &first.artifact_id),
+            before,
+            "assertion rewriting the file leaves the archived bytes untouched"
+        );
+
+        write_workspace_file(&database, &mission_id, "second.md", "another artifact");
+        let second = register(&mut database, &mission_id, "second.md");
+        assert_ne!(second.artifact_id, first.artifact_id);
+        assert_ne!(
+            archived(&database, &second.artifact_id),
+            before,
+            "assertion a second path archives its own bytes"
+        );
+        let snapshots: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact_snapshot", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            snapshots, 2,
+            "assertion both artifacts keep their archived bytes"
+        );
+
+        // The archived bytes are Run execution-lifecycle content, so the legacy unreferenced
+        // collector must leave them alone even though the workspace file they came from was
+        // already rewritten: the snapshot row's Foreign Key is what protects them, and a read that
+        // still yields the registered bytes can only come from the archive, not from the file.
+        let store = crate::managed_blob::ManagedBlobStore::new(database.directory());
+        let collected = store
+            .collect_unreferenced_before(&mut database, "2999-01-01T00:00:00Z")
+            .unwrap();
+        assert!(
+            !collected.contains(&before.0),
+            "assertion the first artifact Blob is still referenced by its snapshot"
+        );
+        let second_before = archived(&database, &second.artifact_id);
+        assert!(
+            !collected.contains(&second_before.0),
+            "assertion the second artifact Blob is still referenced by its snapshot"
+        );
+        assert_eq!(
+            snapshot::read_verified_bytes(
+                database.connection(),
+                database.directory(),
+                &first.plan_id,
+                &first.artifact_id,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(b"archived bytes".as_slice()),
+            "assertion the archived bytes survive collection unchanged, never the rewritten file"
+        );
+        // A snapshot that committed keeps its Blob attachable, so the registration cleared the
+        // candidate marker instead of leaving the archived bytes collectable.
+        for blob_id in [&before.0, &second_before.0] {
+            let marker: (Option<String>, Option<String>) = database
+                .connection()
+                .query_row(
+                    "SELECT gc_candidate_at, gc_candidate_owner FROM managed_blob WHERE id=?1",
+                    [blob_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                marker,
+                (None, None),
+                "assertion a committed snapshot carries no GC candidate marker"
+            );
+        }
+
+        // Legacy rows have no archive: even a readable workspace file must not become a preview.
+        seed_evidence(&mut database, &mission_id);
+        let legacy = preview(&database, &mission_id, &evidence_id("evidence_one", &mission_id))
+            .unwrap();
+        assert_eq!(legacy.text, None);
+        assert_eq!(
+            legacy.unavailable_reason,
+            Some(LoomArtifactPreviewUnavailableReason::NotArchived)
+        );
+
+        let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
+        for (path, bytes) in [
+            ("non-utf8.bin", vec![0xff, 0xfe]),
+            ("nul.bin", b"text\0content".to_vec()),
+        ] {
+            std::fs::write(workspace.join(path), bytes).unwrap();
+            let artifact = register(&mut database, &mission_id, path);
+            let result = preview(&database, &mission_id, &artifact.artifact_id).unwrap();
+            assert_eq!(result.text, None);
+            assert_eq!(
+                result.unavailable_reason,
+                Some(LoomArtifactPreviewUnavailableReason::Binary)
+            );
+        }
+        let boundary_text = "x".repeat(MAX_ARTIFACT_PREVIEW_BYTES as usize);
+        write_workspace_file(&database, &mission_id, "boundary.txt", &boundary_text);
+        let boundary = register(&mut database, &mission_id, "boundary.txt");
+        assert_eq!(
+            preview(&database, &mission_id, &boundary.artifact_id).unwrap().text,
+            Some(boundary_text)
+        );
+        write_workspace_file(
+            &database,
+            &mission_id,
+            "too-large.txt",
+            &"x".repeat(MAX_ARTIFACT_PREVIEW_BYTES as usize + 1),
+        );
+        let large = register(&mut database, &mission_id, "too-large.txt");
+        let blob_path = |sha256: &str| {
+            database.directory().join("managed-blobs").join("sha256")
+                .join(&sha256[..2]).join(sha256)
+        };
+        // Removing the bytes proves the metadata refusal does not attempt a storage read.
+        std::fs::remove_file(blob_path(&large.sha256)).unwrap();
+        let too_large = preview(&database, &mission_id, &large.artifact_id).unwrap();
+        assert_eq!(too_large.text, None);
+        assert_eq!(
+            too_large.unavailable_reason,
+            Some(LoomArtifactPreviewUnavailableReason::TooLarge)
+        );
+
+        std::fs::write(blob_path(&first.sha256), b"corrupted").unwrap();
+        std::fs::remove_file(blob_path(&second.sha256)).unwrap();
+        let changes_before = database.connection().total_changes();
+        for artifact in [&first, &second] {
+            let error = preview(&database, &mission_id, &artifact.artifact_id).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<LoomCommandError>().unwrap().code(),
+                LOOM_EVIDENCE_UNREADABLE
+            );
+        }
+        let error = preview(&database, &other_mission, &first.artifact_id).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_NOT_FOUND,
+            "Mission scoping must precede reading the now-corrupt archive"
+        );
+        preview(&database, &mission_id, &boundary.artifact_id).unwrap();
+        assert_eq!(database.connection().total_changes(), changes_before);
+    }
+
+    /// A verification judges the archived bytes: evidence whose workspace files were rewritten
+    /// after registration still passes, and a Blob that no longer holds the recorded content fails
+    /// rather than quietly falling back to the file on disk.
+    #[test]
+    fn passed_verification_reads_the_archived_bytes_and_refuses_a_corrupted_blob() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact archive verify");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        // The seeded evidence predates archiving: registering each path again replays its row and
+        // gives it the archived bytes that still match the digest it recorded.
+        let one = register(&mut database, &mission_id, "evidence_one.txt");
+        let two = register(&mut database, &mission_id, "evidence_two.txt");
+        assert_eq!(one.artifact_id, evidence_id("evidence_one", &mission_id));
+        assert_eq!(two.artifact_id, evidence_id("evidence_two", &mission_id));
+
+        write_workspace_file(&database, &mission_id, "evidence_one.txt", "rewritten one");
+        write_workspace_file(&database, &mission_id, "evidence_two.txt", "rewritten two");
+        let verified = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "verify_archived",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+        assert_eq!(verified.verification.result, LoomVerificationResult::Passed);
+
+        // Corrupting the archived Blob is a hard failure for the same check, and there is no
+        // second Candidate to record it against: the bytes cannot be substituted by the file.
+        let sha256: String = database
+            .connection()
+            .query_row(
+                "SELECT sha256 FROM loom_artifact_snapshot WHERE artifact_id=?1",
+                [&one.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blob = database
+            .directory()
+            .join("managed-blobs")
+            .join("sha256")
+            .join(&sha256[..2])
+            .join(&sha256);
+        std::fs::write(&blob, b"corrupted").unwrap();
+        let error = snapshot::read_verified_bytes(
+            database.connection(),
+            database.directory(),
+            &one.plan_id,
+            &one.artifact_id,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot be read"),
+            "assertion a corrupted Blob is not answered with other bytes: {error:#}"
+        );
     }
 
     #[test]

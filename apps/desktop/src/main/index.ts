@@ -220,6 +220,8 @@ const allowedMethods = new Set<CoreMethod>([
   'members.capabilityCatalog.get',
   'members.capabilityCatalog.set',
   'members.capabilityCatalog.putItem',
+  'members.executionTarget.get',
+  'members.executionTarget.save',
   'teams.list',
   'teams.save',
   'teams.delete',

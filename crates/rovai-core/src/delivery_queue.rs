@@ -3,6 +3,8 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub use crate::remote_bundle_owner::RemoteBundleCaptureContext;
+
 #[cfg(test)]
 use crate::context::serialized_batch_run_input_len;
 
@@ -313,9 +315,25 @@ pub fn waiting_mission_batch_workspaces(database: &Database) -> Result<Vec<(Stri
                 WHERE c.camp_id=camp.id AND r.cancel_requested_at IS NOT NULL AND r.cancel_acknowledged_at IS NULL)"
     )?.query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let tx = database.connection().unchecked_transaction()?;
+    // Remote mapping tables are migration-owned. A Core without them has no remote
+    // selection anywhere, so this probe keeps its original local behavior.
+    let remote_mapping_ready = remote_mapping_ready(&tx)?;
     let mut camps = std::collections::BTreeMap::new();
     for (camp_id, path, conversation, member) in lanes {
-        if resolve_frozen_runtime(&tx, &conversation, &member)?.is_ok() {
+        // A saved remote selection is decided by the Node authority only. A broken
+        // selection is an error here and never falls through to the local probe.
+        if remote_mapping_ready
+            && crate::remote_execution::load_member_target(&tx, &member)?
+                .selection
+                .is_some()
+        {
+            // Node workspace preparation is already authoritative. Even an
+            // invalid saved remote selection must reach visible claim settlement,
+            // not cause Core to prepare an unrelated A-side Mission worktree.
+            continue;
+        }
+        let eligible = resolve_frozen_runtime(&tx, &conversation, &member)?.is_ok();
+        if eligible {
             camps.insert(camp_id, path);
         }
     }
@@ -327,13 +345,26 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
     limit: i64,
     prepared_workspaces: &BatchWorkspaces,
 ) -> Result<Vec<String>> {
+    claim_waiting_delivery_batches_with_sources(database, limit, prepared_workspaces, None)
+}
+
+/// The application supplies its own read-only capability sources explicitly.
+/// Missing sources settle an explicit remote lane visibly; they never choose A.
+pub fn claim_waiting_delivery_batches_with_sources(
+    database: &mut Database,
+    limit: i64,
+    prepared_workspaces: &BatchWorkspaces,
+    remote_sources: Option<&RemoteBundleCaptureContext<'_>>,
+) -> Result<Vec<String>> {
     if !(1..=100).contains(&limit) {
         anyhow::bail!("Delivery claim limit must be between 1 and 100");
     }
-    let transaction = database
-        .connection_mut()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Core owns the connection mutex. Shared borrowing lets bounded source
+    // capture read this exact write transaction without opening a nested one.
+    let transaction =
+        Transaction::new_unchecked(database.connection(), TransactionBehavior::Immediate)?;
     reconcile_waiting_delivery_conversations(&transaction)?;
+    let remote_mapping_ready = remote_mapping_ready(&transaction)?;
     let mut claimed_run_ids = Vec::new();
     let mut cursor: Option<(String, i64, String, String, String)> = None;
     while claimed_run_ids.len() < limit as usize {
@@ -437,6 +468,14 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
         ));
 
         for (camp_id, agent_id, conversation_id, _, _) in lanes {
+            // A lane carrying a LOOM handoff waits while the control plane says that dispatch is
+            // blocked. The cursor above already advanced past this lane, so a held lane can never
+            // spin the page; the decision itself comes from the control plane's own helper instead
+            // of a second copy of the paused/expired/revoked rules here. An ordinary lane without
+            // a dispatch row asks nothing and is untouched.
+            if loom_lane_blocked(&transaction, &camp_id, &agent_id)? {
+                continue;
+            }
             if runtime_cleanup_blocked_since_connection(&transaction, &conversation_id, None)?
                 .is_some()
             {
@@ -452,31 +491,70 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
                 [&camp_id],
                 |row| row.get(0),
             )?;
-            let prepared_workspace = prepared_workspaces.get(&camp_id);
-            if let Some(Ok(prepared)) = prepared_workspace {
-                if prepared.fence != batch_workspace_fence(&transaction, &camp_id)? {
-                    continue;
-                }
-                let current =
-                    crate::mission_workspace::execution_directory(&transaction, &camp_id)?;
-                if current.as_deref().unwrap_or(&project_path) != prepared.workspace.execution_root
-                {
-                    continue;
+            // An explicit remote selection owns the workspace root. Core never
+            // prepares, fences or inspects that Node path as one of its own, so the
+            // local worktree gates below apply only when no selection is saved.
+            let remote_selection = if remote_mapping_ready {
+                crate::remote_execution::load_member_target(&transaction, &agent_id)?.selection
+            } else {
+                None
+            };
+            let prepared_workspace = if remote_selection.is_none() {
+                prepared_workspaces.get(&camp_id)
+            } else {
+                None
+            };
+            if remote_selection.is_none() {
+                if let Some(Ok(prepared)) = prepared_workspace {
+                    if prepared.fence != batch_workspace_fence(&transaction, &camp_id)? {
+                        continue;
+                    }
+                    let current =
+                        crate::mission_workspace::execution_directory(&transaction, &camp_id)?;
+                    if current.as_deref().unwrap_or(&project_path)
+                        != prepared.workspace.execution_root
+                    {
+                        continue;
+                    }
                 }
             }
-            let workspace = match prepared_workspace {
-                Some(Ok(prepared)) => Some(prepared.workspace.clone()),
-                _ => batch_workspace_for_claim(&transaction, &camp_id, &project_path)?,
+            let workspace = match &remote_selection {
+                // A remote Run has no Core worktree: the Node root is the workspace.
+                Some(selection) => Some(AgentRunWorkspace::runtime_managed_path(
+                    selection.workspace_root.clone(),
+                )),
+                None => match prepared_workspace {
+                    Some(Ok(prepared)) => Some(prepared.workspace.clone()),
+                    _ => batch_workspace_for_claim(&transaction, &camp_id, &project_path)?,
+                },
             };
             if let Some(workspace) = workspace.as_ref() {
-                workspace.validate()?;
+                match &remote_selection {
+                    // Different platforms write different absolute forms. This is a
+                    // lexical check only and never resolves the path on Core's host.
+                    Some(selection) => anyhow::ensure!(
+                        workspace.execution_root == selection.workspace_root
+                            && remote_root_is_absolute(&workspace.execution_root),
+                        "remote workspace root must be the selected node path"
+                    ),
+                    None => workspace.validate()?,
+                }
             }
             let cleanup_execution_root = workspace
                 .as_ref()
                 .map(|workspace| workspace.execution_root.as_str())
                 .unwrap_or(project_path.as_str());
+            let cleanup_node = remote_selection
+                .as_ref()
+                .map(|selection| selection.node_id.as_str());
+            let cleanup_host = if remote_mapping_ready {
+                "(SELECT frozen.node_id FROM agent_run_execution_target frozen WHERE frozen.agent_run_id=prior_run.id)"
+            } else {
+                "NULL"
+            };
             let cleanup_pending_on_execution_root: bool = transaction.query_row(
-                r#"
+                &format!(
+                    r#"
                 SELECT EXISTS(
                     SELECT 1
                     FROM agent_run AS prior_run
@@ -491,9 +569,11 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
                           json_extract(prior_run.workspace_json, '$.executionRoot'),
                           prior_camp.project_path
                       ) = ?1
+                       AND {cleanup_host} IS ?2
                 )
-                "#,
-                [cleanup_execution_root],
+                "#
+                ),
+                params![cleanup_execution_root, cleanup_node],
                 |row| row.get(0),
             )?;
             if cleanup_pending_on_execution_root {
@@ -522,7 +602,56 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
                 previous_public_boundary <= camp_public_tail,
                 "Accepted Public Context Boundary is ahead of the claim boundary"
             );
-            let runtime = match resolve_frozen_runtime(&transaction, &conversation_id, &agent_id)? {
+            // A saved remote selection never falls through to the local path. An
+            // unusable one settles this conversation visibly below instead of
+            // blocking the batch, and it can never become `None`.
+            let mut remote_target = None;
+            let mut remote_source = None;
+            let resolved = if !remote_mapping_ready {
+                resolve_frozen_runtime(&transaction, &conversation_id, &agent_id)?
+            } else {
+                match crate::remote_execution::prepare_member_target(
+                    &transaction,
+                    &conversation_id,
+                    &agent_id,
+                ) {
+                    Ok(Some(mut target)) => {
+                        let source = remote_sources
+                            .context("remote_bundle_source_unavailable")
+                            .and_then(|context| {
+                                crate::remote_bundle_owner::capture_for_target(
+                                    database,
+                                    context,
+                                    &mut target,
+                                )
+                            });
+                        match source {
+                            Ok(source) => {
+                                // The source identity is already in the target digest
+                                // before native binding/Fleet compatibility is frozen.
+                                let resolution =
+                                    crate::agent_profile::resolve_remote_frozen_runtime(
+                                        &transaction,
+                                        &target,
+                                    )?;
+                                remote_target = Some(target);
+                                remote_source = Some(source);
+                                resolution
+                            }
+                            Err(_) => Err(crate::agent_profile::RuntimeConfigurationBlocker {
+                                code: "remote_bundle_source_unavailable".to_string(),
+                                payload: serde_json::json!({ "conversationId": conversation_id }),
+                            }),
+                        }
+                    }
+                    Ok(None) => resolve_frozen_runtime(&transaction, &conversation_id, &agent_id)?,
+                    Err(_) => Err(crate::agent_profile::RuntimeConfigurationBlocker {
+                        code: "remote_target_unavailable".to_string(),
+                        payload: serde_json::json!({ "conversationId": conversation_id }),
+                    }),
+                }
+            };
+            let runtime = match resolved {
                 Ok(runtime) => runtime,
                 Err(blocker) => {
                     // A failed launch intent must settle visibly. Keeping this delivery
@@ -561,7 +690,7 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
             };
             let effective_config =
                 build_effective_config(&transaction, &conversation_id, &agent_id, &runtime)?;
-            if mission_exists && prepared_workspace.is_none() {
+            if remote_selection.is_none() && mission_exists && prepared_workspace.is_none() {
                 continue;
             }
             if let Some(source_id) = waiting[0].continuation_source_run_id.as_deref() {
@@ -584,6 +713,24 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
                     )?;
                 }
             }
+            let remote_workspace_fact = if let Some(target) = remote_target.as_ref() {
+                let branch: String = transaction.query_row(
+                    "SELECT branch FROM mission_workspace WHERE id=?1 AND execution_host_id=?2
+                     AND worktree_path=?3 AND state='ready'",
+                    params![
+                        target.target.workspace_id,
+                        target.target.node_id,
+                        target.target.workspace_root
+                    ],
+                    |row| row.get(0),
+                )?;
+                Some(serde_json::json!({
+                    "workingDirectory": target.target.workspace_root,
+                    "branch": branch,
+                }))
+            } else {
+                None
+            };
             let max_payload_bytes = runtime_max_context_payload_bytes(&runtime);
             let agent_run_id = Uuid::new_v4().to_string();
             let preview = DeliveryContextPreview {
@@ -634,9 +781,11 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
                     std::path::Path::new(cleanup_execution_root),
                     &waiting,
                     &preview,
-                    prepared_workspace
-                        .and_then(|prepared| prepared.as_ref().ok())
-                        .map(|prepared| &prepared.fact),
+                    remote_workspace_fact.as_ref().or_else(|| {
+                        prepared_workspace
+                            .and_then(|prepared| prepared.as_ref().ok())
+                            .map(|prepared| &prepared.fact)
+                    }),
                 ) {
                     Ok(selection) => selection,
                     Err(error) if error.downcast_ref::<rusqlite::Error>().is_none() => {
@@ -685,6 +834,21 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
                 selection.failure_code,
                 &now,
             )?;
+            // The real queued AgentRun and its immutable execution target are frozen
+            // in one transaction: a revalidation failure rolls the whole claim back.
+            if let Some(target) = &remote_target
+                && selection.failure_code.is_none()
+            {
+                crate::remote_execution::freeze_run_target(&transaction, &agent_run_id, target)?;
+                crate::remote_bundle_owner::freeze_run_source(
+                    &transaction,
+                    &agent_run_id,
+                    target,
+                    remote_source
+                        .as_ref()
+                        .context("remote_bundle_source_missing")?,
+                )?;
+            }
             if let Some(context) = selection.context {
                 context.persist(&transaction, &agent_run_id)?;
             }
@@ -696,6 +860,62 @@ pub fn claim_waiting_delivery_batches_with_workspaces(
     }
     transaction.commit()?;
     Ok(claimed_run_ids)
+}
+
+/// True when any waiting Delivery of this lane carries a LOOM dispatch the control plane no longer
+/// allows. The helper is the only judge of paused/expired/revoked authority and of the Candidate
+/// version; a malformed or missing answer counts as blocked, so a paused approval can never be read
+/// as permission. A database that predates the automation authority has no dispatch at all.
+fn loom_lane_blocked(
+    transaction: &Transaction<'_>,
+    camp_id: &str,
+    agent_id: &str,
+) -> Result<bool> {
+    if !crate::remote_execution::authority_table_available(transaction, "loom_control_dispatch")? {
+        return Ok(false);
+    }
+    let dispatch_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT dispatch.dispatch_id
+             FROM camp_message_delivery AS delivery
+             JOIN loom_control_dispatch AS dispatch ON dispatch.delivery_id = delivery.id
+             WHERE delivery.camp_id = ?1
+               AND delivery.recipient_agent_id = ?2
+               AND delivery.status = 'waiting'",
+        )?;
+        statement
+            .query_map(params![camp_id, agent_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if dispatch_ids.is_empty() {
+        return Ok(false);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    for dispatch_id in dispatch_ids {
+        if crate::loom::control::dispatch_block_reason(transaction, &dispatch_id, &now)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Remote mapping tables belong to a later migration than every Core fixture this
+/// delivery path must keep supporting. Their absence means "no remote target", not
+/// a swallowed error: once present, every remote read failure still propagates.
+fn remote_mapping_ready(transaction: &Transaction<'_>) -> Result<bool> {
+    crate::remote_execution::authority_table_available(transaction, "member_execution_target")
+}
+
+/// A Node path is never resolved with Core's own platform semantics. This only
+/// accepts the lexically absolute forms Core and a Node can exchange.
+fn remote_root_is_absolute(root: &str) -> bool {
+    let bytes = root.as_bytes();
+    root.starts_with('/')
+        || root.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\'))
 }
 
 fn batch_workspace_for_claim(
@@ -1188,6 +1408,34 @@ pub(crate) fn settle_run_deliveries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A Node root is only classified lexically. Core must not apply its own platform
+    // path semantics here, so a POSIX root stays absolute on a Windows Core and an
+    // existing local selection keeps using AgentRunWorkspace::validate.
+    #[test]
+    fn remote_workspace_roots_are_classified_lexically_not_with_core_path_semantics() {
+        for absolute in [
+            "/home/roval/work",
+            "//server/share/work",
+            "C:/work",
+            "c:\\work",
+            "D:/",
+        ] {
+            assert!(remote_root_is_absolute(absolute), "{absolute}");
+        }
+        for relative in ["", "work", "./work", "../work", "C:", "C:work", "\\work"] {
+            assert!(!remote_root_is_absolute(relative), "{relative}");
+        }
+        let local = AgentRunWorkspace::runtime_managed_path(
+            std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+        );
+        local.validate().unwrap();
+        assert!(AgentRunWorkspace::runtime_managed_path("relative/work".into()).validate().is_err());
+        #[cfg(windows)]
+        assert!(AgentRunWorkspace::runtime_managed_path("/srv/remote/work".into()).validate().is_err());
+        #[cfg(not(windows))]
+        assert!(AgentRunWorkspace::runtime_managed_path("C:/remote/work".into()).validate().is_err());
+    }
     use crate::{
         agent_profile::{ModelDescriptor, ModelOptionDescriptor, RuntimeOptionScope, ValueChoice},
         camp_content::{StructuredThreadMessageSegment, canonical_content_digest},
@@ -1339,6 +1587,74 @@ mod tests {
                 crate::context::CharterDeliveryMode::NativeAppend,
                 96 * 1024,
             )
+        }
+
+        #[cfg(feature = "extended-tests")]
+        fn assert_active_skill_index(
+            &mut self,
+            run: &str,
+            initial: &crate::context::PreparedContext,
+            included: bool,
+        ) {
+            use crate::context::{
+                CharterDeliveryMode, ContextMaterialization, ContextService,
+                MaterializeContextRequest,
+            };
+            assert!(initial.rendered_payload.contains("[ROVAI_ADDITIONAL_SKILLS]"));
+            let frozen_target = crate::remote_execution::load_run_target(
+                self.database.connection(), run,
+            ).unwrap();
+            assert_eq!(frozen_target.is_none(), included);
+            self.database.connection().execute(
+                "UPDATE conversation SET native_session_id='active-skill-index-session'
+                 WHERE id=(SELECT conversation_id FROM agent_run WHERE id=?1)",
+                [run],
+            ).unwrap();
+            let input = ContextService.prepare_input_delivery_for_context(
+                &mut self.database, run, 1, initial,
+            ).unwrap();
+            ContextService.acknowledge_input_delivery(
+                &mut self.database, &input.id, "active-skill-index-initial",
+            ).unwrap();
+            let message = if included { "local-index-steer" } else { "remote-index-steer" };
+            let delivery = self.enqueue(message, "continue this same frozen Run");
+            let tx = self.database.connection_mut().transaction().unwrap();
+            crate::steer::route_user_message(
+                &tx, message, Some(&[crate::steer::ActiveInputTarget {
+                    agent_run_id: run.to_string(), execution_epoch: 1,
+                }]),
+            ).unwrap();
+            tx.commit().unwrap();
+            let ContextMaterialization::Ready(active) = ContextService.materialize_message_delivery(
+                &mut self.database,
+                &crate::managed_blob::ManagedBlobStore::new(&self._directory),
+                &delivery, &[],
+                &MaterializeContextRequest {
+                    agent_run_id: run, execution_epoch: 1,
+                    charter_delivery_mode: CharterDeliveryMode::NativeAppend,
+                    max_payload_bytes: 96 * 1024,
+                },
+            ).unwrap() else { panic!("active input must materialize") };
+            assert_eq!(active.rendered_payload.contains("[ROVAI_ADDITIONAL_SKILLS]"), included);
+            assert_eq!(active.runtime_payload.contains("[ROVAI_ADDITIONAL_SKILLS]"), included);
+            assert!(active.rendered_payload.contains("continue this same frozen Run"));
+            let initial_blob: String = self.database.connection().query_row(
+                "SELECT rendered_payload_blob_id FROM context_manifest WHERE id=?1",
+                [&initial.manifest_id], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(
+                crate::managed_blob::ManagedBlobStore::new(&self._directory)
+                    .read_text(&self.database, &initial_blob).unwrap(),
+                initial.rendered_payload,
+                "the initial frozen input stays byte-identical",
+            );
+            assert_eq!(
+                serde_json::to_value(crate::remote_execution::load_run_target(
+                    self.database.connection(), run,
+                ).unwrap()).unwrap(),
+                serde_json::to_value(frozen_target).unwrap(),
+                "active input does not change the frozen Run target",
+            );
         }
 
         #[cfg(feature = "extended-tests")]
@@ -1646,6 +1962,426 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    impl Fixture {
+    /// A real local LOOM control plane for this Camp: Core's own plan import, an explicitly
+    /// assigned `READY` Task and the Owner's approval through the production `configure` API. Only
+    /// fixture seeds (Camp, Mission, member profiles, Task shape) are written as SQL; the policy
+    /// row itself is never hand-built.
+    fn attach_loom_control(&mut self, paused: bool, expires_at: &str) {
+        self.attach_loom_control_with_budget(paused, expires_at, 8)
+    }
+
+    fn attach_loom_control_with_budget(
+        &mut self,
+        paused: bool,
+        expires_at: &str,
+        max_dispatches: i64,
+    ) {
+        self.database
+            .connection()
+            .execute_batch(
+                "UPDATE agent_profile SET profile_status='present'
+                 WHERE id IN ('agent_1','agent_2');",
+            )
+            .unwrap();
+        crate::loom::plan_import(
+            &mut self.database,
+            crate::loom::LoomPlanImportInput {
+                mission_id: "delivery-queue-mission".into(),
+                goal: "Ship the approved LOOM task".into(),
+                acceptance_criteria_version: "ac-v1".into(),
+                criteria: vec![crate::loom::LoomPlanImportCriterion {
+                    criterion_id: "criterion_one".into(),
+                    text: "the delivery is complete".into(),
+                }],
+                tasks: vec![crate::loom::LoomPlanImportTask {
+                    task_id: "delivery-queue-task".into(),
+                    title: "Deliver the task".into(),
+                    description: String::new(),
+                    assignee_agent_id: Some("agent_1".into()),
+                }],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+        // An explicit assignee and `READY` are the only shape EXECUTE may take.
+        self.database
+            .connection()
+            .execute_batch(
+                "UPDATE loom_task SET status='READY', assignee_agent_id='agent_1'
+                 WHERE task_id='delivery-queue-task'",
+            )
+            .unwrap();
+        crate::loom::control::configure(
+            &mut self.database,
+            crate::current_user::CURRENT_USER_ID,
+            crate::loom::control::LoomControlPolicyInput {
+                mission_id: "delivery-queue-mission".into(),
+                command_id: "approve-delivery-queue-plan".into(),
+                expected_revision: 0,
+                enabled: true,
+                task_ids: vec!["delivery-queue-task".into()],
+                reviewers: vec![crate::loom::control::LoomReviewerAssignment {
+                    task_id: "delivery-queue-task".into(),
+                    reviewer_agent_id: "agent_2".into(),
+                }],
+                max_dispatches,
+                max_reworks_per_task: 2,
+                expires_at: Some(expires_at.to_string()),
+            },
+        )
+        .unwrap();
+        if paused {
+            self.set_loom_paused(true);
+        }
+    }
+
+    /// Pause or resume through the production compare-and-set, reading the standing revision the
+    /// same way the UI does.
+    fn set_loom_paused(&mut self, paused: bool) {
+        let revision: i64 = self
+            .database
+            .connection()
+            .query_row(
+                "SELECT revision FROM loom_control_policy WHERE mission_id='delivery-queue-mission'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::loom::control::pause(
+            &mut self.database,
+            crate::current_user::CURRENT_USER_ID,
+            crate::loom::control::LoomControlPauseInput {
+                mission_id: "delivery-queue-mission".into(),
+                command_id: format!("pause-{paused}-{}", Uuid::new_v4()),
+                expected_revision: revision,
+                paused,
+            },
+        )
+        .unwrap();
+    }
+
+    /// `(ledger rows, Deliveries carrying a handoff, handoff messages)`.
+    fn loom_dispatch_counts(&self) -> (i64, i64, i64) {
+        self.database
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM loom_control_dispatch),
+                        (SELECT COUNT(*) FROM camp_message_delivery WHERE message_id IN
+                             (SELECT id FROM camp_message
+                              WHERE author_id='loom-control-scheduler')),
+                        (SELECT COUNT(*) FROM camp_message
+                         WHERE author_id='loom-control-scheduler')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// The prepared Mission workspace the real scheduler hands to the claim, so a Mission lane is
+    /// claimed exactly as production claims it instead of being deferred as unprepared.
+    fn claim_with_prepared_mission_workspace(&mut self, limit: i64) -> Vec<String> {
+        let worktree: String = self
+            .database
+            .connection()
+            .query_row(
+                "SELECT worktree_path FROM mission_workspace WHERE camp_id=?1",
+                [&self.camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let workspace = AgentRunWorkspace {
+            execution_root: worktree.clone(),
+            access: "write".into(),
+            isolation: "git_worktree".into(),
+        };
+        let fact = json!({"workingDirectory": worktree, "branch": "rovai/mission/001"});
+        let prepared = capture_prepared_batch_workspace(
+            &self.database,
+            &self.camp_id,
+            workspace,
+            fact,
+        )
+        .unwrap();
+        let workspaces = BatchWorkspaces::from([(self.camp_id.clone(), Ok(prepared))]);
+        claim_waiting_delivery_batches_with_workspaces(&mut self.database, limit, &workspaces)
+            .unwrap()
+    }
+    }
+
+    // Owns the LOOM dispatch lane: the permanent ledger is the dedupe, the budget and the only
+    // source of a handoff Delivery. Published system text is the confirmed r1 template.
+    #[test]
+    fn loom_dispatch_writes_one_ledger_row_and_one_delivery_across_restarts() {
+        let mut fixture = Fixture::with_members(&["agent_1", "agent_2"]);
+        fixture.attach_completed_mission(None);
+        fixture.attach_loom_control(false, "2099-01-01T00:00:00Z");
+
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            1,
+            "an approved READY Task with released dependencies is dispatched once"
+        );
+        // A restart only sees the persisted ledger, so the same event cannot mint a second
+        // Delivery or a second Run.
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        assert_eq!(fixture.loom_dispatch_counts(), (1, 1, 1));
+
+        let (status, linked, body): (String, bool, String) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT dispatch.status,
+                        dispatch.delivery_id = (SELECT id FROM camp_message_delivery
+                                                 WHERE message_id=message.id),
+                        message.body
+                 FROM loom_control_dispatch AS dispatch
+                 JOIN camp_message AS message ON message.author_id='loom-control-scheduler'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "DISPATCHED");
+        assert!(
+            linked,
+            "deliveryId is attached inside the dispatching transaction"
+        );
+        assert!(
+            body.starts_with("[LOOM_HANDOFF_V1]\n{\"dispatchId\":\""),
+            "{body}"
+        );
+        assert!(body.contains("\"taskId\":\"delivery-queue-task\""));
+        assert!(body.contains("\"kind\":\"execute\""));
+        assert!(body.contains("\"candidateId\":null"));
+        assert!(body.contains("Work only on this approved task."));
+        // Only this dispatch's own sentence is written, never all four kinds.
+        assert!(!body.contains("Internal review passed."));
+        assert!(!body.contains("Address the recorded request for changes."));
+        assert!(!body.contains("Review this fixed candidate"));
+    }
+
+    // Owns the claim-time gate: a paused approval holds its whole lane instead of skipping one
+    // Delivery, and ordinary lanes keep claiming on their own.
+    #[test]
+    fn a_paused_loom_dispatch_holds_its_whole_lane_and_leaves_ordinary_lanes_alone() {
+        let mut fixture = Fixture::with_members(&["agent_1", "agent_2"]);
+        let worktree = fixture._directory.join("loom-mission-worktree");
+        fixture.attach_completed_mission(Some(&worktree));
+        fixture.attach_loom_control(false, "2099-01-01T00:00:00Z");
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            1
+        );
+        // An ordinary message queued behind the handoff, in the same lane, keeps its position.
+        fixture.enqueue("ordinary-behind-handoff", "普通消息排在接力之后");
+        let independent = fixture.add_camp_lane("loom-independent");
+        fixture.enqueue_for(&independent, "independent-lane-message", "另一条 lane 照常");
+
+        fixture.set_loom_paused(true);
+        let claimed = fixture.claim_with_prepared_mission_workspace(100);
+        assert_eq!(
+            claimed.len(),
+            1,
+            "only the independent ordinary lane claims while the approval is paused"
+        );
+        let claimed_camp: String = fixture
+            .database
+            .connection()
+            .query_row("SELECT camp_id FROM agent_run WHERE id=?1", [&claimed[0]], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(claimed_camp, independent);
+        assert_eq!(
+            fixture.loom_dispatch_counts(),
+            (1, 1, 1),
+            "a paused handoff owns no Run and its Delivery stays waiting"
+        );
+        let still_waiting: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM camp_message_delivery WHERE camp_id=?1 AND status='waiting'",
+                [&fixture.camp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_waiting, 2,
+            "the handoff and the ordinary message behind it both stay queued"
+        );
+
+        // Resuming releases the same lane: the FIFO order was never rewound past the handoff.
+        fixture.set_loom_paused(false);
+        let resumed = fixture.claim_with_prepared_mission_workspace(100);
+        assert_eq!(resumed.len(), 1);
+        let inputs: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_run_input WHERE agent_run_id=?1",
+                [&resumed[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inputs, 2,
+            "the handoff and the ordinary message behind it claim together"
+        );
+    }
+
+    // Owns the second gate for a whole batch: neither a paused policy nor a later blocked
+    // Task may start a claimed Run. Rejection preserves that Run and its Deliveries.
+    #[test]
+    fn a_claimed_loom_batch_rechecks_every_dispatch_before_runtime_start() {
+        for pause_whole_policy in [true, false] {
+        let mut fixture = Fixture::with_members(&["agent_1", "agent_2"]);
+        let worktree = fixture._directory.join("loom-runtime-worktree");
+        fixture.attach_completed_mission(Some(&worktree));
+        fixture.attach_loom_control(false, "2099-01-01T00:00:00Z");
+        fixture.database.connection().execute_batch(
+            "INSERT INTO loom_task(task_id,plan_id,title,description,assignee_agent_id,status,
+                                   acceptance_criteria_json,created_at,updated_at,revision)
+             SELECT 'delivery-queue-task-2',plan_id,'Second task',description,assignee_agent_id,status,
+                    acceptance_criteria_json,created_at,updated_at,revision
+             FROM loom_task WHERE task_id='delivery-queue-task';"
+        ).unwrap();
+        crate::loom::control::configure(
+            &mut fixture.database,
+            crate::current_user::CURRENT_USER_ID,
+            crate::loom::control::LoomControlPolicyInput {
+                mission_id: "delivery-queue-mission".into(),
+                command_id: "approve-both-delivery-queue-tasks".into(),
+                expected_revision: 1,
+                enabled: true,
+                task_ids: vec!["delivery-queue-task".into(), "delivery-queue-task-2".into()],
+                reviewers: ["delivery-queue-task", "delivery-queue-task-2"].into_iter().map(|task_id|
+                    crate::loom::control::LoomReviewerAssignment {
+                        task_id: task_id.into(), reviewer_agent_id: "agent_2".into(),
+                    }
+                ).collect(),
+                max_dispatches: 8,
+                max_reworks_per_task: 2,
+                expires_at: Some("2099-01-01T00:00:00Z".into()),
+            },
+        ).unwrap();
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            2
+        );
+        let claimed = fixture.claim_with_prepared_mission_workspace(1);
+        assert_eq!(claimed.len(), 1, "the live approval merges both deliveries into one Run");
+        let run = claimed[0].clone();
+        let tasks: Vec<String> = fixture.database.connection().prepare(
+            "SELECT dispatch.task_id FROM camp_message_delivery delivery
+             JOIN loom_control_dispatch dispatch ON dispatch.delivery_id=delivery.id
+             WHERE delivery.claimed_agent_run_id=?1 ORDER BY delivery.queue_sequence"
+        ).unwrap().query_map([&run], |row| row.get(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(tasks.len(), 2, "both dispatches must actually be in this batch");
+        let version: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT version FROM agent_run WHERE id=?1",
+                [&run],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        if pause_whole_policy {
+            fixture.set_loom_paused(true);
+        } else {
+            fixture.database.connection().execute(
+                "UPDATE loom_task SET status='BLOCKED',blocked_reason='task scope withdrawn' WHERE task_id=?1",
+                [&tasks[1]],
+            ).unwrap();
+        }
+        let execution = crate::runtime::ExecutionRuntimeService::default()
+            .claim_agent_run(
+                &mut fixture.database,
+                &CommandEnvelope {
+                    command_id: Uuid::new_v4().to_string(),
+                    actor: ActorRef::System {
+                        component_id: "agent-run-scheduler".into(),
+                    },
+                    camp_id: Some(fixture.camp_id.clone()),
+                    expected_versions: vec![],
+                    execution_epoch: None,
+                    payload: crate::runtime::ClaimAgentRunCommand {
+                        agent_run_id: run.clone(),
+                        expected_version: version,
+                        lease_owner: "loom-test".into(),
+                        lease_seconds: 60,
+                        workspace: None,
+                        starting_git_observation: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            execution.result.status,
+            crate::command::CommandResultStatus::Rejected
+        );
+        assert_eq!(execution.result.code, "agent_run.loom_control_blocked");
+        // The queued Run and its claimed Delivery are kept as facts for the User.
+        let kept: (String, String) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT run.status, delivery.status FROM agent_run AS run
+                 JOIN camp_message_delivery AS delivery ON delivery.claimed_agent_run_id = run.id
+                 WHERE run.id=?1",
+                [&run],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("queued".to_string(), "claimed".to_string()));
+        }
+    }
+
+    // Owns the budget boundary: the Dispatch that brings the permanent ledger exactly up to the
+    // approved total is admitted, and nothing is fabricated or wrongly blocked afterwards.
+    #[test]
+    fn a_dispatch_that_exactly_consumes_the_budget_is_not_blocked() {
+        let mut fixture = Fixture::with_members(&["agent_1", "agent_2"]);
+        fixture.attach_completed_mission(None);
+        fixture.attach_loom_control_with_budget(false, "2099-01-01T00:00:00Z", 1);
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            1,
+            "the only approved slot is spent by a real dispatch, not by a block"
+        );
+        let counts: (i64, i64, Option<String>) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM loom_control_dispatch),
+                        (SELECT COUNT(*) FROM camp_message_delivery WHERE message_id IN
+                             (SELECT id FROM camp_message
+                              WHERE author_id='loom-control-scheduler')),
+                        (SELECT blocked_reason FROM loom_task
+                         WHERE task_id='delivery-queue-task')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            (1, 1, None),
+            "budget consumed exactly is an admission, never a fabricated block"
+        );
+        // The next tick finds the same event already in the ledger and writes nothing.
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        assert_eq!(fixture.loom_dispatch_counts(), (1, 1, 1));
     }
 
     // Owns the new authorization/queue transaction, not transport replay. SQLite
@@ -2968,7 +3704,6 @@ mod tests {
                         | crate::agent_profile::AdapterKind::CodebuddyCli
                         | crate::agent_profile::AdapterKind::QwenCode
                         | crate::agent_profile::AdapterKind::MinimaxCodeCli
-                        | crate::agent_profile::AdapterKind::HermesCli
                         | crate::agent_profile::AdapterKind::GrokBuild
                         | crate::agent_profile::AdapterKind::KiroCli
                         | crate::agent_profile::AdapterKind::ZcodeApp
@@ -3880,27 +4615,12 @@ mod tests {
             ),
             ("qwen-code", Some("0.18.4"), "acp-v1", None),
             ("minimax-code-cli", Some("0.6.12"), "acp-v1", None),
-            ("hermes-cli", Some("0.22.4"), "acp-v1", None),
-            ("hermes-cli", Some("0.23.0"), "acp-v1", None),
-            ("hermes-cli", Some("1.0.0"), "acp-v1", None),
-            (
-                "hermes-cli",
-                Some("0.22.3"),
-                "acp-v1",
-                Some(R::VersionIncompatible),
-            ),
-            (
-                "hermes-cli",
-                None,
-                "acp-v1",
-                Some(R::RuntimeIdentityUnknown),
-            ),
-            (
-                "hermes-cli",
-                Some("0.23.0"),
-                "other",
-                Some(R::ProtocolIncompatible),
-            ),
+            ("hermes-cli", Some("0.22.4"), "acp-v1", Some(R::RuntimeUnsupported)),
+            ("hermes-cli", Some("0.23.0"), "acp-v1", Some(R::RuntimeUnsupported)),
+            ("hermes-cli", Some("1.0.0"), "acp-v1", Some(R::RuntimeUnsupported)),
+            ("hermes-cli", Some("0.22.3"), "acp-v1", Some(R::RuntimeUnsupported)),
+            ("hermes-cli", None, "acp-v1", Some(R::RuntimeUnsupported)),
+            ("hermes-cli", Some("0.23.0"), "other", Some(R::RuntimeUnsupported)),
             (
                 "minimax-code-cli",
                 Some("0.6.11"),
@@ -5205,6 +5925,827 @@ mod tests {
         assert_eq!(fixture.batch_run_count(), 1);
     }
 
+    impl Fixture {
+        /// Remote Node + CLI catalog row. All Node paths stay lexical on A.
+        fn add_remote_node(&self, node_id: &str, program: &str) {
+            let now = chrono::Utc::now().to_rfc3339();
+            self.database
+                .connection()
+                .execute(
+                    "INSERT INTO execution_node(
+                         node_id, display_name, role, os, arch, token_digest,
+                         paired_at, revoked_at, last_heartbeat)
+                     VALUES (?1, ?1, 'remote', 'windows', 'x86_64', ?2, ?3, NULL, NULL)",
+                    params![node_id, "a".repeat(64), now],
+                )
+                .unwrap();
+            self.database
+                .connection()
+                .execute(
+                    "INSERT INTO execution_node_cli(
+                         node_id, adapter_kind, path, version, path_present, reported_at,
+                         installation_identity, installation_generation)
+                     VALUES (?1, 'claude-code-cli', ?2, '2.1.0', 1, ?3, ?4, 1)",
+                    params![node_id, program, now, format!("sha256:{}", "b".repeat(64))],
+                )
+                .unwrap();
+        }
+
+        /// Ready Node workspace for the fixture camp's Mission row; never created on A.
+        fn add_remote_workspace(&self, workspace_id: &str, node_id: &str, root: &str) {
+            let now = chrono::Utc::now().to_rfc3339();
+            self.database
+                .connection()
+                .execute(
+                    "INSERT INTO mission_workspace(
+                         id, mission_id, camp_id, execution_host_id,
+                         source_directory, repository_root, git_common_dir,
+                         worktree_path, working_directory, base_branch, branch,
+                         base_sha, preparation_token, generation, state, created_at, updated_at)
+                     VALUES (?1, 'delivery-queue-mission', ?2, ?3,
+                         ?4, ?4, ?5, ?6, ?6, 'main', ?7,
+                         'base-sha', 'owner-token-remote', 3, 'ready', ?8, ?8)",
+                    params![
+                        workspace_id,
+                        self.camp_id,
+                        node_id,
+                        format!("{root}-src"),
+                        format!("{root}-src/.git"),
+                        root,
+                        format!("rovai/mission/{workspace_id}"),
+                        now
+                    ],
+                )
+                .unwrap();
+        }
+
+        /// Real CAS save; the expected revision is read inside the same transaction.
+        fn save_remote_selection(
+            &mut self,
+            node_id: &str,
+            workspace_id: &str,
+            root: &str,
+            model: crate::agent_profile::ModelSelection,
+        ) -> i64 {
+            let defaults = crate::agent_profile::member_runtime_defaults(
+                crate::agent_profile::AdapterKind::ClaudeCodeCli,
+            );
+            let selection = crate::remote_execution::RemoteMemberSelection {
+                node_id: node_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                workspace_root: root.to_string(),
+                adapter_kind: defaults.adapter_kind,
+                model,
+                permissions: defaults.permissions,
+            };
+            let transaction = self.database.connection_mut().transaction().unwrap();
+            let revision = crate::remote_execution::load_member_target(&transaction, "agent_1")
+                .unwrap()
+                .revision;
+            let saved = crate::remote_execution::save_member_target(
+                &transaction,
+                "agent_1",
+                revision,
+                Some(selection),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            saved.revision
+        }
+
+        /// Production claim with the application's read-only capture sources.
+        fn claim_with_remote_sources(
+            &mut self,
+            store: &crate::mcp::McpConfigStore,
+        ) -> Result<Vec<String>> {
+            let context = crate::remote_bundle_owner::RemoteBundleCaptureContext {
+                data_dir: &self._directory,
+                mcp_store: store,
+            };
+            claim_waiting_delivery_batches_with_sources(
+                &mut self.database,
+                1,
+                &BatchWorkspaces::new(),
+                Some(&context),
+            )
+        }
+
+        fn count_rows(&self, sql: &str) -> i64 {
+            self.database
+                .connection()
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap()
+        }
+
+        /// Terminal transition WITHOUT a pending cancel, so the lane is free and the
+        /// existing cleanup fence is not involved. Rows are kept for immutability checks.
+        fn finish_live_batch_runs(&self) {
+            self.database
+                .connection()
+                .execute(
+                    "UPDATE agent_run SET status='failed', wait_reason=NULL,
+                         runtime_recovery_required=0, ended_at='2026-10-07T00:00:00Z'
+                       WHERE invocation_kind='batch' AND status IN ('queued','running','waiting')",
+                    [],
+                )
+                .unwrap();
+        }
+    }
+
+    /// (1) Real queued Run + immutable target/source in one transaction, and
+    /// (2) a future selection change alters the NEXT Run while the frozen source stays.
+    fn run_remote_claim_contracts_on(fixture: &mut Fixture) {
+        use crate::agent_profile::{AdapterKind, ModelSelection, resolve_frozen_runtime};
+        use crate::remote_bundle_owner::{
+            RemoteBundleCaptureContext, capture_for_target, load_run_source,
+        };
+        use crate::remote_execution::load_run_target;
+
+        #[cfg(windows)]
+        const ROOT: &str = "/srv/r1-fixture/work";
+        #[cfg(not(windows))]
+        const ROOT: &str = "C:/r1-fixture/work";
+        assert!(!std::path::Path::new(ROOT).is_absolute());
+        let node = "node-r1-a";
+        fixture.add_remote_node(node, "C:/node/claude.exe");
+        fixture.add_remote_workspace("ws-r1-a", node, ROOT);
+        assert_eq!(
+            crate::mission_workspace::execution_directory(
+                fixture.database.connection(),
+                &fixture.camp_id,
+            )
+            .unwrap(),
+            None,
+            "a ready Node workspace never becomes Core's local directory"
+        );
+        fixture.database.connection().execute(
+            "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,source_directory,
+                repository_root,git_common_dir,worktree_path,working_directory,branch,base_sha,
+                preparation_token,state,created_at,updated_at)
+             SELECT 'ws-r1-local-shadow',mission_id,camp_id,
+                (SELECT id FROM mission_execution_host WHERE singleton=1),source_directory,
+                repository_root,git_common_dir,worktree_path,working_directory,
+                'wrong-local-branch',base_sha,'local-fixture-token','ready',created_at,updated_at
+             FROM mission_workspace WHERE id='ws-r1-a'", [],
+        ).unwrap();
+        assert_eq!(
+            crate::mission_workspace::execution_directory(
+                fixture.database.connection(),
+                &fixture.camp_id,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(ROOT)
+        );
+        fixture.save_remote_selection(node, "ws-r1-a", ROOT, ModelSelection::RuntimeDefault);
+
+        let store = crate::mcp::McpConfigStore::new(fixture._directory.join("fixture-mcp.json"));
+        fixture.enqueue("remote-owner-1", "run the remote owner contract");
+        let run = fixture
+            .claim_with_remote_sources(&store)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let (status, epoch, installation_id, adapter_kind) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status, execution_epoch, runtime_installation_id, runtime_adapter_kind
+                   FROM agent_run WHERE id=?1",
+                [&run],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), epoch), ("queued", 0));
+        let installation_id = installation_id.expect("remote Run freezes its installation FK");
+        assert!(installation_id.starts_with("remote_"), "{installation_id}");
+        assert_eq!(
+            adapter_kind.as_deref(),
+            Some(AdapterKind::ClaudeCodeCli.as_str())
+        );
+
+        let first_target = load_run_target(fixture.database.connection(), &run)
+            .unwrap()
+            .unwrap();
+        let first_source = load_run_source(fixture.database.connection(), &run)
+            .unwrap()
+            .unwrap();
+        let first_digest = first_source.digest().unwrap();
+        assert_eq!(first_digest, first_target.bundle_source_digest);
+        assert_eq!(first_target.target.workspace_root, ROOT);
+        assert_eq!(first_target.installation_id, installation_id);
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM agent_run_execution_target"),
+            1
+        );
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM agent_run_remote_bundle_source"),
+            1
+        );
+        // Placeholder installation is FK-only: disabled and namespaced.
+        let (enabled, path) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT enabled, executable_path FROM adapter_installation WHERE id=?1",
+                [&installation_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(enabled, 0);
+        assert_eq!(path, format!("rovai-remote://{node}/claude-code-cli"));
+
+        // Other Run-creation paths must report the missing integration, not pick a local CLI.
+        let transaction = fixture.database.connection_mut().transaction().unwrap();
+        let early = resolve_frozen_runtime(&transaction, "delivery-queue-agent-1", "agent_1")
+            .unwrap()
+            .expect_err("a saved remote selection must block the generic resolver");
+        assert_eq!(early.code, "remote_run_creation_not_connected");
+        // With the selection explicitly cleared in this rollback-only TX, the disabled
+        // remote installation is still refused as a local program.
+        let revision = crate::remote_execution::load_member_target(&transaction, "agent_1")
+            .unwrap()
+            .revision;
+        crate::remote_execution::save_member_target(&transaction, "agent_1", revision, None)
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE agent_profile SET default_runtime_installation_id=?1 WHERE id='agent_1'",
+                params![installation_id],
+            )
+            .unwrap();
+        let placeholder = resolve_frozen_runtime(&transaction, "delivery-queue-agent-1", "agent_1")
+            .unwrap()
+            .expect_err("a disabled remote placeholder is never a local launch");
+        assert_eq!(placeholder.code, "runtime_remote_installation_not_local");
+        transaction.rollback().unwrap();
+        // Re-capturing an already-bound target is refused by the real capture owner.
+        {
+            let guard = fixture
+                .database
+                .connection()
+                .unchecked_transaction()
+                .unwrap();
+            let mut bound = first_target.clone();
+            let context = RemoteBundleCaptureContext {
+                data_dir: &fixture._directory,
+                mcp_store: &store,
+            };
+            assert!(capture_for_target(&fixture.database, &context, &mut bound).is_err());
+            guard.rollback().unwrap();
+        }
+
+        run_remote_codex_identity_contract_on(fixture, &run);
+        run_remote_loom_claim_contract_on(fixture, &run, node);
+
+        // (2) A genuinely different selection changes the NEXT Run only.
+        fixture.finish_live_batch_runs();
+        fixture.save_remote_selection(
+            node,
+            "ws-r1-a",
+            ROOT,
+            ModelSelection::Explicit {
+                model_id: crate::agent_runtime_adapter::CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID
+                    .to_string(),
+                options: json!({}),
+                dsh_source: None,
+            },
+        );
+        let kept = load_run_source(fixture.database.connection(), &run)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept.digest().unwrap(),
+            first_digest,
+            "frozen source must not follow a future selection"
+        );
+        for statement in [
+            "UPDATE agent_run_remote_bundle_source SET captured_at='mutated'",
+            "DELETE FROM agent_run_remote_bundle_source",
+            "INSERT INTO agent_run_remote_bundle_source(agent_run_id,source_digest,source_json,captured_at)
+             SELECT agent_run_id,source_digest,source_json,captured_at FROM agent_run_remote_bundle_source",
+        ] {
+            let error = fixture.database.connection().execute(statement, []).unwrap_err();
+            assert!(error.to_string().contains("AgentRun bundle source is immutable"), "{statement}: {error}");
+        }
+
+        fixture.enqueue("remote-owner-2", "next run uses the new selection");
+        let next = fixture
+            .claim_with_remote_sources(&store)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_ne!(next, run);
+        let next_target = load_run_target(fixture.database.connection(), &next)
+            .unwrap()
+            .unwrap();
+        let next_source = load_run_source(fixture.database.connection(), &next)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            next_target.target.configuration_digest, first_target.target.configuration_digest,
+            "an explicit model selection must change the next frozen target"
+        );
+        assert_eq!(
+            next_source.digest().unwrap(),
+            first_digest,
+            "unchanged capability inputs remain byte-identical when only the model target changes"
+        );
+        let still = load_run_source(fixture.database.connection(), &run)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still.digest().unwrap(),
+            first_digest,
+            "the first Run stays frozen"
+        );
+        #[cfg(feature = "extended-tests")]
+        {
+            fixture.database.connection().execute(
+                "UPDATE agent_run SET runtime_reported_version='2.1.316' WHERE id=?1",
+                [&next],
+            ).unwrap();
+            let initial = fixture.materialize_run(&next);
+            fixture.assert_active_skill_index(&next, &initial, false);
+        }
+    }
+
+    /// (3) An injected BEFORE INSERT failure on the source table aborts the claim with an
+    /// error and rolls back every row of that transaction; removing it lets the retry pass.
+    fn run_remote_claim_rollback_on(fixture: &mut Fixture) {
+        use crate::agent_profile::ModelSelection;
+
+        fixture.finish_live_batch_runs();
+        let node = "node-r1-b";
+        fixture.add_remote_node(node, "C:/node/claude.exe");
+        fixture.add_remote_workspace("ws-r1-b", node, "/srv/r1-fixture/rollback");
+        fixture.save_remote_selection(
+            node,
+            "ws-r1-b",
+            "/srv/r1-fixture/rollback",
+            ModelSelection::RuntimeDefault,
+        );
+
+        let store = crate::mcp::McpConfigStore::new(fixture._directory.join("fixture-mcp.json"));
+        let runs = fixture.count_rows("SELECT COUNT(*) FROM agent_run");
+        let targets = fixture.count_rows("SELECT COUNT(*) FROM agent_run_execution_target");
+        let sources = fixture.count_rows("SELECT COUNT(*) FROM agent_run_remote_bundle_source");
+        let installations = fixture.count_rows("SELECT COUNT(*) FROM remote_runtime_installation");
+        fixture.enqueue("remote-owner-rollback", "rollback please");
+
+        fixture
+            .database
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fixture_fail_remote_bundle_source
+                     BEFORE INSERT ON agent_run_remote_bundle_source
+                     BEGIN SELECT RAISE(ABORT, 'fixture injected bundle source failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            fixture.claim_with_remote_sources(&store).is_err(),
+            "the injected source failure must abort the claim instead of settling a Run"
+        );
+        assert_eq!(fixture.count_rows("SELECT COUNT(*) FROM agent_run"), runs);
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM agent_run_execution_target"),
+            targets
+        );
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM agent_run_remote_bundle_source"),
+            sources
+        );
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM remote_runtime_installation"),
+            installations,
+            "installation rows created in the aborted transaction must roll back"
+        );
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM camp_message_delivery WHERE status='waiting'"),
+            1
+        );
+
+        fixture
+            .database
+            .connection()
+            .execute_batch("DROP TRIGGER fixture_fail_remote_bundle_source;")
+            .unwrap();
+        let retried = fixture.claim_with_remote_sources(&store).unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM agent_run_execution_target"),
+            targets + 1
+        );
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM agent_run_remote_bundle_source"),
+            sources + 1
+        );
+    }
+
+    /// Real Delivery-created Run -> runtime scheduler claim -> one atomic LOOM binding.
+    /// Uses the actual catalog -> member selection -> target -> runtime
+    /// resolution path. The enclosing rollback leaves the earlier Claude Run,
+    /// selection and catalog unchanged; no accepted baseline is hand-built.
+    fn run_remote_codex_identity_contract_on(fixture: &mut Fixture, run: &str) {
+        use crate::agent_profile::{
+            AdapterKind, ModelSelection, member_runtime_defaults, resolve_remote_frozen_runtime,
+        };
+        use crate::remote_execution::{
+            RemoteMemberSelection, load_member_target, load_run_target, prepare_member_target,
+            save_member_target,
+        };
+        let current = load_run_target(fixture.database.connection(), run)
+            .unwrap()
+            .unwrap();
+        let selection_before =
+            load_member_target(fixture.database.connection(), "agent_1").unwrap();
+        let installation_count =
+            fixture.count_rows("SELECT COUNT(*) FROM remote_runtime_installation");
+        let tx = fixture
+            .database
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "INSERT INTO execution_node_cli(node_id,adapter_kind,path,version,path_present,
+                reported_at,installation_identity,installation_generation)
+             VALUES(?1,'codex-cli','C:/node/codex.exe','0.166.0',1,?2,?3,1)",
+            params![
+                current.target.node_id,
+                chrono::Utc::now().to_rfc3339(),
+                format!("sha256:{}", "c".repeat(64))
+            ],
+        )
+        .unwrap();
+        let defaults = member_runtime_defaults(AdapterKind::CodexCli);
+        save_member_target(
+            &tx,
+            "agent_1",
+            selection_before.revision,
+            Some(RemoteMemberSelection {
+                node_id: current.target.node_id.clone(),
+                workspace_id: current.target.workspace_id.clone(),
+                workspace_root: current.target.workspace_root.clone(),
+                adapter_kind: AdapterKind::CodexCli,
+                model: ModelSelection::RuntimeDefault,
+                permissions: defaults.permissions,
+            }),
+        )
+        .unwrap();
+        let target = prepare_member_target(&tx, &current.conversation_id, "agent_1")
+            .unwrap()
+            .unwrap();
+        let runtime = resolve_remote_frozen_runtime(&tx, &target)
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::codex::remote_runtime_matches_target(&runtime, &target.target),
+            "a production-resolved virtual Codex installation matches its frozen Node"
+        );
+        assert_ne!(
+            runtime.executable_path, target.target.program,
+            "Core's disabled virtual URI is not B's executable path"
+        );
+
+        let mut wrong = runtime.clone();
+        wrong.executable_path = target.target.program.clone();
+        assert!(!crate::codex::remote_runtime_matches_target(
+            &wrong,
+            &target.target
+        ));
+        let mut wrong = runtime.clone();
+        wrong.auth_scope = "remote_node:other-node".into();
+        assert!(!crate::codex::remote_runtime_matches_target(
+            &wrong,
+            &target.target
+        ));
+        let mut wrong = runtime.clone();
+        wrong.installation_generation += 1;
+        assert!(!crate::codex::remote_runtime_matches_target(
+            &wrong,
+            &target.target
+        ));
+        let mut wrong = runtime.clone();
+        wrong.executable_fingerprint = format!("sha256:{}", "d".repeat(64));
+        assert!(!crate::codex::remote_runtime_matches_target(
+            &wrong,
+            &target.target
+        ));
+        let mut wrong_target = target.target.clone();
+        wrong_target.configuration_digest = format!("sha256:{}", "e".repeat(64));
+        assert!(!crate::codex::remote_runtime_matches_target(
+            &runtime,
+            &wrong_target
+        ));
+        let mut wrong = runtime.clone();
+        wrong.search_environment_generation = 1;
+        assert!(!crate::codex::remote_runtime_matches_target(
+            &wrong,
+            &target.target
+        ));
+        tx.rollback().unwrap();
+        let after = load_member_target(fixture.database.connection(), "agent_1").unwrap();
+        assert_eq!(after.revision, selection_before.revision);
+        assert_eq!(
+            serde_json::to_value(after.selection).unwrap(),
+            serde_json::to_value(selection_before.selection).unwrap(),
+        );
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM remote_runtime_installation"),
+            installation_count
+        );
+        assert_eq!(
+            fixture.count_rows(
+                "SELECT COUNT(*) FROM execution_node_cli WHERE adapter_kind='codex-cli'"
+            ),
+            0
+        );
+    }
+
+    fn run_remote_loom_claim_contract_on(fixture: &mut Fixture, run: &str, node: &str) {
+        use crate::loom::*;
+        let frozen_workspace: crate::runtime::AgentRunWorkspace = serde_json::from_str(
+            &fixture.database.connection().query_row(
+                "SELECT workspace_json FROM agent_run WHERE id=?1",
+                [run],
+                |row| row.get::<_, String>(0),
+            ).unwrap(),
+        ).unwrap();
+        let version: i64 = fixture
+            .database
+            .connection()
+            .query_row("SELECT version FROM agent_run WHERE id=?1", [run], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let envelope = CommandEnvelope {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            actor: ActorRef::System {
+                component_id: "agent-run-scheduler".into(),
+            },
+            camp_id: Some(fixture.camp_id.clone()),
+            expected_versions: vec![],
+            execution_epoch: None,
+            payload: crate::runtime::ClaimAgentRunCommand {
+                agent_run_id: run.into(),
+                expected_version: version,
+                lease_owner: "r1-owner-fixture".into(),
+                lease_seconds: 300,
+                workspace: Some(frozen_workspace.clone()),
+                starting_git_observation: None,
+            },
+        };
+        let service = crate::runtime::ExecutionRuntimeService::default();
+        let mut mismatch = envelope.clone();
+        mismatch.command_id = uuid::Uuid::new_v4().to_string();
+        mismatch.payload.workspace.as_mut().unwrap().execution_root.push_str("/other");
+        let refused = service.claim_agent_run(&mut fixture.database, &mismatch).unwrap();
+        assert_eq!(refused.result.code, "agent_run.workspace_frozen");
+        fixture.database.connection().execute(
+            "UPDATE execution_node SET revoked_at='2026-11-06T00:00:00Z' WHERE node_id=?1",
+            [node],
+        ).unwrap();
+        let mut revoked = envelope.clone();
+        revoked.command_id = uuid::Uuid::new_v4().to_string();
+        let refused = service.claim_agent_run(&mut fixture.database, &revoked).unwrap();
+        assert_eq!(refused.result.code, "agent_run.remote_target_unavailable");
+        fixture.database.connection().execute(
+            "UPDATE execution_node SET revoked_at=NULL WHERE node_id=?1", [node],
+        ).unwrap();
+        assert_eq!(fixture.database.connection().query_row(
+            "SELECT status,execution_epoch FROM agent_run WHERE id=?1", [run],
+            |row| Ok((row.get::<_, String>(0)?,row.get::<_, i64>(1)?)),
+        ).unwrap(), ("queued".to_string(),0));
+        let result = service.claim_agent_run(&mut fixture.database, &envelope).unwrap();
+        let (state, epoch): (String, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT status,execution_epoch FROM agent_run WHERE id=?1",
+                [run],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "running",
+            "actual scheduler claim rejected: {:?}",
+            result.result
+        );
+        assert!(epoch >= 1);
+        let execution = service.load_agent_run_execution(&fixture.database, run, epoch)
+            .unwrap().expect("claimed foreign-OS workspace remains loadable");
+        assert_eq!(execution.workspace, frozen_workspace);
+        plan_import(
+            &mut fixture.database,
+            LoomPlanImportInput {
+                mission_id: "delivery-queue-mission".into(),
+                goal: "real remote claim".into(),
+                acceptance_criteria_version: "1".into(),
+                criteria: vec![LoomPlanImportCriterion {
+                    criterion_id: "c".into(),
+                    text: "one owner".into(),
+                }],
+                tasks: vec![LoomPlanImportTask {
+                    task_id: "r1-task".into(),
+                    title: "bound work".into(),
+                    description: String::new(),
+                    assignee_agent_id: Some("agent_1".into()),
+                }],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+        task_release(
+            &mut fixture.database,
+            LoomTaskReleaseInput {
+                mission_id: "delivery-queue-mission".into(),
+                task_id: "r1-task".into(),
+            },
+        )
+        .unwrap();
+        let claim = || LoomClaimAcquireInput {
+            mission_id: "delivery-queue-mission".into(),
+            task_id: "r1-task".into(),
+            agent_run_id: run.into(),
+            claimant_agent_id: Some("agent_1".into()),
+            command_id: "r1-claim-command".into(),
+            lease_seconds: Some(120),
+        };
+        let task_binding = |fixture: &Fixture| -> (Option<String>, i64) {
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT execution_host_id,revision FROM loom_task WHERE task_id='r1-task'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let unbound_task = task_binding(fixture);
+        assert!(unbound_task.0.is_none());
+        assert!(
+            crate::remote_execution::validate_loom_claim(
+                fixture.database.connection(),
+                run,
+                "delivery-queue-mission",
+                "r1-task",
+                Some("agent_1"),
+            )
+            .unwrap()
+            .is_some(),
+            "the actual Run's authorized frozen target can admit a first task binding"
+        );
+        assert_eq!(
+            task_binding(fixture),
+            unbound_task,
+            "validation is read only"
+        );
+
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE loom_task SET execution_host_id='node-other' WHERE task_id='r1-task'",
+                [],
+            )
+            .unwrap();
+        let error = claim_acquire(&mut fixture.database, claim()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            "LOOM_REMOTE_TARGET_UNAVAILABLE",
+            "an existing different task target is never silently replaced"
+        );
+        assert_eq!(fixture.count_rows("SELECT COUNT(*) FROM loom_claim"), 0);
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE loom_task SET execution_host_id=NULL WHERE task_id='r1-task'",
+                [],
+            )
+            .unwrap();
+
+        fixture
+            .database
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fixture_block_task_binding BEFORE UPDATE OF execution_host_id
+             ON loom_task WHEN OLD.task_id='r1-task' AND OLD.execution_host_id IS NULL
+             BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        assert!(claim_acquire(&mut fixture.database, claim()).is_err());
+        assert_eq!(fixture.count_rows("SELECT COUNT(*) FROM loom_claim"), 0);
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM loom_claim_execution_target"),
+            0
+        );
+        assert_eq!(
+            task_binding(fixture),
+            unbound_task,
+            "failed CAS leaves no task or claim write"
+        );
+        fixture
+            .database
+            .connection()
+            .execute_batch("DROP TRIGGER fixture_block_task_binding;")
+            .unwrap();
+        fixture.database.connection().execute_batch(
+            "CREATE TRIGGER fixture_fail_claim_target BEFORE INSERT ON loom_claim_execution_target
+             BEGIN SELECT RAISE(ABORT,'fixture remote claim binding failure'); END;"
+        ).unwrap();
+        assert!(claim_acquire(&mut fixture.database, claim()).is_err());
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM loom_claim"),
+            0,
+            "claim and remote target must roll back together"
+        );
+        assert_eq!(
+            task_binding(fixture),
+            unbound_task,
+            "failure after task binding rolls back its Node and revision"
+        );
+        fixture
+            .database
+            .connection()
+            .execute_batch("DROP TRIGGER fixture_fail_claim_target;")
+            .unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET cancel_requested_at='2026-11-05T00:00:00Z',cancel_reason_code='user_requested_agent_run_stop' WHERE id=?1",
+                [run],
+            )
+            .unwrap();
+        assert!(
+            claim_acquire(&mut fixture.database, claim()).is_err(),
+            "cancel fences a fresh claim"
+        );
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET cancel_requested_at=NULL,cancel_reason_code=NULL WHERE id=?1",
+                [run],
+            )
+            .unwrap();
+        let created = claim_acquire(&mut fixture.database, claim()).unwrap();
+        let bound_task = task_binding(fixture);
+        assert_eq!(bound_task, (Some(node.into()), unbound_task.1 + 1));
+        let binding: (String, i64, String, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT agent_run_id,execution_epoch,node_id,task_revision
+             FROM loom_claim_execution_target WHERE claim_id=?1",
+                [&created.claim_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(binding, (run.into(), epoch, node.into(), bound_task.1));
+        assert!(
+            claim_acquire(&mut fixture.database, claim())
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(
+            fixture.count_rows("SELECT COUNT(*) FROM loom_claim_execution_target"),
+            1
+        );
+        assert_eq!(
+            task_binding(fixture),
+            bound_task,
+            "command replay does not rebind the task or increment its revision"
+        );
+        crate::loom::remote_artifact::test_archive_contract_on(
+            &mut fixture.database,
+            &fixture._directory,
+            &crate::team_tool::AuthenticatedTeamToolRun {
+                camp_id: fixture.camp_id.clone(),
+                agent_id: "agent_1".into(),
+                agent_run_id: run.into(),
+                execution_epoch: epoch,
+            },
+        );
+        #[cfg(feature = "extended-tests")]
+        {
+            let context = fixture.materialize_run(run);
+            assert!(context.rendered_payload.contains("rovai/mission/ws-r1-a"));
+            assert!(!context.rendered_payload.contains("wrong-local-branch"));
+            crate::context::test_remote_workspace_fact_on(&fixture.database, run, epoch);
+        }
+    }
+
     #[test]
     fn mission_batch_claim_uses_ready_worktree_and_defers_unprepared_workspace() {
         let mut ready = Fixture::new();
@@ -5300,15 +6841,54 @@ mod tests {
         );
         #[cfg(feature = "extended-tests")]
         {
+            ready.database.connection().execute(
+                "UPDATE agent_run SET runtime_reported_version='0.162.1' WHERE id=?1",
+                [&ready_run],
+            ).unwrap();
             let context = ready.materialize_run(&ready_run);
             assert!(context.rendered_payload.contains("actual-user-branch"));
+            let (prefix, workspace_section) = context
+                .rendered_payload
+                .split_once("[WORKSPACE]\n")
+                .expect("the actual prepared context must carry its workspace fact");
+            assert!(!prefix.contains("[WORKSPACE]"));
+            let (workspace_json, suffix) = workspace_section
+                .split_once("\n[/WORKSPACE]")
+                .expect("the workspace fact must be a complete JSON section");
             assert!(
-                context
-                    .rendered_payload
-                    .contains(ready_worktree.to_str().unwrap())
+                !suffix.contains("[WORKSPACE]"),
+                "workspace facts are injected once"
+            );
+            let rendered_workspace: serde_json::Value =
+                serde_json::from_str(workspace_json).expect("WORKSPACE is typed JSON");
+            assert_eq!(
+                rendered_workspace, fact,
+                "the complete rendered workspace fact preserves the actual path and branch"
             );
             assert!(!context.rendered_payload.contains("rovai/mission/001"));
+            // This storage owner models the local Runtime's start observation.
+            // The initial claim fact alone is not an active-input observation.
+            let observed = crate::git::GitObservation {
+                state: crate::git::GitCapabilityState::GitValid,
+                repository_root: Some(ready_worktree.to_string_lossy().into_owned()),
+                git_common_dir: None,
+                object_format: None,
+                head_commit: None,
+                branch: Some(fact["branch"].as_str().unwrap().to_string()),
+                dirty: None,
+                observed_at: chrono::Utc::now().to_rfc3339(),
+                diagnostic: None,
+            };
+            ready.database.connection().execute(
+                "UPDATE agent_run SET starting_git_observation_json=?1 WHERE id=?2",
+                params![serde_json::to_string(&observed).unwrap(), &ready_run],
+            ).unwrap();
+            ready.assert_active_skill_index(&ready_run, &context, true);
         }
+        let mut remote = Fixture::new();
+        remote.attach_completed_mission(None);
+        run_remote_claim_contracts_on(&mut remote);
+        run_remote_claim_rollback_on(&mut remote);
     }
 
     #[test]
@@ -5604,6 +7184,160 @@ mod tests {
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].skill_id, "missing-skill");
         assert_eq!(snapshot.entries[0].name_at_send, "review-code");
+
+        // One claim publishes exactly the material the final selection implies:
+        // the member's selected imported Skill plus the Toolbox Skill a message
+        // mentioned even though the member never configured it.
+        let mut selected = Fixture::new();
+        let directory = selected._directory.clone();
+        let store = crate::mcp::McpConfigStore::new(directory.join("mcp.json"));
+        let library =
+            crate::skill::SkillLibraryService::new(directory.join("skill-library")).unwrap();
+        let member = "agent_1".to_string();
+        let import_root = directory.join("library-import-source");
+        let skill_dir = import_root.join("field-notes");
+        std::fs::create_dir_all(skill_dir.join("resources")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: field-notes\ndescription: Field notes\n---\n\nclaim body\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("resources").join("notes.md"),
+            "claim body resource\n",
+        )
+        .unwrap();
+        let inspection = library.inspect_import(&selected.database, &skill_dir).unwrap();
+        let candidate = inspection.candidates[0].clone();
+        library
+            .commit_import(
+                &mut selected.database,
+                &CommandEnvelope {
+                    command_id: "claim-import-field-notes".into(),
+                    actor: ActorRef::User {
+                        user_id: "local_user".into(),
+                    },
+                    camp_id: None,
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: crate::skill::CommitSkillImportCommand {
+                        staging_token: inspection.staging_token,
+                        candidate_name: candidate.name.clone(),
+                        expected_digest: candidate.content_digest,
+                        expected_skill_version: candidate.existing_skill_version,
+                        confirm_update: false,
+                    },
+                },
+            )
+            .unwrap();
+        let imported = library
+            .list(&selected.database)
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.name == "field-notes")
+            .unwrap();
+        let library_id = format!("library:{}", imported.id);
+        crate::member_capability::put_capability_item(
+            &selected.database,
+            &store,
+            &library,
+            &crate::member_capability::MemberCapabilityPutParams {
+                item_id: Some(library_id.clone()),
+                kind: "skill".into(),
+                name: Some("field-notes".into()),
+                note: Some("Fixture".into()),
+                source_label: Some("Fixture".into()),
+                scope: Some("project".into()),
+                tool_names: Vec::new(),
+                body: None,
+            },
+        )
+        .unwrap();
+        let catalog =
+            crate::member_capability::get_member_capability_catalog(
+                &selected.database,
+                &store,
+                &member,
+            )
+            .unwrap();
+        crate::member_capability::set_member_capability_catalog(
+            &mut selected.database,
+            &store,
+            &library,
+            &crate::member_capability::MemberCapabilitySetParams {
+                agent_id: member.clone(),
+                expected_revision: catalog.revision.clone(),
+                acknowledge_high_risk: false,
+                selections: vec![crate::member_capability::MemberCapabilitySelection {
+                    kind: "skill".into(),
+                    id: library_id.clone(),
+                    selected: true,
+                }],
+                reviewed_hooks: Vec::new(),
+            },
+        )
+        .unwrap();
+        selected.enqueue("material-1", "$campfire claim the selected skills");
+        let mention = vec![StructuredThreadMessageSegment::SkillMention {
+            skill_id: "rovai:campfire".to_string(),
+            name_at_send: "campfire".to_string(),
+        }];
+        selected
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp_message SET structured_content_json=?1, content_digest=?2 WHERE id='material-1'",
+                params![
+                    serde_json::to_string(&mention).unwrap(),
+                    canonical_content_digest(&mention).unwrap()
+                ],
+            )
+            .unwrap();
+        let material_run = claim_waiting_delivery_batches(&mut selected.database, 100)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let claim_json: String = selected
+            .database
+            .connection()
+            .query_row(
+                "SELECT context_json FROM agent_run_claim_context WHERE agent_run_id = ?1",
+                [&material_run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claim: serde_json::Value = serde_json::from_str(&claim_json).unwrap();
+        let section = claim["additionalSkills"]["section"].as_str().unwrap();
+        assert!(section.contains("field-notes"), "{section}");
+        assert!(section.contains("campfire"), "{section}");
+        let index: serde_json::Value = serde_json::from_str(
+            section
+                .split_once("\nCurrent for this run; replaces any earlier Rovai Additional Skills.\n")
+                .expect("additional skills envelope")
+                .1
+                .strip_suffix("\n[/ROVAI_ADDITIONAL_SKILLS]")
+                .expect("additional skills envelope end"),
+        )
+        .unwrap();
+        let root = std::path::Path::new(index["root"].as_str().unwrap());
+        assert!(root.ends_with(std::path::Path::new(&material_run).join("skills")));
+        let imported_entry = std::fs::read_to_string(root.join("field-notes/SKILL.md")).unwrap();
+        assert!(imported_entry.contains("claim body"), "{imported_entry}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("field-notes/resources/notes.md")).unwrap(),
+            "claim body resource\n"
+        );
+        assert!(root.join("campfire/SKILL.md").is_file());
+        assert!(index["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == json!("field-notes")));
+        assert!(index["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == json!("campfire")));
     }
 
     #[test]

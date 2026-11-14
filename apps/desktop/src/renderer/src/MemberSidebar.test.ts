@@ -15,6 +15,36 @@ import {
 } from './MemberSidebar'
 
 describe('v0.29 member sidebar', () => {
+  it('shows the selected remote runtime without claiming a local installation', () => {
+    const agent: AgentProfile = {
+      ...profile('remote-only', 'Remote member', 'Verifier', 'present'),
+      executionAvailability: {
+        location: 'remote' as const, configured: true, canLaunch: true,
+        adapterKind: 'claude-code-cli' as const, targetRevision: 3,
+        nodeId: 'node-b', workspaceId: 'workspace-b',
+        readiness: { status: 'installed_unverified' as const, blockers: [] }
+      }
+    }
+    const props = {
+      agents: [agent], runtimeAvailability: [], runtimeDiscoveryPending: false,
+      selectedAgentId: agent.agentId, onSelect: () => undefined,
+      onCreate: () => undefined, onReload: async () => undefined
+    }
+    const ready = renderSidebar(props)
+    expect(ready).toContain('远端节点')
+    expect(ready).toContain('runtime-available')
+    expect(ready).not.toContain('未配置智能体')
+    agent.executionAvailability!.canLaunch = false
+    agent.executionAvailability!.readiness = {
+      status: 'needs_attention',
+      blockers: [{ code: 'remote_node_offline', detail: null }]
+    }
+    const offline = renderSidebar(props)
+    expect(offline).toContain('远端节点离线')
+    expect(offline).not.toContain('未配置智能体')
+    expect(agent.runtimeConfiguration).toBeNull()
+  })
+
   it('filters only by member name and team role', () => {
     const agents = [
       profile('agent_2', '沐瓦', '开发者', 'present'),

@@ -1,7 +1,7 @@
 ---
 document_type: architecture-index
 authority: long-lived-architecture-routing
-last_updated: 2026-10-16
+last_updated: 2026-11-05
 ---
 
 # 长期系统架构
@@ -16,6 +16,7 @@ last_updated: 2026-10-16
 <!-- architecture-index:begin -->
 | 架构 | 内容 |
 | --- | --- |
+| [跨主机执行](cross-host-execution.md) | Core/Node 权威、真实 Run 冻结、R1 原生进程运输、R2 逐工具工作区调用、独立能力装配和路径/实际字节边界 |
 | [Missions](missions.md) | 内部 ID 贯通 Agent、UI 展示编号、全局只读/当前写入、独立状态、Core-owned 启动/执行投影、Team 创建预设、描述个人提及与原子入队、结构化附件、持久工作区与累计 Git Diff |
 | [统一 Rust Host](unified-rust-host.md) | Desktop 与三平台 Server 共用的应用运行层、Web、身份、source refs 和平台验证边界 |
 | [Team 管理](team-management.md) | Thread/Mission 创建预设、共享默认值、不可变启动文本与独立成员生命周期 |

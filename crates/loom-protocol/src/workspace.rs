@@ -321,25 +321,31 @@ mod tests {
 
     #[test]
     fn parent_and_absolute_escape_are_rejected_before_io() {
-        let root = "/tmp/loom-root";
+        // Keep this lexical owner filesystem-free while using the host's
+        // absolute-path syntax; a POSIX root is not absolute on Windows.
+        let root_path = std::env::temp_dir().join("loom-root");
+        let outside = root_path.with_file_name("loom-outside").join("passwd");
+        let parent_escape = root_path.join("..").join("etc");
+        let inside = root_path.join("src").join("main.rs");
+        let root = root_path.to_string_lossy();
         assert_eq!(
-            workspace_relative(root, "../etc/passwd"),
+            workspace_relative(&root, "../etc/passwd"),
             Err("path_rejected")
         );
         assert_eq!(
-            workspace_relative(root, "/etc/passwd"),
+            workspace_relative(&root, &outside.to_string_lossy()),
             Err("path_rejected")
         );
         assert_eq!(
-            workspace_relative(root, "/tmp/loom-root/../etc"),
+            workspace_relative(&root, &parent_escape.to_string_lossy()),
             Err("path_rejected")
         );
         assert_eq!(
-            workspace_relative(root, "src/main.rs").unwrap(),
+            workspace_relative(&root, "src/main.rs").unwrap(),
             "src/main.rs"
         );
         assert_eq!(
-            workspace_relative(root, "/tmp/loom-root/src/main.rs").unwrap(),
+            workspace_relative(&root, &inside.to_string_lossy()).unwrap(),
             "src/main.rs"
         );
     }

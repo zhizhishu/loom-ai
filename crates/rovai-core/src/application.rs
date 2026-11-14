@@ -1,5 +1,7 @@
 mod execution_drivers;
+mod remote_runtime;
 mod steer;
+mod workspace_rpc;
 use execution_drivers::*;
 use rusqlite::OptionalExtension;
 mod config;
@@ -571,6 +573,15 @@ struct ErrorBody {
 }
 
 fn request_error_body(error: &anyhow::Error) -> ErrorBody {
+    if let Some(error) = error.downcast_ref::<crate::remote_execution::RemoteTargetError>() {
+        return ErrorBody {
+            kind: "domain_rejection",
+            code: error.code().to_string(),
+            message: error.to_string(),
+            retryable: false,
+            details: json!({}),
+        };
+    }
     if let Some(error) = error.downcast_ref::<LocalAttachmentFailure>() {
         return ErrorBody {
             kind: "domain_rejection",
@@ -612,6 +623,24 @@ fn request_error_body(error: &anyhow::Error) -> ErrorBody {
             kind: "domain_rejection",
             code: error.code().to_string(),
             message: error.message().to_string(),
+            retryable: false,
+            details: json!({}),
+        };
+    }
+    if let Some(error) = error.downcast_ref::<crate::remote_run_bundle::RemoteRunBundleError>() {
+        return ErrorBody {
+            kind: "domain_rejection",
+            code: error.code().to_string(),
+            message: error.to_string(),
+            retryable: false,
+            details: json!({}),
+        };
+    }
+    if let Some(error) = error.downcast_ref::<crate::remote_run_bundle::BundleSourceError>() {
+        return ErrorBody {
+            kind: "domain_rejection",
+            code: error.code().to_string(),
+            message: error.to_string(),
             retryable: false,
             details: json!({}),
         };
@@ -1356,6 +1385,51 @@ struct SelectedWorkspaceParams {
     project_path: String,
 }
 
+/// Read-only bounded aggregate of the existing six per-Mission projections.
+/// The request never supplies a filesystem path or mutable state.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LoomBundleBatchParams {
+    mission_ids: Vec<String>,
+}
+
+impl LoomBundleBatchParams {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.mission_ids.is_empty() && self.mission_ids.len() <= 8,
+            "LOOM bundle batch must contain 1..8 Missions"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for id in &self.mission_ids {
+            anyhow::ensure!(
+                !id.is_empty() && id.len() <= 80
+                    && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')),
+                "Invalid LOOM batch mission id"
+            );
+            anyhow::ensure!(seen.insert(id), "Duplicate LOOM batch mission id");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn loom_bundle_batch_admits_only_bounded_unique_identifiers() {
+    let good: LoomBundleBatchParams =
+        serde_json::from_value(json!({"missionIds":["m-1","m_2"]})).unwrap();
+    assert!(good.validate().is_ok());
+    assert!(serde_json::from_value::<LoomBundleBatchParams>(
+        json!({"missionIds":["m-1"],"projectPath":"outside"})).is_err());
+    for ids in [
+        json!([]), json!(["m","m"]), json!(["../escape"]),
+        json!(["x","x","x","x","x","x","x","x","x"])
+    ] {
+        let params: LoomBundleBatchParams =
+            serde_json::from_value(json!({"missionIds":ids})).unwrap();
+        assert!(params.validate().is_err());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateThreadParams {
@@ -1381,6 +1455,7 @@ struct ThreadCreationMember {
     member_order: i64,
     runtime_configured: bool,
     runtime_readiness: RuntimeReadinessStatus,
+    execution_availability: crate::member_execution_availability::MemberExecutionAvailability,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2539,6 +2614,7 @@ struct Core {
     zcode_app: AcpCliRuntimeAdapter,
     runtime_fleet: Arc<AgentRuntimeFleetManager>,
     builtin_tool_leases: Arc<BuiltinToolLeaseRegistry>,
+    remote_runtime_services: Arc<crate::remote_runtime_services::RemoteRuntimeServices>,
     claude_code_cli: ClaudeCodeCliRuntimeAdapter,
     antigravity_app: AntigravityAppRuntimeAdapter,
     planned_shutdown: Arc<PlannedShutdownCoordinator>,
@@ -2563,6 +2639,7 @@ struct PreparedPiRuntimeLaunch<'a> {
     execution: &'a AgentRunExecution,
     resume_disposition: NativeSessionResumeDisposition,
     skill_exposure: &'a PreparedSkillExposure,
+    mcp_projection: &'a PreparedMcpProjection,
     attachment_admission: &'a ThreadAttachmentReadAdmission,
     attachment_authorization: &'a ThreadOutputDirectory,
     output: &'a mpsc::UnboundedSender<String>,
@@ -3162,12 +3239,23 @@ impl Core {
         }
     }
 
-    async fn reconcile_skill_projection_after_run_terminal(&self, execution_root: &str) {
+    async fn reconcile_skill_projection_after_run_terminal(&self, agent_run_id: &str) {
         let mut database = self.database.lock().await;
+        let execution_root = match crate::remote_execution::terminal_local_execution_root(
+            database.connection(),
+            agent_run_id,
+        ) {
+            Ok(Some(root)) => root,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("terminal Skill cleanup has no local Run authority: {error:#}");
+                return;
+            }
+        };
         if let Err(error) = SkillProjectionReconciler.reconcile_after_run_terminal(
             &mut database,
             &self.skill_library,
-            Path::new(execution_root),
+            Path::new(&execution_root),
         ) {
             eprintln!(
                 "failed to reconcile terminal AgentRun Skill projection for {execution_root}: {error:#}"
@@ -7464,6 +7552,16 @@ impl Core {
                         command_execution_payload(execution)
                     }
                 }
+                "loom.workspace.list" | "loom.workspace.read" | "loom.workspace.run"
+                | "loom.workspace.poll" | "loom.workspace.cancel" => {
+                    // The handler uses the authenticated Run and acquires only
+                    // short database scopes around admission and replay.
+                    drop(database);
+                    self.handle_workspace_rpc_operation(
+                        &authenticated_run, &request.tool_name, &request.input,
+                        &request.runtime_tool_call_id,
+                    ).await
+                }
                 name if rovai_core::loom_tool::is_loom_tool(name) => {
                     let read_only = rovai_core::loom_tool::is_read_only(name);
                     if !read_only {
@@ -7490,13 +7588,24 @@ impl Core {
                         command_id: &request.runtime_tool_call_id,
                     };
                     let tool_name = request.tool_name.clone();
-                    let output = rovai_core::loom_tool::invoke(
-                        &mut database,
-                        &caller,
-                        &tool_name,
-                        request.input,
-                    )
-                    .map_err(map_loom_tool_error)?;
+                    let remote_evidence = tool_name == rovai_core::loom_tool::LOOM_EVIDENCE_TOOL_NAME
+                        && crate::remote_execution::authority_table_available(database.connection(),"agent_run_execution_target")?
+                        && crate::remote_execution::load_run_target(database.connection(),&authenticated_run.agent_run_id)?.is_some();
+                    let output = if remote_evidence {
+                        let prepared = rovai_core::loom::remote_artifact::prepare(
+                            database.connection(),&authenticated_run,&request.input,
+                        ).map_err(rovai_core::loom_tool::map_domain_error)
+                        .map_err(map_loom_tool_error)?;
+                        drop(database);
+                        self.register_remote_loom_evidence(
+                            &authenticated_run,prepared,&request.runtime_tool_call_id,
+                        ).await.map_err(rovai_core::loom_tool::map_domain_error)
+                        .map_err(map_loom_tool_error)?
+                    } else {
+                        rovai_core::loom_tool::invoke(
+                            &mut database,&caller,&tool_name,request.input,
+                        ).map_err(map_loom_tool_error)?
+                    };
                     if !read_only {
                         evidence_replayed = output
                             .get("replayed")
@@ -7507,6 +7616,13 @@ impl Core {
                             "missions.loomUpdated",
                             Some(&authenticated_run.camp_id),
                         );
+                        // A LOOM write can release a dependency or return a Task to READY, which
+                        // leaves work for the batch lane. A replay changed nothing, so it wakes
+                        // nothing; a fresh write wakes the scheduler and the Run lanes now.
+                        if !evidence_replayed {
+                            self.delivery_batch_scheduler_notify.notify_one();
+                            self.execution_wake.runs.notify_one();
+                        }
                     }
                     Ok(output)
                 }
@@ -9637,7 +9753,11 @@ impl Core {
                 // trusted from the payload.
                 input.executor_id = CURRENT_USER_ID.to_string();
                 let mut database = self.database.lock().await;
-                let result = rovai_core::loom::verification_record(&mut database, input)?;
+                let result = rovai_core::loom::verification_record_with_archives(
+                    &mut database,
+                    &self.data_dir,
+                    input,
+                )?;
                 Ok(serde_json::to_value(result)?)
             }
             "loom.review.record" => {
@@ -9646,9 +9766,52 @@ impl Core {
                 // The reviewer identity is always injected from the trusted Host, never
                 // trusted from the payload.
                 input.reviewer_id = CURRENT_USER_ID.to_string();
+                let mission_id = input.mission_id.clone();
                 let mut database = self.database.lock().await;
                 let result = rovai_core::loom::review_record(&mut database, input)?;
+                // The User's verdict can release a dependency or finish a Task, so the pages and
+                // the lanes learn about it exactly as they do for an Agent LOOM write. The result
+                // contract itself is unchanged.
+                let camp_id = mission_camp_id(&database, &mission_id)?;
+                drop(database);
+                emit_missions_invalidated(&self.output, "missions.loomUpdated", camp_id.as_deref());
+                self.delivery_batch_scheduler_notify.notify_one();
+                self.execution_wake.runs.notify_one();
                 Ok(serde_json::to_value(result)?)
+            }
+            "loom.artifact.preview" => {
+                let input: rovai_core::loom::LoomArtifactPreviewInput =
+                    serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                Ok(serde_json::to_value(rovai_core::loom::artifact_preview(
+                    &database,
+                    &self.data_dir,
+                    input,
+                )?)?)
+            }
+            "loom.bundles.getMany" => {
+                let params: LoomBundleBatchParams =
+                    serde_json::from_value(request.params.clone())?;
+                params.validate()?;
+                let database = self.database.lock().await;
+                let mut rows = Vec::with_capacity(params.mission_ids.len());
+                for id in &params.mission_ids {
+                    rows.push(json!({
+                        "missionId": id,
+                        "plan": rovai_core::loom::plan_get(&database, id)?,
+                        "tasks": rovai_core::loom::tasks_list(&database, id)?,
+                        "candidates": rovai_core::loom::candidates_list(&database, id)?,
+                        "reviews": rovai_core::loom::reviews_list(&database, id)?,
+                        "verifications": rovai_core::loom::verifications_list(&database, id)?,
+                        "artifacts": rovai_core::loom::artifacts_list(&database, id)?
+                    }));
+                }
+                let value = json!({"bundles":rows});
+                anyhow::ensure!(
+                    serde_json::to_vec(&value)?.len() <= 3_000_000,
+                    "LOOM bundle batch exceeds bounded response budget"
+                );
+                Ok(value)
             }
             "loom.plan.get"
             | "loom.tasks.list"
@@ -9688,6 +9851,46 @@ impl Core {
                         &database, mission_id,
                     )?)?,
                 })
+            }
+            // The control plane read is scoped exactly like every other LOOM read; the two writes
+            // inject the approver identity from the trusted Host and let the control module compare
+            // it with the current user, so a payload can never nominate its own approver. A committed
+            // approval can move Tasks, release dependents and leave a Delivery waiting, so the Host
+            // wakes the batch scheduler and the Run lanes here instead of waiting for the fallback.
+            "loom.control.get" => {
+                let params: rovai_core::loom::MissionScopeInput =
+                    serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                Ok(serde_json::to_value(rovai_core::loom::control::get(
+                    &database,
+                    params.mission_id.as_str(),
+                )?)?)
+            }
+            "loom.control.configure" => {
+                let input: rovai_core::loom::control::LoomControlPolicyInput =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let snapshot =
+                    rovai_core::loom::control::configure(&mut database, CURRENT_USER_ID, input)?;
+                let camp_id = mission_camp_id(&database, &snapshot.mission_id)?;
+                drop(database);
+                emit_missions_invalidated(&self.output, "missions.loomUpdated", camp_id.as_deref());
+                self.delivery_batch_scheduler_notify.notify_one();
+                self.execution_wake.runs.notify_one();
+                Ok(serde_json::to_value(snapshot)?)
+            }
+            "loom.control.pause" => {
+                let input: rovai_core::loom::control::LoomControlPauseInput =
+                    serde_json::from_value(request.params.clone())?;
+                let mut database = self.database.lock().await;
+                let snapshot =
+                    rovai_core::loom::control::pause(&mut database, CURRENT_USER_ID, input)?;
+                let camp_id = mission_camp_id(&database, &snapshot.mission_id)?;
+                drop(database);
+                emit_missions_invalidated(&self.output, "missions.loomUpdated", camp_id.as_deref());
+                self.delivery_batch_scheduler_notify.notify_one();
+                self.execution_wake.runs.notify_one();
+                Ok(serde_json::to_value(snapshot)?)
             }
             "teams.list" => {
                 let database = self.database.lock().await;
@@ -9921,6 +10124,40 @@ impl Core {
                     .context("AgentProfile does not exist")?;
                 Ok(serde_json::to_value(profile)?)
             }
+            "members.executionTarget.get" => {
+                let params: crate::remote_execution::MemberTargetGetParams =
+                    serde_json::from_value(request.params.clone())
+                        .map_err(|_| crate::remote_execution::RemoteTargetError::invalid_input())?;
+                let database = self.database.lock().await;
+                Ok(serde_json::to_value(
+                    crate::remote_execution::get_member_target(&database, &params)
+                        .map_err(crate::remote_execution::RemoteTargetError::from_error)?,
+                )?)
+            }
+            "members.executionTarget.save" => {
+                let params: crate::remote_execution::MemberTargetSaveParams =
+                    serde_json::from_value(request.params.clone())
+                        .map_err(|_| crate::remote_execution::RemoteTargetError::invalid_input())?;
+                let mut database = self.database.lock().await;
+                Ok(serde_json::to_value(
+                    crate::remote_execution::set_member_target(&mut database, params)
+                        .map_err(crate::remote_execution::RemoteTargetError::from_error)?,
+                )?)
+            }
+            "members.runBundle.freeze" => {
+                self.subsystems.require("mcp")?;
+                let params: crate::remote_run_bundle::FreezeMemberBundleParams =
+                    serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                Ok(serde_json::to_value(
+                    crate::remote_run_bundle::freeze_member_bundle(
+                        &database,
+                        &self.data_dir,
+                        self.mcp_config()?,
+                        &params,
+                    )?,
+                )?)
+            }
             "members.runProjection.preview" => {
                 self.subsystems.require("mcp")?;
                 let params: crate::run_projection::MemberRunProjectionParams =
@@ -9957,6 +10194,7 @@ impl Core {
                     crate::member_capability::set_member_capability_catalog(
                         &mut database,
                         self.mcp_config()?,
+                        &self.skill_library,
                         &params,
                     )?,
                 )?)
@@ -9970,6 +10208,7 @@ impl Core {
                     crate::member_capability::put_capability_item(
                         &database,
                         self.mcp_config()?,
+                        &self.skill_library,
                         &params,
                     )?,
                 )?)
@@ -10908,8 +11147,9 @@ impl Core {
                         agent_id: profile.agent_id,
                         display_name: profile.display_name,
                         member_order: profile.member_order,
-                        runtime_configured: profile.runtime_configuration.is_some(),
-                        runtime_readiness: profile.runtime_readiness.status,
+                        runtime_configured: profile.execution_availability.configured,
+                        runtime_readiness: profile.execution_availability.readiness.status.clone(),
+                        execution_availability: profile.execution_availability,
                     })
                     .collect::<Vec<_>>();
                 let initial_lead_agent_id = present_members
@@ -11321,10 +11561,22 @@ impl Core {
                 params.command.draft_client = request.client.clone();
                 let camp_id = params.command.camp_id.clone();
                 let mut database = self.database.lock().await;
-                let execution = SingleChatService::for_client(request.client.clone()).send(
-                    &mut database,
-                    &user_camp_command_envelope(params.command_id, camp_id.clone(), params.command),
-                )?;
+                let remote_sources = self.mcp_config().ok().map(|mcp_store| {
+                    rovai_core::delivery_queue::RemoteBundleCaptureContext {
+                        data_dir: &self.data_dir,
+                        mcp_store,
+                    }
+                });
+                let execution = SingleChatService::for_client(request.client.clone())
+                    .send_with_remote_sources(
+                        &mut database,
+                        &user_camp_command_envelope(
+                            params.command_id,
+                            camp_id.clone(),
+                            params.command,
+                        ),
+                        remote_sources.as_ref(),
+                    )?;
                 let changed = execution.result.status != CommandResultStatus::Rejected;
                 drop(database);
                 if changed {
@@ -13563,6 +13815,13 @@ impl Core {
     async fn collect_delivery_batch_dispatch_candidates(
         self: &Arc<Self>,
     ) -> Result<Vec<rovai_core::runtime::QueuedAgentRunCandidate>> {
+        // Approved LOOM work becomes ordinary Delivery lanes before the existing claim runs, so a
+        // handoff reuses this scheduler instead of opening a second execution path. Selection,
+        // budget and dedupe happen in one Core transaction; a failure here must not stop the
+        // ordinary message lanes below.
+        if let Err(error) = self.admit_due_loom_dispatches().await {
+            eprintln!("failed to admit due LOOM dispatches: {error:#}");
+        }
         let missions = {
             let database = self.database.lock().await;
             rovai_core::delivery_queue::waiting_mission_batch_workspaces(&database)?
@@ -13645,11 +13904,18 @@ impl Core {
                         [],
                         |row| row.get(0),
                     )?;
+                    let remote_sources = self.mcp_config().ok().map(|mcp_store| {
+                        rovai_core::delivery_queue::RemoteBundleCaptureContext {
+                            data_dir: &self.data_dir,
+                            mcp_store,
+                        }
+                    });
                     let runs =
-                        rovai_core::delivery_queue::claim_waiting_delivery_batches_with_workspaces(
+                        rovai_core::delivery_queue::claim_waiting_delivery_batches_with_sources(
                             &mut database,
                             DELIVERY_BATCH_SCHEDULER_PAGE_LIMIT,
                             &ready,
+                            remote_sources.as_ref(),
                         )?;
                     let mut statement = database.connection().prepare(
                         "SELECT DISTINCT camp_id FROM agent_run WHERE id IN (SELECT value FROM json_each(?1)) AND camp_id IS NOT NULL
@@ -13697,6 +13963,21 @@ impl Core {
             candidates
         };
         Ok(candidates)
+    }
+
+    /// Admit the LOOM dispatches the standing approval makes due, then wake exactly the lanes an
+    /// accepted write created. Selection, scope and budget are the control plane's own transaction,
+    /// so a restart resumes from the permanent ledger instead of dispatching the same event twice.
+    async fn admit_due_loom_dispatches(&self) -> Result<usize> {
+        let admitted = {
+            let mut database = self.database.lock().await;
+            rovai_core::loom::control::admit_due_dispatches(&mut database)?
+        };
+        if admitted > 0 {
+            self.delivery_batch_scheduler_notify.notify_one();
+            self.execution_wake.runs.notify_one();
+        }
+        Ok(admitted)
     }
 
     async fn dispatch_agent_runs_by_id(
@@ -13893,7 +14174,22 @@ impl Core {
         let Some(launch_permit) = self.planned_shutdown.enter_launch().await else {
             return;
         };
-        let access_removed = {
+        let remote_target = match self.remote_run_target(&candidate.agent_run_id).await {
+            Ok(target) => target,
+            Err(error) => {
+                self.reject_agent_run_dispatch(
+                    &output,
+                    &candidate,
+                    "remote_target_unavailable",
+                    &error,
+                )
+                .await;
+                return;
+            }
+        };
+        let access_removed = if remote_target.is_some() {
+            false
+        } else {
             let database = self.database.lock().await;
             match SkillProjectionReconciler
                 .execution_root_is_removed(&database, &candidate.project_path)
@@ -13914,19 +14210,21 @@ impl Core {
             return;
         }
         let workspace = candidate.execution_workspace();
-        let _project_path = match self.validate_dispatch_workspace(&candidate).await {
-            Ok(path) => path,
-            Err(error) => {
-                self.reject_agent_run_dispatch(
-                    &output,
-                    &candidate,
-                    "workspace_unavailable",
-                    &error,
-                )
-                .await;
-                return;
-            }
-        };
+        if remote_target.is_none() {
+            let _project_path = match self.validate_dispatch_workspace(&candidate).await {
+                Ok(path) => path,
+                Err(error) => {
+                    self.reject_agent_run_dispatch(
+                        &output,
+                        &candidate,
+                        "workspace_unavailable",
+                        &error,
+                    )
+                    .await;
+                    return;
+                }
+            };
+        }
         let runtime = match candidate.frozen_runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -13959,22 +14257,30 @@ impl Core {
                 return;
             }
         }
-        let workspace = match self.prepare_mission_workspace(&candidate).await {
-            Ok(Some(workspace)) => workspace,
-            Ok(None) => return,
-            Err(error) => {
-                self.reject_agent_run_dispatch(
-                    &output,
-                    &candidate,
-                    "workspace_unavailable",
-                    &error,
-                )
-                .await;
-                return;
+        let workspace = if remote_target.is_some() {
+            workspace
+        } else {
+            match self.prepare_mission_workspace(&candidate).await {
+                Ok(Some(workspace)) => workspace,
+                Ok(None) => return,
+                Err(error) => {
+                    self.reject_agent_run_dispatch(
+                        &output,
+                        &candidate,
+                        "workspace_unavailable",
+                        &error,
+                    )
+                    .await;
+                    return;
+                }
             }
         };
         let workspace_path = PathBuf::from(&workspace.execution_root);
-        let starting_git_observation = Some(git::observe_git(&workspace_path).await);
+        let starting_git_observation = if remote_target.is_some() {
+            None
+        } else {
+            Some(git::observe_git(&workspace_path).await)
+        };
         let (attachment_view_admission, attachment_authorization) = match self
             .verified_camp_attachment_admission(&candidate.camp_id, &workspace_path)
             .await
@@ -14311,7 +14617,7 @@ impl Core {
                                         }),
                                     );
                                     core.reconcile_skill_projection_after_run_terminal(
-                                        &execution.workspace.execution_root,
+                                        &execution.agent_run_id,
                                     )
                                     .await;
                                 }
@@ -14614,7 +14920,7 @@ impl Core {
         // Git and projection work do not extend the Runtime cleanup budget.
         let core = self.clone();
         self.agent_run_tasks.lock().await.spawn(async move {
-            core.reconcile_skill_projection_after_run_terminal(&candidate.execution_root)
+            core.reconcile_skill_projection_after_run_terminal(&candidate.agent_run_id)
                 .await;
             if fence == RuntimeCancellationIngressFence::Flushed {
                 core.project_agent_run_file_changes_after_terminal(
@@ -15404,6 +15710,12 @@ impl Core {
         if source_refs.is_empty() {
             return Ok(Vec::new());
         }
+        anyhow::ensure!(
+            self.remote_run_target(&execution.agent_run_id)
+                .await?
+                .is_none(),
+            "remote_attachment_transfer_required"
+        );
         tokio::task::spawn_blocking(move || resolve_source_attachments_for_run(&source_refs))
             .await
             .context("Source Attachment Run resolver task failed")?
@@ -15442,6 +15754,13 @@ impl Core {
         &self,
         execution: &AgentRunExecution,
     ) -> Result<PreparedMcpProjection> {
+        if self
+            .remote_run_target(&execution.agent_run_id)
+            .await?
+            .is_some()
+        {
+            return self.prepare_remote_mcp_projection(execution).await;
+        }
         self.subsystems.require("mcp")?;
         let execution_root = PathBuf::from(&execution.workspace.execution_root);
         let mut projection = {
@@ -15780,16 +16099,32 @@ impl Core {
         execution: &AgentRunExecution,
         credential: &BuiltinToolBindingCredential,
     ) -> Result<()> {
-        self.builtin_tool_leases
-            .bind(
-                config,
-                &execution.agent_run_id,
-                execution.execution_epoch,
-                credential,
-                Path::new(&execution.workspace.execution_root),
-            )
-            .await?;
-        if config.context_path().is_some() {
+        if config.remote_process_key().is_some() {
+            let target = self
+                .remote_run_target(&execution.agent_run_id)
+                .await?
+                .context("remote_target_real_binding_required")?;
+            self.builtin_tool_leases
+                .bind_remote(
+                    config,
+                    &execution.agent_run_id,
+                    execution.execution_epoch,
+                    credential,
+                    &target.target,
+                )
+                .await?;
+        } else {
+            self.builtin_tool_leases
+                .bind(
+                    config,
+                    &execution.agent_run_id,
+                    execution.execution_epoch,
+                    credential,
+                    Path::new(&execution.workspace.execution_root),
+                )
+                .await?;
+        }
+        if config.context_path().is_some() || config.remote_process_key().is_some() {
             self.refresh_task_discovery(Some((
                 config.process_id(),
                 &execution.agent_run_id,
@@ -16131,6 +16466,33 @@ impl Core {
         runtime: FrozenAgentRuntimeConfig,
         workspace: &AgentRunWorkspace,
     ) -> std::result::Result<(FrozenAgentRuntimeConfig, i64), RuntimeDispatchFailure> {
+        let remote_target = self
+            .remote_run_target(&candidate.agent_run_id)
+            .await
+            .map_err(|error| RuntimeDispatchFailure {
+                code: "remote_target_unavailable".into(),
+                error,
+                effective_version: None,
+            })?;
+        if let Some(target) = remote_target {
+            if target.installation_id != runtime.installation_id
+                || target.target.workspace_root != workspace.execution_root
+            {
+                return Err(RuntimeDispatchFailure {
+                    code: "remote_target_changed".into(),
+                    error: anyhow::anyhow!("Frozen remote Run identity changed"),
+                    effective_version: None,
+                });
+            }
+            self.remote_runtime_services
+                .launcher()
+                .map_err(|error| RuntimeDispatchFailure {
+                    code: "remote_transport_unavailable".into(),
+                    error: error.into(),
+                    effective_version: None,
+                })?;
+            return Ok((runtime, candidate.version));
+        }
         if let Some(blocker) = current_runtime_platform_blocker(runtime.adapter_kind) {
             return Err(RuntimeDispatchFailure {
                 code: blocker.code,
@@ -16569,6 +16931,21 @@ impl Core {
         output: &mpsc::UnboundedSender<String>,
         launch_permit: &mut ExecutionLaunchPermit,
     ) -> Result<()> {
+        if self
+            .remote_run_target(&execution.agent_run_id)
+            .await?
+            .is_some()
+        {
+            return self
+                .launch_agent_run_in_environment(
+                    execution,
+                    attachment_admission,
+                    attachment_authorization,
+                    output,
+                    launch_permit,
+                )
+                .await;
+        }
         rovai_core::member_environment::with_launch_source(
             rovai_core::member_environment::LaunchEnvironmentSource {
                 database: self.database.clone(),
@@ -16604,6 +16981,10 @@ impl Core {
         else {
             return Ok(());
         };
+        let mut mcp_projection = self
+            .prepare_agent_run_mcp_projection(execution)
+            .await
+            .context("failed to prepare AgentRun MCP projection")?;
         if execution.runtime.adapter_kind == AdapterKind::Pi {
             let resume_disposition = {
                 let mut database = self.database.lock().await;
@@ -16628,6 +17009,7 @@ impl Core {
                     execution,
                     resume_disposition,
                     skill_exposure: &skill_exposure,
+                    mcp_projection: &mcp_projection,
                     attachment_admission,
                     attachment_authorization,
                     output,
@@ -16635,10 +17017,6 @@ impl Core {
                 })
                 .await;
         }
-        let mut mcp_projection = self
-            .prepare_agent_run_mcp_projection(execution)
-            .await
-            .context("failed to prepare AgentRun MCP projection")?;
         let attachment_access = ThreadAttachmentRunAccess {
             admission: attachment_admission,
             authorization: attachment_authorization,
@@ -16708,25 +17086,75 @@ impl Core {
         if execution.runtime.adapter_kind.as_str() != "codex-cli" {
             anyhow::bail!("AgentRun selected an unsupported Runtime Adapter");
         }
+        let remote_target = self.remote_run_target(&execution.agent_run_id).await?;
+        let is_remote = remote_target.is_some();
+        let mut prepared_remote_builtin: Option<BuiltinToolProcessConfig> = None;
+        let launch_result: Result<()> = async {
         let execution_root = PathBuf::from(&execution.workspace.execution_root);
-        if !execution_root.is_dir() {
+        if !is_remote && !execution_root.is_dir() {
             anyhow::bail!(
                 "AgentRun execution directory no longer exists: {}",
                 execution_root.display()
             );
         }
+        if let Some(target) = &remote_target {
+            anyhow::ensure!(execution.workspace.execution_root == target.target.workspace_root,
+                "remote_codex_workspace_scope");
+        }
         launch_permit.check_cancelled()?;
         let initial_binding = self
             .prepare_initial_builtin_tool_binding(execution, resume_disposition)
             .await?;
-        let builtin_tool_factory = self.builtin_tool_process_config_factory()?;
-        let runtime_compatibility_digest = codex::runtime_compatibility_digest(
-            &execution.runtime,
-            &execution_root,
-            attachment_authorization,
-        )?;
+        let session_bootstrap = {
+            let mut database = self.database.lock().await;
+            ContextService
+                .prepare_session_bootstrap(
+                    &mut database,
+                    &ManagedBlobStore::new(&self.data_dir),
+                    &execution.agent_run_id,
+                    execution.execution_epoch,
+                    CharterDeliveryMode::NativeAppend,
+                )?
+                .payload
+        };
+        let builtin_tool_factory = if is_remote {
+            None
+        } else {
+            Some(self.builtin_tool_process_config_factory()?)
+        };
+        let runtime_compatibility_digest = if let Some(target) = &remote_target {
+            // The frozen source, not the live MCP store, decides whether this Run
+            // resolves credential references and therefore needs its own process.
+            let has_references = {
+                let database = self.database.lock().await;
+                crate::remote_bundle_owner::load_run_source(
+                    database.connection(),
+                    &execution.agent_run_id,
+                )?
+                .is_some_and(|source| source.has_mcp_references())
+            };
+            self.remote_codex_runtime_compatibility_digest(execution, target, has_references)?
+        } else {
+            codex::runtime_compatibility_digest(
+                &execution.runtime,
+                &execution_root,
+                attachment_authorization,
+            )?
+        };
         self.persist_runtime_compatibility_digest(execution, &runtime_compatibility_digest)
             .await?;
+        let mut remote_launch = if let Some(target) = &remote_target {
+            let builtin = self.prepare_remote_builtin_process(&target.target.node_id)?;
+            prepared_remote_builtin = Some(builtin.clone());
+            // Startup hooks can invoke the CLI before native initialization.
+            // The real Core lease must exist before Open is sent to B.
+            self.bind_builtin_tool_runtime(&builtin, execution, &initial_binding).await?;
+            Some(self.prepare_remote_run_launch(
+                execution, &builtin, &initial_binding, &session_bootstrap,
+            ).await?)
+        } else {
+            None
+        };
         launch_permit.check_cancelled()?;
         let runtime = self
             .codex_cli
@@ -16739,9 +17167,42 @@ impl Core {
                 cwd: &execution_root,
                 frozen_runtime: &execution.runtime,
                 runtime_compatibility_digest: &runtime_compatibility_digest,
-                builtin_tool_factory: &builtin_tool_factory,
+                builtin_tool_factory: builtin_tool_factory.as_ref(),
+                remote_launch: remote_launch.clone(),
+                remote_builtin_tools: prepared_remote_builtin.clone(),
             })
             .await?;
+        let active_builtin_tools = runtime
+            .builtin_tool_process_config()
+            .context("Codex Runtime has no Built-in Tool process context")?
+            .clone();
+        anyhow::ensure!(
+            active_builtin_tools.remote_process_key().is_some() == is_remote,
+            "codex_runtime_host_scope"
+        );
+        if is_remote {
+            let prepared = prepared_remote_builtin.as_ref()
+                .context("remote_codex_builtin_required")?;
+            if prepared.remote_process_key() != active_builtin_tools.remote_process_key() {
+                // Fleet returned a warm Host. Retire only this invocation's
+                // speculative lease, then bind its actual process key to this Run.
+                self.builtin_tool_leases.unregister(prepared.process_id()).await;
+                prepared_remote_builtin = None;
+                self.bind_builtin_tool_runtime(
+                    &active_builtin_tools, execution, &initial_binding,
+                ).await?;
+                remote_launch = Some(self.prepare_remote_run_launch(
+                    execution, &active_builtin_tools, &initial_binding, &session_bootstrap,
+                ).await?);
+            } else {
+                anyhow::ensure!(prepared.process_id() == active_builtin_tools.process_id(),
+                    "remote_codex_builtin_identity");
+            }
+            runtime.bind_remote_owner(
+                remote_launch.as_ref().context("remote_codex_launch_required")?,
+                &runtime_compatibility_digest,
+            ).await?;
+        }
         if !mcp_projection.servers.is_empty() {
             let native_mcp_server_names = runtime
                 .discover_native_mcp_server_names(&execution_root)
@@ -16800,29 +17261,27 @@ impl Core {
             "runtime_default" => None,
             _ => anyhow::bail!("Codex model source is invalid"),
         };
-        let session_bootstrap = {
-            let mut database = self.database.lock().await;
-            ContextService
-                .prepare_session_bootstrap(
-                    &mut database,
-                    &ManagedBlobStore::new(&self.data_dir),
-                    &execution.agent_run_id,
-                    execution.execution_epoch,
-                    CharterDeliveryMode::NativeAppend,
-                )?
-                .payload
-        };
         let resumable_session_id = initial_binding.native_session_id.clone();
         let mut binding_credential = initial_binding;
-        let active_builtin_tools = runtime
-            .builtin_tool_process_config()
-            .context("Codex Runtime has no Built-in Tool process context")?
-            .clone();
-        self.bind_builtin_tool_runtime(&active_builtin_tools, execution, &binding_credential)
-            .await?;
+        if !is_remote {
+            self.bind_builtin_tool_runtime(&active_builtin_tools, execution, &binding_credential)
+                .await?;
+        }
         launch_permit.check_cancelled()?;
-        let thread = runtime
-            .start_or_resume_agent_thread(
+        let thread = if let Some(remote) = &remote_launch {
+            runtime.start_or_resume_remote_agent_thread(
+                remote,
+                &runtime_compatibility_digest,
+                codex::CodexRemoteAgentThreadOptions {
+                    existing_thread_id: resumable_session_id.as_deref(),
+                    sandbox_mode,
+                    approval_policy,
+                    model: explicit_model,
+                    external_mcp_servers: &mcp_projection.servers,
+                },
+            ).await
+        } else {
+            runtime.start_or_resume_agent_thread(
                 &execution_root,
                 CodexAgentThreadOptions {
                     existing_thread_id: resumable_session_id.as_deref(),
@@ -16833,8 +17292,8 @@ impl Core {
                     attachment_access_root: &attachment_access_root,
                     external_mcp_servers: &mcp_projection.servers,
                 },
-            )
-            .await;
+            ).await
+        };
         let thread_id = match thread {
             Ok(thread_id) => thread_id,
             Err(error) => {
@@ -16861,6 +17320,11 @@ impl Core {
                 if !may_replace {
                     return Err(error)
                         .context("Codex Native Session restoration failed; no input was sent");
+                }
+                if is_remote {
+                    // A changed native binding needs a newly prepared process;
+                    // never silently reuse the old owner's launch authority.
+                    return Err(error).context("remote_replacement_requires_relaunch");
                 }
                 // Session activation precedes materialization and dispatch. The
                 // User's new continuation permits one replacement, never a replay
@@ -17023,6 +17487,24 @@ impl Core {
         )
         .await;
         Ok(())
+        }.await;
+        if launch_result.is_err() && is_remote {
+            // Any error after Open must pass the same bounded Stop/cleanup
+            // owner as an interrupted Run. A dropped Arc is not a receipt.
+            self.codex_cli
+                .complete_agent_run(
+                    &execution.agent_run_id,
+                    execution.execution_epoch,
+                    FleetReleaseDisposition::Stop,
+                )
+                .await;
+            if let Some(prepared) = &prepared_remote_builtin {
+                self.builtin_tool_leases
+                    .unregister(prepared.process_id())
+                    .await;
+            }
+        }
+        launch_result
     }
 
     async fn launch_pi_agent_run(&self, launch: PreparedPiRuntimeLaunch<'_>) -> Result<()> {
@@ -17030,6 +17512,7 @@ impl Core {
             execution,
             resume_disposition,
             skill_exposure,
+            mcp_projection,
             attachment_admission,
             attachment_authorization,
             output,
@@ -17072,10 +17555,16 @@ impl Core {
             execution.execution_epoch,
             uuid::Uuid::new_v4()
         );
-        let runtime_compatibility_digest = pi::runtime_compatibility_digest(
-            &execution.runtime,
-            &execution_root,
-            attachment_authorization,
+        let managed_mcp = if mcp_projection.servers.is_empty() {
+            None
+        } else {
+            let document = pi::managed_mcp_document(&mcp_projection.servers)?;
+            let digest = pi::managed_mcp_document_digest(&document)?;
+            Some(pi::PiMcpProjection { document, digest })
+        };
+        let runtime_compatibility_digest = pi::runtime_compatibility_digest_with_mcp(
+            &execution.runtime, &execution_root, attachment_authorization,
+            managed_mcp.as_ref().map(|mcp| &mcp.document),
         )?;
         self.persist_runtime_compatibility_digest(execution, &runtime_compatibility_digest)
             .await?;
@@ -17098,6 +17587,7 @@ impl Core {
                 native_binding_generation: binding_credential.native_binding_generation,
                 bootstrap: &session_bootstrap,
                 builtin_tool_factory: &builtin_tool_factory,
+                mcp: managed_mcp.as_ref(),
             })
             .await;
         let runtime = match runtime_result {
@@ -17168,6 +17658,7 @@ impl Core {
                         native_binding_generation: replacement_binding.native_binding_generation,
                         bootstrap: &replacement_bootstrap,
                         builtin_tool_factory: &builtin_tool_factory,
+                mcp: managed_mcp.as_ref(),
                     })
                     .await
                     .with_context(|| {
@@ -17198,7 +17689,7 @@ impl Core {
                     authorization: attachment_authorization,
                 },
                 skill_exposure,
-                None,
+                Some(mcp_projection),
                 RuntimeInputPreparationRequest {
                     charter_delivery_mode: CharterDeliveryMode::ManagedSystemPrompt,
                     proposed_delivery_id: Some(&delivery_id),
@@ -17330,8 +17821,10 @@ impl Core {
             authorization: attachment_authorization,
         };
         let attachment_access_root = &attachment_authorization.output_root;
+        let remote_target = self.remote_run_target(&execution.agent_run_id).await?;
+        let is_remote = remote_target.is_some();
         let execution_root = PathBuf::from(&execution.workspace.execution_root);
-        if !execution_root.is_dir() {
+        if !is_remote && !execution_root.is_dir() {
             anyhow::bail!(
                 "AgentRun execution directory no longer exists: {}",
                 execution_root.display()
@@ -17348,7 +17841,10 @@ impl Core {
             .native_session_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let builtin_tools = self.prepare_builtin_tool_process_config()?;
+        let builtin_tools = match &remote_target {
+            Some(target) => self.prepare_remote_builtin_process(&target.target.node_id)?,
+            None => self.prepare_builtin_tool_process_config()?,
+        };
         self.bind_builtin_tool_runtime(&builtin_tools, execution, &binding_credential)
             .await?;
 
@@ -17363,6 +17859,31 @@ impl Core {
                     CharterDeliveryMode::NativeAppend,
                 )?
                 .payload
+        };
+        let remote_launch = if is_remote {
+            match self
+                .prepare_remote_run_launch(
+                    execution,
+                    &builtin_tools,
+                    &binding_credential,
+                    &session_bootstrap,
+                )
+                .await
+            {
+                Ok(remote) => Some(remote),
+                Err(error) => {
+                    self.builtin_tool_leases
+                        .unbind(
+                            builtin_tools.process_id(),
+                            &execution.agent_run_id,
+                            execution.execution_epoch,
+                        )
+                        .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
         };
         let native_turn_id = format!(
             "claude-code:{}:{}",
@@ -17396,8 +17917,11 @@ impl Core {
         let (launch_handoff_sender, mut launch_handoff_receiver) = oneshot::channel();
         let (input_ready_sender, mut input_ready_receiver) = mpsc::unbounded_channel();
         let mut launch_execution = execution.clone();
-        launch_execution.runtime.environment =
-            rovai_core::member_environment::load_for_launch().await?;
+        launch_execution.runtime.environment = if is_remote {
+            None
+        } else {
+            rovai_core::member_environment::load_for_launch().await?
+        };
         if launch_execution
             .runtime
             .environment
@@ -17427,7 +17951,7 @@ impl Core {
                         rovai_core::runtime_custom_api::CredentialRedactor::from_values(Vec::new())
                     }),
             );
-        let run = self.claude_code_cli.run(ClaudeCodeRunRequest {
+        let run_request = ClaudeCodeRunRequest {
             agent_run_id: execution.agent_run_id.clone(),
             execution_epoch: execution.execution_epoch,
             workspace: execution.workspace.clone(),
@@ -17439,13 +17963,19 @@ impl Core {
             session_bootstrap: Some(session_bootstrap.clone()),
             builtin_tools: Some(builtin_tools.clone()),
             external_mcp_servers: mcp_projection.servers.clone(),
-            attachment_access_root: Some(attachment_access_root.to_path_buf()),
+            attachment_access_root: (!is_remote).then(|| attachment_access_root.to_path_buf()),
             persist_session: true,
             input_accepted: Some(input_accepted_sender),
             runtime_events: Some(runtime_event_sender),
             launch_handoff: Some(launch_handoff_sender),
             input_ready: Some(input_ready_sender),
-        });
+        };
+        let run = async {
+            match remote_launch {
+                Some(remote) => self.claude_code_cli.run_remote(run_request, remote).await,
+                None => self.claude_code_cli.run(run_request).await,
+            }
+        };
         tokio::pin!(run);
         let ready: Result<_> = tokio::select! {
             biased;
@@ -18119,10 +18649,8 @@ impl Core {
                 if cleanup_required {
                     self.agent_run_cancellation_notify.notify_one();
                 }
-                self.reconcile_skill_projection_after_run_terminal(
-                    &current.workspace.execution_root,
-                )
-                .await;
+                self.reconcile_skill_projection_after_run_terminal(&current.agent_run_id)
+                    .await;
                 self.project_agent_run_file_changes_after_terminal(
                     &current.agent_run_id,
                     current.execution_epoch,
@@ -19419,7 +19947,7 @@ impl Core {
         file_change_ingress_flushed: bool,
     ) {
         if failure_persisted {
-            self.reconcile_skill_projection_after_run_terminal(&execution.workspace.execution_root)
+            self.reconcile_skill_projection_after_run_terminal(&execution.agent_run_id)
                 .await;
         }
         match execution.runtime.adapter_kind {
@@ -19547,10 +20075,8 @@ impl Core {
             );
             self.delivery_batch_scheduler_notify.notify_one();
             self.execution_wake.runs.notify_one();
-            self.reconcile_skill_projection_after_run_terminal(
-                &candidate.execution_workspace().execution_root,
-            )
-            .await;
+            self.reconcile_skill_projection_after_run_terminal(&candidate.agent_run_id)
+                .await;
             self.project_agent_run_file_changes_after_terminal(
                 &candidate.agent_run_id,
                 execution_epoch,
@@ -19879,6 +20405,7 @@ pub fn run_stdio() -> Result<()> {
         input,
         OutputTarget::Stdio,
         None,
+        Arc::new(crate::remote_runtime_services::RemoteRuntimeServices::default()),
     ));
     runtime.shutdown_timeout(Duration::from_millis(250));
     result
@@ -19955,6 +20482,7 @@ async fn run_core(
     mut input: CoreInput,
     output_target: OutputTarget,
     host_control: Option<Arc<dyn HostControl>>,
+    remote_runtime_services: Arc<crate::remote_runtime_services::RemoteRuntimeServices>,
 ) -> Result<()> {
     config.validate()?;
     let CoreConfig {
@@ -20510,8 +21038,13 @@ async fn run_core(
         attachment_view_gates: Mutex::new(HashMap::new()),
         runtime_fleet,
         builtin_tool_leases,
+        remote_runtime_services,
         data_dir,
     });
+    let remote_builtin_handler: Arc<dyn crate::remote_runtime_services::RemoteBuiltinHandler> =
+        core.clone();
+    core.remote_runtime_services
+        .install_builtin_handler(&remote_builtin_handler);
     // Project the durable deletion fence into the Fleet before any scheduler
     // can acquire or finish starting a Runtime for these Camps. Recovery work
     // itself remains asynchronous and does not delay the ready frame.
@@ -22041,7 +22574,7 @@ async fn persist_pi_prompt_completion(
             }),
         );
         if let Some(execution_root) = terminal_execution_root {
-            core.reconcile_skill_projection_after_run_terminal(&execution_root)
+            core.reconcile_skill_projection_after_run_terminal(&agent_run_id)
                 .await;
         }
         if let Some(process_id) = runtime
@@ -22156,10 +22689,8 @@ async fn persist_pi_prompt_completion(
                 );
                 core.delivery_batch_scheduler_notify.notify_one();
                 core.execution_wake.runs.notify_one();
-                core.reconcile_skill_projection_after_run_terminal(
-                    &execution.workspace.execution_root,
-                )
-                .await;
+                core.reconcile_skill_projection_after_run_terminal(&execution.agent_run_id)
+                    .await;
                 if let Some(process_id) = runtime
                     .builtin_tool_process_config()
                     .map(|config| config.process_id().to_string())
@@ -24972,7 +25503,7 @@ async fn persist_acp_prompt_completion(
             }),
         );
         if let Some(execution_root) = terminal_execution_root {
-            core.reconcile_skill_projection_after_run_terminal(&execution_root)
+            core.reconcile_skill_projection_after_run_terminal(&agent_run_id)
                 .await;
         }
         if let Some(adapter) = core.acp_adapter(adapter_kind) {
@@ -25075,10 +25606,8 @@ async fn persist_acp_prompt_completion(
                 );
                 core.delivery_batch_scheduler_notify.notify_one();
                 core.execution_wake.runs.notify_one();
-                core.reconcile_skill_projection_after_run_terminal(
-                    &execution.workspace.execution_root,
-                )
-                .await;
+                core.reconcile_skill_projection_after_run_terminal(&execution.agent_run_id)
+                    .await;
                 if let Some(adapter) = core.acp_adapter(adapter_kind) {
                     adapter
                         .complete_agent_run(agent_run_id, execution_epoch)
@@ -26078,7 +26607,7 @@ async fn process_agent_run_codex_message(
                     }),
                 );
                 if let Some(execution_root) = terminal_execution_root {
-                    core.reconcile_skill_projection_after_run_terminal(&execution_root)
+                    core.reconcile_skill_projection_after_run_terminal(&agent_run_id)
                         .await;
                 }
                 runtime.clear_turn(Some(&completed.turn_id)).await;
@@ -26264,7 +26793,7 @@ async fn process_agent_run_codex_message(
         return;
     }
     if let Some(execution_root) = terminal_execution_root {
-        core.reconcile_skill_projection_after_run_terminal(&execution_root)
+        core.reconcile_skill_projection_after_run_terminal(&agent_run_id)
             .await;
     }
     runtime.clear_turn(Some(&completed.turn_id)).await;
@@ -26612,7 +27141,17 @@ async fn dispatch_pending_single_chat_inputs(core: &Core) -> Result<()> {
         };
         let result = {
             let mut database = core.database.lock().await;
-            SingleChatService::default().publish_pending_input(&mut database, &envelope)
+            let remote_sources = core.mcp_config().ok().map(|mcp_store| {
+                rovai_core::delivery_queue::RemoteBundleCaptureContext {
+                    data_dir: &core.data_dir,
+                    mcp_store,
+                }
+            });
+            SingleChatService::default().publish_pending_input_with_remote_sources(
+                &mut database,
+                &envelope,
+                remote_sources.as_ref(),
+            )
         };
         match result {
             Ok(execution) if execution.result.status != CommandResultStatus::Rejected => emit(
@@ -27447,6 +27986,18 @@ fn emit_missions_invalidated(
         "missions.invalidated",
         json!({ "reason": reason, "threadId": camp_id }),
     );
+}
+
+/// The Mission's Camp is the Thread identity every projection is keyed by, so a Mission-scoped
+/// write reports it instead of passing the Mission id off as a Thread id. A Mission that no longer
+/// resolves leaves the Thread unnamed rather than inventing one.
+fn mission_camp_id(database: &Database, mission_id: &str) -> Result<Option<String>> {
+    Ok(database
+        .connection()
+        .query_row("SELECT camp_id FROM mission WHERE id=?1", [mission_id], |row| {
+            row.get(0)
+        })
+        .optional()?)
 }
 
 fn navigation_group_key(database: &Database, camp_id: &str) -> Result<Option<String>> {
@@ -28965,6 +29516,9 @@ mod tests {
             data_dir,
             runtime_fleet,
             builtin_tool_leases,
+            remote_runtime_services: Arc::new(
+                crate::remote_runtime_services::RemoteRuntimeServices::default(),
+            ),
         })
     }
 
@@ -35701,7 +36255,9 @@ for line in sys.stdin:
                     cwd: &workspace,
                     frozen_runtime: &frozen,
                     runtime_compatibility_digest: "fixture",
-                    builtin_tool_factory: &tools,
+                    builtin_tool_factory: Some(&tools),
+                    remote_launch: None,
+                    remote_builtin_tools: None,
                 })
                 .await
                 .unwrap();
@@ -35812,7 +36368,9 @@ for line in sys.stdin:
                     cwd: &workspace,
                     frozen_runtime: &frozen,
                     runtime_compatibility_digest: "fixture",
-                    builtin_tool_factory: &tools,
+                    builtin_tool_factory: Some(&tools),
+                    remote_launch: None,
+                    remote_builtin_tools: None,
                 })
                 .await
                 .unwrap();
@@ -36245,7 +36803,9 @@ for line in sys.stdin:
                     cwd: &root,
                     frozen_runtime: &runtime_config,
                     runtime_compatibility_digest: "cleanup-compatible",
-                    builtin_tool_factory: &builtin_tools,
+                    builtin_tool_factory: Some(&builtin_tools),
+                    remote_launch: None,
+                    remote_builtin_tools: None,
                 })
                 .await
                 .unwrap();

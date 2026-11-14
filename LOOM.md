@@ -1,3 +1,5 @@
+> **当前产品线（2026-11-13）**：默认入口已经是独立 `loom-native` 用户级工作台，不再沿用本文早期“Mission Activity 增量页面”的视觉实现。当前实施/验收与用户纠偏入口见 [`LOOM-IMPLEMENTATION.md`](LOOM-IMPLEMENTATION.md)，产品定位见 [`PRODUCT.md`](PRODUCT.md)，接口与适配边界见 [`docs/loom/productization-interfaces-2026-11-13.md`](docs/loom/productization-interfaces-2026-11-13.md)。下方早期路线仅保留来源记录，不能反过来要求恢复旧 Rovai UI。
+
 # LOOM
 
 LOOM 是以 [Rovai AI](https://github.com/murray17/rovai-ai) 为 UI 与运行时底座的产品分支。

@@ -1,3 +1,5 @@
+mod remote_launch;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error as StdError,
@@ -14,7 +16,7 @@ use rovai_core::{
     agent_profile::FrozenAgentRuntimeConfig,
     agent_runtime_adapter::CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID,
     managed_process::{
-        ManagedProcess, ManagedProcessLaunchSpec, ManagedProcessPurpose, ManagedStdinPolicy,
+        ManagedProcessLaunchSpec, ManagedProcessPurpose, ManagedStdinPolicy,
         ManagedWindowsArgvDialect,
     },
     mcp::McpServerDefinition,
@@ -39,6 +41,7 @@ use tokio::{
 
 use crate::{
     builtin_tool_runtime::BuiltinToolProcessConfig,
+    runtime_process::{RemoteRuntimeLaunch, RuntimeProcess},
     claude_control::{self, ClaudeControl, ControlReadGuard},
     runtime_mcp::{remove_stale_mcp_configs, write_ephemeral_additive_mcp_config},
 };
@@ -258,7 +261,7 @@ struct ClaudeCodeProcessControl {
 }
 
 struct ClaudeCodeRunResources {
-    child: ManagedProcess,
+    child: RuntimeProcess,
     bootstrap_file: Option<PathBuf>,
     settings_file: Option<PathBuf>,
 }
@@ -281,6 +284,9 @@ impl Drop for ClaudeOutputTasks {
 
 impl ClaudeCodeRunResources {
     async fn finish(&mut self, terminate: bool, deadline: Instant) -> Result<()> {
+        if self.child.is_remote() {
+            self.child.confirm_remote_cleanup(deadline.saturating_duration_since(Instant::now())).await?;
+        } else {
         if terminate && let Err(error) = self.child.force_terminate_tree() {
             eprintln!("Claude Code tree termination request failed: {error}");
         }
@@ -313,6 +319,8 @@ impl ClaudeCodeRunResources {
                 tokio::time::sleep(Duration::from_millis(if cfg!(windows) { 10 } else { 20 }))
                     .await;
             }
+        }
+
         }
 
         for (name, file) in [
@@ -370,7 +378,15 @@ impl ClaudeCodeCliRuntimeAdapter {
         Ok(())
     }
 
-    pub async fn run(&self, mut request: ClaudeCodeRunRequest) -> Result<ClaudeCodeRunResult> {
+    pub async fn run(&self, request: ClaudeCodeRunRequest) -> Result<ClaudeCodeRunResult> {
+        self.run_with_transport(request, None).await
+    }
+
+    pub(crate) async fn run_remote(&self, request: ClaudeCodeRunRequest, remote: RemoteRuntimeLaunch) -> Result<ClaudeCodeRunResult> {
+        self.run_with_transport(request, Some(remote)).await
+    }
+
+    async fn run_with_transport(&self, mut request: ClaudeCodeRunRequest, remote: Option<RemoteRuntimeLaunch>) -> Result<ClaudeCodeRunResult> {
         let key = (request.agent_run_id.clone(), request.execution_epoch);
         let (interrupt, interrupted) = oneshot::channel();
         let control = Arc::new(ClaudeCodeProcessControl {
@@ -404,6 +420,7 @@ impl ClaudeCodeCliRuntimeAdapter {
                     &request,
                     interrupted,
                     launch_handoff,
+                    remote.as_ref(),
                 ),
             )
             .await;
@@ -558,9 +575,10 @@ impl ClaudeCodeCliRuntimeAdapter {
         request: &ClaudeCodeRunRequest,
         mut interrupted: oneshot::Receiver<()>,
         launch_handoff: Option<oneshot::Sender<()>>,
+        remote: Option<&RemoteRuntimeLaunch>,
     ) -> Result<ClaudeCodeRunResult> {
         let execution_root = Path::new(&request.workspace.execution_root);
-        if !execution_root.is_dir() {
+        if remote.is_none() && !execution_root.is_dir() {
             let internal = anyhow::anyhow!(
                 "Claude Code execution directory no longer exists: {}",
                 execution_root.display()
@@ -577,7 +595,7 @@ impl ClaudeCodeCliRuntimeAdapter {
             );
             return Err(internal.context(RuntimeFailureError::new(failure)));
         }
-        if let Some(root) = request.attachment_access_root.as_deref()
+        if remote.is_none() && let Some(root) = request.attachment_access_root.as_deref()
             && !root.is_dir()
         {
             let internal = anyhow::anyhow!(
@@ -597,7 +615,7 @@ impl ClaudeCodeCliRuntimeAdapter {
             return Err(internal.context(RuntimeFailureError::new(failure)));
         }
         let executable = Path::new(&request.runtime.executable_path);
-        if !is_runtime_entrypoint_file(executable) {
+        if remote.is_none() && !is_runtime_entrypoint_file(executable) {
             let internal = anyhow::anyhow!(
                 "Claude Code executable is missing or not executable: {}",
                 executable.display()
@@ -658,6 +676,13 @@ impl ClaudeCodeCliRuntimeAdapter {
             } else {
                 uuid::Uuid::new_v4().to_string()
             };
+        let (child, bootstrap_file, settings_file) = if let Some(remote) = remote {
+            if !matches!(interrupted.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                anyhow::bail!("Claude Code process was interrupted before remote spawn");
+            }
+            let child = remote_launch::spawn(request, remote, permission_mode, &native_session_id, legacy_read_only).await?;
+            (child, None, None)
+        } else {
         let fast_override = request
             .runtime
             .camp_fast
@@ -804,7 +829,7 @@ impl ClaudeCodeCliRuntimeAdapter {
         }
         // Frozen context can contain user messages and local paths. The managed
         // process uses piped stdin so it never appears in argv or diagnostics.
-        let launch_result: Result<ManagedProcess> = (|| {
+        let launch_result: Result<RuntimeProcess> = (|| {
             let spec = ManagedProcessLaunchSpec::capture(
                 &command,
                 ManagedProcessPurpose::RuntimeOneShot,
@@ -812,7 +837,7 @@ impl ClaudeCodeCliRuntimeAdapter {
                 ManagedWindowsArgvDialect::MicrosoftCrt,
                 format!("agent-run:{}:claude-code-cli", request.agent_run_id),
             )?;
-            ManagedProcess::spawn(spec)
+            RuntimeProcess::spawn(spec)
         })();
         let child = launch_result.map_err(|error| {
             let raw_detail = error.to_string();
@@ -833,6 +858,8 @@ impl ClaudeCodeCliRuntimeAdapter {
                 ))
                 .context(RuntimeFailureError::new(failure))
         })?;
+        (child, bootstrap_file, settings_file)
+        };
         // No await separates spawn from transferring all three resources into
         // the adapter's registered run. Aborting the caller cannot drop them.
         let mut owned = control
@@ -3774,7 +3801,7 @@ mod tests {
             let bootstrap = ClaudeLaunchFile::write(&root, b"bootstrap").unwrap();
             let settings = ClaudeLaunchFile::write(&root, br#"{"fastMode":true}"#).unwrap();
             let mut resources = ClaudeCodeRunResources {
-                child: ManagedProcess::spawn(spec).unwrap(),
+                child: RuntimeProcess::spawn(spec).unwrap(),
                 bootstrap_file: Some(bootstrap.into_managed_path()),
                 settings_file: Some(settings.into_managed_path()),
             };

@@ -525,32 +525,30 @@ pub(crate) fn assert_legacy_upgrade(database: &mut Database) {
     // Recreate the deployed branch 203 layout with populated input/receipt rows.
     // Only the fixture removes the compact columns; production converges forward.
     super::minimax::downgrade_for_test(database.connection());
+    compact_execution::remove_compact_for_test(database.connection());
+    // Freeze the deployed columns before upgrading: newer projections may append fields, but
+    // every historical cell must survive unchanged, including unknown and unfinished inputs.
+    let historical_queries = [
+        "context_manifest", "agent_run_input", "runtime_input_delivery",
+        "camp_message_delivery", "agent_run_claim_context",
+    ].iter().map(|table| {
+        let columns = database.connection()
+            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid").unwrap()
+            .query_map([table], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let quoted = columns.iter().map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>().join(",");
+        format!("SELECT {quoted} FROM {table} ORDER BY 1")
+    }).collect::<Vec<_>>();
     let branch_rows = |c: &Connection| -> Vec<Vec<Vec<rusqlite::types::Value>>> {
-        [
-            "context_manifest",
-            "agent_run_input",
-            "runtime_input_delivery",
-            "camp_message_delivery",
-            "agent_run_claim_context",
-        ]
-        .iter()
-        .map(|table| {
-            let mut q = c
-                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
-                .unwrap();
+        historical_queries.iter().map(|sql| {
+            let mut q = c.prepare(sql).unwrap();
             let count = q.column_count();
             q.query_map([], |r| {
-                (0..count)
-                    .map(|i| r.get(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-        })
-        .collect()
+                (0..count).map(|i| r.get(i)).collect::<rusqlite::Result<Vec<_>>>()
+            }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        }).collect()
     };
-    compact_execution::remove_compact_for_test(database.connection());
     database
         .connection()
         .execute_batch(

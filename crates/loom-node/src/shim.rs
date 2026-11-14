@@ -34,9 +34,15 @@ pub(crate) struct Installed {
     pub(crate) bin_dir: PathBuf,
 }
 
+impl Installed {
+    pub(crate) fn root(&self) -> &Path { &self.root }
+}
+
 impl Drop for Installed {
     fn drop(&mut self) {
-        if run_directory_is_owned(&self.root) {
+        if run_directory_is_owned(&self.root)
+            && plain_directory(&self.root)
+            && self.root.parent().is_some_and(plain_directory) {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
@@ -54,6 +60,20 @@ pub(crate) fn check_run_identity(run_id: &str, attempt: u32) -> Result<()> {
         "attempt is not a safe path component"
     );
     Ok(())
+}
+
+fn plain_directory(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else { return false; };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() { return false; }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() &
+            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 fn safe_path_component(value: &str) -> bool {
@@ -102,20 +122,13 @@ pub(crate) fn install(
 ) -> Result<Installed> {
     ensure!(token.len() == 64, "shim token is invalid");
     check_run_identity(run_id, attempt)?;
-    let root = data_dir.join("runs").join(format!("{run_id}-{attempt}"));
+    let parent = rovai_private_storage::prepare_private_directory(&data_dir.join("runs"))?;
+    let root = parent.join(format!("{run_id}-{attempt}"));
+    create_run_directory(&root)?;
     let bin_dir = root.join("bin");
-    fs::create_dir_all(&bin_dir)
-        .with_context(|| format!("could not create {}", bin_dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(
-            root.parent().unwrap_or(&root),
-            fs::Permissions::from_mode(0o700),
-        )?;
-        fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o700))?;
-    }
+    // From this point every error owns and cleans only this newly-created root.
+    let installed = Installed { root: root.clone(), bin_dir: bin_dir.clone() };
+    rovai_private_storage::prepare_private_directory(&bin_dir)?;
     let credential = root.join("credential");
     let body = serde_json::to_vec(&CredentialFile {
         version: 1,
@@ -140,7 +153,7 @@ pub(crate) fn install(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700))?;
     }
-    Ok(Installed { root, bin_dir })
+    Ok(installed)
 }
 
 pub(crate) fn forward(credential_path: &Path, args: &[String]) -> Result<()> {
@@ -176,24 +189,26 @@ pub(crate) fn forward(credential_path: &Path, args: &[String]) -> Result<()> {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("could not write {}", path.display()))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes).with_context(|| format!("could not write {}", path.display()))?;
-    }
+    let mut file = rovai_private_storage::create_private_new_file(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_run_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    Ok(())
+}
+#[cfg(windows)]
+fn create_run_directory(path: &Path) -> Result<()> {
+    rovai_private_storage::create_private_directory(path)?;
+    Ok(())
+}
+#[cfg(not(any(unix, windows)))]
+fn create_run_directory(_: &Path) -> Result<()> {
+    bail!("legacy_platform_unsupported")
 }
 
 fn shell_single(path: &Path) -> String {
@@ -234,8 +249,14 @@ mod tests {
         let script = fs::read_to_string(installed.bin_dir.join("rovai")).unwrap();
         assert!(!script.contains(&token));
         assert!(script.contains("--shim"));
+        let credential_path = installed.root.join("credential");
+        // Native private-file admission includes Windows DACLs / Unix mode.
+        drop(rovai_private_storage::open_private_read_file(&credential_path).unwrap());
+        assert!(install(&root, "run_1", 1, &token,
+            "ws://127.0.0.1:8767/api/v1/nodes/connect").is_err(),
+            "a second materialization must not overwrite an owned root");
         let credential: serde_json::Value =
-            serde_json::from_slice(&fs::read(installed.root.join("credential")).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(&credential_path).unwrap()).unwrap();
         assert_eq!(credential["token"], token);
         assert_eq!(credential["url"], "http://127.0.0.1:8767/api/v1/nodes/shim");
         drop(installed);

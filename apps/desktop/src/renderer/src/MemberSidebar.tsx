@@ -20,6 +20,7 @@ import type {
   StoredCommandResult
 } from '@contracts'
 import { RuntimeGlyph } from './MemberRuntimePicker'
+import { memberExecutionAvailability, remoteExecutionPresentation } from './member-execution-availability'
 import { adapterLabel } from './runtime-products'
 import { MemberAvatar } from './MemberAvatar'
 import { useMobileLayout } from './MobileLayout'
@@ -317,7 +318,8 @@ function MemberSidebarRow({
 }): React.JSX.Element {
   const [menuOpen, setMenuOpen] = useState(false)
   const selectRef = useRef<HTMLButtonElement>(null)
-  const runtime = memberRuntimePresentation(
+  const execution = memberExecutionAvailability(agent)
+  const runtime = remoteExecutionPresentation(execution) ?? memberRuntimePresentation(
     agent,
     agent.runtimeConfiguration?.adapterKind ?? null,
     availability,
@@ -326,10 +328,10 @@ function MemberSidebarRow({
     platformAdmissionKnown
   )
   const compact = compactRuntimeState(runtime.status)
-  const product = agent.runtimeConfiguration?.adapterKind
-    ? adapterLabel(agent.runtimeConfiguration.adapterKind)
+  const product = execution.adapterKind
+    ? adapterLabel(execution.adapterKind) + (execution.location === 'remote' ? ' · ' + uiAttribute('远端节点') : '')
     : uiAttribute('智能体')
-  const configured = Boolean(agent.runtimeConfiguration?.adapterKind)
+  const configured = execution.configured
   const runtimeLabel = !configured
     ? uiAttribute("{0}，未配置智能体；打开运行配置", agent.displayName)
     : runtime.status === 'available'
@@ -388,7 +390,7 @@ function MemberSidebarRow({
               onPointerDown={(event) => event.stopPropagation()}
               onClick={() => onSelect(agent.agentId, 'runtime', true)}
             >
-              <RuntimeGlyph kind={agent.runtimeConfiguration?.adapterKind ?? null} />
+              <RuntimeGlyph kind={execution.adapterKind} />
               {(compact === 'action' || runtime.status === 'not_qualified' || runtime.status === 'unsupported') && <i className="member-runtime-attention" aria-hidden="true">!</i>}
             </button>
       <Menu.Trigger asChild><button className="member-reorder-menu-anchor" aria-hidden="true" tabIndex={-1} /></Menu.Trigger>

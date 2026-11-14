@@ -3813,6 +3813,241 @@ pub(crate) fn admit_mission_start(
     ))
 }
 
+/// The scheduler component every LOOM handoff is authored by. A handoff is a system message, so
+/// it can never be mistaken for the Owner speaking or for another Agent's output.
+pub(crate) const LOOM_CONTROL_SCHEDULER_COMPONENT: &str = "loom-control-scheduler";
+
+/// The Core-validated facts of one scheduled LOOM dispatch.
+///
+/// Nothing here is read from a model payload: the scheduler derived every field from the standing
+/// policy, the Plan's Tasks and the permanent dispatch ledger before calling the wrapper, so this
+/// type only carries what that transaction already proved.
+pub(crate) struct LoomDispatchAdmission<'a> {
+    pub mission_id: &'a str,
+    pub dispatch_id: &'a str,
+    pub plan_id: &'a str,
+    pub task_id: &'a str,
+    /// The persisted ledger literal: `EXECUTE`, `REVIEW`, `REWORK` or `HANDOFF`.
+    pub kind: &'a str,
+    pub candidate_id: Option<&'a str>,
+    pub policy_revision: i64,
+    pub recipient_agent_id: &'a str,
+    /// The event identity of this dispatch. The ledger row is unique on it, so one event can
+    /// produce at most one Delivery even across a scheduler restart.
+    pub dedupe_key: &'a str,
+    pub now: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoomDispatchAdmissionOutcome {
+    Admitted {
+        camp_message_id: String,
+        delivery_id: String,
+    },
+    /// The dedupe key already carries a ledger row, so nothing new was written.
+    Skipped,
+}
+
+/// Write one LOOM dispatch as the existing system Camp message plus its Delivery, in the caller's
+/// transaction, together with its permanent ledger row.
+///
+/// The ledger row is inserted first (`WAITING`), then the ordinary message/Delivery lane is used
+/// unchanged, then `deliveryId` is attached inside the same transaction — so a rollback leaves
+/// neither half behind and no dispatch can exist without its Delivery or vice versa.
+pub(crate) fn admit_loom_dispatch_message(
+    transaction: &Transaction<'_>,
+    admission: &LoomDispatchAdmission<'_>,
+) -> Result<LoomDispatchAdmissionOutcome> {
+    let camp_id: String = transaction
+        .query_row(
+            "SELECT camp_id FROM mission WHERE id = ?1",
+            [admission.mission_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context("a LOOM dispatch needs the Camp of its Mission")?;
+    // This wrapper proves only that the three identities belong together and that the address has
+    // exactly one live target. Whether the standing approval still covers the Task is the control
+    // plane's judgement, made before this call; the ledger row does not exist yet, so it cannot be
+    // re-derived from the ledger here. A failure rolls the caller's transaction back.
+    let scope_matches: bool = transaction.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM loom_plan AS plan
+            JOIN loom_task AS task ON task.plan_id = plan.plan_id
+            WHERE plan.plan_id = ?1 AND plan.mission_id = ?2 AND task.task_id = ?3)
+        "#,
+        params![admission.plan_id, admission.mission_id, admission.task_id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        scope_matches,
+        "a LOOM dispatch must name one Plan, Mission and Task that belong together"
+    );
+    // The control plane has already checked the budget and has not recorded this event yet, so the
+    // replay test is a plain read: an existing row means this dedupe key was admitted before. It
+    // runs before address resolution because a replay must not depend on who is a current member
+    // today. `ON CONFLICT` is deliberately not used: the ledger refuses a second row at INSERT time,
+    // so a conflicting insert would abort the whole transaction instead of reporting the replay.
+    let already_admitted: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loom_control_dispatch WHERE dedupe_key = ?1)",
+        [admission.dedupe_key],
+        |row| row.get(0),
+    )?;
+    if already_admitted {
+        return Ok(LoomDispatchAdmissionOutcome::Skipped);
+    }
+    let actor = ActorRef::System {
+        component_id: LOOM_CONTROL_SCHEDULER_COMPONENT.to_string(),
+    };
+    let address = ThreadMessageAddress::Explicit {
+        agent_ids: vec![admission.recipient_agent_id.to_string()],
+    };
+    let mut resolution = match resolve_address(transaction, &camp_id, &address, &actor)? {
+        AddressingOutcome::Resolved(resolution) => resolution,
+        AddressingOutcome::Rejected(_) => {
+            anyhow::bail!("a LOOM dispatch recipient must be an active addressable Member")
+        }
+    };
+    anyhow::ensure!(
+        resolution.targets.len() == 1,
+        "a LOOM dispatch addresses exactly one target"
+    );
+    transaction.execute(
+        r#"
+        INSERT INTO loom_control_dispatch(
+            dispatch_id, plan_id, task_id, kind, candidate_id, policy_revision,
+            recipient_agent_id, delivery_id, status, reason, dedupe_key, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'WAITING', NULL, ?8, ?9, ?9)
+        "#,
+        params![
+            admission.dispatch_id,
+            admission.plan_id,
+            admission.task_id,
+            admission.kind,
+            admission.candidate_id,
+            admission.policy_revision,
+            admission.recipient_agent_id,
+            admission.dedupe_key,
+            admission.now,
+        ],
+    )?;
+    ensure_resolution_conversations(transaction, &camp_id, &mut resolution, admission.now)?;
+    let body = loom_handoff_body(admission)?;
+    let content = normalize_content(vec![StructuredThreadMessageSegment::Text { text: body.clone() }]);
+    let camp_message_id = Uuid::new_v4().to_string();
+    // LOOM work is never a DurableTask, so `taskId` stays None. The purpose reuses the approved
+    // handoff sentence for this kind instead of introducing new model-visible wording.
+    let execution = ExecutionRequest {
+        task_id: None,
+        purpose: loom_handoff_kind_parts(admission.kind)?.1.to_string(),
+        completion_role: required_completion_role(),
+        budget: None,
+    };
+    let queued = queue_camp_message_and_runs(
+        transaction,
+        QueueThreadMessageInput {
+            camp_message_id: &camp_message_id,
+            camp_id: &camp_id,
+            body: &body,
+            structured_content: &content,
+            source_attachments: &[],
+            prepared_attachment_ids: &[],
+            legacy_attachment_publication_operation_id: None,
+            managed_attachment_ingest_intent_id: None,
+            consume_composer_draft: false,
+            draft_client: &DraftClient::default(),
+            draft_revision: 1,
+            address_mode: address.mode(),
+            reply_to_camp_message_id: None,
+            resolution: &resolution,
+            execution: Some(&execution),
+            actor: &actor,
+            message_author: Some(ThreadMessageAuthor {
+                author_type: "system",
+                author_id: LOOM_CONTROL_SCHEDULER_COMPONENT,
+                source_agent_run_id: None,
+            }),
+            origin_kind: Some("system"),
+            execution_epoch: None,
+            command_id: admission.dispatch_id,
+            now: admission.now,
+            generated_camp_name: None,
+        },
+    )?;
+    anyhow::ensure!(
+        queued.delivery_ids.len() == 1,
+        "a LOOM dispatch addresses exactly one target, not a batch of Deliveries"
+    );
+    let delivery_id = queued
+        .delivery_ids
+        .first()
+        .cloned()
+        .context("a LOOM dispatch created no Delivery")?;
+    transaction.execute(
+        "UPDATE loom_control_dispatch SET delivery_id = ?2, status = 'DISPATCHED', updated_at = ?3
+         WHERE dispatch_id = ?1 AND status = 'WAITING'",
+        params![admission.dispatch_id, delivery_id, admission.now],
+    )?;
+    Ok(LoomDispatchAdmissionOutcome::Admitted {
+        camp_message_id,
+        delivery_id,
+    })
+}
+
+/// The frozen facts a handoff body carries. Struct field order is the documented order, so the
+/// published line never depends on a map's iteration order.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoomHandoffFacts<'a> {
+    dispatch_id: &'a str,
+    task_id: &'a str,
+    kind: &'a str,
+    candidate_id: Option<&'a str>,
+    policy_revision: i64,
+}
+
+/// The approved wire kind and the single sentence for it. The same sentence labels the Run's
+/// purpose, so no second wording of the same handoff exists.
+fn loom_handoff_kind_parts(kind: &str) -> Result<(&'static str, &'static str)> {
+    Ok(match kind {
+        "EXECUTE" => (
+            "execute",
+            "Work only on this approved task. Acquire its claim, produce evidence and submit a candidate. Do not accept or publish it for the User.",
+        ),
+        "REVIEW" => (
+            "review",
+            "Review this fixed candidate under the current authorization. Use `rovai loom stage-review`; do not change its files or accept it for the User.",
+        ),
+        "REWORK" => (
+            "rework",
+            "Address the recorded request for changes. Acquire a new claim and submit a new candidate linked to the previous candidate, preserving its evidence.",
+        ),
+        "HANDOFF" => (
+            "handoff",
+            "Internal review passed. Summarize the candidate and evidence for the User's acceptance. Do not mark it accepted or publish it yourself.",
+        ),
+        other => anyhow::bail!("LOOM dispatch has no approved handoff kind {other}"),
+    })
+}
+
+/// The approved handoff body. Only the sentence for this dispatch's kind is ever written, and every
+/// dynamic identity is a JSON string: no Task or Candidate text is ever spliced into an instruction.
+fn loom_handoff_body(admission: &LoomDispatchAdmission<'_>) -> Result<String> {
+    let (wire_kind, sentence) = loom_handoff_kind_parts(admission.kind)?;
+    let facts = serde_json::to_string(&LoomHandoffFacts {
+        dispatch_id: admission.dispatch_id,
+        task_id: admission.task_id,
+        kind: wire_kind,
+        candidate_id: admission.candidate_id,
+        policy_revision: admission.policy_revision,
+    })?;
+    Ok(format!(
+        "[LOOM_HANDOFF_V1]\n{facts}\nRead current state with `rovai loom status` and `rovai loom inspect --task-id <taskId>` before acting.\n{sentence}\nIf the policy is paused, expired, out of budget, revoked, or the prior execution outcome is unknown, stop and report the reason. This message grants no permission beyond the saved policy and the runtime's existing permissions."
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ExternalChannelAdmissionInput {
     pub source_attachments: Vec<LocalAttachmentSourceRef>,

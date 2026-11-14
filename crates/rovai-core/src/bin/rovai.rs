@@ -178,14 +178,7 @@ async fn run() -> Result<u8> {
         }
         _ => bail!("invalid Rovai command; run `rovai --help`"),
     };
-    let request_id = if operation == "member.update" {
-        input["requestId"]
-            .as_str()
-            .context("member.update requestId is missing")?
-            .to_string()
-    } else {
-        Uuid::new_v4().to_string()
-    };
+    let request_id = invocation_request_id(&operation, &input)?;
     let body = BuiltinToolIpcRequestBody::Invoke {
         request_id,
         operation,
@@ -1593,7 +1586,7 @@ fn print_root_help() {
 }
 
 fn root_help_text(managed_runtime: bool, tasks_enabled: bool) -> String {
-    let mut text = "Rovai CLI\n\nAgent operations:\n  rovai send\n  rovai member list|get|create|update\n  rovai task create|get|list|update\n  rovai thread list|search|read|runs\n  rovai history search\n  rovai memory view|search|read|write\n  rovai automation list|get|create|run|close|update|delete\n  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit\n\nRun an Agent operation's exact `--help` for its closed inputs.\n".to_string();
+    let mut text = "Rovai CLI\n\nAgent operations:\n  rovai send\n  rovai member list|get|create|update\n  rovai task create|get|list|update\n  rovai thread list|search|read|runs\n  rovai history search\n  rovai memory view|search|read|write\n  rovai automation list|get|create|run|close|update|delete\n  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|run|poll|cancel\n\nRun an Agent operation's exact `--help` for its closed inputs.\n".to_string();
     if !tasks_enabled {
         text = text.replace("  rovai task create|get|list|update\n", "");
     }
@@ -1609,7 +1602,7 @@ fn task_family_help_text() -> &'static str {
 
 /// Confirmed r1 text of `docs/versions/v1.72/model-context-change-loom-accp.md`.
 fn loom_family_help_text() -> &'static str {
-    "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
+    "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n  inspect       Read a task's latest candidate and review authorization.\n  stage-review  Record an authorized internal review; never User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
 }
 
 fn user_automation_available_in_current_process() -> bool {
@@ -2154,6 +2147,30 @@ fn write_indented_help(output: &mut String, help: &str) {
     }
 }
 
+fn invocation_request_id(operation: &str, input: &Value) -> Result<String> {
+    if operation == "member.update" {
+        return Ok(input["requestId"]
+            .as_str()
+            .context("member.update requestId is missing")?
+            .to_owned());
+    }
+    if matches!(
+        operation,
+        "loom.workspace.list" | "loom.workspace.read" | "loom.workspace.run"
+    ) {
+        if let Some(value) = input.get("requestId") {
+            return Ok(Uuid::parse_str(
+                value
+                    .as_str()
+                    .context("workspace requestId must be a UUID")?,
+            )
+            .context("workspace requestId must be a UUID")?
+            .to_string());
+        }
+    }
+    Ok(Uuid::new_v4().to_string())
+}
+
 fn operation_help_examples(operation: &str) -> &'static [&'static str] {
     match operation {
         "mission.list" => &[
@@ -2167,6 +2184,19 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
         ],
         "mission.update" => &["rovai mission update --title \"Directory navigation\""],
         "mission.status" => &["rovai mission status --status needs_you"],
+        "loom.workspace.list" => &["rovai workspace list --workspace-id workspace-id"],
+        "loom.workspace.read" => {
+            &["rovai workspace read --workspace-id workspace-id --path r2-fixture.txt"]
+        }
+        "loom.workspace.run" => {
+            &["rovai workspace run --workspace-id workspace-id --tool-id git.status"]
+        }
+        "loom.workspace.poll" => &[
+            "rovai workspace poll --request-id wrpc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ],
+        "loom.workspace.cancel" => &[
+            "rovai workspace cancel --request-id wrpc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ],
         "loom.status" => &["rovai loom status"],
         "loom.plan" => &["rovai loom plan --input-file plan.json"],
         "loom.release" => &["rovai loom release --task-id report-draft"],
@@ -2175,6 +2205,8 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
             &["rovai loom evidence --relative-path out/report.md --task-id report-draft"]
         }
         "loom.submit" => &["rovai loom submit --task-id report-draft --evidence-ids <artifactId>"],
+        "loom.inspect" => &["rovai loom inspect --task-id t1"],
+        "loom.stage-review" => &["rovai loom stage-review --input-file review.json"],
         "thread.message.send" => &CAMP_MESSAGE_SEND_HELP_EXAMPLES,
         "member.list" => &["rovai member list"],
         "member.get" => &["rovai member get --agent-id agent_27"],
@@ -2558,10 +2590,10 @@ mod tests {
         assert!(!is_family_help(&loom_help));
         assert_eq!(
             loom_family_help_text(),
-            "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
+            "rovai loom\n\nUse LOOM when a Mission needs a plan whose tasks, claims, deliveries and User acceptance stay on record.\nThe target is always the current Thread's Mission. Only the User accepts or rejects a delivery, in the Mission's Delivery tab.\n\n  status    Read the current Mission's plan, tasks and claims.\n  plan      Import the Mission's one plan (Default Lead only).\n  release   Make planned tasks claimable (Default Lead only).\n  claim     Claim a released task for this Run.\n  evidence  Register a file you produced as delivery evidence.\n  submit    Submit a claimed task's delivery for User acceptance.\n  inspect       Read a task's latest candidate and review authorization.\n  stage-review  Record an authorized internal review; never User acceptance.\n\nUse rovai loom <command> --help for arguments.\n"
         );
         assert!(root_help_text(true, true).contains(
-            "  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit\n\n"
+            "  rovai mission list|get|update|status\n  rovai loom status|plan|release|claim|evidence|submit|inspect|stage-review\n  rovai workspace list|read|run|poll|cancel\n\n"
         ));
         assert_eq!(
             task_family_help_text(),
@@ -2571,6 +2603,7 @@ mod tests {
 
     #[test]
     fn exact_help_surface_covers_the_current_catalog_and_no_family_aliases() {
+        assert!(root_help_text(true, true).contains("rovai workspace list|read|run|poll|cancel"));
         let exact_paths: &[&[&str]] = &[
             &["send", "--help"],
             &["member", "list", "--help"],
@@ -2607,8 +2640,15 @@ mod tests {
             &["loom", "claim", "--help"],
             &["loom", "evidence", "--help"],
             &["loom", "submit", "--help"],
+            &["loom", "inspect", "--help"],
+            &["loom", "stage-review", "--help"],
+            &["workspace", "list", "--help"],
+            &["workspace", "read", "--help"],
+            &["workspace", "run", "--help"],
+            &["workspace", "poll", "--help"],
+            &["workspace", "cancel", "--help"],
         ];
-        assert_eq!(exact_paths.len(), 35);
+        assert_eq!(exact_paths.len(), 42);
         for path in exact_paths {
             let args = path
                 .iter()
@@ -3481,5 +3521,41 @@ mod tests {
         let help = operation_help_text(&description);
         assert!(help.starts_with(&format!("rovai loom plan\n{summary}\n")));
         assert!(help.contains("rovai loom plan --input-file plan.json"));
+    }
+}
+
+#[cfg(test)]
+mod workspace_rpc_cli_tests {
+    use super::*;
+    #[test]
+    fn workspace_initial_retry_uuid_is_not_confused_with_poll_target_id() {
+        let id = "6e71a1b4-6b19-4f86-8c18-988552586a37";
+        let input = serde_json::json!({"workspaceId":"workspace","requestId":id});
+        assert_eq!(
+            invocation_request_id("loom.workspace.list", &input).unwrap(),
+            id
+        );
+        assert_eq!(
+            invocation_request_id("loom.workspace.read", &input).unwrap(),
+            id
+        );
+        assert_eq!(
+            invocation_request_id("loom.workspace.run", &input).unwrap(),
+            id
+        );
+        let poll = serde_json::json!({"requestId":"wrpc_observed_id"});
+        let actual = invocation_request_id("loom.workspace.poll", &poll).unwrap();
+        assert!(Uuid::parse_str(&actual).is_ok());
+        assert_ne!(actual, "wrpc_observed_id");
+        assert!(invocation_request_id("loom.workspace.list", &poll).is_err());
+        for operation in [
+            "loom.workspace.list",
+            "loom.workspace.read",
+            "loom.workspace.run",
+            "loom.workspace.poll",
+            "loom.workspace.cancel",
+        ] {
+            assert!(operation_help_examples(operation)[0].starts_with("rovai workspace "));
+        }
     }
 }

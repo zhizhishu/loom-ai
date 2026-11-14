@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  botMemberAvatarRef,
   builtinMemberAvatarRef,
   clampControlledMemberAvatarCrop,
   managedMemberAvatarRef,
@@ -49,6 +50,50 @@ describe('controlled member avatar references', () => {
 
   it('does not construct a managed ref from an invalid id', () => {
     expect(() => managedMemberAvatarRef('------------------------------------')).toThrow(
+      'canonical lowercase UUID'
+    )
+  })
+
+  it('round-trips a bot reference with its managed still asset', () => {
+    const assetId = '2b945f3f-4b45-4ae5-92b2-739fce600338'
+    const value = botMemberAvatarRef('witch-hat', '#F97316', assetId)
+    expect(value).toBe(
+      `rovai://member-avatar/bot/witch-hat/f97316/${assetId}/v1`
+    )
+    expect(parseControlledMemberAvatarRef(value)).toEqual({
+      kind: 'bot',
+      id: 'witch-hat',
+      color: '#f97316',
+      assetId,
+      value
+    })
+  })
+
+  it('rejects non-canonical bot references', () => {
+    const assetId = '2b945f3f-4b45-4ae5-92b2-739fce600338'
+    for (const value of [
+      `rovai://member-avatar/bot/Witch/f97316/${assetId}/v1`,
+      `rovai://member-avatar/bot/-witch/f97316/${assetId}/v1`,
+      `rovai://member-avatar/bot/witch_hat/f97316/${assetId}/v1`,
+      `rovai://member-avatar/bot/${'a'.repeat(49)}/f97316/${assetId}/v1`,
+      `rovai://member-avatar/bot/witch-hat/F97316/${assetId}/v1`,
+      `rovai://member-avatar/bot/witch-hat/f9731/${assetId}/v1`,
+      `rovai://member-avatar/bot/witch-hat/f97316/${assetId.toUpperCase()}/v1`,
+      `rovai://member-avatar/bot/witch-hat/f97316/${assetId}/v2`,
+      `rovai://member-avatar/bot/witch-hat/f97316/${assetId}`,
+      `rovai://member-avatar/bot//f97316/${assetId}/v1`
+    ]) {
+      expect(parseControlledMemberAvatarRef(value), value).toBeNull()
+    }
+  })
+
+  it('refuses to build a bot ref from an unsafe shape, color or asset', () => {
+    const assetId = '2b945f3f-4b45-4ae5-92b2-739fce600338'
+    expect(() => botMemberAvatarRef('Witch', '#f97316', assetId)).toThrow('slug')
+    expect(() => botMemberAvatarRef('witch-hat', '#F9731', assetId)).toThrow(
+      '#rrggbb'
+    )
+    expect(() => botMemberAvatarRef('witch-hat', '#f97316', 'nope')).toThrow(
       'canonical lowercase UUID'
     )
   })

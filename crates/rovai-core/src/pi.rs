@@ -20,10 +20,16 @@ pub(crate) use host::{
     PiActivationFailureKind, PiHost, PiPromptImage, PreparedPiPromptImage, activation_failure_kind,
     machine_ready_probe, model_catalog_probe, prepare_prompt_images,
 };
-pub use host::{PiAgentRunRuntimeRequest, PiRpcRuntimeAdapter, PiRuntime};
+pub use host::{PiAgentRunRuntimeRequest, PiMcpProjection, PiRpcRuntimeAdapter, PiRuntime};
 
 pub(crate) const PI_PROTOCOL_VERSION: &str = "pi-jsonl-rpc-v1";
 pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v8";
+/// The managed Pi MCP extension is a generated bundle: `scripts/build-pi-mcp.mjs`
+/// inlines the maintained MCP client so the Pi process needs no node_modules tree.
+pub(crate) const PI_MCP_EXTENSION_VERSION: &str = "rovai-pi-mcp-v1";
+pub(crate) const MANAGED_MCP_EXTENSION: &str = include_str!("pi/managed-mcp.bundle.mjs");
+pub(crate) const PI_MCP_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+const PI_MCP_MAX_SERVERS: usize = 32;
 // Pi image results may include the same base64 data in content and structuredContent.
 // Receive and send budgets are independent; stderr retains its own smaller limit.
 pub(super) const PI_MAX_INBOUND_RECORD_BYTES: usize = 64 * 1024 * 1024;
@@ -347,7 +353,21 @@ impl PiTextState {
 pub(crate) fn runtime_compatibility_digest(
     frozen_runtime: &FrozenAgentRuntimeConfig,
     cwd: &Path,
+    attachment_authorization: &ThreadOutputDirectory,
+) -> Result<String> {
+    runtime_compatibility_digest_with_mcp(frozen_runtime, cwd, attachment_authorization, None)
+}
+
+/// Same identity, plus the frozen MCP document this Run actually carries.
+///
+/// Warm reuse is fenced on the whole document digest, so two Runs with different
+/// selected servers can never share one Host, and a retry of the same Run keeps
+/// reusing the bytes frozen at launch instead of re-reading the live catalog.
+pub(crate) fn runtime_compatibility_digest_with_mcp(
+    frozen_runtime: &FrozenAgentRuntimeConfig,
+    cwd: &Path,
     _attachment_authorization: &ThreadOutputDirectory,
+    mcp_document: Option<&Value>,
 ) -> Result<String> {
     let cwd = cwd
         .canonicalize()
@@ -355,7 +375,7 @@ pub(crate) fn runtime_compatibility_digest(
     let executable = Path::new(&frozen_runtime.executable_path)
         .canonicalize()
         .context("failed to resolve qualified Pi executable")?;
-    canonical_json_digest(&json!({
+    let mut identity = json!({
         "schemaVersion": 4,
         "adapterKind": AdapterKind::Pi,
         "protocolVersion": PI_PROTOCOL_VERSION,
@@ -366,7 +386,124 @@ pub(crate) fn runtime_compatibility_digest(
         "hostConfigDigest": frozen_runtime.host_config_digest,
         "managedExtensionVersion": PI_HOST_EXTENSION_VERSION,
         "managedExtensionDigest": format!("{:x}", Sha256::digest(include_str!("pi/managed-host.ts").as_bytes())),
-    }))
+    });
+    if let Some(document) = mcp_document {
+        identity["managedMcpExtensionVersion"] = json!(PI_MCP_EXTENSION_VERSION);
+        identity["managedMcpExtensionDigest"] = json!(format!("{:x}", Sha256::digest(MANAGED_MCP_EXTENSION.as_bytes())));
+        identity["managedMcpDocumentDigest"] = json!(managed_mcp_document_digest(document)?);
+    }
+    canonical_json_digest(&identity)
+}
+
+/// Constant used when this Run selects no MCP server at all.
+pub(crate) const PI_MCP_NO_DOCUMENT_DIGEST: &str = "none";
+
+/// One frozen MCP server, in the exact shape the managed extension consumes.
+///
+/// An absent `cwd` is omitted from the document instead of serialized as `null`:
+/// the extension only accepts an absent or a string `cwd`.
+pub(crate) fn managed_mcp_server(name: &str, definition: &crate::mcp::McpServerDefinition) -> Result<Value> {
+    match definition {
+        crate::mcp::McpServerDefinition::Stdio {
+            command,
+            args,
+            cwd,
+            env,
+        } => {
+            let mut entry = serde_json::Map::new();
+            entry.insert("name".to_string(), json!(name));
+            entry.insert("transport".to_string(), json!("stdio"));
+            entry.insert("command".to_string(), json!(command));
+            entry.insert("args".to_string(), json!(args));
+            entry.insert("env".to_string(), json!(env));
+            if let Some(cwd) = cwd {
+                entry.insert("cwd".to_string(), json!(cwd));
+            }
+            Ok(Value::Object(entry))
+        }
+        crate::mcp::McpServerDefinition::StreamableHttp { url, headers } => Ok(json!({
+            "name": name,
+            "transport": "streamable_http",
+            "url": url,
+            "headers": headers,
+        })),
+    }
+}
+
+/// `sha256:` prefix is required by the extension for every digest it verifies.
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+///
+/// The frozen per-Run MCP document for the managed Pi extension.
+///
+/// Two different digests exist on purpose:
+/// * `config_digest` stamps the canonical configuration *body* (schema + servers).
+///   It is what re-identifies the selection; it is not a file stamp.
+/// * `file_digest` covers the **exact bytes written**, trailing newline included,
+///   because the extension hashes the file it actually read.
+///
+#[derive(Debug, Clone)]
+pub(crate) struct PiMcpDocumentFile {
+    pub document: Value,
+    pub bytes: Vec<u8>,
+    pub config_digest: String,
+    pub file_digest: String,
+}
+
+/// The single serializer both Core and the Host writer must use.
+pub(crate) fn managed_mcp_document_file(
+    servers: &std::collections::BTreeMap<String, crate::mcp::McpServerDefinition>,
+) -> Result<PiMcpDocumentFile> {
+    anyhow::ensure!(
+        servers.len() <= PI_MCP_MAX_SERVERS,
+        "Pi MCP selection exceeds the managed server limit"
+    );
+    let mut entries = Vec::with_capacity(servers.len());
+    for (name, definition) in servers {
+        if name.trim().is_empty() || name.contains('\0') {
+            bail!("invalid Pi MCP server name");
+        }
+        entries.push(managed_mcp_server(name, definition)?);
+    }
+    let body = json!({
+        "schemaVersion": PI_MCP_DOCUMENT_SCHEMA_VERSION,
+        "servers": entries,
+    });
+    let config_digest = format!("sha256:{}", canonical_json_digest(&body)?);
+    let document = json!({
+        "schemaVersion": PI_MCP_DOCUMENT_SCHEMA_VERSION,
+        "configDigest": config_digest,
+        "servers": body["servers"].clone(),
+    });
+    let bytes = managed_mcp_document_bytes(&document)?;
+    let file_digest = sha256_prefixed(&bytes);
+    Ok(PiMcpDocumentFile {
+        document,
+        bytes,
+        config_digest,
+        file_digest,
+    })
+}
+
+/// Backwards-compatible view for the read-only Run projection.
+pub(crate) fn managed_mcp_document(
+    servers: &std::collections::BTreeMap<String, crate::mcp::McpServerDefinition>,
+) -> Result<Value> {
+    Ok(managed_mcp_document_file(servers)?.document)
+}
+
+/// Exact on-disk bytes. The Host and the Node-side verifier share this format.
+pub(crate) fn managed_mcp_document_bytes(document: &Value) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(document)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Warm reuse and file admission use the same complete frozen document bytes.
+pub(crate) fn managed_mcp_document_digest(document: &Value) -> Result<String> {
+    Ok(sha256_prefixed(&managed_mcp_document_bytes(document)?))
 }
 
 pub(super) fn completed_action(message: &Value) -> Result<Option<CompletedAcpAction>> {
@@ -724,8 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_file_tools_emit_bounded_read_and_write_operations() {
-        for (tool_name, operation_kind) in [("read", "read"), ("write", "write"), ("edit", "write")]
+    fn terminal_file_tools_emit_bounded_read_and_write_operations() {        for (tool_name, operation_kind) in [("read", "read"), ("write", "write"), ("edit", "write")]
         {
             let (_, payload) = normalize_event(&json!({
                 "type": "tool_execution_end",
@@ -886,5 +1022,100 @@ mod tests {
                 "confirmed": false,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod managed_mcp_document_tests {
+    use super::*;
+    use crate::mcp::McpServerDefinition;
+    use std::collections::BTreeMap;
+
+    fn selection(cwd: Option<&str>) -> BTreeMap<String, McpServerDefinition> {
+        BTreeMap::from([(
+            "fixture".to_string(),
+            McpServerDefinition::Stdio {
+                command: "__NODE_EXECUTABLE__".to_string(),
+                args: vec!["__STDIO_FIXTURE__".to_string()],
+                cwd: cwd.map(str::to_owned),
+                env: BTreeMap::new(),
+            },
+        )])
+    }
+
+    /// The extension hashes the file it read, so Core must stamp those exact bytes.
+    #[test]
+    fn file_digest_covers_the_exact_written_bytes_including_the_newline() {
+        let file = managed_mcp_document_file(&selection(None)).unwrap();
+        assert_eq!(file.bytes.last(), Some(&b'\n'), "the document must end with a newline");
+        assert_eq!(file.file_digest, sha256_prefixed(&file.bytes));
+        assert_eq!(managed_mcp_document_digest(&file.document).unwrap(), file.file_digest);
+        assert_eq!(managed_mcp_document_bytes(&file.document).unwrap(), file.bytes);
+        assert_eq!(
+            file.file_digest,
+            format!("sha256:{:x}", Sha256::digest(&file.bytes))
+        );
+        // The digest must cover the whole file, not just the config body.
+        assert_ne!(file.file_digest, file.config_digest);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&file.bytes).unwrap(),
+            file.document
+        );
+    }
+
+    /// The extension only accepts `sha256:<hex>` and an absent-or-string `cwd`.
+    #[test]
+    fn config_digest_is_prefixed_and_absent_cwd_is_omitted() {
+        let file = managed_mcp_document_file(&selection(None)).unwrap();
+        let config_digest = file.document["configDigest"].as_str().unwrap();
+        assert!(config_digest.starts_with("sha256:"), "{config_digest}");
+        let hex = &config_digest["sha256:".len()..];
+        assert_eq!(hex.len(), 64);
+        assert!(hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(config_digest, file.config_digest);
+
+        let server = &file.document["servers"][0];
+        assert!(server.get("cwd").is_none(), "absent cwd must be omitted: {server}");
+
+        let with_cwd = managed_mcp_document_file(&selection(Some("/synthetic/work"))).unwrap();
+        assert_eq!(
+            with_cwd.document["servers"][0]["cwd"].as_str(),
+            Some("/synthetic/work")
+        );
+        assert_ne!(with_cwd.config_digest, file.config_digest);
+        assert_ne!(with_cwd.file_digest, file.file_digest);
+    }
+
+    /// Warm reuse must move with the configuration body.
+    #[test]
+    fn document_digest_changes_with_the_selection() {
+        let plain = selection(None);
+        let one = managed_mcp_document_file(&plain).unwrap();
+        let two = managed_mcp_document_file(&selection(Some("/synthetic/work"))).unwrap();
+        assert_ne!(
+            managed_mcp_document_digest(&one.document).unwrap(),
+            managed_mcp_document_digest(&two.document).unwrap()
+        );
+        assert_eq!(managed_mcp_document(&plain).unwrap(), one.document);
+        // A Run with no selected server keeps the original identity.
+        assert_eq!(PI_MCP_NO_DOCUMENT_DIGEST, "none");
+    }
+
+    /// The shared fixture is the same frozen shape both Core and the Node test read.
+    #[test]
+    fn shared_fixture_matches_the_generated_document_shape() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../scripts/fixtures/pi-mcp/frozen-document.json"))
+                .unwrap();
+        let generated = managed_mcp_document_file(&selection(None)).unwrap();
+        assert_eq!(fixture["schemaVersion"], generated.document["schemaVersion"]);
+        assert_eq!(fixture["servers"], generated.document["servers"]);
+        // The fixture must carry no configDigest: Core stamps it, the Node test
+        // recomputes the file digest over exactly these bytes.
+        assert!(fixture.get("configDigest").is_none());
+        for server in fixture["servers"].as_array().unwrap() {
+            assert!(server.get("cwd").is_none());
+            assert!(server.get("transport").is_some());
+        }
     }
 }

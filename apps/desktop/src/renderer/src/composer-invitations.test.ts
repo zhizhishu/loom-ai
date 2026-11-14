@@ -73,6 +73,28 @@ describe('composerInvitationTargets', () => {
     }
   })
 
+  it('invites an explicit remote outsider and does not fall back locally when its node goes offline', () => {
+    const profile = {
+      ...profiles[1], runtimeConfiguration: null,
+      runtimeReadiness: { status: 'runtime_not_configured' as const, blockers: [] },
+      executionAvailability: {
+        location: 'remote', configured: true, canLaunch: true,
+        adapterKind: 'claude-code-cli', targetRevision: 2,
+        nodeId: 'node-b', workspaceId: 'workspace-b',
+        readiness: { status: 'installed_unverified', blockers: [] }
+      } satisfies NonNullable<AgentProfile['executionAvailability']>
+    }
+    expect(composerInvitationTargets(['outside', 'outside'], members, [profile], true))
+      .toEqual({ inviteAgentIds: ['outside'], unavailableAgentIds: [] })
+    const offline = { ...profile, runtimeConfiguration,
+      runtimeReadiness: { status: 'ready' as const, blockers: [] },
+      executionAvailability: { ...profile.executionAvailability, canLaunch: false,
+        readiness: { status: 'needs_attention' as const,
+          blockers: [{ code: 'remote_node_offline', detail: null }] } } }
+    expect(composerInvitationTargets(['outside'], members, [offline], true))
+      .toEqual({ inviteAgentIds: [], unavailableAgentIds: ['outside'] })
+  })
+
   it('keeps existing present members addressable independently of runtime readiness', () => {
     const profile = { ...profiles[0], runtimeConfiguration: null,
       runtimeReadiness: { status: 'runtime_not_configured' as const, blockers: [] } }

@@ -247,6 +247,21 @@ export type RuntimeReadinessStatus =
   | 'installed_unverified'
   | 'ready'
 
+export interface MemberExecutionAvailability {
+  location: 'local' | 'remote'
+  configured: boolean
+  /** Eligibility to attempt the next launch; provider authentication is checked at runtime. */
+  canLaunch: boolean
+  adapterKind: AdapterKind | null
+  readiness: {
+    status: RuntimeReadinessStatus
+    blockers: Array<{ code: string; detail: string | null }>
+  }
+  nodeId?: string
+  workspaceId?: string
+  targetRevision: number
+}
+
 export type MemberPresence = 'present' | 'away' | 'removed'
 
 export interface AgentProfile {
@@ -266,6 +281,8 @@ export interface AgentProfile {
     status: RuntimeReadinessStatus
     blockers: Array<{ code: string; detail: string | null }>
   }
+  /** Current Core sends this read-only projection; absence supports older local-only snapshots. */
+  executionAvailability?: MemberExecutionAvailability
   memberOrder: number
   version: number
   createdAt: string
@@ -866,6 +883,7 @@ export interface ThreadCreationPreflight {
     memberOrder: number
     runtimeConfigured: boolean
     runtimeReadiness: RuntimeReadinessStatus
+    executionAvailability?: MemberExecutionAvailability
   }>
   initialLeadAgentId: string | null
   lastMemberCreationHelperAgentId?: string | null
@@ -4297,6 +4315,8 @@ export type CoreMethod =
   | 'members.capabilityCatalog.get'
   | 'members.capabilityCatalog.set'
   | 'members.capabilityCatalog.putItem'
+  | 'members.executionTarget.get'
+  | 'members.executionTarget.save'
   | 'automations.list'
   | 'automations.get'
   | 'automations.runs.list'
@@ -4315,6 +4335,7 @@ export type CoreMethod =
   | 'missions.status'
   | 'missions.start'
   | 'missions.linkPr'
+  | 'loom.bundles.getMany'
   | 'loom.plan.get'
   | 'loom.plan.import'
   | 'loom.task.release'
@@ -4326,10 +4347,14 @@ export type CoreMethod =
   | 'loom.claims.list'
   | 'loom.artifact.register'
   | 'loom.artifacts.list'
+  | 'loom.artifact.preview'
   | 'loom.reviews.list'
   | 'loom.review.record'
   | 'loom.verifications.list'
   | 'loom.verification.record'
+  | 'loom.control.get'
+  | 'loom.control.configure'
+  | 'loom.control.pause'
   | 'automations.create'
   | 'automations.update'
   | 'automations.configureTimeLimit'
@@ -4612,6 +4637,8 @@ export interface NodeOutputPage {
 
 /** One row of `GET /api/v1/nodes`. The node token is never included. */
 export interface ExecutionNodeRecord {
+  /** Live paired-connection fact; absent on older Hosts, not inferred from OS. */
+  computer?: { advertised: boolean; version: number }
   nodeId: string
   displayName: string
   role: string

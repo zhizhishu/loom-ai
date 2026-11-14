@@ -102,7 +102,7 @@
 .mission-folder-option { width: 100%; border: 0; color: var(--ink); background: transparent; text-align: left; }
 .mission-folder-option:hover { background: var(--surface-hover); }
 .mission-board-card.selected { border-color: var(--line-strong); background: var(--neutral-selected); }
-.mission-drawer { position: absolute; z-index: 20; top: 50px; right: 0; bottom: 0; display: flex; width: min(650px, calc(100% - var(--rail-width) - 30px)); min-width: 0; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--conversation-surface); animation: mission-drawer-in 180ms ease-out; }
+.mission-drawer { position: absolute; z-index: 20; top: 50px; right: 0; bottom: 0; display: flex; width: min(420px, calc(100% - var(--rail-width) - 30px)); min-width: 0; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--conversation-surface); animation: mission-drawer-in 180ms ease-out; }
 .mission-icon-button > svg { width: 16px; height: 16px; }
 .mission-drawer-hero { flex: 0 0 auto; min-width: 0; padding: 18px 22px 15px; }
 .mission-drawer-hero h2 { margin: 0 0 8px; color: var(--ink); font-size: 17px; font-weight: 600; line-height: 1.55; overflow-wrap: anywhere; }
@@ -1018,3 +1018,9 @@ button.mission-avatars.is-card-roster:hover .member-avatar { filter: brightness(
 @media(prefers-reduced-motion:reduce) { .mission-team-guidance-toggle .dialog-glyph { transition: none; } }
 
 .mission-team-picker button:focus-visible { outline: 1px solid var(--ink); outline-offset: -2px; }
+
+/* 使命抽屉模式：中间的使命列表让位，只留对话 + 右栏（照 Mikka 三栏）。
+   使命切换走左栏「使命板」图标；这层是 presentation，不动数据与选中逻辑。 */
+.content.mission-active-content > .mission-board-content { display: none; }
+.content.mission-active-content { background: var(--canvas); }
+.content.mission-active-content > .mission-drawer { left: 12px; right: 12px; width: auto; top: 12px; bottom: 12px; }

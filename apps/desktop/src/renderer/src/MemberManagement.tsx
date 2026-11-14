@@ -89,6 +89,8 @@ import {
   type MemberIdentityEditorHandle
 } from './MemberIdentityEditor'
 import { MemberCatalog } from './MemberCatalog'
+import { memberExecutionAvailability, remoteExecutionPresentation } from './member-execution-availability'
+import type { NodeApi } from './nodes-api'
 import { saveMemberIdentity } from './member-identity-save'
 import type { IdentityDraft } from './member-identity-draft'
 import { UiText, uiAttribute } from './interface-language'
@@ -105,6 +107,8 @@ type MembersViewProps = {
   agents: AgentProfile[]
   topNotices?: ReactNode
   installations: AdapterInstallation[]
+  /** Existing node channel; only the run-target panel reads it. */
+  nodes?: NodeApi | null
   runtimeAvailability: ProductRuntimeAvailability[]
   hostPlatform?: HostPlatformKey | null
   runtimePlatformAdmission?: RuntimePlatformAdmission[]
@@ -485,6 +489,7 @@ const MemberEditor = forwardRef<
     activeTab,
     active,
     runtimeFocusRequest,
+    nodes = null,
     onTabChange,
     onReload,
     onProfileCommitted,
@@ -866,6 +871,8 @@ const MemberEditor = forwardRef<
               <h2><UiText zh={"运行配置"} /></h2>
 
             </div>
+            {selectedAgent && <RemoteExecutionNotice agent={selectedAgent} onConfigure={() => setPane('catalog')} />}
+            {selectedAgent?.executionAvailability?.location === 'remote' && <h3><UiText zh="本机运行配置（当前未使用）" /></h3>}
             {selectedAgent ? (
               <MemberRuntimeForm
                 ref={runtimeRef}
@@ -894,8 +901,10 @@ const MemberEditor = forwardRef<
             <MemberCatalog
               agentId={selectedAgent.agentId}
               active={active && pane === 'catalog'}
+              nodes={nodes}
               onDirtyChange={setCatalogDirty}
               onOpenProfile={() => setPane('profile')}
+              onExecutionFactsChanged={() => { void onReload() }}
             />
           </div>}
         </div>
@@ -1106,6 +1115,17 @@ const HOST_PLATFORM_LABELS: Record<HostPlatformKey, string> = {
   'macos-x64': 'macOS Intel',
   'windows-x64': 'Windows x64',
   'linux-x64': 'Linux x64 Server'
+}
+
+function RemoteExecutionNotice({ agent, onConfigure }: { agent: AgentProfile; onConfigure(): void }): React.JSX.Element | null {
+  const execution = memberExecutionAvailability(agent)
+  const status = remoteExecutionPresentation(execution)
+  if (!status) return null
+  return <div className="member-catalog-banner" role="status" data-execution-location="remote">
+    <strong>{execution.adapterKind ? adapterLabel(execution.adapterKind) + ' · ' : ''}{status.label}</strong>
+    <p>{status.detail}</p>
+    <button className="quiet-button" type="button" onClick={onConfigure}><UiText zh="配置运行位置" /></button>
+  </div>
 }
 
 export type MemberRuntimeFormHandle = {

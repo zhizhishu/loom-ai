@@ -324,6 +324,7 @@ struct PiHostLaunch<'a> {
     initial_binding: &'a PiBindingSeed,
     incoming: mpsc::UnboundedSender<PiIncoming>,
     builtin_tools: Option<BuiltinToolProcessConfig>,
+    mcp: Option<&'a PiMcpProjection>,
 }
 
 struct PiProbeRootCleanup(PathBuf);
@@ -525,6 +526,20 @@ impl PiHost {
         create_private_directory(&config_root)?;
         let extension_path = config_root.join("rovai-pi-host.ts");
         write_private_file(&extension_path, MANAGED_HOST_EXTENSION.as_bytes())?;
+        let managed_mcp = match launch.mcp {
+            Some(mcp) => {
+                anyhow::ensure!(super::managed_mcp_document_digest(&mcp.document)? == mcp.digest,
+                    "Pi MCP document digest does not match frozen selection");
+                let (document_path, file_digest) = write_pi_mcp_document(
+                    &config_root, &mcp.document, &mcp.digest,
+                )?;
+                write_private_file(&config_root.join("managed-mcp.bundle.mjs"), super::MANAGED_MCP_EXTENSION.as_bytes())?;
+                let entry = config_root.join("index.mjs");
+                write_private_file(&entry, MANAGED_MCP_ENTRY.as_bytes())?;
+                Some((document_path, file_digest, entry))
+            }
+            None => None,
+        };
         let binding_path = config_root.join("binding.json");
         let initial_document = launch.initial_binding.document(&host_instance_id, 1);
         write_private_json(&binding_path, &initial_document)?;
@@ -537,12 +552,16 @@ impl PiHost {
         if let Some(config) = &launch.builtin_tools {
             config.configure_command(&mut command)?;
         }
-        append_host_arguments(&mut command, &extension_path);
+        let entry = managed_mcp.as_ref().map_or(extension_path.as_path(), |(_, _, entry)| entry.as_path());
+        append_host_arguments(&mut command, Path::new(&node_path(entry)));
         append_session_directory_argument(&mut command, launch.session_dir);
         append_initial_session_argument(&mut command, launch.initial_session_file);
         command
-            .env("ROVAI_PI_HOST_BINDING_FILE", &binding_path)
+            .env("ROVAI_PI_HOST_BINDING_FILE", node_path(&binding_path))
             .env("PI_TELEMETRY", "0");
+        if let Some((document_path, digest, _)) = &managed_mcp {
+            command.envs(pi_mcp_environment(&config_root, document_path, digest, launch.cwd));
+        }
         configure_host_working_directory(&mut command, launch.cwd)?;
         let spec = ManagedProcessLaunchSpec::capture(
             &command,
@@ -1746,6 +1765,15 @@ pub struct PiRpcRuntimeAdapter {
     private_runtime_dir: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct PiMcpProjection {
+    pub document: Value,
+    pub digest: String,
+}
+
+// One explicitly loaded entry owns the platform host and the selected MCP tools.
+const MANAGED_MCP_ENTRY: &str = "import host from \"./rovai-pi-host.ts\";\nimport mcp from \"./managed-mcp.bundle.mjs\";\nexport default async function (pi) { host(pi); await mcp(pi); }\n";
+
 pub struct PiAgentRunRuntimeRequest<'a> {
     pub agent_run_id: &'a str,
     pub execution_epoch: i64,
@@ -1761,6 +1789,7 @@ pub struct PiAgentRunRuntimeRequest<'a> {
     pub native_binding_generation: i64,
     pub bootstrap: &'a PreparedSessionBootstrap,
     pub builtin_tool_factory: &'a BuiltinToolProcessConfigFactory,
+    pub mcp: Option<&'a PiMcpProjection>,
 }
 
 impl PiRpcRuntimeAdapter {
@@ -1858,6 +1887,7 @@ impl PiRpcRuntimeAdapter {
         let spawn_builtin_tool_factory = request.builtin_tool_factory.clone();
         let spawn_environment = request.frozen_runtime.environment.clone();
         let spawn_environment_source = rovai_core::member_environment::launch_source();
+        let spawn_mcp = request.mcp.cloned();
         let lease = self
             .fleet
             .acquire(
@@ -1888,6 +1918,7 @@ impl PiRpcRuntimeAdapter {
                         initial_binding: &spawn_seed,
                         incoming: spawn_incoming,
                         builtin_tools: Some(spawn_builtin_tool_factory.create()?),
+                        mcp: spawn_mcp.as_ref(),
                     })
                     .await?;
                     Ok(RuntimeProcessHost::Pi(host))
@@ -2137,6 +2168,7 @@ async fn spawn_probe_host(executable: &Path) -> Result<(Arc<PiHost>, PiProbeRoot
         initial_binding: &seed,
         incoming,
         builtin_tools: None,
+        mcp: None,
     })
     .await?;
     Ok((host, _probe_root_cleanup))
@@ -2163,6 +2195,18 @@ async fn read_probe_model_catalog(host: &PiHost) -> Result<Value> {
     let models = catalog
         .as_array()
         .context("Pi probe model catalog is malformed")?;
+    if models.is_empty() {
+        // A successful RPC response with zero native models is not a Ready
+        // observation: Pi answers with an empty list when its own provider
+        // configuration is unreachable, and the only selectable model would
+        // then be a fabricated default. Name the Core-owned isolated probe
+        // config root only; inherited user configuration and credential
+        // values stay out of the diagnostic.
+        bail!(
+            "model_required: Pi reported an empty native model catalog (isolated probe config root {})",
+            host.config_root.display()
+        );
+    }
     if models.iter().any(|model| {
         ["provider", "id"].iter().any(|key| {
             model
@@ -2641,6 +2685,59 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     write_private_file(path, &bytes)
 }
 
+/// Path spelling a Node child (and the extension) can consume.
+///
+/// Windows `\\?\` verbatim prefixes are not part of the path a child process
+/// should receive. Containment is *not* relaxed here: the extension still
+/// re-resolves the document and refuses anything outside the private root.
+pub(crate) fn node_path(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    if let Some(tail) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", tail)
+    } else {
+        text.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(text)
+    }
+}
+
+/// Write the frozen MCP document exactly as Core serialized it.
+///
+/// Returns the absolute path and the digest of the **exact bytes written**, which
+/// is what the extension recomputes over the file it read. Using this writer (and
+/// `pi::managed_mcp_document_file` as the only serializer) removes the drift
+/// between the digest Core stamps and the bytes the extension hashes.
+pub(crate) fn write_pi_mcp_document(
+    config_root: &Path,
+    document: &Value,
+    expected_digest: &str,
+) -> Result<(PathBuf, String)> {
+    let digest = super::managed_mcp_document_digest(document)?;
+    anyhow::ensure!(digest == expected_digest, "Pi MCP frozen file digest changed before publication");
+    create_private_directory(config_root)?;
+    let path = config_root.join("mcp.json");
+    write_private_file(&path, &super::managed_mcp_document_bytes(document)?)?;
+    Ok((path, digest))
+}
+
+/// The exact environment the managed extension reads, with Node-consumable spelling.
+///
+/// `ROVAI_PI_MCP_ROOT` is the private config root and `ROVAI_PI_MCP_FILE` is the
+/// document inside it: the extension re-resolves both and refuses anything that
+/// escapes the root, so stripping the Windows verbatim prefix does not relax
+/// containment. The workspace is the prepared execution root, never a guess.
+pub(crate) fn pi_mcp_environment(
+    config_root: &Path,
+    document_path: &Path,
+    document_digest: &str,
+    workspace_root: &Path,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("ROVAI_PI_MCP_FILE", node_path(document_path)),
+        ("ROVAI_PI_MCP_DIGEST", document_digest.to_string()),
+        ("ROVAI_PI_MCP_ROOT", node_path(config_root)),
+        ("ROVAI_PI_MCP_WORKSPACE", node_path(workspace_root)),
+    ]
+}
+
 #[cfg(windows)]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     // Windows does not support Unix directory fsync. The shared primitive
@@ -2979,7 +3076,11 @@ while IFS= read -r request; do
       if [ -f "$fixture_dir/stderr-only" ]; then
         printf '%s\n' 'provider warning text without structured evidence' >&2
       fi
-      printf '{"type":"response","id":"%s","success":true,"command":"get_available_models","data":{"models":[{"provider":"minimax","id":"MiniMax-M3","name":"MiniMax M3"},{"provider":"other","id":"MiniMax-M3"},{"provider":"minimax","id":"next"}]}}\n' "$request_id"
+      if [ -f "$fixture_dir/catalog-empty" ]; then
+        printf '{"type":"response","id":"%s","success":true,"command":"get_available_models","data":{"models":[]}}\n' "$request_id"
+      else
+        printf '{"type":"response","id":"%s","success":true,"command":"get_available_models","data":{"models":[{"provider":"minimax","id":"MiniMax-M3","name":"MiniMax M3"},{"provider":"other","id":"MiniMax-M3"},{"provider":"minimax","id":"next"}]}}\n' "$request_id"
+      fi
       ;;
     new_session)
       session_number=$((session_number + 1))
@@ -3142,6 +3243,55 @@ done
         // partial-looking list, with only arbitrary stderr, remains an observation.
         std::fs::write(root.join("stderr-only"), "").unwrap();
         assert_eq!(model_catalog_probe(&executable).await.unwrap(), catalog);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_native_model_catalog_is_rejected_without_a_false_ready() {
+        let root = std::env::temp_dir().join(format!(
+            "rovai-pi-empty-catalog-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = write_pi_host_fixture(&root);
+        std::fs::write(root.join("catalog-empty"), "").unwrap();
+
+        let catalog_error = model_catalog_probe(&executable)
+            .await
+            .expect_err("an empty native catalog is not a Ready observation")
+            .to_string();
+        assert!(
+            catalog_error.contains("model_required"),
+            "the empty catalog keeps its own error class: {catalog_error}"
+        );
+        // The diagnostic names the Core-owned isolated probe root, so an empty
+        // catalog is attributable without reading inherited user configuration.
+        assert!(
+            catalog_error.contains("rovai-pi-probe-"),
+            "the diagnostic names the isolated probe root: {catalog_error}"
+        );
+        assert!(
+            !catalog_error.contains("/.pi/") && !catalog_error.contains("\\.pi\\"),
+            "the diagnostic never points at a user Pi configuration: {catalog_error}"
+        );
+
+        let ready_error = machine_ready_probe(&executable)
+            .await
+            .expect_err("Machine Ready must not accept an empty catalog")
+            .to_string();
+        assert!(
+            ready_error.contains("model_required"),
+            "Machine Ready rejects the same observation: {ready_error}"
+        );
+
+        // Removing the marker restores the existing non-empty observation.
+        std::fs::remove_file(root.join("catalog-empty")).unwrap();
+        let catalog = model_catalog_probe(&executable)
+            .await
+            .expect("a non-empty native catalog remains a valid observation");
+        assert!(!catalog.as_array().unwrap().is_empty());
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3340,6 +3490,7 @@ done
             initial_binding: &seed,
             incoming,
             builtin_tools: None,
+        mcp: None,
         })
         .await
         .unwrap();
@@ -3526,6 +3677,7 @@ done
                 initial_binding: &seed,
                 incoming,
                 builtin_tools: None,
+        mcp: None,
             })
             .await
             .unwrap();
@@ -3766,6 +3918,7 @@ done
                 initial_binding: &seed,
                 incoming,
                 builtin_tools: None,
+        mcp: None,
             })
             .await?;
             let state = host.command("get_state", json!({})).await;

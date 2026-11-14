@@ -68,6 +68,7 @@ export function AppHeader({
           ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m14 6-6 6 6 6" /></svg>
           : <PanelToggleIcon side="left" visible={false} />}</button>}
         {onBack && <MobileBack label={previewVisible ? uiAttribute("返回对话") : uiAttribute("返回对话列表")} onClick={previewVisible ? filePreview!.hidePane : onBack} />}
+        <div id="loom-thread-identity-slot" className="loom-thread-identity-slot" />
         <div className="context-breadcrumb" hidden={hideTitle}>
           {contextLabel && <span className="context-project">{contextLabel}</span>}
           {contextLabel && <span className="context-sep" aria-hidden="true">›</span>}
@@ -89,6 +90,9 @@ export function AppHeader({
         {previewTabsInPane && previewControls}
       </div>
       {!previewTabsInPane && previewVisible && <FilePreviewTabs compact={previewLayout?.compact} />}
+      {!previewTabsInPane && previewVisible && !previewLayout?.compact
+        && filePreview?.activeTab?.kind === 'mission_activity' && filePreview.tabs.length === 1
+        && <div id="loom-inspector-header-slot" className="loom-inspector-header-slot" />}
       {!previewTabsInPane && previewControls}
     </header>
   )

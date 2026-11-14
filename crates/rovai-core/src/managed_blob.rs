@@ -133,7 +133,9 @@ impl ManagedBlobStore {
 
         let blob_id = format!("blob-sha256-{digest}");
         let now = chrono::Utc::now().to_rfc3339();
-        let transaction = database.connection_mut().transaction()?;
+        let transaction = database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some((existing_size, existing_path)) = transaction
             .query_row(
                 "SELECT byte_size, storage_relative_path FROM managed_blob WHERE sha256 = ?1",
@@ -430,17 +432,37 @@ impl ManagedBlobStore {
     }
 
     pub fn read_bytes(&self, database: &Database, blob_id: &str) -> Result<Vec<u8>> {
+        self.read_bytes_connection(database.connection(), blob_id)
+    }
+
+    /// Reads a Blob while the caller already holds the database, typically inside the transaction
+    /// that just resolved the reference it is about to judge.
+    ///
+    /// The bytes are opened through a handle that refuses to follow a link at any component and
+    /// are read with a bound, so a Blob file replaced by a link, or grown after it was written,
+    /// cannot be handed out as the verified content of its digest.
+    pub(crate) fn read_bytes_connection(
+        &self,
+        connection: &Connection,
+        blob_id: &str,
+    ) -> Result<Vec<u8>> {
         #[cfg(test)]
         BLOB_READS.set(BLOB_READS.get() + 1);
-        let metadata = load_blob_metadata(database.connection(), blob_id)?
+        let metadata = load_blob_metadata(connection, blob_id)?
             .context("Managed Blob does not exist")?;
         if metadata.state != "present" || metadata.byte_size > self.max_blob_bytes {
             anyhow::bail!("Managed Blob is not readable");
         }
         let path = safe_blob_path(&self.root, &metadata.sha256)?;
-        let bytes = fs::read(&path)
+        let mut file = crate::local_attachment_snapshot::open_resolved_file_without_following(&path)
             .with_context(|| format!("failed to read Managed Blob {}", path.display()))?;
-        if bytes.len() as u64 != metadata.byte_size
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(self.max_blob_bytes + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read Managed Blob {}", path.display()))?;
+        if bytes.len() as u64 > self.max_blob_bytes
+            || bytes.len() as u64 != metadata.byte_size
             || format!("{:x}", Sha256::digest(&bytes)) != metadata.sha256
         {
             anyhow::bail!("Managed Blob content does not match its metadata");
@@ -535,50 +557,76 @@ impl ManagedBlobStore {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        // Every current-schema Foreign Key decides, not only the columns this legacy query lists:
+        // a Blob that a newer projection still names must never lose its bytes first and fail its
+        // reference afterwards. The reference set is discovered from the schema, so a projection
+        // this function has never heard of is still honoured.
+        let references = managed_blob_reference_columns(database.connection())?;
         let mut collected = Vec::new();
         for (blob_id, digest) in candidates {
-            let path = safe_blob_path(&self.root, &digest)?;
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+            let transaction = database
+                .connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if blob_is_referenced(&transaction, &references, &blob_id)? {
+                transaction.commit()?;
+                continue;
             }
-            let deleted = database.connection().execute(
-                r#"
-                DELETE FROM managed_blob
-                WHERE id = ?1
-                  AND NOT EXISTS (SELECT 1 FROM action_execution WHERE result_blob_id = ?1)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM context_manifest
-                      WHERE rendered_payload_blob_id = ?1
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM runtime_input_delivery
-                      WHERE hermes_runtime_payload_blob_id = ?1
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM agent_run_execution_evidence
-                      WHERE content_blob_id = ?1
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM agent_run_execution_evidence
-                      WHERE input_blob_id = ?1 OR result_blob_id = ?1
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM agent_run_file_change_projection
-                      WHERE details_blob_id = ?1
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM agent_run_image WHERE content_blob_id = ?1
-                  )
-                "#,
-                [&blob_id],
-            )?;
-            if deleted == 1 {
+            if self.collect_fenced_blob(transaction, &digest, |transaction| {
+                transaction.execute("DELETE FROM managed_blob WHERE id = ?1", [&blob_id])
+            })? {
                 collected.push(blob_id);
             }
         }
         Ok(collected)
+    }
+
+    /// Removes one Blob after the caller proved under this write lock that nothing references it.
+    /// The bytes leave the readable namespace first, the row is deleted, and the file is removed
+    /// only once that delete committed; a row that changed under us rolls back and restores the
+    /// bytes, so a reference can never be left pointing at content that is already gone.
+    fn collect_fenced_blob<F>(&self, transaction: Transaction<'_>, digest: &str, delete: F) -> Result<bool>
+    where
+        F: FnOnce(&Transaction<'_>) -> rusqlite::Result<usize>,
+    {
+        let path = safe_blob_path(&self.root, digest)?;
+        let quarantine_dir = self.root.join("tmp");
+        fs::create_dir_all(&quarantine_dir)?;
+        let quarantine = quarantine_dir.join(format!("gc-{digest}"));
+        let moved = match fs::rename(&path, &quarantine) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        match delete(&transaction) {
+            Ok(1) => {
+                if let Err(error) = transaction.commit() {
+                    if moved {
+                        let _ = fs::rename(&quarantine, &path);
+                    }
+                    return Err(error.into());
+                }
+                if moved {
+                    fs::remove_file(&quarantine).with_context(|| {
+                        format!("failed to remove collected Blob {}", quarantine.display())
+                    })?;
+                }
+                Ok(true)
+            }
+            Ok(_) => {
+                drop(transaction);
+                if moved {
+                    fs::rename(&quarantine, &path)?;
+                }
+                Ok(false)
+            }
+            Err(error) => {
+                drop(transaction);
+                if moved {
+                    let _ = fs::rename(&quarantine, &path);
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Collects only Blobs explicitly owned by the new replaceable-content paths. The database
@@ -636,48 +684,14 @@ impl ManagedBlobStore {
                 transaction.commit()?;
                 continue;
             }
-
-            let path = safe_blob_path(&self.root, &digest)?;
-            let quarantine_dir = self.root.join("tmp");
-            fs::create_dir_all(&quarantine_dir)?;
-            let quarantine = quarantine_dir.join(format!("gc-{digest}"));
-            let moved = match fs::rename(&path, &quarantine) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(error) => return Err(error.into()),
-            };
-            let deleted = transaction.execute(
-                "DELETE FROM managed_blob WHERE id = ?1 AND gc_candidate_at < ?2",
-                params![blob_id, detached_before],
-            );
-            match deleted {
-                Ok(1) => {
-                    if let Err(error) = transaction.commit() {
-                        if moved {
-                            let _ = fs::rename(&quarantine, &path);
-                        }
-                        return Err(error.into());
-                    }
-                    if moved {
-                        fs::remove_file(&quarantine).with_context(|| {
-                            format!("failed to remove collected Blob {}", quarantine.display())
-                        })?;
-                    }
-                    collected.push(blob_id);
-                }
-                Ok(_) => {
-                    drop(transaction);
-                    if moved {
-                        fs::rename(&quarantine, &path)?;
-                    }
-                }
-                Err(error) => {
-                    drop(transaction);
-                    if moved {
-                        let _ = fs::rename(&quarantine, &path);
-                    }
-                    return Err(error.into());
-                }
+            let removed = self.collect_fenced_blob(transaction, &digest, |transaction| {
+                transaction.execute(
+                    "DELETE FROM managed_blob WHERE id = ?1 AND gc_candidate_at < ?2",
+                    params![blob_id, detached_before],
+                )
+            })?;
+            if removed {
+                collected.push(blob_id);
             }
         }
         Ok(collected)
@@ -797,6 +811,27 @@ pub(crate) fn camp_blob_references(
             quote_identifier(&table),
             quote_identifier(&column)
         ))?;
+        ids.extend(
+            query
+                .query_map([camp_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
+    // LOOM evidence hangs off a plan's Mission rather than a Camp Agent Run, so the per-table
+    // match above cannot reach it. Selecting it here keeps Camp deletion from stranding an
+    // archived artifact Blob that nothing can name any more.
+    if connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='loom_artifact_snapshot')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        let mut query = connection.prepare(
+            "SELECT snapshot.blob_id FROM loom_artifact_snapshot AS snapshot
+             JOIN loom_artifact AS artifact ON artifact.artifact_id=snapshot.artifact_id
+             JOIN loom_plan AS plan ON plan.plan_id=artifact.plan_id
+             JOIN mission ON mission.id=plan.mission_id
+             WHERE mission.camp_id=?1",
+        )?;
         ids.extend(
             query
                 .query_map([camp_id], |row| row.get::<_, String>(0))?
@@ -934,6 +969,144 @@ fn sync_parent(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    // Reuse the real Blob/DB fixture; only the extended route owns this race.
+    #[cfg(feature = "extended-tests")]
+    fn assert_put_waits_for_writer(
+        database: &mut Database,
+        store: &ManagedBlobStore,
+        seed: &ManagedBlobMetadata,
+        bytes: &[u8],
+    ) {
+        use std::{cell::RefCell, sync::mpsc, time::Duration};
+        const BOUND: Duration = Duration::from_secs(10);
+        const WRITER_MARKER: &str = "2001-01-01T00:00:00Z";
+        #[derive(Debug)]
+        enum Event {
+            Contended(i32),
+            Finished(Option<i32>),
+        }
+        struct Probe {
+            events: mpsc::Sender<Event>,
+            released: mpsc::Receiver<()>,
+            calls: u32,
+            protocol_ok: bool,
+        }
+        thread_local! {
+            static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+        }
+        fn on_busy(count: i32) -> bool {
+            PROBE.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                let Some(probe) = slot.as_mut() else { return false; };
+                probe.calls += 1;
+                if count != 0 || probe.calls != 1 {
+                    probe.protocol_ok = false;
+                    return false;
+                }
+                if probe.events.send(Event::Contended(count)).is_err() {
+                    probe.protocol_ok = false;
+                    return false;
+                }
+                probe.protocol_ok = probe.released.recv_timeout(BOUND).is_ok();
+                probe.protocol_ok
+            })
+        }
+
+        database.connection().pragma_update(None, "journal_mode", "WAL").unwrap();
+        let mode: String = database.connection()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+        let path: String = database.connection()
+            .query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |row| row.get(0)).unwrap();
+        let timeout_ms: i64 = database.connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0)).unwrap();
+        let blob_id = seed.id.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let mut connection = Connection::open(path).unwrap();
+                let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+                let changed = transaction.execute(
+                    "UPDATE managed_blob SET verified_at = ?1 WHERE id = ?2",
+                    params![WRITER_MARKER, blob_id],
+                ).unwrap();
+                assert_eq!(changed, 1);
+                // A cannot start until B has really updated this row under its write lock.
+                ready_tx.send(()).unwrap();
+                let event = events_rx.recv_timeout(BOUND).expect("A neither contended nor finished");
+                transaction.commit().unwrap();
+                released_tx.send(()).unwrap();
+                event
+            });
+
+            ready_rx.recv_timeout(BOUND).expect("B did not acquire its actual write transaction");
+            PROBE.with(|cell| {
+                assert!(cell.borrow().is_none());
+                *cell.borrow_mut() = Some(Probe {
+                    events: events_tx.clone(),
+                    released: released_rx,
+                    calls: 0,
+                    protocol_ok: true,
+                });
+            });
+            database.connection().busy_handler(Some(on_busy)).unwrap();
+            let outcome = store.put_bytes(database, bytes, "text/plain", "normal");
+            let extended_code = outcome.as_ref().err().and_then(|error| {
+                match error.downcast_ref::<rusqlite::Error>() {
+                    Some(rusqlite::Error::SqliteFailure(code, _)) => Some(code.extended_code),
+                    _ => None,
+                }
+            });
+            // Deferred can fail its read-to-write upgrade without invoking a busy handler.
+            // This event still releases B immediately; no sleep or blind retry is needed.
+            let _ = events_tx.send(Event::Finished(extended_code));
+            let event = writer.join().expect("writer thread panicked");
+            database.connection().busy_timeout(
+                Duration::from_millis(u64::try_from(timeout_ms).unwrap())
+            ).unwrap();
+            let probe = PROBE.with(|cell| cell.borrow_mut().take().unwrap());
+            let count: i64 = database.connection()
+                .query_row("SELECT COUNT(*) FROM managed_blob WHERE sha256 = ?1", [&seed.sha256], |row| row.get(0)).unwrap();
+            let row: (String, String, i64, String, Option<String>) = database.connection()
+                .query_row(
+                    "SELECT id, sha256, byte_size, created_at, verified_at FROM managed_blob WHERE sha256 = ?1",
+                    [&seed.sha256],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                ).unwrap();
+            let readback = store.read_bytes(database, &seed.id).unwrap();
+            let trigger = match &event {
+                Event::Contended(retry_index) => serde_json::json!({"kind":"Contended","retryIndex":retry_index}),
+                Event::Finished(code) => serde_json::json!({"kind":"Finished","sqliteExtendedCode":code}),
+            };
+            println!("MANAGED_BLOB_CONTENTION {}", serde_json::json!({
+                "busyCallbacks":probe.calls, "busyProtocolOk":probe.protocol_ok,
+                "putOk":outcome.is_ok(), "sqliteExtendedCode":extended_code,
+                "writerCommitTrigger":trigger, "rowCount":count,
+                "createdAtPreserved":row.3 == seed.created_at,
+                "writerMarkerReplaced":row.4.as_deref() != Some(WRITER_MARKER),
+                "readbackSha256":format!("{:x}", Sha256::digest(&readback)),
+                "readbackBytes":readback.len()
+            }));
+            assert_eq!(count, 1);
+            assert_eq!(row.0, seed.id);
+            assert_eq!(row.1, seed.sha256);
+            assert_eq!(row.2, i64::try_from(bytes.len()).unwrap());
+            assert_eq!(row.3, seed.created_at);
+            assert_eq!(readback, bytes);
+            assert!(matches!(event, Event::Contended(0)), "put_reader failed before obtaining write admission: {outcome:?}");
+            assert_eq!(probe.calls, 1);
+            assert!(probe.protocol_ok);
+            let result = outcome.expect("put_reader must succeed after the competing writer commits");
+            assert_eq!(result.id, seed.id);
+            assert_eq!(result.sha256, seed.sha256);
+            assert_eq!(result.verified_at, row.4);
+            assert_ne!(row.4.as_deref(), Some(WRITER_MARKER));
+        });
+    }
+
     #[test]
     fn targeted_gc_uses_detach_time_and_rechecks_all_foreign_key_references() {
         let directory =
@@ -943,6 +1116,8 @@ mod tests {
         let unowned = store
             .put_bytes(&mut database, b"historical", "text/plain", "normal")
             .unwrap();
+        #[cfg(feature = "extended-tests")]
+        assert_put_waits_for_writer(&mut database, &store, &unowned, b"historical");
         let candidate = store
             .put_bytes_candidate(
                 &mut database,

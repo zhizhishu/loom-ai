@@ -1,3 +1,4 @@
+import type { HostWorkbench, ComputerPort, ComputerFrame, NativeCatalog, NativePreview } from '../../desktop/src/renderer/src/loom-native/host-services'
 import { TAB_AUTH_KEY, type AuthStorage, type BrowserSession } from './auth-storage'
 import { browserEditingRecovery } from './editing-recovery'
 import { RECOVERY_KEY, type RecoveryStorage } from './tab-recovery'
@@ -141,16 +142,21 @@ export const WEB_OPERATIONS = [
   'missions.status',
   'missions.start',
   'missions.linkPr',
+  'loom.bundles.getMany',
   'loom.plan.get',
   'loom.tasks.list',
   'loom.dependencies.list',
   'loom.candidates.list',
   'loom.claims.list',
   'loom.artifacts.list',
+  'loom.artifact.preview',
   'loom.reviews.list',
   'loom.verifications.list',
   'loom.review.record',
   'loom.verification.record',
+  'loom.control.get',
+  'loom.control.configure',
+  'loom.control.pause',
   'automations.create',
   'automations.update',
   'automations.close',
@@ -172,6 +178,8 @@ export const WEB_OPERATIONS = [
   'thread.messages.find',
   'members.list',
   'members.get',
+  'members.executionTarget.get',
+  'members.executionTarget.save',
   'members.runProjection.preview',
   'members.capabilityCatalog.get',
   'members.capabilityCatalog.set',
@@ -284,6 +292,8 @@ const RECONCILABLE_COMMANDS = new Set<WebOperation>([
   'missions.linkPr',
   'loom.review.record',
   'loom.verification.record',
+  'loom.control.configure',
+  'loom.control.pause',
   'automations.create',
   'automations.update',
   'automations.close',
@@ -337,6 +347,9 @@ export class InvalidationDecoder {
 }
 
 type SessionResponse = { protocolVersion?: unknown; token?: unknown; clientId?: unknown; editorProof?: unknown; ownerId?: unknown; channels?: unknown; fileTransfers?: { uploadMaxBytes?: unknown; nativeDownload?: unknown }; expiresAt?: unknown; serverTime?: unknown; renewalWindowSeconds?: unknown }
+
+type RemoteComputerPath = `computer/nodes/${string}`
+type WorkbenchPath = RemoteComputerPath | 'computer/agents/list' | 'computer/agents/grant' | 'computer/agents/revoke' | 'native-discovery' | 'native-discovery/preview' | 'native-discovery/import-mcp' | 'computer/status' | 'computer/view' | 'computer/frame' | 'computer/control' | 'computer/control/heartbeat' | 'computer/control/release' | 'computer/view/stop' | 'computer/input'
 
 export class ConsoleClient {
   readonly origin: string
@@ -1118,11 +1131,78 @@ export class ConsoleClient {
     return payload as T
   }
 
+  /** Fixed-route Host adapters share the existing authenticated transport. */
+  readonly workbench: HostWorkbench = {
+    catalog: threadId => this.#workbenchJson<NativeCatalog>('native-discovery', threadId ? { threadId } : {}),
+    preview: (sourceId, expectedDigest, threadId) => this.#workbenchJson<NativePreview>('native-discovery/preview', { sourceId, expectedDigest, ...(threadId ? { threadId } : {}) }),
+    importMcp: (sourceId, expectedDigest, expectedConfigDigest, threadId) => this.#workbenchJson('native-discovery/import-mcp', { sourceId, expectedDigest, expectedConfigDigest, consent: true, ...(threadId ? { threadId } : {}) }),
+    computerNodes: async () => { const list = await this.listNodes(); return list.nodes.map(node => ({ nodeId:node.nodeId, displayName:node.displayName, status:node.status, computerProtocolVersions:node.computer?.advertised === true && Number.isInteger(node.computer.version) ? [node.computer.version] : [], os:node.os })) },
+    remoteComputer: nodeId => this.#remoteComputer(nodeId),
+    computer: {
+      agents: {
+        list: () => this.#workbenchJson('computer/agents/list', {}),
+        grant: input => this.#workbenchJson('computer/agents/grant', { ...input, consent: true }),
+        revoke: grantId => this.#workbenchJson('computer/agents/revoke', { grantId })
+      },
+      status: () => this.#workbenchJson('computer/status', {}),
+      startView: deviceId => this.#workbenchJson('computer/view', { deviceId, consent: true }),
+      frame: (viewId, signal) => this.#computerFrame(viewId, signal),
+      acquire: (viewId, deviceId) => this.#workbenchJson('computer/control', { viewId, deviceId, consent: true, ttlSeconds: 30 }),
+      heartbeat: identity => this.#workbenchJson('computer/control/heartbeat', { ...identity, consent: true }),
+      release: identity => this.#workbenchJson('computer/control/release', identity),
+      stop: viewId => this.#workbenchJson('computer/view/stop', { viewId }),
+      input: (identity, seq, event) => this.#workbenchJson('computer/input', { ...identity, seq, event, consent: true })
+    }
+  }
+
+  #remoteComputer(nodeId: string): ComputerPort {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(nodeId)) throw new Error('执行节点身份无效。')
+    const base = `computer/nodes/${nodeId}` as const
+    // No Agent grant port here: remote Agent tooling has a separate admission gate.
+    return {
+      status: () => this.#workbenchJson(base, {}),
+      startView: deviceId => this.#workbenchJson(`${base}/view`, { deviceId, consent:true }),
+      frame: (viewId, signal) => this.#computerFrame(viewId,signal,`${base}/frame`),
+      acquire: (viewId,deviceId) => this.#workbenchJson(`${base}/control`, { viewId,deviceId,consent:true,ttlSeconds:30 }),
+      heartbeat: identity => this.#workbenchJson(`${base}/control/heartbeat`, { ...identity,consent:true }),
+      release: identity => this.#workbenchJson(`${base}/control/release`,identity),
+      stop: viewId => this.#workbenchJson(`${base}/view/stop`,{viewId}),
+      input: (identity,seq,event) => this.#workbenchJson(`${base}/input`,{...identity,seq,event,consent:true})
+    }
+  }
+
+  async #workbenchJson<T>(path: WorkbenchPath, body: unknown): Promise<T> {
+    // Native discovery may inspect multiple bounded roots. Computer calls have a
+    // shorter local helper deadline too; no request is allowed to hang forever.
+    const timeout = path.startsWith('computer/agents/') ? 45_000 : path.startsWith('native-discovery') ? 25_000 : 10_000
+    return this.#json<T>(path, { method: 'POST', body: JSON.stringify(body), signal: AbortSignal.timeout(timeout) })
+  }
+
+  async #computerFrame(viewId: string, signal?: AbortSignal, path: WorkbenchPath = 'computer/frame'): Promise<ComputerFrame> {
+    const generation = this.#generation
+    const timeout = AbortSignal.timeout(10_000)
+    const response = await this.#authorized(path, { method: 'POST', body: JSON.stringify({ viewId, consent: true }), signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
+    const size = Number(response.headers.get('Content-Length'))
+    if (Number.isFinite(size) && size > 4 * 1024 * 1024) throw new Error('电脑画面超出允许大小。')
+    if (!response.headers.get('Content-Type')?.startsWith('image/png')) throw new Error('主机返回的画面格式无效。')
+    const blob = await this.#readResponse(() => response.blob(), generation, signal)
+    if (generation !== this.#generation) throw new DOMException('Connection replaced', 'AbortError')
+    const parts = (response.headers.get('x-loom-computer-bounds') ?? '').split(',').map(Number)
+    const width = Number(response.headers.get('x-loom-computer-width'))
+    const height = Number(response.headers.get('x-loom-computer-height'))
+    const seq = Number(response.headers.get('x-loom-computer-frame-seq'))
+    const capturedAt = Number(response.headers.get('x-loom-computer-captured-at'))
+    if (blob.size === 0 || blob.size > 4 * 1024 * 1024 || parts.length !== 4 || !parts.every(Number.isSafeInteger)
+      || parts[2]! <= 0 || parts[3]! <= 0 || ![width, height, seq, capturedAt].every(Number.isSafeInteger)
+      || width <= 0 || height <= 0 || width > 4096 || height > 4096 || seq < 0) throw new Error('电脑画面元数据无效，未显示。')
+    return { blob, bounds: { x: parts[0]!, y: parts[1]!, width: parts[2]!, height: parts[3]! }, width, height, seq, capturedAt }
+  }
+
   async getWorkspaces(path?: string, offset = 0): Promise<WorkspaceListing> {
     return this.#json('workspaces', { method: 'POST', body: JSON.stringify({ path, offset }) })
   }
 
-  async #json<T>(path: 'session' | 'session/renew' | 'channels' | 'updates' | 'workspaces' | 'uploads' | 'uploads/reconcile' | 'files' | 'downloads' | 'avatars', options: RequestInit = {}, recovery = false): Promise<T> {
+  async #json<T>(path: WorkbenchPath | 'session' | 'session/renew' | 'channels' | 'updates' | 'workspaces' | 'uploads' | 'uploads/reconcile' | 'files' | 'downloads' | 'avatars', options: RequestInit = {}, recovery = false): Promise<T> {
     const generation = this.#generation
     const response = await this.#authorized(path, options, recovery)
     const result = await this.#readResponse(() => response.json(), generation, options.signal, path !== 'session/renew') as T
@@ -1144,7 +1224,7 @@ export class ConsoleClient {
     }
   }
 
-  async #authorized(path: 'session' | 'session/renew' | 'channels' | 'updates' | 'request' | 'events' | 'logout' | 'workspaces' | 'uploads' | 'uploads/reconcile' | 'files' | 'files/bytes' | 'attachments' | 'downloads' | 'avatars', options: RequestInit = {}, recovery = false): Promise<Response> {
+  async #authorized(path: WorkbenchPath | 'session' | 'session/renew' | 'channels' | 'updates' | 'request' | 'events' | 'logout' | 'workspaces' | 'uploads' | 'uploads/reconcile' | 'files' | 'files/bytes' | 'attachments' | 'downloads' | 'avatars', options: RequestInit = {}, recovery = false): Promise<Response> {
     if (!this.#token) throw new SessionRequired()
     const internal = recovery || ['session', 'session/renew', 'events', 'logout', 'uploads/reconcile'].includes(path)
     // Pending domain submissions block new commands/uploads at their admission

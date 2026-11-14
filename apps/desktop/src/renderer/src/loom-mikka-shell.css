@@ -1,0 +1,206 @@
+/* ── LOOM shell (Package A) ─────────────────────────────────────────────
+   Scope: sidebar + rail rows only. Every rule is prefixed with `.loom-mikka`
+   (root class set by the supervisor on NavigationShell), so nothing here can
+   leak into chat, panels or dialogs. Import order must be AFTER styles.css.
+   Owned layout (--rail-width, .unified-sidebar grid, top strip height) is NOT
+   touched from this file: the rail keeps real resize behaviour. */
+
+.loom-mikka {
+  --mm-rail: 64px;
+  --mm-sidebar: #ededec;
+  --mm-selected: #d6d6d4;
+  --mm-hover: #e5e5e3;
+  --mm-muted: #777;
+  --mm-sep: #e8e8e8;
+  --mm-ink: #1d1d1f;
+  --mm-row-h: 52px;
+  --mm-row-radius: 14px;
+}
+
+/* Shared system font stack + neutral sidebar surface. */
+.loom-mikka .navigation-scroll {
+  background: var(--mm-sidebar);
+  padding: 6px 8px 10px;
+  min-width: 0;
+}
+.loom-mikka .sidebar-agents,
+.loom-mikka .navigation-projects,
+.loom-mikka .pinned-navigation {
+  background: transparent;
+  border: 0;
+}
+
+/* Brand: restrained LOOM wordmark next to the (existing) small mark. */
+.loom-mikka .rail-logo {
+  gap: 8px;
+  color: var(--mm-ink);
+}
+.loom-mikka .rail-logo-mark {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+.loom-mikka .rail-logo strong {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+/* Rail: icon-only, 64px wide, generous hit targets. Labels stay hidden here
+   (the reference rail is icon-only); accessible names still come from
+   aria-label on each button, which this file never changes. */
+.loom-mikka .unified-primary-nav {
+  width: var(--mm-rail);
+  padding: 8px 0;
+  gap: 6px;
+  align-items: center;
+}
+.loom-mikka .unified-primary-nav .rail-button {
+  width: 44px;
+  min-height: 44px;
+  height: 44px;
+  border-radius: 12px;
+  justify-content: center;
+  padding: 0;
+}
+.loom-mikka .unified-primary-nav .rail-glyph {
+  width: 20px;
+  height: 20px;
+}
+.loom-mikka .mission-rail-badge-dot {
+  top: 7px;
+  right: 8px;
+  width: 7px;
+  height: 7px;
+}
+
+/* Top search: real `.conversation-jump` button (opens the command palette),
+   kept inside an easy-to-restyle container. `grid-area: jump` preserves the
+   current sidebar grid slot; the supervisor positions the window-centred
+   strip. Keyboard behaviour, label and shortcut hint stay intact. */
+.loom-mikka .mm-topsearch {
+  grid-area: jump;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  padding: 0 8px;
+  -webkit-app-region: no-drag;
+}
+.loom-mikka .mm-topsearch .conversation-jump {
+  width: min(100%, 420px);
+  height: 32px;
+  justify-self: center;
+  border: 1px solid var(--mm-sep);
+  border-radius: 10px;
+  background: #ffffff;
+  color: var(--mm-muted);
+  -webkit-app-region: no-drag;
+}
+.loom-mikka .mm-topsearch .conversation-jump kbd {
+  flex: 0 0 auto;
+  font-size: 11px;
+}
+
+/* Group headings: small, muted, with a separator rule. */
+.loom-mikka .sidebar-group-title.navigation-section-title {
+  color: var(--mm-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 10px 6px 6px;
+  margin: 0;
+  border-bottom: 1px solid var(--mm-sep);
+  background: transparent;
+}
+
+/* Rows: 52px targets, broad 14px selection, no left colour bar. These
+   intentionally override the earlier 40px PiBot block in styles.css by
+   specificity instead of editing shared CSS. */
+.loom-mikka .camp-nav-row {
+  min-height: var(--mm-row-h);
+  border: 0;
+  border-radius: var(--mm-row-radius);
+  background: none;
+  min-width: 0;
+}
+.loom-mikka .camp-nav-row:hover {
+  background: var(--mm-hover);
+}
+.loom-mikka .camp-nav-row.selected {
+  background: var(--mm-selected);
+  border-left: 0;
+  box-shadow: none;
+}
+.loom-mikka .camp-nav-open {
+  min-height: var(--mm-row-h);
+  padding: 6px 40px 6px 8px;
+  gap: 7px;
+  font-size: 13px;
+  line-height: 1.35;
+  align-items: center;
+  min-width: 0;
+}
+/* Member avatars stay 34px (`size="workspace"`), coloured by the real
+   per-agent accent token; nothing is re-tinted here. */
+.loom-mikka .sidebar-agents .member-avatar {
+  flex: 0 0 auto;
+}
+
+/* Two-line row text: primary (semibold, one line) + secondary (muted, one
+   truncated line). Second line is only ever rendered when a real fact
+   exists — no placeholder statuses. */
+.loom-mikka .mm-row-main {
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+}
+.loom-mikka .mm-row-primary {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--mm-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.loom-mikka .mm-row-sub {
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.35;
+  color: var(--mm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* The draft marker becomes plain muted secondary text (no coloured pill). */
+.loom-mikka .mm-row-sub .camp-draft-badge {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--mm-muted);
+  font-size: 12px;
+}
+.loom-mikka .camp-unread-dot {
+  width: 7px;
+  height: 7px;
+}
+
+/* Responsive: interior padding only — column widths stay owned elsewhere. */
+@media (max-width: 1200px) {
+  .loom-mikka .navigation-scroll { padding: 4px 6px 8px; }
+  .loom-mikka .camp-nav-open { padding: 6px 36px 6px 6px; }
+  .loom-mikka .mm-row-primary,
+  .loom-mikka .mm-row-sub { font-size: 12.5px; }
+}
+@media (max-width: 900px) {
+  .loom-mikka .unified-primary-nav { width: 56px; }
+  .loom-mikka .mm-topsearch { padding: 0 4px; }
+  .loom-mikka .mm-topsearch .conversation-jump { width: 100%; }
+}

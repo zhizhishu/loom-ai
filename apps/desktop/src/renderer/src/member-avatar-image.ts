@@ -232,6 +232,36 @@ function ownedArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return Uint8Array.from(bytes).buffer
 }
 
+/**
+ * Rasterizes an already rendered still avatar SVG (upstream `renderAvatarSvg`)
+ * to PNG bytes, so a generated shape travels through the same normalized-image
+ * save path as an uploaded picture.
+ */
+export async function rasterizeMemberAvatarSvg(
+  svg: string,
+  edge: number
+): Promise<Uint8Array> {
+  validateDecodedMemberAvatarDimensions(edge, edge)
+  const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }))
+  try {
+    const image = new Image()
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve()
+      image.onerror = () => reject(new Error(uiAttribute('无法读取头像图形')))
+      image.src = url
+    })
+    const canvas = document.createElement('canvas')
+    canvas.width = edge
+    canvas.height = edge
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error(uiAttribute('无法创建头像画布'))
+    context.drawImage(image, 0, 0, edge, edge)
+    return await canvasToPngBytes(canvas)
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
 async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
   const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((value) => {

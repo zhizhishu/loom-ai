@@ -3,8 +3,8 @@ import { clampNavigationWidth, navigationDragLayout, navigationMaxWidth, parseNa
 
 describe('navigation layout preferences and collapse threshold', () => {
   it('recovers from corrupt storage and keeps a saved expanded width while collapsed', () => {
-    for (const raw of [null, '{', 'null', 'false', '{"width":"300","collapsed":"true"}']) expect(parseNavigationLayout(raw)).toEqual({ width: 270, collapsed: false })
-    expect(parseNavigationLayout('{"width":1e999}').width).toBe(270)
+    for (const raw of [null, '{', 'null', 'false', '{"width":"300","collapsed":"true"}']) expect(parseNavigationLayout(raw)).toEqual({ width: 328, collapsed: false })
+    expect(parseNavigationLayout('{"width":1e999}').width).toBe(328)
     expect(parseNavigationLayout('{"width":350,"collapsed":true}')).toEqual({ width: 350, collapsed: true })
     expect(parseNavigationLayout('{"width":0}').width).toBe(200)
     expect(parseNavigationLayout('{"width":900}').width).toBe(420)

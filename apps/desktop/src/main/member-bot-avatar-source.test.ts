@@ -89,6 +89,29 @@ describe('controlled member Bot avatar source resolver', () => {
       .rejects.toThrow('feishu_member_bot_avatar_ref_invalid')
   })
 
+  it('reads a shape (bot) avatar through the same managed PNG asset', async () => {
+    const bytes = new Uint8Array([1, 2, 3])
+    const managed = {
+      read: vi.fn(async () => ({
+        mediaType: 'image/png' as const,
+        bytes,
+        width: 192,
+        height: 192,
+        crop: { centerX: 96, centerY: 96, size: 192 }
+      }))
+    }
+    const resolver = new ControlledMemberBotAvatarSourceResolver(managed, vi.fn())
+    const avatarRef =
+      'rovai://member-avatar/bot/star/f97316/2b945f3f-4b45-4ae5-92b2-739fce600338/v1'
+
+    await expect(resolver.resolve(avatarRef)).resolves.toEqual({
+      pngBytes: bytes,
+      width: 192,
+      height: 192
+    })
+    expect(managed.read).toHaveBeenCalledWith(avatarRef, 'icon', 192)
+  })
+
   it('fails closed when an assigned managed avatar cannot be read', async () => {
     const resolver = new ControlledMemberBotAvatarSourceResolver(
       { read: vi.fn(async () => null) },

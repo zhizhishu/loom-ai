@@ -1749,7 +1749,7 @@ pub fn persist_plan(connection: &Connection, workspace: &MissionWorkspace) -> Re
     Ok(())
 }
 pub fn execution_directory(connection: &Connection, camp_id: &str) -> Result<Option<String>> {
-    Ok(connection.query_row("SELECT w.working_directory FROM mission_workspace w JOIN mission m ON m.id=w.mission_id WHERE m.camp_id=?1 AND w.state='ready' ORDER BY w.created_at LIMIT 1",[camp_id],|r|r.get(0)).optional()?)
+    Ok(connection.query_row("SELECT w.working_directory FROM mission_workspace w JOIN mission m ON m.id=w.mission_id WHERE m.camp_id=?1 AND w.state='ready' AND w.execution_host_id=(SELECT id FROM mission_execution_host WHERE singleton=1) ORDER BY w.created_at,w.id LIMIT 1",[camp_id],|r|r.get(0)).optional()?)
 }
 
 pub fn workspace_in_use(connection: &Connection, workspace: &MissionWorkspace) -> Result<bool> {

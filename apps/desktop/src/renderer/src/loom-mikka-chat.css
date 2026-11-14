@@ -1,0 +1,281 @@
+/*
+ * LOOM Mikka — conversation surface.
+ *
+ * Scope: every rule is nested under `.loom-mikka .camp-workspace` (root marker on NavigationShell,
+ * `camp-workspace` marker on ThreadWorkspace's shell). Quick chat (`.quick-chat-workspace`) and the
+ * single chat pane never match, so this file cannot leak into other surfaces and no shared
+ * stylesheet has to change. No `!important`: the extra scope classes out-specify styles.css.
+ */
+
+.loom-mikka {
+  --conversation-action: #155dff;
+  --conversation-action-hover: #0f4bd8;
+  --mikka-user-bubble: #155dff;
+  --mikka-user-bubble-ink: #ffffff;
+  --mikka-assistant-bubble: #f5f5f5;
+  --mikka-hairline: #e8e8e8;
+  --mikka-hairline-strong: #d6d6d4;
+  --mikka-ink-soft: #3c3c3c;
+  --mikka-muted: #777;
+  --mikka-canvas: #ffffff;
+}
+
+/* ---------------------------------------------------------------- canvas */
+
+.loom-mikka .camp-workspace .timeline-pane,
+.loom-mikka .camp-workspace .camp-conversation-stage {
+  background: var(--mikka-canvas);
+}
+
+/* ------------------------------------------------- centered identity capsule */
+
+.loom-mikka .mikka-thread-identity {
+  display: flex;
+  min-height: 34px;
+  flex: 0 0 auto;
+  align-items: center;
+  align-self: center;
+  gap: 7px;
+  width: fit-content;
+  max-width: calc(100% - 48px);
+  margin: 10px auto 2px;
+  padding: 3px 13px 3px 4px;
+  border: 1px solid #ededec;
+  border-radius: 999px;
+  background: var(--mikka-canvas);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.07);
+}
+
+.loom-mikka .mikka-thread-identity-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--mikka-ink-soft);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------ message bubbles (Mikka) */
+
+/* assistant: light gray rounded card, 16px radius, 720px narrative width */
+.loom-mikka .camp-workspace .conversation-bubble.agent .final-copy,
+.loom-mikka .camp-workspace .conversation-bubble.agent .message-bubble {
+  max-width: min(720px, 100%);
+  padding: 10px 14px 11px;
+  border-radius: 16px;
+  background: var(--mikka-assistant-bubble);
+}
+
+/* user: bright blue, 20px radius, right aligned, white ink */
+.loom-mikka .camp-workspace .conversation-bubble:is(.user, .external_principal) .message-bubble {
+  max-width: min(720px, 100%);
+  padding: 10px 14px 11px;
+  border-color: var(--mikka-user-bubble);
+  border-radius: 20px;
+  color: var(--mikka-user-bubble-ink);
+  background: var(--mikka-user-bubble);
+}
+
+.loom-mikka .camp-workspace .conversation-bubble:is(.user, .external_principal) .message-bubble :where(
+  p, span, div, li, ul, ol, strong, b, em, i, blockquote, h1, h2, h3, h4, h5, h6, time, code
+) {
+  color: inherit;
+}
+
+.loom-mikka .camp-workspace .conversation-bubble:is(.user, .external_principal) .message-bubble :where(a) {
+  color: var(--mikka-user-bubble-ink);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.loom-mikka .camp-workspace .conversation-bubble:is(.user, .external_principal) .message-bubble :where(code) {
+  background: color-mix(in srgb, var(--mikka-user-bubble-ink) 18%, transparent);
+}
+
+/* narrative breathing room: side padding only, so the find-bar padding-top overrides in
+   styles.css (`.camp-conversation-stage.conversation-find-open > .timeline-scroll`) keep winning */
+@media (min-width: 901px) {
+  .loom-mikka .camp-workspace .timeline-scroll {
+    padding-right: 24px;
+    padding-left: 24px;
+  }
+}
+
+/* ------------------------------------------------------- compact tool cards */
+
+.loom-mikka .camp-workspace .tool-group-summary,
+.loom-mikka .camp-workspace .tool-call-summary {
+  border-radius: 12px;
+  border-color: var(--mikka-hairline);
+  background: #fafafa;
+}
+
+.loom-mikka .camp-workspace .tool-group-summary {
+  min-height: 34px;
+  padding: 5px 10px;
+  font-size: 12.5px;
+}
+
+.loom-mikka .camp-workspace .tool-activity-group > .tool-group-items {
+  border-color: var(--mikka-hairline);
+}
+
+/* ----------------------------------------------------------------- composer */
+
+.loom-mikka .camp-workspace .composer-box.mikka-composer {
+  min-height: 92px;
+  padding: 14px 16px 12px;
+  border-color: var(--mikka-hairline);
+  border-radius: 20px;
+  background: var(--mikka-canvas);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+}
+
+.loom-mikka .camp-workspace .composer-box.mikka-composer:focus-within {
+  border-color: var(--mikka-hairline-strong);
+  box-shadow: 0 2px 8px rgba(16, 24, 40, 0.09);
+}
+
+.loom-mikka .camp-workspace .composer-box.mikka-composer .composer-action-row {
+  min-height: 34px;
+  padding-top: 4px;
+  background: var(--mikka-canvas);
+}
+
+.loom-mikka .camp-workspace .composer-box.mikka-composer .composer-tools {
+  gap: 8px;
+}
+
+/* current member + model chip, bottom left of the composer */
+.loom-mikka .camp-workspace .mikka-composer-chip {
+  display: inline-flex;
+  max-width: min(240px, 46vw);
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px 3px 3px;
+  border: 1px solid var(--mikka-hairline);
+  border-radius: 999px;
+  color: var(--mikka-ink-soft);
+  background: var(--mikka-canvas);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.loom-mikka .camp-workspace .mikka-composer-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.loom-mikka .camp-workspace .mikka-composer-chip-model {
+  min-width: 0;
+  max-width: 116px;
+  overflow: hidden;
+  color: var(--mikka-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.loom-mikka .camp-workspace .mikka-composer-chip-model::before {
+  margin-right: 5px;
+  color: var(--mikka-hairline-strong);
+  content: '·';
+}
+
+/* the rail above the composer already names the recipient on narrow screens */
+@media (max-width: 640px) {
+  .loom-mikka .camp-workspace .mikka-composer-chip {
+    display: none;
+  }
+}
+
+/* circular 32px send, bottom right. The visual label is hidden only; the button keeps the
+   accessible name supplied by ComposerDeliveryAction (aria-label / aria-keyshortcuts / title),
+   and the steer dropdown trigger stays visible and operable. */
+.loom-mikka .camp-workspace .mikka-send-slot {
+  display: inline-flex;
+  align-items: center;
+}
+
+.loom-mikka .camp-workspace .mikka-send-slot .steer-send-group {
+  gap: 0;
+  background: transparent;
+}
+
+.loom-mikka .camp-workspace .mikka-send-slot .composer-primary-action {
+  border-radius: 999px;
+}
+
+.loom-mikka .camp-workspace .mikka-send-slot .composer-primary-action.steer-send-action {
+  position: relative;
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+  border-radius: 999px;
+}
+
+.loom-mikka .camp-workspace .mikka-send-slot .steer-send-action > svg {
+  width: 17px;
+  height: 17px;
+}
+
+/* visual text of the steer send button only; the accessible name lives on the button element */
+.loom-mikka .camp-workspace .mikka-send-slot .steer-send-action > span:not(.composer-primary-action-spinner) {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  border: 0;
+  white-space: nowrap;
+}
+
+.loom-mikka .camp-workspace .mikka-send-slot .steer-send-choice {
+  min-width: 18px;
+  height: 32px;
+  padding: 0 2px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--mikka-muted);
+  background: transparent;
+}
+
+.loom-mikka .camp-workspace .mikka-send-slot .steer-send-choice:hover:not(:disabled) {
+  color: var(--conversation-action);
+  background: transparent;
+}
+
+.loom-mikka .camp-workspace .mikka-send-slot .steer-send-choice:disabled {
+  opacity: 0.42;
+}
+
+.loom-mikka .camp-workspace .mikka-send-slot .steer-send-group.has-no-choice .steer-send-action {
+  border-radius: 999px;
+}
+
+/* Shared-header identity and compact real controls. */
+.loom-mikka .mikka-thread-identity-name { margin: 0; }
+.loom-mikka .camp-workspace .mikka-composer-chip { cursor: pointer; border: 0; background: #f1f1f1; }
+.loom-mikka .camp-workspace .mikka-composer-chip:disabled { cursor: default; }
+.loom-mikka .camp-workspace .mikka-chip-chevron { flex: 0 0 12px; }
+.loom-mikka .camp-workspace .composer-attachment-button { width: 30px; height: 30px; border-radius: 50%; background: var(--mikka-assistant-bubble); }
+.loom-mikka .camp-workspace .mikka-send-slot .composer-primary-action.is-send:not(.is-invite) { min-width: 32px; width: 32px; height: 32px; padding: 0; }
+.loom-mikka .camp-workspace .composer-hint-visual { display: none; }
+.loom-mikka .camp-workspace .composer > div:first-child { display: flex; flex-direction: column; }
+.loom-mikka .camp-workspace .composer-route-slot { order: 2; }
+.loom-mikka .camp-workspace .composer-box { order: 1; }
+:root[data-theme="night"] .loom-mikka {
+  --mikka-user-bubble: #3976ff; --mikka-assistant-bubble: #292c30;
+  --mikka-hairline: #3b3e42; --mikka-hairline-strong: #52565c;
+  --mikka-ink-soft: #eceef0; --mikka-muted: #a5a9af; --mikka-canvas: #1b1d20;
+}
+:root[data-theme="night"] .loom-mikka .camp-workspace .mikka-composer-chip,
+:root[data-theme="night"] .loom-mikka .camp-workspace .tool-group-summary,
+:root[data-theme="night"] .loom-mikka .camp-workspace .tool-call-summary { background: #292c30; }

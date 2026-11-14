@@ -11,6 +11,10 @@ const CANDIDATE_TABLE: &str = "loom_candidate";
 const REVIEW_TABLE: &str = "loom_review";
 const VERIFICATION_TABLE: &str = "loom_verification";
 const ARTIFACT_TABLE: &str = "loom_artifact";
+const CONTROL_POLICY_TABLE: &str = "loom_control_policy";
+const CONTROL_COMMAND_TABLE: &str = "loom_control_command";
+const STAGE_REVIEW_TABLE: &str = "loom_stage_review";
+const CONTROL_DISPATCH_TABLE: &str = "loom_control_dispatch";
 
 /// Task states follow the LOOM control-plane contract
 /// (DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED).
@@ -27,6 +31,16 @@ const ACCEPTANCE_STATUS: &str = "CHECK(acceptance_status IN ('PENDING','ACCEPTED
 const REVIEW_VERDICT: &str = "CHECK(verdict IN ('ACCEPTED','REJECTED'))";
 /// Evidence verification is an axis of its own: a Run's claim is not a proof.
 const VERIFICATION_RESULT: &str = "CHECK(result IN ('PASSED','FAILED'))";
+/// An assistant stage verdict is not the Owner's verdict: `pass` only advances the internal
+/// stage, so the persisted literals still stay apart from `loom_review`'s ACCEPTED/REJECTED.
+const STAGE_VERDICT: &str = "CHECK(verdict IN ('PASS','REQUEST_CHANGES','BLOCKED'))";
+/// The four dispatch kinds the control plane may ask another Run to perform.
+const DISPATCH_KIND: &str = "CHECK(kind IN ('EXECUTE','REVIEW','REWORK','HANDOFF'))";
+/// A Dispatch is a ledger row: it moves once through these states and is never deleted.
+const DISPATCH_STATUS: &str =
+    "CHECK(status IN ('WAITING','DISPATCHED','SETTLED','BLOCKED','CANCELLED'))";
+/// The only kinds of command the control plane may replay.
+const CONTROL_COMMAND_KIND: &str = "CHECK(kind IN ('CONFIGURE','PAUSE','STAGE_REVIEW'))";
 
 fn create_sql() -> String {
     format!(
@@ -350,6 +364,329 @@ fn claim_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     Ok(columns == 10 && open_task_index && declared)
 }
 
+/// Migration 232: the persistent automation authority of one LOOM plan.
+///
+/// These four tables are the whole control plane, and they are deliberately separate from
+/// `loom_candidate`/`loom_review`: an assistant's stage verdict is not the Owner's verdict, so
+/// it never lands in the human review table.
+///
+/// * `loom_control_policy` — one row per plan carrying the whole approved configuration, who
+///   approved it, the row counter `revision` and the grant counter `authorization_revision`.
+///   `revision` advances on every accepted command (pause/resume included) so a request written
+///   against an older reading is refused; `authorization_revision` advances only on a real
+///   re-approval, so pausing and resuming cannot launder the standing grant into a new one.
+/// * `loom_control_command` — the strict replay ledger: `request_json` holds the normalized
+///   request (trusted caller identity included), so a replayed `commandId` can only ever return
+///   what that exact request produced.
+/// * `loom_stage_review` — one immutable assistant verdict per (candidate, policy revision).
+/// * `loom_control_dispatch` — the Delivery association and budget ledger. Rows are never
+///   deleted, so re-approving a policy cannot reset what previous revisions already consumed.
+fn control_sql() -> String {
+    let mut sql = format!(
+        r#"
+        CREATE TABLE {CONTROL_POLICY_TABLE} (
+            plan_id TEXT PRIMARY KEY,
+            mission_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            authorization_revision INTEGER NOT NULL CHECK(authorization_revision >= 1),
+            enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+            paused INTEGER NOT NULL CHECK(paused IN (0,1)),
+            task_ids_json TEXT NOT NULL
+                CHECK(json_valid(task_ids_json) AND json_type(task_ids_json)='array'),
+            reviewers_json TEXT NOT NULL
+                CHECK(json_valid(reviewers_json) AND json_type(reviewers_json)='array'),
+            max_dispatches INTEGER NOT NULL CHECK(max_dispatches BETWEEN 1 AND 1000),
+            max_reworks_per_task INTEGER NOT NULL CHECK(max_reworks_per_task BETWEEN 0 AND 20),
+            expires_at TEXT,
+            approved_by TEXT NOT NULL CHECK(length(approved_by) BETWEEN 1 AND 200),
+            approved_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(plan_id) REFERENCES {PLAN_TABLE}(plan_id) ON DELETE CASCADE
+        );
+        CREATE TABLE {CONTROL_COMMAND_TABLE} (
+            command_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            kind TEXT NOT NULL {CONTROL_COMMAND_KIND},
+            request_json TEXT NOT NULL CHECK(json_valid(request_json)),
+            response_json TEXT NOT NULL CHECK(json_valid(response_json)),
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX loom_control_command_plan_idx
+            ON {CONTROL_COMMAND_TABLE}(plan_id, command_id);
+        CREATE TABLE {STAGE_REVIEW_TABLE} (
+            stage_review_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            candidate_id TEXT NOT NULL
+                REFERENCES {CANDIDATE_TABLE}(candidate_id) ON DELETE CASCADE,
+            command_id TEXT NOT NULL UNIQUE,
+            reviewer_agent_id TEXT NOT NULL CHECK(length(reviewer_agent_id) BETWEEN 1 AND 200),
+            reviewer_agent_run_id TEXT NOT NULL CHECK(length(reviewer_agent_run_id) BETWEEN 1 AND 200),
+            policy_revision INTEGER NOT NULL CHECK(policy_revision >= 1),
+            manifest_hash TEXT NOT NULL CHECK(length(manifest_hash) BETWEEN 1 AND 200),
+            verdict TEXT NOT NULL {STAGE_VERDICT},
+            reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 4000),
+            criteria_results_json TEXT NOT NULL
+                CHECK(json_valid(criteria_results_json) AND json_type(criteria_results_json)='array'),
+            reviewed_at TEXT NOT NULL,
+            UNIQUE(candidate_id, policy_revision),
+            FOREIGN KEY(plan_id, task_id)
+                REFERENCES {TASK_TABLE}(plan_id, task_id) ON DELETE CASCADE
+        );
+        CREATE INDEX loom_stage_review_plan_idx ON {STAGE_REVIEW_TABLE}(plan_id, stage_review_id);
+        CREATE INDEX loom_stage_review_task_idx ON {STAGE_REVIEW_TABLE}(task_id, reviewed_at);
+        CREATE TRIGGER loom_stage_review_immutable
+            BEFORE UPDATE ON {STAGE_REVIEW_TABLE}
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM stage review is immutable'); END;
+        -- INSERT OR REPLACE would delete and re-insert, slipping past a BEFORE UPDATE guard,
+        -- so a second row claiming the same identity is refused outright.
+        CREATE TRIGGER loom_stage_review_no_replace
+            BEFORE INSERT ON {STAGE_REVIEW_TABLE}
+            WHEN EXISTS(
+                SELECT 1 FROM {STAGE_REVIEW_TABLE}
+                WHERE stage_review_id=NEW.stage_review_id
+                   OR command_id=NEW.command_id
+                   OR (candidate_id=NEW.candidate_id AND policy_revision=NEW.policy_revision)
+                   OR rowid=NEW.rowid
+            )
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM stage review is immutable'); END;
+        -- A direct DELETE is refused while the candidate still exists; only the aggregate
+        -- cascade, where the candidate is already gone, may remove the verdict.
+        CREATE TRIGGER loom_stage_review_no_direct_delete
+            BEFORE DELETE ON {STAGE_REVIEW_TABLE}
+            WHEN EXISTS(SELECT 1 FROM {CANDIDATE_TABLE} WHERE candidate_id=OLD.candidate_id)
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM stage review is immutable'); END;
+        CREATE TABLE {CONTROL_DISPATCH_TABLE} (
+            dispatch_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL {DISPATCH_KIND},
+            candidate_id TEXT,
+            policy_revision INTEGER NOT NULL CHECK(policy_revision >= 1),
+            recipient_agent_id TEXT NOT NULL CHECK(length(recipient_agent_id) BETWEEN 1 AND 200),
+            delivery_id TEXT,
+            status TEXT NOT NULL {DISPATCH_STATUS},
+            reason TEXT CHECK(reason IS NULL OR length(reason) BETWEEN 1 AND 2000),
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(plan_id, task_id)
+                REFERENCES {TASK_TABLE}(plan_id, task_id) ON DELETE CASCADE
+        );
+        CREATE INDEX loom_control_dispatch_plan_idx
+            ON {CONTROL_DISPATCH_TABLE}(plan_id, created_at);
+        CREATE INDEX loom_control_dispatch_task_idx
+            ON {CONTROL_DISPATCH_TABLE}(task_id, kind);
+        -- One Delivery can carry at most one dispatch: the association is a fact, not a hint.
+        CREATE UNIQUE INDEX loom_control_dispatch_delivery_idx
+            ON {CONTROL_DISPATCH_TABLE}(delivery_id) WHERE delivery_id IS NOT NULL;
+        -- The identity of a dispatch is immutable: only `delivery_id`, `status`, `reason` and
+        -- `updated_at` may move after the row exists.
+        CREATE TRIGGER loom_control_dispatch_identity
+            BEFORE UPDATE OF dispatch_id, plan_id, task_id, kind, candidate_id, policy_revision,
+                             recipient_agent_id, dedupe_key, created_at
+            ON {CONTROL_DISPATCH_TABLE}
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM dispatch identity is immutable'); END;
+        -- `INSERT OR REPLACE` under the same dispatch id or dedupe key is refused outright. SQLite
+        -- only fires the implicit DELETE of a REPLACE when `recursive_triggers` is ON, so a delete
+        -- guard alone is not enough: this BEFORE INSERT guard is the one that always holds. The
+        -- Delivery lane checks the dedupe key itself and then inserts plainly, never with REPLACE.
+        CREATE TRIGGER loom_control_dispatch_no_replace
+            BEFORE INSERT ON {CONTROL_DISPATCH_TABLE}
+            WHEN EXISTS(
+                SELECT 1 FROM {CONTROL_DISPATCH_TABLE}
+                WHERE dispatch_id=NEW.dispatch_id
+                   OR dedupe_key=NEW.dedupe_key
+                   OR rowid=NEW.rowid
+            )
+            BEGIN SELECT RAISE(ABORT, 'a recorded LOOM dispatch is immutable'); END;
+        -- A direct DELETE is refused while the parent Task still exists; only the aggregate
+        -- cascade, where the Task is already gone, may remove the ledger row.
+        CREATE TRIGGER loom_control_dispatch_no_direct_delete
+            BEFORE DELETE ON {CONTROL_DISPATCH_TABLE}
+            WHEN EXISTS(SELECT 1 FROM {TASK_TABLE}
+                        WHERE plan_id=OLD.plan_id AND task_id=OLD.task_id)
+            BEGIN SELECT RAISE(ABORT, 'a LOOM dispatch is a permanent budget record'); END;
+        "#
+    );
+    // The artifact snapshot projection is part of the same pre-release schema 232. Its SQL is
+    // owned by `crate::loom::snapshot`; appending it here means the control migration, the
+    // object-list comparison and the test downgrade all cover it from the first install instead of
+    // needing a second migration for a shape nothing has shipped yet.
+    sql.push_str(crate::loom::snapshot::MIGRATION_SQL);
+    sql
+}
+
+/// Statement-level normalisation: whitespace outside literals and quoted identifiers is
+/// insignificant, everything else is contract. Copied deliberately from the LOOM archive
+/// template in `loom/remote_artifact.rs` so both surfaces compare SQLite's own text the same way.
+fn normalized_control_sql(sql: &str) -> String {
+    let mut result = String::new();
+    let mut quote = None;
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(end) = quote {
+            result.push(ch);
+            if ch == end {
+                if chars.peek() == Some(&end) {
+                    result.push(chars.next().unwrap());
+                } else {
+                    quote = None;
+                }
+            }
+        } else if matches!(ch, '\'' | '"' | '[') || ch as u32 == 96 {
+            quote = Some(if ch == '[' { ']' } else { ch });
+            result.push(ch);
+        } else if !ch.is_ascii_whitespace() {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Every schema object SQLite itself reports for the four control tables — table, index and
+/// trigger with its real `CREATE` text — so a `WHEN 0` stub trigger, a lookalike index name or a
+/// wrong partial index cannot pass as the contract.
+fn control_schema_objects(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<(String, String, String, Option<String>)>> {
+    let mut statement = connection.prepare(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master
+         WHERE tbl_name IN ('loom_control_policy','loom_control_command',
+                            'loom_stage_review','loom_control_dispatch',
+                            'loom_artifact_snapshot')
+         ORDER BY type,name",
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get::<_, Option<String>>(3)?
+                    .map(|sql| normalized_control_sql(&sql)),
+            ))
+        })?
+        .collect()
+}
+
+/// The control projection is part of the LOOM schema from migration 232 on; earlier markers
+/// keep admitting databases that predate the automation authority.
+///
+/// The authority is compared by executing this module's own `control_sql()` in a scratch
+/// in-memory database and diffing SQLite's reported objects, not by counting columns or looking
+/// for index names: only the real table CHECKs, the real unique/partial indexes and the real
+/// trigger bodies satisfy the comparison.
+fn control_schema_matches_shape_tokens(connection: &Connection) -> rusqlite::Result<bool> {
+    let policy_columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('plan_id','mission_id','revision','authorization_revision','enabled','paused',
+              'task_ids_json','reviewers_json','max_dispatches','max_reworks_per_task',
+              'expires_at','approved_by','approved_at','updated_at')",
+        [CONTROL_POLICY_TABLE],
+        |row| row.get(0),
+    )?;
+    let stage_columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('stage_review_id','plan_id','mission_id','task_id','candidate_id','command_id',
+              'reviewer_agent_id','reviewer_agent_run_id','policy_revision','manifest_hash',
+              'verdict','reason','criteria_results_json','reviewed_at')",
+        [STAGE_REVIEW_TABLE],
+        |row| row.get(0),
+    )?;
+    let dispatch_columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('dispatch_id','plan_id','task_id','kind','candidate_id','policy_revision',
+              'recipient_agent_id','delivery_id','status','reason','dedupe_key',
+              'created_at','updated_at')",
+        [CONTROL_DISPATCH_TABLE],
+        |row| row.get(0),
+    )?;
+    let command_columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('command_id','plan_id','kind','request_json','response_json','created_at')",
+        [CONTROL_COMMAND_TABLE],
+        |row| row.get(0),
+    )?;
+    let stage_triggers: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1
+             AND name IN ('loom_stage_review_immutable','loom_stage_review_no_replace',
+                          'loom_stage_review_no_direct_delete')",
+        [STAGE_REVIEW_TABLE],
+        |row| row.get(0),
+    )?;
+    let dispatch_triggers: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1
+             AND name IN ('loom_control_dispatch_identity','loom_control_dispatch_no_replace',
+                          'loom_control_dispatch_no_direct_delete')",
+        [CONTROL_DISPATCH_TABLE],
+        |row| row.get(0),
+    )?;
+    let indexes: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN
+             ('loom_control_command_plan_idx','loom_stage_review_plan_idx',
+              'loom_stage_review_task_idx','loom_control_dispatch_plan_idx',
+              'loom_control_dispatch_task_idx','loom_control_dispatch_delivery_idx')",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalize = |sql: &str| sql.split_whitespace().collect::<String>();
+    let policy_declared = table_sql(connection, CONTROL_POLICY_TABLE)?.is_some_and(|sql| {
+        let sql = normalize(&sql);
+        sql.contains(&normalize("max_dispatches INTEGER NOT NULL CHECK(max_dispatches BETWEEN 1 AND 1000)"))
+            && sql.contains(&normalize("max_reworks_per_task INTEGER NOT NULL CHECK(max_reworks_per_task BETWEEN 0 AND 20)"))
+            && sql.contains(&normalize("CHECK(enabled IN (0,1))"))
+            && sql.contains(&normalize("REFERENCESloom_plan(plan_id)"))
+    });
+    let stage_declared = table_sql(connection, STAGE_REVIEW_TABLE)?.is_some_and(|sql| {
+        let sql = normalize(&sql);
+        sql.contains(&normalize(STAGE_VERDICT))
+            && sql.contains("UNIQUE(candidate_id,policy_revision)")
+            && sql.contains(&normalize("REFERENCESloom_candidate(candidate_id)"))
+            && sql.contains(&normalize("REFERENCESloom_task(plan_id,task_id)"))
+    });
+    let dispatch_declared = table_sql(connection, CONTROL_DISPATCH_TABLE)?.is_some_and(|sql| {
+        let sql = normalize(&sql);
+        sql.contains(&normalize(DISPATCH_KIND))
+            && sql.contains(&normalize(DISPATCH_STATUS))
+            && sql.contains(&normalize("dedupe_key TEXT NOT NULL UNIQUE"))
+    });
+    let delivery_index_declared = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='loom_control_dispatch_delivery_idx'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .is_some_and(|sql| {
+            let sql = normalize(&sql);
+            sql.contains("ONloom_control_dispatch(delivery_id)")
+                && sql.contains("WHEREdelivery_idISNOTNULL")
+        });
+    Ok(policy_columns == 14
+        && stage_columns == 14
+        && dispatch_columns == 13
+        && command_columns == 6
+        && stage_triggers == 3
+        && dispatch_triggers == 3
+        && indexes == 6
+        && policy_declared
+        && stage_declared
+        && dispatch_declared
+        && delivery_index_declared)
+}
+
+/// The authoritative control-schema check: the exact object list of this module's own executed
+/// SQL, plus the token-level guards above for a readable failure reason.
+pub(super) fn control_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(&control_sql())?;
+    Ok(control_schema_matches_shape_tokens(connection)?
+        && control_schema_objects(connection)? == control_schema_objects(&expected)?)
+}
+
 fn table_sql(connection: &Connection, table: &str) -> rusqlite::Result<Option<String>> {
     connection
         .query_row(
@@ -476,7 +813,37 @@ fn trigger_sql_matches(
     Ok(normalise(&stored) == normalise(expected))
 }
 
+fn artifact_origin_present(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('loom_artifact') WHERE name='origin_key')",
+        [],
+        |r| r.get(0),
+    )
+}
+
+pub(super) fn migrate_remote_artifact_origin(connection: &Connection) -> Result<()> {
+    crate::loom::remote_artifact::migrate(connection, &artifact_sql())
+}
+
+#[cfg(test)]
+pub(super) fn restore_local_artifact_contract_for_test(connection: &Connection) {
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM loom_artifact", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    connection
+        .execute_batch("DROP TABLE loom_artifact_archive; DROP TABLE loom_artifact;")
+        .unwrap();
+    connection.execute_batch(&artifact_sql()).unwrap();
+}
+
 fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    if artifact_origin_present(connection)? {
+        return crate::loom::remote_artifact::schema_matches(connection, &artifact_sql());
+    }
     let columns: i64 = connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
              ('artifact_id','plan_id','task_id','agent_run_id','relative_path','sha256',
@@ -569,7 +936,9 @@ pub(super) fn schema_matches(
     let review_recorded = projection_schema_version < 172 || review_schema_matches(connection)?;
     let verification_recorded =
         projection_schema_version < 173 || verification_schema_matches(connection)?;
-    let artifact_recorded = projection_schema_version < 174 || artifact_schema_matches(connection)?;
+    let artifact_recorded = projection_schema_version < 174
+        || (artifact_origin_present(connection)? == (projection_schema_version >= 181)
+            && artifact_schema_matches(connection)?);
     let task_host_recorded =
         projection_schema_version < 178 || task_holds_execution_host(connection)?;
     Ok(holds(
@@ -892,6 +1261,56 @@ pub(super) fn migrate_verification(database: &mut Database) -> Result<()> {
     Ok(())
 }
 
+/// Migration 232: the persistent automation authority of one Plan — the approved policy, the
+/// strict command replay ledger, the assistant stage verdicts and the dispatch/budget ledger.
+///
+/// The receipt is written in the same transaction as the tables, so a half-applied control
+/// plane cannot be reopened as current: either all four tables and the receipt exist, or the
+/// database still reports schema 181 as an upgrade source.
+pub(super) fn migrate_control(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 181
+        ),
+        "LOOM control migration requires schema 181"
+    );
+    tx.execute_batch(&control_sql())?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(232,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=182,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(
+        &tx,
+        &[
+            CONTROL_POLICY_TABLE,
+            CONTROL_COMMAND_TABLE,
+            STAGE_REVIEW_TABLE,
+            CONTROL_DISPATCH_TABLE,
+        ],
+    )?;
+    anyhow::ensure!(
+        control_schema_matches(&tx)?,
+        "LOOM control migration did not create the required tables"
+    );
+    // 182 is only Current while nothing newer exists; a later migration must leave this
+    // receipt admissible as a supported source instead of pinning Current.
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 182
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "LOOM control schema admission failed");
+    tx.commit()?;
+    Ok(())
+}
+
 /// Only synthetic migration fixtures reverse this projection; product code never drops it.
 #[cfg(test)]
 pub(super) fn downgrade_for_test(connection: &Connection) {
@@ -908,8 +1327,23 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+            DROP TABLE IF EXISTS loom_claim_execution_target;
+            DROP TABLE IF EXISTS agent_run_remote_process;
+            DROP TABLE IF EXISTS agent_run_remote_bundle_source;
+            DROP TABLE IF EXISTS agent_run_execution_target;
+            DROP TABLE IF EXISTS member_execution_target;
+            DROP TABLE IF EXISTS remote_runtime_installation;
+            DROP TABLE IF EXISTS workspace_rpc_events;
+            DROP TABLE IF EXISTS workspace_rpc_audit;
+            DROP TABLE IF EXISTS loom_artifact_archive;
+            DROP TABLE IF EXISTS workspace_rpc_requests;
+            DROP TABLE IF EXISTS loom_artifact_snapshot;
             DROP TABLE IF EXISTS loom_artifact;
             DROP TABLE IF EXISTS loom_verification;
+            DROP TABLE IF EXISTS loom_stage_review;
+            DROP TABLE IF EXISTS loom_control_dispatch;
+            DROP TABLE IF EXISTS loom_control_command;
+            DROP TABLE IF EXISTS loom_control_policy;
             DROP TABLE IF EXISTS loom_review;
             DROP TABLE IF EXISTS loom_candidate;
             DROP TABLE IF EXISTS loom_claim;
@@ -917,6 +1351,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS loom_task;
             DROP TABLE IF EXISTS loom_plan;
             PRAGMA foreign_keys=ON;
+            DROP TABLE IF EXISTS node_run_bundle;
             DROP TABLE IF EXISTS node_run_credential;
             DROP TABLE IF EXISTS node_dispatch_output;
             DROP TABLE IF EXISTS node_dispatch;
@@ -925,7 +1360,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS member_capability_tool_claim;
             DROP TABLE IF EXISTS member_capability_choice;
             DROP TABLE IF EXISTS member_capability_item;
-            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225,226,227,228);
+            DELETE FROM schema_migration WHERE version IN (218,219,220,221,222,223,224,225,226,227,228,229,230,231,232);
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
@@ -942,6 +1377,108 @@ mod tests {
     };
     use crate::mission::{CreateMissionCommand, MissionService};
     use uuid::Uuid;
+
+    /// The dispatch ledger's identity guards have to hold without `recursive_triggers`: SQLite only
+    /// fires the implicit DELETE of `INSERT OR REPLACE` when that pragma is ON, so the BEFORE INSERT
+    /// guard — not the delete guard — is what refuses a replaced row.
+    ///
+    /// The fixture is a real database with a real Plan and Task: the ledger's foreign keys mean a
+    /// synthetic parent would only prove that SQLite rejects a missing table, and the legitimate
+    /// insert has to succeed first or the two rejections prove nothing.
+    #[test]
+    fn control_dispatch_refuses_a_replaced_identity_without_recursive_triggers() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let mission_id = create_mission(&mut database, &directory, "LOOM dispatch identity");
+        let imported = plan_import(
+            &mut database,
+            LoomPlanImportInput {
+                mission_id,
+                goal: "Ship the guarded plan".into(),
+                acceptance_criteria_version: "ac-v1".into(),
+                criteria: vec![LoomPlanImportCriterion {
+                    criterion_id: "criterion_one".into(),
+                    text: "one".into(),
+                }],
+                tasks: vec![LoomPlanImportTask {
+                    task_id: "task_a".into(),
+                    title: "Task A".into(),
+                    description: String::new(),
+                    assignee_agent_id: None,
+                }],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+        let plan_id = imported.plan_id.clone();
+        let task_id = imported.task_ids[0].clone();
+        let connection = database.connection();
+        connection
+            .execute_batch("PRAGMA recursive_triggers=OFF;")
+            .unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO loom_control_dispatch(dispatch_id,plan_id,task_id,kind,candidate_id,
+                        policy_revision,recipient_agent_id,delivery_id,status,reason,dedupe_key,
+                        created_at,updated_at)
+                 VALUES('dispatch_one',?1,?2,'EXECUTE',NULL,1,'agent_1',NULL,'WAITING',NULL,
+                        '[\"EXECUTE\",\"task_a\"]','2026-08-31','2026-08-31')",
+                rusqlite::params![&plan_id, &task_id],
+            )
+            .expect("a legitimate dispatch row must be insertable");
+
+        let replaced = connection.execute(
+            "INSERT OR REPLACE INTO loom_control_dispatch(dispatch_id,plan_id,task_id,kind,
+                    candidate_id,policy_revision,recipient_agent_id,delivery_id,status,reason,
+                    dedupe_key,created_at,updated_at)
+             VALUES('dispatch_one',?1,?2,'EXECUTE',NULL,1,'agent_other',NULL,'WAITING',NULL,
+                    '[\"EXECUTE\",\"task_a\"]','2026-08-31','2026-08-31')",
+            rusqlite::params![&plan_id, &task_id],
+        );
+        assert!(
+            replaced.is_err(),
+            "assertion insert_or_replace_cannot_rewrite_a_recorded_dispatch"
+        );
+
+        let replaced_dedupe = connection.execute(
+            "INSERT OR REPLACE INTO loom_control_dispatch(dispatch_id,plan_id,task_id,kind,
+                    candidate_id,policy_revision,recipient_agent_id,delivery_id,status,reason,
+                    dedupe_key,created_at,updated_at)
+             VALUES('dispatch_two',?1,?2,'EXECUTE',NULL,1,'agent_1',NULL,'WAITING',NULL,
+                    '[\"EXECUTE\",\"task_a\"]','2026-08-31','2026-08-31')",
+            rusqlite::params![&plan_id, &task_id],
+        );
+        assert!(
+            replaced_dedupe.is_err(),
+            "assertion insert_or_replace_cannot_reuse_a_recorded_dedupe_key"
+        );
+
+        // The refused replacements left the original identity, recipient and row count untouched.
+        let (rows, dispatch_id, recipient): (i64, String, String) = connection
+            .query_row(
+                "SELECT COUNT(*), MAX(dispatch_id), MAX(recipient_agent_id)
+                 FROM loom_control_dispatch",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (rows, dispatch_id.as_str(), recipient.as_str()),
+            (1, "dispatch_one", "agent_1"),
+            "assertion a_refused_replacement_leaves_the_recorded_dispatch_untouched"
+        );
+
+        let rewritten = connection.execute(
+            "UPDATE loom_control_dispatch SET dedupe_key='[\"EXECUTE\",\"other\"]'
+             WHERE dispatch_id='dispatch_one'",
+            [],
+        );
+        assert!(
+            rewritten.is_err(),
+            "assertion a_recorded_dispatch_identity_is_immutable"
+        );
+    }
 
     /// A real Mission through the product command, because `loom_plan` is keyed by `mission.id`.
     fn create_mission(database: &mut Database, directory: &std::path::Path, title: &str) -> String {
@@ -1379,9 +1916,13 @@ mod tests {
             local, 1,
             "assertion the local node is recorded and not revocable"
         );
+        // This historical owner intentionally walks through migration 228 only.
+        // Current 181 admission and 180 -> 231 are owned by the production
+        // preflight test; this remains the exact admitted historical 178 source.
         assert!(matches!(
             classify_database_contract(database.connection()).unwrap(),
-            DatabaseContractClassification::Current(_)
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 178
         ));
 
         // The product write path still stores all three LOOM tables, and reads them back.

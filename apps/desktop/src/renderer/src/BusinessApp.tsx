@@ -116,6 +116,11 @@ import { MissionActivityDocument } from './MissionDelivery'
 import { MissionCommandRejected, missionCommand, missionError, unreadMissionCount, useMissions } from './useMissions'
 import './mission.css'
 import './loom-workspace.css'
+import { LoomChrome } from './LoomChrome'
+import './loom-mikka-shell.css'
+import './loom-mikka-chat.css'
+import './loom-mikka-panel.css'
+import './loom-mikka.css'
 import { createRuntimeRefresh, openRuntimeModelCatalog } from './runtime-check'
 import { MissionSurface } from './MissionSurface'
 import { MissionHeader } from './MissionHeader'
@@ -4116,10 +4121,12 @@ export function BusinessApp({
   }
 
   async function openMission(mission: MissionRecord): Promise<void> {
-    setMissionPresentation('drawer')
+    // LOOM opens work in the continuous conversation/inspector layout.
+    // The existing drawer remains available as an explicit secondary presentation.
+    setMissionPresentation('full')
     await activateThread(mission.threadId, { reconcileDefaultLead: false })
     if (activeThreadIdRef.current === mission.threadId && viewRef.current === 'camp') {
-      setMissionPresentation('drawer'); setMissionOpenRequest(value => value + 1)
+      setMissionPresentation('full'); setMissionOpenRequest(value => value + 1)
     }
   }
   const refreshMission = async (threadId: string): Promise<void> => {
@@ -4337,6 +4344,13 @@ export function BusinessApp({
   }
 
   const renderNavigation = (drawer = false): React.JSX.Element => <ThreadNavigation
+    agents={agents}
+    missions={missionList.missions.map(mission => ({ missionId: mission.missionId, number: mission.number, title: mission.title, hasUnread: mission.hasUnread }))}
+    activeMissionId={activeMission?.missionId ?? null}
+    onOpenMission={missionId => {
+      const target = missionList.missions.find(mission => mission.missionId === missionId)
+      if (target !== undefined) void openMission(target).catch(error => notifyError(missionError(error)))
+    }}
     navigationId={drawer ? 'mobile-conversation-navigation' : 'global-navigation'}
     platform={client.platform}
     footer={sidebarFooter}
@@ -4416,7 +4430,10 @@ export function BusinessApp({
       }
     }}>
     <MissionInteractionProvider missions={missionList.missions} projects={displayNavigation?.projects ?? []} agents={agents} installations={installations} onChanged={refreshMission} onWorkspaceCleaned={refreshMissionAfterWorkspaceCleanup} onDeleted={onMissionDeleted} onOpen={mission => { void openMission(mission).catch(error => notifyError(missionError(error))) }} onError={notifyError}>
-    <NavigationShell platform={client.platform} settings={view === 'settings' || view === 'memory'} navigation={desktopNavigation} nativeWindowControls={desktop?.windowControls} browser={!desktop} disabled={startupStatus !== 'resolved' || shuttingDown} className={view === 'camp' && !missionDrawer ? 'app-shell-camp' : ''} data-mobile-view={mobile ? view : undefined} data-mobile-settings-list={mobile && view === 'settings' && mobileSettingsList || undefined}>
+    <NavigationShell platform={client.platform} settings={view === 'settings' || view === 'memory'} navigation={desktopNavigation} nativeWindowControls={desktop?.windowControls} browser={!desktop} disabled={startupStatus !== 'resolved' || shuttingDown} className={`loom-mikka${view === 'camp' && !missionDrawer ? ' app-shell-camp' : ''}`} data-mobile-view={mobile ? view : undefined} data-mobile-settings-list={mobile && view === 'settings' && mobileSettingsList || undefined}>
+      {!mobile && <LoomChrome unreadCount={unreadMissionCount(missionList.missions)}
+        disabled={startupStatus !== 'resolved' || shuttingDown}
+        onWork={() => chooseView('missions')} onNewConversation={beginNewConversation} />}
       {!mobile && renderNavigation()}
       {!startupGateVisible && mobile && ['compose', 'members', 'teams', 'automations'].includes(view) && <MobilePageHeader
         title={({ compose:uiAttribute("新对话"), members:uiAttribute("队员"), teams:uiAttribute("团队"), automations:uiAttribute("定时任务") } as Record<string, string>)[view]}
@@ -4665,6 +4682,7 @@ export function BusinessApp({
                     hostPlatform={health?.hostPlatform ?? null}
                     runtimePlatformAdmission={health?.runtimePlatformAdmission ?? []}
                     runtimeDiscoveryPending={health === null || healthLoading}
+                    nodes={environment.nodes}
                     selectedAgentId={selectedMemberId}
                     activeTab={memberTab}
                     runtimeFocusRequest={memberRuntimeFocusRequest}
@@ -5276,8 +5294,9 @@ export function campCreationPreflightFromAgents(
       agentId: agent.agentId,
       displayName: agent.displayName,
       memberOrder: agent.memberOrder,
-      runtimeConfigured: agent.runtimeConfiguration !== null,
-      runtimeReadiness: agent.runtimeReadiness.status
+      runtimeConfigured: agent.executionAvailability?.configured ?? (agent.runtimeConfiguration !== null),
+      runtimeReadiness: agent.executionAvailability?.readiness.status ?? agent.runtimeReadiness.status,
+      ...(agent.executionAvailability ? { executionAvailability: agent.executionAvailability } : {})
     }))
   const initialLeadAgentId = presentMembers
     .find((member) => member.runtimeReadiness === 'ready')

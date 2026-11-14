@@ -1,131 +1,90 @@
 ---
-name: Rovai AI
-description: A quiet, evidence-first desktop workspace for human and agent collaboration.
+name: LOOM
+description: A calm, material-rich workspace for human and assistant collaboration.
 typography:
   body:
-    fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif'
-    fontSize: "13px"
+    fontFamily: '-apple-system, BlinkMacSystemFont, Segoe UI, Microsoft YaHei, sans-serif'
+    fontSize: '14px'
     fontWeight: 400
     lineHeight: 1.6
   mono:
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"
+    fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace'
 rounded:
-  control: "6px"
-  surface: "10px"
-  dialog: "12px"
+  control: '9px'
+  surface: '14px'
+  dialog: '21px'
 spacing:
-  xs: "4px"
-  sm: "8px"
-  md: "12px"
-  lg: "16px"
-  xl: "24px"
+  xs: '4px'
+  sm: '8px'
+  md: '12px'
+  lg: '16px'
+  xl: '24px'
 ---
 
-# Design System: Rovai AI
+# LOOM 视觉与交互系统
 
-## Overview
+## 已选方向
 
-Use compact desktop controls, open reading surfaces, aligned rows and restrained decoration.
-All registered palettes share one component tree, interaction model and state matrix.
-Use [UI routing](docs/ui/README.md) for component contracts, surface briefs and verification.
+用户已确认 Mikka/PiBot 风格和当前 `loom-native` 主布局。后续属于这个方向的产品打磨，不重新发散，也不导入旧 Rovai 页面、主题变量、导航框架或品牌约束。底层权限、持久化与安全合同保留；视觉不被旧代码命名绑住。
 
-### Brand mark
+当前视觉真源：
 
-- Preserve the separated four-point star and curved horizon; reuse the production assets.
-- The App icon uses its fixed charcoal carrier, Steel horizon and Porcelain star, without a rendezvous point.
-- In-app marks omit the carrier and use `--rail-logo` with the `--ember` rendezvous point.
-- Brand geometry and colors do not express status, selection, identity or approval.
+- `apps/desktop/src/renderer/src/loom-native/native.css`：独立基础几何与主界面。
+- `apps/desktop/src/renderer/src/loom-native/product.css`：玻璃材料、助手配置、能力、群聊、工作区、关系图。
+- `Controls.tsx`：有键盘语义的统一选择菜单/浮层。
+
+## 几何
+
+1605px 参考画布：42px 顶部、64px 窄图标栏、264px 会话栏、弹性中央阅读区、最多528px右检查器。小屏采用同一组件和数据，侧栏/检查器可覆盖显示，不硬压缩所有列。
+
+聊天区白色偏暖中性阅读层；用户气泡蓝底白字、20px圆角；助手浅灰段落气泡与结构化正文分开。输入框两行、圆角20px，附件/接收者在底行，发送按钮右下。长文本、代码、图片和表格可局部滚动，不使整个窗口横向溢出。
 
 ## Colors
 
-Complete palettes and mode mappings belong to the [theme registry](docs/ui/themes/README.md);
-production values live in [theme.css](packages/ui/src/theme.css). Use semantic variables; do not
-add component-level theme colors, automatic inversion or theme-specific markup.
+当前新界面的颜色由 `native.css` 的 `--ln-bg / --ln-side / --ln-card / --ln-text / --ln-muted / --ln-blue` 和 `product.css` 的 `--ln-glass / --ln-glass-raised / --ln-soft-line / --ln-soft-fill` 定义。深浅主题沿同一组件树切换，Portal 需携带对应主题。文字对比、危险/成功状态与可读禁用态优先于透明效果。
 
-| UI role | Token / rule |
-|---|---|
-| Solid primary action | `--conversation-action`, `--conversation-action-hover`, `--conversation-action-contrast` |
-| Action text and selected control marks on a surface | `--conversation-action-ink`; ordinary labels use `--ink` |
-| Checked checkbox, radio, switch and range accent | Current theme action family; never the OS default accent, `--brand`, `--workspace-steel` or `--focus` |
-| Navigation and row selection | The surface's selection/hover tokens; neutral readable text, no colored left stripe |
-| Brand | `--brand` / `--brand-*`, `--rail-logo`, `--ember`; only for an explicitly assigned brand role |
-| Semantic state | Dedicated success, attention, danger and info tokens plus text, icon or shape |
-| Identity | Eight stable `--identity-*` tokens; never state or selection |
-| Evidence and Diff | Dedicated evidence, code and diff tokens; preserve signs and line numbers |
-| Scrollbar | `--scrollbar-thumb`; preserve the documented Memory/Automation override |
+历史主题文档仍引用本节作为颜色原则入口，但其旧 `--conversation-*` 等 token 仅归历史表面，不导入新 `loom-native`。不能为统一颜色而改变权限、验收状态或头像身份色；新主题也不得用颜色单独表达状态。
 
-- Apply the same control rules inside Portal-mounted menus, dialogs and sheets. Do not depend on a page-local alias reaching a Portal.
-- Action colors follow the selected palette; do not describe them as always black, white or neutral.
-- Memory content, notices and dialogs use the achromatic `--memory-*` family, including local actions. Its shared navigation keeps the selected App theme.
-- Preserve dedicated component tokens for reading surfaces, links, search matches and Runtime configuration; do not replace them with a generic accent.
+## Material 层次
 
-## Typography
+外窗是低饱和灰蓝/暖灰基底，不做鲜艳渐变背景。侧栏与右面板半透明，约24–28px blur；正文层保持高不透明度保证阅读。输入框、身份胶囊和菜单轻微浮起；任务卡以低对比填色区分，不依赖明显边框。
 
-- Use the production system sans-serif stack; add no downloaded font.
-- Body text is normally 12.5–13px with 1.6–1.7 line height; secondary copy is at least 10.5px.
-  Smaller type is limited to short, contrast-safe metadata.
-- Use monospace for commands, paths, timestamps, IDs and evidence.
-- Establish hierarchy with size, weight, spacing and alignment before color.
-- Follow the [conversation](docs/ui/components/conversation-workspace.md) and
-  [file preview](docs/ui/components/file-preview.md) contracts for prose/artifact widths and reading preferences.
+玻璃只用在有层级意义的 chrome、侧栏、检查器和浮层。不要给每个段落/卡片加 blur，不做霓虹、光晕、粒子或渐变文字。深色保持同一组件结构，以 token 切换。无 backdrop-filter 或 reduced-transparency 时回退为实色。
 
-## Layout
+## 控件
 
-- Desktop: default 270px navigation, 50px top row (38px in Thread), flexible content.
-  Navigation sizing, collapse and platform-specific settings layout follow
-  [App Shell](docs/ui/components/app-shell-navigation.md#调宽与完全折叠).
-- Use the `4 / 8 / 12 / 16 / 20 / 24 / 32px` spacing rhythm and stable alignment axes.
-- Keep narrative text aligned; wide artifacts may expand independently. Composer and its route rail share one centered track.
-- Avoid page-level horizontal scrolling. Desktop checks cover `1040×700`, `1440×920`, `2560×1440` and 200% zoom.
-- Mobile reflows the same data and actions; use the [Mobile contract](docs/ui/host-web-mobile.md) for sheets, navigation and touch controls.
+负责人、运行端、模型等选择使用 `ChoiceMenu`：柔和填色、无原生硬外框、轻箭头、选中标记；可带真实头像。菜单通过 Radix 的键盘导航、角色和焦点管理实现，Portal 同样携带 `.ln-portal` 与当前 theme。
 
-## Elevation & Depth
+按钮只分必要的主要动作、安静动作与危险动作。不能为了“看起来能用”显示假的启用按钮。禁用态必须可读且有原因。持续权限不得默认选中或藏在一般保存中。
 
-- Establish depth with canvas, surface, raised surface and dividers.
-- Ordinary messages, lists, cards and Inspector content have no shadow.
-- Use `--shadow-float` and its aliases only for actual overlays, menus, dialogs and floating approval surfaces.
-- Prefer open sections and separators; use a card only for a bounded object, decision or independent state.
+四类能力分区要清晰、计数真实；优先名称、简述和状态，来源/正文/范围可展开。正常界面不堆 JSON、hash、Run ID；审阅和诊断时允许查看精确内容。
 
-## Shapes
+## 助手与群聊
 
-- Controls: 5–8px radius; work surfaces: 9–11px; dialogs: 12–13px.
-- Pills are for short statuses, filters and identity metadata; circles are for portraits, small status dots and bounded icon controls.
-- Use `--line` for separators, `--line-strong` for structure and `--control-line` for interactive boundaries.
-- Dialog fields use `--dialog-field-line` / `--dialog-field-line-hover`; higher-contrast modes retain a visible control boundary.
+保留动态头像引擎、原身份颜色和用户自选头像。资料页主要是名称、职责、用途、沟通方式，补充约定可展开。模型和权限放在独立分区，不能用身份模板顺手改变。
 
-## Components
+新对话允许单聊/群聊，勾选成员并从中指定主助手。主助手是会话职责，不是高权限等级。工作区域应显示真实主机目录；浏览/取消不创建群聊或授权。
 
-- **Buttons:** primary actions use the action family; secondary and workspace creation entries use quiet tonal surfaces.
-  Destructive actions use `--danger-soft` and `--danger`. Mission Worktree cleanup keeps its documented ordinary action treatment.
-  Preserve existing pressed behavior; fixed-position controls must not shift their hit area. Disabled labels remain legible.
-- **Inputs and selection:** use the input surface and visible labels. Apply the Colors table to checked and disabled states.
-  Keep DOM focus, caret, IME and keyboard navigation without extra focus rings, glow, focus-only borders or search underlines.
-- **Navigation:** retain selected state independently of hover. Selected conversation and teammate rows use a quiet surface and neutral text, without a left stripe.
-- **Splitters:** use one 1px boundary; hover/drag changes it to `--resize-line` without thickening or a short grip.
-  Preserve wide hit areas, keyboard resizing, reset, cancellation and final-pointer coordinates under zoom.
-  Collapsible panes stop at minimum width; dragging another 64px folds immediately during the gesture over 160ms.
-  Reverse 24px to reopen within the same gesture; reduced motion skips animation.
-  Escape restores the prior layout; pointer interruption, blur and container resize settle the last position.
-  Scope changes discard stale gestures; a drag-generated click never resets width.
-  Keep each surface's dimensions and persistence in its component contract or brief.
-- **Preview expansion:** file, execution and activity use the shared 28px header control and 15px two-corner glyph.
-  Expansion hides the conversation flush to navigation; restore with the same control or Escape. Preserve mounted content, drafts and reading positions.
-- **Dialogs and Popovers:** one raised surface, 1px boundary, single title, muted regular-weight labels and no colored top stripe.
-  Keep common fields visible; optional disclosure preserves drafts and validation. Footers contain actions and necessary status only.
-  Preserve modal focus trapping and Esc; use the surface's documented focus return, otherwise suppress automatic trigger refocus.
-- **Messages and code:** retain production bubble geometry, spacing and same-color bubble borders.
-  Use shared SafeMarkdown and the dedicated conversation code tokens; release notes retain shared defaults.
-- **Identity:** preserve portraits and stable identity markers; do not spread identity colors into surrounding surfaces.
+## 工作与成果
 
-Page composition belongs in [surface briefs](docs/ui/README.md#页面局部-brief); complex interactions belong in
-[component contracts](docs/ui/components/README.md). Do not duplicate their state machines here.
+任务状态、运行完成、技术核验、独立审查、用户接受和发布分开。显示“等待你”要有真实依据，不从聊天口吻推断。
 
-## Do's and Don'ts
+成果浮层是文档阅读＋相关上下文。版本和证据由后端提供，不按时间猜链路。打开文档不自动验收。未连接屏幕服务时用清楚的空状态，不放演示桌面。
 
-- **Do** cover Loading, Empty, Partial, Error, Disabled, Submitting and Recovery with real read-model facts.
-- **Do** preserve drafts, selection, scroll and focus on failures and theme changes.
-- **Do** keep labels direct; show explanations only when needed to choose, resolve a problem or understand an unavailable action.
-- **Do** use the established terms 队员、记忆、智能体、快速对话.
-- **Don't** add decorative gradients, glow, particles, role-colored message bubbles, card walls or global `transition: all`.
-- **Don't** invent progress, approvals, capabilities or recovery certainty.
-- **Don't** introduce a new UI framework, CSS-in-JS layer, font, icon system, animation library or state manager for an incremental change.
+工作/资产图只投影真实任务、依赖、候选、证据和版本关系。图不拥有第二份业务状态，也不通过拖拽绕过审核。
+
+## 失败与恢复
+
+Loading / Empty / Error / Unsupported / Unsaved / Submitting / Conflict / Unknown 都有独立表达。读取失败不画成空名单；保存失败不清空草稿；“已保存”“已生成下次配置”“设备已应用”“实际执行”不混用。
+
+有未保存修改时切助手、分区或关闭，需要可返回编辑的提示。高风险 Hook 的确认绑定精确正文与范围，取消不产生授权。请求结果未知时保留原命令身份，不换新ID重复创建。
+
+## 可访问性与验收
+
+所有主操作使用 button、form、label 和明确 aria-label。保留 focus-visible、键盘导航、Tab 限制、Esc 关闭和焦点返回；色彩不是唯一状态信息。动画尊重 reduced-motion。
+
+最小验收：1605/1440/1040/760/390宽度、深浅模式、真实资料与任务、菜单焦点、浮层、小屏无页面级横向溢出。每个可保存功能至少有隔离真实 Core 写入与读回证据，不能只靠静态截图或 mock 单测。
+
+## 文档分工
+
+产品定义归 `PRODUCT.md`；实施状态和用户纠偏归 `LOOM-IMPLEMENTATION.md`；接口/Runtime兼容归 `docs/loom/productization-interfaces-2026-11-13.md`；Core权限、数据、冻结和恢复归对应 Contracts。历史Rovai UI文档仅供尚未迁移表面的参考，不得推翻当前已选视觉世界。

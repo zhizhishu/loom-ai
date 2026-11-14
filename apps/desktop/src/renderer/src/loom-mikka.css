@@ -1,0 +1,259 @@
+/* LOOM reference reconstruction. This is the final composition layer, not a
+   parallel app: NavigationShell and FilePreviewLayout own all live dimensions. */
+.loom-mikka {
+  --mm-chrome: #e4e4e2;
+  --mm-sidebar: #ededec;
+  --mm-selected: #d6d6d4;
+  --mm-hover: #e5e5e3;
+  --mm-muted: #777775;
+  --mm-sep: #e8e8e8;
+  --mm-content: #fff;
+  --mm-card: #f7f7f7;
+  --mm-blue: #155dff;
+  --mm-header: 42px;
+  --mm-text: var(--ink, #171717);
+  --mm-line: var(--mm-sep);
+  --mm-line-strong: color-mix(in srgb, var(--mm-muted) 45%, var(--mm-content));
+  --mm-side: var(--mm-card);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  line-height: 1.6;
+}
+:root:not([data-theme="night"]) .loom-mikka {
+  --canvas: var(--mm-sidebar);
+  --surface: var(--mm-content);
+  --surface-raised: var(--mm-content);
+  --conversation-surface: var(--mm-content);
+  --home-surface: var(--mm-content);
+  --input: var(--mm-content);
+  --rail: var(--mm-sidebar);
+  --rail-line: var(--mm-sep);
+  --line: var(--mm-sep);
+  --line-strong: #dededd;
+  --ink: #171717;
+  --muted: #737373;
+  --neutral-hover: #eeeeed;
+  --neutral-selected: #e2e2e0;
+  --surface-selected: #d6d6d4;
+  --conversation-action: var(--mm-blue);
+  --conversation-action-hover: #0e4ee2;
+  --conversation-action-ink: #155dff;
+  --conversation-action-contrast: #fff;
+}
+:root[data-theme="night"] .loom-mikka {
+  --mm-chrome: #202224;
+  --mm-sidebar: #26282a;
+  --mm-selected: #3a3d40;
+  --mm-hover: #323538;
+  --mm-muted: #a6a8ab;
+  --mm-sep: #36393d;
+  --mm-content: #1b1d20;
+  --mm-card: #272a2e;
+  --mm-blue: #3976ff;
+}
+.loom-app-toolbar { display: none; }
+@media (min-width: 901px) {
+  .navigation-shell.loom-mikka {
+    padding: var(--mm-header) 16px 8px 0;
+    background: var(--mm-chrome);
+    grid-template-rows: 48px minmax(0, 1fr);
+    overflow: hidden;
+  }
+  .loom-mikka .loom-app-toolbar {
+    position: absolute;
+    z-index: 28;
+    inset: 0 0 auto;
+    display: flex;
+    height: var(--mm-header);
+    align-items: center;
+    justify-content: center;
+    padding: 0 24px 0 120px;
+    background: var(--mm-chrome);
+    -webkit-app-region: drag;
+  }
+  .loom-global-search-slot {
+    position: absolute;
+    left: 50%;
+    top: 8px;
+    width: min(396px, calc(100% - 340px));
+    height: 26px;
+    transform: translateX(-50%);
+    -webkit-app-region: no-drag;
+  }
+  .loom-mikka .loom-global-search-slot .conversation-jump {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    width: 100%;
+    min-height: 26px;
+    height: 26px;
+    padding: 0 12px;
+    margin: 0;
+    border: 0;
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--mm-chrome) 92%, #888);
+    color: var(--mm-muted);
+    font-size: 12px;
+    box-shadow: none;
+  }
+  .loom-mikka .loom-global-search-slot .conversation-jump:hover {
+    background: color-mix(in srgb, var(--mm-chrome) 85%, #888);
+  }
+  .loom-mikka .loom-global-search-slot .conversation-jump kbd {
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    padding: 0 4px;
+    border: 1px solid color-mix(in srgb, var(--mm-muted) 20%, transparent);
+    border-radius: 4px;
+    background: transparent;
+  }
+  .loom-mikka .loom-toolbar-actions {
+    position: absolute;
+    right: 22px;
+    top: 7px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    -webkit-app-region: no-drag;
+  }
+  .loom-mikka .loom-toolbar-button {
+    display: inline-flex;
+    min-width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 3px 6px;
+    border: 0;
+    border-radius: 8px;
+    color: var(--muted);
+    background: transparent;
+    cursor: pointer;
+  }
+  .loom-mikka .loom-toolbar-button:hover { background: var(--mm-hover); }
+  .loom-mikka .loom-toolbar-button:disabled { cursor: default; opacity: .45; }
+  .loom-mikka .loom-toolbar-button svg { width: 18px; height: 18px; }
+  .loom-mikka .loom-toolbar-count { font-size: 11px; font-variant-numeric: tabular-nums; }
+  .loom-mikka > .unified-sidebar {
+    grid-template-columns: 64px minmax(0, 1fr);
+    grid-template-rows: 48px auto minmax(0, 1fr) auto;
+    grid-template-areas: "rail brand" "rail jump" "rail scroll" "rail footer";
+    border: 0;
+    background: var(--mm-sidebar);
+  }
+  .loom-mikka .unified-sidebar-drag { display: none; }
+  .loom-mikka .unified-primary-nav {
+    width: 64px;
+    margin: 0;
+    padding-top: 4px;
+    background: var(--mm-chrome);
+  }
+  .loom-mikka .unified-brand { min-height: 48px; padding: 0 16px; }
+  .loom-mikka .rail-logo strong { font-size: 15px; font-weight: 650; letter-spacing: .02em; }
+  .loom-mikka .unified-sidebar-footer { padding: 8px 10px; border-top: 0; }
+  .loom-mikka > .content {
+    margin: 0;
+    min-height: 0;
+    border: 0;
+    border-radius: 0 16px 16px 0;
+    background: var(--mm-content);
+  }
+  .loom-mikka > .content.mission-active-content {
+    grid-row: 1 / -1;
+    padding: 0;
+    background: var(--mm-content);
+  }
+  .loom-mikka .mission-active-content > .mission-workspace-host {
+    min-width: 0;
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    background: var(--mm-content);
+  }
+  .loom-mikka .mission-active-content > .mission-drawer {
+    inset: 0;
+    width: auto;
+  }
+  .loom-mikka .mission-drawer > .camp-topbar,
+  .loom-mikka .mission-drawer > .camp-workspace { border-radius: 0; }
+  .loom-mikka .mission-activity-document { padding: 0; background: var(--mm-content); }
+  .loom-mikka .file-preview-pane { background: var(--mm-content); border-left-color: var(--mm-sep); }
+  .loom-mikka .mission-session-header { height: 48px; min-height: 48px; flex-basis: 48px; }
+  .loom-mikka .camp-topbar { background: var(--mm-content); border-bottom-color: transparent; }
+  .loom-mikka .mission-session-header .topbar-conversation-context { height: 48px; }
+  .loom-mikka .mission-session-header .file-preview-tabs { height: 48px; padding-top: 10px; padding-bottom: 10px; }
+  .loom-mikka .mission-session-header .file-preview-toggle-group { top: 10px; }
+  .loom-mikka .mission-session-header .file-preview-tab { background: transparent; }
+  .loom-mikka .mission-session-header .file-preview-tab.is-active { background: var(--mm-card); }
+  .loom-mikka .window-drag-strip { pointer-events: none; }
+  .loom-mikka .navigation-browser-control,
+  .loom-mikka .navigation-macos-control {
+    position: absolute;
+    top: 6px;
+    left: 12px;
+    z-index: 30;
+  }
+  .loom-mikka .navigation-chrome-controls { gap: 4px; }
+  .loom-mikka .navigation-resize-handle { top: var(--mm-header); bottom: 8px; }
+  .loom-mikka.navigation-collapsed > .content { border-radius: 16px; }
+  .loom-mikka .workspace-grid.file-preview-open:not(.file-preview-compact):not(.file-preview-expanded):not(.file-preview-folded),
+  .loom-mikka .camp-topbar.has-file-preview:not(.file-preview-compact):not(.file-preview-expanded):not(.file-preview-folded) {
+    grid-template-columns: minmax(0, 1fr) var(--file-preview-width, 42%);
+  }
+}
+@media (max-width: 900px) {
+  .navigation-shell.loom-mikka { padding: 0; }
+  .loom-mikka .mission-active-content > .mission-workspace-host {
+    inset: 0;
+    width: 100%;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .loom-mikka .mission-activity-document { padding: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .loom-mikka .mission-workspace-host { animation: none; }
+}
+
+@media (min-width: 901px) {
+  .loom-mikka .topbar-conversation-context { position: relative; }
+  .loom-mikka .loom-thread-identity-slot { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 0 112px; pointer-events: none; }
+  .loom-mikka .loom-thread-identity-slot .mikka-thread-identity { margin: 0; max-width: min(280px,100%); min-height: 34px; pointer-events: auto; }
+  .loom-mikka .topbar-conversation-context:has(.mikka-thread-identity) .context-breadcrumb { display: none; }
+  .loom-mikka .topbar-context-status { margin-left: auto; position: relative; }
+  .loom-mikka .camp-detail-entry-host { position: relative; }
+}
+
+/* One inspector header, not a preview-tab row stacked over a second tab row. */
+@media (min-width: 901px) {
+  .loom-mikka .loom-inspector-header-slot { grid-column: 2; grid-row: 1; z-index: 4; min-width: 0; align-self: stretch; margin-right: 74px; display: flex; align-items: center; background: var(--mm-content); }
+  .loom-mikka .loom-inspector-header-slot .loom-section-tabs { flex: 1 1 auto; height: 48px; padding: 0 12px; margin: 0; background: transparent; }
+  .loom-mikka .camp-topbar:has(.loom-inspector-header-slot .loom-section-tabs) .file-preview-tabs > :not(.file-preview-return) { visibility: hidden; }
+  .loom-mikka .camp-detail-entry-host button { min-width: 28px; width: 28px; padding-inline: 5px; font-size: 0; gap: 0; }
+  .loom-mikka .camp-detail-entry-host button svg { width: 16px; height: 16px; }
+  .loom-mikka .mission-activity-entry { width: 28px; min-width: 28px; padding: 0; font-size: 0; gap: 0; }
+}
+.loom-mikka .loom-overview { padding-top: 12px; }
+.loom-mikka .loom-overview .loom-section-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+.loom-mikka .loom-overview .loom-section-heading h2 { white-space: nowrap; font-size: 13px; }
+.loom-mikka .loom-overview .loom-work-controls { flex: 1; justify-content: flex-end; gap: 6px; margin: 0; }
+.loom-mikka .loom-overview .loom-board-search { flex: 0 1 148px; min-width: 34px; padding: 4px 8px; height: 28px; border: 0; border-radius: 7px; background: var(--mm-card); }
+.loom-mikka .loom-overview .loom-work-filter select { height: 28px; border: 0; border-radius: 7px; background: var(--mm-card); }
+.loom-mikka .loom-summary-count { margin-left: 2px; font-weight: 400; }
+:root[data-theme="night"] .loom-mikka { --mm-tab-selected: #363a3f; }
+
+.loom-mikka .loom-workspace, .loom-mikka .loom-section-tabs, .loom-mikka .mission-activity-document { background: var(--mm-content); }
+.loom-mikka .loom-section-heading h2 { color: var(--mm-text); }
+:root[data-theme="night"] .loom-mikka { --mm-ink: #eceef0; --mm-text: #eceef0; --ink: #eceef0; --muted: #a6a8ab; }
+:root[data-theme="night"] .loom-mikka .mm-topsearch .conversation-jump { background: var(--mm-card); }
+
+/* Leave the native macOS traffic-light region unobstructed. */
+@media (min-width: 901px) {
+  .loom-mikka .navigation-macos-control { left: 82px; }
+}

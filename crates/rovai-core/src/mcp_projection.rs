@@ -142,6 +142,9 @@ struct ProjectionFile {
 #[derive(Debug, Clone)]
 pub struct McpProjectionService {
     root: PathBuf,
+    /// Per-Run member-selected Skill material. This owner sweeps it but never
+    /// writes into it: Skills are not MCP projections.
+    skills_root: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -175,6 +178,7 @@ impl McpProjectionService {
     pub fn new(data_dir: &Path) -> Self {
         Self {
             root: data_dir.join("runtime/mcp"),
+            skills_root: data_dir.join("runtime/skills"),
         }
     }
 
@@ -222,44 +226,10 @@ impl McpProjectionService {
     }
 
     pub fn cleanup_terminal_and_orphaned(&self, database: &Database) -> Result<usize> {
-        if !self.root.exists() {
-            return Ok(0);
-        }
-        ensure_private_directory(&self.root)?;
-        let mut removed = 0;
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if !file_type.is_dir() {
-                continue;
-            }
-            let run_id = entry.file_name().to_string_lossy().to_string();
-            let status = database
-                .connection()
-                .query_row(
-                    "SELECT status FROM agent_run WHERE id = ?1",
-                    [&run_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if status
-                .as_deref()
-                .is_none_or(|status| matches!(status, "succeeded" | "failed" | "cancelled"))
-            {
-                fs::remove_dir_all(&path)?;
-                removed += 1;
-                continue;
-            }
-            for child in fs::read_dir(&path)? {
-                let child = child?;
-                if child.file_name().to_string_lossy().starts_with('.')
-                    && child.file_type()?.is_dir()
-                {
-                    fs::remove_dir_all(child.path())?;
-                }
-            }
-        }
+        let mut removed = cleanup_run_roots(&self.root, database, false, true)?;
+        // Only exact owned Run directories are swept, so an unrelated name under
+        // the Skill material root is never traversed or deleted.
+        removed += cleanup_run_roots(&self.skills_root, database, true, false)?;
         Ok(removed)
     }
 
@@ -797,7 +767,31 @@ fn transport_name(definition: &McpServerDefinition) -> &'static str {
     }
 }
 
-fn runtime_version_supports_mcp(kind: AdapterKind, reported_version: Option<&str>) -> bool {
+/// Pure capability check for one already-selected transport, with no value
+/// resolution and no filesystem read. The credential-reference capture uses it
+/// because the projector resolves A's own environment, which a reference must
+/// never touch. `Err` carries the stable reason the projector would report.
+pub(crate) fn mcp_projection_transport_supported(
+    adapter_kind: AdapterKind,
+    reported_version: Option<&str>,
+    transport: &str,
+) -> Result<(), &'static str> {
+    let capability = AgentRuntimeAdapterRegistry::default().mcp_projection(adapter_kind);
+    if !runtime_version_supports_mcp(adapter_kind, reported_version) {
+        return Err("runtime_version_below_mcp_minimum");
+    }
+    if capability.external_mcp_projection == ExternalMcpProjection::Unsupported {
+        return Err("adapter_does_not_support_per_run_mcp");
+    }
+    if (transport == "stdio" && !capability.supports_stdio)
+        || (transport == "streamable_http" && !capability.supports_streamable_http)
+    {
+        return Err("adapter_does_not_support_transport");
+    }
+    Ok(())
+}
+
+pub(crate) fn runtime_version_supports_mcp(kind: AdapterKind, reported_version: Option<&str>) -> bool {
     let minimum = match kind {
         AdapterKind::ClaudeCodeCli => [1, 0, 44],
         AdapterKind::CopilotCli => [0, 0, 370],
@@ -808,7 +802,7 @@ fn runtime_version_supports_mcp(kind: AdapterKind, reported_version: Option<&str
         .is_none_or(|version| version >= minimum)
 }
 
-fn parse_reported_version(value: &str) -> Option<[u64; 3]> {
+pub(crate) fn parse_reported_version(value: &str) -> Option<[u64; 3]> {
     value
         .split(|character: char| !character.is_ascii_digit() && character != '.')
         .filter(|part| !part.is_empty())
@@ -970,6 +964,65 @@ fn ensure_or_create_private_directory(path: &Path) -> Result<()> {
 fn ensure_or_create_private_directory(path: &Path) -> Result<()> {
     prepare_private_directory(path)?;
     Ok(())
+}
+
+/// Sweeps one Run-scoped runtime root shared by MCP projections and the
+/// member-selected Skill material. A live Run is never touched, and an unknown
+/// name is only removed when this owner's key shape owns it.
+fn cleanup_run_roots(
+    root: &Path,
+    database: &Database,
+    run_uuid_only: bool,
+    prune_dot_children: bool,
+) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    ensure_private_directory(root)?;
+    let mut removed = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let run_id = entry.file_name().to_string_lossy().to_string();
+        if run_id.starts_with('.') {
+            // Unpublished staging belongs to no Run and is always removable.
+            fs::remove_dir_all(&path)?;
+            continue;
+        }
+        if run_uuid_only && Uuid::parse_str(&run_id).is_err() {
+            continue;
+        }
+        let status = database
+            .connection()
+            .query_row(
+                "SELECT status FROM agent_run WHERE id = ?1",
+                [&run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if status
+            .as_deref()
+            .is_none_or(|status| matches!(status, "succeeded" | "failed" | "cancelled"))
+        {
+            fs::remove_dir_all(&path)?;
+            removed += 1;
+            continue;
+        }
+        if prune_dot_children {
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                if child.file_name().to_string_lossy().starts_with('.')
+                    && child.file_type()?.is_dir()
+                {
+                    fs::remove_dir_all(child.path())?;
+                }
+            }
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(unix)]

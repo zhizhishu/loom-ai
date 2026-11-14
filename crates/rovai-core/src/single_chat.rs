@@ -1,3 +1,4 @@
+mod remote;
 use crate::draft_client::DraftClient;
 use crate::message_quote::{
     MessageQuoteSnapshot, QuoteStorage, copy_quotes, load_quotes, store_quotes,
@@ -588,12 +589,25 @@ impl SingleChatService {
         database: &mut Database,
         envelope: &CommandEnvelope<SendSingleChatMessageCommand>,
     ) -> Result<CommandExecution> {
+        self.send_with_remote_sources(database, envelope, None)
+    }
+
+    pub fn send_with_remote_sources(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SendSingleChatMessageCommand>,
+        sources: Option<&crate::remote_bundle_owner::RemoteBundleCaptureContext<'_>>,
+    ) -> Result<CommandExecution> {
         if envelope.payload.body.chars().count() > 100_000 {
             anyhow::bail!("Single Chat body exceeds the 100000-character limit");
         }
         if envelope.payload.draft_revision < 0 {
             anyhow::bail!("Single Chat Draft revision is invalid");
         }
+        if let Some(replayed) = self.gateway.replay_if_recorded(database, envelope)? {
+            return Ok(replayed);
+        }
+        let captured = remote::capture(database, sources, &envelope.payload.conversation_id);
         let client = &envelope.payload.draft_client;
         self.gateway.execute(database, envelope, |transaction| {
             let ActorRef::User { user_id } = &envelope.actor else {
@@ -657,6 +671,15 @@ impl SingleChatService {
                 ));
             }
 
+            if !source_attachments.is_empty()
+                && remote::has_remote_selection(transaction, &target.agent_id)?
+            {
+                return Ok(CommandHandlerResult::rejected(
+                    "remote_file_transfer_required",
+                    json!({"message":"Remote Single Chat file transfer is not available"}),
+                ));
+            }
+
             if single_chat_has_active_run(transaction, &target.conversation_id)?
                 || single_chat_has_pending_queue(transaction, &target.conversation_id)?
             {
@@ -704,11 +727,21 @@ impl SingleChatService {
                 ));
             }
 
-            let runtime = match resolve_frozen_runtime(
+            let remote_admission = remote::prepare(
                 transaction,
-                &target.conversation_id,
-                &target.agent_id,
-            )? {
+                &target,
+                &captured,
+                !source_attachments.is_empty(),
+            )?;
+            let runtime_result = match &remote_admission {
+                Some(remote) => {
+                    crate::agent_profile::resolve_remote_frozen_runtime(transaction, &remote.target)
+                }
+                None => {
+                    resolve_frozen_runtime(transaction, &target.conversation_id, &target.agent_id)
+                }
+            };
+            let runtime = match runtime_result? {
                 Ok(runtime) => runtime,
                 Err(blocker) => {
                     return Ok(CommandHandlerResult::rejected(
@@ -734,6 +767,9 @@ impl SingleChatService {
                 Some((draft_revision, client)),
                 &envelope.actor,
             )?;
+            if let Some(remote) = &remote_admission {
+                remote::freeze(transaction, &admitted.agent_run_id, remote)?;
+            }
             Ok(CommandHandlerResult::accepted(
                 "single_chat.reply_queued",
                 json!({
@@ -1424,6 +1460,19 @@ impl SingleChatService {
         database: &mut Database,
         envelope: &CommandEnvelope<PublishSingleChatPendingInput>,
     ) -> Result<CommandExecution> {
+        self.publish_pending_input_with_remote_sources(database, envelope, None)
+    }
+
+    pub fn publish_pending_input_with_remote_sources(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<PublishSingleChatPendingInput>,
+        sources: Option<&crate::remote_bundle_owner::RemoteBundleCaptureContext<'_>>,
+    ) -> Result<CommandExecution> {
+        if let Some(replayed) = self.gateway.replay_if_recorded(database, envelope)? {
+            return Ok(replayed);
+        }
+        let captured = remote::capture(database, sources, &envelope.payload.conversation_id);
         self.gateway.execute(database, envelope, |transaction| {
             let ActorRef::User { user_id } = &envelope.actor else {
                 anyhow::bail!("Single Chat pending input must publish as its original user");
@@ -1478,15 +1527,27 @@ impl SingleChatService {
                 ));
             }
             validate_source_attachments(&pending.source_attachments).map_err(anyhow::Error::new)?;
-            let runtime =
-                resolve_frozen_runtime(transaction, &target.conversation_id, &target.agent_id)?
-                    .map_err(|blocker| {
-                        anyhow::anyhow!(
-                            "single_chat.runtime_not_ready: {}: {}",
-                            blocker.code,
-                            blocker.payload
-                        )
-                    })?;
+            let remote_admission = remote::prepare(
+                transaction,
+                &target,
+                &captured,
+                !pending.source_attachments.is_empty(),
+            )?;
+            let runtime_result = match &remote_admission {
+                Some(remote) => {
+                    crate::agent_profile::resolve_remote_frozen_runtime(transaction, &remote.target)
+                }
+                None => {
+                    resolve_frozen_runtime(transaction, &target.conversation_id, &target.agent_id)
+                }
+            };
+            let runtime = runtime_result?.map_err(|blocker| {
+                anyhow::anyhow!(
+                    "single_chat.runtime_not_ready: {}: {}",
+                    blocker.code,
+                    blocker.payload
+                )
+            })?;
             let admitted = admit_single_chat_message(
                 transaction,
                 &target,
@@ -1503,6 +1564,9 @@ impl SingleChatService {
                 None,
                 &envelope.actor,
             )?;
+            if let Some(remote) = &remote_admission {
+                remote::freeze(transaction, &admitted.agent_run_id, remote)?;
+            }
             transaction.execute(
                 r#"
                 UPDATE single_chat_pending_input
@@ -2741,6 +2805,473 @@ mod tests {
         skill_projection::{SkillExposureEntry, SkillExposureSnapshot},
     };
 
+    use crate::agent_profile::{AdapterKind, ModelSelection};
+
+    const SC_REMOTE_ROOT: &str = "/srv/r1-sc/work";
+
+    fn sc_remote_store(directory: &std::path::Path) -> crate::mcp::McpConfigStore {
+        crate::mcp::McpConfigStore::new(directory.join("fixture-mcp.json"))
+    }
+
+    fn sc_count(database: &Database, sql: &str) -> i64 {
+        database
+            .connection()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn sc_run_rows(
+        database: &Database,
+        run_id: &str,
+    ) -> (String, i64, Option<String>, Option<String>) {
+        database
+            .connection()
+            .query_row(
+                "SELECT status, execution_epoch, runtime_installation_id, runtime_adapter_kind
+                   FROM agent_run WHERE id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// Node + CLI catalog + a ready Mission workspace for this Single Chat camp, plus an
+    /// active camp member for the conversation's agent. Isolation only: no A filesystem
+    /// object is created for the Node root and no real MCP/HOME path is read.
+    fn sc_seed_remote_target(database: &mut Database, camp_id: &str, agent_id: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let connection = database.connection();
+        connection
+            .execute(
+                "INSERT INTO execution_node(
+                     node_id, display_name, role, os, arch, token_digest, paired_at,
+                     revoked_at, last_heartbeat)
+                 VALUES ('node-sc', 'node-sc', 'remote', 'windows', 'x86_64', ?1, ?2, NULL, NULL)",
+                rusqlite::params!["a".repeat(64), now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO execution_node_cli(
+                     node_id, adapter_kind, path, version, path_present, reported_at,
+                     installation_identity, installation_generation)
+                 VALUES ('node-sc', 'claude-code-cli', 'C:/node/claude.exe', '2.1.0', 1, ?1, ?2, 1)",
+                rusqlite::params![now, format!("sha256:{}", "b".repeat(64))],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mission(
+                     id, number, camp_id, title, description, status, tags_json,
+                     source_attachments_json, details_version, created_at, updated_at)
+                 VALUES ('sc-remote-mission', 1, ?1, 'Remote Single Chat', '', 'completed',
+                     '[]', '[]', 1, ?2, ?2)",
+                rusqlite::params![camp_id, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mission_workspace(
+                     id, mission_id, camp_id, execution_host_id, source_directory,
+                     repository_root, git_common_dir, worktree_path, working_directory,
+                     base_branch, branch, base_sha, preparation_token, generation, state,
+                     created_at, updated_at)
+                 VALUES ('ws-sc', 'sc-remote-mission', ?1, 'node-sc', ?2, ?2, ?3, ?4, ?4,
+                     'main', 'rovai/sc/001', 'base-sha', 'sc-token', 3, 'ready', ?5, ?5)",
+                rusqlite::params![
+                    camp_id,
+                    format!("{SC_REMOTE_ROOT}-src"),
+                    format!("{SC_REMOTE_ROOT}-src/.git"),
+                    SC_REMOTE_ROOT,
+                    now
+                ],
+            )
+            .unwrap();
+        // Single Chat's fixture camp may or may not carry this membership; make it explicit
+        // so `workspace_authority` (remote_execution.rs:170-207) can resolve the camp.
+        let member: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM camp_member
+                                WHERE camp_id = ?1 AND agent_id = ?2 AND status = 'active')",
+                rusqlite::params![camp_id, agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            member,
+            "Single Chat fixture camp must already hold an active {agent_id}"
+        );
+    }
+
+    fn sc_save_remote_selection(
+        database: &mut Database,
+        agent_id: &str,
+        model: ModelSelection,
+    ) -> i64 {
+        let defaults = crate::agent_profile::member_runtime_defaults(AdapterKind::ClaudeCodeCli);
+        let selection = crate::remote_execution::RemoteMemberSelection {
+            node_id: "node-sc".to_string(),
+            workspace_id: "ws-sc".to_string(),
+            workspace_root: SC_REMOTE_ROOT.to_string(),
+            adapter_kind: defaults.adapter_kind,
+            model,
+            permissions: defaults.permissions,
+        };
+        let transaction = database.connection_mut().transaction().unwrap();
+        let revision = crate::remote_execution::load_member_target(&transaction, agent_id)
+            .unwrap()
+            .revision;
+        let saved = crate::remote_execution::save_member_target(
+            &transaction,
+            agent_id,
+            revision,
+            Some(selection),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        saved.revision
+    }
+
+    fn sc_send_envelope(
+        database: &Database,
+        camp_id: &str,
+        conversation_id: &str,
+        command_id: &str,
+        body: &str,
+    ) -> CommandEnvelope<SendSingleChatMessageCommand> {
+        let draft_revision = database
+            .connection()
+            .query_row(
+                "SELECT revision FROM single_chat_composer_draft WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        user_envelope(
+            command_id,
+            Some(camp_id),
+            SendSingleChatMessageCommand {
+                draft_client: Default::default(),
+                camp_id: camp_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                body: body.to_string(),
+                draft_revision,
+            },
+        )
+    }
+
+    fn sc_complete_real_run(database: &mut Database, camp_id: &str, run_id: &str) {
+        database.connection().execute(
+            "UPDATE agent_run SET status='running',execution_epoch=1,started_at=updated_at WHERE id=?1",
+            [run_id],
+        ).unwrap();
+        let finished = ExecutionRuntimeService::default()
+            .succeed_agent_run(
+                database,
+                &CommandEnvelope {
+                    command_id: format!("sc-remote-finish-{run_id}"),
+                    actor: ActorRef::System {
+                        component_id: "runtime-adapter:test".into(),
+                    },
+                    camp_id: Some(camp_id.into()),
+                    expected_versions: vec![],
+                    execution_epoch: None,
+                    payload: SucceedAgentRunCommand {
+                        agent_run_id: run_id.into(),
+                        expected_version: 1,
+                        execution_epoch: 1,
+                        native_turn_id: format!("native-{run_id}"),
+                        final_output: "fixture complete".into(),
+                        missing_send_recovery_candidate: None,
+                        ending_git_observation: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(finished.result.status, CommandResultStatus::Applied);
+    }
+
+    fn assert_single_chat_remote_send_contracts(service: &SingleChatService) {
+        let (mut database, camp_id) = fixture();
+        let (conversation_id, _) = open(service, &mut database, &camp_id, "sc-remote-open");
+        sc_seed_remote_target(&mut database, &camp_id, "agent_1");
+        sc_save_remote_selection(&mut database, "agent_1", ModelSelection::RuntimeDefault);
+        let directory = database.directory().to_path_buf();
+        let store = sc_remote_store(&directory);
+        let context = crate::remote_bundle_owner::RemoteBundleCaptureContext {
+            data_dir: &directory,
+            mcp_store: &store,
+        };
+        let envelope = sc_send_envelope(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "sc-remote-send",
+            "remote fixture",
+        );
+        let tables = [
+            "agent_run",
+            "conversation_message",
+            "agent_run_execution_target",
+            "agent_run_remote_bundle_source",
+        ];
+        let before: Vec<_> = tables
+            .iter()
+            .map(|table| sc_count(&database, &format!("SELECT COUNT(*) FROM {table}")))
+            .collect();
+        database.connection().execute_batch(
+            "CREATE TRIGGER fixture_fail_sc_bundle_source BEFORE INSERT ON agent_run_remote_bundle_source
+             BEGIN SELECT RAISE(ABORT,'fixture injected'); END;"
+        ).unwrap();
+        assert!(
+            service
+                .send_with_remote_sources(&mut database, &envelope, Some(&context))
+                .is_err()
+        );
+        let after: Vec<_> = tables
+            .iter()
+            .map(|table| sc_count(&database, &format!("SELECT COUNT(*) FROM {table}")))
+            .collect();
+        assert_eq!(
+            after, before,
+            "source failure must roll back real Run, message and both snapshots"
+        );
+        database
+            .connection()
+            .execute_batch("DROP TRIGGER fixture_fail_sc_bundle_source;")
+            .unwrap();
+
+        let sent = service
+            .send_with_remote_sources(&mut database, &envelope, Some(&context))
+            .unwrap();
+        assert_eq!(
+            sent.result.status,
+            CommandResultStatus::Accepted,
+            "{:?}",
+            sent.result
+        );
+        let run_id = sent.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, epoch, installation, adapter) = sc_run_rows(&database, &run_id);
+        assert_eq!((status.as_str(), epoch), ("queued", 0));
+        assert!(installation.as_ref().unwrap().starts_with("remote_"));
+        assert_eq!(adapter.as_deref(), Some("claude-code-cli"));
+        let target = crate::remote_execution::load_run_target(database.connection(), &run_id)
+            .unwrap()
+            .unwrap();
+        let source = crate::remote_bundle_owner::load_run_source(database.connection(), &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.digest().unwrap(), target.bundle_source_digest);
+        assert_eq!(target.installation_id, installation.unwrap());
+        assert_eq!(target.target.workspace_root, SC_REMOTE_ROOT);
+        let route: (String, String, i64) = database.connection().query_row(
+            "SELECT json_extract(workspace_json,'$.executionRoot'),operation_policy,operation_policy_version
+             FROM agent_run WHERE id=?1", [&run_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            route,
+            (
+                SC_REMOTE_ROOT.into(),
+                SINGLE_CHAT_OPERATION_POLICY.into(),
+                SINGLE_CHAT_OPERATION_POLICY_VERSION
+            )
+        );
+        let frozen_before: (String, String, String) = database
+            .connection()
+            .query_row(
+                "SELECT source_digest,source_json,session_bootstrap_json
+             FROM agent_run_remote_bundle_source WHERE agent_run_id=?1",
+                [&run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let bootstrap: serde_json::Value = serde_json::from_str(&frozen_before.2).unwrap();
+        assert_eq!(bootstrap["agentRunId"], run_id);
+        assert_eq!(bootstrap["conversationId"], conversation_id);
+        assert_eq!(bootstrap["version"], 1);
+
+        std::fs::write(directory.join("fixture-mcp.json"), b"{ invalid fixture").unwrap();
+        let replay = service
+            .send_with_remote_sources(&mut database, &envelope, Some(&context))
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload["agentRunId"], run_id);
+        assert_eq!(
+            sc_count(&database, "SELECT COUNT(*) FROM agent_run"),
+            before[0] + 1
+        );
+
+        let transaction = database.connection_mut().transaction().unwrap();
+        let revision = crate::remote_execution::load_member_target(&transaction, "agent_1")
+            .unwrap()
+            .revision;
+        crate::remote_execution::save_member_target(&transaction, "agent_1", revision, None)
+            .unwrap();
+        transaction.commit().unwrap();
+        let frozen_after: (String, String, String) = database
+            .connection()
+            .query_row(
+                "SELECT source_digest,source_json,session_bootstrap_json
+             FROM agent_run_remote_bundle_source WHERE agent_run_id=?1",
+                [&run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(frozen_after, frozen_before);
+        assert_eq!(
+            crate::remote_execution::load_run_target(database.connection(), &run_id)
+                .unwrap()
+                .unwrap(),
+            target
+        );
+        for statement in [
+            "UPDATE agent_run_remote_bundle_source SET captured_at='mutated'",
+            "DELETE FROM agent_run_remote_bundle_source",
+        ] {
+            assert!(
+                database
+                    .connection()
+                    .execute(statement, [])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("immutable")
+            );
+        }
+    }
+
+    fn assert_single_chat_remote_queue_only_and_publish(service: &SingleChatService) {
+        let (mut database, camp_id) = fixture();
+        let (conversation_id, _) = open(service, &mut database, &camp_id, "sc-queue-open");
+        sc_seed_remote_target(&mut database, &camp_id, "agent_1");
+        sc_save_remote_selection(&mut database, "agent_1", ModelSelection::RuntimeDefault);
+        let directory = database.directory().to_path_buf();
+        let store = sc_remote_store(&directory);
+        let context = crate::remote_bundle_owner::RemoteBundleCaptureContext {
+            data_dir: &directory,
+            mcp_store: &store,
+        };
+        let first_command = sc_send_envelope(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "sc-queue-first",
+            "first",
+        );
+        let first = service
+            .send_with_remote_sources(&mut database, &first_command, Some(&context))
+            .unwrap();
+        assert_eq!(first.result.status, CommandResultStatus::Accepted);
+        let first_run = first.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = sc_count(&database, "SELECT COUNT(*) FROM agent_run");
+        let broken_path = directory.join("broken-mcp-directory");
+        std::fs::create_dir(&broken_path).unwrap();
+        let broken_store = crate::mcp::McpConfigStore::new(broken_path);
+        let broken_context = crate::remote_bundle_owner::RemoteBundleCaptureContext {
+            data_dir: &directory,
+            mcp_store: &broken_store,
+        };
+        let queued_command = sc_send_envelope(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "sc-queue-second",
+            "second",
+        );
+        let queued = service
+            .send_with_remote_sources(&mut database, &queued_command, Some(&broken_context))
+            .unwrap();
+        assert_eq!(queued.result.status, CommandResultStatus::Accepted);
+        assert_eq!(queued.result.code, "single_chat.pending_input_queued");
+        assert_eq!(
+            sc_count(&database, "SELECT COUNT(*) FROM agent_run"),
+            before
+        );
+        sc_complete_real_run(&mut database, &camp_id, &first_run);
+        let ready = ready_pending_inputs(&database).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            ready[0].pending_input_id,
+            queued.result.payload["pendingInputId"]
+        );
+        let publish_command = user_envelope("sc-queue-publish", Some(&camp_id), ready[0].clone());
+        let published = service
+            .publish_pending_input_with_remote_sources(
+                &mut database,
+                &publish_command,
+                Some(&context),
+            )
+            .unwrap();
+        assert_eq!(published.result.status, CommandResultStatus::Accepted);
+        let second_run = published.result.payload["agentRunId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(second_run, first_run);
+        assert_eq!(
+            sc_count(&database, "SELECT COUNT(*) FROM agent_run"),
+            before + 1
+        );
+        assert!(
+            crate::remote_execution::load_run_target(database.connection(), &second_run)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::remote_bundle_owner::load_run_source(database.connection(), &second_run)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            service
+                .publish_pending_input_with_remote_sources(
+                    &mut database,
+                    &publish_command,
+                    Some(&broken_context),
+                )
+                .unwrap()
+                .replayed
+        );
+
+        // Files are an explicit unsupported boundary until owner-bound transfer is
+        // implemented; preserving the draft lets the user remove the attachment.
+        let input_path = directory.join("remote-attachment.txt");
+        std::fs::write(&input_path, b"isolated attachment").unwrap();
+        let source_ref =
+            observe_source_attachment(&input_path, "remote-attachment.txt", Some("text/plain"))
+                .unwrap();
+        let revision = service
+            .snapshot(&database, &conversation_id)
+            .unwrap()
+            .unwrap()
+            .draft
+            .revision;
+        service
+            .add_source_attachment(&mut database, &conversation_id, revision, source_ref)
+            .unwrap();
+        let attached_command = sc_send_envelope(
+            &database,
+            &camp_id,
+            &conversation_id,
+            "sc-remote-attachment",
+            "attachment",
+        );
+        let rejected = service
+            .send_with_remote_sources(&mut database, &attached_command, Some(&context))
+            .unwrap();
+        assert_eq!(rejected.result.status, CommandResultStatus::Rejected);
+        assert_eq!(rejected.result.code, "remote_file_transfer_required");
+        assert_eq!(
+            sc_count(&database, "SELECT COUNT(*) FROM agent_run"),
+            before + 1
+        );
+    }
+
     fn user_envelope<P>(command_id: &str, camp_id: Option<&str>, payload: P) -> CommandEnvelope<P> {
         CommandEnvelope {
             command_id: command_id.to_string(),
@@ -2901,6 +3432,7 @@ mod tests {
     fn send_uses_current_state_and_end_uses_exact_identity_without_fencing_a_successor() {
         let (mut database, camp_id) = fixture();
         let service = SingleChatService::default();
+        assert_single_chat_remote_send_contracts(&service);
         let (conversation_id, _) =
             open(&service, &mut database, &camp_id, "single-chat-open-first");
         let first = send(
@@ -4306,6 +4838,7 @@ mod tests {
     fn pending_input_preserves_source_refs_and_publishes_after_the_active_run() {
         let (mut database, camp_id) = fixture();
         let service = SingleChatService::default();
+        assert_single_chat_remote_queue_only_and_publish(&service);
         let runtime = ExecutionRuntimeService::default();
         let (conversation_id, _) = open(
             &service,

@@ -20,11 +20,19 @@ impl BootstrapContents {
         snapshot: &RunSnapshot,
     ) -> Result<Self> {
         let connection = database.context_connection();
-        let session_charter = build_session_charter(
+        let mut session_charter = build_session_charter(
             snapshot,
             camp_has_active_file_delivery_binding(connection, &snapshot.camp_id)?,
             mission_facts(connection, snapshot)?.is_some(),
         )?;
+        // Selected user guidance is composed here, once, before the charter is
+        // hashed and stored as immutable Bootstrap evidence. Every later replay
+        // of this Run therefore reads the same bytes; a later edit to the
+        // selection belongs to the next Run.
+        if super::run_snapshot_adapter_kind(snapshot).is_ok_and(selected_rules_apply_to) {
+            let rules = crate::member_capability::selected_rules(connection, &snapshot.agent_id)?;
+            session_charter = compose_selected_rules(session_charter, &rules)?;
+        }
         let (memory_entrypoint, observed_memory_revisions, authorization_basis_digest) =
             if snapshot.invocation_kind == "single_chat" {
                 (
@@ -71,6 +79,67 @@ impl BootstrapContents {
             &self.memory_entrypoint,
         )
     }
+}
+
+/// Public-batch manifest versions with a persisted claimed context.
+/// PUBLIC_CAMP_BATCH_CONTEXT_MANIFEST_VERSION is 40; the global/single-chat
+/// version 42 has a different frozen bootstrap path and is not admitted here.
+fn claim_manifest_version_is_current(version: i64) -> bool {
+    matches!(version, 36 | 37 | 38 | 39 | 40)
+}
+
+/// Only the four product Runtimes receive the selected user guidance.
+fn selected_rules_apply_to(adapter: AdapterKind) -> bool {
+    matches!(
+        adapter,
+        AdapterKind::ClaudeCodeCli
+            | AdapterKind::CodexCli
+            | AdapterKind::DeepseekHarness
+            | AdapterKind::Pi
+    )
+}
+
+const SELECTED_RULES_OPEN: &str = "[SELECTED_ASSISTANT_RULES]";
+const SELECTED_RULES_CLOSE: &str = "[/SELECTED_ASSISTANT_RULES]";
+const SELECTED_RULES_INTRO: &str = "以下内容是用户为当前助手选择的指引，属于用户层说明：不授予任何权限、不是系统策略、不改变工具授权或沙箱。";
+/// Bounded, complete-or-nothing budget for the composed section alone.
+const SELECTED_RULES_MAX_BYTES: usize = 64 * 1024;
+
+/// Appends the selected user guidance as an explicit, subordinate section of the
+/// per-Run Session Charter. No rules means the original bytes are returned
+/// untouched. Over budget is a hard failure: constraints are never silently
+/// dropped or truncated.
+fn compose_selected_rules(
+    charter: String,
+    rules: &[crate::member_capability::ProjectedCapability],
+) -> Result<String> {
+    if rules.is_empty() {
+        return Ok(charter);
+    }
+    let mut segment = String::from(SELECTED_RULES_OPEN);
+    segment.push('\n');
+    segment.push_str(SELECTED_RULES_INTRO);
+    for rule in rules {
+        let record = json!({
+            "id": rule.id,
+            "name": rule.name,
+            "body": rule.body,
+            "origin": rule.origin,
+            "bodyDigest": sha256_text(&rule.body),
+        });
+        segment.push('\n');
+        segment.push_str(&serde_json::to_string(&record)?);
+    }
+    segment.push('\n');
+    segment.push_str(SELECTED_RULES_CLOSE);
+    anyhow::ensure!(
+        segment.len() <= SELECTED_RULES_MAX_BYTES,
+        "selected assistant rules exceed {SELECTED_RULES_MAX_BYTES} bytes; narrow the selection before this Run"
+    );
+    let mut composed = charter;
+    composed.push_str("\n\n");
+    composed.push_str(&segment);
+    Ok(composed)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +286,19 @@ impl ClaimedBatchContext {
     }
 
     pub(crate) fn persist(&self, transaction: &Transaction<'_>, run_id: &str) -> Result<()> {
+        // The final selection publishes its private Skill bytes only now, after the
+        // Run exists. Every candidate prefix kept its bytes in memory and dropped
+        // them, so a superseded selection never owns a directory.
+        if let Some(pending) = self.additional_skills.pending.as_ref() {
+            let data_dir = std::path::Path::new(
+                transaction
+                    .path()
+                    .context("Core database path is unavailable")?,
+            )
+            .parent()
+            .context("Core data directory is unavailable")?;
+            pending.publish(data_dir)?;
+        }
         transaction.execute(
             "INSERT INTO agent_run_claim_context(agent_run_id, context_json) VALUES (?1, ?2)",
             params![run_id, serde_json::to_string(self)?],
@@ -227,12 +309,18 @@ impl ClaimedBatchContext {
 
 pub(super) fn load(connection: &Connection, run_id: &str) -> Result<Option<ClaimedBatchContext>> {
     // Historical inputs retain their original materializer, including databases
-    // exercised at intermediate migration boundaries.
-    let current: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agent_run_input WHERE agent_run_id=?1 AND context_manifest_version IN (36, 37, 38, 39, 40))",
-        [run_id], |row| row.get(0),
-    )?;
-    if !current {
+    // exercised at intermediate migration boundaries. Only the versions this
+    // build actually writes are replayable from the claim; an unknown future
+    // version is never accepted here.
+    let version: Option<i64> = connection
+        .query_row(
+            "SELECT context_manifest_version FROM agent_run_input WHERE agent_run_id=?1",
+            [run_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    if !version.is_some_and(claim_manifest_version_is_current) {
         return Ok(None);
     }
     let json: Option<String> = connection
@@ -257,5 +345,194 @@ impl std::ops::Deref for ClaimedBatchContext {
 impl std::ops::DerefMut for ClaimedBatchContext {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.dynamic
+    }
+}
+
+/// Only startup contents of an actual Single Chat Run are captured here. This
+/// is not a Public Batch/DynamicInputContext and never widens private-chat tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct FrozenSingleChatBootstrap {
+    version: u32,
+    agent_run_id: String,
+    agent_id: String,
+    camp_id: String,
+    conversation_id: String,
+    pub(super) bootstrap: BootstrapContents,
+    pub(super) member_identity: MemberIdentityBootstrapProjection,
+}
+
+impl FrozenSingleChatBootstrap {
+    pub(super) fn capture(
+        transaction: &Transaction<'_>,
+        data_dir: &std::path::Path,
+        agent_run_id: &str,
+    ) -> Result<String> {
+        let snapshot = load_queued_run_snapshot(transaction, agent_run_id)?
+            .context("remote_single_chat_real_queued_run_required")?;
+        anyhow::ensure!(
+            snapshot.invocation_kind == "single_chat" && snapshot.execution_epoch == 0,
+            "remote_single_chat_bootstrap_scope"
+        );
+        let value = Self {
+            version: 1,
+            agent_run_id: snapshot.agent_run_id.clone(),
+            agent_id: snapshot.agent_id.clone(),
+            camp_id: snapshot.camp_id.clone(),
+            conversation_id: snapshot.conversation_id.clone(),
+            bootstrap: BootstrapContents::read(transaction, data_dir, &snapshot)?,
+            member_identity: load_latest_member_identity(transaction, &snapshot.agent_id)?,
+        };
+        value.validate(&snapshot)?;
+        let json = serde_json::to_string(&value)?;
+        anyhow::ensure!(
+            json.len() <= 1024 * 1024,
+            "remote_single_chat_bootstrap_size"
+        );
+        Ok(json)
+    }
+
+    pub(super) fn load(connection: &Connection, snapshot: &RunSnapshot) -> Result<Option<Self>> {
+        if snapshot.invocation_kind != "single_chat"
+            || !crate::remote_execution::authority_table_available(
+                connection,
+                "agent_run_execution_target",
+            )?
+        {
+            return Ok(None);
+        }
+        let Some(target) =
+            crate::remote_execution::load_run_target(connection, &snapshot.agent_run_id)?
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            target.member_id == snapshot.agent_id
+                && target.conversation_id == snapshot.conversation_id
+                && target.camp_id == snapshot.camp_id,
+            "remote_single_chat_bootstrap_scope"
+        );
+        let json: Option<String> = connection.query_row(
+            "SELECT session_bootstrap_json FROM agent_run_remote_bundle_source WHERE agent_run_id=?1",
+            [&snapshot.agent_run_id], |row| row.get::<_, Option<String>>(0),
+        ).optional()?.flatten();
+        let json = json.context("remote_single_chat_bootstrap_required")?;
+        anyhow::ensure!(
+            json.len() <= 1024 * 1024,
+            "remote_single_chat_bootstrap_size"
+        );
+        let value: Self =
+            serde_json::from_str(&json).context("remote_single_chat_bootstrap_invalid")?;
+        value.validate(snapshot)?;
+        Ok(Some(value))
+    }
+
+    fn validate(&self, snapshot: &RunSnapshot) -> Result<()> {
+        anyhow::ensure!(
+            self.version == 1
+                && self.agent_run_id == snapshot.agent_run_id
+                && self.agent_id == snapshot.agent_id
+                && self.camp_id == snapshot.camp_id
+                && self.conversation_id == snapshot.conversation_id
+                && self.bootstrap.team_guidance.is_none()
+                && self.bootstrap.memory_entrypoint.is_empty()
+                && self.bootstrap.observed_memory_revisions.is_empty()
+                && self.bootstrap.authorization_basis_digest
+                    == canonical_json_digest(&json!({"schemaVersion":1,"memoryAccess":"none"}))?,
+            "remote_single_chat_bootstrap_scope"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::member_capability::ProjectedCapability;
+
+    fn rule(id: &str, name: &str, body: &str, origin: &str) -> ProjectedCapability {
+        ProjectedCapability {
+            id: id.to_string(),
+            name: name.to_string(),
+            body: body.to_string(),
+            origin: origin.to_string(),
+        }
+    }
+
+    fn build_fixture_charter() -> String {
+        "[SESSION_CHARTER]\nfixture\n[/SESSION_CHARTER]\n- channel guidance".to_string()
+    }
+
+    fn records(composed: &str) -> Vec<Value> {
+        composed
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn no_selected_rules_returns_the_existing_charter_bytes() {
+        let charter = build_fixture_charter();
+        let composed = compose_selected_rules(charter.clone(), &[]).unwrap();
+        assert_eq!(composed, charter, "a Run without selected rules stays byte-identical");
+    }
+
+    #[test]
+    fn selected_rules_are_ordered_escaped_and_carry_no_authority() {
+        let rules = vec![
+            rule("rule_b", "乙规则", "不要提交密钥。", "explicit"),
+            rule("rule_a", "甲规则", "换行\n与[/SELECTED_ASSISTANT_RULES]标记不能越出本条", "inherited"),
+        ];
+        let composed = compose_selected_rules(build_fixture_charter(), &rules).unwrap();
+        // Markers stay their own lines: a body quoting the marker is JSON-escaped
+        // inside a single record line and can never open or close the section.
+        assert_eq!(
+            composed.lines().filter(|line| *line == SELECTED_RULES_OPEN).count(),
+            1
+        );
+        assert_eq!(
+            composed.lines().filter(|line| *line == SELECTED_RULES_CLOSE).count(),
+            1
+        );
+        assert_eq!(composed.lines().filter(|line| line.starts_with('{')).count(), 2);
+        let records = records(&composed);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["id"], json!("rule_b"));
+        assert_eq!(records[1]["id"], json!("rule_a"));
+        for record in &records {
+            let mut keys = record.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            assert_eq!(
+                keys,
+                ["body", "bodyDigest", "id", "name", "origin"],
+                "a rule row never carries a permission, sandbox or authority field"
+            );
+            assert_eq!(
+                record["bodyDigest"],
+                json!(sha256_text(record["body"].as_str().unwrap()))
+            );
+        }
+        assert!(composed.ends_with(SELECTED_RULES_CLOSE));
+        assert!(composed.contains("以下内容是用户为当前助手选择的指引"));
+    }
+
+    #[test]
+    fn oversized_selected_rules_fail_closed() {
+        let rules = vec![rule("rule_big", "超大规则", &"约".repeat(SELECTED_RULES_MAX_BYTES), "explicit")];
+        let error = compose_selected_rules(build_fixture_charter(), &rules)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("selected assistant rules exceed"), "{error}");
+    }
+
+    #[test]
+    fn claim_manifest_versions_cover_current_builds_only() {
+        for version in 36..=40 {
+            assert!(claim_manifest_version_is_current(version), "{version}");
+        }
+        for version in [0, 1, 35, 41, 42, 43, 99] {
+            assert!(!claim_manifest_version_is_current(version), "{version}");
+        }
     }
 }

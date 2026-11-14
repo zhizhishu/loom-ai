@@ -155,7 +155,7 @@ export function NavigationShell({ platform, disabled = false, settings = false, 
             }}><SplitterFeedback phase={splitter.phase} target={splitter.target} label={uiAttribute('继续拖动收起侧栏')} /></div>
         </DropdownMenu.Trigger>
         <DropdownMenu.Portal><DropdownMenu.Content className="sidebar-action-menu" side="right" sideOffset={4} collisionPadding={8}>
-          {[[200, '紧凑宽度'], [270, '默认宽度'], [360, '宽侧栏']].map(([value, text]) => <DropdownMenu.Item key={value} className="sidebar-action-menu-item" onSelect={() => resizeTo(Number(value))}>{uiAttribute(String(text))}</DropdownMenu.Item>)}
+          {[[200, '紧凑宽度'], [NAVIGATION_DEFAULT_WIDTH, '默认宽度'], [360, '宽侧栏']].map(([value, text]) => <DropdownMenu.Item key={value} className="sidebar-action-menu-item" onSelect={() => resizeTo(Number(value))}>{uiAttribute(String(text))}</DropdownMenu.Item>)}
           <DropdownMenu.Separator className="sidebar-action-menu-separator" />
           <DropdownMenu.Item className="sidebar-action-menu-item" onSelect={toggle}>{label}</DropdownMenu.Item>
         </DropdownMenu.Content></DropdownMenu.Portal>

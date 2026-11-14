@@ -1551,11 +1551,11 @@ export function emptyThreadRuntimeSummary(
   const profiles = activeMembers.map((member) => profileById.get(member.agentId))
   if (profiles.some((profile) => !profile)) return uiAttribute("正在检查智能体…")
 
-  const readyCount = profiles.filter((profile) => (
-    profile?.runtimeReadiness.status === 'ready'
-    || profile?.runtimeReadiness.status === 'light_ready'
-    || profile?.runtimeReadiness.status === 'installed_unverified'
-  )).length
+  const readyCount = profiles.filter((profile) => profile && isNewConversationMemberAvailable({
+    runtimeConfigured: profile.runtimeConfiguration !== null,
+    runtimeReadiness: profile.runtimeReadiness.status,
+    executionAvailability: profile.executionAvailability
+  })).length
   if (readyCount === activeMembers.length) return uiAttribute("智能体可用")
   if (readyCount === 0) return uiAttribute("智能体不可用")
   return uiAttribute("{0}/{1} 个智能体可用", String(readyCount), String(activeMembers.length))
@@ -1580,7 +1580,8 @@ export function QuickChatWorkspace({
 }): JSX.Element {
   const hasAvailableMember = agents.some((agent) => agent.presence === 'present' && isNewConversationMemberAvailable({
     runtimeConfigured: agent.runtimeConfiguration !== null,
-    runtimeReadiness: agent.runtimeReadiness.status
+    runtimeReadiness: agent.runtimeReadiness.status,
+    executionAvailability: agent.executionAvailability
   }))
   return (
     <section className="workspace-shell new-conversation-workspace quick-chat-workspace" aria-label={uiAttribute("快速对话")}>
@@ -5233,6 +5234,36 @@ export function ThreadWorkspace({
     navigateConversationFind(-1)
   })
 
+  const [mikkaHeaderHost, setMikkaHeaderHost] = useState<HTMLElement | null>(null)
+  useLayoutEffect(() => {
+    setMikkaHeaderHost(mobile ? null : document.getElementById('loom-thread-identity-slot'))
+  }, [mobile, snapshot.thread.id, detailEntryHost])
+  const mikkaLeadProfile = defaultLead ? profileById.get(defaultLead.agentId) ?? null : null
+  const mikkaIdentity = defaultLead
+    ? {
+        agentId: defaultLead.agentId,
+        displayName: mikkaLeadProfile?.displayName ?? defaultLead.displayName,
+        avatarRef: mikkaLeadProfile?.avatarRef ?? null
+      }
+    : null
+  const mikkaThreadTitle = formatThreadTitle(snapshot.thread, firstRunThreadId)
+  const mikkaLeadRuntime = mikkaLeadProfile?.runtimeConfiguration ?? null
+  const mikkaLeadModel = mikkaLeadRuntime
+    ? modelSummary(memberRuntimeConfigurationPresentation(mikkaLeadRuntime, null))
+    : ''
+  const mikkaIdentityHeader = <div className="mikka-thread-identity">
+            {mikkaIdentity && (
+              <MemberAvatar
+                agentId={mikkaIdentity.agentId}
+                avatarRef={mikkaIdentity.avatarRef}
+                displayName={mikkaIdentity.displayName}
+                size="mention"
+                decorative
+              />
+            )}
+            <h1 className="mikka-thread-identity-name" title={mikkaThreadTitle}>{mikkaThreadTitle}</h1>
+          </div>
+
   return (
     <RunInputSourceContext.Provider value={{
       body: async messageId => {
@@ -5262,6 +5293,7 @@ export function ThreadWorkspace({
           onDragLeave={leaveAttachmentDropSurface}
           onDrop={dropAttachments}
         >
+          {!mobile && (mikkaHeaderHost ? createPortal(mikkaIdentityHeader, mikkaHeaderHost) : mikkaIdentityHeader)}
           <div className={`camp-conversation-stage ${conversationFind.open ? 'conversation-find-open' : ''}`.trim()}>
             <div className={`conversation-floating-tools ${conversationFind.open ? 'find-open' : ''}`.trim()}>
               {conversationFind.open && (
@@ -6322,7 +6354,7 @@ export function ThreadWorkspace({
           disabled={composerInteractionDisabled}
           onAdd={async (selection) => { await mutateRoutingDraft(() => draftCoordinator.mutateQuote({ type: 'add', selection })) }}
         />
-        <div className="composer-box">
+        <div className="composer-box mikka-composer">
           {attachmentDragState && (
             <span className="composer-destination"><UiText zh={"将添加到这条消息"} /></span>
           )}
@@ -6591,10 +6623,28 @@ export function ThreadWorkspace({
                 onClick={() => composerFileInputRef.current?.click()}
               >
                 <svg aria-hidden="true" viewBox="0 0 18 18">
-                  <path d="m6.2 9.8 4.65-4.65a2.5 2.5 0 0 1 3.54 3.54l-6.1 6.1a4 4 0 0 1-5.66-5.66l6.1-6.1" />
+                  <path d="M9 3.5v11M3.5 9h11" />
                 </svg>
               </button>
               {mobile && <button className="composer-attachment-button" type="button" aria-label={uiAttribute("提及队员")} disabled={busy || composerInteractionDisabled} onPointerDown={(event) => event.preventDefault()} onClick={() => composerHandleRef.current?.startMention()}>@</button>}
+              {mikkaIdentity && (
+                <button type="button" className="mikka-composer-chip"
+                  disabled={!onConfigureRuntime || busy || composerInteractionDisabled}
+                  aria-label={uiAttribute('配置 {0} 的模型', mikkaIdentity.displayName)}
+                  title={uiAttribute('配置 {0} 的模型', mikkaIdentity.displayName)}
+                  onClick={() => onConfigureRuntime?.(mikkaIdentity.agentId)}>
+                  <MemberAvatar
+                    agentId={mikkaIdentity.agentId}
+                    avatarRef={mikkaIdentity.avatarRef}
+                    displayName={mikkaIdentity.displayName}
+                    size="execution"
+                    decorative
+                  />
+                  <span className="mikka-composer-chip-name">{mikkaIdentity.displayName}</span>
+                  {mikkaLeadModel && <span className="mikka-composer-chip-model">{mikkaLeadModel}</span>}
+                  <svg className="mikka-chip-chevron" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                </button>
+              )}
             </div>
             <div className="composer-actions">
               {!managedShortcuts && !executionBlocked && (
@@ -6610,16 +6660,18 @@ export function ThreadWorkspace({
                   </span>
                 </span>
               )}
-              <ComposerDeliveryAction
-                plans={composerDeliveryPlans}
-                mode={deliveryMode}
-                onModeChange={setDeliveryMode}
-                action="send"
-                type="submit"
-                disabled={composerSendDisabled}
-                busy={Boolean(busy || composerSubmitting || preparingAttachments.length > 0)}
-                invite={pendingInviteIds.length > 0}
-              />
+              <div className="mikka-send-slot">
+                <ComposerDeliveryAction
+                  plans={composerDeliveryPlans}
+                  mode={deliveryMode}
+                  onModeChange={setDeliveryMode}
+                  action="send"
+                  type="submit"
+                  disabled={composerSendDisabled}
+                  busy={Boolean(busy || composerSubmitting || preparingAttachments.length > 0)}
+                  invite={pendingInviteIds.length > 0}
+                />
+              </div>
             </div>
           </div>
         </div>

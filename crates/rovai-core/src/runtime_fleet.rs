@@ -294,6 +294,13 @@ impl RuntimeProcessHost {
     }
 
     async fn shutdown_and_reap_until(&self, deadline: Instant) -> bool {
+        if let Self::Codex(host) = self
+            && host.is_remote()
+        {
+            // One authenticated terminate/receipt operation owns the entire
+            // budget; do not spend it on two consecutive network round trips.
+            return host.force_reap_until(deadline).await;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let reserve = std::cmp::min(Duration::from_millis(250), remaining / 4);
         let _ = timeout_at(deadline - reserve, self.shutdown_and_reap()).await;
@@ -993,6 +1000,12 @@ impl RuntimeOwnerRecordStore {
         host: &RuntimeProcessHost,
         run_lease: Option<RunLeaseKey>,
     ) -> Result<()> {
+        // This file is an A-local OS recovery ledger. Remote process identity
+        // and owner preparation are held by Core's remote tables and current
+        // authenticated pipe receipts; a B PID/Job must never enter this ledger.
+        if matches!(host, RuntimeProcessHost::Codex(codex) if codex.is_remote()) {
+            return Ok(());
+        }
         let record = RuntimeOwnerRecord {
             run_lease,
             reaped: false,
@@ -1017,7 +1030,9 @@ impl RuntimeOwnerRecordStore {
                 #[cfg(windows)]
                 {
                     match host {
-                        RuntimeProcessHost::Codex(host) => Some(host.windows_job_name().to_owned()),
+                        RuntimeProcessHost::Codex(host) => {
+                            host.windows_job_name().map(str::to_owned)
+                        }
                         _ => None,
                     }
                 }
@@ -2179,7 +2194,10 @@ impl AgentRuntimeFleetManager {
 
     /// Release native Session locks held by an obsolete configuration before
     /// a resumable Runtime starts its replacement Host in the same reuse scope.
-    /// Active leases retain their normal retirement boundary.
+    /// Active leases retain their normal retirement boundary. A later explicit
+    /// remote acquisition also retries an already-stopping Host in this exact
+    /// scope. It can proceed only after a positive cleanup receipt; no new
+    /// business input or native process is replayed to resolve an unknown stop.
     pub(crate) async fn retire_incompatible_hosts(
         &self,
         adapter_kind: AdapterKind,
@@ -2194,7 +2212,10 @@ impl AgentRuntimeFleetManager {
                 .filter(|(_, entry)| {
                     entry.adapter_kind == adapter_kind
                         && entry.compatibility.reuse_scope == compatibility.reuse_scope
-                        && entry.compatibility.policy != compatibility.policy
+                        && (entry.compatibility.policy != compatibility.policy
+                            || (entry.state == FleetProcessState::Stopping
+                                && matches!(entry.host.as_ref(),
+                                    Some(RuntimeProcessHost::Codex(host)) if host.is_remote())))
                 })
                 .map(|(process_id, entry)| (process_id.clone(), entry.state))
                 .collect::<Vec<_>>();

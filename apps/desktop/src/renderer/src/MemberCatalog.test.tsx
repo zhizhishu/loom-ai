@@ -70,11 +70,13 @@ function renderCatalog(overrides: Partial<Parameters<typeof MemberCatalogBody>[0
     notice: '',
     projection: { status: 'ready', preview, message: '' },
     riskNames: [],
+    reviewSnapshot: null,
     saving: false,
     onQuery: () => undefined,
     onToggle: () => undefined,
     onRetry: () => undefined,
     onSave: () => undefined,
+    onImport: () => undefined,
     onIdentity: () => undefined,
     onOpenProfile: () => undefined,
     onProjectionRetry: () => undefined,
@@ -101,9 +103,14 @@ describe('member capability catalog', () => {
     expect(markup).toContain('[SESSION_CHARTER]')
     expect(markup).toContain('不要写工作区。')
     expect(markup).toContain('下次运行生效：2 项技能，2 个 MCP')
-    expect(markup).toContain('尚未接入运行：1 条规则，1 个 hook')
+    expect(markup).toContain('1 条规则')
+    expect(markup).toContain('1 个 hook')
     expect(markup).not.toContain('下次运行生效：2 项技能，2 个 MCP，1 条规则')
-    expect(markup).toContain('尚未接入运行')
+    expect(markup).not.toContain('尚未接入运行')
+    expect(markup).toContain('选中的 hook 需先审阅正文与运行范围；批准只适用当前定义和范围。')
+    expect(markup).toContain('hook 的批准只对当前正文、成员、节点和工作区有效；其中一处变了就要重新审阅。')
+    expect(markup).not.toContain('原生信任未登记')
+    expect(markup).not.toContain('Codex 远端运行选中 hook 时')
     expect(markup).toContain('与 只读工作区 的 read_file 冲突')
     expect(markup).toContain('与 filesystem 的 read_file 冲突')
     expect(markup).toContain('1 处冲突')

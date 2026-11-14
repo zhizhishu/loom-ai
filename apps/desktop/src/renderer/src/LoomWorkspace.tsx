@@ -1,15 +1,41 @@
+import { createPortal } from 'react-dom'
+import { useOptionalFilePreview } from './FilePreviewContext'
+import { useOptionalFilePreviewLayout } from './FilePreviewLayout'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { AgentProfile, ExecutionNodeRecord, MissionRecord, LoomPlan, LoomTask, LoomDependency, LoomTaskStatus, LoomCandidate, LoomReview, LoomVerification, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
 import { loomTaskReady } from '@contracts'
+import { LoomControl } from './LoomControl'
+import {
+  loomCandidateAcceptable,
+  loomCandidateVersions,
+  loomDependencyReasonLabel,
+  loomUnreleasedInbound,
+  loomVersionLabel,
+  type LoomControlSnapshot
+} from './loom-control-model'
 import { Icon } from './MissionControls'
 import { MissionDeliveryPanel, MissionActivityPanel } from './MissionDelivery'
+import { LoomDelivery } from './LoomDelivery'
+import { MemberAvatar } from './MemberAvatar'
 import { UiText, uiAttribute, useUiText, getInterfaceLanguage } from './interface-language'
 import { useThreadClient } from './camp-client'
 import { LoomLiveProcess, LoomLiveRow, LoomLiveStrip } from './LoomLive'
 import { livePhaseText, livePlacements } from './loom-live-model'
 import type { NodeApi } from './nodes-api'
 
-export type LoomSection = 'activity' | 'plan' | 'delivery'
+/** 内部值保持稳定（滚动位、测试与持久化都按它记）；界面上的名字见 TABS。 */
+export type LoomSection = 'activity' | 'plan' | 'delivery' | 'computer'
+
+/** 工作／流程／资产／电脑：右栏四块，工作在最前。 */
+const LOOM_TABS: ReadonlyArray<{ id: LoomSection; label: string }> = [
+  { id: 'activity', label: '工作' },
+  { id: 'plan', label: '流程' },
+  { id: 'delivery', label: '资产' },
+  { id: 'computer', label: '电脑' }
+]
+
+/** 控制投影的读结果：null 快照 + 非空 error 才是「读不到」，与「读到了但没批准」分开。 */
+type LoomControlRead = { snapshot: LoomControlSnapshot | null; error: string }
 
 function LoomEmpty({ title, children }: { title: string; children: ReactNode }) {
   return <div className="loom-empty">
@@ -176,6 +202,16 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims, pl
     (task.status === 'ready' || task.status === 'in_review') && loomTaskReady(task.taskId, graph).ready
   const readyTasks = tasks.filter(claimable)
   const blockedTasks = tasks.filter(task => task.status === 'blocked')
+  // 返工版本标签：同一任务的候选链有几版就标几版，不把返工画成 DAG 环。
+  const versions = loomCandidateVersions(candidates)
+  const latestVersionOf = (taskId: string): number => versions
+    .reduce((max, entry) => entry.taskId === taskId && entry.version > max ? entry.version : max, 0)
+  const taskTitleOf = (taskId: string): string => tasks.find(entry => entry.taskId === taskId)?.title ?? taskId
+  // 当前 review 提示：只有链头候选且待验收才算「等你决定」，历史版本不算。
+  const pendingReview = (taskId: string): boolean => candidates.some(candidate =>
+    candidate.taskId === taskId
+    && candidate.acceptanceStatus === 'pending'
+    && loomCandidateAcceptable(versions, candidate.candidateId))
   
   // 泳道：depth 0 在最左，往右递增。列内保持 tasks 原顺序，不另排序。
   const depths = flowDepths(tasks, dependencies)
@@ -281,8 +317,12 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims, pl
               else nodeRefs.current.set(task.taskId, element)
             }}
             className={`loom-flow-node ${ready ? 'ready' : ''} ${task.status}`}>
+            {/* 主图只留四件事：标题、成员头像、当前工作状态、卡点。租约/fence/依赖原文进详情。 */}
             <div className="loom-flow-node-header">
               <span className="loom-flow-node-dot" data-status={task.status} data-live={placements.find(entry => entry.taskId === task.taskId)?.phase ?? ''}/>
+              {assignee !== undefined && <MemberAvatar
+                agentId={assignee.agentId} avatarRef={assignee.avatarRef ?? null}
+                displayName={assignee.displayName} size="execution" decorative/>}
               <span className="loom-flow-node-title">{task.title}</span>
             </div>
             <div className="loom-flow-node-meta">
@@ -291,34 +331,48 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims, pl
                 if (placement?.runId && placement.phase !== 'queued' && placement.phase !== 'done') return t(livePhaseText(placement.phase))
                 return statusLabels[task.status]
               })()}</span>
+              {assignee !== undefined
+                && <span className="loom-flow-node-assignee">{assignee.displayName}</span>}
+              {pendingReview(task.taskId)
+                && <span className="loom-summary-tag" data-review="pending">{t('待验收')}</span>}
               {(() => {
                 const pinned = placements.find(entry => entry.taskId === task.taskId)?.pinnedName
                 return pinned ? <span className="loom-flow-node-pin">{t('钉在 {0}', pinned)}</span> : null
               })()}
             </div>
-            {assignee && <div className="loom-flow-node-assignee">{assignee.displayName}</div>}
-            {upstreams.length > 0 && (
-              <div className="loom-flow-node-deps">
-                {t('依赖')}: {upstreams.map(d => {
-                  const upstream = tasks.find(entry => entry.taskId === d.upstreamTaskId)
-                  return upstream?.title ?? d.upstreamTaskId
-                }).join(', ')}
-              </div>
-            )}
             {task.blockedReason && (
               <div className="loom-flow-node-blocked">{task.blockedReason}</div>
             )}
-            <FlowClaimBadge claims={claims} taskId={task.taskId} agents={agents}/>
-            {(() => {
-              const placement = placements.find(entry => entry.taskId === task.taskId)
-              if (!placement) return null
-              return <LoomLiveRow
-                placement={placement}
-                now={now}
-                open={placement.runId !== null && placement.runId === openRunId}
-                onOpen={() => onOpen(task.taskId)}
-              />
-            })()}
+            <details className="loom-summary-details" data-details="flow-node">
+              <summary>{t('详情')}</summary>
+              {upstreams.length > 0 && (
+                <div className="loom-flow-node-deps">
+                  {t('依赖')}: {upstreams.map(d => {
+                    const upstream = tasks.find(entry => entry.taskId === d.upstreamTaskId)
+                    return upstream?.title ?? d.upstreamTaskId
+                  }).join(', ')}
+                </div>
+              )}
+              {latestVersionOf(task.taskId) > 1
+                && <div className="loom-flow-node-rework">{t('返工 {0}', loomVersionLabel(latestVersionOf(task.taskId)))}</div>}
+              {/* 未释放入边的真实原因：直接读控制层求值，不另存一份阻塞表。 */}
+              {loomUnreleasedInbound(loomTaskReady(task.taskId, graph).blockedBy).map(entry => (
+                <div key={entry.dependencyId} className="loom-flow-node-blocked-by">
+                  {t('{0}：{1}', taskTitleOf(entry.upstreamTaskId), loomDependencyReasonLabel(entry.reason))}
+                </div>
+              ))}
+              <FlowClaimBadge claims={claims} taskId={task.taskId} agents={agents}/>
+              {(() => {
+                const placement = placements.find(entry => entry.taskId === task.taskId)
+                if (!placement) return null
+                return <LoomLiveRow
+                  placement={placement}
+                  now={now}
+                  open={placement.runId !== null && placement.runId === openRunId}
+                  onOpen={() => onOpen(task.taskId)}
+                />
+              })()}
+            </details>
           </div>
         })}
       </div>)}
@@ -332,7 +386,7 @@ function LoomFlow({ tasks, dependencies, candidates, reviews, agents, claims, pl
   </div>
 }
 
-function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates, reviews, claims, loading, error, nodeRecords, nodeError, nodes }: {
+function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates, reviews, claims, loading, error, nodeRecords, nodeError, nodes, control, controlError, onReload }: {
   mission: MissionRecord
   agents: AgentProfile[]
   plan: LoomPlan | null
@@ -346,6 +400,9 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
   nodeRecords: ExecutionNodeRecord[] | null
   nodeError: boolean
   nodes: NodeApi | null
+  control: LoomControlSnapshot | null
+  controlError: string
+  onReload(): void
 }) {
   const t = useUiText()
   const [now, setNow] = useState(() => Date.now())
@@ -361,7 +418,7 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
     return <div className="loom-plan">
       <header className="loom-section-heading">
         <div><span className="loom-eyebrow">LOOM · {t('编排')}</span><h2>{t('工作关系')}</h2></div>
-        <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
+  <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
       </header>
       <LoomEmpty title={t('正在读取编排…')}>
         <p>{t('从控制面读取计划、任务与依赖关系。')}</p>
@@ -403,12 +460,15 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
   
   return <div className="loom-plan">
     <header className="loom-section-heading">
-      <div><span className="loom-eyebrow">LOOM · {t('编排')}</span><h2>{plan.goal}</h2></div>
+      <div><span className="loom-eyebrow">LOOM · {t('编排')}</span><h2>{t('工作关系')}</h2></div>
       <span className="loom-number">M-{String(mission.number).padStart(3, '0')}</span>
     </header>
-    <p className="loom-intro">{t('把目标、责任与交付放在同一张工作图上。执行状态和人工验收各自保留。')}</p>
+    {/* 目标常常很长：收进折叠，图放在最前面。 */}
+    <details className="loom-summary-details" data-details="plan-goal">
+      <summary>{t('计划目标')}</summary>
+      <p className="loom-intro">{plan.goal}</p>
+    </details>
     {nodeError && <p className="loom-live-note" role="status">{t('节点列表没有读到。编排仍在。')}</p>}
-    <LoomLiveStrip placements={placements} now={now} />
     <LoomFlow
       tasks={tasks}
       dependencies={dependencies}
@@ -421,242 +481,213 @@ function PlanWorkspace({ mission, agents, plan, tasks, dependencies, candidates,
       openRunId={openPlacement?.runId ?? null}
       onOpen={taskId => setOpenTaskId(current => current === taskId ? null : taskId)}
     />
+    <LoomLiveStrip placements={placements} now={now} />
+    {/* 接力/暂停这类控制策略在图之后：先看关系，再改策略。 */}
+    <LoomControl missionId={mission.missionId} tasks={tasks} agents={agents} snapshot={control} readError={controlError} onReload={onReload}/>
     {openPlacement && nodes && <LoomLiveProcess placement={openPlacement} api={nodes} onClose={() => setOpenTaskId(null)} />}
   </div>
 }
 
 /**
- * 产物大小的展示换算：B / KiB / MiB 三档，B 不带小数。
- * 只换单位，不回写、不四舍五入到「看起来更整」的值。
+ * 进展：任务优先。一句总状态 + 待你处理 + 真实任务行（头像/负责人/状态），
+ * 不做装饰性大数字、不写长导语；跳转按钮直接切 tab，不在这里做接受。
  */
-function artifactSizeLabel(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+/** 「电脑」：任务在哪台机器上跑。读不到节点就说读不到，不编造屏幕。 */
+function LoomComputer({ nodeRecords, nodeError, lead }: {
+  nodeRecords: ExecutionNodeRecord[] | null
+  nodeError: boolean
+  /** 使命默认队长：只显示真实成员档案；读不到或没配就是没有，不摆占位假人。 */
+  lead: AgentProfile | null
+}): React.JSX.Element {
+  const t = useUiText()
+  const nodes = nodeError ? null : nodeRecords
+  return <div className="loom-computer">
+    {lead !== null && <header className="loom-computer-profile">
+      <MemberAvatar agentId={lead.agentId} avatarRef={lead.avatarRef ?? null} displayName={lead.displayName} size="profile" decorative/>
+      <span className="loom-computer-name">{lead.displayName}</span>
+      <span className="loom-computer-role">{t('使命队长')}</span>
+    </header>}
+    {/* 照 PiBot BotScreenPanel 的舞台构图，但没有屏幕流就明说，不摆假画面。 */}
+    <div className="loom-screen">
+      <div className="loom-screen-bar"><span>{t('远程屏幕')}</span></div>
+      <div className="loom-screen-stage"><span>{t('未连接屏幕服务')}</span></div>
+    </div>
+    <p className="loom-board-note">{t('接管控制需要宿主提供屏幕流；当前未接入，这里只列执行节点与运行位置。')}</p>
+    <h3 className="loom-board-heading">{t('执行节点')}</h3>
+    {nodes === null && <p className="loom-board-empty">{t('读取执行节点失败')}</p>}
+    {nodes !== null && nodes.length === 0 && <p className="loom-board-empty">{t('尚未连接执行节点')}</p>}
+    {nodes?.map(node => <div key={node.nodeId} className="loom-node" data-online={node.status === 'online' || undefined}>
+      <span className="loom-node-main">
+        <span className="loom-node-name">{node.displayName}</span>
+        <span className="loom-node-meta">{[node.os, node.arch].filter(Boolean).join(' · ') || node.role}</span>
+      </span>
+      <span className="loom-node-state">
+        {node.status === 'online' ? t('在线') : node.status === 'revoked' ? t('已撤销') : t('离线')}
+      </span>
+    </div>)}
+    <p className="loom-board-note">{t('工具在该节点所在机器上执行，工作区与凭据留在那台机器。')}</p>
+  </div>
 }
 
-/** 一次人工验收的在途表单：勾选集合按 criterionId 记，不依赖数组下标。 */
-type DeliveryDraft = {
-  candidateId: string
-  verdict: 'accepted' | 'rejected'
-  reason: string
-  satisfied: readonly string[]
+/** 六档归位：一项工作只出现一次。判据见 docs/loom-ui-redesign-brief.md，不新增字段。 */
+const LOOM_BUCKETS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'wait', label: '待你处理' },
+  { id: 'running', label: '进行中' },
+  { id: 'delivered', label: '已交付' },
+  { id: 'blocked', label: '受阻' },
+  { id: 'idle', label: '空闲' },
+  { id: 'unknown', label: '状态未确认' }
+]
+
+/** 送审不等于你的待办；done 不等于已交付；ready 有认领才算在跑。 */
+function loomBucket(status: string, needsYou: boolean, isRunning: boolean, hasArtifact: boolean): string {
+  if (needsYou) return 'wait'
+  if (status === 'blocked') return 'blocked'
+  if (status === 'done') return hasArtifact ? 'delivered' : 'unknown'
+  if (status === 'in_review') return hasArtifact ? 'delivered' : 'running'
+  if (status === 'ready') return isRunning ? 'running' : 'idle'
+  if (status === 'draft' || status === 'canceled') return 'idle'
+  return 'unknown'
 }
 
-function DeliveryReview({ candidates, reviews, verifications, artifacts, plan, missionId, onRefresh }: {
+function LoomProgress({ mission, agents, tasks, candidates, loading, error, onRetry, onOpenPlan }: {
+  mission: MissionRecord
+  agents: AgentProfile[]
+  tasks: LoomTask[]
   candidates: LoomCandidate[]
-  reviews: LoomReview[]
-  verifications: LoomVerification[]
-  artifacts: LoomArtifact[] | null
-  plan: LoomPlan | null
-  missionId: string
-  onRefresh: () => void
+  /** 当前 scope 还没读到数据：只给读取态，不显示 0 任务/无待办这种假信息 */
+  loading: boolean
+  error: string
+  onRetry(): void
+  onOpenPlan(): void
 }) {
   const t = useUiText()
-  // 证据 ID 就是产物登记里的 artifactId：一次建索引，逐条回填，不在渲染里反复扫数组。
-  const artifactById = useMemo(
-    () => new Map<string, LoomArtifact>((artifacts ?? []).map(entry => [entry.artifactId, entry] as const)),
-    [artifacts])
-  const client = useThreadClient()
-  const [draft, setDraft] = useState<DeliveryDraft | null>(null)
-  // 写入是串行的人工动作：在途时禁用全部操作，避免重复 commandId 之外的并发提交。
-  const [pending, setPending] = useState('')
-  // 错误只挂在出事的候选上：别的卡片不该替它报错。
-  const [failure, setFailure] = useState<{ candidateId: string; message: string } | null>(null)
-  // 枚举值是英文标识，不直接展示；data-state 仍保留原值，两个徽章各看各的状态，不合并。
-  const verificationLabel = (state: LoomCandidate['verificationStatus']): string =>
-    state === 'verified' ? t('已核验') : state === 'failed' ? t('核验失败') : t('未核验')
-  const acceptanceLabel = (state: LoomCandidate['acceptanceStatus']): string =>
-    state === 'accepted' ? t('已验收') : state === 'rejected' ? t('已驳回') : t('待验收')
-  // 候选 ID 先去掉冗余的 candidate- 前缀再截尾：直接 slice(-6) 会把 "candidate-1"
-  // 切成 "date-1"，看起来像个日期。
-  const candidateLabel = (candidateId: string): string => {
-    const bare = candidateId.replace(/^candidate-/, '')
-    return bare.length > 8 ? `…${bare.slice(-8)}` : bare
+  // 枚举值是英文标识，不直接展示给用户。
+  const statusText: Record<LoomTaskStatus, string> = {
+    draft: t('草稿'), ready: t('就绪'), blocked: t('阻塞'), in_review: t('评审中'), done: t('已完成'), canceled: t('已取消')
   }
-  // 核验方法目前只有人工与自动两种；已知取值翻译，未知值原样显示，不丢信息。
-  const methodLabel = (method: string): string =>
-    method === 'manual' ? t('人工核验') : method === 'automated' ? t('自动核验') : method
-  // 新的返工版本在最前；createdAt 相同就保持后端顺序。
-  const ordered = [...candidates].sort((a, b) =>
-    a.createdAt === b.createdAt ? 0 : a.createdAt < b.createdAt ? 1 : -1)
-  // 验收标准版本与逐条标准一律读计划快照：候选快照只照抄，不在这里另立规则。
-  const criteria = plan?.acceptanceCriteria.criteria ?? []
-  const criteriaVersion = plan?.acceptanceCriteria.version ?? ''
-
-  const closeDraft = (): void => { setDraft(null); setPending(''); setFailure(null) }
-
-  const openDraft = (candidate: LoomCandidate, verdict: 'accepted' | 'rejected'): void => {
-    setFailure(null)
-    setPending('')
-    setDraft({ candidateId: candidate.candidateId, verdict, reason: '', satisfied: [] })
+  // 待你处理只认「链头 + 待验收」的真实候选，历史版本不算。
+  const versions = useMemo(() => loomCandidateVersions(candidates), [candidates])
+  const pending = useMemo(() => candidates.filter(candidate => candidate.acceptanceStatus === 'pending'
+    && loomCandidateAcceptable(versions, candidate.candidateId)), [candidates, versions])
+  const pendingTasks = useMemo(() => new Set(pending.map(candidate => candidate.taskId)), [pending])
+  const titleOf = (taskId: string): string => {
+    const title = tasks.find(task => task.taskId === taskId)?.title ?? ''
+    return title.trim() === '' ? t('未命名任务') : title
   }
-
-  const toggleCriterion = (criterionId: string): void => setDraft(current => current === null ? current : {
-    ...current,
-    satisfied: current.satisfied.includes(criterionId)
-      ? current.satisfied.filter(id => id !== criterionId)
-      : [...current.satisfied, criterionId]
+  const versionOf = (candidateId: string): number | undefined =>
+    versions.find(entry => entry.candidateId === candidateId)?.version
+  // 待你处理最前，然后按执行先后；同档保持后端顺序（sort 是稳定的）。
+  const rank = (task: LoomTask): number => pendingTasks.has(task.taskId) ? 0
+    : task.status === 'in_review' ? 1
+      : task.status === 'blocked' ? 2
+        : task.status === 'ready' ? 3
+          : task.status === 'draft' ? 4 : task.status === 'done' ? 5 : 6
+  const orderedTasks = [...tasks].sort((left, right) => rank(left) - rank(right))
+  // 照 BotBoard：搜索 + 状态筛选（_references/pibot/web/src/BotBoard.tsx:116-123）
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState('all')
+  const bucketOf = (task: LoomTask): string => loomBucket(
+    String(task.status),
+    pendingTasks.has(task.taskId),
+    mission.runningAgentIds.includes(task.assigneeAgentId ?? ''),
+    candidates.some(candidate => candidate.taskId === task.taskId)
+  )
+  const visibleTasks = orderedTasks.filter(task => {
+    if (filter !== 'all' && bucketOf(task) !== filter) return false
+    const needle = query.trim().toLowerCase()
+    return needle === '' || task.title.toLowerCase().includes(needle)
   })
-
-  // 接受必须逐条全勾；驳回只要求写明理由。reviewerId 由 Core 从可信身份注入，客户端不发。
-  const canSubmit = draft !== null && draft.reason.trim() !== ''
-    && (draft.verdict === 'rejected' || criteria.every(criterion => draft.satisfied.includes(criterion.criterionId)))
-
-  const recordReview = async (candidate: LoomCandidate): Promise<void> => {
-    if (draft === null || draft.candidateId !== candidate.candidateId || !canSubmit || pending !== '') return
-    setPending(`${candidate.candidateId}:${draft.verdict}`)
-    setFailure(null)
-    try {
-      await client.request<unknown>('loom.review.record', {
-        missionId,
-        taskId: candidate.taskId,
-        candidateId: candidate.candidateId,
-        commandId: crypto.randomUUID(),
-        acceptanceCriteriaVersion: criteriaVersion,
-        verdict: draft.verdict,
-        reason: draft.reason.trim(),
-        criteriaResults: criteria.map(criterion => ({
-          criterionId: criterion.criterionId,
-          satisfied: draft.satisfied.includes(criterion.criterionId),
-          evidenceIds: [],
-          note: null
-        }))
-      })
-      closeDraft()
-      onRefresh()
-    } catch (e) {
-      setFailure({ candidateId: candidate.candidateId, message: e instanceof Error ? e.message : '验收写入失败' })
-      setPending('')
-    }
+  if (loading) {
+    return <div className="loom-overview">
+      <LoomEmpty title={t('正在读取进展…')}><p>{t('从控制面读取任务、成果与验收状态。')}</p></LoomEmpty>
+    </div>
   }
-
-  // executorId 同样由 Core 注入；客户端只报方法（人工核验）与结论。
-  const recordVerification = async (candidate: LoomCandidate, result: 'passed' | 'failed'): Promise<void> => {
-    if (pending !== '') return
-    setPending(`${candidate.candidateId}:${result}`)
-    setFailure(null)
-    try {
-      await client.request<unknown>('loom.verification.record', {
-        missionId,
-        taskId: candidate.taskId,
-        candidateId: candidate.candidateId,
-        commandId: crypto.randomUUID(),
-        method: 'manual',
-        result
-      })
-      setPending('')
-      onRefresh()
-    } catch (e) {
-      setFailure({ candidateId: candidate.candidateId, message: e instanceof Error ? e.message : '核验写入失败' })
-      setPending('')
-    }
-  }
-
-  return <div className="loom-delivery-context">
-    <header className="loom-section-heading">
-      <div><span className="loom-eyebrow">LOOM · {t('交付')}</span><h2>{t('成果与验收')}</h2></div>
-    </header>
-    {ordered.length === 0
-      ? <LoomEmpty title={t('尚无交付')}>
-          <p>{t('任务提交候选成果后，这里会出现待验收的产物。')}</p>
-        </LoomEmpty>
-      : ordered.map(candidate => {
-        const review = reviews.find(entry => entry.candidateId === candidate.candidateId)
-        const verification = verifications.find(entry => entry.candidateId === candidate.candidateId)
-        // 一个候选只有一份评审、一份核验：已有记录就不再给同类写入口。
-        const reviewable = review === undefined
-        const verifiable = candidate.verificationStatus === 'unverified'
-        const open = draft?.candidateId === candidate.candidateId ? draft : null
-        return <div key={candidate.candidateId} className="loom-candidate">
-          <div className="loom-candidate-header">
-            <span className="loom-candidate-title">{t('候选')} {candidateLabel(candidate.candidateId)}</span>
-            <span className="loom-badge loom-badge-verification" data-state={candidate.verificationStatus}>
-              {verificationLabel(candidate.verificationStatus)}
-            </span>
-            <span className="loom-badge loom-badge-acceptance" data-state={candidate.acceptanceStatus}>
-              {acceptanceLabel(candidate.acceptanceStatus)}
-            </span>
-          </div>
-          <div className="loom-candidate-meta">{candidate.contentHash} · {t('证据')} {candidate.evidenceIds.length} {t('条')}</div>
-          {/* 逐条证据：只读已登记的产物行。登记证明当时算过 hash，不重读字节，所以徽章只说「已登记」，
-              不说「已核验」。artifacts 为 null 是整条投影读不到，不能降级成「未登记」。 */}
-          {candidate.evidenceIds.length > 0 && <div className="loom-candidate-evidence">
-            {candidate.evidenceIds.map(evidenceId => {
-              const artifact = artifacts === null ? undefined : artifactById.get(evidenceId)
-              const state = artifacts === null ? 'unknown' : artifact === undefined ? 'unregistered' : 'registered'
-              return <div key={evidenceId} className="loom-evidence-row">
-                {artifact === undefined
-                  ? <span className="loom-evidence-path">{evidenceId}</span>
-                  : <>
-                    <span className="loom-evidence-path" title={artifact.relativePath}>{artifact.relativePath}</span>
-                    <span className="loom-evidence-hash" title={artifact.sha256}>{artifact.sha256.slice(0, 12)}</span>
-                    <span className="loom-evidence-size">{artifactSizeLabel(artifact.sizeBytes)}</span>
-                  </>}
-                <span className="loom-evidence-state" data-artifact-state={state}>
-                  {state === 'unknown' ? t('产物信息读取失败') : state === 'registered' ? t('已登记') : t('未登记')}
+  // 一句总状态：只有真有待确认的成果才说成果，否则说任务本身的真实状态。
+  const summary = pending.length > 0
+    ? t('有 {0} 份成果等你确认', pending.length)
+    : error !== '' && tasks.length === 0
+      ? t('还没读到任务')
+      : mission.runningAgentIds.length > 0
+      ? t('任务进行中')
+      : tasks.length === 0 ? t('等待计划') : t('暂无进行中的任务')
+  // 折叠只收紧真正空闲的一档：unknown、待你处理、进行中、受阻与已交付都留在明面上。
+  // 「已交付」里还可能是等着接受的在审版本，收进折叠就等于谎称已解决。
+  const stillOpenBuckets = LOOM_BUCKETS.filter(bucket => bucket.id !== 'idle')
+  const settledBuckets = LOOM_BUCKETS.filter(bucket => bucket.id === 'idle')
+  const countOf = (bucketId: string): number => bucketId === 'all'
+    ? orderedTasks.length
+    : orderedTasks.filter(task => bucketOf(task) === bucketId).length
+  const bucketGroup = (bucket: { id: string; label: string }): ReactNode => {
+    const rows = visibleTasks.filter(task => bucketOf(task) === bucket.id)
+    if (rows.length === 0) return null
+    return <section key={bucket.id} className="loom-summary-group" data-bucket={bucket.id} aria-label={uiAttribute(bucket.label)}>
+      <span className="loom-summary-label">{t(bucket.label)} <span className="loom-summary-count">({rows.length})</span></span>
+      <ul className="loom-summary-tasks">
+        {rows.map(task => {
+          const member = agents.find(agent => agent.agentId === task.assigneeAgentId)
+          return <li key={task.taskId} className="loom-summary-task" data-status={task.status}>
+            <button type="button" className="loom-summary-row" onClick={onOpenPlan}>
+              <span className="loom-summary-state" data-status={task.status} aria-hidden="true"/>
+              <span className="loom-summary-text">
+                <span className="loom-summary-title">{task.title.trim() === '' ? t('未命名任务') : task.title}</span>
+                <span className="loom-summary-sub">
+                  {member !== undefined
+                    ? <>
+                        <MemberAvatar
+                          agentId={member.agentId} avatarRef={member.avatarRef ?? null}
+                          displayName={member.displayName} size="execution" decorative/>
+                        <span>{member.displayName}</span>
+                      </>
+                    : <span>{t('未指派')}</span>}
+                  <span className="loom-summary-status" data-status={task.status}>{statusText[task.status]}</span>
                 </span>
-              </div>
-            })}
-          </div>}
-          {review !== undefined && <div className="loom-candidate-review">
-            <div>{t('验收结论')}：{review.verdict === 'accepted' ? t('通过') : t('驳回')} · {review.reason}</div>
-            {review.criteriaResults.map(result => <div key={result.criterionId}>
-              {result.criterionId} · {result.satisfied ? t('满足') : t('未满足')}
-            </div>)}
-          </div>}
-          {verification !== undefined && <div className="loom-candidate-verification">
-            <div>{t('核验结论')}：{verification.result === 'passed' ? t('通过') : t('失败')} · {methodLabel(verification.method)}</div>
-          </div>}
-          {(reviewable || verifiable) && <div className="loom-delivery-actions">
-            {reviewable && <button
-              type="button" className="loom-btn-accept" disabled={pending !== ''}
-              onClick={() => openDraft(candidate, 'accepted')}>{t('接受')}</button>}
-            {reviewable && <button
-              type="button" className="loom-btn-reject" disabled={pending !== ''}
-              onClick={() => openDraft(candidate, 'rejected')}>{t('驳回')}</button>}
-            {verifiable && <button
-              type="button" className="loom-btn-verify" disabled={pending !== ''}
-              onClick={() => void recordVerification(candidate, 'passed')}>{t('通过核验')}</button>}
-            {verifiable && <button
-              type="button" className="loom-btn-verify" data-result="failed" disabled={pending !== ''}
-              onClick={() => void recordVerification(candidate, 'failed')}>{t('核验失败')}</button>}
-          </div>}
-          {failure !== null && failure.candidateId === candidate.candidateId
-            && <p className="loom-review-failure">{failure.message}</p>}
-          {open !== null && <form className="loom-review-form" onSubmit={event => {
-            event.preventDefault()
-            void recordReview(candidate)
-          }}>
-            <div className="loom-review-criteria">
-              {criteria.map(criterion => <label key={criterion.criterionId} className="loom-review-criterion">
-                <input
-                  type="checkbox" checked={open.satisfied.includes(criterion.criterionId)}
-                  onChange={() => toggleCriterion(criterion.criterionId)}/>
-                <span className="loom-review-criterion-id">{criterion.criterionId}</span>
-                <span className="loom-review-criterion-text">{criterion.text}</span>
-              </label>)}
-            </div>
-            <textarea
-              className="loom-review-reason" rows={3} value={open.reason}
-              aria-label={t('验收理由')} placeholder={t('验收理由（必填）')}
-              onChange={event => {
-                const reason = event.target.value
-                setDraft(current => current === null ? current : { ...current, reason })
-              }}/>
-            <div className="loom-delivery-actions">
-              <button
-                type="submit" className={open.verdict === 'accepted' ? 'loom-btn-accept' : 'loom-btn-reject'}
-                disabled={!canSubmit || pending !== ''}>
-                {open.verdict === 'accepted' ? t('确认接受') : t('确认驳回')}
-              </button>
-              <button type="button" className="loom-btn-cancel" disabled={pending !== ''} onClick={closeDraft}>
-                {t('取消')}
-              </button>
-            </div>
-          </form>}
+              </span>
+              <span className="loom-summary-chev" aria-hidden="true">›</span>
+            </button>
+          </li>
+        })}
+      </ul>
+    </section>
+  }
+  const settledRows = visibleTasks.filter(task => bucketOf(task) === 'idle').length
+  return <div className="loom-overview">
+    <header className="loom-section-heading">
+      <div><h2>{t('全部工作')}</h2></div>
+      <div className="loom-work-controls">
+          <label className="loom-board-search">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input value={query} onChange={event => setQuery(event.target.value)}
+              placeholder={t('搜索任务')} aria-label={t('搜索任务')}/>
+          </label>
+          <label className="loom-work-filter">
+            <select value={filter} onChange={event => setFilter(event.target.value)} aria-label={uiAttribute('状态筛选')}>
+              <option value="all">{t('全部')} {orderedTasks.length}</option>
+              {LOOM_BUCKETS.map(bucket => <option key={bucket.id} value={bucket.id}>{t(bucket.label)} {countOf(bucket.id)}</option>)}
+            </select>
+          </label>
+
         </div>
-      })}
+    </header>
+    {error !== '' && <p className="loom-live-note" role="status">
+      {t('刷新失败：{0}', error)}
+      <button type="button" className="loom-summary-secondary" onClick={onRetry}>{t('重试')}</button>
+    </p>}
+    <p className="loom-summary-line sr-only">
+      {summary}
+      {' · '}{t('{0} 个任务', tasks.length)}
+      {' · '}{t('{0} 人在执行', mission.runningAgentIds.length)}
+    </p>
+    {orderedTasks.length === 0
+      ? <p className="loom-summary-line">{t('还没有任务。主助手建立计划后，这里会列出任务与负责人。')}</p>
+      : <>
+        {visibleTasks.length === 0 && <p className="loom-summary-line">{t('没有符合筛选条件的任务。')}</p>}
+        {stillOpenBuckets.map(bucketGroup)}
+        {settledRows > 0 && <details className="loom-summary-details" data-bucket-group="idle">
+          <summary>{t('空闲')} · {settledRows}</summary>
+          {settledBuckets.map(bucketGroup)}
+        </details>}
+      </>}
   </div>
 }
 
@@ -665,11 +696,13 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
   onNotify(message: string): void; onWorkspaceCleanupRequested(threadId: string): Promise<void>
   nodes?: NodeApi | null
 }) {
+  // 内部值仍是 activity（契约与滚动位不变），用户看到的名字是「进展」。
   const [section, setSection] = useState<LoomSection>('activity')
   const [visited, setVisited] = useState<ReadonlySet<LoomSection>>(() => new Set(['activity']))
   const shared = useRef<HTMLDivElement>(null)
   const scrollPositions = useRef<Partial<Record<LoomSection, { top: number; left: number }>>>({})
-  
+  const t = useUiText()
+
   const client = useThreadClient()
   const [plan, setPlan] = useState<LoomPlan | null>(null)
   const [tasks, setTasks] = useState<LoomTask[]>([])
@@ -681,51 +714,110 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
   const [claims, setClaims] = useState<LoomClaim[] | null>(null)
   // 产物投影：语义同 claims——null = 读不到（不是「没有产物」）。数组为空才算真的没有登记过。
   const [artifacts, setArtifacts] = useState<LoomArtifact[] | null>(null)
+  // 控制策略投影：读失败保留 null + 错误文案，从不当成 enabled=false 的假成功。
+  const [control, setControl] = useState<LoomControlSnapshot | null>(null)
+  const [controlError, setControlError] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [nodeRecords, setNodeRecords] = useState<ExecutionNodeRecord[] | null>(null)
   const [nodeError, setNodeError] = useState(false)
 
-  // 写入口（验收 / 核验）成功后重新读一遍八个投影：状态只认控制面回读，不在本地猜。
-  const reload = useCallback((): void => {
+  // 只有一条 load：代次隔离，重复触发（切 tab / 事件 / 重新可见）时只让最后一份落地。
+  // 代次跟着 mission scope 走：换使命立刻退役旧代次，旧响应不能换使命覆盖。
+  const generation = useRef(0)
+  // 已落地的数据属于哪个 mission；不等于当前 mission 就还在读新 scope。
+  const loadedMission = useRef<string | null>(null)
+  const renderScope = useRef<string | null>(null)
+  // 渲染期同步检测换使命：只递增代次与标记 scope，不在这里 setState。
+  if (renderScope.current !== mission.missionId) {
+    renderScope.current = mission.missionId
+    generation.current += 1
+    loadedMission.current = null
+  }
+  const load = useCallback((): void => {
+    const ticket = generation.current + 1
+    generation.current = ticket
+    const missionId = mission.missionId
+    // 只有「这个 scope 还没读到过东西」才亮读取态：后台回读不在界面上闪空。
+    if (loadedMission.current !== missionId) setLoading(true)
     void Promise.all([
-      client.request<LoomPlan | null>('loom.plan.get', { missionId: mission.missionId }),
-      client.request<LoomTask[]>('loom.tasks.list', { missionId: mission.missionId }),
-      client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId }),
-      client.request<LoomCandidate[]>('loom.candidates.list', { missionId: mission.missionId }),
-      client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId }),
-      client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId }),
+      client.request<LoomPlan | null>('loom.plan.get', { missionId }),
+      client.request<LoomTask[]>('loom.tasks.list', { missionId }),
+      client.request<LoomDependency[]>('loom.dependencies.list', { missionId }),
+      client.request<LoomCandidate[]>('loom.candidates.list', { missionId }),
+      client.request<LoomReview[]>('loom.reviews.list', { missionId }),
+      client.request<LoomVerification[]>('loom.verifications.list', { missionId }),
       // 认领读失败不拖垮其他投影：只把认领区降级成「认领状态未知」。
-      client.request<LoomClaimsListResult>('loom.claims.list', { missionId: mission.missionId })
+      client.request<LoomClaimsListResult>('loom.claims.list', { missionId })
         .then((result): LoomClaimsListResult | null => result, () => null),
       // 产物读失败同理：只把候选卡的产物区降级成「产物信息读取失败」，其他七个投影照常。
-      client.request<LoomArtifactsListResult>('loom.artifacts.list', { missionId: mission.missionId })
-        .then((result): LoomArtifactsListResult | null => result, () => null)
-    ]).then(([p, t, d, c, r, v, k, a]) => {
+      client.request<LoomArtifactsListResult>('loom.artifacts.list', { missionId })
+        .then((result): LoomArtifactsListResult | null => result, () => null),
+      // 控制策略：读失败只降级成「读不到」，不影响其他投影，也不编一个未启用状态。
+      client.request<LoomControlSnapshot>('loom.control.get', { missionId })
+        .then((result): LoomControlRead => ({ snapshot: result, error: '' }), (e: unknown): LoomControlRead => ({
+          snapshot: null,
+          error: e instanceof Error && e.message !== '' ? e.message : '控制策略读取失败'
+        }))
+    ]).then(([p, t, d, c, r, v, k, a, controlRead]) => {
+      if (generation.current !== ticket) return
+      loadedMission.current = missionId
       setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v)
-      setClaims(k === null ? null : k.claims); setArtifacts(a === null ? null : a.artifacts); setError('')
-    }).catch(e => setError(e.message ?? '刷新失败'))
+      setClaims(k === null ? null : k.claims); setArtifacts(a === null ? null : a.artifacts)
+      setControl(controlRead.snapshot); setControlError(controlRead.error); setError('')
+      setLoading(false)
+    }, (e: unknown) => {
+      if (generation.current !== ticket) return
+      setError(e instanceof Error && e.message !== '' ? e.message : '读取编排数据失败')
+      setLoading(false)
+    })
   }, [client, mission.missionId])
 
-  // 助手经 `rovai loom` 写入后，Core 发 missions.invalidated(reason=missions.loomUpdated)：同一使命就回读。
+  // 换使命或换 client：paint 前清掉上一 scope 的投影，再拉新 scope。
+  // cleanup 递增代次：卸载或换 scope 后，旧请求的响应一律不再 setState。
+  useLayoutEffect(() => {
+    loadedMission.current = null
+    setPlan(null); setTasks([]); setDependencies([]); setCandidates([]); setReviews([]); setVerifications([])
+    setClaims(null); setArtifacts(null); setControl(null); setControlError(''); setError(''); setLoading(true)
+    load()
+    return () => { generation.current += 1 }
+  }, [mission.missionId, load])
+
+  // 助手经 `rovai loom` 写入后 Core 发 missions.invalidated：本使命相关（含 loomUpdated）就回读。
   useEffect(() => {
     const stop = client.onEvent?.(event => {
       if (event.method !== 'missions.invalidated') return
       const params = event.params && typeof event.params === 'object' ? event.params as Record<string, unknown> : {}
-      if (params.reason !== 'missions.loomUpdated') return
-      if (typeof params.threadId === 'string' && params.threadId !== mission.threadId) return
-      reload()
+      const reason = typeof params.reason === 'string' ? params.reason : ''
+      const threadId = typeof params.threadId === 'string' ? params.threadId : null
+      const eventMissionId = typeof params.missionId === 'string' ? params.missionId : null
+      // 明确属于别的使命/会话的事件不处理。
+      if (threadId !== null && threadId !== mission.threadId) return
+      if (eventMissionId !== null && eventMissionId !== mission.missionId) return
+      const sameMission = threadId === mission.threadId || eventMissionId === mission.missionId
+      if (reason !== 'missions.loomUpdated' && !sameMission) return
+      load()
     })
     return () => { stop?.() }
-  }, [client, mission.threadId, reload])
-  
+  }, [client, mission.missionId, mission.threadId, load])
+
+  // 页面重新可见时回读；不新增定时轮询。
+  useEffect(() => {
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'visible') load()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [load])
+
   useLayoutEffect(() => {
     if (section === 'plan') return
     const saved = scrollPositions.current[section]
     const node = shared.current
     if (node && saved) { node.scrollTop = saved.top; node.scrollLeft = saved.left }
   }, [section])
-  
+
+  // 节点进程列表独立轮询：这是执行侧观测，不属于上面那条投影 load。
   useEffect(() => {
     if (!nodes) {
       setNodeRecords(null)
@@ -733,7 +825,7 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
       return
     }
     let alive = true
-    const load = (): void => {
+    const readNodes = (): void => {
       void nodes.list().then(result => {
         if (!alive) return
         setNodeRecords(result.nodes)
@@ -742,60 +834,73 @@ export function LoomWorkspace({ mission, agents, onSource, onNotify, onWorkspace
         if (alive) setNodeError(true)
       })
     }
-    load()
-    const timer = window.setInterval(load, 5000)
+    readNodes()
+    const timer = window.setInterval(readNodes, 5000)
     return () => {
       alive = false
       window.clearInterval(timer)
     }
   }, [nodes])
 
-  useLayoutEffect(() => {
-    let alive = true
-    setLoading(true)
-    void Promise.all([
-      client.request<LoomPlan | null>('loom.plan.get', { missionId: mission.missionId }),
-      client.request<LoomTask[]>('loom.tasks.list', { missionId: mission.missionId }),
-      client.request<LoomDependency[]>('loom.dependencies.list', { missionId: mission.missionId }),
-      client.request<LoomCandidate[]>('loom.candidates.list', { missionId: mission.missionId }),
-      client.request<LoomReview[]>('loom.reviews.list', { missionId: mission.missionId }),
-      client.request<LoomVerification[]>('loom.verifications.list', { missionId: mission.missionId }),
-      client.request<LoomClaimsListResult>('loom.claims.list', { missionId: mission.missionId })
-        .then((result): LoomClaimsListResult | null => result, () => null),
-      client.request<LoomArtifactsListResult>('loom.artifacts.list', { missionId: mission.missionId })
-        .then((result): LoomArtifactsListResult | null => result, () => null)
-    ]).then(([p, t, d, c, r, v, k, a]) => {
-      if (alive) {
-        setPlan(p); setTasks(t); setDependencies(d); setCandidates(c); setReviews(r); setVerifications(v)
-        setClaims(k === null ? null : k.claims); setArtifacts(a === null ? null : a.artifacts); setError('')
-      }
-    }).catch(e => {
-      if (alive) setError(e.message ?? '读取编排数据失败')
-    }).finally(() => {
-      if (alive) setLoading(false)
-    })
-    return () => { alive = false }
-  }, [client, mission.missionId])
-  
+  // 这个 scope 的数据是否已经落地：没落地就只给读取态，绝不把 0 任务当成空结果。
+  const scopeLoaded = loadedMission.current === mission.missionId
+  const scopedLoading = !scopeLoaded && error === ''
+  const hasData = plan !== null || tasks.length > 0 || candidates.length > 0
+
   const select = (next: LoomSection): void => {
     const node = shared.current
     if (node && section !== 'plan') scrollPositions.current[section] = { top: node.scrollTop, left: node.scrollLeft }
     setSection(next)
     setVisited(current => current.has(next) ? current : new Set(current).add(next))
+    // 用户切 tab（首次或再次）都回读一次；并发触发由代次只取最后一份。
+    load()
   }
-  return <div className="loom-workspace">
-    <nav className="loom-section-tabs" aria-label={uiAttribute('使命工作区')}>
-      {(['activity', 'plan', 'delivery'] as const).map(id => <button key={id} type="button" aria-pressed={section === id} onClick={() => select(id)}>
-        {id === 'plan' && <Icon name="branch"/>}{id === 'delivery' && <Icon name="check"/>}
-        <UiText zh={id === 'activity' ? '活动' : id === 'plan' ? '编排' : '交付'}/>
+  // 电脑页顶部的真实队长档案：使命里配了默认队长且该成员仍在 agents 里才渲染。
+  const missionLead = mission.defaultLeadAgentId === null
+    ? null
+    : agents.find(agent => agent.agentId === mission.defaultLeadAgentId) ?? null
+  const preview = useOptionalFilePreview()
+  const previewLayout = useOptionalFilePreviewLayout()
+  const [sectionHeaderHost, setSectionHeaderHost] = useState<HTMLElement | null>(null)
+  useLayoutEffect(() => {
+    setSectionHeaderHost(document.getElementById('loom-inspector-header-slot'))
+  }, [preview?.activeTabId, preview?.paneVisible, preview?.tabs.length, previewLayout?.compact, mission.missionId])
+  const sectionTabs = <nav className="loom-section-tabs" aria-label={uiAttribute('使命工作区')}>
+      {LOOM_TABS.map(tab => <button key={tab.id} type="button" aria-pressed={section === tab.id} onClick={() => select(tab.id)}>
+        {tab.id === 'plan' && <Icon name="branch"/>}
+        <UiText zh={tab.label}/>
       </button>)}
     </nav>
+  return <div className="loom-workspace">
+    {sectionHeaderHost ? createPortal(sectionTabs, sectionHeaderHost) : sectionTabs}
     <div className="loom-section-body">
-      {visited.has('plan') && <div className="loom-plan-host" hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} claims={claims} loading={loading} error={error} nodeRecords={nodeRecords} nodeError={nodeError} nodes={nodes}/></div>}
-      <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan'}>
-        {visited.has('delivery') && <div hidden={section !== 'delivery'}><DeliveryReview candidates={candidates} reviews={reviews} verifications={verifications} artifacts={artifacts} plan={plan} missionId={mission.missionId} onRefresh={reload}/></div>}
-        <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>
-        <div hidden={section !== 'activity'}><MissionActivityPanel mission={mission} agents={agents} onSource={onSource}/></div>
+      {visited.has('computer') && <div hidden={section !== 'computer'}><LoomComputer nodeRecords={nodeRecords} nodeError={nodeError} lead={missionLead}/></div>}
+      {visited.has('plan') && <div className="loom-plan-host" hidden={section !== 'plan'}><PlanWorkspace mission={mission} agents={agents} plan={plan} tasks={tasks} dependencies={dependencies} candidates={candidates} reviews={reviews} claims={claims} loading={loading} error={error} nodeRecords={nodeRecords} nodeError={nodeError} nodes={nodes} control={control} controlError={controlError} onReload={load}/></div>}
+      <div ref={shared} className={section === 'delivery' ? 'loom-delivery' : 'mission-activity-document'} hidden={section === 'plan' || section === 'computer'}>
+        {visited.has('delivery') && <div hidden={section !== 'delivery'}>
+          {scopedLoading && <LoomEmpty title={t('正在读取交付…')}><p>{t('从控制面读取成果、审查与验收记录。')}</p></LoomEmpty>}
+          {!scopeLoaded && !scopedLoading && !hasData && <LoomEmpty title={t('读取交付失败')}>
+            <p>{error}</p>
+            <p>{t('请检查控制面连接后重试。')}</p>
+            <button type="button" className="loom-summary-secondary" onClick={load}>{t('重试')}</button>
+          </LoomEmpty>}
+          {scopeLoaded && error !== ''
+            && <p className="loom-live-note" role="status">{t('刷新失败：{0}', error)}</p>}
+          {/* 读到过就挂载：空候选也要显示真实的「尚无成果」，不能整块空白。 */}
+          {!scopedLoading && scopeLoaded && <LoomDelivery candidates={candidates} reviews={reviews} verifications={verifications} artifacts={artifacts} plan={plan} missionId={mission.missionId} onRefresh={load} tasks={tasks} dependencies={dependencies} stageReviews={control === null ? null : control.stageReviews} agents={agents} policy={control === null ? null : control.policy}/>}
+        </div>}
+        <div hidden={section !== 'activity'}>
+          <LoomProgress
+            mission={mission} agents={agents} tasks={tasks} candidates={candidates}
+            loading={scopedLoading} error={error} onRetry={load}
+            onOpenPlan={() => select('plan')}/>
+          {/* 原来的交付动作与活动流水保留，但收进进展页的折叠区，不再跨 tab 常显。 */}
+          <details className="loom-summary-details" data-details="activity">
+            <summary>{t('活动与交付记录')}</summary>
+            <MissionDeliveryPanel mission={mission} agents={agents} onSource={onSource} onNotify={onNotify} onWorkspaceCleanupRequested={onWorkspaceCleanupRequested}/>
+            <MissionActivityPanel mission={mission} agents={agents} onSource={onSource}/>
+          </details>
+        </div>
       </div>
     </div>
   </div>

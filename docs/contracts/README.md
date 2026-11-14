@@ -1,17 +1,23 @@
 ---
 document_type: contracts-index
 authority: protocol-contract-routing
-last_updated: 2026-10-27
+last_updated: 2026-11-05
 ---
 
 # 长期接口合同
 
 User 的主称呼、结构化提及及冻结恢复见 [User Naming v1](user-naming-v1.md)。
 
-公开命名与历史合同的关系见 [Thread Naming v1](thread-naming-v1.md)；当前模型与 CLI 版本见 [ContextManifest v34](context-manifest-evidence-v34.md)、[Built-in Tool Transport v41（历史）](builtin-tool-transport-v41.md)。
+公开命名与历史合同的关系见 [Thread Naming v1](thread-naming-v1.md)；当前模型与 CLI 版本见 [ContextManifest v34](context-manifest-evidence-v34.md)、[Built-in Tool Transport v45](builtin-tool-transport-v45.md)。
 
 本目录保存跨版本、字段级且可由测试直接验证的接口合同。[Version Decisions](../decisions/README.md)解释为什么选择某个边界，
 Architecture 解释组件如何组成，Version 概览记录交付范围；它们都不复制本目录的完整 wire shape。
+
+## 跨主机执行
+
+- [Workspace RPC v1](workspace-rpc-v1.md)：真实 AgentRun 权威、已准备工作区、幂等与 unknown、逐工具流和 Core 实际字节归档。
+- [Built-in Tool Transport v45](builtin-tool-transport-v45.md)：五个 Workspace 命令及当前 CLI/IPC/schema/输出准入。
+- 组件关系见[跨主机架构](../architecture/cross-host-execution.md)；R1 持续管道的当前实施/证据见[process pipe](../loom/process-pipe-v1-implementation-2026-11-04.md)，不把实施记录当作整体已验收。
 
 ## Hermes Runtime
 
@@ -26,7 +32,7 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 ## 会话 Task 能力（当前）
 
 - [Durable Task v6](durable-task-v6.md)
-- [Built-in Tool Transport v44](builtin-tool-transport-v44.md)：Thread read 正向分页输入与精简教学；继承 [v43（历史）](builtin-tool-transport-v43.md) 的 Send 输入来源和 [v42（历史）](builtin-tool-transport-v42.md) 的 Task 发现边界。
+- [Built-in Tool Transport v45](builtin-tool-transport-v45.md)：增加有界 Workspace list/read/run/poll/cancel，继承 [v44（历史）](builtin-tool-transport-v44.md) 的 Thread 分页、Send 输入来源与 Task 边界。
 - [ContextManifest Evidence v40 / v42](context-manifest-evidence-v42.md)
 - [Context Delivery Profile v15 / v16](context-delivery-profile-v15.md)
 - [Run Facts v10](run-facts-v10.md)

@@ -4,6 +4,7 @@ import { EMPTY_FILE_FIND } from '../../../apps/desktop/src/renderer/src/file-fin
 import { EditorView } from '@codemirror/view'
 import { isFileFindTarget } from '../../../apps/desktop/src/renderer/src/FilePreviewFind'
 import { StrictMode, useEffect, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { ActionApprovalView, AgentRunFileChangesDetailView, AgentRunFileChangesView, ComposerDocument, FilePreviewApi, OpenFilePreviewRequest, ResolvedFilePreview, ResolvedTheme, TaskView } from '@contracts'
 import { AppHeader } from '../../../apps/desktop/src/renderer/src/App'
@@ -22,6 +23,12 @@ import { applyAppearanceSnapshot } from '../../../apps/desktop/src/renderer/src/
 import { DEFAULT_APPEARANCE } from '../../../apps/desktop/src/shared/appearance'
 import { agents, initial, initialDraft, installations, run as fixtureRun } from '../host-web-parity/data'
 import '../../../apps/desktop/src/renderer/src/styles.css'
+// The LOOM reference composition ships as four stylesheets imported after styles.css in BusinessApp.
+// The fixture renders the same shell, so it must load them in the same order.
+import '../../../apps/desktop/src/renderer/src/loom-mikka-shell.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka-chat.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka-panel.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka.css'
 
 const file: ResolvedFilePreview = {
   previewKey: 'split-fixture', handleId: 'handle-1', reopenToken: 'reopen-1',
@@ -514,7 +521,10 @@ function Fixture(): React.JSX.Element {
     setResolvedTheme(theme)
   }
   return <FilePreviewProvider threadId={camp} resolvedTheme={resolvedTheme} api={camp === 'cold-download' ? api : undefined}>
-    <div className="app-shell app-shell-camp">
+    {/* Production frame: NavigationShell renders `app-shell navigation-shell loom-mikka` with the
+        persisted --rail-width. AppHeader stays the real topbar so the shared
+        `#loom-thread-identity-slot` (ported into by ThreadWorkspace) has its production host. */}
+    <div className="app-shell navigation-shell loom-mikka app-shell-camp" style={{ '--rail-width': '328px' } as CSSProperties}>
       <aside style={{ gridRow: '1 / -1', padding: '48px 24px', background: 'var(--rail)' }}>Rovai AI</aside>
       <AppHeader threadTitle="文件预览验收" contextLabel="Rovai AI" thread={null} onFocusApprovals={() => {}} />
       <main className="content task-content">{initialExecutionCase ? <InitialExecutionWorkspace /> : <Workspace />}</main>

@@ -1,79 +1,60 @@
-# Product
+# LOOM Product
 
 <!-- impeccable:product-schema 1 -->
 
 ## Platform
 
-desktop
+desktop and authenticated host web
 
 ## Users
 
-Rovai AI serves developers who coordinate coding agents on their desktop. They need to assign work,
-inspect what each agent did, intervene when approval or recovery is required, and keep collaboration
-state understandable across long-running projects.
+LOOM 面向希望直接与 AI 助手协作的人。用户描述需求，挑选助手与能力，组织单聊或群聊，指定工作区域，观察执行并审阅成果，不应被要求理解 RPC、Lease、RunBundle 或编辑底层 JSON 才能开始。
 
 ## Product Purpose
 
-Rovai AI is a desktop workspace for long-lived agent teams. It organizes members, Threads, tasks,
-execution, approvals, evidence, recovery and collaborative memory while driving coding-agent
-Runtimes already installed on the user's machine. Success means the user can understand and control
-collaborative agent work without surrendering ownership of the workspace, Runtime configuration or
-credentials.
+一个以 Mikka 体验为中心、内置 Pi Agent、连接本机与云端执行环境的多 Agent 工作空间。用户只需要创建助手、选择能力、组建群聊并提出目标；系统负责协作、执行、电脑控制、成果追踪和人工验收。
 
-## Positioning
+这是用户已批准的最终产品目标；各项当前实施/发布状态以 `docs/loom/ultimate-workspace-plan.md` 的验收表为准，不把愿景当成完成事实。
 
-The product combines durable collaboration state with Runtime-native execution and explicit
-evidence boundaries. It does not replace supported coding-agent products with a hosted proxy; it
-coordinates them while preserving which facts came from Rovai Core and which came from each Runtime.
+当前默认 UI 是 `apps/desktop/src/renderer/src/loom-native/`，不是旧 Rovai 业务页面的样式覆盖。用户已认可 Mikka/PiBot 方向，后续在同一方向打磨，不再恢复旧导航和 Mission 抽屉。
 
-## Operating Context
+## Product Model
 
-- A desktop Electron application operates alongside local Git workspaces and coding-agent CLIs; platform-specific
-  support and qualification remain explicit for macOS and Windows rather than being inferred from a shared UI.
-- Users move between Threads, members, memory, settings, approvals, diagnostics and execution detail.
-- Runtime availability, model capabilities and usage reporting vary by installed product and version.
-- Monitoring is a compact Usage read surface: users compare recent Runtime-reported Token, Cache,
-  attributable Cost and Coverage without exposing prompts, completions, tool output or credentials.
+- **助手**：名字、动态头像、职责、用途与沟通方式。身份与模型、运行端、权限是不同维度。
+- **对话与群聊**：可以一对一，也可邀请多名助手。主助手是本群默认协调者；其他助手是同等可配置的参与者，不是较低权限身份。可以先组队再配置模型，发送与执行仍受 Core 准入。
+- **能力**：Skills / MCP / Rules / Hooks 四个分类，每类可选多项。定义、助手选择、下一次运行配置和实际装载是不同事实。
+- **工作**：任务、依赖、Run、候选与审查。一次运行结束不等于用户已接受。
+- **成果**：真实文件、不可变版本、来源和审阅上下文。接受与发布是不同操作。
+- **电脑与工作区**：明确运行在哪台主机、哪个准备好的目录。设备进程执行不等于图形远程控制。
 
 ## Capabilities and Constraints
 
-- Supported product language includes “Thread”, “队员”, “记忆”, “智能体” and “快速对话”. In the interface, “智能体” names a selectable coding-agent product; “队员” names the long-lived team identity.
-- SQLite-backed Core facts are authoritative; Renderer pages consume typed, read-only projections.
-- Runtime Usage is sparse and source-qualified. Missing fields remain unknown and never become zero.
-- Each Monitoring schema begins at a persistent clean-break collection boundary; older Core runs are
-  retained but are not backfilled or included in current Usage denominators.
-- Runtime-reported cost, public-price estimates and Provider billing buckets remain distinct grains.
-- User workspaces, Runtime-native configuration and credentials remain user-owned and local.
-- Rovai AI publishes versioned public releases; compatibility labels describe Rovai's verified evidence,
-  not upstream support promises.
+本期运行端选择只有 Claude Code、Codex、DSH、Pi。列表来自实际安装，缺失不显示为就绪，不自动换模型或运行端。远程绑定当前只对已提供对应 descriptor 的 Claude/Codex 开放；其余不冒称支持。
 
-## Brand Commitments
+Skill 是方法/资源；MCP 是连接；Rule 是约定；Hook 是生命周期执行定义。勾选不是凭据授权，也不是运行证明。能力界面必须保留读取失败、未保存、保存拒绝、版本冲突、不支持与待确认状态。
 
-The product name, macOS application bundle, macOS executable and Helper names are “Rovai AI”.
-“Rovai-ai” remains only where legacy data, the Windows executable or the repository slug requires it.
-Copy is calm, direct and evidence-first. Uncertainty, partial coverage and the next available action
-are stated plainly rather than hidden behind optimistic status language.
+“仅一次”“本会话允许”来自原生审批选项。“始终允许”只能用于实际支持并明确作用范围的持久配置，不能把 allow_session 翻译为整机永久信任。
 
-## Evidence on Hand
+原生客户端与账号配置仍由用户控制；LOOM 不修改主机全局模型默认，不偷偷复制凭据。运行和安全合同沿用唯一 Core 权威。ACCP 仅是控制面设计参照，不等于 LOOM 已兼容其线协议。
 
-- Product scope and current claims: `README.md`.
-- Durable visual system and brand mark: `DESIGN.md` and `docs/ui/`.
-- Runtime compatibility evidence: `docs/runtime-compatibility.md`.
-- Current monitoring scope, field semantics and acceptance: `docs/versions/v0.96/`,
-  `docs/contracts/runtime-monitoring-v1.md` and `docs/research/runtime-monitoring/README.md`.
-- The supplied monitoring HTML is a prototype for information coverage; its sample values are not
-  production evidence and must not ship as fallback data.
+内置 Pi 路线已规划为受管 RPC 子进程，但当前 `packaged:false`，没有分发内置引擎。电脑页尚无屏幕流提供者时必须明确未连接。任何待实现能力不得伪装成可用按钮或演示桌面。
 
-## Product Principles
+## Experience
 
-1. Preserve provenance: every operational claim names its authority and quality.
-2. Make uncertainty useful: unknown and partial states show coverage and a concrete explanation.
-3. Keep ownership boundaries explicit: coordination must not silently take over workspaces or credentials.
-4. Prefer durable, inspectable state over transient inference.
-5. Keep dense operational surfaces calm, navigable and honest.
+默认入口是聊天，旁边是工作。管理助手通过紧凑配置浮层完成；四类能力在助手详情中可直接发现。创建群聊只选择成员、主助手和工作区域，不自动派工。
 
-## Accessibility & Inclusion
+默认四助手面向实现、审查、研究、设计，而不是冗长角色扮演。已有自定义助手不会被种子更新覆盖；简洁职责模板需要显式选择保存。
 
-Primary desktop surfaces support keyboard operation, predictable focus behavior, screen-reader labels, reduced
-motion, all registered palettes, 200% zoom and the minimum `1040×700` window without page-level
-horizontal overflow. State is never communicated by color alone.
+日常回复优先说人能理解的结果、下一步和真实阻塞，不暴露平台管道和无意义编号。用户需要诊断时仍可查看确切事实。
+
+## Design Direction
+
+Mikka/PiBot 式安静桌面工作台；轻微半透明材料、明确阅读层、圆角输入框、蓝色用户气泡和动态头像。保留当前布局，减少硬框和大面积平白，不做炫光玻璃、营销仪表盘或密集技术面板。细则归 `DESIGN.md`。
+
+## Evidence and State
+
+可验证实现与未完成项统一记录在根 `LOOM-IMPLEMENTATION.md`，用户纠偏区置顶。接口归 `docs/loom/productization-interfaces-2026-11-13.md`。测试夹具、只读截图、真实写入和模型运行分别记账，不混称“端到端全通过”。
+
+## Accessibility
+
+键盘可进入菜单/浮层、明确焦点与 Esc 关闭、取消不丢未保存内容、支持 reduced motion / reduced transparency。深浅色与 390–1605px 窄宽屏都必须可用，无页面级横向溢出。状态不只由颜色表达。

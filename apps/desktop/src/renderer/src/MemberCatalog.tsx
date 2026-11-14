@@ -1,25 +1,34 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useThreadClient } from './camp-client'
 import { AppDialogContent, AppDialogFooter, AppDialogHeader } from './AppDialog'
 import { uiAttribute, useUiText } from './interface-language'
+import { MemberExecutionTarget } from './MemberExecutionTarget'
+import { MemberSkillImport } from './MemberSkillImport'
+import type { NodeApi } from './nodes-api'
 import {
   conflictingKeys,
   conflictPartners,
   conflictTools,
+  hookReviewSnapshot,
+  pendingHookReview,
   presentProjectionMcp,
   highRiskToConfirm,
   isCatalogEmpty,
   itemKey,
   matchesQuery,
   previewRuntime,
+  revertPending,
   sameSelection,
+  selectRefusal,
   selectionCounts,
   selectionsOf,
+  snapshotApplies,
   toggleWouldConflict,
   type CapabilityCatalog,
   type CapabilityItem,
   type CapabilityKind,
+  type HookReviewSnapshot,
   type RunProjectionPreview
 } from './member-catalog-model'
 import './member-catalog.css'
@@ -39,14 +48,19 @@ function groupCopy(kind: CapabilityKind, t: (text: string, ...values: Array<stri
   }
   if (kind === 'rule') return {
     title: t('规则'),
-    hint: t('身份里的六段文字不在这里勾选。下面是可复用的规则片段。勾上的先记在目录里，还没有接进运行。'),
+    hint: t('身份里的六段文字不在这里勾选。选中的规则片段会随远端成员 Run 的运行包追加；未选中的只保存在目录。'),
     empty: t('还没有可勾选的规则片段。身份里的六段文字仍会随下一次运行包出发。')
   }
   return {
     title: 'hook',
-    hint: t('没有条目时就这样写，不放一排永远空着的开关。'),
+    hint: t('选中的 hook 需先审阅正文与运行范围；批准只适用当前定义和范围。'),
     empty: t('还没有可勾选的 hook。')
   }
+}
+
+/** Consent is scoped to one definition and one run range; it is never a blanket trust. */
+function hookTrustNote(t: (text: string, ...values: Array<string | number>) => string): string {
+  return t('hook 的批准只对当前正文、成员、节点和工作区有效；其中一处变了就要重新审阅。')
 }
 
 type ProjectionState = { status: 'loading' | 'error' | 'ready' | 'unsupported', preview: RunProjectionPreview | null, message: string }
@@ -82,11 +96,13 @@ export function MemberCatalogBody({
   notice,
   projection,
   riskNames,
+  reviewSnapshot,
   saving,
   onQuery,
   onToggle,
   onRetry,
   onSave,
+  onImport,
   onIdentity,
   onOpenProfile,
   onProjectionRetry,
@@ -102,11 +118,13 @@ export function MemberCatalogBody({
   notice: string
   projection: ProjectionState
   riskNames: readonly string[]
+  reviewSnapshot: HookReviewSnapshot | null
   saving: boolean
   onQuery(value: string): void
   onToggle(kind: CapabilityKind, id: string): void
   onRetry(): void
   onSave(): void
+  onImport(): void
   onIdentity(): void
   onOpenProfile(): void
   onProjectionRetry(): void
@@ -121,7 +139,9 @@ export function MemberCatalogBody({
   const empty = phase === 'ready' && isCatalogEmpty(items)
   const state = phase === 'loading' ? 'loading' : phase === 'error' ? 'error' : conflicts.length ? 'conflict' : empty ? 'empty' : 'ready'
   return <div className="member-catalog" data-catalog-state={state}>
-    <p className="member-catalog-lede">{t('勾选写在这份 Core 上。技能和 MCP 从下一次 Run 生效。规则片段和 hook 尚未接入运行。')}</p>
+    <p className="member-catalog-lede">{t('勾选保存在这份 Core。Claude 与 Codex 的远端成员 Run 会冻结当时的选择；保存影响新 Run，重试仍用原快照。')}</p>
+    <p className="member-catalog-lede">{t('这里控制 Rovai 追加的可选项。两个必需的平台技能仍保留；节点原生配置中的技能、MCP 和 hooks 独立管理。')}</p>
+    <p className="member-catalog-lede">{t('MCP 目前只传递不含凭据的定义，需要凭据的配置会拒绝。规则片段会随运行包追加，Claude 会把选中的 hooks 写进这次 Run 的私有设置。')}</p>
     {phase === 'loading' && <CatalogEmpty title={t('正在读取目录…')} detail={t('技能、MCP、规则片段和 hook 都在这份 Core 上。勾选结果也在这里。')} />}
     {phase === 'error' && <CatalogEmpty
       title={t('目录读取失败')}
@@ -150,10 +170,14 @@ export function MemberCatalogBody({
             const copy = groupCopy(kind, t)
             const rows = items.filter((item) => item.kind === kind && matchesQuery(item, query)).sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'))
             const noneSelected = kind === 'skill' && items.some((item) => item.kind === 'skill') && items.every((item) => item.kind !== 'skill' || !item.selected)
-            const pendingRun = kind === 'rule' || kind === 'hook'
             return <section key={kind} className="member-catalog-group" aria-label={copy.title}>
-              <h3>{copy.title}{pendingRun && <span className="member-catalog-mark is-pending">{t('尚未接入运行')}</span>}</h3>
+              <h3>{copy.title}</h3>
               <p className="member-catalog-hint">{copy.hint}</p>
+              {kind === 'skill' && <p className="member-catalog-hint">
+                <button className="quiet-button" type="button" onClick={onImport}>{t('导入 Skill')}</button>
+                {' '}{t('把这份 Core 上文件夹里的 Skill 导进来，再勾给它用。')}
+              </p>}
+              {kind === 'hook' && items.some((item) => item.kind === 'hook' && item.selected) && <p className="member-catalog-hint">{hookTrustNote(t)}</p>}
               {kind === 'rule' && identity && <>
                 <button className="member-catalog-link" type="button" aria-expanded={identityOpen} onClick={onIdentity}>
                   {identityOpen ? t('收起身份六段') : t('身份六段在队员资料里编辑')}
@@ -195,7 +219,8 @@ export function MemberCatalogBody({
         <footer className="member-catalog-save">
           <p>
             {t('下次运行生效：{0} 项技能，{1} 个 MCP', String(counts.skill), String(counts.mcp))}
-            {(counts.rule > 0 || counts.hook > 0) ? ` ${t('尚未接入运行：{0} 条规则，{1} 个 hook', String(counts.rule), String(counts.hook))}` : ''}
+            {counts.rule > 0 ? ` ${t('{0} 条规则', String(counts.rule))}` : ''}
+            {counts.hook > 0 ? ` ${t('{0} 个 hook', String(counts.hook))}` : ''}
             {counts.conflicts > 0 ? ` ${t('· {0} 处冲突', String(counts.conflicts))}` : ''}
           </p>
           <button className="primary-button" type="button" disabled={!dirty || saving || conflicts.length > 0} onClick={onSave}>
@@ -206,15 +231,34 @@ export function MemberCatalogBody({
         <ProjectionPanel projection={projection} onRetry={onProjectionRetry} />
       </div>
     </>}
-    <Dialog.Root open={riskNames.length > 0} onOpenChange={(open) => { if (!open) onRiskCancel() }}>
+    <Dialog.Root open={riskNames.length > 0 || reviewSnapshot !== null} onOpenChange={(open) => { if (!open) onRiskCancel() }}>
       <Dialog.Portal>
         <Dialog.Overlay className="dialog-overlay app-dialog-overlay" />
         <AppDialogContent aria-describedby="catalog-risk-description">
           <AppDialogHeader
-            title={t('确认勾选高风险项？')}
-            description={t('「{0}」是高风险 MCP，或会执行命令的 hook。确认之后才会勾上。取消则这次勾选不留下。', riskNames.join('、'))}
+            title={reviewSnapshot && reviewSnapshot.entries.length > 0 ? t('审阅 hook 正文与运行范围') : t('确认勾选高风险项？')}
+            description={reviewSnapshot && reviewSnapshot.entries.length > 0
+              ? (riskNames.length > 0
+                ? t('「{0}」是高风险 MCP，或会执行命令的 hook；下面这些 hook 的正文和运行范围还没审过。确认之后才会勾上。取消则这次勾选不留下。', riskNames.join('、'))
+                : t('下面这些 hook 的正文和运行范围还没审过。确认之后才会勾上。取消则这次勾选不留下。'))
+              : t('「{0}」是高风险 MCP，或会执行命令的 hook。确认之后才会勾上。取消则这次勾选不留下。', riskNames.join('、'))}
             descriptionId="catalog-risk-description"
           />
+          {reviewSnapshot && reviewSnapshot.entries.length > 0 && <div className="member-catalog-review">
+            {reviewSnapshot.entries.map((entry) => <section key={entry.id}>
+              <h3>{entry.name}</h3>
+              <p className="member-catalog-hint">{t('成员 {0} · 节点 {1} · 工作区 {2} · 运行端 {3}', entry.scope.memberId, entry.scope.nodeId || t('本机'), entry.scope.workspaceRoot, entry.scope.adapterKind)}</p>
+              <pre>{entry.body}</pre>
+              <details>
+                <summary>{t('定义摘要')}</summary>
+                <dl className="member-catalog-identity">
+                  <dt>{t('定义')}</dt><dd>{entry.definitionDigest}</dd>
+                  <dt>{t('范围')}</dt><dd>{entry.scopeDigest}</dd>
+                </dl>
+              </details>
+            </section>)}
+            <p className="member-catalog-hint">{t('批准只适用这份正文和这次范围。成员、节点、工作区或正文变了就要重新审阅。')}</p>
+          </div>}
           <AppDialogFooter>
             <button className="quiet-button" type="button" onClick={onRiskCancel}>{t('取消')}</button>
             <button className="primary-button" type="button" onClick={onRiskConfirm}>{t('确认勾选')}</button>
@@ -229,7 +273,7 @@ function ProjectionPanel({ projection, onRetry }: { projection: ProjectionState,
   const t = useUiText()
   return <aside className="member-catalog-preview" aria-label={t('运行投影')} data-projection-state={projection.status}>
     <h3>{t('运行投影')}</h3>
-    <p>{t('引导正文和 MCP 文件是下一次 Run 会拿到的内容。技能与附加技能用的是同一份勾选。规则片段和 hook 还没有接进运行。未保存的勾选要等这次保存之后才出现。')}</p>
+    <p>{t('引导正文和 MCP 文件是下一次 Run 会拿到的内容。技能与附加技能用的是同一份勾选；规则片段随运行包追加，Claude 的 hooks 写进这次 Run 的私有设置。未保存的勾选要等这次保存之后才出现。')}</p>
     {projection.status === 'loading' && <p role="status">{t('正在读取运行投影…')}</p>}
     {projection.status === 'unsupported' && <p role="status">{t('这位队员还没有 Codex 或 Claude Code，还不能预览运行包。')}</p>}
     {projection.status === 'error' && <p className="member-catalog-banner is-error" role="alert">
@@ -253,13 +297,14 @@ function ProjectionPanel({ projection, onRetry }: { projection: ProjectionState,
         <pre>{JSON.stringify(presentProjectionMcp(projection.preview.mcp), null, 2)}</pre>
       </section>
       <section>
-        <h3>{t('规则片段')}<span className="member-catalog-mark is-pending">{t('尚未接入运行')}</span></h3>
+        <h3>{t('规则片段')}</h3>
         {projection.preview.rules.length === 0
           ? <p>{t('还没有勾选的规则片段。')}</p>
           : <ul>{projection.preview.rules.map((rule) => <li key={rule.id}><strong>{rule.name}</strong> · {rule.origin === 'inherited' ? t('继承') : t('已选')}<p>{rule.body}</p></li>)}</ul>}
       </section>
       <section>
-        <h3>hook<span className="member-catalog-mark is-pending">{t('尚未接入运行')}</span></h3>
+        <h3>hook</h3>
+        <p>{hookTrustNote(t)}</p>
         {projection.preview.hooks.length === 0
           ? <p>{t('还没有勾选的 hook。')}</p>
           : <ul>{projection.preview.hooks.map((hook) => <li key={hook.id}><strong>{hook.name}</strong> · {hook.origin === 'inherited' ? t('继承') : t('已选')}<p>{hook.body}</p></li>)}</ul>}
@@ -272,12 +317,16 @@ export function MemberCatalog({
   agentId,
   active,
   onDirtyChange,
-  onOpenProfile
+  onOpenProfile,
+  onExecutionFactsChanged,
+  nodes = null
 }: {
   agentId: string
   active: boolean
   onDirtyChange(dirty: boolean): void
   onOpenProfile(): void
+  onExecutionFactsChanged?(): void
+  nodes?: NodeApi | null
 }): React.JSX.Element {
   const client = useThreadClient()
   const t = useUiText()
@@ -293,20 +342,44 @@ export function MemberCatalog({
   const [reload, setReload] = useState(0)
   const [saving, setSaving] = useState(false)
   const [riskNames, setRiskNames] = useState<string[]>([])
+  const [reviewSnapshot, setReviewSnapshot] = useState<HookReviewSnapshot | null>(null)
+  // One generation fences every late reply and every frozen dialog snapshot.
+  const generation = useRef(0)
   const [projection, setProjection] = useState<ProjectionState>({ status: 'loading', preview: null, message: '' })
   const [projectionReload, setProjectionReload] = useState(0)
+  const [factsReload, setFactsReload] = useState(0)
+  // The run target keeps its own draft and save button; only the leave guard merges both.
+  const [targetDirty, setTargetDirty] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
 
   useEffect(() => {
-    onDirtyChange(phase === 'ready' && !sameSelection(items, saved))
-  }, [items, saved, phase, onDirtyChange])
+    // Another member's page never inherits this dialog or its in-flight replies.
+    setImportOpen(false)
+  }, [agentId])
 
   useEffect(() => {
-    if (!active) return
-    let cancelled = false
+    onDirtyChange((phase === 'ready' && !sameSelection(items, saved)) || targetDirty)
+  }, [items, saved, phase, targetDirty, onDirtyChange])
+
+  function retire(): void {
+    generation.current += 1
+    setRiskNames([])
+    setReviewSnapshot(null)
+  }
+
+  useEffect(() => {
+    // One read owns the whole catalog. Member, reload and target facts all re-read
+    // scope and definitions, so a stale draft never masquerades as the new catalog.
+    // The generation still bumps when inactive: a late reply must land nowhere.
+    const current = ++generation.current
+    setRiskNames([])
+    setReviewSnapshot(null)
+    setSaving(false)
     setPhase('loading')
-    setNotice('')
+    setNotice(factsReload > 0 ? uiAttribute('已重新读取目录；未保存的勾选需按新目录重新选择。') : '')
+    if (!active) return undefined
     void client.request<CapabilityCatalog>('members.capabilityCatalog.get', { agentId }).then((catalog) => {
-      if (cancelled) return
+      if (generation.current !== current) return
       setSaved(catalog.items)
       setItems(catalog.items)
       setRevision(catalog.revision)
@@ -314,13 +387,13 @@ export function MemberCatalog({
       setIdentity(catalog.identity)
       setPhase('ready')
     }).catch(() => {
-      if (cancelled) return
+      if (generation.current !== current) return
       setPhase('error')
       setSaved([])
       setItems([])
     })
-    return () => { cancelled = true }
-  }, [active, agentId, client, reload])
+    return () => { generation.current += 1 }
+  }, [active, agentId, client, reload, factsReload])
 
   useEffect(() => {
     if (!active || phase !== 'ready') return
@@ -346,79 +419,173 @@ export function MemberCatalog({
   }, [active, agentId, client, phase, projectionReload, runtime])
 
   function toggle(kind: CapabilityKind, id: string): void {
+    const item = items.find((entry) => entry.kind === kind && entry.id === id)
+    if (!item) return
     if (toggleWouldConflict(items, kind, id)) {
       setNotice(t('这条会和已勾选的条目占用同一个工具名，勾选已回到原来的状态。'))
       return
     }
-    setNotice('')
-    setItems((current) => current.map((item) => item.kind === kind && item.id === id
-      ? { ...item, selected: !item.selected, origin: 'explicit' }
-      : item))
-  }
-
-  async function save(acknowledgeHighRisk: boolean): Promise<void> {
-    const pending = highRiskToConfirm(items, saved)
-    if (pending.length && !acknowledgeHighRisk) {
-      setRiskNames(pending.map((item) => item.name))
+    const refusal = selectRefusal(item)
+    if (refusal) {
+      setNotice(t('这条的来源读不到，不能新勾选；已勾选的仍可以取消。'))
       return
     }
+    setNotice('')
+    setItems((current) => current.map((entry) => entry.kind === kind && entry.id === id
+      ? { ...entry, selected: !entry.selected, origin: 'explicit' }
+      : entry))
+  }
+
+  /** Opens the shared confirmation with a frozen snapshot, or sends a plain save. */
+  function requestSave(): void {
+    const risky = highRiskToConfirm(items, saved)
+    const pendingHooks = pendingHookReview(items)
+    if (!risky.length && !pendingHooks.length) {
+      void submit(null)
+      return
+    }
+    const snapshot = hookReviewSnapshot({
+      agentId,
+      revision,
+      token: generation.current,
+      acknowledgeHighRisk: risky.length > 0,
+      selections: selectionsOf(items),
+      pending: pendingHooks
+    })
+    if (!snapshot) {
+      setNotice(t('这个 hook 的正文没读到，先重新读取目录再勾选。'))
+      return
+    }
+    setRiskNames(risky.map((item) => item.name))
+    setReviewSnapshot(snapshot)
+  }
+
+  async function submit(snapshot: HookReviewSnapshot | null): Promise<void> {
+    const frozen = snapshot
+    // A member, target or reload change retires the snapshot instead of sending it.
+    if (frozen && !snapshotApplies(frozen, agentId, generation.current)) {
+      retire()
+      setNotice(t('运行位置已改变，请重新勾选。'))
+      setReload((value) => value + 1)
+      return
+    }
+    const current = generation.current
     setSaving(true)
     setNotice('')
     try {
       const catalog = await client.request<CapabilityCatalog>('members.capabilityCatalog.set', {
         agentId,
-        expectedRevision: revision,
-        acknowledgeHighRisk,
-        selections: selectionsOf(items)
+        expectedRevision: frozen ? frozen.revision : revision,
+        acknowledgeHighRisk: frozen ? frozen.acknowledgeHighRisk : false,
+        selections: frozen ? frozen.selections : selectionsOf(items),
+        reviewedHooks: frozen ? frozen.approvals : []
       })
+      if (generation.current !== current) return
       setSaved(catalog.items)
       setItems(catalog.items)
       setRevision(catalog.revision)
       setRuntime(catalog.runtime)
       setIdentity(catalog.identity)
       setRiskNames([])
+      setReviewSnapshot(null)
       setProjectionReload((value) => value + 1)
     } catch (error) {
+      if (generation.current !== current) return
       const code = errorCode(error)
       if (code === 'capability.risk_acknowledgement_required') {
+        // Reopen from the current read with the acknowledgement on, so a null
+        // snapshot confirm can never loop on the same refusal.
+        const reopened = hookReviewSnapshot({
+          agentId,
+          revision,
+          token: generation.current,
+          acknowledgeHighRisk: true,
+          selections: frozen ? frozen.selections : selectionsOf(items),
+          pending: pendingHookReview(items)
+        })
         setRiskNames(highRiskToConfirm(items, saved).map((item) => item.name))
+        if (reopened) {
+          setReviewSnapshot(reopened)
+          return
+        }
+        retire()
+        setNotice(t('这个 hook 的正文没读到，先重新读取目录再勾选。'))
+        setReload((value) => value + 1)
+        return
+      }
+      if (code === 'capability.hook_review_required' || code === 'capability.hook_review_conflict'
+        || code === 'capability.hook_review_scope_changed') {
+        retire()
+        setNotice(t('hook 的正文或运行范围刚变过。已重新读取目录，请重新审阅。'))
+        setReload((value) => value + 1)
         return
       }
       if (code === 'capability.revision_conflict') {
+        retire()
         setNotice(t('这些勾选刚被别人改过。已重新读取。'))
         setReload((value) => value + 1)
         return
       }
+      retire()
       setNotice(t('保存没有写成，勾选已回到上次读到的结果。'))
       setItems(saved)
     } finally {
-      setSaving(false)
+      // An older request must not unlock a newer one.
+      if (generation.current === current) setSaving(false)
     }
   }
 
-  return <MemberCatalogBody
-    phase={phase}
-    items={items}
-    saved={saved}
-    query={query}
-    identity={identity}
-    identityOpen={identityOpen}
-    notice={notice}
-    projection={projection}
-    riskNames={riskNames}
-    saving={saving}
-    onQuery={setQuery}
-    onToggle={toggle}
-    onRetry={() => setReload((value) => value + 1)}
-    onSave={() => void save(false)}
-    onIdentity={() => setIdentityOpen((open) => !open)}
-    onOpenProfile={onOpenProfile}
-    onProjectionRetry={() => setProjectionReload((value) => value + 1)}
-    onRiskConfirm={() => void save(true)}
-    onRiskCancel={() => {
-      const pending = new Set(highRiskToConfirm(items, saved).map(itemKey))
-      setItems((current) => current.map((item) => pending.has(itemKey(item)) ? { ...item, selected: false } : item))
-      setRiskNames([])
-    }}
-  />
+  return <div className="member-catalog-page">
+    <MemberExecutionTarget
+      memberId={agentId}
+      active={active}
+      nodes={nodes}
+      onDirtyChange={setTargetDirty}
+      onFactsChanged={() => {
+        onExecutionFactsChanged?.()
+        // Retire synchronously: a confirm clicked before the effect runs must not send.
+        retire()
+        setPhase('loading')
+        setFactsReload((value) => value + 1)
+      }}
+    />
+    {importOpen && <MemberSkillImport
+      items={items}
+      onImported={() => setReload((value) => value + 1)}
+      onClose={() => setImportOpen(false)}
+    />}
+    <MemberCatalogBody
+      phase={phase}
+      items={items}
+      saved={saved}
+      query={query}
+      identity={identity}
+      identityOpen={identityOpen}
+      notice={notice}
+      projection={projection}
+      riskNames={riskNames}
+      reviewSnapshot={reviewSnapshot}
+      saving={saving}
+      onQuery={setQuery}
+      onToggle={toggle}
+      onRetry={() => setReload((value) => value + 1)}
+      onSave={requestSave}
+      onImport={() => setImportOpen(true)}
+      onIdentity={() => setIdentityOpen((open) => !open)}
+      onOpenProfile={onOpenProfile}
+      onProjectionRetry={() => setProjectionReload((value) => value + 1)}
+      onRiskConfirm={() => void submit(reviewSnapshot)}
+      onRiskCancel={() => {
+        // Only never-saved keys are reverted; a saved selection keeps its check.
+        const savedOn = new Set(saved.filter((item) => item.selected).map(itemKey))
+        const keys = new Set<string>()
+        for (const item of highRiskToConfirm(items, saved)) keys.add(itemKey(item))
+        for (const entry of reviewSnapshot?.entries ?? []) keys.add(`hook:${entry.id}`)
+        for (const key of [...keys]) if (savedOn.has(key)) keys.delete(key)
+        setItems((current) => revertPending(current, keys))
+        setRiskNames([])
+        setReviewSnapshot(null)
+      }}
+    />
+  </div>
 }

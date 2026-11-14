@@ -50,4 +50,30 @@ Claim before working; a claim lease expires, so claim again if a long task outli
 
 The User's acceptance does not start anyone. When a dependent task is waiting, ask the User in the Thread to reply after accepting. On that reply, the Default Lead reads `rovai loom status` and messages each assignee whose dependencies are now met.
 
+## Authorized stage review and handoff
+
+The User can approve a bounded set of tasks, reviewers, dispatches, rework attempts and an expiry in the Orchestration tab. No approval means automatic handoff is off. Only the User can change this policy, pause it or resume it.
+
+An assigned reviewer first runs `rovai loom inspect --task-id <id>`, checks the frozen candidate and its evidence, and submits `rovai loom stage-review --input-file review.json`. The response's `reviewSubmission` block carries the exact shape: copy `taskId`, `candidateId`, `policyRevision` and `manifestHash` from it, and answer every `criterionId` it lists exactly once. Each `criteriaResults` entry uses `satisfied` (a boolean) — there is no `passed` field — and may cite evidence ids of that candidate plus a note. Do not edit the candidate under review. The block is guidance only: it records nothing, approves nothing, and only the User accepts a delivery.
+
+Review file shape (`rovai loom stage-review --input-file review.json`). Every object has exactly these fields:
+
+```json
+{
+  "taskId": "report-draft",
+  "candidateId": "lcand_example",
+  "policyRevision": 1,
+  "manifestHash": "<the 64-character hash loom inspect returned>",
+  "verdict": "request_changes",
+  "reason": "out/report.md still carries the placeholder line",
+  "criteriaResults": [
+    { "criterionId": "report-exists", "satisfied": false, "note": "two sections are missing" }
+  ]
+}
+```
+
+`pass` is internal stage approval and still waits for User acceptance. `request_changes` returns the same task for rework; the producer must acquire a new claim, use a new evidence path for changed content, and submit a new candidate with previousCandidateId pointing to the latest candidate. `blocked` stops that task for a User decision. A reviewer cannot review their own output.
+
+Core may deliver one system handoff message for the next approved action. Read current state before acting. A pause prevents the next automatic dispatch but does not terminate a running Run. A limit, expired approval, lost authority or unknown execution outcome stops automatic progress. Report it instead of repeatedly starting another Run. Human acceptance and external publication remain separate decisions. The selected runtime keeps its existing execution permissions; a handoff is not extra permission to publish, deploy or access another project.
+
 Follow `error.recovery` on failure; see [Recovery](recovery.md).

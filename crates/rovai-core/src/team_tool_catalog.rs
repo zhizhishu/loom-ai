@@ -65,6 +65,11 @@ pub fn validate_builtin_tool_input(canonical_name: &str, input: &Value) -> Resul
         return serde_json::from_value::<MemberUpdateInput>(input.clone())?.validate();
     }
     let valid = match canonical_name {
+        "loom.workspace.list"
+        | "loom.workspace.read"
+        | "loom.workspace.run"
+        | "loom.workspace.poll"
+        | "loom.workspace.cancel" => Ok(()),
         MEMBER_LIST_TOOL_NAME => Ok(()),
         MEMBER_GET_TOOL_NAME => serde_json::from_value::<MemberGetInput>(input.clone()).map(|_| ()),
         CAMP_MESSAGE_SEND_TOOL_NAME => {
@@ -1020,6 +1025,197 @@ pub fn builtin_tool_definitions() -> &'static [Value] {
     DEFINITIONS.get_or_init(build_builtin_tool_definitions)
 }
 
+fn workspace_rpc_object(required: &[&str], properties: Value) -> Value {
+    json!({"type":"object","additionalProperties":false,"required":required,"properties":properties})
+}
+fn workspace_rpc_error_schema(wire: bool) -> Value {
+    let codes = [
+        loom_protocol::workspace_rpc::RpcErrorCode::UnsupportedVersion,
+        loom_protocol::workspace_rpc::RpcErrorCode::InvalidRequest,
+        loom_protocol::workspace_rpc::RpcErrorCode::PathRejected,
+        loom_protocol::workspace_rpc::RpcErrorCode::Unauthorized,
+        loom_protocol::workspace_rpc::RpcErrorCode::WrongNode,
+        loom_protocol::workspace_rpc::RpcErrorCode::PolicyMismatch,
+        loom_protocol::workspace_rpc::RpcErrorCode::ToolDenied,
+        loom_protocol::workspace_rpc::RpcErrorCode::DeadlineExceeded,
+        loom_protocol::workspace_rpc::RpcErrorCode::RequestConflict,
+        loom_protocol::workspace_rpc::RpcErrorCode::NotFound,
+        loom_protocol::workspace_rpc::RpcErrorCode::NotDirectory,
+        loom_protocol::workspace_rpc::RpcErrorCode::NotFile,
+        loom_protocol::workspace_rpc::RpcErrorCode::NodeOffline,
+        loom_protocol::workspace_rpc::RpcErrorCode::Busy,
+        loom_protocol::workspace_rpc::RpcErrorCode::OutputLimit,
+        loom_protocol::workspace_rpc::RpcErrorCode::SequenceConflict,
+        loom_protocol::workspace_rpc::RpcErrorCode::UnknownOutcome,
+        loom_protocol::workspace_rpc::RpcErrorCode::SpawnFailed,
+        loom_protocol::workspace_rpc::RpcErrorCode::Cancelled,
+        loom_protocol::workspace_rpc::RpcErrorCode::StorageUnavailable,
+        loom_protocol::workspace_rpc::RpcErrorCode::UnsupportedPlatform,
+    ];
+    let codes = codes
+        .into_iter()
+        .map(|code| {
+            if wire {
+                json!(code)
+            } else {
+                json!(code.code())
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({"type":"string","enum":codes})
+}
+fn workspace_rpc_encoded_schemas(read: bool) -> Vec<Value> {
+    ["utf8", "base64"]
+        .into_iter()
+        .map(|encoding| {
+            let (field, maximum) = match (read, encoding) {
+                (true, "utf8") => ("text", 1_048_576),
+                (true, _) => ("data", 1_398_104),
+                (false, "utf8") => ("text", 16_384),
+                (false, _) => ("data", 21_848),
+            };
+            let mut properties = json!({
+                "kind":{"const":if read {"read"}else{"output"}},
+                "encoding":{"const":encoding},
+            });
+            properties[field] = json!({"type":"string","maxLength":maximum});
+            let mut required = vec!["kind", "encoding", field];
+            if read {
+                properties["offset"] = json!({"type":"integer","minimum":0,"maximum":u64::MAX});
+                properties["truncated"] = json!({"type":"boolean"});
+                required.extend(["offset", "truncated"]);
+            } else {
+                properties["stream"] = json!({"type":"string","enum":["stdout","stderr"]});
+                required.push("stream");
+            }
+            workspace_rpc_object(&required, properties)
+        })
+        .collect()
+}
+fn workspace_rpc_success_schema() -> Value {
+    let mut result_variants = workspace_rpc_encoded_schemas(true);
+    result_variants.push(workspace_rpc_object(&["kind","entries","truncated"],json!({
+        "kind":{"const":"list"},"truncated":{"type":"boolean"},
+        "entries":{"type":"array","maxItems":200,"items":workspace_rpc_object(&["name","kind"],json!({
+            "name":{"type":"string","minLength":1,"maxLength":4096},
+            "kind":{"type":"string","enum":["file","directory"]}}))}
+    })));
+    result_variants.push(workspace_rpc_object(&["kind","exitCode","outputBytes","omittedBytes"],json!({
+        "kind":{"const":"run"},"exitCode":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},
+        "outputBytes":{"type":"integer","minimum":0,"maximum":1_048_576},
+        "omittedBytes":{"type":"integer","minimum":0,"maximum":u64::MAX}
+    })));
+    let mut bodies = workspace_rpc_encoded_schemas(false);
+    bodies.push(workspace_rpc_object(
+        &["kind"],
+        json!({"kind":{"const":"accepted"}}),
+    ));
+    bodies.push(workspace_rpc_object(&["kind","omittedBytes"],json!({
+        "kind":{"const":"outputTruncated"},"omittedBytes":{"type":"integer","minimum":1,"maximum":u64::MAX}
+    })));
+    bodies.push(workspace_rpc_object(
+        &["kind", "result"],
+        json!({
+            "kind":{"const":"completed"},"result":{"oneOf":result_variants}
+        }),
+    ));
+    for kind in ["failed", "unknown"] {
+        bodies.push(workspace_rpc_object(
+            &["kind", "code"],
+            json!({
+                "kind":{"const":kind},"code":workspace_rpc_error_schema(true)
+            }),
+        ));
+    }
+    bodies.push(workspace_rpc_object(
+        &["kind", "cause"],
+        json!({
+            "kind":{"const":"cancelled"},"cause":{"type":"string","enum":["user","deadline"]}
+        }),
+    ));
+    let id = json!({"type":"string","minLength":1,"maxLength":128});
+    let receipt = workspace_rpc_object(
+        &[
+            "version",
+            "archiveId",
+            "requestId",
+            "kind",
+            "sha256",
+            "sizeBytes",
+            "truncated",
+        ],
+        json!({"version":{"const":1},"archiveId":id,"requestId":id,
+            "kind":{"type":"string","enum":["read","stdout","stderr"]},
+            "sha256":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"},
+            "sizeBytes":{"type":"integer","minimum":0,"maximum":1_048_576},
+            "truncated":{"type":"boolean"}}),
+    );
+    workspace_rpc_object(
+        &[
+            "requestId",
+            "state",
+            "runId",
+            "sessionId",
+            "attempt",
+            "deadlineUnixMs",
+            "lastSeq",
+            "nextAfterSeq",
+            "hasMore",
+            "outputBytes",
+            "omittedBytes",
+            "archives",
+            "events",
+        ],
+        json!({
+            "requestId":id,"runId":id,"sessionId":id,
+            "state":{"type":"string","enum":["queued","dispatched","running","cancelRequested","completed","failed","cancelled","unknown"]},
+            "attempt":{"type":"integer","minimum":1,"maximum":u32::MAX},
+            "deadlineUnixMs":{"type":"integer","minimum":1,"maximum":u64::MAX},
+            "lastSeq":{"type":"integer","minimum":0,"maximum":512},
+            "nextAfterSeq":{"type":"integer","minimum":0,"maximum":u64::MAX},
+            "hasMore":{"type":"boolean"},"outputBytes":{"type":"integer","minimum":0,"maximum":1_048_576},
+            "omittedBytes":{"type":"integer","minimum":0,"maximum":u64::MAX},
+            "deliveryError":workspace_rpc_error_schema(false),
+            "archives":{"type":"array","maxItems":2,"items":receipt},
+            "events":{"type":"array","maxItems":256,"items":workspace_rpc_object(&["seq","body"],json!({
+                "seq":{"type":"integer","minimum":1,"maximum":512},"body":{"oneOf":bodies}}))}
+        }),
+    )
+}
+fn workspace_rpc_definitions() -> Vec<Value> {
+    let id = json!({"type":"string","minLength":1,"maxLength":128});
+    let relative = json!({"type":"string","maxLength":4096,"description":"Path relative to the prepared workspace; absolute paths and traversal are refused."});
+    let initial = json!({
+        "workspaceId":id,
+        "requestId":{"type":"string","format":"uuid","minLength":36,"maxLength":36,"description":"Optional UUID for an explicit retry. Reuse with identical arguments within the same Run; Core retains the original deadline and never executes it twice."},
+        "timeoutMs":{"type":"integer","minimum":1,"maximum":300_000,"default":30_000}
+    });
+    let output = workspace_rpc_success_schema();
+    [
+        ("list","List a remote workspace","List bounded entries in a prepared workspace. The active Run and workspace owner determine access.",vec!["workspaceId"]),
+        ("read","Read a remote workspace file","Read at most 1 MiB. A whole, untruncated read from offset zero receives a Core-verified archive receipt.",vec!["workspaceId","path"]),
+        ("run","Run an allowed remote workspace tool","Run the fixed git.status tool. No shell program or environment can be supplied. Retry by request ID to observe the same execution.",vec!["workspaceId","toolId"]),
+        ("poll","Poll a workspace request","Read a bounded event page for an existing request owned by this Run. Unknown outcomes stay unknown until actual Node evidence resolves them.",vec!["requestId"]),
+        ("cancel","Cancel a workspace request","Request cancellation of one request. Cancellation becomes final only after the Node confirms its process boundary stopped.",vec!["requestId"]),
+    ].into_iter().map(|(action,title,description,required)|{
+        let mut properties=if matches!(action,"poll"|"cancel"){json!({"requestId":{"type":"string","minLength":69,"maxLength":69,"pattern":"^wrpc_[0-9a-f]{64}$"}})}else{initial.clone()};
+        match action {
+            "list"=>{properties["path"]=relative.clone();properties["limit"]=json!({"type":"integer","minimum":1,"maximum":200,"default":200});},
+            "read"=>{properties["path"]=relative.clone();properties["path"]["minLength"]=json!(1);
+                properties["offset"]=json!({"type":"integer","minimum":0,"maximum":u64::MAX,"default":0});
+                properties["maxBytes"]=json!({"type":"integer","minimum":1,"maximum":1_048_576,"default":65_536});},
+            "run"=>{properties["toolId"]=json!({"type":"string","enum":["git.status"]});
+                properties["args"]=json!({"type":"array","maxItems":0,"items":{"type":"string","maxLength":8192},"default":[]});
+                properties["cwd"]=relative.clone();},
+            "poll"=>{properties["afterSeq"]=json!({"type":"integer","minimum":0,"maximum":u64::MAX,"default":0});
+                properties["limit"]=json!({"type":"integer","minimum":1,"maximum":256,"default":256});},
+            _=>{}
+        }
+        json!({"name":format!("loom.workspace.{action}"),"title":title,"description":description,
+            "inputSchema":workspace_rpc_object(&required,properties),"outputSchema":output})
+    }).collect()
+}
+
 fn build_builtin_tool_definitions() -> Vec<Value> {
     let mut definitions = vec![
         json!({
@@ -1357,7 +1553,9 @@ fn build_builtin_tool_definitions() -> Vec<Value> {
         .map_or(definitions.len(), |index| index + 1);
     definitions.splice(
         after_mission..after_mission,
-        crate::loom_tool::tool_definitions(),
+        crate::loom_tool::tool_definitions()
+            .into_iter()
+            .chain(workspace_rpc_definitions()),
     );
     definitions
 }
@@ -1383,6 +1581,72 @@ mod tests {
         assert!(!serialized.contains("\"rovaiTeamReceipt\""));
         assert!(!serialized.contains("team.call_member"));
         assert!(!serialized.contains("rovai member call"));
+    }
+
+    /// The two LOOM control tools are admitted, validated and refused exactly like every other
+    /// closed tool: this owner checks the routing, not another copy of the shapes.
+    #[test]
+    fn loom_control_tools_round_trip_through_the_closed_catalog() {
+        let stage_review = json!({
+            "taskId": "t1",
+            "candidateId": "lcand_example",
+            "policyRevision": 1,
+            "manifestHash": "0".repeat(64),
+            "verdict": "pass",
+            "reason": "The candidate matches every acceptance criterion.",
+            "criteriaResults": [{"criterionId": "c1", "satisfied": true}]
+        });
+        validate_builtin_tool_input("loom.inspect", &json!({"taskId": "t1"})).unwrap();
+        validate_builtin_tool_input("loom.stage-review", &stage_review).unwrap();
+        // An identity the caller must never nominate, and an unknown field the model invented.
+        for injected in [
+            json!({"taskId": "t1", "reviewerAgentId": "agent_2", "candidateId": "lcand_example",
+                "policyRevision": 1, "manifestHash": "0".repeat(64), "verdict": "pass",
+                "reason": "ok", "criteriaResults": [{"criterionId": "c1", "satisfied": true}]}),
+            json!({"taskId": "t1", "task_id": "t2"}),
+            json!({"taskId": "t1", "verdict": "pass"}),
+        ] {
+            let operation = if injected.get("verdict").is_some() {
+                "loom.stage-review"
+            } else {
+                "loom.inspect"
+            };
+            assert!(
+                validate_builtin_tool_input(operation, &injected).is_err(),
+                "{operation} still refuses {injected}"
+            );
+        }
+        // Catalog bounds and the shared domain shape guard both run before dispatch.
+        let mut short_hash = stage_review.clone();
+        short_hash["manifestHash"] = json!("abc");
+        let mut upper_hash = stage_review.clone();
+        upper_hash["manifestHash"] = json!("A".repeat(64));
+        let mut long_reason = stage_review.clone();
+        long_reason["reason"] = json!("x".repeat(4001));
+        let mut no_criteria = stage_review.clone();
+        no_criteria["criteriaResults"] = json!([]);
+        let mut unknown_criterion = stage_review.clone();
+        unknown_criterion["criteriaResults"] =
+            json!([{"criterionId": "c1", "satisfied": true, "futureField": 1}]);
+        let mut zero_revision = stage_review.clone();
+        zero_revision["policyRevision"] = json!(0);
+        for invalid in [
+            short_hash,
+            upper_hash,
+            long_reason,
+            no_criteria,
+            unknown_criterion,
+            zero_revision,
+        ] {
+            assert!(
+                validate_builtin_tool_input("loom.stage-review", &invalid).is_err(),
+                "the closed schema still refuses {invalid}"
+            );
+        }
+        assert!(
+            validate_builtin_tool_input("loom.inspect", &json!({"taskId": ""})).is_err(),
+            "an empty task id is not a task"
+        );
     }
 
     #[test]
@@ -1834,5 +2098,50 @@ mod tests {
             "counterpartyAgentId": "agent_3"
         });
         assert!(validate_builtin_tool_input(MEMORY_WRITE_TOOL_NAME, &hearth).is_err());
+    }
+}
+
+#[cfg(test)]
+mod workspace_rpc_contract_tests {
+    use super::*;
+    #[test]
+    fn workspace_rpc_schema_rejects_identity_injection_arbitrary_commands_and_unbounded_results() {
+        let good = json!({"workspaceId":"workspace","path":"data.txt"});
+        validate_builtin_tool_input("loom.workspace.read", &good).unwrap();
+        let mut foreign = good.clone();
+        foreign["memberId"] = json!("foreign");
+        assert!(validate_builtin_tool_input("loom.workspace.read", &foreign).is_err());
+        assert!(
+            validate_builtin_tool_input(
+                "loom.workspace.run",
+                &json!({"workspaceId":"workspace","toolId":"shell","args":[]})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_builtin_tool_input(
+                "loom.workspace.run",
+                &json!({"workspaceId":"workspace","toolId":"git.status","args":["--help"]})
+            )
+            .is_err()
+        );
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/builtin-tool-agent-output-v17.json"
+        ))
+        .unwrap();
+        let schema = workspace_rpc_success_schema();
+        let good = fixtures["loom.workspace.read"]["canonicalResult"].clone();
+        validate_schema(&good, &schema).unwrap();
+        let mut extra = good.clone();
+        extra["archives"][0]["localPath"] = json!("C:/untrusted");
+        assert!(validate_schema(&extra, &schema).is_err());
+        let mut bad = good.clone();
+        bad["events"][1]["body"]["result"]["text"] = json!("x".repeat(1_048_577));
+        assert!(validate_schema(&bad, &schema).is_err());
+        let mut wrong_tag = good.clone();
+        let body = wrong_tag["events"][1]["body"].as_object_mut().unwrap();
+        let kind = body.remove("kind").unwrap();
+        body.insert("type".into(), kind);
+        assert!(validate_schema(&wrong_tag, &schema).is_err());
     }
 }

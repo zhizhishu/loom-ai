@@ -300,3 +300,154 @@
     max-height: none;
   }
 }
+
+.member-catalog-page {
+  display: grid;
+  gap: 20px;
+}
+
+.member-execution-target {
+  display: grid;
+  gap: 10px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.member-execution-target-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+}
+
+.member-execution-target-heading h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 620;
+}
+
+.member-target-summary,
+.member-target-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.member-target-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.member-target-modes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.member-target-mode {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  min-height: 36px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.member-target-mode:has(input:checked) {
+  border-color: var(--control-line, var(--line-strong));
+  background: var(--workspace-surface-subtle, var(--surface));
+}
+
+.member-target-mode input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--conversation-action);
+}
+
+.member-target-mode strong {
+  display: block;
+  font-weight: 620;
+}
+
+.member-target-mode small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.member-target-mode input:disabled {
+  cursor: not-allowed;
+}
+
+.member-target-fields {
+  display: grid;
+  gap: 10px;
+}
+
+.member-target-field {
+  display: grid;
+  gap: 4px;
+  max-width: 460px;
+}
+
+.member-target-field > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.member-target-field select,
+.member-target-field input {
+  width: 100%;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--input);
+  font: inherit;
+}
+
+.member-target-field select:disabled,
+.member-target-field input:disabled {
+  color: var(--muted);
+}
+
+.member-target-mode input:focus-visible,
+.member-target-field select:focus-visible,
+.member-target-field input:focus-visible {
+  outline: 2px solid var(--conversation-action);
+  outline-offset: 2px;
+}
+
+.member-target-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.member-target-actions p {
+  flex: 1 1 220px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.member-target-actions button {
+  min-height: 32px;
+}
+
+.member-target-actions .member-target-hint {
+  flex: 1 1 220px;
+}

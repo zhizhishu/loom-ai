@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
+  DEFAULT_FILE_PREVIEW_RATIO,
   filePreviewDragWidth,
   filePreviewRatioForWidth,
   filePreviewRatioFromStoredValue,
@@ -9,6 +10,10 @@ import {
 } from './file-preview-layout'
 
 describe('File preview split geometry', () => {
+  it('gives LOOM conversation 58 percent of the workspace by default', () => {
+    expect(DEFAULT_FILE_PREVIEW_RATIO).toBe(.42)
+    expect(filePreviewWidthForRatio(1248, DEFAULT_FILE_PREVIEW_RATIO)).toBeCloseTo(524.16)
+  })
   it('starts at 44/56 while protecting the conversation and preview reading widths', () => {
     expect(filePreviewWidthForRatio(1_200, .56)).toBeCloseTo(672)
     expect(filePreviewWidthForRatio(841, .56)).toBe(421)

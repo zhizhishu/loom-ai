@@ -37,7 +37,14 @@ export const BUILTIN_CLI_NAMES: Readonly<Record<string, string>> = Object.freeze
   'loom.release': 'rovai loom release',
   'loom.claim': 'rovai loom claim',
   'loom.evidence': 'rovai loom evidence',
-  'loom.submit': 'rovai loom submit'
+  'loom.submit': 'rovai loom submit',
+  'loom.inspect': 'rovai loom inspect',
+  'loom.stage-review': 'rovai loom stage-review',
+  'loom.workspace.list': 'rovai workspace list',
+  'loom.workspace.read': 'rovai workspace read',
+  'loom.workspace.run': 'rovai workspace run',
+  'loom.workspace.poll': 'rovai workspace poll',
+  'loom.workspace.cancel': 'rovai workspace cancel'
 })
 
 function currentOperation(operation: unknown): unknown {

@@ -11,6 +11,14 @@ mkdirSync(userData, { recursive: true })
 app.setPath('userData', userData)
 app.setPath('sessionData', join(userData, 'session'))
 
+// Mirrors FILE_PREVIEW_RATIO_STORAGE_KEY in apps/desktop/src/renderer/src/file-preview-layout.ts.
+// The renderer snapshot reads the real constant; this copy only seeds and inspects storage.
+const PREFERRED_RATIO_KEY = 'loom.file-preview.preferred-ratio.mikka.v1'
+// Production `.navigation-shell.loom-mikka` chrome on a desktop window: 328px rail + 16px right inset.
+// Viewports below are written as `tuned workspace width + LOOM_MIKKA_CHROME` so the split geometry
+// stays the geometry the assertions were written against.
+const LOOM_MIKKA_CHROME = 344
+
 // Only the production Renderer runs here. The closed API fixture never starts
 // Core, SQLite, a Skill Library, a Runtime, or any daily App/data connection.
 app.whenReady().then(async () => {
@@ -130,9 +138,9 @@ app.whenReady().then(async () => {
     return result.text
   }
 
-  const initialExecutionFixture = async (scenario = 'new', ratio = null, width = 1440) => {
+  const initialExecutionFixture = async (scenario = 'new', ratio = null, width = 1170 + LOOM_MIKKA_CHROME) => {
     await run(`localStorage.clear(); sessionStorage.clear();
-      ${ratio === null ? '' : `localStorage.setItem('rovai.file-preview.preferred-ratio', '${ratio}')`}`)
+      ${ratio === null ? '' : `localStorage.setItem('${PREFERRED_RATIO_KEY}', '${ratio}')`}`)
     await window.loadFile(renderer, { query: { 'initial-execution': scenario } })
     await viewport(width)
   }
@@ -190,7 +198,7 @@ app.whenReady().then(async () => {
       await initialExecutionFixture(scenario, saved)
       await submitFirstMessage()
       const state = await claimFirstRun()
-      closeTo(state.width, Math.min(state.available - 420, state.available * (saved ?? .56)), 'Existing ratio')
+      closeTo(state.width, Math.min(state.available - 420, state.available * (saved ?? .42)), 'Existing ratio')
       assert.equal(state.stored, saved === null ? null : String(saved))
     }
   })
@@ -209,7 +217,7 @@ app.whenReady().then(async () => {
         await snapshot()
       }
       const state = await claimFirstRun()
-      closeTo(state.width, state.available * .56, `${scenario} retains width`)
+      closeTo(state.width, state.available * .42, `${scenario} retains width`)
       assert.equal(state.stored, null)
       assert.equal(await run('window.previewTest.activeTabKind()'), 'execution', 'Existing selection priority is unchanged')
       if (scenario.includes('file') || scenario === 'mission') assert.equal(state.tabCount, 2)
@@ -217,22 +225,22 @@ app.whenReady().then(async () => {
   })
 
   await check('first Run respects the compact breakpoint and starts at minimum in a wide workspace', async () => {
-    await initialExecutionFixture('new', null, 1040)
+    await initialExecutionFixture('new', null, 770 + LOOM_MIKKA_CHROME)
     await submitFirstMessage()
     const compact = await claimFirstRun()
     assert.equal(compact.compact, true)
     closeTo(compact.width, compact.available, 'Compact preview still replaces the conversation')
     assert.equal(compact.handle, null)
-    const expanded = await viewport(1440)
-    closeTo(expanded.width, expanded.available * .56, 'Compact entry did not change the default ratio')
-    await initialExecutionFixture('new', null, 2560)
+    const expanded = await viewport(1170 + LOOM_MIKKA_CHROME)
+    closeTo(expanded.width, expanded.available * .42, 'Compact entry did not change the default ratio')
+    await initialExecutionFixture('new', null, 2290 + LOOM_MIKKA_CHROME)
     await submitFirstMessage()
     closeTo((await claimFirstRun()).width, 420, 'Wide first Run uses the minimum')
   })
 
   await run('localStorage.clear(); sessionStorage.clear()')
   await window.loadFile(renderer)
-  await viewport(1440)
+  await viewport(1170 + LOOM_MIKKA_CHROME)
   await check('the persistent preview toggle opens an empty reading plane and closes without saving a new ratio', async () => {
     const initial = await reviewSnapshot()
     assert.equal(initial.toggleVisible, true)
@@ -252,10 +260,10 @@ app.whenReady().then(async () => {
     assert.equal((await snapshot()).stored, null)
   })
 
-  await check('44/56 default shares the header/body boundary and keeps the complete workspace', async () => {
+  await check('42/58 default shares the header/body boundary and keeps the complete workspace', async () => {
     const state = await open()
     closeTo(state.available, 1170, 'Workspace excludes the navigation rail')
-    closeTo(state.width, state.available * .56, 'Default preview ratio')
+    closeTo(state.width, state.available * .42, 'Default preview ratio')
     assert.equal(state.aligned, true)
     assert.equal(state.overflow, false)
     assert.equal(state.stored, null, 'Opening must not persist a clamped ratio')
@@ -280,7 +288,7 @@ app.whenReady().then(async () => {
     assert.equal(rail.paneBorder, '0px')
     assert.equal(rail.tabBorder, '0px')
     assert.equal(rail.grip, '0')
-    assert.deepEqual(state.aria, { min: '420', max: '750', now: '655' })
+    assert.deepEqual(state.aria, { min: '420', max: '750', now: '491' })
     await capture('preview-day-1440x920')
   })
 
@@ -498,13 +506,15 @@ app.whenReady().then(async () => {
       '.file-preview-tab-panel:not([hidden]) .file-preview-markdown'
     ).scrollTop`), readingPosition, 'Tab switches preserve Markdown reading position')
 
-    await viewport(1111)
+    await viewport(841 + LOOM_MIKKA_CHROME)
     const narrow = await run('window.previewTest.markdownSnapshot()')
     assert.match(narrow.metadata.columns, /^104px /)
     assert.equal(narrow.metadata.overflows, false)
     assert.equal(narrow.pageOverflow, false)
     await capture('markdown-reader-narrow-night')
-    await viewport(2560, 1440)
+    // The 1120px document track only applies once the 42% pane itself exceeds it
+    // (`@container file-preview-pane (min-width: 1200px)` plus the padded reading gutter).
+    await viewport(2916 + LOOM_MIKKA_CHROME, 1440)
     for (const theme of ['day', 'night']) {
       await run(`window.previewTest.setTheme(${JSON.stringify(theme)})`)
       await snapshot()
@@ -522,7 +532,7 @@ app.whenReady().then(async () => {
       assert.equal(wide.overflow, false)
       await capture(`markdown-reader-${theme}-2k`)
     }
-    await viewport(1440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
     await run('window.previewTest.setTheme("day"); window.previewTest.closeExtraTabs(); window.previewTest.open()')
   })
 
@@ -647,7 +657,7 @@ app.whenReady().then(async () => {
     assert.ok(wide.segments.every(segment => !segment.truncated), 'Directory character limits cannot truncate a path that fits')
     assert.equal(wide.pathOverflow, false)
 
-    await viewport(1_111)
+    await viewport(841 + LOOM_MIKKA_CHROME)
     const narrow = await run('window.previewTest.pathSnapshot()')
     assert.equal(narrow.pathOverflow, false)
     assert.equal(narrow.segments[1].truncated, true, 'An overlong middle directory yields space')
@@ -657,12 +667,12 @@ app.whenReady().then(async () => {
     await snapshot()
     await capture('preview-path-narrow-night')
 
-    await viewport(2_560, 1_440)
+    await viewport(2290 + LOOM_MIKKA_CHROME, 1_440)
     const expanded = await run('window.previewTest.pathSnapshot()')
     assert.ok(expanded.segments.every(segment => !segment.truncated), 'Widening the pane restores the complete path')
     await capture('preview-path-wide-night')
     await run('window.previewTest.setTheme("day"); window.previewTest.closeExtraTabs()')
-    await viewport(1_440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
     await open()
   })
 
@@ -700,7 +710,8 @@ app.whenReady().then(async () => {
   })
 
   await check('tabs shrink equally before minimum-width overflow, and expand again after closing', async () => {
-    await viewport(1_540)
+    // 1270px workspace → 42% pane (533px) → 379px tab strip: two 180px tabs fit, three shrink, four overflow.
+    await viewport(1270 + LOOM_MIKKA_CHROME)
     const tabs = async () => { await snapshot(); return run('window.previewTest.tabSnapshot()') }
     const equalWidths = (state, width) => state.tabs.forEach(tab => closeTo(tab.width, width, 'Equal tab widths'))
     await run('window.previewTest.openTab(0)')
@@ -745,13 +756,13 @@ app.whenReady().then(async () => {
     assert.deepEqual(closed.edges, { left: false, right: false })
     assert.ok(closed.tabs.every(tab => !tab.faded))
 
-    await viewport(1_200)
+    await viewport(930 + LOOM_MIKKA_CHROME)
     equalWidths(await tabs(), 120)
     assert.equal((await tabs()).overflow, true)
     await run('window.previewTest.setTheme("night")')
     await snapshot()
     await capture('tabs-minimum-night')
-    await viewport(1_540)
+    await viewport(1270 + LOOM_MIKKA_CHROME)
     const expanded = await tabs()
     closeTo(expanded.tabs[0].width, shrinking.tabs[0].width, 'Widening the preview expands tabs')
     assert.equal(expanded.overflow, false)
@@ -762,7 +773,7 @@ app.whenReady().then(async () => {
     await open()
     equalWidths(await tabs(), 180)
     assert.equal((await snapshot()).stored, null, 'Tab layout does not write preview width preferences')
-    await viewport(1_440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
   })
 
   await check('edge arrows track overflow and scroll without changing the active file or reading positions', async () => {
@@ -990,32 +1001,34 @@ app.whenReady().then(async () => {
     for (const [code, modifiers, expected] of [
       ['Left', [], 444], ['Left', ['shift'], 524], ['Right', [], 500], ['Right', ['shift'], 420], ['Right', [], 420]
     ]) closeTo((await key(code, modifiers)).width, expected, 'Keyboard preview width')
-    assert.equal(Number((await reset()).stored), .56, 'Default ratio reset')
+    assert.equal(Number((await reset()).stored), .42, 'Default ratio reset')
     for (const code of ['Delete', 'Backspace']) {
       await run('document.querySelector(".file-preview-resize-handle").focus()')
       assert.equal((await key(code)).visible, false)
-      assert.equal((await open()).stored, '0.56')
+      assert.equal((await open()).stored, '0.42')
     }
   })
 
   await check('container resize settles active dragging within the new bounds', async () => {
     await drag(700)
-    await viewport(1_130)
+    await viewport(860 + LOOM_MIKKA_CHROME)
     const done = await release()
     closeTo(done.width, 440, 'Container clamps while preserving the conversation')
-    assert.notEqual(done.stored, '0.56', 'The last observed position replaces the old preference')
+    assert.notEqual(done.stored, '0.42', 'The last observed position replaces the old preference')
     assert.equal(done.resizing, false)
-    const restored = await viewport(1_440)
+    const restored = await viewport(1170 + LOOM_MIKKA_CHROME)
     closeTo(restored.width, restored.available * Number(done.stored), 'Committed ratio after window expands')
     assert.equal(restored.aligned, true)
     await reset()
   })
 
   await check('actual workspace threshold replaces the conversation and returns without losing content', async () => {
-    const split = await viewport(1_111)
+    // 841px is FILE_PREVIEW_SPLIT_MIN_WIDTH; at 42% the smallest split pane is the 420px minimum,
+    // so the conversation keeps 421px here and 840px falls back to the compact preview.
+    const split = await viewport(841 + LOOM_MIKKA_CHROME)
     assert.equal(split.compact, false)
-    closeTo(split.conversation, 420, 'Last split conversation width')
-    const compact = await viewport(1_110)
+    closeTo(split.conversation, 421, 'Last split conversation width')
+    const compact = await viewport(840 + LOOM_MIKKA_CHROME)
     assert.equal(compact.compact, true)
     assert.equal(compact.returnVisible, true)
     assert.equal(compact.controlsVisible, false)
@@ -1029,14 +1042,14 @@ app.whenReady().then(async () => {
     assert.equal(back.visible, false)
     assert.equal(back.controlsVisible, true)
     assert.match(back.focused, /camp-timeline/)
-    assert.equal(back.stored, '0.56')
+    assert.equal(back.stored, '0.42')
     await open()
-    await viewport(1_040, 700)
+    await viewport(770 + LOOM_MIKKA_CHROME, 700)
     await capture('preview-day-1040x700')
   })
 
   await check('compact conversation follows its own width on a 2560px desktop without remounting content', async () => {
-    const wide = await viewport(2_560, 1_440)
+    const wide = await viewport(2290 + LOOM_MIKKA_CHROME, 1_440)
     await run('window.previewTest.bookmark()')
     for (const conversationWidth of [481, 480, 450, 420]) {
       const moving = await drag(wide.available - conversationWidth)
@@ -1088,7 +1101,7 @@ app.whenReady().then(async () => {
     await capture('conversation-find-420px', { x: 270, y: 0, width: 600, height: 1440 })
     await run('document.querySelector(".conversation-find-icon-button.close").click()')
     assert.equal((await conversationSnapshot()).viewSwitcherVisible, true)
-    await viewport(2_560, 700)
+    await viewport(2290 + LOOM_MIKKA_CHROME, 700)
     await run('window.previewTest.docks("both")')
     const docked = await conversationSnapshot()
     assert.deepEqual(docked.overflows, [])
@@ -1108,8 +1121,8 @@ app.whenReady().then(async () => {
 
   await check('wide, night and 200% reduced-motion layouts preserve one boundary without overflow', async () => {
     await run('window.previewTest.setTheme("night")')
-    const wide = await viewport(2_560, 1_440)
-    closeTo(wide.width, wide.available * .56, 'Wide preview ratio')
+    const wide = await viewport(2290 + LOOM_MIKKA_CHROME, 1_440)
+    closeTo(wide.width, wide.available * .42, 'Wide preview ratio')
     assert.equal(wide.aligned, true)
     assert.equal(wide.overflow, false)
     await capture('preview-night-2560x1440')
@@ -1117,7 +1130,7 @@ app.whenReady().then(async () => {
     await release()
     await capture('conversation-night-450px', { x: 270, y: 0, width: 600, height: 1440 })
     await reset()
-    await viewport(1_440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
     await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', {
       features: [{ name: 'prefers-reduced-motion', value: 'reduce' }]
     })
@@ -1130,7 +1143,7 @@ app.whenReady().then(async () => {
     assert.ok(Number.parseFloat(zoomed.transition) <= .00001, 'Reduced motion disables visible layout transitions')
     await capture('preview-night-200-percent-reduced-motion')
     window.webContents.setZoomFactor(1)
-    await viewport(1_440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
   })
 
   await check('Camp changes release capture and reload restores the saved ratio from local storage', async () => {
@@ -1139,14 +1152,14 @@ app.whenReady().then(async () => {
     const changed = await release()
     assert.equal(changed.visible, false)
     assert.equal(changed.resizing, false)
-    assert.equal(changed.stored, '0.56')
+    assert.equal(changed.stored, '0.42')
     await new Promise(resolve => {
       window.webContents.once('did-finish-load', resolve)
       window.webContents.reload()
     })
     const reopened = await open()
-    closeTo(reopened.width, reopened.available * .56, 'Reloaded ratio')
-    assert.equal(reopened.stored, '0.56')
+    closeTo(reopened.width, reopened.available * .42, 'Reloaded ratio')
+    assert.equal(reopened.stored, '0.42')
   })
 
   await check('File Change opens beside the unchanged conversation with its own tab and immutable evidence', async () => {
@@ -1225,19 +1238,19 @@ app.whenReady().then(async () => {
     assert.equal((await reviewSnapshot()).fileReads, before.fileReads)
     await click('[aria-label="关闭 File Change·styles.css"]')
     assert.deepEqual((await reviewSnapshot()).releases, before.releases)
-    await viewport(2_560, 1_440)
+    await viewport(2290 + LOOM_MIKKA_CHROME, 1_440)
     await run('window.previewTest.setTheme("night")')
     assert.equal((await reviewSnapshot()).sidebarVisible, true)
     assert.deepEqual((await reviewSnapshot()).overflow, [])
     await capture('file-change-night-2560x1440')
-    await viewport(1_110)
+    await viewport(840 + LOOM_MIKKA_CHROME)
     assert.equal((await snapshot()).returnVisible, true)
     assert.equal((await reviewSnapshot()).reviewVisible, true)
     await click('.file-preview-toggle')
     assert.equal((await snapshot()).controlsVisible, true)
     await click('.file-preview-toggle')
     assert.equal((await reviewSnapshot()).reviewVisible, true)
-    assert.equal((await snapshot()).stored, '0.56')
+    assert.equal((await snapshot()).stored, '0.42')
     await run('window.previewTest.closeAll()')
     assert.equal((await snapshot()).visible, false)
     assert.equal((await reviewSnapshot()).toggleVisible, true)
@@ -1245,7 +1258,7 @@ app.whenReady().then(async () => {
     assert.equal((await reviewSnapshot()).emptyVisible, true)
     assert.equal((await snapshot()).focused, 'file-preview-return')
     await click('.file-preview-return')
-    await viewport(1_440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
     await run('window.previewTest.openReview(); window.previewTest.switchCamp()')
     assert.equal((await snapshot()).visible, false)
     await run('window.previewTest.openReview()')
@@ -1311,7 +1324,7 @@ app.whenReady().then(async () => {
     await key('Escape')
   })
   await check('compact changed-file picker filters, scrolls, supports keyboard cancellation, and keeps live code typography', async () => {
-    await viewport(1_440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
     await run('window.previewTest.openPickerReview()')
     await drag(420)
     await release()
@@ -1386,7 +1399,7 @@ app.whenReady().then(async () => {
     assert.equal(await run('!!document.querySelector(".changed-file-popover")'), false)
     await key('Escape')
     await click('.file-preview-tab-panel:not([hidden]) .changed-file-trigger')
-    await viewport(2_560, 1_440)
+    await viewport(2290 + LOOM_MIKKA_CHROME, 1_440)
     assert.equal((await reviewSnapshot()).sidebarVisible, true)
     assert.equal(await run('!!document.querySelector(".changed-file-popover")'), false, 'Responsive switch closes the hidden picker')
     await run('window.previewTest.setTheme("night")')
@@ -1397,7 +1410,7 @@ app.whenReady().then(async () => {
     assert.equal(after.fileReads, before.fileReads, 'Switching immutable evidence never reads current files')
     assert.equal(after.reviewRequests.length, before.reviewRequests.length, 'Filtering and navigation reuse the loaded evidence')
     await run('window.previewTest.setTheme("day")')
-    await viewport(1_440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
   })
   await check('operation-only DiffCard opens once and reuses the loaded current file', async () => {
     await run('window.previewTest.closeAll()')
@@ -1497,7 +1510,7 @@ app.whenReady().then(async () => {
   })
   await check('primary W closes the active file or review tab, restores focus, and keeps the conversation alive', async () => {
     const primary = process.platform === 'darwin' ? 'meta' : 'control'
-    for (const width of [1440, 1040]) {
+    for (const width of [1170 + LOOM_MIKKA_CHROME, 770 + LOOM_MIKKA_CHROME]) {
       await viewport(width)
       await run('window.previewTest.closeAll(); window.previewTest.open()')
       await run('window.previewTest.openFindFixture("find.html")')
@@ -1511,7 +1524,7 @@ app.whenReady().then(async () => {
       assert.equal(last.visible, false)
       assert.equal(nativeCloseRequests, 0, 'Closing the last file must not close the window')
     }
-    await viewport(1440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
     await run('window.previewTest.open()')
     await click('.run-file-change-file')
     assert.equal((await snapshot()).tabCount, 2)
@@ -1605,7 +1618,7 @@ app.whenReady().then(async () => {
     await capture('tool-edit-preview-and-diff')
   })
   await check('a cold background tab downloads on the first menu click without starting its preview', async () => {
-    await viewport(1_440)
+    await viewport(1170 + LOOM_MIKKA_CHROME)
     await run('window.previewTest.prepareColdDownload()')
     const before = await run('window.previewTest.downloadState()')
     assert.equal(before.tab.loadState, 'cold')

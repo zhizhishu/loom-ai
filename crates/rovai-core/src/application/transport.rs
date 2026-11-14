@@ -51,9 +51,57 @@ pub struct CoreService {
     control_capacity: Arc<Semaphore>,
     output: Arc<EmbeddedOutput>,
     capacity: Arc<Semaphore>,
+    remote_runtime_services: Arc<crate::remote_runtime_services::RemoteRuntimeServices>,
 }
 
 impl CoreService {
+    /// Trusted in-process Host capability. It is not a public JSON launch API.
+    pub fn install_remote_process_launcher(
+        &self,
+        launcher: Arc<dyn crate::remote_process::RemoteProcessLauncher>,
+    ) -> Result<()> {
+        self.remote_runtime_services
+            .install_launcher(launcher)
+            .map_err(Into::into)
+    }
+
+    /// Trusted in-process embedding capability; never a public JSON operation.
+    pub fn install_workspace_rpc_transport(
+        &self, transport: Arc<dyn crate::workspace_rpc_transport::WorkspaceRpcTransport>,
+    ) -> Result<()> {
+        self.remote_runtime_services.install_workspace_transport(transport).map_err(Into::into)
+    }
+
+    pub fn remote_process_launcher(
+        &self,
+    ) -> Result<Option<Arc<dyn crate::remote_process::RemoteProcessLauncher>>> {
+        self.remote_runtime_services
+            .installed_launcher()
+            .map_err(Into::into)
+    }
+
+    /// The embedding Hub has authenticated node + process + owner + binding_seq.
+    /// Core independently resolves its current native Built-in Tool lease.
+    pub async fn invoke_remote_builtin(
+        &self,
+        request: crate::remote_runtime_services::RemoteBuiltinInvocation,
+    ) -> Result<rovai_core::builtin_tool_transport::BuiltinToolIpcResponse> {
+        if self
+            .output
+            .startup
+            .borrow()
+            .get("status")
+            .and_then(Value::as_str)
+            != Some("ready")
+        {
+            anyhow::bail!("remote_process_unavailable");
+        }
+        self.remote_runtime_services
+            .invoke_builtin(request)
+            .await
+            .map_err(Into::into)
+    }
+
     pub fn startup(&self) -> watch::Receiver<Value> {
         self.output.startup.subscribe()
     }
@@ -237,13 +285,18 @@ pub struct CoreRunner {
     completion: RunnerCompletion,
     desktop_stdio: bool,
     host_control: Option<Arc<dyn HostControl>>,
+    remote_runtime_services: Arc<crate::remote_runtime_services::RemoteRuntimeServices>,
 }
 
-struct RunnerCompletion(Arc<EmbeddedOutput>);
+struct RunnerCompletion {
+    output: Arc<EmbeddedOutput>,
+    remote_runtime_services: Arc<crate::remote_runtime_services::RemoteRuntimeServices>,
+}
 
 impl Drop for RunnerCompletion {
     fn drop(&mut self) {
-        self.0.finish();
+        self.output.finish();
+        self.remote_runtime_services.close();
     }
 }
 
@@ -284,6 +337,7 @@ impl CoreRunner {
             input,
             output,
             self.host_control,
+            self.remote_runtime_services,
         )
         .await
     }
@@ -307,6 +361,8 @@ pub fn embedded(
         startup,
         events,
     });
+    let remote_runtime_services =
+        Arc::new(crate::remote_runtime_services::RemoteRuntimeServices::default());
     Ok((
         CoreService {
             requests,
@@ -314,16 +370,21 @@ pub fn embedded(
             control_capacity: Arc::new(Semaphore::new(CONTROL_CAPACITY)),
             output: output.clone(),
             capacity: Arc::new(Semaphore::new(REQUEST_CAPACITY)),
+            remote_runtime_services: remote_runtime_services.clone(),
         },
         CoreRunner {
             config,
             environment,
             requests: receiver,
             control: control_receiver,
-            completion: RunnerCompletion(output.clone()),
+            completion: RunnerCompletion {
+                output: output.clone(),
+                remote_runtime_services: remote_runtime_services.clone(),
+            },
             output,
             desktop_stdio: false,
             host_control: None,
+            remote_runtime_services,
         },
     ))
 }
@@ -568,6 +629,51 @@ mod tests {
             "domain_rejected"
         );
         assert!(runner.output.pending.lock().unwrap().is_empty());
+    }
+
+    struct UnusedRemoteLauncher;
+    impl crate::remote_process::RemoteProcessLauncher for UnusedRemoteLauncher {
+        fn start(
+            &self,
+            _: crate::remote_process::ScopedRemoteLaunch,
+        ) -> crate::remote_process::RemoteFuture<'_, crate::remote_process::RemoteProcess> {
+            Box::pin(async { Err(crate::remote_process::RemoteProcessError::Unavailable) })
+        }
+    }
+
+    #[tokio::test]
+    async fn unique_runner_owns_provider_lifetime_across_service_clones() {
+        let (service, runner) = transport();
+        let launcher: Arc<dyn crate::remote_process::RemoteProcessLauncher> =
+            Arc::new(UnusedRemoteLauncher);
+        let weak = Arc::downgrade(&launcher);
+        service
+            .install_remote_process_launcher(launcher.clone())
+            .unwrap();
+        let listener = service.clone();
+        assert!(Arc::ptr_eq(
+            &listener.remote_process_launcher().unwrap().unwrap(),
+            &launcher
+        ));
+        listener
+            .install_remote_process_launcher(launcher.clone())
+            .unwrap();
+        assert!(
+            listener
+                .install_remote_process_launcher(Arc::new(UnusedRemoteLauncher))
+                .is_err()
+        );
+        drop(listener); // A listener is not the Core owner.
+        drop(launcher);
+        assert!(weak.upgrade().is_some());
+        drop(runner); // Includes a never-polled runner: no ownership cycle remains.
+        assert!(weak.upgrade().is_none());
+        assert!(service.remote_process_launcher().unwrap().is_none());
+        assert!(
+            service
+                .install_remote_process_launcher(Arc::new(UnusedRemoteLauncher))
+                .is_err()
+        );
     }
 
     #[tokio::test]

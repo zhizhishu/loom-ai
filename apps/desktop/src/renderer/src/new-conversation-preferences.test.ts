@@ -222,6 +222,33 @@ describe('new conversation preferences', () => {
     expect(defaultsNeedInvalidation(preferences, members)).toBe(false)
   })
 
+  it('preserves a remote one-click team through an outage without using a local fallback', () => {
+    const preferences = configuredPreferences()
+    const members = ['agent-a', 'agent-b'].map(id => profile(id, 'present'))
+    for (const member of members) member.executionAvailability = {
+      location: 'remote', configured: true, canLaunch: true,
+      adapterKind: 'claude-code-cli', targetRevision: 2,
+      nodeId: 'node-b', workspaceId: 'workspace-b',
+      readiness: { status: 'installed_unverified', blockers: [] }
+    }
+    expect(resolveAvailableNewConversationDefaults(preferences, members)?.members).toHaveLength(2)
+    expect(members.every(member => member.runtimeConfiguration === null)).toBe(true)
+    members[1].runtimeConfiguration = {
+      adapterKind: 'codex-cli', model: { mode: 'runtime_default' },
+      permissions: { adapterKind: 'codex-cli', schemaVersion: 1, values: {} }
+    }
+    members[1].runtimeReadiness = { status: 'ready', blockers: [] }
+    members[1].executionAvailability!.canLaunch = false
+    members[1].executionAvailability!.readiness = {
+      status: 'needs_attention', blockers: [{ code: 'remote_node_offline', detail: null }]
+    }
+    expect(resolveAvailableNewConversationDefaults(preferences, members)).toBeNull()
+    expect(defaultsNeedInvalidation(preferences, members)).toBe(false)
+    members[1].executionAvailability!.canLaunch = true
+    members[1].executionAvailability!.readiness = { status: 'installed_unverified', blockers: [] }
+    expect(resolveAvailableNewConversationDefaults(preferences, members)?.members).toHaveLength(2)
+  })
+
   it('waits for the authoritative Member overview before invalidating saved defaults', () => {
     const preferences = configuredPreferences()
     expect(shouldInvalidateNewConversationDefaults(preferences, [], false)).toBe(false)

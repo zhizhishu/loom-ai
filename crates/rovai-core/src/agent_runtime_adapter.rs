@@ -1112,7 +1112,10 @@ impl AgentRuntimeAdapterRegistry {
     pub fn mcp_projection(&self, kind: AdapterKind) -> McpProjectionCapability {
         match kind {
             AdapterKind::CodexCli => self.codex_cli.mcp_projection(),
-            AdapterKind::Pi => unsupported_external_mcp_projection(),
+            // Pi has no native MCP of its own. Selected servers reach the managed
+            // extension as a frozen per-Run document, so the projection is additive
+            // and a tool the user's own Pi extension already provides keeps winning.
+            AdapterKind::Pi => additive_native_mcp_projection(McpSameNamePolicy::NativeWinsSkip),
             AdapterKind::OpencodeCli => self.opencode_cli.mcp_projection(),
             AdapterKind::CopilotCli => self.copilot_cli.mcp_projection(),
             AdapterKind::ClaudeCodeCli => self.claude_code_cli.mcp_projection(),

@@ -891,6 +891,105 @@ export function dshModelOptionsResolved(model: ModelDescriptor | null, source?: 
     && model.runtimeMetadata.dshSource === (source ?? 'native')
 }
 
+/**
+ * One native permission select driven only by a shipped descriptor. It never needs an
+ * AdapterInstallation, so a remote member target can reuse the local control as-is.
+ */
+export function PermissionSelectField({
+  permissionOptions,
+  values,
+  recommendedValues,
+  disabled,
+  fieldKey,
+  label,
+  choiceDescriptions,
+  onChange
+}: {
+  permissionOptions: PermissionOptionDescriptor[]
+  values: Record<string, unknown>
+  recommendedValues: Record<string, unknown> | null
+  disabled: boolean
+  fieldKey: string
+  label: string
+  choiceDescriptions?: Record<string, string>
+  onChange(fieldKey: string, value: string): void
+}): React.JSX.Element {
+  const descriptor = permissionDescriptor(permissionOptions, fieldKey)
+  if (!descriptor) {
+    return <p className="runtime-parameter-unavailable"><UiText zh={"当前能力快照未提供“"} />{label}”。</p>
+  }
+  const currentValue = stringValue(values[fieldKey])
+  const invalid = Boolean(currentValue)
+    && !descriptor.choices.some((choice) => choice.value === currentValue)
+  return (
+    <RuntimeParameterSelect
+      label={label}
+      recommendedValue={stringValue(recommendedValues?.[fieldKey]) || undefined}
+      menuGuidance={uiAttribute("建议使用最高权限，体验更顺畅。")}
+      value={currentValue}
+      disabled={disabled}
+      onChange={(value) => onChange(fieldKey, value)}
+      choices={[
+        ...(!currentValue ? [{ value: '', label:uiAttribute("请选择") }] : []),
+        ...(invalid ? [{ value: currentValue, label: uiAttribute("已失效 · {0}", String(currentValue)), disabled: true }] : []),
+        ...descriptor.choices.map((choice) => ({
+          ...choice,
+          description: choiceDescriptions?.[choice.value] ? uiAttribute(choiceDescriptions[choice.value]) : undefined
+        }))
+      ]}
+    />
+  )
+}
+
+/** The same switch face as the local member form, without an installation dependency. */
+export function PermissionSwitchField({
+  permissionOptions,
+  values,
+  recommendedValues,
+  disabled,
+  fieldKey,
+  label,
+  enabledValue = 'on',
+  disabledValue = 'off',
+  onChange
+}: {
+  permissionOptions: PermissionOptionDescriptor[]
+  values: Record<string, unknown>
+  recommendedValues: Record<string, unknown> | null
+  disabled: boolean
+  fieldKey: string
+  label: string
+  enabledValue?: string
+  disabledValue?: string
+  onChange(fieldKey: string, value: string): void
+}): React.JSX.Element {
+  const language = useInterfaceLanguage()
+  const hintId = useId()
+  const descriptor = permissionDescriptor(permissionOptions, fieldKey)
+  const checked = values[fieldKey] === enabledValue
+  const recommendEnabling = descriptor?.choices.some(choice => choice.value === enabledValue) === true
+    && recommendedValues?.[fieldKey] === enabledValue
+  return (
+    <label className="field-label runtime-parameter-switch-field">
+      <span className="permission-switch-label">{label}</span>
+      <span className="runtime-parameter-switch">
+        <span className="runtime-parameter-switch-state" aria-hidden="true">
+          {checked ? uiAttribute("开启") : uiAttribute(language === 'en' ? "已关闭" : "关闭")}
+        </span>
+        <input
+          type="checkbox"
+          aria-label={label}
+          aria-describedby={recommendEnabling ? hintId : undefined}
+          checked={checked}
+          disabled={disabled || !descriptor}
+          onChange={(event) => onChange(fieldKey, event.target.checked ? enabledValue : disabledValue)}
+        />
+      </span>
+      {recommendEnabling && <span id={hintId} className="permission-switch-guidance"><UiText zh={"建议开启，体验更顺畅。"} /></span>}
+    </label>
+  )
+}
+
 function PermissionSelect({
   installation,
   permissionOptions,
@@ -905,29 +1004,16 @@ function PermissionSelect({
   label: string
   choiceDescriptions?: Record<string, string>
 }): React.JSX.Element {
-  const descriptor = permissionDescriptor(permissionOptions, fieldKey)
-  if (!descriptor) {
-    return <p className="runtime-parameter-unavailable"><UiText zh={"当前能力快照未提供“"} />{label}”。</p>
-  }
-  const currentValue = stringValue(draft.permissions.values[fieldKey])
-  const invalid = Boolean(currentValue)
-    && !descriptor.choices.some((choice) => choice.value === currentValue)
   return (
-    <RuntimeParameterSelect
-      label={label}
-      recommendedValue={stringValue(installation.memberRuntimeDefaults?.permissions.values[fieldKey]) || undefined}
-      menuGuidance={uiAttribute("建议使用最高权限，体验更顺畅。")}
-      value={currentValue}
+    <PermissionSelectField
+      permissionOptions={permissionOptions}
+      values={draft.permissions.values}
+      recommendedValues={installation.memberRuntimeDefaults?.permissions.values ?? null}
       disabled={disabled}
-      onChange={(value) => updatePermission(draft, fieldKey, value, onChange)}
-      choices={[
-        ...(!currentValue ? [{ value: '', label:uiAttribute("请选择") }] : []),
-        ...(invalid ? [{ value: currentValue, label: uiAttribute("已失效 · {0}", String(currentValue)), disabled: true }] : []),
-        ...descriptor.choices.map((choice) => ({
-          ...choice,
-          description: choiceDescriptions?.[choice.value] ? uiAttribute(choiceDescriptions[choice.value]) : undefined
-        }))
-      ]}
+      fieldKey={fieldKey}
+      label={label}
+      choiceDescriptions={choiceDescriptions}
+      onChange={(key, value) => updatePermission(draft, key, value, onChange)}
     />
   )
 }
@@ -948,35 +1034,18 @@ function PermissionSwitch({
   enabledValue?: string
   disabledValue?: string
 }): React.JSX.Element {
-  const language = useInterfaceLanguage()
-  const hintId = useId()
-  const descriptor = permissionDescriptor(permissionOptions, fieldKey)
-  const checked = draft.permissions.values[fieldKey] === enabledValue
-  const recommendEnabling = descriptor?.choices.some(choice => choice.value === enabledValue) === true
-    && installation.memberRuntimeDefaults?.permissions.values[fieldKey] === enabledValue
   return (
-    <label className="field-label runtime-parameter-switch-field">
-      <span className="permission-switch-label">{label}</span>
-      <span className="runtime-parameter-switch">
-        <span className="runtime-parameter-switch-state" aria-hidden="true">
-          {checked ? uiAttribute("开启") : uiAttribute(language === 'en' ? "已关闭" : "关闭")}
-        </span>
-        <input
-          type="checkbox"
-          aria-label={label}
-          aria-describedby={recommendEnabling ? hintId : undefined}
-          checked={checked}
-          disabled={disabled || !descriptor}
-          onChange={(event) => updatePermission(
-            draft,
-            fieldKey,
-            event.target.checked ? enabledValue : disabledValue,
-            onChange
-          )}
-        />
-      </span>
-      {recommendEnabling && <span id={hintId} className="permission-switch-guidance"><UiText zh={"建议开启，体验更顺畅。"} /></span>}
-    </label>
+    <PermissionSwitchField
+      permissionOptions={permissionOptions}
+      values={draft.permissions.values}
+      recommendedValues={installation.memberRuntimeDefaults?.permissions.values ?? null}
+      disabled={disabled}
+      fieldKey={fieldKey}
+      label={label}
+      enabledValue={enabledValue}
+      disabledValue={disabledValue}
+      onChange={(key, value) => updatePermission(draft, key, value, onChange)}
+    />
   )
 }
 

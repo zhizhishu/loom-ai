@@ -1,3 +1,6 @@
+mod computer;
+mod computer_agent;
+mod native_discovery;
 mod auth;
 mod channels;
 mod nodes;
@@ -52,6 +55,12 @@ pub struct WebConfig {
 
 #[derive(Clone)]
 struct WebState {
+    agents: Arc<computer_agent::AgentGrants>,
+    computer: Arc<computer::Computer>,
+    /// Per-node computer ports. Empty until a paired node advertises the
+    /// transport; the local `computer` above stays the default device.
+    node_computers: Arc<computer::NodeComputers>,
+    native_discovery: Arc<native_discovery::NativeDiscovery>,
     core: CoreService,
     channels: Option<Arc<dyn ChannelHost>>,
     updates: Option<Arc<dyn UpdateHost>>,
@@ -143,7 +152,12 @@ impl WebServer {
         let address = listener.local_addr()?;
         let network = Arc::new(network::Network::new(address, config.public_origin)?);
         let cached_assets = Arc::new(load_asset_cache(&assets).await);
+        let nodes = nodes::Hub::for_core(&core, sessions.clone(), data_dir)?;
         let state = WebState {
+            agents: computer_agent::AgentGrants::with_core(data_dir, address.port(), core.clone()),
+            computer: Arc::new(computer::Computer::from_env()),
+            node_computers: Arc::new(computer::NodeComputers::new()),
+            native_discovery: Arc::new(native_discovery::NativeDiscovery::from_env()),
             core,
             channels,
             updates,
@@ -157,11 +171,7 @@ impl WebServer {
             upload_attempts: Arc::new(uploads::Attempts::default()),
             files: Arc::new(resources::Handles::default()),
             downloads: Arc::new(downloads::Downloads::new()?),
-            nodes: nodes::Hub::start(
-                sessions.clone(),
-                rovai_core::execution_node::NodeStore::open(&data_dir.join("rovai.sqlite"))
-                    .context("node store is unavailable")?,
-            ),
+            nodes,
         };
         sessions.enable();
         let app = routes(state);
@@ -232,6 +242,39 @@ impl Drop for WebServer {
 
 fn routes(state: WebState) -> Router {
     let api = Router::new()
+        .route("/native-discovery", post(native_discovery::catalog))
+        .route("/native-discovery/preview", post(native_discovery::preview))
+        .route("/native-discovery/import-mcp", post(native_discovery::import_mcp))
+        .route("/computer/agents/grant", post(computer_agent::grant))
+        .route("/computer/agents/list", post(computer_agent::list))
+        .route("/computer/agents/revoke", post(computer_agent::revoke))
+        .route("/computer/status", post(computer::status))
+        .route("/computer/preview", post(computer::preview))
+        .route("/computer/view", post(computer::view))
+        .route("/computer/frame", post(computer::frame))
+        .route("/computer/control", post(computer::control))
+        .route("/computer/control/heartbeat", post(computer::heartbeat))
+        .route("/computer/control/release", post(computer::release))
+        .route("/computer/input", post(computer::input))
+        .route("/computer/view/stop", post(computer::stop))
+        // Per-node ports. Same bodies and the same admission code as the local
+        // routes above; only the device behind them is remote. A node id is
+        // resolved against the authenticated node registry, never a URL.
+        .route("/computer/nodes/{node_id}", post(computer::node_status))
+        .route("/computer/nodes/{node_id}/preview", post(computer::node_preview))
+        .route("/computer/nodes/{node_id}/view", post(computer::node_view))
+        .route("/computer/nodes/{node_id}/frame", post(computer::node_frame))
+        .route("/computer/nodes/{node_id}/control", post(computer::node_control))
+        .route(
+            "/computer/nodes/{node_id}/control/heartbeat",
+            post(computer::node_heartbeat),
+        )
+        .route(
+            "/computer/nodes/{node_id}/control/release",
+            post(computer::node_release),
+        )
+        .route("/computer/nodes/{node_id}/input", post(computer::node_input))
+        .route("/computer/nodes/{node_id}/view/stop", post(computer::node_stop))
         .route("/capabilities", get(capabilities))
         .route("/channels", post(channels::request))
         .route("/updates", post(updates::request))
@@ -265,6 +308,7 @@ fn routes(state: WebState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .nest("/api/v1", api)
+        .route("/api/v1/computer-agent/rpc", post(computer_agent::rpc))
         .route("/api/v1/nodes/connect", get(nodes::connect))
         .route("/api/v1/nodes/shim", post(nodes::shim))
         .route("/api/v1/downloads/{token}", get(downloads::file))

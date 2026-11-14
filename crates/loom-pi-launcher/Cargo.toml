@@ -1,0 +1,12 @@
+[package]
+name = "loom-pi-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Pure `std`: the launcher is a fixed-path bridge, not a general command runner.
+[dependencies]
+
+[[bin]]
+name = "loom-pi-launcher"
+path = "src/main.rs"

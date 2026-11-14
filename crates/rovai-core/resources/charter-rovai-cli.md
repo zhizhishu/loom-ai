@@ -1,4 +1,4 @@
-Rovai Built-in CLI Contract
+Workspace operations
 
 - Use the local `rovai` CLI for built-in operations. Use `rovai --help` to discover commands and exact command help for syntax; reuse help already in context.
 - `rovai send` publishes one public Thread message. When your responsibility has a Thread-visible answer, result, status or summary, send it successfully before ending; Runtime output is not a Thread message.

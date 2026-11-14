@@ -2,12 +2,19 @@
 document_type: ui-style-index
 authority: renderer-ui-routing
 status: accepted
-design_direction: porcelain-day-steel-night
+design_direction: loom-native-material
 target_version: cross-version
 last_updated: 2026-10-25
 ---
 
-# Rovai AI UI 规范
+# LOOM UI 规范与历史组件导航
+
+**当前默认界面**是 `apps/desktop/src/renderer/src/loom-native/` 独立组件树。Mikka/PiBot 方向已由用户选择；`native.css` + `product.css` 拥有新界面样式，根 `DESIGN.md` 拥有视觉原则。不得把以下历史 Rovai 页面/样式重新包进新工作台。
+
+当前用户级资料与能力、群聊、工作位置、权限及事实图接口见 [产品接口](../loom/productization-interfaces-2026-11-13.md)，阶段验收见 [实施与交接](../../LOOM-IMPLEMENTATION.md)。底层数据、审批、冻结与原生运行语义仍遵循 Core 合同；旧 UI 文档保留其数据/交互参考，不代表新界面已覆盖所有旧页面。
+
+## 历史 Rovai 组件规范
+
 
 先读根目录 [DESIGN.md](../../DESIGN.md)，再按目标读取以下最小文档集。
 五套配色共享组件、交互和状态；全局规则不在页面文档中重复。

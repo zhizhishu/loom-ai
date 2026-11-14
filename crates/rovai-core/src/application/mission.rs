@@ -240,10 +240,16 @@ impl Core {
                 [],
                 |r| r.get(0),
             )?;
+            // Remote Nodes may own ready workspaces for the same Mission.
+            // This owner only prepares A's Git/filesystem; B rows cannot select
+            // the local path or suppress creating the local workspace.
             let existing = mission_workspace::load_workspaces(
                 database.connection(),
                 &mission.info.mission_id,
-            )?;
+            )?
+            .into_iter()
+            .filter(|workspace| workspace.execution_host_id == host)
+            .collect::<Vec<_>>();
             (mission, existing, host)
         };
         let source = Path::new(&mission.project_path);

@@ -22,7 +22,6 @@ use rovai_core::{
     builtin_tool_transport::BUILTIN_TOOL_CONTRACT_VERSION,
     command::canonical_json_digest,
     managed_process::{
-        ManagedChildStderr, ManagedChildStdin, ManagedChildStdout, ManagedProcess,
         ManagedProcessLaunchSpec, ManagedProcessPurpose, ManagedStdinPolicy,
         ManagedWindowsArgvDialect,
     },
@@ -44,11 +43,21 @@ use tokio::{
 
 use crate::{
     builtin_tool_runtime::{BuiltinToolProcessConfig, BuiltinToolProcessConfigFactory},
+    remote_process::{
+        FrozenRemoteTarget, NonSecretEnvironment, RemoteArgument, RemoteBundleMaterialization,
+        RemoteHostScope,
+    },
     runtime_fleet::{
         AgentRuntimeFleetManager, FleetAcquireRequest, FleetReleaseDisposition,
         FleetReleaseOutcome, RuntimeCompatibilityKey, RuntimeProcessHost,
     },
+    runtime_process::{
+        RemoteRuntimeLaunch, RuntimeProcess, RuntimeStderr, RuntimeStdin, RuntimeStdout,
+    },
 };
+
+#[path = "codex_hook_trust.rs"]
+mod hook_trust;
 
 #[derive(Debug)]
 pub enum CodexIncoming {
@@ -133,12 +142,22 @@ impl CodexRuntimeOwner {
     }
 }
 
+/// A remote Host retains only the materialized source whose immutable
+/// compatibility identity was admitted at launch. Per-Run bootstrap text and
+/// tool authority are refreshed before the next native thread/turn request.
+struct CodexRemoteHostIdentity {
+    target: FrozenRemoteTarget,
+    scope: RemoteHostScope,
+    compatibility_digest: String,
+    materialization: RemoteBundleMaterialization,
+}
+
 pub(crate) struct CodexHost {
     initialized: tokio::sync::OnceCell<()>,
     credential_redactor: Option<rovai_core::runtime_custom_api::CredentialRedactor>,
     host_instance_id: String,
-    child: Mutex<ManagedProcess>,
-    stdin: Mutex<ManagedChildStdin>,
+    child: Mutex<RuntimeProcess>,
+    stdin: Mutex<RuntimeStdin>,
     pending: Mutex<HashMap<u64, PendingRpc>>,
     next_id: AtomicU64,
     routes: CodexThreadRoutes,
@@ -147,8 +166,9 @@ pub(crate) struct CodexHost {
     alive: AtomicBool,
     executable_path: PathBuf,
     #[cfg(windows)]
-    windows_job_name: String,
+    windows_job_name: Option<String>,
     builtin_tools: Option<BuiltinToolProcessConfig>,
+    remote: Option<CodexRemoteHostIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +369,91 @@ async fn route_codex_stdout_ingress(
     }
 }
 
+// Native protocol parsing stays unchanged; remote framing cannot retain an
+// unbounded line across otherwise bounded pipe frames.
+const MAX_REMOTE_CODEX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteCodexLineFailure {
+    OverBudget,
+    InvalidUtf8,
+}
+impl std::fmt::Display for RemoteCodexLineFailure {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(match self {
+            Self::OverBudget => "Codex remote protocol line exceeds 8 MiB",
+            Self::InvalidUtf8 => "Codex remote protocol is not UTF-8",
+        })
+    }
+}
+impl std::error::Error for RemoteCodexLineFailure {}
+
+/// Drop the remainder of one oversized diagnostic line without retaining it.
+/// stdout remains strict: it cannot skip a corrupt native protocol message.
+async fn discard_remote_codex_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<bool> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(false);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |index| index + 1);
+        reader.consume(count);
+        if newline.is_some() {
+            return Ok(true);
+        }
+    }
+}
+
+async fn read_codex_protocol_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    remote: bool,
+) -> std::io::Result<Option<String>> {
+    if !remote {
+        return reader.lines().next_line().await;
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if bytes.len().saturating_add(count) > MAX_REMOTE_CODEX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                RemoteCodexLineFailure::OverBudget,
+            ));
+        }
+        let complete = available[count - 1] == b'\n';
+        bytes.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if complete {
+            break;
+        }
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            RemoteCodexLineFailure::InvalidUtf8,
+        )
+    })
+}
+
 struct PendingRpc {
     sender: oneshot::Sender<std::result::Result<Value, CodexRpcFailure>>,
     turn_activation: Option<(String, CodexRuntimeOwner)>,
@@ -434,40 +539,109 @@ impl CodexHost {
             ManagedWindowsArgvDialect::MicrosoftCrt,
             "runtime-host:codex-cli",
         )?;
-        let mut child = ManagedProcess::spawn(spec)
+        let child = RuntimeProcess::spawn(spec)
             .with_context(|| format!("failed to start {} app-server", codex_path.display()))?;
-        let stdin = child
-            .take_stdin()
-            .context("Codex app-server stdin was unavailable")?;
-        let stdout = child
-            .take_stdout()
-            .context("Codex app-server stdout was unavailable")?;
-        let stderr = child
-            .take_stderr()
-            .context("Codex app-server stderr was unavailable")?;
-        let host = Arc::new(Self {
-            initialized: tokio::sync::OnceCell::new(),
-            credential_redactor: Some(
-                environment
+        let redactor = environment
+            .as_ref()
+            .map(|env| env.redactor())
+            .unwrap_or_else(|| {
+                rovai_core::runtime_custom_api::CredentialRedactor::from_values(vec![])
+            })
+            .extend(
+                custom_api
                     .as_ref()
-                    .map(|env| env.redactor())
+                    .and_then(|api| api.redactor().ok())
                     .unwrap_or_else(|| {
                         rovai_core::runtime_custom_api::CredentialRedactor::from_values(vec![])
-                    })
-                    .extend(
-                        custom_api
-                            .as_ref()
-                            .and_then(|api| api.redactor().ok())
-                            .unwrap_or_else(|| {
-                                rovai_core::runtime_custom_api::CredentialRedactor::from_values(
-                                    vec![],
-                                )
-                            }),
-                    ),
-            ),
+                    }),
+            );
+        Self::from_process(
+            child,
+            codex_path.to_path_buf(),
+            incoming,
+            builtin_tools,
+            Some(redactor),
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_remote(
+        remote: RemoteRuntimeLaunch,
+        builtin_tools: BuiltinToolProcessConfig,
+        compatibility_digest: String,
+        incoming: mpsc::UnboundedSender<CodexIncoming>,
+    ) -> Result<Arc<Self>> {
+        anyhow::ensure!(
+            builtin_tools.remote_process_key() == Some(&remote.frozen.key),
+            "remote_codex_builtin_scope"
+        );
+        let arguments = [
+            "-c",
+            "allow_login_shell=false",
+            "-c",
+            "features.memories=false",
+            "-c",
+            "memories.generate_memories=false",
+            "-c",
+            "memories.use_memories=false",
+            "app-server",
+            "--listen",
+            "stdio://",
+        ]
+        .into_iter()
+        .map(|value| RemoteArgument::Literal {
+            value: value.to_string(),
+        })
+        .collect();
+        // B owns native provider credentials and environment. This branch never
+        // resolves A's environment, configures a local Command or probes B paths.
+        let child = remote
+            .spawn(arguments, NonSecretEnvironment::default())
+            .await?;
+        let materialization = child
+            .bundle_materialization()
+            .context("remote_codex_materialization_required")?
+            .clone();
+        let identity = CodexRemoteHostIdentity {
+            target: remote.frozen.target.clone(),
+            scope: remote.frozen.host_scope.clone(),
+            compatibility_digest,
+            materialization,
+        };
+        Self::from_process(
+            child,
+            PathBuf::from(&remote.frozen.target.program),
+            incoming,
+            Some(builtin_tools),
+            None,
+            Some(identity),
+        )
+        .await
+    }
+
+    async fn from_process(
+        mut child: RuntimeProcess,
+        executable_path: PathBuf,
+        incoming: mpsc::UnboundedSender<CodexIncoming>,
+        builtin_tools: Option<BuiltinToolProcessConfig>,
+        credential_redactor: Option<rovai_core::runtime_custom_api::CredentialRedactor>,
+        remote: Option<CodexRemoteHostIdentity>,
+    ) -> Result<Arc<Self>> {
+        let streams = (child.take_stdin(), child.take_stdout(), child.take_stderr());
+        let (Some(stdin), Some(stdout), Some(stderr)) = streams else {
+            let cleanup = child.confirm_remote_cleanup(Duration::from_secs(4));
+            let _ = child.force_terminate_tree();
+            drop(child);
+            let _ = cleanup.await;
+            bail!("Codex app-server streams were unavailable");
+        };
+        let host = Arc::new(Self {
+            initialized: tokio::sync::OnceCell::new(),
+            credential_redactor,
             host_instance_id: uuid::Uuid::new_v4().to_string(),
             #[cfg(windows)]
-            windows_job_name: child.windows_job_name().to_owned(),
+            windows_job_name: child.windows_job_name().map(str::to_owned),
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
@@ -476,12 +650,37 @@ impl CodexHost {
             ingress_fence: Mutex::new(()),
             incoming,
             alive: AtomicBool::new(true),
-            executable_path: codex_path.to_path_buf(),
+            executable_path,
             builtin_tools,
+            remote,
         });
         Self::spawn_stdout_reader(host.clone(), stdout);
         Self::spawn_stderr_reader(host.clone(), stderr);
         Ok(host)
+    }
+
+    fn validate_remote_identity(
+        &self,
+        remote: &RemoteRuntimeLaunch,
+        compatibility_digest: &str,
+    ) -> Result<()> {
+        let identity = self.remote.as_ref().context("remote_codex_host_required")?;
+        anyhow::ensure!(
+            identity.target == remote.frozen.target
+                && identity.scope == remote.frozen.host_scope
+                && identity.compatibility_digest == compatibility_digest,
+            "remote_codex_host_source_mismatch"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    async fn clear_remote_owner(&self) -> Result<()> {
+        let pending = { self.child.lock().await.bind_remote_owner(None, false) };
+        pending.await
     }
 
     async fn initialize(&self) -> Result<()> {
@@ -497,11 +696,11 @@ impl CodexHost {
         Ok(())
     }
 
-    fn spawn_stdout_reader(host: Arc<Self>, stdout: ManagedChildStdout) {
+    fn spawn_stdout_reader(host: Arc<Self>, stdout: RuntimeStdout) {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
             loop {
-                match lines.next_line().await {
+                match read_codex_protocol_line(&mut reader, host.is_remote()).await {
                     Ok(Some(line)) if !line.trim().is_empty() => {
                         let message = match serde_json::from_str::<Value>(&line) {
                             Ok(message) => message,
@@ -604,12 +803,54 @@ impl CodexHost {
         });
     }
 
-    fn spawn_stderr_reader(host: Arc<Self>, stderr: ManagedChildStderr) {
+    fn spawn_stderr_reader(host: Arc<Self>, stderr: RuntimeStderr) {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if !line.trim().is_empty() {
-                    host.broadcast_stderr(line).await;
+            let mut reader = BufReader::new(stderr);
+            loop {
+                match read_codex_protocol_line(&mut reader, host.is_remote()).await {
+                    Ok(Some(line)) => {
+                        if !line.trim().is_empty() {
+                            host.broadcast_stderr(line).await;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) if host.is_remote() => {
+                        let failure = error
+                            .get_ref()
+                            .and_then(|inner| inner.downcast_ref::<RemoteCodexLineFailure>())
+                            .copied();
+                        match failure {
+                            Some(RemoteCodexLineFailure::OverBudget) => {
+                                host.broadcast_stderr(
+                                    "A remote Codex stderr line exceeded 8 MiB and was omitted."
+                                        .into(),
+                                )
+                                .await;
+                                if !discard_remote_codex_line(&mut reader)
+                                    .await
+                                    .unwrap_or(false)
+                                {
+                                    break;
+                                }
+                            }
+                            Some(RemoteCodexLineFailure::InvalidUtf8) => {
+                                host.broadcast_stderr(
+                                    "A remote Codex stderr line was not UTF-8 and was omitted."
+                                        .into(),
+                                )
+                                .await;
+                            }
+                            None => {
+                                host.broadcast_stderr(format!(
+                                    "Remote Codex stderr transport failed: {}",
+                                    error.kind()
+                                ))
+                                .await;
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
         });
@@ -702,8 +943,8 @@ impl CodexHost {
     }
 
     #[cfg(windows)]
-    pub(crate) fn windows_job_name(&self) -> &str {
-        &self.windows_job_name
+    pub(crate) fn windows_job_name(&self) -> Option<&str> {
+        self.windows_job_name.as_deref()
     }
 
     pub(crate) fn builtin_tool_process_config(&self) -> Option<&BuiltinToolProcessConfig> {
@@ -722,6 +963,20 @@ impl CodexHost {
         self.alive.store(false, Ordering::Release);
         let Ok(mut child) = tokio::time::timeout_at(deadline, self.child.lock()).await else {
             return false;
+        };
+        if child.is_remote() {
+            let pending = child.confirm_remote_cleanup(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            );
+            drop(child);
+            return matches!(tokio::time::timeout_at(deadline, pending).await, Ok(Ok(())));
+        }
+        // Keep the local OS future typed as ManagedProcess. Borrowing the
+        // entire RuntimeProcess enum here would require its remote single-owner
+        // IO to be Sync, even though the remote branch already returned.
+        let child = match &mut *child {
+            RuntimeProcess::Local(child) => child,
+            RuntimeProcess::Remote(_) => return false,
         };
         let _ = child.force_terminate_tree();
         if !matches!(
@@ -759,6 +1014,12 @@ impl CodexHost {
     pub(crate) async fn shutdown_and_reap(&self) {
         self.alive.store(false, Ordering::Release);
         let mut child = self.child.lock().await;
+        if child.is_remote() {
+            let pending = child.confirm_remote_cleanup(Duration::from_secs(4));
+            drop(child);
+            let _ = pending.await;
+            return;
+        }
         let _ = child.request_graceful_termination();
         if timeout(Duration::from_secs(3), child.wait()).await.is_err() {
             let _ = child.force_terminate_tree();
@@ -903,7 +1164,180 @@ pub struct CodexAgentThreadOptions<'a> {
     pub external_mcp_servers: &'a BTreeMap<String, McpServerDefinition>,
 }
 
+pub(crate) struct CodexRemoteAgentThreadOptions<'a> {
+    pub existing_thread_id: Option<&'a str>,
+    pub sandbox_mode: &'a str,
+    pub approval_policy: &'a str,
+    pub model: Option<&'a str>,
+    pub external_mcp_servers: &'a BTreeMap<String, McpServerDefinition>,
+}
+
 impl CodexRuntime {
+    pub(crate) async fn bind_remote_owner(
+        &self,
+        remote: &RemoteRuntimeLaunch,
+        compatibility_digest: &str,
+    ) -> Result<()> {
+        self.host
+            .validate_remote_identity(remote, compatibility_digest)?;
+        let CodexRuntimeOwner::AgentRun {
+            agent_run_id,
+            execution_epoch,
+        } = &self.owner;
+        anyhow::ensure!(
+            remote.frozen.initial_owner.agent_run_id == *agent_run_id
+                && i64::try_from(remote.frozen.initial_owner.execution_epoch).ok()
+                    == Some(*execution_epoch)
+                && self
+                    .host
+                    .builtin_tool_process_config()
+                    .and_then(|config| config.remote_process_key())
+                    == Some(&remote.frozen.key),
+            "remote_codex_owner_scope"
+        );
+        let pending = {
+            let child = self.host.child.lock().await;
+            anyhow::ensure!(
+                child.remote_key() == Some(&remote.frozen.key),
+                "remote_codex_process_scope"
+            );
+            child.bind_remote_owner(
+                Some(remote.frozen.initial_owner.clone()),
+                self.host
+                    .builtin_tool_process_config()
+                    .context("remote_codex_builtin_required")?
+                    .tasks_enabled(),
+            )
+        };
+        pending.await
+    }
+
+    pub(crate) fn remote_bundle_materialization(&self) -> Option<&RemoteBundleMaterialization> {
+        self.host
+            .remote
+            .as_ref()
+            .map(|identity| &identity.materialization)
+    }
+
+    pub(crate) async fn start_or_resume_remote_agent_thread(
+        &self,
+        remote: &RemoteRuntimeLaunch,
+        compatibility_digest: &str,
+        options: CodexRemoteAgentThreadOptions<'_>,
+    ) -> Result<String> {
+        self.host
+            .validate_remote_identity(remote, compatibility_digest)?;
+        let CodexRuntimeOwner::AgentRun {
+            agent_run_id,
+            execution_epoch,
+        } = &self.owner;
+        anyhow::ensure!(
+            remote.frozen.initial_owner.agent_run_id == *agent_run_id
+                && i64::try_from(remote.frozen.initial_owner.execution_epoch).ok()
+                    == Some(*execution_epoch)
+                && self
+                    .host
+                    .builtin_tool_process_config()
+                    .and_then(|config| config.remote_process_key())
+                    == Some(&remote.frozen.key),
+            "remote_codex_thread_owner_scope"
+        );
+        {
+            let child = self.host.child.lock().await;
+            let receipt = match &*child {
+                RuntimeProcess::Remote(process) => process.owner_receipt()?,
+                RuntimeProcess::Local(_) => None,
+            }
+            .context("remote_codex_thread_owner_unbound")?;
+            anyhow::ensure!(
+                receipt.owner.as_ref() == Some(&remote.frozen.initial_owner)
+                    && receipt.builtin_tasks_enabled
+                        == self
+                            .host
+                            .builtin_tool_process_config()
+                            .context("remote_codex_builtin_required")?
+                            .tasks_enabled()
+                    && receipt.input_boundary_written,
+                "remote_codex_thread_owner_unbound"
+            );
+        }
+        let bundle = remote
+            .frozen
+            .bundle
+            .as_ref()
+            .context("remote_codex_bundle_required")?;
+        let bootstrap = bundle
+            .files
+            .iter()
+            .find(|file| {
+                file.artifact == loom_protocol::run_bundle::BundleArtifact::BootstrapPrompt
+            })
+            .context("remote_codex_bootstrap_required")?;
+        let bytes = loom_protocol::run_bundle::decode_file(bootstrap)
+            .map_err(|_| anyhow::anyhow!("remote_codex_bootstrap_invalid"))?;
+        let frozen_text = std::str::from_utf8(&bytes).context("remote_codex_bootstrap_invalid")?;
+        // On a warm Host only the identical source identity can reuse its
+        // already-verified files. A new Run's complete frozen instructions are
+        // sent on thread/start or thread/resume; an old receipt is not relabeled
+        // as proof that a different bundle ID was newly materialized.
+        let materialized = self
+            .remote_bundle_materialization()
+            .context("remote_codex_materialization_required")?;
+        let instructions = loom_protocol::run_bundle::relocate_skill_roots(
+            frozen_text,
+            bundle.source_skill_root.as_deref(),
+            &materialized.skill_root,
+            bundle,
+        )
+        .map_err(|_| anyhow::anyhow!("remote_codex_skill_relocation_failed"))?;
+        let cwd = Path::new(&remote.frozen.target.workspace_root);
+        let mut start = CodexThreadStartOptions {
+            developer_instructions: Some(&instructions),
+            sandbox: options.sandbox_mode,
+            approval_policy: options.approval_policy,
+            model: options.model.filter(|model| *model != "default"),
+            config: if options.external_mcp_servers.is_empty() {
+                None
+            } else {
+                // Remote only: the frozen definition's whole-value reference is
+                // rewritten into the native passthrough forms above.
+                Some(codex_remote_mcp_session_config(
+                    options.external_mcp_servers,
+                )?)
+            },
+            runtime_workspace_roots: Some(vec![remote.frozen.target.workspace_root.clone()]),
+            ephemeral: false,
+        };
+        let Some(grant) = remote.frozen.codex_hook_grant.as_ref() else {
+            // The no-hook RPC sequence and serialized native request are unchanged.
+            return self.start_or_resume_thread_with_config(cwd, options.existing_thread_id, start).await;
+        };
+        let result = async {
+            let config = self.rpc("config/read", json!({
+                "cwd": remote.frozen.target.workspace_root, "includeLayers": true,
+            })).await.map_err(|_| anyhow::anyhow!("codex_hook_config_unavailable"))?;
+            let listed = self.rpc("hooks/list", json!({
+                "cwds": [remote.frozen.target.workspace_root],
+            })).await.map_err(|_| anyhow::anyhow!("codex_hook_list_unavailable"))?;
+            let trust = hook_trust::NativeHookTrust::prepare(
+                bundle, grant, &remote.frozen.target.workspace_root,
+                &remote.frozen.target.program, &config, &listed,
+            )?;
+            start.config = Some(trust.merge_thread_config(start.config.take())?);
+            self.start_or_resume_thread_verified(cwd, options.existing_thread_id, start, Some(&trust)).await
+        }.await;
+        if result.is_err() {
+            // A failed native trust/policy proof must not return this Host to the
+            // warm pool. A timeout retains the transport's existing unknown
+            // cleanup evidence; it is never reported as a positive tree receipt.
+            self.host.alive.store(false, Ordering::Release);
+            if !self.host.force_reap_until(tokio::time::Instant::now() + Duration::from_secs(4)).await {
+                return result.context("codex_hook_cleanup_unknown");
+            }
+        }
+        result
+    }
+
     pub(crate) fn redact_output(&self, value: &Value) -> Value {
         self.host
             .credential_redactor
@@ -1063,7 +1497,18 @@ impl CodexRuntime {
         existing_thread_id: Option<&str>,
         options: CodexThreadStartOptions<'_>,
     ) -> Result<String> {
+        self.start_or_resume_thread_verified(cwd, existing_thread_id, options, None).await
+    }
+
+    async fn start_or_resume_thread_verified(
+        &self,
+        cwd: &Path,
+        existing_thread_id: Option<&str>,
+        options: CodexThreadStartOptions<'_>,
+        trust: Option<&hook_trust::NativeHookTrust>,
+    ) -> Result<String> {
         let (method, request) = thread_start_or_resume_request(cwd, existing_thread_id, options)?;
+        let verification_request = trust.map(|_| request.clone());
         let result = self.rpc(method, request).await?;
         let observed_model_id = runtime_model_id_from_thread_response(&result);
         let thread_id = result
@@ -1073,6 +1518,21 @@ impl CodexRuntime {
             .to_string();
         if existing_thread_id.is_some_and(|expected| expected != thread_id) {
             bail!("Codex resumed a different Native Thread than requested");
+        }
+        if let Some(trust) = trust {
+            trust.verify_launch_response(
+                verification_request.as_ref().context("codex_hook_launch_contract_missing")?,
+                &result,
+            )?;
+            let scoped = self.rpc("hooks/list", json!({"threadId": thread_id})).await
+                .map_err(|_| anyhow::anyhow!("codex_hook_thread_list_unavailable"))?;
+            trust.verify_thread_hooks(&scoped)?;
+            let global_config = self.rpc("config/read", json!({
+                "cwd": cwd.to_string_lossy(), "includeLayers": true,
+            })).await.map_err(|_| anyhow::anyhow!("codex_hook_config_unavailable"))?;
+            let global_hooks = self.rpc("hooks/list", json!({"cwds": [cwd.to_string_lossy()]})).await
+                .map_err(|_| anyhow::anyhow!("codex_hook_list_unavailable"))?;
+            trust.verify_global_unchanged(&global_config, &global_hooks)?;
         }
         self.host.bind_thread(&thread_id, &self.owner).await?;
         *self.thread_id.write().await = Some(thread_id.clone());
@@ -1470,13 +1930,21 @@ pub(crate) fn codex_mcp_session_config(
                 args,
                 cwd,
                 env,
-            } => json!({
-                "command": command,
-                "args": args,
-                "cwd": cwd,
-                "env": env,
-                "enabled": true,
-            }),
+            } => {
+                let mut value = json!({
+                    "command": command,
+                    "args": args,
+                    "env": env,
+                    "enabled": true,
+                });
+                // Native Codex treats an explicit null cwd as an invalid path.
+                // Absence inherits the native thread workspace; an explicit cwd
+                // remains the caller's already validated directory.
+                if let Some(cwd) = cwd {
+                    value["cwd"] = json!(cwd);
+                }
+                value
+            },
             McpServerDefinition::StreamableHttp { url, headers } => json!({
                 "url": url,
                 "http_headers": headers,
@@ -1486,6 +1954,101 @@ pub(crate) fn codex_mcp_session_config(
         servers.insert(name.clone(), value);
     }
     Ok(json!({"mcp_servers": servers}))
+}
+
+/// Remote Codex session config. This is the only dialect that carries a
+/// credential by name: a stdio `env` entry whose value is exactly `${KEY}` and
+/// whose key is that same `KEY` becomes a native `env_vars` passthrough, and a
+/// whole-value `${REF}` header becomes an `env_http_headers` entry. Codex resolves
+/// both from the process environment the node prepares, so the wire never
+/// carries a value. An empty value stays the literal empty value it was.
+/// The local `codex_mcp_session_config` stays as it is: it is not a reference
+/// dialect.
+pub(crate) fn codex_remote_mcp_session_config(
+    external_mcp_servers: &BTreeMap<String, McpServerDefinition>,
+) -> Result<Value> {
+    // A reference-free selection keeps the established document byte for byte;
+    // the reference dialect below is only reached when a server carries one.
+    if !crate::remote_run_bundle::selected_mcp_has_references(external_mcp_servers) {
+        return codex_mcp_session_config(external_mcp_servers);
+    }
+    let mut servers = serde_json::Map::new();
+    for (name, definition) in external_mcp_servers {
+        if name.trim().is_empty() || name.contains('\0') {
+            bail!("invalid Codex MCP server name");
+        }
+        let value = match definition {
+            McpServerDefinition::Stdio {
+                command,
+                args,
+                cwd,
+                env,
+            } => {
+                let mut literal = serde_json::Map::new();
+                let mut env_vars = Vec::new();
+                for (key, value) in env {
+                    match reference_variable(value) {
+                        // Native `env_vars` only passes a name through, so the
+                        // key and the referenced name must be the same name.
+                        Some(variable) if variable == key => env_vars.push(json!(key)),
+                        Some(_) => bail!("invalid Codex MCP env reference"),
+                        // No value reaches the wire in this dialect: only the
+                        // empty value keeps its place.
+                        None if value.is_empty() => {
+                            literal.insert(key.clone(), json!(value));
+                        }
+                        None => bail!("invalid Codex MCP env reference"),
+                    }
+                }
+                let mut value = json!({
+                    "command": command,
+                    "args": args,
+                    "enabled": true,
+                });
+                if let Some(cwd) = cwd {
+                    value["cwd"] = json!(cwd);
+                }
+                if !literal.is_empty() {
+                    value["env"] = Value::Object(literal);
+                }
+                if !env_vars.is_empty() {
+                    value["env_vars"] = Value::Array(env_vars);
+                }
+                value
+            }
+            McpServerDefinition::StreamableHttp { url, headers } => {
+                let mut literal = serde_json::Map::new();
+                let mut references = serde_json::Map::new();
+                for (header, value) in headers {
+                    match reference_variable(value) {
+                        Some(variable) => {
+                            references.insert(header.clone(), json!(variable));
+                        }
+                        None if value.is_empty() => {
+                            literal.insert(header.clone(), json!(value));
+                        }
+                        None => bail!("invalid Codex MCP header reference"),
+                    }
+                }
+                let mut value = json!({"url": url, "enabled": true});
+                if !literal.is_empty() {
+                    value["http_headers"] = Value::Object(literal);
+                }
+                if !references.is_empty() {
+                    value["env_http_headers"] = Value::Object(references);
+                }
+                value
+            }
+        };
+        servers.insert(name.clone(), value);
+    }
+    Ok(json!({"mcp_servers": servers}))
+}
+
+/// A whole `${NAME}` value, or nothing. Any other text is not a reference.
+fn reference_variable(value: &str) -> Option<&str> {
+    let name = value.strip_prefix("${")?.strip_suffix('}')?;
+    loom_protocol::run_bundle::valid_mcp_reference_name(name).then_some(name)
 }
 
 fn native_mcp_server_names_from_config_read(
@@ -1557,7 +2120,9 @@ pub struct CodexAgentRunRuntimeRequest<'a> {
     pub cwd: &'a Path,
     pub frozen_runtime: &'a FrozenAgentRuntimeConfig,
     pub runtime_compatibility_digest: &'a str,
-    pub builtin_tool_factory: &'a BuiltinToolProcessConfigFactory,
+    pub builtin_tool_factory: Option<&'a BuiltinToolProcessConfigFactory>,
+    pub(crate) remote_launch: Option<RemoteRuntimeLaunch>,
+    pub remote_builtin_tools: Option<BuiltinToolProcessConfig>,
 }
 
 impl AgentRuntimeAdapter for CodexCliRuntimeAdapter {
@@ -1579,6 +2144,35 @@ impl AgentRuntimeAdapter for CodexCliRuntimeAdapter {
     ) -> Result<AdapterRuntimeProjection> {
         AgentRuntimeAdapterRegistry::default().resolve_runtime(self.kind(), input)
     }
+}
+
+/// The disabled Core installation is a Node-scoped URI, never the executable
+/// path on B. Match its frozen authority to the separately scoped launch target.
+pub(crate) fn remote_runtime_matches_target(
+    frozen_runtime: &FrozenAgentRuntimeConfig,
+    target: &FrozenRemoteTarget,
+) -> bool {
+    let expected_executable = format!("rovai-remote://{}/codex-cli", target.node_id);
+    let expected_auth_scope = format!("remote_node:{}", target.node_id);
+    let expected_session_key = format!(
+        "remote:{}:codex-cli:{}:{}:{}",
+        target.node_id,
+        target.program_identity,
+        target.node_generation,
+        target.configuration_digest
+    );
+    frozen_runtime.adapter_kind == AdapterKind::CodexCli
+        && target.adapter_kind == "codex-cli"
+        && frozen_runtime.environment.is_none()
+        && frozen_runtime.custom_api.is_none()
+        && frozen_runtime.search_environment_generation == 0
+        && frozen_runtime.executable_path == expected_executable
+        && frozen_runtime.auth_scope == expected_auth_scope
+        && u64::try_from(frozen_runtime.installation_generation).ok()
+            == Some(target.node_generation)
+        && frozen_runtime.executable_fingerprint == target.program_identity
+        && frozen_runtime.native_session_compatibility_key.as_deref()
+            == Some(expected_session_key.as_str())
 }
 
 impl CodexCliRuntimeAdapter {
@@ -1608,9 +2202,35 @@ impl CodexCliRuntimeAdapter {
             frozen_runtime,
             runtime_compatibility_digest,
             builtin_tool_factory,
+            remote_launch,
+            remote_builtin_tools,
         } = request;
         if frozen_runtime.adapter_kind != AdapterKind::CodexCli {
             bail!("Codex Runtime received a non-Codex AgentRun");
+        }
+        if let Some(remote) = &remote_launch {
+            remote.frozen.validate()?;
+            anyhow::ensure!(
+                remote_runtime_matches_target(frozen_runtime, &remote.frozen.target)
+                    && builtin_tool_factory.is_none()
+                    && remote.frozen.initial_owner.agent_run_id == agent_run_id
+                    && i64::try_from(remote.frozen.initial_owner.execution_epoch).ok()
+                        == Some(execution_epoch)
+                    && remote.frozen.host_scope.member_id == agent_id
+                    && remote.frozen.target.adapter_kind == "codex-cli"
+                    && remote.frozen.target.workspace_root == cwd.to_string_lossy()
+                    && !runtime_compatibility_digest.trim().is_empty()
+                    && remote_builtin_tools
+                        .as_ref()
+                        .and_then(|config| config.remote_process_key())
+                        == Some(&remote.frozen.key),
+                "remote_codex_launch_scope"
+            );
+        } else {
+            anyhow::ensure!(
+                remote_builtin_tools.is_none() && builtin_tool_factory.is_some(),
+                "local_codex_launch_scope"
+            );
         }
         let _creation = self.runtime_creation.lock().await;
         let existing = self
@@ -1621,6 +2241,12 @@ impl CodexCliRuntimeAdapter {
             .cloned();
         if let Some(runtime) = existing {
             if runtime.agent_run_epoch() == Some(execution_epoch) && runtime.host.is_alive() {
+                match &remote_launch {
+                    Some(remote) => runtime
+                        .host
+                        .validate_remote_identity(remote, runtime_compatibility_digest)?,
+                    None => anyhow::ensure!(!runtime.host.is_remote(), "local_codex_remote_host"),
+                }
                 return Ok(runtime);
             }
             let old_epoch = runtime.agent_run_epoch().unwrap_or(execution_epoch);
@@ -1633,10 +2259,18 @@ impl CodexCliRuntimeAdapter {
         let spawn_executable = PathBuf::from(&frozen_runtime.executable_path);
         let spawn_cwd = cwd.to_path_buf();
         let spawn_incoming = self.incoming.clone();
-        let spawn_builtin_tool_factory = builtin_tool_factory.clone();
-        let mut spawn_custom_api = frozen_runtime.custom_api.clone();
-        let spawn_environment_source = rovai_core::member_environment::launch_source();
-        let spawn_environment = frozen_runtime.environment.clone();
+        let spawn_builtin_tool_factory = builtin_tool_factory.cloned();
+        let spawn_runtime = frozen_runtime.clone();
+        // Capture the task-local source handle before Fleet starts its own
+        // task. Values remain resolved at actual local launch time. A remote
+        // request must not inspect A's environment source at all.
+        let spawn_environment_source = if remote_launch.is_none() {
+            rovai_core::member_environment::launch_source()
+        } else {
+            None
+        };
+        let spawn_remote = remote_launch.clone();
+        let spawn_compatibility_digest = runtime_compatibility_digest.to_string();
         let compatibility = RuntimeCompatibilityKey::member_session(
             camp_id,
             agent_id,
@@ -1658,26 +2292,41 @@ impl CodexCliRuntimeAdapter {
                     compatibility,
                 },
                 move || async move {
-                    let spawn_environment = rovai_core::member_environment::resolve_for_launch(
-                        spawn_environment_source,
-                        spawn_environment,
-                    )
-                    .await?;
-                    if spawn_environment
-                        .as_ref()
-                        .is_some_and(|env| env.has_overlay())
-                    {
-                        spawn_custom_api = None;
-                    }
-                    let host = CodexHost::spawn_uninitialized(
-                        &spawn_executable,
-                        &spawn_cwd,
-                        spawn_incoming,
-                        Some(spawn_builtin_tool_factory.create()?),
-                        spawn_custom_api,
-                        spawn_environment,
-                    )
-                    .await?;
+                    let host = if let Some(remote) = spawn_remote {
+                        CodexHost::spawn_remote(
+                            remote,
+                            remote_builtin_tools.context("remote_codex_builtin_required")?,
+                            spawn_compatibility_digest,
+                            spawn_incoming,
+                        )
+                        .await?
+                    } else {
+                        let spawn_environment = rovai_core::member_environment::resolve_for_launch(
+                            spawn_environment_source,
+                            spawn_runtime.environment.clone(),
+                        )
+                        .await?;
+                        let mut spawn_custom_api = spawn_runtime.custom_api.clone();
+                        if spawn_environment
+                            .as_ref()
+                            .is_some_and(|env| env.has_overlay())
+                        {
+                            spawn_custom_api = None;
+                        }
+                        CodexHost::spawn_uninitialized(
+                            &spawn_executable,
+                            &spawn_cwd,
+                            spawn_incoming,
+                            Some(
+                                spawn_builtin_tool_factory
+                                    .context("local_codex_builtin_factory_required")?
+                                    .create()?,
+                            ),
+                            spawn_custom_api,
+                            spawn_environment,
+                        )
+                        .await?
+                    };
                     Ok(RuntimeProcessHost::Codex(host))
                 },
             )
@@ -1685,7 +2334,22 @@ impl CodexCliRuntimeAdapter {
         let _process_id = &fleet_lease.process_id;
         let _residency = fleet_lease.residency;
         let host = fleet_lease.host.into_codex()?;
-        host.initialize().await?;
+        let initialized = async {
+            match &remote_launch {
+                Some(remote) => {
+                    host.validate_remote_identity(remote, runtime_compatibility_digest)?
+                }
+                None => anyhow::ensure!(!host.is_remote(), "local_codex_remote_host"),
+            }
+            host.initialize().await
+        }
+        .await;
+        if let Err(error) = initialized {
+            self.fleet
+                .release(agent_run_id, execution_epoch, FleetReleaseDisposition::Stop)
+                .await;
+            return Err(error);
+        }
         let runtime = CodexRuntime::from_host(
             CodexRuntimeOwner::AgentRun {
                 agent_run_id: agent_run_id.to_string(),
@@ -1746,7 +2410,7 @@ impl CodexCliRuntimeAdapter {
         &self,
         agent_run_id: &str,
         execution_epoch: i64,
-        disposition: FleetReleaseDisposition,
+        mut disposition: FleetReleaseDisposition,
     ) -> FleetReleaseOutcome {
         let runtime = {
             let mut runtimes = self.agent_run_runtimes.lock().await;
@@ -1761,6 +2425,14 @@ impl CodexCliRuntimeAdapter {
         };
         if let Some(runtime) = runtime {
             runtime.detach().await;
+            // A native terminal and the existing Core lease revocation remain
+            // prerequisites. An unconfirmed Node ownership clear cannot enter
+            // the reusable pool.
+            if matches!(disposition, FleetReleaseDisposition::Reusable)
+                && runtime.host.clear_remote_owner().await.is_err()
+            {
+                disposition = FleetReleaseDisposition::Stop;
+            }
         }
         self.fleet
             .release_with_outcome(agent_run_id, execution_epoch, disposition)
@@ -2594,7 +3266,9 @@ mod tests {
                 cwd: &root,
                 frozen_runtime: &frozen,
                 runtime_compatibility_digest: &legacy_digest,
-                builtin_tool_factory: &builtin_tools,
+                builtin_tool_factory: Some(&builtin_tools),
+                remote_launch: None,
+                remote_builtin_tools: None,
             })
             .await
             .unwrap();
@@ -2611,7 +3285,9 @@ mod tests {
                 cwd: &root,
                 frozen_runtime: &frozen,
                 runtime_compatibility_digest: &first_digest,
-                builtin_tool_factory: &builtin_tools,
+                builtin_tool_factory: Some(&builtin_tools),
+                remote_launch: None,
+                remote_builtin_tools: None,
             })
             .await
             .unwrap();
@@ -2646,7 +3322,9 @@ mod tests {
                 cwd: &root,
                 frozen_runtime: &next,
                 runtime_compatibility_digest: &next_digest,
-                builtin_tool_factory: &warm_factory,
+                builtin_tool_factory: Some(&warm_factory),
+                remote_launch: None,
+                remote_builtin_tools: None,
             })
             .await
             .unwrap();
@@ -2674,7 +3352,9 @@ mod tests {
                 cwd: &root,
                 frozen_runtime: &next,
                 runtime_compatibility_digest: &replacement_digest,
-                builtin_tool_factory: &builtin_tools,
+                builtin_tool_factory: Some(&builtin_tools),
+                remote_launch: None,
+                remote_builtin_tools: None,
             })
             .await
             .unwrap();
@@ -2769,7 +3449,9 @@ for line in sys.stdin:
                         cwd: &root,
                         frozen_runtime: &frozen,
                         runtime_compatibility_digest: "stable",
-                        builtin_tool_factory: &tools,
+                        builtin_tool_factory: Some(&tools),
+                        remote_launch: None,
+                        remote_builtin_tools: None,
                     })
                     .await
                     .unwrap();
@@ -2876,7 +3558,9 @@ for line in sys.stdin:
                     cwd: &root,
                     frozen_runtime: &frozen,
                     runtime_compatibility_digest: "stable",
-                    builtin_tool_factory: &tools,
+                    builtin_tool_factory: Some(&tools),
+                    remote_launch: None,
+                    remote_builtin_tools: None,
                 })
                 .await
                 .unwrap();
@@ -2964,7 +3648,9 @@ for line in sys.stdin:
             cwd: &root,
             frozen_runtime: &frozen,
             runtime_compatibility_digest: "unchanged",
-            builtin_tool_factory: &builtin_tools,
+            builtin_tool_factory: Some(&builtin_tools),
+            remote_launch: None,
+            remote_builtin_tools: None,
         };
         save(&source, 0, "A").await;
         let first = with_launch_source(
@@ -3265,6 +3951,28 @@ for line in sys.stdin:
             config.pointer("/mcp_servers/rovai_docs/url"),
             Some(&json!("https://example.test/mcp"))
         );
+        // Real native Codex accepts an omitted cwd and an explicit directory,
+        // but fails MCP startup for JSON null (Windows os error 123).
+        for cwd in [None, Some("B:/prepared/mcp")] {
+            let config = codex_mcp_session_config(&BTreeMap::from([(
+                "stdio_probe".to_string(),
+                McpServerDefinition::Stdio {
+                    command: "fixture-mcp".into(),
+                    args: vec!["--stdio".into()],
+                    cwd: cwd.map(Into::into),
+                    env: BTreeMap::new(),
+                },
+            )]))
+            .unwrap();
+            let server = &config["mcp_servers"]["stdio_probe"];
+            assert_eq!(server["command"], "fixture-mcp");
+            assert_eq!(server["args"], json!(["--stdio"]));
+            assert_eq!(server["enabled"], true);
+            match cwd {
+                None => assert!(server.get("cwd").is_none()),
+                Some(directory) => assert_eq!(server["cwd"], directory),
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -3353,7 +4061,9 @@ for line in sys.stdin:
                         cwd: &root,
                         frozen_runtime: &frozen,
                         runtime_compatibility_digest: "launch-fixture",
-                        builtin_tool_factory: &tools,
+                        builtin_tool_factory: Some(&tools),
+                        remote_launch: None,
+                        remote_builtin_tools: None,
                     })
                     .await;
                 if matches!(scenario, "init_failure" | "memory_rejected") {
@@ -3617,7 +4327,9 @@ for line in sys.stdin:
                 cwd: &workspace,
                 frozen_runtime: &runtime_config,
                 runtime_compatibility_digest: "test-digest-agent-1",
-                builtin_tool_factory: &first_builtin_tools,
+                builtin_tool_factory: Some(&first_builtin_tools),
+                remote_launch: None,
+                remote_builtin_tools: None,
             })
             .await
             .unwrap();
@@ -3633,7 +4345,9 @@ for line in sys.stdin:
                 cwd: &workspace,
                 frozen_runtime: &runtime_config,
                 runtime_compatibility_digest: "test-digest-agent-2",
-                builtin_tool_factory: &second_builtin_tools,
+                builtin_tool_factory: Some(&second_builtin_tools),
+                remote_launch: None,
+                remote_builtin_tools: None,
             })
             .await
             .unwrap();
@@ -3729,7 +4443,9 @@ for line in sys.stdin:
                 cwd: &workspace,
                 frozen_runtime: &runtime_config,
                 runtime_compatibility_digest: "test-digest-agent-1",
-                builtin_tool_factory: &successor_builtin_tools,
+                builtin_tool_factory: Some(&successor_builtin_tools),
+                remote_launch: None,
+                remote_builtin_tools: None,
             })
             .await
             .unwrap();
@@ -4371,6 +5087,74 @@ for line in sys.stdin:
         assert_eq!(
             normalize_event("item/reasoning/textDelta", &raw),
             ("agent.thought.delta", raw)
+        );
+    }
+}
+
+#[cfg(test)]
+mod remote_protocol_line_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_lines_preserve_fragmented_utf8_and_eof_without_newline() {
+        let text = "{\"text\":\"跨机\"}\r\nlast";
+        let mut reader = tokio::io::BufReader::with_capacity(2, text.as_bytes());
+        assert_eq!(
+            read_codex_protocol_line(&mut reader, true).await.unwrap(),
+            Some("{\"text\":\"跨机\"}".into())
+        );
+        assert_eq!(
+            read_codex_protocol_line(&mut reader, true).await.unwrap(),
+            Some("last".into())
+        );
+        assert_eq!(
+            read_codex_protocol_line(&mut reader, true).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_line_budget_rejects_before_consuming_unbounded_stream() {
+        let bytes = vec![b'x'; MAX_REMOTE_CODEX_LINE_BYTES + 32];
+        let mut reader = tokio::io::BufReader::with_capacity(4096, bytes.as_slice());
+        let error = read_codex_protocol_line(&mut reader, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!reader.buffer().is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_stderr_can_drain_and_preserve_the_next_diagnostic() {
+        let mut bytes = vec![b'x'; MAX_REMOTE_CODEX_LINE_BYTES + 64];
+        bytes.extend_from_slice(b"\nnext diagnostic\n");
+        let mut reader = tokio::io::BufReader::with_capacity(4096, bytes.as_slice());
+        let error = read_codex_protocol_line(&mut reader, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<RemoteCodexLineFailure>()),
+            Some(&RemoteCodexLineFailure::OverBudget)
+        );
+        assert!(discard_remote_codex_line(&mut reader).await.unwrap());
+        assert_eq!(
+            read_codex_protocol_line(&mut reader, true).await.unwrap(),
+            Some("next diagnostic".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_line_rejects_invalid_utf8_instead_of_lossy_json() {
+        let bytes = [0xff, b'\n'];
+        let mut reader = tokio::io::BufReader::new(bytes.as_slice());
+        assert_eq!(
+            read_codex_protocol_line(&mut reader, true)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
         );
     }
 }

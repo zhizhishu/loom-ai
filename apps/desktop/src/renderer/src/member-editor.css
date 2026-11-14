@@ -1333,3 +1333,97 @@
 .mission-member-profile { width: min(376px, calc(100vw - 24px)); padding: 0; max-height: calc(100dvh - 24px); overflow-y: auto; }
 .first-run-camp-intro { grid-template-columns: 50px minmax(0, 1fr); }
 .first-run-camp-intro > .first-run-camp-avatar { --member-avatar-size: 50px; }
+
+/* Live shape library replacing the raster presets as the default entry. */
+.member-avatar .open-bot-avatar {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  overflow: hidden;
+}
+.avatar-picker-bot {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.avatar-picker-bot-preview {
+  justify-self: center;
+  width: 96px;
+  height: 96px;
+  border-radius: 28px;
+  background: var(--surface-sunken, rgba(127, 127, 127, 0.08));
+  padding: 8px;
+}
+.avatar-picker-bot-preview .open-bot-avatar {
+  width: 80px;
+  height: 80px;
+  display: block;
+}
+.avatar-picker-bot-shapes {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+  gap: 6px;
+  max-height: 168px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.avatar-picker-bot-shape-option {
+  /* The shared option class sets a min-width above the 44px track. */
+  min-width: 0;
+  width: 100%;
+  height: 44px;
+  padding: 4px;
+  border-radius: 12px;
+}
+.avatar-picker-bot-shape-option .avatar-picker-bot-shape {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.avatar-picker-bot-shape-option[aria-pressed='true'] {
+  outline: 2px solid var(--conversation-action-ink);
+  outline-offset: 1px;
+}
+.avatar-picker-bot-colors {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+.avatar-picker-bot-swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  padding: 0;
+  background: var(--avatar-picker-swatch, #ccc);
+  cursor: pointer;
+}
+.avatar-picker-bot-swatch[aria-pressed='true'] {
+  border-color: var(--conversation-action-ink);
+  box-shadow: 0 0 0 2px var(--surface) inset;
+}
+/* Uploading is the secondary path once the shape grid exists. */
+.avatar-picker-bot + .avatar-picker-upload-area {
+  padding: 8px 0;
+  gap: 0;
+}
+.avatar-picker-bot + .avatar-picker-upload-area .avatar-picker-upload-glyph {
+  display: none;
+}
+
+/* Motion is an explicit, per-browser choice; default follows the system. */
+.avatar-picker-bot-motion {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  justify-self: center;
+  font-size: 12px;
+  opacity: 0.85;
+  cursor: pointer;
+}
+.avatar-picker-bot-motion input {
+  margin: 0;
+  width: 14px;
+  height: 14px;
+}

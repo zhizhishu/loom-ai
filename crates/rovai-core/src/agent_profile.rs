@@ -866,6 +866,7 @@ pub struct AgentProfileView {
     pub presence: String,
     pub runtime_configuration: Option<MemberRuntimeConfiguration>,
     pub runtime_readiness: RuntimeReadiness,
+    pub execution_availability: crate::member_execution_availability::MemberExecutionAvailability,
     pub member_order: i64,
     pub version: i64,
     pub created_at: String,
@@ -3907,6 +3908,12 @@ impl AgentProfileService {
                     model: binding.model.clone(),
                     permissions: binding.permissions.clone(),
                 });
+        let execution_availability = crate::member_execution_availability::evaluate(
+            database.connection(),
+            &raw.id,
+            runtime_configuration.as_ref(),
+            &runtime_readiness,
+        )?;
         Ok(AgentProfileView {
             agent_id: raw.id,
             display_name: raw.display_name,
@@ -3921,6 +3928,7 @@ impl AgentProfileService {
             presence: raw.presence,
             runtime_configuration,
             runtime_readiness,
+            execution_availability,
             member_order: raw.member_order,
             version: raw.version,
             created_at: raw.created_at,
@@ -4625,6 +4633,18 @@ pub fn resolve_frozen_runtime(
     conversation_id: &str,
     agent_id: &str,
 ) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
+    // A member's explicit Node choice is authoritative for every Run-creation
+    // path. Only the caller that freezes the target and source in this same
+    // transaction may invoke resolve_remote_frozen_runtime; other paths must
+    // report the missing integration instead of silently choosing a local CLI.
+    if crate::remote_execution::authority_table_available(transaction, "member_execution_target")?
+        && crate::remote_execution::load_member_target(transaction, agent_id)?.selection.is_some()
+    {
+        return Ok(Err(runtime_blocker(
+            "remote_run_creation_not_connected",
+            json!({"agentId": agent_id, "conversationId": conversation_id}),
+        )));
+    }
     let profile = transaction
         .query_row(
             r#"
@@ -4770,6 +4790,16 @@ fn resolve_frozen_runtime_binding_with_snapshot(
     native_binding_compatibility_digest: Option<&str>,
 ) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
     let installation_id = binding.installation_id.clone();
+    // A remote placeholder installation exists only to satisfy Core's established
+    // native-session and Run foreign key. It is never a local launch intent, even
+    // if its `enabled` flag was flipped by hand, so the local resolver rejects it
+    // before it can observe a remote URI as an executable path.
+    if remote_installation_present(transaction, &installation_id)? {
+        return Ok(Err(runtime_blocker(
+            "runtime_remote_installation_not_local",
+            json!({ "installationId": installation_id }),
+        )));
+    }
     let installation = transaction
         .query_row(
             r#"
@@ -4949,6 +4979,224 @@ fn resolve_frozen_runtime_binding_with_snapshot(
     }
     frozen.refresh_config_digest()?;
     Ok(Ok(frozen))
+}
+
+/// A remote mapping can only exist once the node catalog tables exist. Pre-migration
+/// fixtures have no such table and therefore no remote installation to reject.
+fn remote_installation_present(connection: &Connection, installation_id: &str) -> Result<bool> {
+    if !crate::remote_execution::authority_table_available(connection, "remote_runtime_installation")? {
+        return Ok(false);
+    }
+    crate::remote_execution::is_remote_installation(connection, installation_id)
+}
+
+/// Pure shipped adapter validation for a remote selection; no installation,
+/// filesystem, runtime probe or inherited environment is needed.
+pub(crate) fn validate_remote_member_configuration(
+    adapter_kind: AdapterKind, model: &ModelSelection, permissions: &AdapterPermissionConfig,
+) -> Result<Option<RuntimeConfigurationBlocker>> {
+    let descriptors = AgentRuntimeAdapterRegistry::default().permission_options(adapter_kind);
+    let binding = ResolvedRuntimeBinding {
+        adapter_kind, installation_id:"remote-selection".into(),
+        model:ModelSelection::RuntimeDefault, permissions:permissions.clone(),
+    };
+    if let Some(issue) = runtime_configuration_issue(
+        "[]", 1, &serde_json::to_string(&descriptors)?, &binding,
+    )? { return Ok(Some(runtime_blocker(issue.code,issue.payload))); }
+    match resolve_model_selection(adapter_kind, &provisional_runtime_models(adapter_kind), model)? {
+        Ok(_) => Ok(None),
+        Err(blocker) => Ok(Some(blocker)),
+    }
+}
+
+/// Build the frozen launch policy for an explicit remote member selection.
+///
+/// The model and permission registries are the same ones the local path uses. The
+/// installation facts come only from Core's own remote catalog rows: no Core
+/// startup snapshot, provider credential, environment plan or file probe is read,
+/// and the Node workspace root is never resolved as a Core path.
+pub(crate) fn resolve_remote_frozen_runtime(
+    transaction: &Connection,
+    target: &crate::remote_execution::FrozenRunTarget,
+) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
+    let installation_id = target.installation_id.clone();
+    let adapter_kind = target.selection.adapter_kind;
+    if !matches!(
+        adapter_kind,
+        AdapterKind::ClaudeCodeCli | AdapterKind::CodexCli
+    ) {
+        return Ok(Err(runtime_blocker(
+            "remote_runtime_adapter_unsupported",
+            json!({ "adapterKind": adapter_kind }),
+        )));
+    }
+    let remote = transaction
+        .query_row(
+            r#"
+            SELECT remote.node_id, remote.adapter_kind, remote.installation_identity,
+                   remote.installation_generation, remote.reported_version,
+                   installation.executable_path, installation.auth_scope
+            FROM remote_runtime_installation AS remote
+            JOIN adapter_installation AS installation
+              ON installation.id = remote.installation_id
+            WHERE remote.installation_id = ?1 AND installation.enabled = 0
+              AND installation.adapter_kind = remote.adapter_kind
+              AND installation.generation = remote.installation_generation
+              AND installation.source = 'custom'
+              AND installation.executable_path =
+                    'rovai-remote://' || remote.node_id || '/' || remote.adapter_kind
+              AND installation.auth_scope = 'remote_node:' || remote.node_id
+            "#,
+            [&installation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        node_id,
+        stored_adapter_kind,
+        installation_identity,
+        installation_generation,
+        reported_version,
+        executable_path,
+        auth_scope,
+    )) = remote
+    else {
+        return Ok(Err(runtime_blocker(
+            "runtime_remote_installation_missing",
+            json!({ "installationId": installation_id }),
+        )));
+    };
+    // The frozen target and the disabled installation row must describe one Node
+    // installation. A drifted identity, generation or Node is never re-selected.
+    if stored_adapter_kind != adapter_kind.as_str()
+        || node_id != target.target.node_id
+        || installation_identity != target.target.program_identity
+        || u64::try_from(installation_generation).ok() != Some(target.target.node_generation)
+    {
+        return Ok(Err(runtime_blocker(
+            "runtime_remote_installation_mismatch",
+            json!({ "installationId": installation_id, "nodeId": node_id }),
+        )));
+    }
+    let registry = AgentRuntimeAdapterRegistry::default();
+    let permission_descriptors = registry.permission_options(adapter_kind);
+    let mut validation_binding = ResolvedRuntimeBinding {
+        adapter_kind,
+        installation_id: installation_id.clone(),
+        model: target.selection.model.clone(),
+        permissions: target.selection.permissions.clone(),
+    };
+    // The installed model catalog is a Node fact, so only the permission and
+    // adapter portions of the binding are validated against today's registry.
+    validation_binding.model = ModelSelection::RuntimeDefault;
+    if let Some(issue) = runtime_configuration_issue(
+        "[]",
+        1,
+        &serde_json::to_string(&permission_descriptors)?,
+        &validation_binding,
+    )? {
+        return Ok(Err(runtime_blocker(issue.code, issue.payload)));
+    }
+    let model = match resolve_model_selection(
+        adapter_kind,
+        &provisional_runtime_models(adapter_kind),
+        &target.selection.model,
+    )? {
+        Ok(model) => model,
+        Err(blocker) => return Ok(Err(blocker)),
+    };
+    let protocol = provisional_runtime_protocol(adapter_kind);
+    let protocols = vec![protocol.to_owned()];
+    // Node identity, not a Core-shaped path or an environment digest: reconnecting
+    // the same Node keeps this key, and a different Node can never reuse the Host.
+    let native_session_compatibility_key = format!(
+        "remote:{}:{}:{}:{}:{}",
+        target.target.node_id,
+        adapter_kind.as_str(),
+        installation_identity,
+        installation_generation,
+        target.target.configuration_digest
+    );
+    let projection = match registry.resolve_runtime(
+        adapter_kind,
+        AdapterRuntimeResolutionInput {
+            installation_id: &installation_id,
+            executable_path: &executable_path,
+            auth_scope: &auth_scope,
+            reported_version: reported_version.as_deref(),
+            executable_fingerprint: &installation_identity,
+            protocols: &protocols,
+            native_session_compatibility_key: Some(native_session_compatibility_key.as_str()),
+            permissions: &target.selection.permissions,
+            permission_descriptors: &permission_descriptors,
+        },
+    ) {
+        Ok(projection) => projection,
+        Err(error) => {
+            return Ok(Err(runtime_blocker(
+                "runtime_adapter_not_implemented",
+                json!({
+                    "adapterKind": adapter_kind,
+                    "detail": error.to_string(),
+                }),
+            )));
+        }
+    };
+    let remote_identity = json!({
+        "nodeId": target.target.node_id,
+        "installationIdentity": target.target.program_identity,
+        "installationGeneration": target.target.node_generation,
+        "configurationDigest": target.target.configuration_digest,
+    });
+    let mut frozen = FrozenAgentRuntimeConfig {
+        environment: None,
+        custom_api: None,
+        camp_fast: None,
+        adapter_kind,
+        installation_id,
+        installation_generation,
+        // Core's search-environment generation belongs to the local Host only.
+        search_environment_generation: 0,
+        executable_path,
+        auth_scope,
+        reported_version,
+        executable_fingerprint: installation_identity,
+        capabilities: Vec::new(),
+        protocol_version: projection.protocol_version,
+        model,
+        permissions: target.selection.permissions.clone(),
+        native_session_compatibility_key: Some(native_session_compatibility_key),
+        binding_compatibility_digest: remote_compatible_digest(
+            projection.binding_compatibility_digest,
+            &remote_identity,
+        )?,
+        host_config_digest: remote_compatible_digest(projection.host_config_digest, &remote_identity)?,
+        config_digest: String::new(),
+    };
+    frozen.refresh_config_digest()?;
+    Ok(Ok(frozen))
+}
+
+/// The adapter projection digests gain the Node/installation/target identity, so a
+/// Host or native-session compatibility key can never span two Node installations.
+fn remote_compatible_digest(native: Option<String>, remote: &Value) -> Result<Option<String>> {
+    Ok(match native {
+        Some(native) => Some(canonical_json_digest(&json!({
+            "native": native,
+            "remote": remote,
+        }))?),
+        None => None,
+    })
 }
 
 fn resolve_model_selection(
@@ -5664,7 +5912,7 @@ fn model_option_validation_rejects_preserved_effort_after_catalog_refresh() {
     }
 }
 
-fn member_runtime_defaults(adapter_kind: AdapterKind) -> MemberRuntimeConfiguration {
+pub(crate) fn member_runtime_defaults(adapter_kind: AdapterKind) -> MemberRuntimeConfiguration {
     MemberRuntimeConfiguration {
         adapter_kind,
         model: ModelSelection::RuntimeDefault,
