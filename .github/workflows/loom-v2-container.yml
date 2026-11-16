@@ -24,6 +24,7 @@ on:
       - docker/**
       - .github/workflows/loom-v2-container.yml
       - scripts/lib/loom-container-contract.test.mjs
+      - scripts/lib/loom-container-healthcheck.test.mjs
 
 permissions:
   contents: read
@@ -99,7 +100,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Verify the container contract before spending build time
-        run: node --test scripts/lib/loom-container-contract.test.mjs
+        run: node --test scripts/lib/loom-container-contract.test.mjs scripts/lib/loom-container-healthcheck.test.mjs
 
       - name: Verify actual Core pre-execution claims and Persona admission
         run: |
@@ -160,7 +161,7 @@ jobs:
 
       - name: Stage the allowlisted Docker context
         # No source checkout, no .git and no credential enters the context. The
-        # four entries below are exactly what docker/Dockerfile copies.
+        # five entries below are exactly what docker/Dockerfile copies.
         run: |
           set -euo pipefail
           ctx="$RUNNER_TEMP/loom-container-context"
@@ -169,11 +170,13 @@ jobs:
           cp -a out/server/linux-x64 "$ctx/package"
           cp docker/Dockerfile "$ctx/Dockerfile"
           cp docker/entrypoint.sh "$ctx/entrypoint.sh"
+          cp docker/healthcheck.sh "$ctx/healthcheck.sh"
           cp scripts/smoke-linux-server.py "$ctx/smoke-linux-server.py"
           cat > "$ctx/.dockerignore" <<'IGNORE'
           *
           !Dockerfile
           !entrypoint.sh
+          !healthcheck.sh
           !smoke-linux-server.py
           !package
           !package/**

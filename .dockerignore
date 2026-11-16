@@ -11,6 +11,7 @@
 !docker/
 !docker/Dockerfile
 !docker/entrypoint.sh
+!docker/healthcheck.sh
 !scripts/
 !scripts/smoke-linux-server.py
 !out/

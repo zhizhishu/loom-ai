@@ -121,10 +121,12 @@ test('the Dockerfile ships an unprivileged Host+Web runtime with no toolchain', 
 
 test('Dockerfile COPY sources match the workflow staging directory exactly', () => {
   const copies = [...dockerfile.matchAll(/^COPY --chown=root:root (\S+) (\S+)$/gm)].map(match => match[1])
-  assert.deepEqual(copies.sort(), ['entrypoint.sh', 'package/', 'smoke-linux-server.py'])
+  assert.deepEqual(copies.sort(), ['entrypoint.sh', 'healthcheck.sh', 'package/', 'smoke-linux-server.py'])
   assert.match(workflow, /cp -a out\/server\/linux-x64 "\$ctx\/package"/)
   assert.match(workflow, /cp docker\/Dockerfile "\$ctx\/Dockerfile"/)
   assert.match(workflow, /cp docker\/entrypoint\.sh "\$ctx\/entrypoint\.sh"/)
+  assert.match(workflow, /cp docker\/healthcheck\.sh "\$ctx\/healthcheck\.sh"/)
+  assert.match(dockerfile, /CMD \["\/usr\/local\/bin\/loom-healthcheck"\]/)
   assert.match(workflow, /cp scripts\/smoke-linux-server\.py "\$ctx\/smoke-linux-server\.py"/)
   assert.match(workflow, /-f "\$ctx\/Dockerfile" "\$ctx"/)
   // No checkout, .git or credential may be staged into the build context.

@@ -15,7 +15,7 @@
 #
 # Build context is the allowlisted staging directory produced by
 # .github/workflows/loom-v2-container.yml. It contains exactly:
-#   Dockerfile, entrypoint.sh, smoke-linux-server.py, package/
+#   Dockerfile, entrypoint.sh, healthcheck.sh, smoke-linux-server.py, package/
 # There is no source checkout, no `.git`, no credential and no whole working
 # tree in the context. `package/` is the native Server package built by
 # `node scripts/build-server.mjs --target-key linux-x64 --debug`, whose
@@ -65,8 +65,10 @@ RUN groupadd --gid 10001 loom \
 # and HOME are writable.
 COPY --chown=root:root package/ /opt/rovai/
 COPY --chown=root:root entrypoint.sh /usr/local/bin/loom-entrypoint
+COPY --chown=root:root healthcheck.sh /usr/local/bin/loom-healthcheck
 
 RUN chmod 0755 /usr/local/bin/loom-entrypoint \
+ && chmod 0755 /usr/local/bin/loom-healthcheck \
  && chmod 0755 /opt/rovai/rovai-server /opt/rovai/rovai-host /opt/rovai/rovai \
  && test -f /opt/rovai/web-ui/index.html \
  && test -f /opt/rovai/skills/cli-operations/SKILL.md \
@@ -87,7 +89,7 @@ EXPOSE 8767
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-  CMD ["curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8767/"]
+  CMD ["/usr/local/bin/loom-healthcheck"]
 
 STOPSIGNAL SIGTERM
 WORKDIR /opt/rovai
