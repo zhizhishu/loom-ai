@@ -6,7 +6,8 @@ export const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 // Used only by the real Host acceptance commands. Each caller owns an isolated
 // profile and process; this helper never attaches to a user's existing browser.
-export async function launchAcceptanceBrowser({ executable, args, env = process.env }) {
+export async function launchAcceptanceBrowser({ executable, args, env = process.env, startupBudgetMs = 15000 }) {
+  assert.ok(Number.isSafeInteger(startupBudgetMs) && startupBudgetMs > 0 && startupBudgetMs <= 60000, 'browser startup budget must be bounded to at most 60 seconds')
   const child = spawn(executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
   // Crashpad may inherit stderr beyond Chrome's lifetime. Wait for our process,
   // then close the log pipes instead of waiting indefinitely for that descendant.
@@ -28,14 +29,15 @@ export async function launchAcceptanceBrowser({ executable, args, env = process.
   }
   try {
     let port
-    for (let i = 0; i < 150; i++) {
+    const startupDeadline = Date.now() + startupBudgetMs
+    while (Date.now() < startupDeadline) {
       port = log.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/)?.[1]
       if (port) break
       if (launchError) throw launchError
       if (child.exitCode !== null || child.signalCode !== null) throw Error(log.slice(-2000))
       await pause(100)
     }
-    assert.ok(port, log.slice(-2000))
+    assert.ok(port, `Acceptance browser did not advertise DevTools within ${startupBudgetMs}ms (exit=${child.exitCode}, signal=${child.signalCode}): ${log.slice(-2000)}`)
     let target
     for (let i = 0; i < 100; i++) {
       target = (await fetch(`http://127.0.0.1:${port}/json`).then(r => r.json())).find(t => t.type === 'page')

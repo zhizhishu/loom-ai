@@ -23,7 +23,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { access, mkdtemp, mkdir, readFile, realpath, rm } from 'node:fs/promises'
+import { access, copyFile, mkdtemp, mkdir, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import electron from 'electron'
@@ -312,6 +312,7 @@ test('official rovai-host + two real guarded Pi writes -> production Web LoomApp
     // The browser: the production React Web LoomApp served by the official Host, driven by real
     // Electron mouse input inside an isolated profile. No QA nonce, no fixture proxy, no IPC bridge.
     browser = await launchAcceptanceBrowser({
+      startupBudgetMs: 60_000,
       executable: electron,
       args: [parityShell, electronProfile],
       env: browserEnvironment
@@ -367,7 +368,18 @@ test('official rovai-host + two real guarded Pi writes -> production Web LoomApp
     await browser.wait(`document.querySelector('.ln-artifact-review-form button[type=submit]').disabled === false`, 20_000)
     await browser.click(`document.querySelector('.ln-artifact-review-form button[type=submit]')`)
     await browser.wait(`document.querySelector('.ln-artifact-review-record')?.dataset.verdict === 'accepted'`, 60_000)
-    const screenshot = await browser.capture(join(fixture, 'web-artifact-accepted.png')).then(() => true, () => false)
+    await browser.wait(`(() => { const mark = document.querySelector('img.ln-brand-mark'); return mark?.complete && mark.naturalWidth === 256 && mark.alt === 'LOOM' })()`, 20_000)
+    assert.match(await browser.evaluate(`document.querySelector('link[rel="icon"]')?.href ?? ''`), /loom-favicon-9bd461c1\.png$/)
+    const screenshotFile = join(fixture, 'web-artifact-accepted.png')
+    const screenshot = await browser.capture(screenshotFile).then(() => true, () => false)
+    if (process.env.LOOM_E3_CAPTURE_DIR) {
+      const captureRoot = resolve(process.env.LOOM_E3_CAPTURE_DIR)
+      const captureRelative = relative(join(repository, '_artifacts'), captureRoot)
+      assert.ok(captureRelative && !isAbsolute(captureRelative) && captureRelative !== '..' && !captureRelative.startsWith(`..${sep}`), 'optional visual evidence must stay in the repository artifact area')
+      assert.ok(screenshot, 'explicit visual acceptance requested a real screenshot')
+      await mkdir(captureRoot, { recursive: true })
+      await copyFile(screenshotFile, join(captureRoot, `official-host-brand-${randomUUID()}.png`))
+    }
 
     // Core read-back: the verdict exists in the same SQLite because of that pointer action.
     const reviews = await host.request('loom.reviews.list', { missionId })

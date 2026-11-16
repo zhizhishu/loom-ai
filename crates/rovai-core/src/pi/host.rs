@@ -3485,10 +3485,10 @@ done
             "the diagnostic never points at a user Pi configuration: {catalog_error}"
         );
 
-        let ready_error = machine_ready_probe(&executable)
-            .await
-            .expect_err("Machine Ready must not accept an empty catalog")
-            .to_string();
+        let ready_error = match machine_ready_probe(&executable).await {
+            Ok(_) => panic!("Machine Ready must not accept an empty catalog"),
+            Err(error) => error.to_string(),
+        };
         assert!(
             ready_error.contains("model_required"),
             "Machine Ready rejects the same observation: {ready_error}"
