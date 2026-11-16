@@ -24,7 +24,7 @@ test('V2 E3 CI pins versions and isolates both native Host and managed Pi', () =
   assert.match(workflow, /pnpm@11\.20\.0/)
   assert.match(workflow, /rustup toolchain install 1\.97\.1/)
   assert.match(workflow, /pnpm install --frozen-lockfile/)
-  assert.match(workflow, /cargo build --locked -p rovai-host -p rovai-core -p loom-pi-launcher --bins --jobs 2/)
+  assert.match(workflow, /cargo build --locked -p rovai-host -p rovai-core -p loom-pi-launcher -p loom-node --bins --jobs 2/)
   assert.match(workflow, /pnpm build:web/)
   assert.equal(sourcePackage.dependencies['@earendil-works/pi-coding-agent'], '0.85.1')
   assert.match(workflow, /npm ci --prefix \$sourceRoot --ignore-scripts --no-audit --no-fund/)
@@ -110,4 +110,14 @@ test('complete preview is assembled after E3 without claiming real-provider or O
   assert.match(launcher, /--data-dir "%LOOM_PREVIEW_DATA%"/)
   assert.match(launcher, /ROVAI_EMBEDDED_PI_ROOT=%~dp0runtime\\pi/)
   assert.doesNotMatch(launcher, /(?:taskkill|setx|schtasks|sc\.exe|--allow-insecure-lan)/i)
+})
+
+// The static public icon must pass the real authenticated Host boundary, not only Vite.
+test('candidate CI validates real Host brand routes and retains the same-source device Node', () => {
+  assert.match(workflow, /name: Test exact public brand routes over real Host HTTP/)
+  assert.match(workflow, /--test-name-pattern="Desktop and Web share one Core" scripts\/lib\/host-web\.test\.mjs/)
+  assert.match(workflow, /Same-source device Node missing/)
+  assert.match(workflow, /target\/debug\/loom-node\.exe/)
+  const assembly = workflow.slice(workflow.indexOf('name: Assemble isolated personal preview only after E3 passes'))
+  assert.match(assembly, /'rovai', 'loom-node'/)
 })

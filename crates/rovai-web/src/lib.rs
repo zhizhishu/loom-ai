@@ -316,6 +316,10 @@ fn routes(state: WebState) -> Router {
         .route("/api/v1/login-ticket", post(redeem_login_ticket))
         .route("/", get(index))
         .route("/preview.html", get(preview_shell))
+        // Exact root public files. Vite copies apps/web/public verbatim to the
+        // Web root; only these names are served, never a directory.
+        .route("/loom-favicon-9bd461c1.png", get(favicon_png))
+        .route("/loom-favicon.svg", get(favicon_svg))
         .route(
             "/preview-assets/{token}/{*path}",
             get(resources::preview_asset),
@@ -783,6 +787,12 @@ async fn preview_shell(State(state): State<WebState>) -> Response {
 }
 async fn asset(State(state): State<WebState>, Path(path): Path<String>) -> Response {
     static_file(&state, &format!("assets/{path}")).await
+}
+async fn favicon_png(State(state): State<WebState>) -> Response {
+    static_file(&state, "loom-favicon-9bd461c1.png").await
+}
+async fn favicon_svg(State(state): State<WebState>) -> Response {
+    static_file(&state, "loom-favicon.svg").await
 }
 
 async fn static_file(state: &WebState, relative: &str) -> Response {

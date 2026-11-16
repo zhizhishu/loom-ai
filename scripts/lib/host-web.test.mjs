@@ -114,6 +114,15 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
     for (const name of ['plain.js', 'unlisted-Abcdef12.js', 'missing-Abcdef12.js']) {
       assert.equal((await fetch(`${origin}/assets/${name}`)).headers.get('cache-control'), 'no-store')
     }
+    // Root-level public files are served only through the exact route allowlist.
+    for (const [name, type] of [['loom-favicon-9bd461c1.png', 'image/png'], ['loom-favicon.svg', 'image/svg+xml']]) {
+      const icon = await fetch(`${origin}/${name}`)
+      assert.equal(icon.status, 200, `${name} must be served from the Web root`)
+      assert.equal(icon.headers.get('content-type'), type)
+      assert.equal(icon.headers.get('cache-control'), 'no-store')
+      assert.deepEqual(Buffer.from(await icon.arrayBuffer()), await readAssetFile(join(ownedUiDirectory, name)), `${name} bytes are the approved file, unmodified`)
+    }
+    assert.equal((await fetch(`${origin}/index.html`)).status, 404, 'only allowlisted root files are served')
     const assetPath = join(ownedUiDirectory, assetUrl.slice(1))
     const originalAsset = await readAssetFile(assetPath)
     await writeFile(assetPath, 'changed under the same URL')

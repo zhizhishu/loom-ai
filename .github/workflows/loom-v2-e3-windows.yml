@@ -12,6 +12,7 @@ on:
       - apps/web/**
       - web.vite.config.ts
       - crates/rovai-host/**
+      - crates/rovai-web/**
       - crates/rovai-core/**
       - crates/loom-pi-launcher/**
       - crates/loom-protocol/**
@@ -97,10 +98,11 @@ jobs:
       - name: Fresh official Host and native Pi launcher
         shell: pwsh
         run: |
-          cargo build --locked -p rovai-host -p rovai-core -p loom-pi-launcher --bins --jobs 2
+          cargo build --locked -p rovai-host -p rovai-core -p loom-pi-launcher -p loom-node --bins --jobs 2
           if ($LASTEXITCODE -ne 0) { throw 'Fresh Host/launcher build failed' }
           if (!(Test-Path target/debug/rovai-host.exe)) { throw 'Fresh Host binary missing' }
           if (!(Test-Path target/debug/loom-pi-launcher.exe)) { throw 'Native Pi launcher missing' }
+          if (!(Test-Path target/debug/loom-node.exe)) { throw 'Same-source device Node missing' }
           if (!(Test-Path target/debug/rovai-core.exe) -or !(Test-Path target/debug/rovai.exe)) { throw 'Same-source Core/helper binaries missing' }
           foreach ($name in @('rovai-host', 'rovai-server', 'rovai-core', 'rovai')) {
             $stream = [System.IO.File]::OpenRead((Resolve-Path "target/debug/$name.exe").Path)
@@ -132,7 +134,7 @@ jobs:
           $files = [ordered]@{}
           $actualCommit = (git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $env:LOOM_SOURCE_COMMIT) { throw 'Candidate checkout does not match the selected source commit' }
-          foreach ($path in @('target/debug/rovai-host.exe', 'target/debug/rovai-server.exe', 'target/debug/rovai-core.exe', 'target/debug/rovai.exe', 'target/debug/loom-pi-launcher.exe', 'out/web/index.html')) {
+          foreach ($path in @('target/debug/rovai-host.exe', 'target/debug/rovai-server.exe', 'target/debug/rovai-core.exe', 'target/debug/rovai.exe', 'target/debug/loom-pi-launcher.exe', 'target/debug/loom-node.exe', 'out/web/index.html')) {
             if (!(Test-Path -LiteralPath $path)) { throw "Missing compiler output: $path" }
             $files[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
           }
@@ -161,9 +163,18 @@ jobs:
             target/debug/rovai-core.exe
             target/debug/rovai.exe
             target/debug/loom-pi-launcher.exe
+            target/debug/loom-node.exe
             out/web/
           if-no-files-found: error
           retention-days: 3
+
+      - name: Test exact public brand routes over real Host HTTP
+        shell: pwsh
+        run: |
+          $env:ROVAI_HOST_BIN = (Resolve-Path 'target/debug/rovai-host.exe').Path
+          $env:ROVAI_WEB_UI = (Resolve-Path 'out/web').Path
+          node --test --test-force-exit --test-timeout=180000 --test-name-pattern="Desktop and Web share one Core" scripts/lib/host-web.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Real Host HTTP brand/auth regression failed' }
 
       - name: Stage exact Pi 0.85.1 into isolated repository runtime directory
         shell: pwsh
@@ -266,7 +277,7 @@ jobs:
           $kit = Join-Path $env:RUNNER_TEMP 'loom-personal-preview'
           if (Test-Path $kit) { throw 'Refusing to replace an existing candidate package' }
           New-Item -ItemType Directory -Path $kit | Out-Null
-          foreach ($name in @('rovai-host', 'rovai-server', 'rovai-core', 'rovai')) {
+          foreach ($name in @('rovai-host', 'rovai-server', 'rovai-core', 'rovai', 'loom-node')) {
             Copy-Item "target/debug/$name.exe" $kit
           }
           Copy-Item out/web (Join-Path $kit 'web-ui') -Recurse
