@@ -89,7 +89,7 @@ jobs:
       - name: Check the V2 workflow fail-closed contract
         shell: pwsh
         run: |
-          node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs scripts/lib/embedded-pi.test.mjs
+          node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs scripts/lib/embedded-pi.test.mjs scripts/lib/windows-native-stack.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'V2 E3 CI contract test failed' }
 
       - name: Fresh official Host and native Pi launcher
@@ -100,6 +100,22 @@ jobs:
           if (!(Test-Path target/debug/rovai-host.exe)) { throw 'Fresh Host binary missing' }
           if (!(Test-Path target/debug/loom-pi-launcher.exe)) { throw 'Native Pi launcher missing' }
           if (!(Test-Path target/debug/rovai-core.exe) -or !(Test-Path target/debug/rovai.exe)) { throw 'Same-source Core/helper binaries missing' }
+          foreach ($name in @('rovai-host', 'rovai-server', 'rovai-core', 'rovai')) {
+            $stream = [System.IO.File]::OpenRead((Resolve-Path "target/debug/$name.exe").Path)
+            $reader = [System.IO.BinaryReader]::new($stream)
+            try {
+              $stream.Position = 0x3c
+              $pe = $reader.ReadUInt32()
+              $stream.Position = $pe
+              if ($reader.ReadUInt32() -ne 0x4550) { throw 'Invalid PE signature' }
+              $stream.Position = $pe + 24
+              if ($reader.ReadUInt16() -ne 0x20b) { throw 'Expected a PE32+ native binary' }
+              $stream.Position = $pe + 24 + 72
+              $reserve = $reader.ReadUInt64()
+              if ($reserve -lt 8388608) { throw "$name has an insufficient native main-stack reserve: $reserve" }
+              Write-Host "$name main-stack reserve: $reserve bytes"
+            } finally { $reader.Dispose(); $stream.Dispose() }
+          }
 
       - name: Fresh production Mikka Web bundle
         shell: pwsh
