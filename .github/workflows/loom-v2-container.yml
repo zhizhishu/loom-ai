@@ -1,0 +1,429 @@
+name: LOOM container candidate
+
+# Linux x64 Host+Web container candidate.
+#
+# Registration is deliberately narrow:
+#   * workflow_dispatch: builds the dispatched commit; publishes only when the
+#     `publish` input is true.
+#   * push: only on the approved candidate branch and only when the container
+#     files change. It never runs for main, pull requests, pull_request_target,
+#     merge queues, schedules or releases.
+# Nothing here creates or promotes a GitHub Release, moves a channel pointer or
+# merges branches. The pushed tag is an immutable, commit-addressed candidate.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push the immutable candidate image to GHCR after every gate passes
+        type: boolean
+        default: false
+  push:
+    branches:
+      - rovai/loom-v2-personal-20261116
+    paths:
+      - docker/**
+      - .github/workflows/loom-v2-container.yml
+      - scripts/lib/loom-container-contract.test.mjs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loom-container-candidate-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  LOOM_ALLOWED_REF: refs/heads/rovai/loom-v2-personal-20261116
+  LOOM_RUST_VERSION: 1.97.1
+  LOOM_NODE_VERSION: 24.14.1
+  LOOM_PNPM_VERSION: 11.20.0
+  # The published host port must equal the container port: rovai-web builds its
+  # allowed origins from the listen port (crates/rovai-web/src/network.rs:102-112)
+  # and answers 403 origin_not_allowed when Host/Origin name another port.
+  LOOM_SMOKE_PORT: '8767'
+
+jobs:
+  candidate:
+    name: Linux x64 Host+Web container candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - name: Refuse any ref other than the approved candidate branch
+        if: github.ref != env.LOOM_ALLOWED_REF
+        env:
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          echo "::error::This workflow only builds $LOOM_ALLOWED_REF; got $GITHUB_REF (event $GITHUB_EVENT_NAME, publish=$PUBLISH_INPUT)."
+          exit 1
+
+      - name: Check out the dispatched commit without retained credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install Rust ${{ env.LOOM_RUST_VERSION }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$LOOM_RUST_VERSION" --profile minimal
+          rustup default "$LOOM_RUST_VERSION"
+          cargo --version
+          readelf --version | head -n 1
+
+      - name: Set up Node ${{ env.LOOM_NODE_VERSION }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.LOOM_NODE_VERSION }}
+
+      - name: Install pnpm ${{ env.LOOM_PNPM_VERSION }}
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.20.0
+          run_install: false
+
+      - name: Restore isolated candidate Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: loom-container-linux-ubuntu2204
+          cache-on-failure: true
+
+      - name: Install locked Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify the container contract before spending build time
+        run: node --test scripts/lib/loom-container-contract.test.mjs
+
+      - name: Verify actual Core pre-execution claims and Persona admission
+        run: |
+          set -euo pipefail
+          for owner in a_claimed_loom_batch_rechecks_every_dispatch_before_runtime_start pi_purge_selection_roundtrips_without_entering_runtime_permissions; do
+            log="$RUNNER_TEMP/$owner.log"
+            cargo test --locked -p rovai-core --features extended-tests --lib "$owner" -- --nocapture > "$log" 2>&1 || { tail -100 "$log"; exit 1; }
+            tail -12 "$log"
+            grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log" || { echo 'Required test owner did not execute exactly once'; exit 1; }
+          done
+
+      - name: Build the native Linux x64 Server candidate package
+        # Same packaging entrypoint as the release workflow, in its explicit
+        # debug profile: the output records profile=debug and is never a release.
+        run: node scripts/build-server.mjs --target-key linux-x64 --debug
+
+      - name: Refuse a dirty or mismatched package manifest
+        run: |
+          set -euo pipefail
+          node -e '
+            const { readFileSync } = require("node:fs");
+            const manifest = JSON.parse(readFileSync("out/server/linux-x64/manifest.json", "utf8"));
+            const expected = process.env.GITHUB_SHA;
+            if (manifest.dirty !== false) throw new Error("package manifest is dirty: refusing to build an image from uncommitted state");
+            if (manifest.commit !== expected) throw new Error(`package commit ${manifest.commit} is not ${expected}`);
+            if (manifest.target !== "linux-x64") throw new Error(`unexpected target ${manifest.target}`);
+            if (manifest.profile !== "debug") throw new Error(`unexpected profile ${manifest.profile}; this job builds the debug candidate only`);
+            if (manifest.qualification !== "development-preview") throw new Error(`unexpected qualification ${manifest.qualification}`);
+            for (const required of ["rovai-server", "rovai-host", "rovai", "web-ui/index.html", "skills/cli-operations/SKILL.md", "linux-abi.json", "LICENSE"]) {
+              if (!(required in manifest.files)) throw new Error(`package is missing ${required}`);
+            }
+            console.log(`manifest ok: ${manifest.commit} ${manifest.target} ${manifest.profile} dirty=${manifest.dirty}`);
+          '
+
+      - name: Run the existing Server entry, lifecycle and install tests
+        env:
+          ROVAI_HOST_BIN: ${{ github.workspace }}/out/server/linux-x64/rovai-host
+          ROVAI_SERVER_BIN: ${{ github.workspace }}/out/server/linux-x64/rovai-server
+          ROVAI_SERVER_RELEASE_DIR: ${{ github.workspace }}/out/server/releases/linux-x64
+          ROVAI_WEB_UI: ${{ github.workspace }}/out/server/linux-x64/web-ui
+        run: |
+          node --test scripts/lib/host-lifecycle.test.mjs scripts/lib/host-web.test.mjs \
+            scripts/lib/host-web-channels.test.mjs scripts/lib/server-entry.test.mjs \
+            scripts/lib/server-install.test.mjs
+
+      - name: Resolve the immutable base image digest
+        run: |
+          set -euo pipefail
+          docker pull ubuntu:22.04
+          base=$(docker inspect --format '{{index .RepoDigests 0}}' ubuntu:22.04)
+          case "$base" in
+            ubuntu@sha256:*) ;;
+            *) echo "::error::Could not resolve an immutable ubuntu:22.04 digest (got: $base)"; exit 1 ;;
+          esac
+          docker pull "$base"
+          echo "LOOM_BASE_IMAGE=$base" >> "$GITHUB_ENV"
+          echo "Resolved base image: $base"
+
+      - name: Stage the allowlisted Docker context
+        # No source checkout, no .git and no credential enters the context. The
+        # four entries below are exactly what docker/Dockerfile copies.
+        run: |
+          set -euo pipefail
+          ctx="$RUNNER_TEMP/loom-container-context"
+          rm -rf "$ctx"
+          mkdir -p "$ctx"
+          cp -a out/server/linux-x64 "$ctx/package"
+          cp docker/Dockerfile "$ctx/Dockerfile"
+          cp docker/entrypoint.sh "$ctx/entrypoint.sh"
+          cp scripts/smoke-linux-server.py "$ctx/smoke-linux-server.py"
+          cat > "$ctx/.dockerignore" <<'IGNORE'
+          *
+          !Dockerfile
+          !entrypoint.sh
+          !smoke-linux-server.py
+          !package
+          !package/**
+          IGNORE
+          for unwanted in .git package/.env package/web-auth.json package/server-token; do
+            if [ -e "$ctx/$unwanted" ]; then echo "::error::staged context contains $unwanted"; exit 1; fi
+          done
+          find "$ctx" -maxdepth 1 -mindepth 1 -printf '%f\n' | sort
+
+      - name: Build the verification stage
+        run: |
+          set -euo pipefail
+          ctx="$RUNNER_TEMP/loom-container-context"
+          docker build --progress=plain --target verify \
+            --build-arg BASE_IMAGE="$LOOM_BASE_IMAGE" \
+            --build-arg SOURCE_COMMIT="$GITHUB_SHA" \
+            --build-arg BUILD_PROFILE=debug \
+            -t "loom-server-candidate-verify:$GITHUB_SHA" \
+            -f "$ctx/Dockerfile" "$ctx"
+
+      - name: Run the repository Gate A smoke as uid 10001 inside the image
+        # scripts/smoke-linux-server.py asserts os.geteuid() != 0, manifest
+        # commit/dirty, WebUI, authentication, bundled Skills, exclusive root,
+        # durable SIGTERM and restart persistence. No Runtime or model is used.
+        run: |
+          set -euo pipefail
+          proof="$RUNNER_TEMP/loom-container-proof"
+          rm -rf "$proof"
+          mkdir -p "$proof/gate-a"
+          chmod 0777 "$proof/gate-a"
+          # --entrypoint replaces the Server entrypoint: the smoke drives its own
+          # isolated Server instances as uid 10001 and never prints a token.
+          docker run --rm --network none --user 10001:10001 --entrypoint python3 \
+            -v "$proof/gate-a:/proof" \
+            "loom-server-candidate-verify:$GITHUB_SHA" \
+            /opt/loom-verify/smoke-linux-server.py /opt/rovai \
+              --expected-source "$GITHUB_SHA" --output /proof/gate-a.json --startup-timeout 120
+
+      - name: Build the runtime candidate image
+        run: |
+          set -euo pipefail
+          ctx="$RUNNER_TEMP/loom-container-context"
+          local_image="loom-server-candidate:sha-$GITHUB_SHA"
+          docker build --progress=plain --target runtime \
+            --build-arg BASE_IMAGE="$LOOM_BASE_IMAGE" \
+            --build-arg SOURCE_COMMIT="$GITHUB_SHA" \
+            --build-arg BUILD_PROFILE=debug \
+            -t "$local_image" \
+            -f "$ctx/Dockerfile" "$ctx"
+          echo "LOOM_LOCAL_IMAGE=$local_image" >> "$GITHUB_ENV"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}-server-candidate"
+          echo "LOOM_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "Candidate tag will be: $image:sha-$GITHUB_SHA"
+
+      - name: Assert the runtime image is unprivileged, toolchain-free and Pi-free
+        run: |
+          set -euo pipefail
+          uid=$(docker run --rm --entrypoint /usr/bin/id "$LOOM_LOCAL_IMAGE" -u)
+          [ "$uid" = 10001 ] || { echo "::error::runtime user is $uid, expected 10001"; exit 1; }
+          docker run --rm --entrypoint /bin/sh "$LOOM_LOCAL_IMAGE" -c '
+            set -eu
+            test -f /opt/rovai/web-ui/index.html
+            test -f /opt/rovai/skills/cli-operations/SKILL.md
+            test ! -e /opt/rovai/pi
+            for tool in node npm pnpm cargo rustc python3; do
+              if command -v "$tool" >/dev/null 2>&1; then echo "unexpected toolchain entry: $tool"; exit 1; fi
+            done
+            echo "runtime image: uid 10001, no Node, no Rust, no Python, no Pi bundle"
+          '
+
+      - name: Container HTTP, unauthenticated-API and durable-stop acceptance
+        run: |
+          set -euo pipefail
+          # Publish 127.0.0.1:$LOOM_SMOKE_PORT:8767 with both ports equal. The
+          # Server allows only its own displayed origins, so a translated host
+          # port would make both checks return 403 instead of 200/401.
+          volume="loom-container-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "$volume" >/dev/null
+          docker run -d --name loom-container-smoke \
+            -p "127.0.0.1:${LOOM_SMOKE_PORT}:8767" \
+            -v "$volume:/data" \
+            "$LOOM_LOCAL_IMAGE" >/dev/null
+          origin="http://127.0.0.1:${LOOM_SMOKE_PORT}"
+          code=''
+          for _ in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$origin/" || true)
+            [ "$code" = 200 ] && break
+            sleep 2
+          done
+          if [ "$code" != 200 ]; then
+            docker logs loom-container-smoke >&2 || true
+            echo "::error::WebUI root did not return 200 within the startup budget (last: $code)"
+            exit 1
+          fi
+          unauthenticated=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$origin/api/v1/request" \
+            -H 'Content-Type: application/json' -H "Origin: $origin" \
+            -d '{"operation":"navigation.snapshot","params":{}}')
+          if [ "$unauthenticated" != 401 ]; then
+            echo "::error::unauthenticated API returned $unauthenticated, expected 401"
+            exit 1
+          fi
+          docker stop -t 90 loom-container-smoke >/dev/null
+          exit_code=$(docker inspect --format '{{.State.ExitCode}}' loom-container-smoke)
+          if [ "$exit_code" != 0 ]; then
+            docker logs loom-container-smoke >&2 || true
+            echo "::error::SIGTERM stop exited $exit_code, expected durable 0"
+            exit 1
+          fi
+          echo "Container accepted: unauthenticated root 200, unauthenticated API 401, SIGTERM exit 0."
+          docker rm -f loom-container-smoke >/dev/null
+          docker volume rm "$volume" >/dev/null
+
+      - name: Decide publish eligibility
+        id: publish
+        env:
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          publish=false
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = "$LOOM_ALLOWED_REF" ]; then publish=true; fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$PUBLISH_INPUT" = true ]; then publish=true; fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Publish decision: $publish (event $GITHUB_EVENT_NAME, ref $GITHUB_REF)"
+
+      - name: Log in to GHCR with the job token
+        if: steps.publish.outputs.publish == 'true'
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Refuse to overwrite an existing immutable tag
+        if: steps.publish.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          tag="sha-$GITHUB_SHA"
+          if existing=$(docker manifest inspect "$LOOM_IMAGE:$tag" 2>&1); then
+            echo "::error::Tag $tag already exists; candidate tags are immutable and are never overwritten."
+            exit 1
+          fi
+          case "$existing" in
+            *manifest\ unknown*|*no\ such\ manifest*|*manifest_unknown*) ;;
+            *)
+              echo "::error::Registry response did not prove tag absence for $tag: $existing"
+              exit 1 ;;
+          esac
+          echo "Tag $tag is absent; it will be created at most once."
+
+      - name: Push the immutable candidate tag
+        if: steps.publish.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          tag="sha-$GITHUB_SHA"
+          docker tag "$LOOM_LOCAL_IMAGE" "$LOOM_IMAGE:$tag"
+          docker push "$LOOM_IMAGE:$tag"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$LOOM_IMAGE:$tag")
+          case "$digest" in
+            "$LOOM_IMAGE@sha256:"*) ;;
+            *) echo "::error::Unexpected pushed digest: $digest"; exit 1 ;;
+          esac
+          echo "LOOM_PUSHED_DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "Pushed $LOOM_IMAGE:$tag as $digest"
+
+      - name: Record the sanitized build proof
+        run: |
+          set -euo pipefail
+          proof="$RUNNER_TEMP/loom-container-proof"
+          mkdir -p "$proof"
+          node -e '
+            const { readFileSync, writeFileSync } = require("node:fs");
+            const path = require("node:path");
+            const proof = process.env.PROOF_DIR;
+            const gate = JSON.parse(readFileSync(path.join(proof, "gate-a", "gate-a.json"), "utf8"));
+            // Only allowlisted, credential-free fields are republished.
+            const sanitized = {
+              schemaVersion: gate.schemaVersion, gate: gate.gate,
+              runtimeQualification: gate.runtimeQualification,
+              sourceCommit: gate.sourceCommit,
+              packageManifestSha256: gate.packageManifestSha256,
+              platform: gate.platform, libc: gate.libc,
+              checks: gate.checks, status: gate.status
+            };
+            writeFileSync(path.join(proof, "gate-a.json"), JSON.stringify(sanitized, null, 2) + "\n");
+            const record = {
+              schemaVersion: 1,
+              channel: "container-candidate",
+              release: false,
+              profile: "debug",
+              sourceCommit: process.env.GITHUB_SHA,
+              ref: process.env.GITHUB_REF,
+              event: process.env.GITHUB_EVENT_NAME,
+              baseImage: process.env.LOOM_BASE_IMAGE,
+              localTag: process.env.LOOM_LOCAL_IMAGE,
+              publishedTag: process.env.LOOM_PUSHED_DIGEST ? `${process.env.LOOM_IMAGE}:sha-${process.env.GITHUB_SHA}` : null,
+              publishedDigest: process.env.LOOM_PUSHED_DIGEST || null,
+              port: "8767",
+              user: "10001:10001",
+              dataRoot: "/data",
+              authentication: "manual owner token only; no default, no env token, no auto session",
+              agentRuntimeBundled: false,
+              piBundled: false,
+              piNote: "Pi runtime is NOT bundled. scripts/build-server.mjs packages no Pi assets; enable only after a separately verified Pi bundle exists.",
+              gateA: sanitized.status,
+              gates: [
+                "container contract test",
+                "manifest commit/dirty/profile refusal",
+                "existing server entry/lifecycle/web/install tests",
+                "native ABI gate inside scripts/build-server.mjs (GLIBC <= 2.35)",
+                "Gate A smoke as uid 10001 inside the verify image",
+                "runtime image uid 10001, no toolchain, no Pi",
+                "container unauthenticated root 200 and API 401",
+                "durable SIGTERM exit 0"
+              ]
+            };
+            writeFileSync(path.join(proof, "container-proof.json"), JSON.stringify(record, null, 2) + "\n");
+            console.log(JSON.stringify(record, null, 2));
+          '
+        env:
+          PROOF_DIR: ${{ runner.temp }}/loom-container-proof
+
+      - name: Summarize the candidate
+        run: |
+          set -euo pipefail
+          {
+            echo "## LOOM container candidate (debug, not a release)"
+            echo
+            echo "- source commit: \`$GITHUB_SHA\`"
+            echo "- base image: \`$LOOM_BASE_IMAGE\`"
+            echo "- image: \`$LOOM_IMAGE:sha-$GITHUB_SHA\`"
+            echo "- digest: \`${LOOM_PUSHED_DIGEST:-not pushed (publish=false)}\`"
+            echo "- runtime user: 10001:10001, data root \`/data\`, port 8767"
+            echo "- Pi runtime: **NOT bundled** (host+web candidate only)"
+            echo "- authentication: manual owner token via \`rovai-server token\`; no default and no env token"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the sanitized build proof
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-container-proof-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/loom-container-proof/container-proof.json
+            ${{ runner.temp }}/loom-container-proof/gate-a.json
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Remove this run's container, volume and local images
+        if: always()
+        run: |
+          docker rm -f loom-container-smoke >/dev/null 2>&1 || true
+          docker volume rm "loom-container-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >/dev/null 2>&1 || true
+          for image in "loom-server-candidate-verify:$GITHUB_SHA" "loom-server-candidate:sha-$GITHUB_SHA"; do
+            docker image rm "$image" >/dev/null 2>&1 || true
+          done

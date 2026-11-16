@@ -1244,6 +1244,24 @@ pub fn task_release(
     })
 }
 
+/// How a claim command treats an open, unexpired lease that the *same* Run already holds on the
+/// Task. Every other Run keeps the one rule the claim path always had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SameRunClaim {
+    /// Any holder keeps the Task and the caller is refused (`LOOM_CLAIM_HELD`). This is the public
+    /// claim path, unchanged for every Run including the one that already holds the lease.
+    Refuse,
+    /// The authenticated `loom.claim` tool asks for its own Task again after Core pre-claimed it for
+    /// this very Run: the held claim *is* the answer. Nothing is renewed, nothing is granted to any
+    /// other Run, and the receipt is the claim this Run already held rather than a replay of this
+    /// command id.
+    ReturnHeld,
+    /// Core's pre-execution admission of one execution epoch: the same Run's earlier lease is
+    /// revoked and the fence advances, because the new epoch is a new holder of the same Task. A
+    /// different Run's unexpired lease is never taken this way.
+    RevokeOwnLease,
+}
+
 /// LOOM claim path: one Task, one Run, one lease. Everything the claim depends on
 /// (Mission, Plan ownership, Task state, dependency release, the previous lease) is
 /// checked and written in one immediate transaction, so a rejected or failed claim leaves
@@ -1251,6 +1269,38 @@ pub fn task_release(
 pub fn claim_acquire(
     database: &mut Database,
     input: LoomClaimAcquireInput,
+) -> Result<LoomClaimAcquireResult> {
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = claim_acquire_in(&transaction, input, SameRunClaim::Refuse)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// The authenticated `loom.claim` tool. Core may already have claimed the Task for this very Run
+/// when it admitted the Run to execution, so the Run's own live claim is returned instead of a
+/// refusal; every other holder, and every expired lease, keeps the general rule.
+pub fn claim_acquire_reusing_own_lease(
+    database: &mut Database,
+    input: LoomClaimAcquireInput,
+) -> Result<LoomClaimAcquireResult> {
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = claim_acquire_in(&transaction, input, SameRunClaim::ReturnHeld)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// The claim write itself, on a caller-owned transaction, so a Run's execution admission and the
+/// claims it cannot start without commit together. The caller owns the write lock and the commit;
+/// this function never commits, so a caller's own transaction stays in charge. The clock is still
+/// read only after that lock is held.
+pub(crate) fn claim_acquire_in(
+    transaction: &rusqlite::Transaction<'_>,
+    input: LoomClaimAcquireInput,
+    same_run_claim: SameRunClaim,
 ) -> Result<LoomClaimAcquireResult> {
     let mission_id = required_field("claim acquire", "missionId", &input.mission_id)?;
     let task_id = required_field("claim acquire", "taskId", &input.task_id)?;
@@ -1269,9 +1319,6 @@ pub fn claim_acquire(
             format!("LOOM claim leaseSeconds must be 1 to {MAX_CLAIM_LEASE_SECONDS}"),
         ));
     }
-    let transaction = database
-        .connection_mut()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
     // The clock is read only after the write lock is held. Reading it before would let a
     // wait across the held claim's expiry judge a live lease as expired, and would stamp a
     // new lease from a stale instant that may already have run out.
@@ -1346,7 +1393,7 @@ pub fn claim_acquire(
             format!("LOOM task {task_id} is {status} and cannot be claimed"),
         ));
     }
-    let blocking = blocking_dependencies(&transaction, &plan_id, &task_id)?;
+    let blocking = blocking_dependencies(transaction, &plan_id, &task_id)?;
     if !blocking.is_empty() {
         return Err(LoomCommandError::rejection(
             LOOM_DEPENDENCY_UNRELEASED,
@@ -1360,7 +1407,7 @@ pub fn claim_acquire(
     // Freeze the same real Run/epoch/Task/Node authority as the claim itself.
     // Reject before releasing a previous lease; a failed binding rolls back all writes.
     let remote_admission = crate::remote_execution::validate_loom_claim(
-        &transaction,
+        transaction,
         &agent_run_id,
         &mission_id,
         &task_id,
@@ -1372,12 +1419,13 @@ pub fn claim_acquire(
             "The current Run, Task and frozen remote execution target do not authorize this claim",
         )
     })?;
-    let open_claim: Option<(String, String)> = transaction
+    let open_claim: Option<(String, String, Option<String>, String)> = transaction
         .query_row(
-            "SELECT claim_id, lease_expires_at FROM loom_claim
+            "SELECT claim_id, agent_run_id, claimant_agent_id, lease_expires_at
+             FROM loom_claim
              WHERE task_id=?1 AND released_at IS NULL",
             [&task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
     // Every claim on the Task, released or not, counts: the fence only ever advances.
@@ -1386,14 +1434,36 @@ pub fn claim_acquire(
         [&task_id],
         |row| row.get::<_, i64>(0),
     )? + 1;
-    if let Some((held_claim_id, held_lease_expires_at)) = open_claim {
+    if let Some((held_claim_id, held_run_id, held_claimant, held_lease_expires_at)) = open_claim {
         if !lease_expired(&held_lease_expires_at, now) {
-            return Err(LoomCommandError::rejection(
-                LOOM_CLAIM_HELD,
-                format!(
-                    "task {task_id} is held by claim {held_claim_id} until {held_lease_expires_at}"
-                ),
-            ));
+            // A live lease belongs to its holder. Only the same Run, asking as the same claimant,
+            // may read it back or revoke it, and only in the shape the caller declared; nothing
+            // here renews a lease, and no other Run is ever handed somebody else's Task.
+            let same_holder = held_run_id == agent_run_id
+                && held_claimant.as_deref() == claimant_agent_id.as_deref();
+            match same_run_claim {
+                SameRunClaim::ReturnHeld if same_holder => {
+                    let held = transaction.query_row(
+                        "SELECT claim_id, plan_id, task_id, agent_run_id, claimant_agent_id,
+                                fence_generation, claimed_at, lease_expires_at, released_at
+                         FROM loom_claim WHERE claim_id=?1",
+                        [&held_claim_id],
+                        StoredClaim::read,
+                    )?;
+                    // Not a replay of this command id: this Run held the Task before the call and
+                    // reads back the lease it took then, unrenewed and unextended.
+                    return Ok(held.into_result(&mission_id, false));
+                }
+                SameRunClaim::RevokeOwnLease if same_holder => {}
+                _ => {
+                    return Err(LoomCommandError::rejection(
+                        LOOM_CLAIM_HELD,
+                        format!(
+                            "task {task_id} is held by claim {held_claim_id} until {held_lease_expires_at}"
+                        ),
+                    ));
+                }
+            }
         }
         transaction.execute(
             "UPDATE loom_claim SET released_at=?1 WHERE claim_id=?2 AND released_at IS NULL",
@@ -1427,7 +1497,6 @@ pub fn claim_acquire(
             },
         )?;
     }
-    transaction.commit()?;
     Ok(LoomClaimAcquireResult {
         claim_id,
         mission_id,

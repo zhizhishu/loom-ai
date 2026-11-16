@@ -265,7 +265,10 @@ pub fn invoke(
         }
         LOOM_CLAIM_TOOL_NAME => {
             let input: LoomClaimToolInput = serde_json::from_value(input)?;
-            let result = loom::claim_acquire(
+            // Core claims the Task for this very Run when it admits the Run to execution, so an
+            // agent that claims again reads back the claim it already holds instead of being told
+            // the Task is held. Any other holder keeps the general refusal.
+            let result = loom::claim_acquire_reusing_own_lease(
                 database,
                 loom::LoomClaimAcquireInput {
                     mission_id,

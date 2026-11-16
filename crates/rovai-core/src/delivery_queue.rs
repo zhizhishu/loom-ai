@@ -2343,6 +2343,281 @@ mod tests {
             .unwrap();
         assert_eq!(kept, ("queued".to_string(), "claimed".to_string()));
         }
+
+        // The same owner proves the other half of admission: a Run whose dispatches are still
+        // authorized starts WITH the claims of its EXECUTE Tasks, written by the very transaction
+        // that admits it to execution, so no Task is ever claimed after the Run already started.
+        // Two assignees make two independent lanes and therefore two real Runs in one Mission.
+        let mut fixture = Fixture::with_members(&["agent_1", "agent_2"]);
+        let worktree = fixture._directory.join("loom-preclaim-worktree");
+        fixture.attach_completed_mission(Some(&worktree));
+        fixture.attach_loom_control(false, "2099-01-01T00:00:00Z");
+        fixture
+            .database
+            .connection()
+            .execute_batch(
+                "INSERT INTO loom_task(task_id,plan_id,title,description,assignee_agent_id,status,
+                                       acceptance_criteria_json,created_at,updated_at,revision)
+                 SELECT 'delivery-queue-task-2',plan_id,'Second task',description,'agent_2',status,
+                        acceptance_criteria_json,created_at,updated_at,revision
+                 FROM loom_task WHERE task_id='delivery-queue-task';",
+            )
+            .unwrap();
+        crate::loom::control::configure(
+            &mut fixture.database,
+            crate::current_user::CURRENT_USER_ID,
+            crate::loom::control::LoomControlPolicyInput {
+                mission_id: "delivery-queue-mission".into(),
+                command_id: "approve-both-preclaim-tasks".into(),
+                expected_revision: 1,
+                enabled: true,
+                task_ids: vec!["delivery-queue-task".into(), "delivery-queue-task-2".into()],
+                reviewers: ["delivery-queue-task", "delivery-queue-task-2"]
+                    .into_iter()
+                    .map(|task_id| crate::loom::control::LoomReviewerAssignment {
+                        task_id: task_id.into(),
+                        reviewer_agent_id: if task_id == "delivery-queue-task" {
+                            "agent_2".into()
+                        } else {
+                            "agent_1".into()
+                        },
+                    })
+                    .collect(),
+                max_dispatches: 8,
+                max_reworks_per_task: 2,
+                expires_at: Some("2099-01-01T00:00:00Z".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            2
+        );
+        let mut runs = fixture.claim_with_prepared_mission_workspace(4);
+        for _ in 0..3 {
+            if runs.len() >= 2 {
+                break;
+            }
+            runs.extend(fixture.claim_with_prepared_mission_workspace(4));
+        }
+        assert_eq!(
+            runs.len(),
+            2,
+            "two assignees must produce two real Runs: {runs:?}"
+        );
+        assert_ne!(runs[0], runs[1]);
+
+        let task_of = |fixture: &Fixture, run: &str| -> String {
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT dispatch.task_id FROM camp_message_delivery delivery
+                     JOIN loom_control_dispatch dispatch ON dispatch.delivery_id=delivery.id
+                     WHERE delivery.claimed_agent_run_id=?1 AND dispatch.kind='EXECUTE'",
+                    [run],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let claims_of = |fixture: &Fixture, run: &str| -> Vec<(String, i64, String)> {
+            fixture
+                .database
+                .connection()
+                .prepare(
+                    "SELECT task_id, fence_generation, command_id FROM loom_claim
+                     WHERE agent_run_id=?1 ORDER BY rowid",
+                )
+                .unwrap()
+                .query_map([run], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let claim_run = |fixture: &mut Fixture, run: &str, command_id: &str| {
+            let version: i64 = fixture
+                .database
+                .connection()
+                .query_row("SELECT version FROM agent_run WHERE id=?1", [run], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            crate::runtime::ExecutionRuntimeService::default()
+                .claim_agent_run(
+                    &mut fixture.database,
+                    &CommandEnvelope {
+                        command_id: command_id.to_string(),
+                        actor: ActorRef::System {
+                            component_id: "agent-run-scheduler".into(),
+                        },
+                        camp_id: Some(fixture.camp_id.clone()),
+                        expected_versions: vec![],
+                        execution_epoch: None,
+                        payload: crate::runtime::ClaimAgentRunCommand {
+                            agent_run_id: run.to_string(),
+                            expected_version: version,
+                            lease_owner: "loom-preclaim-test".into(),
+                            lease_seconds: 60,
+                            workspace: None,
+                            starting_git_observation: None,
+                        },
+                    },
+                )
+                .unwrap()
+        };
+
+        let task_a = task_of(&fixture, &runs[0]);
+        let task_b = task_of(&fixture, &runs[1]);
+        assert_ne!(task_a, task_b);
+
+        let admitted = claim_run(&mut fixture, &runs[0], "preclaim-run-a");
+        assert_eq!(admitted.result.status, crate::command::CommandResultStatus::Accepted);
+        let first = claims_of(&fixture, &runs[0]);
+        assert_eq!(first.len(), 1, "one EXECUTE Task, one claim: {first:?}");
+        assert_eq!(first[0].0, task_a);
+        assert!(first[0].1 >= 1, "a claim always carries a fence: {first:?}");
+        assert_eq!(
+            first[0].2,
+            format!("core-loom-claim:{}:1:{}", runs[0], task_a),
+            "the claim must be Core's pre-execution claim for this exact Run, Task and epoch"
+        );
+        let started: String = fixture
+            .database
+            .connection()
+            .query_row("SELECT status FROM agent_run WHERE id=?1", [&runs[0]], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(started, "running");
+
+        // The authenticated tool can read its preclaimed lease without silently renewing it.
+        // The general Host RPC retains its original conflict semantics, even for this same Run.
+        let (held_id, held_until, held_member): (String, String, String) = fixture.database.connection()
+            .query_row("SELECT claim_id,lease_expires_at,claimant_agent_id FROM loom_claim WHERE agent_run_id=?1 AND released_at IS NULL", [&runs[0]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        let own_input = || crate::loom::LoomClaimAcquireInput {
+            mission_id: "delivery-queue-mission".into(), task_id: task_a.clone(),
+            agent_run_id: runs[0].clone(), claimant_agent_id: Some(held_member.clone()),
+            command_id: "authenticated-held-readback".into(), lease_seconds: Some(3600),
+        };
+        let held = crate::loom::claim_acquire_reusing_own_lease(&mut fixture.database, own_input()).unwrap();
+        assert_eq!(held.claim_id, held_id);
+        assert_eq!(held.lease_expires_at, held_until);
+        assert!(!held.replayed, "readback is not a replay of the new tool command");
+        assert_eq!(claims_of(&fixture, &runs[0]).len(), 1);
+        let refusal = crate::loom::claim_acquire(&mut fixture.database, own_input()).unwrap_err();
+        assert_eq!(refusal.downcast_ref::<crate::loom::LoomCommandError>().unwrap().code(), "LOOM_CLAIM_HELD");
+        let mut wrong_owner = own_input();
+        wrong_owner.agent_run_id = runs[1].clone();
+        wrong_owner.command_id = "foreign-held-readback".into();
+        let refusal = crate::loom::claim_acquire_reusing_own_lease(&mut fixture.database, wrong_owner).unwrap_err();
+        assert_eq!(refusal.downcast_ref::<crate::loom::LoomCommandError>().unwrap().code(), "LOOM_CLAIM_HELD");
+
+        // Another live Run's lease is never taken: the Run that would need it is refused, stays
+        // queued at the same epoch and leaves no partial claim of its own behind.
+        let foreign = crate::loom::claim_acquire(
+            &mut fixture.database,
+            crate::loom::LoomClaimAcquireInput {
+                mission_id: "delivery-queue-mission".into(),
+                task_id: task_b.clone(),
+                agent_run_id: "foreign-live-run".into(),
+                claimant_agent_id: Some("agent_2".into()),
+                command_id: "foreign-live-claim".into(),
+                lease_seconds: Some(600),
+            },
+        )
+        .unwrap();
+        let blocked = claim_run(&mut fixture, &runs[1], "preclaim-run-b-blocked");
+        assert_eq!(
+            blocked.result.status,
+            crate::command::CommandResultStatus::Rejected
+        );
+        assert_eq!(blocked.result.code, "agent_run.loom_claim_unavailable");
+        let (kept_status, kept_epoch, kept_claims): (String, i64, i64) = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT run.status, run.execution_epoch,
+                        (SELECT COUNT(*) FROM loom_claim claim WHERE claim.agent_run_id=run.id)
+                 FROM agent_run run WHERE run.id=?1",
+                [&runs[1]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (kept_status.as_str(), kept_epoch, kept_claims),
+            ("queued", 0, 0),
+            "a refused pre-claim must leave the Run queued, at the same epoch, with no partial claim"
+        );
+
+        // The Task is free again, so the same Run now starts and takes the next fence.
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at='2026-01-01T00:00:00Z' WHERE claim_id=?1",
+                [&foreign.claim_id],
+            )
+            .unwrap();
+        claim_run(&mut fixture, &runs[1], "preclaim-run-b");
+        let second = claims_of(&fixture, &runs[1]);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0, task_b);
+        assert_eq!(
+            second[0].1, 2,
+            "taking the Task after a released claim advances the fence"
+        );
+
+        // A new epoch of the same real Run revokes only its own earlier lease, advances the fence
+        // and never touches the other Run's live claim.
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status='waiting', wait_reason='runtime_recovery',
+                                      runtime_recovery_required=1 WHERE id=?1",
+                [&runs[0]],
+            )
+            .unwrap();
+        claim_run(&mut fixture, &runs[0], "preclaim-run-a-epoch-2");
+        let rotated = claims_of(&fixture, &runs[0]);
+        assert_eq!(rotated.len(), 2);
+        assert_eq!(
+            (rotated[0].1, rotated[1].1),
+            (1, 2),
+            "the recovery epoch advances the fence instead of reusing it"
+        );
+        assert_eq!(
+            rotated[1].2,
+            format!("core-loom-claim:{}:2:{}", runs[0], task_a)
+        );
+        let open_on_task_a: i64 = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM loom_claim WHERE task_id=?1 AND released_at IS NULL",
+                [&task_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open_on_task_a, 1, "exactly one lease is open after the rotation");
+        assert_eq!(
+            claims_of(&fixture, &runs[1]).len(),
+            1,
+            "the recovery of one Run must not touch another Run's claim"
+        );
+
+        // The same epoch's command id is a gateway replay: no second lease and no second fence.
+        let replayed = claim_run(&mut fixture, &runs[0], "preclaim-run-a-epoch-2");
+        assert_eq!(
+            replayed.result.status,
+            crate::command::CommandResultStatus::Accepted
+        );
+        assert_eq!(
+            claims_of(&fixture, &runs[0]).len(),
+            2,
+            "a replayed claim command writes nothing new"
+        );
     }
 
     // Owns the budget boundary: the Dispatch that brings the permanent ledger exactly up to the

@@ -29,6 +29,7 @@ use crate::{
     },
     db::Database,
     member_avatar::validate_member_avatar_update,
+    pi::{PiFileAccessMode, mode_from_permissions},
     runtime_failure::RuntimeFailureView,
 };
 
@@ -491,6 +492,23 @@ fn permissions_with_pi_purge(
             .insert("piPurge".to_string(), serde_json::to_value(preference)?);
     }
     Ok(serde_json::to_string(&document)?)
+}
+
+// A Pi Purge Append Run only starts when Core issues a workspace file grant, and that grant exists
+// only for a guarded `loom_file_access` mode (pi/host.rs `stage_pi_purge`). Reject the selection at
+// configuration time instead of failing the first Run, and never widen or upgrade the member's own
+// permission choice to satisfy the purge. An unreadable policy is not guarded, so it is rejected.
+fn pi_purge_append_without_file_grant(
+    selection: Option<&PiPurgeSelection>,
+    permissions: &AdapterPermissionConfig,
+) -> bool {
+    if !selection.is_some_and(|selection| selection.mode == PiPurgeMode::Append) {
+        return false;
+    }
+    !matches!(
+        mode_from_permissions(&permissions.values),
+        Ok(PiFileAccessMode::WorkspaceReadOnly | PiFileAccessMode::WorkspaceReadWrite)
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3063,6 +3081,15 @@ impl AgentProfileService {
                 {
                     return Ok(CommandHandlerResult::rejected(
                         "pi_purge_configuration_invalid",
+                        json!({"adapterKind": envelope.payload.adapter_kind}),
+                    ));
+                }
+                if pi_purge_append_without_file_grant(
+                    Some(selection),
+                    &envelope.payload.permissions,
+                ) {
+                    return Ok(CommandHandlerResult::rejected(
+                        "pi_purge_requires_file_grant",
                         json!({"adapterKind": envelope.payload.adapter_kind}),
                     ));
                 }
@@ -6400,6 +6427,40 @@ fn pi_purge_selection_roundtrips_without_entering_runtime_permissions() {
     let malformed = old_saved.trim_end_matches('}').to_owned()
         + ",\"piPurge\":{\"mode\":\"unknown\",\"persona\":\"x\"}}";
     assert!(saved_pi_purge(&malformed).is_err());
+
+    // Append only runs with a Core-issued workspace file grant. Both guarded spellings satisfy it,
+    // while native, missing and malformed policies do not; nothing is upgraded to satisfy the purge.
+    let append = PiPurgeSelection {
+        mode: PiPurgeMode::Append,
+        persona: "Use concise responses".to_owned(),
+    };
+    let off = PiPurgeSelection {
+        mode: PiPurgeMode::Off,
+        persona: "Use concise responses".to_owned(),
+    };
+    for (values, expected) in [
+        (json!({ "loom_file_access": "workspace_read_only" }), false),
+        (json!({ "loom_file_access": { "mode": "workspace_read_only" } }), false),
+        (json!({ "loom_file_access": "workspace_read_write" }), false),
+        (json!({ "loom_file_access": { "mode": "workspace_read_write" } }), false),
+        (json!({}), true),
+        (json!({ "loom_file_access": "native" }), true),
+        (json!({ "loom_file_access": { "mode": "native" } }), true),
+        (json!({ "loom_file_access": "workspace" }), true),
+        (json!({ "loom_file_access": { "mode": "workspace_read_write", "tools": ["read"] } }), true),
+    ] {
+        let mut candidate = permissions.clone();
+        candidate.values = values.clone();
+        assert_eq!(
+            pi_purge_append_without_file_grant(Some(&append), &candidate),
+            expected,
+            "{values} must {} require a file grant",
+            if expected { "" } else { "not" }
+        );
+        // Off and an absent selection keep their saved meaning under every policy.
+        assert!(!pi_purge_append_without_file_grant(Some(&off), &candidate));
+        assert!(!pi_purge_append_without_file_grant(None, &candidate));
+    }
 }
 
 #[cfg(all(test, feature = "slow-tests"))]

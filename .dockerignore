@@ -1,0 +1,24 @@
+# The container build must never receive the working tree.
+#
+# The real capability boundary is the staging directory: the workflow copies an
+# allowlisted, manifest-verified Server package plus three named files into
+# $RUNNER_TEMP/loom-container-context and builds only that directory — there is
+# no `.git`, no source checkout and no credential inside it.
+#
+# This file is the second line of defence for a manual `docker build .`: exclude
+# everything first, then re-include only what the Dockerfile can consume.
+*
+!docker/
+!docker/Dockerfile
+!docker/entrypoint.sh
+!scripts/
+!scripts/smoke-linux-server.py
+!out/
+!out/server/
+!out/server/linux-x64/
+!out/server/linux-x64/**
+
+# Never re-included (no negation may be added for these): .git, _artifacts/,
+# root_artifacts/, .oce-client/, node_modules/, target/, dist/, coverage/,
+# resources/bin/, mcp-gateway/, docs/prototypes/, .env and .env.*, *.sqlite*,
+# *.log, Start-LOOM.cmd, TASK.md, LOG.md, PROJECT_*.md, any credential file.

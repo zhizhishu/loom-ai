@@ -266,7 +266,7 @@ describe('assistant Runtime choice and save', () => {
   it('persists Pi Purge as an independent per-assistant preference and refuses invalid input', async () => {
     const defaultsPi: MemberRuntimeConfiguration = {
       adapterKind: 'pi', model: { mode: 'runtime_default' },
-      permissions: { adapterKind: 'pi', schemaVersion: 1, values: { file_access: 'workspace_read_write' } }
+      permissions: { adapterKind: 'pi', schemaVersion: 1, values: { loom_file_access: 'workspace_read_write' } }
     }
     const installedPi = installation({
       adapterKind: 'pi', memberRuntimeDefaults: defaultsPi,
@@ -295,6 +295,23 @@ describe('assistant Runtime choice and save', () => {
       })).rejects.toThrow('Pi Purge')
     }
     expect(request).toHaveBeenCalledTimes(1)
+
+    // Core, not the renderer, decides whether the selected file policy can host Purge.
+    // Surface its precise refusal without changing the user's draft or granting tools.
+    const nativeDraft = {
+      ...choice,
+      permissions: { ...defaultsPi.permissions, values: {} },
+      piPurge: { mode: 'append' as const, persona: 'Keep this draft.' }
+    }
+    const missingGrant = vi.fn(async () => ({
+      ...applied({}), status: 'rejected', code: 'pi_purge_requires_file_grant'
+    }))
+    await expect(saveAssistantRuntime({
+      client: client(missingGrant), agent: profile, choice: nativeDraft
+    })).rejects.toThrow('Core 不会自动开启权限')
+    expect(nativeDraft.permissions.values).toEqual({})
+    expect(nativeDraft.piPurge.persona).toBe('Keep this draft.')
+    expect(missingGrant).toHaveBeenCalledTimes(1)
   })
 
   it('surfaces a Core rejection and refuses an unconfirmed version', async () => {

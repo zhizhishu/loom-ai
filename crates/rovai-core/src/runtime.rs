@@ -2029,6 +2029,14 @@ impl ExecutionRuntimeService {
                 + chrono::Duration::seconds(envelope.payload.lease_seconds))
             .to_rfc3339();
             let next_epoch = run.execution_epoch + 1;
+            // The write lock is already held here, so the CAS below and the LOOM claims it
+            // authorizes are one unit: a Run either starts holding the claims of the
+            // policy-authorized work it is about to execute, or it does not start at all. The
+            // savepoint exists only so an expected claim refusal can be undone while its rejection
+            // receipt is still recorded by the gateway.
+            transaction
+                .execute_batch(LOOM_PRECLAIM_SAVEPOINT_OPEN)
+                .context("failed to open the LOOM pre-claim savepoint")?;
             let updated = transaction.execute(
                 r#"
                 UPDATE agent_run
@@ -2076,10 +2084,38 @@ impl ExecutionRuntimeService {
                 ],
             )?;
             if updated != 1 {
+                transaction
+                    .execute_batch(LOOM_PRECLAIM_SAVEPOINT_RELEASE)
+                    .context("failed to release the LOOM pre-claim savepoint")?;
                 return Ok(rejected(
                     "agent_run.claim_race_lost",
                     "AgentRun changed before its lease was acquired",
                 ));
+            }
+            match preclaim_loom_dispatch_tasks(transaction, &run, next_epoch) {
+                Ok(()) => {
+                    transaction
+                        .execute_batch(LOOM_PRECLAIM_SAVEPOINT_RELEASE)
+                        .context("failed to release the LOOM pre-claim savepoint")?;
+                }
+                Err(error) => {
+                    let refusal = error
+                        .downcast_ref::<crate::loom::LoomCommandError>()
+                        .map(|rejection| (rejection.code(), rejection.message().to_string()));
+                    let Some((code, message)) = refusal else {
+                        // Not a domain refusal. Propagating it rolls the caller's transaction back
+                        // whole, so neither the lease nor a half-written claim can survive, and the
+                        // scheduler retries against the real state instead of a swallowed error.
+                        return Err(error);
+                    };
+                    transaction
+                        .execute_batch(LOOM_PRECLAIM_SAVEPOINT_ROLLBACK)
+                        .context("failed to roll back the LOOM pre-claim savepoint")?;
+                    return Ok(rejected(
+                        "agent_run.loom_claim_unavailable",
+                        &format!("{code}: {message}"),
+                    ));
+                }
             }
             // A reusable Native Session may outlive an AgentRun epoch. Clear the
             // previous Team Tool credential before the new epoch can execute so
@@ -6661,6 +6697,145 @@ pub(crate) fn pump_target_after_run_terminal(
         DeliveryDispatchTrigger::TargetRunEnded,
         true,
     )?;
+    Ok(())
+}
+
+/// Savepoint names for the pre-execution LOOM claim, written as SQL so the rollback and the release
+/// are explicit at the only two places that can undo it.
+const LOOM_PRECLAIM_SAVEPOINT_OPEN: &str = "SAVEPOINT loom_preclaim";
+const LOOM_PRECLAIM_SAVEPOINT_ROLLBACK: &str = "ROLLBACK TO loom_preclaim; RELEASE loom_preclaim";
+const LOOM_PRECLAIM_SAVEPOINT_RELEASE: &str = "RELEASE loom_preclaim";
+/// Bounded lease of a claim Core writes on the Run's behalf; `loom::DEFAULT_CLAIM_LEASE_SECONDS` is
+/// the agent-facing default and is deliberately not reused, because this lease covers a whole epoch.
+const LOOM_PRECLAIM_LEASE_SECONDS: i64 = 1800;
+
+/// Claim every policy-authorized LOOM Task this Run is about to execute, in the same transaction that
+/// admits it to execution.
+///
+/// Only an `EXECUTE` or `REWORK` dispatch carries work that is later submitted under a claim, so only
+/// those Tasks are claimed here. A `REVIEW` or `HANDOFF` dispatch reads another Run's Candidate under
+/// no claim of its own, and an ordinary chat Run has no dispatch row at all, so neither acquires
+/// anything. Every identity is read from the ledger and the Run, never from a payload: the Task's
+/// Mission comes from its Plan, and the claimant is the scheduler's proven recipient, which must be
+/// the agent this Run belongs to. The first epoch takes the claim; a later epoch of the same real Run
+/// revokes only that Run's own earlier lease and advances the fence through
+/// [`crate::loom::SameRunClaim::RevokeOwnLease`], so another Run's live lease is never taken.
+fn preclaim_loom_dispatch_tasks(
+    transaction: &Transaction<'_>,
+    run: &ClaimableRun,
+    execution_epoch: i64,
+) -> Result<()> {
+    if !crate::remote_execution::authority_table_available(transaction, "loom_control_dispatch")? {
+        return Ok(());
+    }
+    let run_agent_id: Option<String> = transaction
+        .query_row(
+            "SELECT conversation.agent_id FROM agent_run
+             JOIN conversation ON conversation.id = agent_run.conversation_id
+             WHERE agent_run.id = ?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(run_agent_id) = run_agent_id else {
+        anyhow::bail!("AgentRun {} has no conversation agent to claim for", run.id);
+    };
+    let mut targets: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT dispatch.plan_id, dispatch.task_id, dispatch.recipient_agent_id,
+                    plan.mission_id, mission.camp_id, task.assignee_agent_id, task.task_id
+             FROM camp_message_delivery AS delivery
+             JOIN loom_control_dispatch AS dispatch ON dispatch.delivery_id = delivery.id
+             LEFT JOIN loom_plan AS plan ON plan.plan_id = dispatch.plan_id
+             LEFT JOIN mission ON mission.id = plan.mission_id
+             LEFT JOIN loom_task AS task
+                    ON task.plan_id = dispatch.plan_id AND task.task_id = dispatch.task_id
+             WHERE delivery.claimed_agent_run_id = ?1
+               AND dispatch.kind IN ('EXECUTE','REWORK')
+             ORDER BY delivery.queue_sequence, dispatch.dispatch_id",
+        )?;
+        let rows = statement.query_map([&run.id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?;
+        for row in rows {
+            targets.push(row?);
+        }
+    }
+    for (plan_id, task_id, recipient_agent_id, mission_id, mission_camp_id, assignee, task_row_id) in
+        targets
+    {
+        // A dispatch whose Plan, Mission or Task cannot be resolved is a broken authority row, not
+        // an empty lane: it stops this Run instead of being filtered away as "no work to claim".
+        let (Some(mission_id), Some(mission_camp_id), Some(assignee), Some(task_row_id)) =
+            (mission_id, mission_camp_id, assignee, task_row_id)
+        else {
+            anyhow::bail!(
+                "LOOM dispatch task {task_id} has no readable Plan, Mission or Task to claim"
+            );
+        };
+        anyhow::ensure!(
+            task_row_id == task_id,
+            "LOOM dispatch task {task_id} resolved to another Task"
+        );
+        let plan_of_mission: Option<String> = transaction
+            .query_row(
+                "SELECT plan_id FROM loom_plan WHERE plan_id=?1 AND mission_id=?2",
+                params![&plan_id, &mission_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            plan_of_mission.as_deref() == Some(plan_id.as_str()),
+            "LOOM dispatch task {task_id} does not belong to Mission {mission_id}"
+        );
+        // The scheduler already re-proved these before the Run was claimed; the Run's own Camp and
+        // agent are checked again here because the claim is written by this transaction alone.
+        anyhow::ensure!(
+            mission_camp_id == run.camp_id,
+            "LOOM dispatch task {task_id} belongs to Camp {mission_camp_id}, not to this Run's Camp"
+        );
+        anyhow::ensure!(
+            recipient_agent_id == run_agent_id,
+            "LOOM dispatch task {task_id} was addressed to {recipient_agent_id}, not to this Run's agent"
+        );
+        anyhow::ensure!(
+            assignee == run_agent_id,
+            "LOOM task {task_id} is assigned to {assignee}, not to this Run's agent"
+        );
+        let command_id = format!(
+            "core-loom-claim:{}:{}:{}",
+            run.id, execution_epoch, task_id
+        );
+        crate::loom::claim_acquire_in(
+            transaction,
+            crate::loom::LoomClaimAcquireInput {
+                mission_id,
+                task_id,
+                agent_run_id: run.id.clone(),
+                claimant_agent_id: Some(recipient_agent_id),
+                command_id,
+                lease_seconds: Some(LOOM_PRECLAIM_LEASE_SECONDS),
+            },
+            crate::loom::SameRunClaim::RevokeOwnLease,
+        )?;
+    }
     Ok(())
 }
 
