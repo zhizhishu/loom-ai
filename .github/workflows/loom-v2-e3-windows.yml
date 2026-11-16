@@ -1,0 +1,210 @@
+# Candidate-only E3. Never run on push or release; no real Provider credentials.
+# Run only the reviewed candidate branch/PR; never publish or deploy from this job.
+name: LOOM V2 Windows isolated E3
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/loom-v2-e3-windows.yml
+      - apps/desktop/src/renderer/src/loom-native/**
+      - apps/desktop/src/renderer/src/**
+      - apps/web/**
+      - web.vite.config.ts
+      - crates/rovai-host/**
+      - crates/rovai-core/**
+      - crates/loom-pi-launcher/**
+      - crates/loom-protocol/**
+      - crates/loom-node/**
+      - scripts/loom-v2-*
+      - scripts/lib/loom-v2-*
+      - scripts/lib/host-*
+      - scripts/fixtures/host-web-parity/**
+      - scripts/fixtures/loom-*/**
+      - scripts/package-embedded-pi.mjs
+      - scripts/runtime/pi-source/**
+      - package.json
+      - pnpm-workspace.yaml
+      - pnpm-lock.yaml
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loom-v2-e3-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e3-windows:
+    name: Windows fresh Host + guarded Pi + production Mikka Electron
+    # Manual runs must select a reviewed V2 branch; never treat main as a V2 result.
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+      ROVAI_REQUIRE_ELECTRON_INTEGRATION: '1'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      LOOM_E3_READY_BUDGET_MS: '180000'
+    steps:
+      - name: Checkout without retained credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24 (pinned runtime)
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.14.1
+
+      - name: Install pnpm 11.20.0
+        shell: pwsh
+        run: npm install --global pnpm@11.20.0
+
+      - name: Install Rust 1.97.1 MSVC toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust install failed' }
+          rustup default 1.97.1
+          if ($LASTEXITCODE -ne 0) { throw 'Rust selection failed' }
+
+      - name: Restore isolated candidate Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: loom-v2-e3-windows-msvc
+
+      - name: Install locked project dependencies
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Locked dependency install failed' }
+
+      - name: Check the V2 workflow fail-closed contract
+        shell: pwsh
+        run: |
+          node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'V2 E3 CI contract test failed' }
+
+      - name: Fresh official Host and native Pi launcher
+        shell: pwsh
+        run: |
+          cargo build --locked -p rovai-host -p loom-pi-launcher --bins --jobs 2
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh Host/launcher build failed' }
+          if (!(Test-Path target/debug/rovai-host.exe)) { throw 'Fresh Host binary missing' }
+          if (!(Test-Path target/debug/loom-pi-launcher.exe)) { throw 'Native Pi launcher missing' }
+
+      - name: Fresh production Mikka Web bundle
+        shell: pwsh
+        run: |
+          pnpm build:web
+          if ($LASTEXITCODE -ne 0) { throw 'Production Web bundle build failed' }
+          if (!(Test-Path out/web/index.html)) { throw 'Production Web index missing' }
+
+      - name: Stage exact Pi 0.85.1 into isolated repository runtime directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'loom-v2-pi-source'
+          New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+          Copy-Item scripts/runtime/pi-source/package.json, scripts/runtime/pi-source/package-lock.json -Destination $sourceRoot
+          npm ci --prefix $sourceRoot --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Locked Pi 0.85.1 source install failed (no fallback version)' }
+          $sourceLockSha = (Get-FileHash (Join-Path $sourceRoot 'package-lock.json') -Algorithm SHA256).Hash
+          $committedLockSha = (Get-FileHash scripts/runtime/pi-source/package-lock.json -Algorithm SHA256).Hash
+          if ($sourceLockSha -ne $committedLockSha) { throw 'Pi source lock changed during installation' }
+          $source = Join-Path $sourceRoot 'node_modules/@earendil-works/pi-coding-agent'
+          $nodeExecutable = (Get-Command node).Source
+          $launcher = (Resolve-Path 'target/debug/loom-pi-launcher.exe').Path
+          node scripts/package-embedded-pi.mjs --source $source --node $nodeExecutable --launcher-built $launcher --destination resources/runtime/pi
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned native Pi staging failed' }
+          node scripts/package-embedded-pi.mjs --verify --destination resources/runtime/pi
+          if ($LASTEXITCODE -ne 0) { throw 'Pi manifest verification failed' }
+
+      - name: Test real guarded Pi + official Host + production Web Electron (E3 only)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'loom-v2-e3'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $env:ROVAI_HOST_BIN = (Resolve-Path 'target/debug/rovai-host.exe').Path
+          $env:ROVAI_WEB_UI = (Resolve-Path 'out/web').Path
+          $tapFile = Join-Path $evidence 'e3-tap.txt'
+          node --test --test-force-exit --test-reporter=tap --test-timeout=900000 scripts/lib/loom-v2-official-host-electron-review.test.mjs 2>&1 | Tee-Object -FilePath $tapFile
+          $exit = $LASTEXITCODE
+          if ($exit -ne 0) { throw "E3 test failed with exit $exit" }
+          $tap = Get-Content -LiteralPath $tapFile -Raw
+          foreach ($expected in @('(?m)^# tests 1\s*$', '(?m)^# pass 1\s*$', '(?m)^# fail 0\s*$', '(?m)^# skipped 0\s*$')) {
+            if ($tap -notmatch $expected) { throw "Missing acceptance TAP summary: $expected" }
+          }
+          if ($tap -match '(?im)(authorization:\s*bearer\s+\S+|api[_-]?key\s*[:=]\s*\S+)') {
+            throw 'Potential credential-shaped output in TAP; evidence upload refused'
+          }
+          $hostSha = (Get-FileHash $env:ROVAI_HOST_BIN -Algorithm SHA256).Hash.ToLowerInvariant()
+          $piSha = (Get-FileHash 'resources/runtime/pi/pi.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $piManifestPath = 'resources/runtime/pi/pi-bundle.json'
+          $piManifest = Get-Content -LiteralPath $piManifestPath -Raw | ConvertFrom-Json
+          if ($piManifest.piVersion -ne '0.85.1' -or !$piManifest.closureComplete -or $piManifest.launchKind -ne 'native') {
+            throw 'Embedded Pi provenance is not the pinned native 0.85.1 release'
+          }
+          # npm ci enforces the committed dependency versions and registry integrity.
+          # Record the platform-specific closure; do not compare it with a different
+          # machine's unlocked npm install or native optional dependencies.
+          [string[]]$closureRows = @($piManifest.files | Where-Object { $_.path.StartsWith('node_modules/') } | ForEach-Object { "$($_.path)`t$($_.sha256)" })
+          [Array]::Sort($closureRows, [System.StringComparer]::Ordinal)
+          $closureData = [string]::Join("`n", $closureRows) + "`n"
+          $closureSha = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($closureData))).ToLowerInvariant()
+          if ($closureRows.Count -lt 1) { throw 'Pi dependency closure is empty' }
+          $sourceLockSha = (Get-FileHash scripts/runtime/pi-source/package-lock.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          $piManifestSha = (Get-FileHash $piManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $nodeSha = (Get-FileHash 'resources/runtime/pi/node/node.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $webSha = (Get-FileHash 'out/web/index.html' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $testSha = (Get-FileHash 'scripts/lib/loom-v2-official-host-electron-review.test.mjs' -Algorithm SHA256).Hash.ToLowerInvariant()
+          [ordered]@{
+            scope = 'E3-Windows-GitHub-candidate-only'
+            commit = $env:GITHUB_SHA
+            os = $env:RUNNER_OS
+            runner = $env:RUNNER_NAME
+            hostSha256 = $hostSha
+            piExecutableSha256 = $piSha
+            piManifestSha256 = $piManifestSha
+            piManifestTreeSha256 = $piManifest.treeSha256
+            piDependencyClosureSha256 = $closureSha
+            piSourceLockSha256 = $sourceLockSha
+            piDependencyFileCount = $closureRows.Count
+            bundledNodeSha256 = $nodeSha
+            bundledPiVersion = $piManifest.piVersion
+            dependencyTreeSourceLock = 'committed npm lockfile with registry integrity; npm ci --ignore-scripts'
+            webIndexSha256 = $webSha
+            testSourceSha256 = $testSha
+            freshHostBuild = $true
+            hostBuildEvidence = 'workflow cargo build step; standalone test self-report does not verify freshness'
+            freshWebBuild = $true
+            expectedTests = 1
+            pass = 1
+            fail = 0
+            skipped = 0
+            actualElectronPointerInput = $true
+            humanClickedUI = $false
+            mockProvider = $true
+            realExternalProvider = $false
+            E4 = 'NOT_RUN'
+            E5 = 'NOT_RUN'
+            E6 = 'NOT_RUN'
+            E7 = 'NOT_RUN'
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence 'e3-manifest.json') -Encoding utf8
+
+      - name: Upload only validated candidate E3 evidence (no build binaries)
+        # A failed or credential-shaped TAP stays in restricted job logs; never upload it.
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-v2-e3-win-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/loom-v2-e3/e3-tap.txt
+            ${{ runner.temp }}/loom-v2-e3/e3-manifest.json
+          if-no-files-found: error
+          retention-days: 3

@@ -8,6 +8,7 @@ import { Sidebar } from './Sidebar'
 import { ConversationView } from './ConversationView'
 import { Inspector, flattenWork, workStatus } from './Inspector'
 import { ArtifactView } from './ArtifactView'
+import { refreshArtifactSelection } from './artifact-service'
 import { Avatar } from './Avatar'
 import { Icon, IconButton } from './icons'
 import './native.css'
@@ -18,6 +19,7 @@ import { searchWorkspace } from './workspace-search'
 import { WorkspaceSearch } from './WorkspaceSearch'
 import { PanelResizeHandle } from './PanelResizeHandle'
 import { WorkspaceManager } from './WorkspaceManager'
+import { RunStatusDialog } from './RunStatusDialog'
 import { storedPanelWidth, fittedPanelWidths, type PanelSide, type PanelWidths } from './panel-resize'
 
 // Load optional editors only when opened; keep them mounted after first use so
@@ -70,6 +72,8 @@ export function LoomApp({ environment, onLogout }: Props) {
   const [modal, setModal] = useState<'search' | 'settings' | 'history' | null>(null)
   const [newRoom, setNewRoom] = useState(false)
   const [workspaceManagerOpen,setWorkspaceManagerOpen] = useState(false)
+  const [runSurfaceOpen, setRunSurfaceOpen] = useState(false)
+  const runSurfaceOpener = useRef<HTMLElement | null>(null)
   const [roomInitialWorkspace,setRoomInitialWorkspace] = useState<WorkspaceSelection|null>(null)
   const [roomMode, setRoomMode] = useState<'group' | 'work'>('group')
   const beginConversation = () => { setRoomInitialWorkspace(null);setRoomMode('group'); setNewRoom(true) }
@@ -106,6 +110,8 @@ export function LoomApp({ environment, onLogout }: Props) {
   const historyIndex = useRef(-1)
   const [, updateHistory] = useState(0)
   const active = data.conversations.find(item => item.id === data.selectedId) ?? null
+  const selectedRunBundle = data.bundles.find(bundle => bundle.mission.missionId === active?.missionId) ?? null
+  const currentArtifact = useMemo(() => artifact === null ? null : refreshArtifactSelection(artifact, data.bundles), [artifact, data.bundles])
   const activeAgent = data.agents.find(agent => agent.agentId === (active?.agentId || data.snapshot?.thread.defaultLeadAgentId)) ?? null
   const draftKey = data.selectedId || 'new'
   const latestDraftKey = useRef(draftKey)
@@ -225,6 +231,7 @@ export function LoomApp({ environment, onLogout }: Props) {
       <IconButton icon="home" label="对话" active={!studioOpen && !setupOpen} onClick={() => { setExpanded(false); setSidebarOpen(true); if (!active) beginConversation() }}/>
       <IconButton icon="plus" label="开始新对话" onClick={beginConversation}/>
       <IconButton icon="board" label="工作空间" onClick={() => openWork()}/>
+      <IconButton icon="branch" label="运行与成果" active={runSurfaceOpen} onClick={() => { runSurfaceOpener.current=document.activeElement instanceof HTMLElement?document.activeElement:null; setRunSurfaceOpen(true) }}/>
       <IconButton icon="files" label="工作目录" onClick={() => setWorkspaceManagerOpen(true)}/>
       <IconButton icon="people" label="管理助手" active={studioOpen} onClick={() => manageAssistant(activeAgent?.agentId)}/>
       <IconButton icon="globe" label="连接与设备" active={setupOpen} onClick={() => setSetupOpen(true)}/>
@@ -245,7 +252,10 @@ export function LoomApp({ environment, onLogout }: Props) {
     {visitedPanels.members&&<Suspense fallback={null}><RoomMembersDialog open={membersOpen} environment={environment} agents={data.agents} snapshot={data.snapshot} theme={theme} onClose={() => setMembersOpen(false)} onRefresh={data.refresh}/></Suspense>}
     {visitedPanels.library&&<Suspense fallback={<span role="status" className="ln-loading">正在打开能力库…</span>}><CapabilityLibrary open={libraryOpen} environment={environment} theme={theme} onClose={() => setLibraryOpen(false)} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh() }}/></Suspense>}
     <SurfaceDialog open={pendingInspectorAction !== null} title="保留能力修改？" theme={theme} onClose={() => setPendingInspectorAction(null)} className="ln-room-dialog"><UnsavedNotice onKeep={() => setPendingInspectorAction(null)} onDiscard={() => { const action = pendingInspectorAction; setPendingInspectorAction(null); setCapabilityDirty(false); action?.() }}/></SurfaceDialog>
-    {artifact && <ArtifactView selection={artifact} onClose={() => setArtifact(null)} onRefresh={data.refresh}/>}
+    <RunStatusDialog open={runSurfaceOpen} port={environment.client} bundle={selectedRunBundle} thread={data.snapshot} theme={theme}
+      onClose={() => setRunSurfaceOpen(false)} onCreateWork={() => { setRunSurfaceOpen(false); beginWork() }}
+      onArtifact={selection => { setRunSurfaceOpen(false); setArtifact(selection) }}/>
+    {artifact && <ArtifactView key={`${artifact.bundle.mission.missionId}:${artifact.artifact.artifactId}:${artifact.candidate?.candidateId ?? "none"}`} theme={theme} fallbackFocus={runSurfaceOpener.current} selection={currentArtifact?.selection ?? artifact} contextAvailable={currentArtifact?.contextAvailable ?? false} onClose={() => setArtifact(null)} onRefresh={data.refresh}/>}
     <Dialog.Root open={modal !== null} onOpenChange={open => { if (!open) setModal(null) }}><Dialog.Portal><div className="ln-portal" data-theme={theme}><Dialog.Overlay className="ln-modal-backdrop"/><Dialog.Content className={`ln-dialog${modal === 'search' ? ' ln-search-dialog' : ''}`} aria-describedby={undefined}><header><Dialog.Title>{modal === 'search' ? '搜索' : modal === 'history' ? '会话活动' : '设置'}</Dialog.Title><Dialog.Close asChild><button type="button" className="ln-icon-button" aria-label="关闭"><Icon name="close"/></button></Dialog.Close></header>
       {modal === 'search' && <><div className="ln-search-field"><Icon name="search"/><input placeholder="搜索对话、助手、工作或文件名…" aria-label="全局搜索" value={query} onChange={event => setQuery(event.target.value)} autoFocus/></div><WorkspaceSearch results={searchResults} query={query} onConversation={item => safeInspectorAction(() => { void select(item); setModal(null) })} onAssistant={agentId => { setModal(null); manageAssistant(agentId) }} onWork={searchWork} onArtifact={searchArtifact}/></>}
       {modal === 'history' && <div className="ln-dialog-results">{data.snapshot?.agentRuns.slice().reverse().map(run => <div className="ln-settings-row" key={run.id}><span>{data.agents.find(agent => agent.agentId === run.agentId)?.displayName || '助手'}</span><span>{({ queued:'排队中', running:'执行中', waiting:'等待中', succeeded:'已完成', failed:'失败', cancelled:'已取消' })[run.status]}</span></div>)}{!data.snapshot?.agentRuns.length && <p className="ln-inspector-empty">当前对话暂无执行活动</p>}</div>}

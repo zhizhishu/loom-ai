@@ -23,12 +23,13 @@ export function ChoiceMenu({ value, choices, onChange, label, theme = 'day', dis
   </div></Menu.Portal></Menu.Root>
 }
 
-export function SurfaceDialog({ open, title, description, theme = 'day', onClose, children, className = '' }: {
+export function SurfaceDialog({ open, title, description, theme = 'day', onClose, children, className = '', onOpenAutoFocus, onCloseAutoFocus }: {
   open: boolean; title: string; description?: string; theme?: 'day' | 'night'; onClose(): void; children: ReactNode; className?: string
+  onOpenAutoFocus?(event: Event): void; onCloseAutoFocus?(event: Event): void
 }) {
   return <Dialog.Root open={open} onOpenChange={value => { if (!value) onClose() }}><Dialog.Portal>
     <div className="ln-portal" data-theme={theme}><Dialog.Overlay className="ln-modal-backdrop"/>
-      <Dialog.Content className={`ln-surface-dialog ${className}`} {...(!description ? { 'aria-describedby': undefined } : {})}>
+      <Dialog.Content className={`ln-surface-dialog ${className}`} onOpenAutoFocus={onOpenAutoFocus} onCloseAutoFocus={onCloseAutoFocus} {...(!description ? { 'aria-describedby': undefined } : {})}>
         <header className="ln-surface-title"><div><Dialog.Title>{title}</Dialog.Title>{description && <Dialog.Description>{description}</Dialog.Description>}</div>
           <button type="button" className="ln-icon-button" aria-label="关闭窗口" onClick={onClose}><Icon name="close"/></button></header>
         {children}

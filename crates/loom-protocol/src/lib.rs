@@ -5,6 +5,10 @@
 //! Sequence numbers are per run, starting at 1, shared by stdout and stderr.
 
 pub mod run_bundle;
+pub mod v2_domain;
+pub mod v2_coordinator;
+pub mod v2_coordinator_replay;
+pub mod v2_capability;
 pub mod command_hooks;
 pub mod computer;
 pub mod process_pipe;

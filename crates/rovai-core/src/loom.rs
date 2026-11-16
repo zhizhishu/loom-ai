@@ -6,6 +6,8 @@ pub(crate) mod remote_artifact;
 /// The bytes of a registered local artifact, archived so a later verification re-reads what was
 /// registered instead of whatever the workspace file holds now.
 pub(crate) mod snapshot;
+// V2 additive coordinator ledger remains dormant until its Core migration is approved.
+pub(crate) mod v2_coordinator_adapter;
 /// The persistent automation authority of one Plan: the approved policy, the assistant stage
 /// verdicts, and the dispatch/budget ledger. Split out of this module because nothing in it may
 /// set the Owner's own `ACCEPTED` verdict — that stays in [`review_record`].

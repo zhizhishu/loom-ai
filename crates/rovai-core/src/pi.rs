@@ -1,3 +1,4 @@
+mod file_grant;
 mod host;
 
 use std::{fmt, path::Path, time::Duration};
@@ -16,6 +17,11 @@ use tokio::io::AsyncBufRead;
 
 use crate::acp::CompletedAcpAction;
 
+pub(crate) use file_grant::{
+    PI_FILE_ACCESS_KEY, PI_FILE_ACCESS_NATIVE, PI_FILE_ACCESS_WORKSPACE_READ_ONLY,
+    PI_FILE_ACCESS_WORKSPACE_READ_WRITE, PI_FILE_GRANT_READ_ONLY_TOOLS, PI_FILE_GRANT_READ_WRITE_TOOLS,
+    PI_FILE_GRANT_SCHEMA, PiFileAccessMode, PiFileGrant, mode_from_permissions, now_epoch_ms,
+};
 pub(crate) use host::{
     PiActivationFailureKind, PiHost, PiPromptImage, PreparedPiPromptImage, activation_failure_kind,
     machine_ready_probe, model_catalog_probe, prepare_prompt_images,
@@ -23,7 +29,19 @@ pub(crate) use host::{
 pub use host::{PiAgentRunRuntimeRequest, PiMcpProjection, PiRpcRuntimeAdapter, PiRuntime};
 
 pub(crate) const PI_PROTOCOL_VERSION: &str = "pi-jsonl-rpc-v1";
-pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v8";
+pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v10";
+// The managed Host extension validates the OPTIONAL per-Run file grant (`ROVAI_PI_FILE_GRANT_FILE`)
+// and publishes `rovai-managed-guard-state`. v10 widens the accepted grant to the two exact frozen
+// tool sets (`read` or `read`/`write`/`edit`); every hard-coded copy of the version string was updated
+// in the same change (agent_runtime_adapter host-config metadata, the Host test fixture, and
+// `scripts/smoke-member-environment-upgrade.mjs`).
+/// The shared Pi file guard is embedded from the single canonical source in `scripts/`. The Core
+/// materializes these exact bytes into the private Host root and loads them with an explicit
+/// `--extension`, so the production path and the isolated Runner validate with the SAME algorithm.
+/// The digest participates in the Host compatibility digest, never just a wrapper hash.
+pub(crate) const PI_FILE_GUARD_EXTENSION_SOURCE: &str =
+    include_str!("../../../scripts/loom-v2-runtime-file-guard.ts");
+pub(crate) const PI_FILE_GUARD_EXTENSION_NAME: &str = "rovai-pi-file-guard.ts";
 /// The managed Pi MCP extension is a generated bundle: `scripts/build-pi-mcp.mjs`
 /// inlines the maintained MCP client so the Pi process needs no node_modules tree.
 pub(crate) const PI_MCP_EXTENSION_VERSION: &str = "rovai-pi-mcp-v1";
@@ -386,6 +404,9 @@ pub(crate) fn runtime_compatibility_digest_with_mcp(
         "hostConfigDigest": frozen_runtime.host_config_digest,
         "managedExtensionVersion": PI_HOST_EXTENSION_VERSION,
         "managedExtensionDigest": format!("{:x}", Sha256::digest(include_str!("pi/managed-host.ts").as_bytes())),
+        // The shared guard is part of the same compatibility identity: two Runs that would load a
+        // different guard implementation must never share a warm Host.
+        "managedFileGuardDigest": format!("{:x}", Sha256::digest(PI_FILE_GUARD_EXTENSION_SOURCE.as_bytes())),
     });
     if let Some(document) = mcp_document {
         identity["managedMcpExtensionVersion"] = json!(PI_MCP_EXTENSION_VERSION);

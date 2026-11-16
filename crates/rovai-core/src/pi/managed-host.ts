@@ -3,7 +3,45 @@ import { lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 const SCHEMA_VERSION = 3;
-const EXTENSION_VERSION = "rovai-pi-host-v8";
+const EXTENSION_VERSION = "rovai-pi-host-v10";
+// Optional per-Run file-access policy. Absent => the unchanged legacy native policy (no guard).
+// Core writes the grant to a private file and points this env var at it; the same file is what the
+// shared guard reads, so the extension and the guard can never disagree about the policy.
+const FILE_GRANT_FILE_ENV = "ROVAI_PI_FILE_GRANT_FILE";
+const FILE_GRANT_SCHEMA = "loom.runtime.file-guard.v1";
+// The only two tool sets a Core-written grant may carry: the conservative read-only policy and the
+// read-write policy over Pi's three native file tools. Anything else (a subset, a duplicate, `bash`,
+// an extension/MCP tool) fails the extension load. The sets are compared in order, exactly.
+const FILE_GRANT_READ_ONLY_TOOLS = ["read"];
+const FILE_GRANT_READ_WRITE_TOOLS = ["read", "write", "edit"];
+const FILE_GRANT_TOOL_SETS = [FILE_GRANT_READ_ONLY_TOOLS, FILE_GRANT_READ_WRITE_TOOLS];
+const FILE_GRANT_KEYS = [
+  "schema",
+  "runId",
+  "botId",
+  "executionEpoch",
+  "workspaceReal",
+  "allowedTools",
+  "expiresAtEpochMs",
+  "logPath",
+];
+
+/**
+ * Read the Core-written grant. `null` means the legacy native policy: no guard, no restriction.
+ * A present-but-invalid grant must throw, never degrade to native.
+ */
+function readRunGrant(): any {
+  const grantPath = process.env[FILE_GRANT_FILE_ENV];
+  if (grantPath === undefined || grantPath.length === 0) return null;
+  if (!path.isAbsolute(grantPath)) throw new Error("file grant path must be absolute");
+  const stat = lstatSync(grantPath);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("file grant must be a regular file");
+  const parsed = JSON.parse(readFileSync(grantPath, "utf8"));
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("file grant is not an object");
+  }
+  return parsed;
+}
 const REQUIRED_BINDING_KEYS = [
   "agentRunId",
   "bootstrap",
@@ -67,7 +105,71 @@ function loadBinding(): any {
   ) {
     throw new Error("binding evidence mismatch");
   }
+  // A present-but-invalid grant fails every load instead of degrading to native permissions. No guard
+  // ACK then follows, and Core refuses to send a prompt for this Run.
+  validateFileAccess(binding);
   return binding;
+}
+
+/**
+ * Validate the optional per-Run file-access policy.
+ *
+ * - absent / `native`: the unchanged legacy behaviour. A `runGrant` must NOT be present, so a guard can
+ *   never be half-configured.
+ * - `workspace_read_only` / `workspace_read_write`: a fully typed `runGrant` is mandatory and must be
+ *   bound to THIS run, to one of the two exact frozen tool sets, and to a future expiry. Anything else
+ *   fails the extension load.
+ */
+function validateFileAccess(binding: any): void {
+  const grant = readRunGrant();
+  if (grant === null) return;
+  if (!hasRequiredKeys(grant, FILE_GRANT_KEYS) || Object.keys(grant).length !== FILE_GRANT_KEYS.length) {
+    throw new Error("runGrant shape mismatch");
+  }
+  if (grant.schema !== FILE_GRANT_SCHEMA) throw new Error("runGrant schema mismatch");
+  if (grant.runId !== binding.agentRunId) throw new Error("runGrant is bound to another AgentRun");
+  if (grant.executionEpoch !== binding.executionEpoch) throw new Error("runGrant epoch mismatch");
+  if (!nonEmpty(grant.botId)) throw new Error("runGrant botId is missing");
+  if (!nonEmpty(grant.workspaceReal) || !path.isAbsolute(grant.workspaceReal)) {
+    throw new Error("runGrant workspaceReal must be absolute");
+  }
+  if (!nonEmpty(grant.logPath) || !path.isAbsolute(grant.logPath)) {
+    throw new Error("runGrant logPath must be absolute");
+  }
+  if (!Array.isArray(grant.allowedTools)
+    || !FILE_GRANT_TOOL_SETS.some((toolSet) => toolSet.length === grant.allowedTools.length
+      && toolSet.every((tool, index) => grant.allowedTools[index] === tool))) {
+    throw new Error("runGrant tools exceed the file-access policy");
+  }
+  if (!Number.isSafeInteger(grant.expiresAtEpochMs) || grant.expiresAtEpochMs <= Date.now()) {
+    throw new Error("runGrant is expired");
+  }
+}
+
+/**
+ * Publish the binding-side guard acknowledgement. This is only an ACK of the *grant the Host was
+ * started with*; the executed guard writes its own `guard_ready`/`guard_selftest` lines into
+ * `runGrant.logPath`, and Core must require BOTH before it sends a prompt.
+ */
+function publishGuardState(ctx: any, binding: any): void {
+  const grant = readRunGrant();
+  if (grant === null) return;
+  ctx.ui.setStatus(
+    "rovai-managed-guard-state",
+    JSON.stringify({
+      schemaVersion: SCHEMA_VERSION,
+      extensionVersion: EXTENSION_VERSION,
+      hostInstanceId: binding.hostInstanceId,
+      hostBindingGeneration: binding.hostBindingGeneration,
+      runId: grant.runId,
+      botId: grant.botId,
+      executionEpoch: grant.executionEpoch,
+      allowedTools: grant.allowedTools,
+      workspaceReal: grant.workspaceReal,
+      expiresAtEpochMs: grant.expiresAtEpochMs,
+      guardLogPath: grant.logPath,
+    }),
+  );
 }
 
 function publishManagedSessionState(ctx: any, current: any): void {
@@ -139,7 +241,11 @@ export default function (pi: any) {
   pi.on("session_compact", async (_event: any, ctx: any) => publishContextUsage(ctx));
   pi.on("session_start", async (_event: any, ctx: any) => {
     try {
-      publishManagedSessionState(ctx, loadBinding());
+      const binding = loadBinding();
+      publishManagedSessionState(ctx, binding);
+      // Binding-side guard ACK: proves this Host was started with the Run's grant. The executed guard
+      // writes its own guard_ready/guard_selftest lines; Core requires both before prompting.
+      publishGuardState(ctx, binding);
     } catch (error) {
       publishFailure(ctx, undefined, "session_start", error);
     }

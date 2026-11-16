@@ -53,7 +53,8 @@ use crate::{
 
 use super::{
     PI_COMMAND_TIMEOUT, PI_HOST_EXTENSION_VERSION, PI_MAX_INBOUND_RECORD_BYTES,
-    PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiIncoming, PiTransportFailure,
+    PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiFileGrant, PiIncoming, PiTransportFailure,
+    mode_from_permissions, now_epoch_ms,
     assistant_message_text, completed_action, read_jsonl_record, value_id,
 };
 
@@ -126,6 +127,22 @@ struct PiManagedSessionState {
     session_id: String,
     session_file: String,
     cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PiManagedGuardState {
+    schema_version: i64,
+    extension_version: String,
+    host_instance_id: String,
+    host_binding_generation: u64,
+    run_id: String,
+    bot_id: String,
+    execution_epoch: i64,
+    allowed_tools: Vec<String>,
+    workspace_real: String,
+    expires_at_epoch_ms: i64,
+    guard_log_path: String,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +325,10 @@ pub(crate) struct PiHost {
     binding_generation: AtomicU64,
     binding_document: RwLock<Option<PiHostBindingDocument>>,
     managed_session_state: RwLock<Option<PiManagedSessionState>>,
+    /// Core-issued per-Run file grant. `None` = the unchanged legacy native policy (no guard).
+    file_grant: Option<PiFileGrant>,
+    /// Binding-side guard acknowledgement published by the managed extension.
+    guard_state: RwLock<Option<PiManagedGuardState>>,
     session_id: RwLock<String>,
     session_file: RwLock<PathBuf>,
     model_identity: RwLock<Option<(String, String, String)>>,
@@ -325,6 +346,8 @@ struct PiHostLaunch<'a> {
     incoming: mpsc::UnboundedSender<PiIncoming>,
     builtin_tools: Option<BuiltinToolProcessConfig>,
     mcp: Option<&'a PiMcpProjection>,
+    /// `Some` only for an explicit guarded policy (`workspace_read_only` / `workspace_read_write`).
+    file_grant: Option<&'a PiFileGrant>,
 }
 
 struct PiProbeRootCleanup(PathBuf);
@@ -477,11 +500,20 @@ fn append_initial_session_argument(command: &mut Command, session_file: Option<&
     }
 }
 
-fn append_host_arguments(command: &mut Command, extension_path: &Path) {
+fn append_host_arguments(
+    command: &mut Command,
+    extension_path: &Path,
+    file_access: Option<(&Path, &str)>,
+) {
     command.args(["--mode", "rpc"]);
-    command
-        .args(["--no-themes", "--approve", "--extension"])
-        .arg(extension_path);
+    command.args(["--no-themes", "--approve"]);
+    // Only the explicit managed guard is added: the pre-existing isolation switches (including
+    // `--no-extensions`) stay exactly as the frozen launch already declared them. `--tools` carries the
+    // comma-joined tool list Core derived from the frozen access mode, never a caller-composed list.
+    if let Some((guard_path, tools)) = file_access {
+        command.args(["--tools", tools, "--extension"]).arg(guard_path);
+    }
+    command.args(["--extension"]).arg(extension_path);
 }
 
 fn configure_host_working_directory(command: &mut Command, cwd: &Path) -> Result<()> {
@@ -544,6 +576,19 @@ impl PiHost {
         let initial_document = launch.initial_binding.document(&host_instance_id, 1);
         write_private_json(&binding_path, &initial_document)?;
 
+        // Materialize the shared guard from its single canonical source and hand the guard the exact
+        // Core-issued grant through a private file (never an environment-asserted identity).
+        let file_access = match launch.file_grant {
+            Some(grant) => {
+                let guard_path = config_root.join(super::PI_FILE_GUARD_EXTENSION_NAME);
+                write_private_file(&guard_path, super::PI_FILE_GUARD_EXTENSION_SOURCE.as_bytes())?;
+                let grant_path = config_root.join("guard-grant.json");
+                write_private_json(&grant_path, &grant.to_document()?)?;
+                Some((guard_path, grant.allowed_tools.join(","), grant_path))
+            }
+            None => None,
+        };
+
         let mut command = Command::new(launch.executable);
         rovai_core::runtime_discovery::configure_runtime_command(AdapterKind::Pi, &mut command);
         if let Some(environment) = launch.environment {
@@ -553,12 +598,21 @@ impl PiHost {
             config.configure_command(&mut command)?;
         }
         let entry = managed_mcp.as_ref().map_or(extension_path.as_path(), |(_, _, entry)| entry.as_path());
-        append_host_arguments(&mut command, Path::new(&node_path(entry)));
+        append_host_arguments(
+            &mut command,
+            Path::new(&node_path(entry)),
+            file_access
+                .as_ref()
+                .map(|(guard_path, tools, _)| (guard_path.as_path(), tools.as_str())),
+        );
         append_session_directory_argument(&mut command, launch.session_dir);
         append_initial_session_argument(&mut command, launch.initial_session_file);
         command
             .env("ROVAI_PI_HOST_BINDING_FILE", node_path(&binding_path))
             .env("PI_TELEMETRY", "0");
+        if let Some((_, _, grant_path)) = &file_access {
+            command.env("ROVAI_PI_FILE_GRANT_FILE", node_path(grant_path));
+        }
         if let Some((document_path, digest, _)) = &managed_mcp {
             command.envs(pi_mcp_environment(&config_root, document_path, digest, launch.cwd));
         }
@@ -600,6 +654,8 @@ impl PiHost {
             binding_generation: AtomicU64::new(1),
             binding_document: RwLock::new(Some(initial_document)),
             managed_session_state: RwLock::new(None),
+            file_grant: launch.file_grant.cloned(),
+            guard_state: RwLock::new(None),
             session_id: RwLock::new(String::new()),
             session_file: RwLock::new(PathBuf::new()),
             model_identity: RwLock::new(None),
@@ -897,6 +953,17 @@ impl PiHost {
             }
             return;
         }
+        if message.get("type").and_then(Value::as_str) == Some("extension_ui_request")
+            && message.get("method").and_then(Value::as_str) == Some("setStatus")
+            && message.get("statusKey").and_then(Value::as_str)
+                == Some("rovai-managed-guard-state")
+        {
+            let result = self.capture_managed_guard_state(&message).await;
+            if result.is_err() {
+                self.poisoned.store(true, Ordering::Release);
+            }
+            return;
+        }
         let Some(owner) = self.owner.read().await.clone() else {
             return;
         };
@@ -1023,12 +1090,25 @@ impl PiHost {
             ));
         }
         let generation = self.binding_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // A guarded Host is bound to exactly one Run: its guard, its grant file and its log were all
+        // materialized at spawn. Re-activating it for a different Run would let that Run's tools run
+        // under the previous grant, so this is refused outright instead of re-pointed.
+        if let Some(grant) = self.file_grant.as_ref() {
+            if grant.run_id != seed.agent_run_id || grant.execution_epoch != seed.execution_epoch {
+                return Err(activation_failure(
+                    PiActivationFailureKind::ActivationFailed,
+                    "Pi Host file grant is bound to another AgentRun",
+                ));
+            }
+        }
         let document = seed.document(&self.host_instance_id, generation);
         write_private_json(&self.binding_path, &document).map_err(|error| {
             activation_failure(PiActivationFailureKind::ActivationFailed, error)
         })?;
         *self.binding_document.write().await = Some(document.clone());
         *self.managed_session_state.write().await = None;
+        // The previous generation's guard ACK must never satisfy the next generation's gate.
+        *self.guard_state.write().await = None;
 
         if let Some(expected_session_id) = seed.expected_native_session_id.as_deref() {
             let locator = read_session_locator(locator_root, expected_session_id, &self.cwd)
@@ -1388,6 +1468,90 @@ impl PiHost {
     pub(crate) async fn shutdown_and_reap(&self) {
         let _ = self.shutdown_and_reap_with_status().await;
     }
+
+    async fn capture_managed_guard_state(&self, message: &Value) -> Result<()> {
+        let text = message
+            .get("statusText")
+            .and_then(Value::as_str)
+            .context("Pi managed guard state has no status text")?;
+        let state: PiManagedGuardState =
+            serde_json::from_str(text).context("Pi managed guard state is invalid")?;
+        *self.guard_state.write().await = Some(state);
+        Ok(())
+    }
+
+    /// Prove this Run is actually guarded before any prompt is sent.
+    ///
+    /// Two independent receipts are required: the managed extension's binding-side acknowledgement
+    /// (generation/Run/tools/workspace/expiry), and the executed guard's OWN `guard_ready` +
+    /// `guard_selftest(failures=0)` lines in its log file. A file merely existing is not evidence.
+    async fn await_guard_ready(&self, grant: &PiFileGrant) -> Result<()> {
+        let binding = self
+            .binding_document
+            .read()
+            .await
+            .clone()
+            .context("Pi file grant requires an active Host binding")?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(state) = self.guard_state.read().await.clone() {
+                if state.schema_version != 3
+                    || state.extension_version != super::PI_HOST_EXTENSION_VERSION
+                    || state.host_instance_id != self.host_instance_id
+                    || state.host_binding_generation != binding.host_binding_generation
+                {
+                    bail!("Pi managed guard state does not match the active Host binding");
+                }
+                if state.run_id != grant.run_id
+                    || state.bot_id != grant.bot_id
+                    || state.execution_epoch != grant.execution_epoch
+                    || state.allowed_tools != grant.allowed_tools
+                    || state.workspace_real != grant.workspace_real
+                    || state.expires_at_epoch_ms != grant.expires_at_epoch_ms
+                    || state.guard_log_path != grant.log_path
+                {
+                    bail!("Pi managed guard state is not bound to this Run's file grant");
+                }
+                if grant.is_expired(super::now_epoch_ms()) {
+                    bail!("Pi file grant expired before the prompt");
+                }
+                let log = std::fs::read_to_string(&grant.log_path)
+                    .context("Pi file guard receipt is unreadable")?;
+                let mut ready = false;
+                let mut self_test_ok = false;
+                for line in log.lines() {
+                    let Ok(record) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+                    match record.get("t").and_then(Value::as_str) {
+                        Some("guard_selftest") => {
+                            self_test_ok =
+                                record.get("failures").and_then(Value::as_u64) == Some(0);
+                        }
+                        Some("guard_ready") => {
+                            ready = record.get("runId").and_then(Value::as_str)
+                                == Some(grant.run_id.as_str())
+                                && record.get("botId").and_then(Value::as_str)
+                                    == Some(grant.bot_id.as_str())
+                                && record.get("workspaceReal").and_then(Value::as_str)
+                                    == Some(grant.workspace_real.as_str())
+                                && record.get("expiresAtEpochMs").and_then(Value::as_i64)
+                                    == Some(grant.expires_at_epoch_ms);
+                        }
+                        _ => {}
+                    }
+                }
+                if !ready || !self_test_ok {
+                    bail!("Pi file guard has not proven readiness for this Run");
+                }
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("Pi file guard did not acknowledge readiness before the prompt");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 }
 
 pub struct PiRuntime {
@@ -1513,6 +1677,9 @@ impl PiRuntime {
         *self.final_stop_reason.write().await = None;
         self.active_tool_executions.lock().await.clear();
         self.validate_images(images)?;
+        if let Some(grant) = self.host.file_grant.as_ref() {
+            self.host.await_guard_ready(grant).await?;
+        }
         let mut fields = json!({"message":message});
         if !images.is_empty() {
             fields["images"] = serde_json::to_value(images)?;
@@ -1888,6 +2055,39 @@ impl PiRpcRuntimeAdapter {
         let spawn_environment = request.frozen_runtime.environment.clone();
         let spawn_environment_source = rovai_core::member_environment::launch_source();
         let spawn_mcp = request.mcp.cloned();
+        // The policy comes from the frozen runtime permissions; the workspace is the canonical root Core
+        // already chose for this AgentRun. Neither the prompt nor the environment may supply either.
+        let file_access_mode = mode_from_permissions(&request.frozen_runtime.permissions.values)?;
+        let guard_log_dir = self
+            .private_runtime_dir
+            .join("pi-file-guard")
+            .join(format!("{}-{}", request.agent_run_id, request.execution_epoch));
+        if file_access_mode.guarded() {
+            std::fs::create_dir_all(&guard_log_dir)
+                .context("failed to create the Pi file-guard log directory")?;
+        }
+        let spawn_file_grant = PiFileGrant::for_run(
+            file_access_mode,
+            request.agent_run_id,
+            request.agent_id,
+            request.execution_epoch,
+            request.cwd,
+            &guard_log_dir.join("guard.jsonl"),
+            now_epoch_ms(),
+        )?;
+        // A guarded Run must never share a warm Host with another Run or with the native policy, so the
+        // reuse key carries the access mode plus the Run identity. Native Runs keep the digest verbatim,
+        // which leaves today's warm-reuse behaviour byte-identical.
+        let compatibility_digest = match spawn_file_grant.as_ref() {
+            Some(grant) => format!(
+                "{}#file-access={};run={};epoch={}",
+                request.runtime_compatibility_digest,
+                file_access_mode.as_str(),
+                grant.run_id,
+                grant.execution_epoch
+            ),
+            None => request.runtime_compatibility_digest.to_string(),
+        };
         let lease = self
             .fleet
             .acquire(
@@ -1899,7 +2099,7 @@ impl PiRpcRuntimeAdapter {
                         request.camp_id,
                         request.agent_id,
                         Some(request.native_binding_id),
-                        request.runtime_compatibility_digest,
+                        &compatibility_digest,
                     ),
                 },
                 move || async move {
@@ -1918,7 +2118,14 @@ impl PiRpcRuntimeAdapter {
                         initial_binding: &spawn_seed,
                         incoming: spawn_incoming,
                         builtin_tools: Some(spawn_builtin_tool_factory.create()?),
-                        mcp: spawn_mcp.as_ref(),
+                        // A read-only Run never installs MCP: the policy grants exactly one native tool,
+                        // so projecting MCP servers while denying every `mcp__*` call would be dishonest.
+                        mcp: if spawn_file_grant.is_some() {
+                            None
+                        } else {
+                            spawn_mcp.as_ref()
+                        },
+                        file_grant: spawn_file_grant.as_ref(),
                     })
                     .await?;
                     Ok(RuntimeProcessHost::Pi(host))
@@ -2169,6 +2376,7 @@ async fn spawn_probe_host(executable: &Path) -> Result<(Arc<PiHost>, PiProbeRoot
         incoming,
         builtin_tools: None,
         mcp: None,
+        file_grant: None,
     })
     .await?;
     Ok((host, _probe_root_cleanup))
@@ -3052,7 +3260,7 @@ write_session() {
 emit_managed_session_state() {
   host_instance_id=$(/usr/bin/sed -n 's/.*"hostInstanceId":"\([^"]*\)".*/\1/p' "$ROVAI_PI_HOST_BINDING_FILE")
   host_binding_generation=$(/usr/bin/sed -n 's/.*"hostBindingGeneration":\([0-9][0-9]*\).*/\1/p' "$ROVAI_PI_HOST_BINDING_FILE")
-  event=$(printf '{"type":"extension_ui_request","method":"setStatus","statusKey":"rovai-managed-session-state","statusText":"{\\"schemaVersion\\":3,\\"extensionVersion\\":\\"rovai-pi-host-v8\\",\\"hostInstanceId\\":\\"%s\\",\\"hostBindingGeneration\\":%s,\\"sessionId\\":\\"%s\\",\\"sessionFile\\":\\"%s\\",\\"cwd\\":\\"%s\\"}"}' "$host_instance_id" "$host_binding_generation" "$session_id" "$session_file" "$PWD")
+  event=$(printf '{"type":"extension_ui_request","method":"setStatus","statusKey":"rovai-managed-session-state","statusText":"{\\"schemaVersion\\":3,\\"extensionVersion\\":\\"rovai-pi-host-v10\\",\\"hostInstanceId\\":\\"%s\\",\\"hostBindingGeneration\\":%s,\\"sessionId\\":\\"%s\\",\\"sessionFile\\":\\"%s\\",\\"cwd\\":\\"%s\\"}"}' "$host_instance_id" "$host_binding_generation" "$session_id" "$session_file" "$PWD")
   printf '%s\n' "$event" >> "$event_log"
   printf '%s\n' "$event"
 }
@@ -3491,6 +3699,7 @@ done
             incoming,
             builtin_tools: None,
         mcp: None,
+            file_grant: None,
         })
         .await
         .unwrap();
@@ -3678,6 +3887,7 @@ done
                 incoming,
                 builtin_tools: None,
         mcp: None,
+                file_grant: None,
             })
             .await
             .unwrap();
@@ -3814,9 +4024,9 @@ done
 
     #[test]
     fn production_host_launch_preserves_pi_native_resources() {
-        let extension = Path::new("/private/rovai-pi-host-v8.ts");
+        let extension = Path::new("/private/rovai-pi-host-v10.ts");
         let mut production = Command::new("pi");
-        append_host_arguments(&mut production, extension);
+        append_host_arguments(&mut production, extension, None);
         let production_args = production
             .as_std()
             .get_args()
@@ -3830,7 +4040,7 @@ done
                 "--no-themes",
                 "--approve",
                 "--extension",
-                "/private/rovai-pi-host-v8.ts",
+                "/private/rovai-pi-host-v10.ts",
             ]
         );
         for forbidden in [
@@ -3842,6 +4052,54 @@ done
             "--no-extensions",
         ] {
             assert!(!production_args.iter().any(|argument| argument == forbidden));
+        }
+    }
+
+    #[test]
+    fn guarded_host_launch_adds_only_the_granted_tools_and_the_managed_guard() {
+        let extension = Path::new("/private/rovai-pi-host-v10.ts");
+        let guard = Path::new("/private/rovai-pi-file-guard.ts");
+        // One table over the two exact frozen tool sets Core can emit; the joined spelling is what the
+        // Host receives, so it is asserted verbatim.
+        for tools in ["read", "read,write,edit"] {
+            let mut production = Command::new("pi");
+            append_host_arguments(&mut production, extension, Some((guard, tools)));
+            let production_args = production
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                production_args,
+                [
+                    "--mode",
+                    "rpc",
+                    "--no-themes",
+                    "--approve",
+                    "--tools",
+                    tools,
+                    "--extension",
+                    "/private/rovai-pi-file-guard.ts",
+                    "--extension",
+                    "/private/rovai-pi-host-v10.ts",
+                ]
+            );
+            // Exactly one `--tools` flag, and no isolation switch is dropped by the guard slice.
+            assert_eq!(
+                production_args.iter().filter(|argument| *argument == "--tools").count(),
+                1
+            );
+            for forbidden in [
+                "--no-skills",
+                "--no-context-files",
+                "--no-prompt-templates",
+                "--no-builtin-tools",
+                "--no-approve",
+                "--no-extensions",
+                "--no-builtin-read",
+            ] {
+                assert!(!production_args.iter().any(|argument| argument == forbidden));
+            }
         }
     }
 
@@ -3919,6 +4177,7 @@ done
                 incoming,
                 builtin_tools: None,
         mcp: None,
+                file_grant: None,
             })
             .await?;
             let state = host.command("get_state", json!({})).await;

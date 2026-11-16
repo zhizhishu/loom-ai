@@ -1,6 +1,8 @@
 import type {
   LoomAcceptanceCriterion,
+  LoomAcceptanceCriterionResult,
   LoomArtifactPreviewResult,
+  LoomReviewRecordInput,
   LoomReviewRecordReceipt,
   LoomTaskStatus
 } from '@contracts'
@@ -8,7 +10,7 @@ import type {
 import type { ThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
 import { loomCandidateAcceptable, loomCandidateVersions, loomVersionLabel } from '../loom-control-model'
-import type { LoomArtifact, LoomCandidate, LoomReview, LoomTask, LoomVerification, WorkBundle } from './types'
+import type { ArtifactSelection, LoomArtifact, LoomCandidate, LoomReview, LoomTask, LoomVerification, WorkBundle } from './types'
 
 /**
  * 成果浮层的数据层：纯函数 + 两个真实 Core 调用，不含 React、不含样式、不 import 任何旧界面组件。
@@ -191,20 +193,58 @@ export function reviewDraftComplete(draft: ArtifactReviewDraft, facts: ArtifactC
 }
 
 /**
- * 真实写入：loom.review.record。reviewerId 由 Core 从可信身份注入，客户端不发；
- * 这里只发真实候选、该候选钉住的标准版本与逐条结论。
+ * 提交门槛（prepare 与 submit 共用）：必须写明理由；接受还必须逐条勾满该候选快照里的每条标准。
+ * 退回只要求理由。门槛不放宽也不加码。
  */
-export async function submitArtifactReview(
-  rpc: LoomRpc,
-  missionId: string,
-  facts: ArtifactCandidateFacts,
-  draft: ArtifactReviewDraft
-): Promise<LoomReviewRecordReceipt> {
+function reviewSubmissionGuard(facts: ArtifactCandidateFacts, draft: ArtifactReviewDraft): LoomCandidate {
   const candidate = facts.candidate
   if (candidate === null) throw new Error('没有可验收的候选')
   if (draft.candidateId !== candidate.candidateId) throw new Error('验收表单与候选不一致')
   if (!facts.reviewable || !facts.latest) throw new Error('这份成果现在不可验收，请刷新后重试')
   if (!reviewDraftComplete(draft, facts)) throw new Error('请填写理由并逐条确认验收标准')
+  return candidate
+}
+
+/**
+ * 真实写入：loom.review.record。reviewerId 由 Core 从可信身份注入，客户端不发；
+ * 这里只发真实候选、该候选钉住的标准版本与逐条结论。
+ *
+ * @deprecated 无 attempt 的历史用法仅为兼容保留：它每次调用都生成新 commandId，
+ * 回执丢失后无法幂等重试。生产写入只能走 prepareArtifactReviewAttempt + 显式
+ * attempt 的 send 路径（冻结 payload + 同一 commandId 重试）；未确认 attempt
+ * 未清理时不得重新组装提交。
+ */
+export async function submitArtifactReview(
+  rpc: LoomRpc,
+  missionId: string,
+  facts: ArtifactCandidateFacts,
+  draft: ArtifactReviewDraft,
+  attempt?: ArtifactReviewAttempt
+): Promise<LoomReviewRecordReceipt> {
+  const candidate = reviewSubmissionGuard(facts, draft)
+  if (attempt !== undefined) {
+    if (attempt.missionId !== missionId) throw new Error('冻结的验收attempt属于另一个 Mission')
+    if (attempt.candidateId !== candidate.candidateId) throw new Error('冻结的验收attempt指向另一个候选')
+    if (draft.candidateId !== attempt.candidateId) throw new Error('验收表单与冻结attempt不一致')
+    // 表单内容也必须与冻结 payload 逐字段一致：不一致时拒绝发送，
+    // 不静默重发旧内容让用户误以为新理由已保存。
+    if (draft.verdict !== attempt.payload.verdict
+      || draft.reason.trim() !== attempt.payload.reason
+      || attempt.payload.criteriaResults.some(row => row.satisfied !== draft.satisfied.includes(row.criterionId))) {
+      throw new Error('验收表单与冻结attempt内容不一致；请取回原attempt，不能静默替换已冻结的理由')
+    }
+    const outcome = await sendArtifactReviewAttempt(rpc, attempt)
+    if (outcome.state === 'completed') {
+      discardUnconfirmedReviewAttempt(rpc, attempt, 'confirmed_receipt')
+      return outcome.receipt
+    }
+    if (outcome.state === 'rejected') {
+      discardUnconfirmedReviewAttempt(rpc, attempt, 'confirmed_rejection')
+      throw new Error(`验收提交被拒绝（${outcome.code}）：${outcome.message}`)
+    }
+    // 通信未知：attempt 必须留在内存仓里，二次打开取回后重发同一 commandId，不换包。
+    throw new Error(outcome.message)
+  }
   return rpc.request<LoomReviewRecordReceipt>('loom.review.record', {
     missionId,
     taskId: candidate.taskId,
@@ -220,4 +260,399 @@ export async function submitArtifactReview(
       note: null
     }))
   })
+}
+
+// ------------------------------------------------------- idempotent review attempt
+
+/** 一次冻结的验收提交：commandId 与完整 payload 组装后不可变，重试只重发同一份。 */
+export type ArtifactReviewAttempt = {
+  readonly commandId: string
+  readonly missionId: string
+  readonly candidateId: string
+  readonly taskId: string
+  /** 冻结自 facts.task?.planId；无 task 时为 null（回执只能按非空形状弱验）。 */
+  readonly planId: string | null
+  /** 冻结的完整 loom.review.record 载荷；reviewerId 由 Core 注入，客户端从不发送。 */
+  readonly payload: LoomReviewRecordInput
+}
+
+/** 递归冻结：包括嵌套数组（criteriaResults 行、evidenceIds）在内不留任何可变入口。 */
+function deepFreeze<T>(value: T): T {
+  if (Array.isArray(value)) {
+    value.forEach(entry => deepFreeze(entry))
+    return Object.freeze(value) as T
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const entry of Object.values(value as Record<string, unknown>)) deepFreeze(entry)
+    return Object.freeze(value as T)
+  }
+  return value
+}
+
+/**
+ * 组装并冻结一次验收提交：门槛与旧 submit 完全一致，commandId 只在这里生成一次。
+ * 返回的 attempt 深度冻结——重试路径没有任何改 payload 或换 commandId 的入口。
+ * 不写任何 registry、不发请求；发送交给 sendArtifactReviewAttempt。
+ */
+export function prepareArtifactReviewAttempt(
+  missionId: string,
+  facts: ArtifactCandidateFacts,
+  draft: ArtifactReviewDraft
+): ArtifactReviewAttempt {
+  const candidate = reviewSubmissionGuard(facts, draft)
+  const payload: LoomReviewRecordInput = {
+    missionId,
+    taskId: candidate.taskId,
+    candidateId: candidate.candidateId,
+    commandId: crypto.randomUUID(),
+    acceptanceCriteriaVersion: facts.criteriaVersion,
+    verdict: draft.verdict,
+    reason: draft.reason.trim(),
+    criteriaResults: facts.criteria.map(criterion => ({
+      criterionId: criterion.criterionId,
+      satisfied: draft.satisfied.includes(criterion.criterionId),
+      evidenceIds: [],
+      note: null
+    }))
+  }
+  return Object.freeze({
+    commandId: payload.commandId,
+    missionId,
+    candidateId: payload.candidateId,
+    taskId: payload.taskId,
+    planId: facts.task?.planId ?? null,
+    payload: deepFreeze({ ...payload }) as LoomReviewRecordInput
+  })
+}
+
+export type ArtifactReviewSendOutcome =
+  | { state: 'completed'; receipt: LoomReviewRecordReceipt }
+  | { state: 'rejected'; code: string; message: string }
+  | { state: 'unknown'; message: string }
+
+const LOOM_TASK_STATUSES = ['draft', 'ready', 'blocked', 'in_review', 'done', 'canceled'] as const
+
+/** 真合同枚举守卫：全部字面量命中才算合法 taskStatus，不靠 as 强转未知值。 */
+function isLoomTaskStatus(value: unknown): value is (typeof LOOM_TASK_STATUSES)[number] {
+  return (LOOM_TASK_STATUSES as readonly unknown[]).includes(value)
+}
+
+/**
+ * 与冻结 payload 的 criteriaResults 精确匹配：同长度、同序，每行 criterionId/satisfied/note/
+ * evidenceIds 逐一相等（evidenceIds 也同序同内容且每个元素都验过是字符串）。
+ */
+function criteriaResultsMatchPayload(
+  value: unknown,
+  attempt: ArtifactReviewAttempt
+): boolean {
+  if (!Array.isArray(value) || value.length !== attempt.payload.criteriaResults.length) return false
+  return attempt.payload.criteriaResults.every((row, index) => {
+    const other = value[index] as Record<string, unknown> | undefined
+    if (!other || typeof other !== 'object') return false
+    if (other.criterionId !== row.criterionId) return false
+    if (other.satisfied !== row.satisfied) return false
+    if (other.note !== row.note) return false
+    const otherEvidence: unknown = other.evidenceIds
+    if (!Array.isArray(otherEvidence) || otherEvidence.length !== row.evidenceIds.length) return false
+    return row.evidenceIds.every((id, i) => {
+      const evidence: unknown = otherEvidence[i]
+      return typeof evidence === 'string' && evidence === id
+    })
+  })
+}
+
+/**
+ * 完整回执校验：形状 + 身份 + 与冻结 payload 的一致性 + Core 实际回执语义。
+ * 真合同（packages/contracts/src/loom.ts:148-165, 341-369）：review 携带
+ * acceptanceCriteriaVersion/criteriaResults/reviewerId/reviewedAt；非 replay 的回执里
+ * accepted 应 task done/candidate accepted，rejected 应 task ready/candidate rejected，
+ * pending 永远不能算 completed；replayed 回执的 taskStatus 是 Core 读到的当前状态
+ * （loom.rs 重放分支），允许合法枚举内任意值；reviewerId 只验非空字符串，不硬编码身份。
+ * 身份不符/形状不认识/与冻结 payload 不一致一律 unknown。
+ */
+function validatedReviewReceipt(value: unknown, attempt: ArtifactReviewAttempt): LoomReviewRecordReceipt | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const row = value as Record<string, unknown>
+  const review = row.review
+  if (!review || typeof review !== 'object' || Array.isArray(review)) return null
+  const reviewRow = review as Record<string, unknown>
+  if (row.missionId !== attempt.missionId) return null
+  // planId：attempt 冻结了 facts.task?.planId 时强证；无 task 时只验非空形状。
+  const planId = typeof row.planId === 'string' && row.planId !== '' ? row.planId : null
+  if (planId === null) return null
+  if (attempt.planId !== null && planId !== attempt.planId) return null
+  if (row.taskId !== attempt.taskId) return null
+  const reviewId = reviewRow.reviewId
+  if (typeof reviewId !== 'string' || reviewId === '') return null
+  if (reviewRow.candidateId !== attempt.candidateId) return null
+  if (reviewRow.verdict !== attempt.payload.verdict) return null
+  if (reviewRow.reason !== attempt.payload.reason) return null
+  if (reviewRow.acceptanceCriteriaVersion !== attempt.payload.acceptanceCriteriaVersion) return null
+  if (!criteriaResultsMatchPayload(reviewRow.criteriaResults, attempt)) return null
+  const reviewerId = reviewRow.reviewerId
+  if (typeof reviewerId !== 'string' || reviewerId === '') return null
+  const reviewedAt = reviewRow.reviewedAt
+  if (typeof reviewedAt !== 'string' || reviewedAt === '') return null
+  const taskStatus = row.taskStatus
+  if (!isLoomTaskStatus(taskStatus)) return null
+  const verdict = attempt.payload.verdict
+  const expectedAcceptance = verdict === 'accepted' ? 'accepted' : 'rejected'
+  const acceptanceStatus = row.candidateAcceptanceStatus
+  // pending 不能算 completed：候选验收状态必须与 verdict 一致（重放也成立：候选
+  // 不可变，其 acceptance_status 永远等于它那份评审的 verdict）。
+  if (acceptanceStatus !== 'accepted' && acceptanceStatus !== 'rejected') return null
+  if (acceptanceStatus !== expectedAcceptance) return null
+  const releasedDependencyIds = row.releasedDependencyIds
+  if (!Array.isArray(releasedDependencyIds)) return null
+  const releasedIds: string[] = []
+  for (const entry of releasedDependencyIds) {
+    // 每一项都必须是非空字符串；任何形状未知条目让整份回执不可信。
+    if (typeof entry !== 'string' || entry === '') return null
+    releasedIds.push(entry)
+  }
+  const replayed = row.replayed
+  if (typeof replayed !== 'boolean') return null
+  // 非 replay：task 状态必须被 verdict 推进到位；replay：taskStatus 是 Core 读到的
+  // 当前状态快照（loom.rs 重放分支），允许合法枚举内任意值。
+  if (replayed !== true && taskStatus !== (verdict === 'accepted' ? 'done' : 'ready')) return null
+  // 每个字段都验过之后才组装回执，不靠 as 强转掩盖漏验字段。
+  return {
+    review: {
+      reviewId,
+      candidateId: attempt.candidateId,
+      acceptanceCriteriaVersion: attempt.payload.acceptanceCriteriaVersion,
+      verdict: attempt.payload.verdict,
+      reason: attempt.payload.reason,
+      criteriaResults: attempt.payload.criteriaResults,
+      reviewerId,
+      reviewedAt
+    },
+    missionId: attempt.missionId,
+    planId,
+    taskId: attempt.taskId,
+    taskStatus,
+    candidateAcceptanceStatus: acceptanceStatus,
+    releasedDependencyIds: releasedIds,
+    replayed
+  }
+}
+
+/** 只有错误对象自带精确 kind==='domain_rejection' 与非空 code 才算已证实的拒绝。 */
+function structuredRejectionCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return null
+  const kind = (error as { kind?: unknown }).kind
+  const code = (error as { code?: unknown }).code
+  return kind === 'domain_rejection' && typeof code === 'string' && code !== '' ? code : null
+}
+
+/**
+ * 严格以 attempt 的冻结 payload 发送：同一 commandId、同一份字段，不生成新 ID、
+ * 不改 reviewerId、不发任何自制 API（没有 commands.getResult 这类东西，本模块也不造）。
+ * 发送前原子登记 attempt 并标记 sending（UI 侧 remember 是幂等 no-op）；同 attempt
+ * 的并发 send 共用同一个在途 Promise（返回的就是同一条 record.inFlight）。
+ * rpc.request 同步 throw 也安全：执行体在 microtask 中执行，inFlight 先登记、
+ * 落定清理必挂上，同步 throw 走统一 catch 记 unknown，显式 retry 可真再发。
+ * completed 仅当 Core 回了形状、身份与冻结 payload 都一致的真实回执；已证实的结构化拒绝是 rejected；其余（网络、超时、回执形状不认识、
+ * 身份不符）一律 unknown——未知不是成功，落定后状态留在 unknown，调用方不得据此改
+ * payload 或另起 command，只能取回原 attempt 同包重试或等待明确结局。
+ */
+export function sendArtifactReviewAttempt(
+  rpc: LoomRpc,
+  attempt: ArtifactReviewAttempt
+): Promise<ArtifactReviewSendOutcome> {
+  const store = attemptStore(rpc)
+  const key = attemptStoreKey(attempt.missionId, attempt.candidateId)
+  const existing = store.get(key)
+  // 同 scope 已有另一个 attempt：不能覆盖，也不能并行发送（旧attempt不能换成新包）。
+  if (existing !== undefined && existing.attempt !== attempt) {
+    return Promise.reject(new Error('该候选已有另一个未确认的验收attempt，不能覆盖或并行发送'))
+  }
+  // 同 attempt 的并发 send 共用同一个在途 Promise；发送前原子登记并标记发送。
+  if (existing !== undefined && existing.inFlight !== null) return existing.inFlight
+  const record: AttemptRecord = existing ?? { attempt, state: 'not_sent', inFlight: null }
+  if (existing === undefined) store.set(key, record)
+  record.state = 'sending'
+  // 执行体放进 microtask：rpc.request 同步 throw 时 inFlight 已先登记、落定清理必挂上。
+  const flight = Promise.resolve().then(async (): Promise<ArtifactReviewSendOutcome> => {
+    let raw: unknown
+    try {
+      raw = await rpc.request('loom.review.record', { ...attempt.payload })
+    } catch (error) {
+      const code = structuredRejectionCode(error)
+      if (code !== null) {
+        record.state = 'rejected'
+        return { state: 'rejected', code, message: readErrorMessage(error, '验收提交被拒绝') }
+      }
+      record.state = 'unknown'
+      return { state: 'unknown', message: readErrorMessage(error, '验收提交结果未知') }
+    }
+    const receipt = validatedReviewReceipt(raw, attempt)
+    if (receipt === null) {
+      record.state = 'unknown'
+      return { state: 'unknown', message: '验收回执形状、身份或与冻结 payload 不一致，结果未知' }
+    }
+    record.state = 'completed'
+    return { state: 'completed', receipt }
+  })
+  record.inFlight = flight
+  // 落定后清出在途句柄，之后的 unknown 同包重试才能重新发送。
+  void flight.then(() => { if (record.inFlight === flight) record.inFlight = null },
+    () => { if (record.inFlight === flight) record.inFlight = null })
+  return flight
+}
+
+// ------------------------------------------------- unconfirmed attempt memory store
+
+/** attempt 的真实生命周期：由 send 内部推进，调用方不可伪造。 */
+export type AttemptLifecycle = 'not_sent' | 'sending' | 'unknown' | 'completed' | 'rejected'
+
+type AttemptRecord = {
+  attempt: ArtifactReviewAttempt
+  state: AttemptLifecycle
+  /** 非空表示有一个在途 send，所有并发调用共用同一个 Promise。 */
+  inFlight: Promise<ArtifactReviewSendOutcome> | null
+}
+
+/**
+ * 未确认 attempt 的内存仓：按 rpc 对象分桶（WeakMap，通道被回收时桶随之消失），
+ * 桶内按 missionId+candidateId 各保留一条（含生命周期）。不落盘、不跨会话、
+ * 没有全局 registry，也没有超时放弃——只有拿到真实回执、收到精确结构化拒绝、
+ * 或该 attempt 确实从未发送时才允许显式清理。
+ */
+const unconfirmedReviewAttempts = new WeakMap<object, Map<string, AttemptRecord>>()
+
+function attemptStoreKey(missionId: string, candidateId: string): string {
+  return `${missionId}\u0000${candidateId}`
+}
+
+function attemptStore(rpc: LoomRpc): Map<string, AttemptRecord> {
+  let store = unconfirmedReviewAttempts.get(rpc)
+  if (store === undefined) {
+    store = new Map()
+    unconfirmedReviewAttempts.set(rpc, store)
+  }
+  return store
+}
+
+/** 登记一条未确认 attempt；重复登记同一对象是幂等 no-op，不同对象拒绝覆盖。 */
+export function rememberUnconfirmedReviewAttempt(rpc: LoomRpc, attempt: ArtifactReviewAttempt): void {
+  const store = attemptStore(rpc)
+  const key = attemptStoreKey(attempt.missionId, attempt.candidateId)
+  const existing = store.get(key)
+  if (existing !== undefined) {
+    if (existing.attempt !== attempt) {
+      throw new Error('该候选已有未确认的验收提交，不能覆盖；请先取回原 attempt 或明确清理')
+    }
+    return
+  }
+  store.set(key, { attempt, state: 'not_sent', inFlight: null })
+}
+
+/** 二次打开同一候选时取回原 attempt（冻结 payload 原样）；没有未确认记录则 null。 */
+export function recallUnconfirmedReviewAttempt(
+  rpc: LoomRpc,
+  missionId: string,
+  candidateId: string
+): ArtifactReviewAttempt | null {
+  return attemptStore(rpc).get(attemptStoreKey(missionId, candidateId))?.attempt ?? null
+}
+
+/** 只读查询内部生命周期；调用方不能写。没有记录/对象不符则 null。 */
+export function unconfirmedAttemptLifecycle(
+  rpc: LoomRpc,
+  attempt: ArtifactReviewAttempt
+): AttemptLifecycle | null {
+  const record = attemptStore(rpc).get(attemptStoreKey(attempt.missionId, attempt.candidateId))
+  return record !== undefined && record.attempt === attempt ? record.state : null
+}
+
+/** 明确的清理理由；不存在超时/放弃式入口。 */
+export type UnconfirmedAttemptDiscardReason = 'confirmed_receipt' | 'confirmed_rejection' | 'never_sent'
+
+const DISCARD_ALLOWED_STATES: Record<UnconfirmedAttemptDiscardReason, AttemptLifecycle> = {
+  confirmed_receipt: 'completed',
+  confirmed_rejection: 'rejected',
+  never_sent: 'not_sent'
+}
+
+/**
+ * 只对已确定结局的 attempt 清理：真实回执（completed）、精确结构化拒绝（rejected）、
+ * 或确实从未发送（not_sent）。理由必须与 send 内部维护的真实状态相符，且必须是同一个
+ * attempt 对象——旧 attempt 删不掉同 scope 的新 attempt，通信未知（unknown/sending）
+ * 时无论传什么理由都不会被清理。
+ */
+export function discardUnconfirmedReviewAttempt(
+  rpc: LoomRpc,
+  attempt: ArtifactReviewAttempt,
+  reason: UnconfirmedAttemptDiscardReason
+): boolean {
+  const store = attemptStore(rpc)
+  const record = store.get(attemptStoreKey(attempt.missionId, attempt.candidateId))
+  if (record === undefined || record.attempt !== attempt) return false
+  if (record.state !== DISCARD_ALLOWED_STATES[reason]) return false
+  return store.delete(attemptStoreKey(attempt.missionId, attempt.candidateId))
+}
+
+// ------------------------------------------------------------ selection refresh
+
+/** 一次选择刷新的结果：contextAvailable=false 表示旧上下文不可再信（缺失/身份变化）。 */
+export type ArtifactSelectionRefresh = {
+  selection: ArtifactSelection
+  contextAvailable: boolean
+}
+
+/**
+ * 用最新 bundles 刷新打开着的成果 selection：严格同 missionId + artifactId + sha256，
+ * 候选按原 candidateId 取回并验证它仍拥有这份证据。任何缺失或身份变化都不自动跳到
+ * 另一个候选：保留原只读 selection 并把 contextAvailable 置 false，禁写与状态提示由 UI 负责。
+ */
+export function refreshArtifactSelection(
+  selection: ArtifactSelection,
+  bundles: readonly WorkBundle[]
+): ArtifactSelectionRefresh {
+  const { artifact, candidate, bundle } = selection
+  const freshBundle = bundles.find(
+    entry => entry.mission.missionId === bundle.mission.missionId
+  )
+  if (freshBundle === undefined) return { selection, contextAvailable: false }
+  // 产物严格同 artifactId + sha256，且 task/run 归属都不变：归属变了就是另一份事实。
+  const freshArtifact = freshBundle.artifacts.find(entry =>
+    entry.artifactId === artifact.artifactId
+    && entry.sha256 === artifact.sha256
+    && entry.taskId === artifact.taskId
+    && entry.agentRunId === artifact.agentRunId
+  )
+  if (freshArtifact === undefined) return { selection, contextAvailable: false }
+  if (candidate === null) {
+    return {
+      selection: { artifact: freshArtifact, candidate: null, bundle: freshBundle },
+      contextAvailable: true
+    }
+  }
+  // 候选是 immutable 行：同 candidateId 但 contentHash/taskId/钉住的验收标准快照变化
+  // 视为身份变化，拒绝静默更新；证据归属也必须仍然成立。
+  const freshCandidate = freshBundle.candidates.find(entry =>
+    entry.candidateId === candidate.candidateId
+    && entry.contentHash === candidate.contentHash
+    && entry.taskId === candidate.taskId
+    && sameAcceptanceCriteria(entry.acceptanceCriteria, candidate.acceptanceCriteria)
+    && entry.evidenceIds.includes(freshArtifact.artifactId)
+  )
+  if (freshCandidate === undefined) return { selection, contextAvailable: false }
+  return {
+    selection: { artifact: freshArtifact, candidate: freshCandidate, bundle: freshBundle },
+    contextAvailable: true
+  }
+}
+
+/** 验收标准快照的精确相等：同 version、同序、每条 criterionId/text 相同。 */
+function sameAcceptanceCriteria(
+  a: LoomCandidate['acceptanceCriteria'],
+  b: LoomCandidate['acceptanceCriteria']
+): boolean {
+  if (a.version !== b.version || a.criteria.length !== b.criteria.length) return false
+  return a.criteria.every((criterion, index) =>
+    criterion.criterionId === b.criteria[index].criterionId
+    && criterion.text === b.criteria[index].text
+  )
 }

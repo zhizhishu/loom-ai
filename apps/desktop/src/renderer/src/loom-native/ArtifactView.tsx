@@ -6,6 +6,7 @@ import type { LoomReviewRecordReceipt } from '@contracts'
 import { useThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
 import { Icon } from './icons'
+import './artifact-ux.css'
 import type { ArtifactSelection } from './types'
 import {
   acceptanceLabel,
@@ -18,11 +19,16 @@ import {
   readArtifactPreview,
   reviewDraftComplete,
   stripLeadingHeading,
-  submitArtifactReview,
+  prepareArtifactReviewAttempt,
+  sendArtifactReviewAttempt,
+  rememberUnconfirmedReviewAttempt,
+  recallUnconfirmedReviewAttempt,
+  discardUnconfirmedReviewAttempt,
   taskStatusLabel,
   verificationLabel,
   type ArtifactPreviewState,
-  type ArtifactReviewDraft
+  type ArtifactReviewDraft,
+  type ArtifactReviewAttempt
 } from './artifact-service'
 
 /**
@@ -30,8 +36,22 @@ import {
  * 正文只显示 loom.artifact.preview 真实返回的文本，上下文只显示真实的候选/评审/核验投影。
  * 这里不缓存第二份正文，也不在挂载或刷新时自动写任何验收结论。
  */
-export function ArtifactView({ selection, onClose, onRefresh }: {
+// Unsaved review text is scoped to the authenticated client and immutable file /
+// candidate identity. Closing a panel is not the same as cancelling its draft.
+// This deliberately stays in memory, not browser storage or user files.
+type ReviewDraftMemory = { identity: string; draft: ArtifactReviewDraft | null; note: string }
+const reviewDrafts = new WeakMap<object, Map<string, ReviewDraftMemory>>()
+function savedDrafts(client: object): Map<string, ReviewDraftMemory> {
+  let drafts = reviewDrafts.get(client)
+  if (!drafts) { drafts = new Map(); reviewDrafts.set(client, drafts) }
+  return drafts
+}
+
+export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = null, contextAvailable = true, theme: suppliedTheme }: {
   selection: ArtifactSelection
+  fallbackFocus?: HTMLElement | null
+  contextAvailable?: boolean
+  theme?: 'day' | 'night'
   onClose(): void
   onRefresh(): Promise<void>
 }): React.JSX.Element {
@@ -43,8 +63,9 @@ export function ArtifactView({ selection, onClose, onRefresh }: {
 
   // 触发浮层的那个元素：关闭后焦点必须回到它，找不到就交给浏览器默认处理。
   const opener = useRef<HTMLElement | null>(typeof document !== 'undefined' && document.activeElement instanceof HTMLElement ? document.activeElement : null)
-  // 主题只读一次：浮层挂在 portal 里，取 .ln-app 上已经生效的那一个值。
-  const [theme] = useState(() => document.querySelector('.ln-app')?.getAttribute('data-theme') ?? undefined)
+  // The app supplies the live theme across this portal; legacy callers use the initial app theme.
+  const [initialTheme] = useState(() => document.querySelector('.ln-app')?.getAttribute('data-theme') ?? undefined)
+  const theme = suppliedTheme ?? initialTheme
 
   const facts = useMemo(
     () => artifactCandidateFacts(bundle, artifact, selection.candidate),
@@ -66,20 +87,51 @@ export function ArtifactView({ selection, onClose, onRefresh }: {
     return () => { live = false }
   }, [client, missionId, artifact.artifactId, retry])
 
-  // 换一份产物就丢掉上一份的草稿/回执/错误：不能把 A 的理由提交到 B 上。
+  // Keep unknown writes under their original immutable intent. Reopening the same
+  // artifact restores that intent instead of creating another acceptance command.
+  const candidateId = facts.candidate?.candidateId ?? null
+  const draftKey = `${missionId}\0${artifact.artifactId}\0${candidateId ?? 'none'}`
+  const draftIdentity = `${artifact.sha256}\0${facts.candidate?.contentHash ?? 'none'}\0${facts.candidate?.acceptanceCriteria.version ?? 'none'}`
   const [draft, setDraft] = useState<ArtifactReviewDraft | null>(null)
   const [reviewNote, setReviewNote] = useState('')
   const [failure, setFailure] = useState<string | null>(null)
-  // 写入回执：一旦拿到就锁住入口，即使父级投影还没刷新（selection 仍旧）也不会重复验收。
   const [receipt, setReceipt] = useState<LoomReviewRecordReceipt | null>(null)
+  const [attempt, setAttempt] = useState<ArtifactReviewAttempt | null>(null)
   const [pending, setPending] = useState(false)
+  const writeScope = useRef(0)
+  const sending = useRef(false)
   useEffect(() => {
-    setDraft(null)
-    setReviewNote('')
-    setFailure(null)
+    const recovered = candidateId === null ? null : recallUnconfirmedReviewAttempt(client, missionId, candidateId)
+    writeScope.current += 1
+    sending.current = false
+    const saved = savedDrafts(client).get(draftKey)
+    const restored: ArtifactReviewDraft | null = recovered !== null ? {
+      candidateId: recovered.candidateId, verdict: recovered.payload.verdict,
+      reason: recovered.payload.reason,
+      satisfied: recovered.payload.criteriaResults.filter(row => row.satisfied).map(row => row.criterionId)
+    } : saved?.identity === draftIdentity && saved.draft !== null ? { ...saved.draft, satisfied: [...saved.draft.satisfied] } : null
+    setAttempt(recovered)
+    setDraft(restored)
+    setReviewNote(restored?.reason ?? (saved?.identity === draftIdentity ? saved.note : ''))
+    setFailure(recovered === null ? null : '此前的验收请求尚未确认。已保留原请求，重试不会新增一次验收。')
     setReceipt(null)
     setPending(false)
-  }, [artifact.artifactId])
+    return () => { writeScope.current += 1 }
+  }, [client, missionId, artifact.artifactId, candidateId, draftKey, draftIdentity])
+
+  const saveDraft = (value: ArtifactReviewDraft | null): void => {
+    setDraft(value)
+    setReviewNote(value?.reason ?? '')
+    const store = savedDrafts(client)
+    if (value === null) store.delete(draftKey)
+    else {
+      store.delete(draftKey)
+      store.set(draftKey, { identity: draftIdentity, draft: { ...value, satisfied: [...value.satisfied] }, note: value.reason })
+      // Bound only unsent convenience drafts; unknown write intents live in the
+      // separate non-evicting command recovery store and are never discarded here.
+      while (store.size > 32) store.delete(store.keys().next().value!)
+    }
+  }
 
   // 下载只对已取到的正文快照成立：没有正文就没有按钮，避免点了没反应的假动作。
   const download = preview.status === 'ready' ? { text: preview.text, name: fileName } : null
@@ -95,36 +147,54 @@ export function ArtifactView({ selection, onClose, onRefresh }: {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  const toggleCriterion = (criterionId: string): void => setDraft(current => current === null ? current : {
-    ...current,
-    satisfied: current.satisfied.includes(criterionId)
-      ? current.satisfied.filter(id => id !== criterionId)
-      : [...current.satisfied, criterionId]
-  })
+  const toggleCriterion = (criterionId: string): void => {
+    if (draft !== null) saveDraft({ ...draft, satisfied: draft.satisfied.includes(criterionId)
+      ? draft.satisfied.filter(id => id !== criterionId) : [...draft.satisfied, criterionId] })
+  }
 
   const record = async (): Promise<void> => {
-    // 只有用户按下提交才会走到这里；没有自动接受路径。
-    if (draft === null || pending || facts.candidate === null) return
-    if (draft.candidateId !== facts.candidate.candidateId) return
-    if (!reviewDraftComplete(draft, facts)) return
-    // 提交前再用当前投影核一次链头：数据旧了就不给「假绿」，让用户刷新后重来。
-    if (!facts.latest) {
-      setFailure('这份成果已不是最新版本，请刷新后再决定')
+    // This path is only entered by an explicit user action, never by opening a file.
+    if (sending.current || pending || !contextAvailable || facts.candidate === null || receipt !== null) return
+    const scope = writeScope.current
+    const current = (): boolean => scope === writeScope.current
+    let intent = attempt ?? recallUnconfirmedReviewAttempt(client, missionId, facts.candidate.candidateId)
+    if (intent === null && (draft === null || draft.candidateId !== facts.candidate.candidateId || !facts.latest || !facts.reviewable)) {
+      setFailure('这份成果现在不可提交，请刷新记录后再决定')
       return
     }
+    sending.current = true
     setPending(true)
     setFailure(null)
     try {
-      const result = await submitArtifactReview(client, missionId, facts, draft)
-      // 回执即本地事实：表单立刻收起并保持锁住，父级刷新失败也不会重复提交。
-      setReceipt(result)
-      setDraft(null)
-      setPending(false)
-      await onRefresh()
+      if (intent === null) {
+        intent = prepareArtifactReviewAttempt(missionId, facts, draft!)
+        rememberUnconfirmedReviewAttempt(client, intent)
+      }
+      setAttempt(intent)
+      const outcome = await sendArtifactReviewAttempt(client, intent)
+      if (outcome.state === 'completed') {
+        discardUnconfirmedReviewAttempt(client, intent, 'confirmed_receipt')
+        savedDrafts(client).delete(draftKey)
+        if (!current()) return
+        setReceipt(outcome.receipt)
+        setAttempt(null)
+        setDraft(null)
+        setReviewNote('')
+        try { await onRefresh() } catch (error) {
+          if (current()) setFailure('验收已记录，但列表刷新失败：'+readErrorMessage(error, '请稍后刷新'))
+        }
+      } else if (outcome.state === 'rejected') {
+        discardUnconfirmedReviewAttempt(client, intent, 'confirmed_rejection')
+        if (!current()) return
+        setAttempt(null)
+        setFailure('请求被主机拒绝：'+outcome.message)
+      } else if (current()) {
+        setFailure(outcome.message+'。结果仍未确认；请重试原请求，不要改写为另一条验收。')
+      }
     } catch (error) {
-      // 失败保留草稿（含理由与勾选），用户改完再提交，不用重写一遍。
-      setFailure(readErrorMessage(error, '验收写入失败'))
-      setPending(false)
+      if (current()) setFailure(readErrorMessage(error, '暂时不能提交验收'))
+    } finally {
+      if (current()) { sending.current=false; setPending(false) }
     }
   }
 
@@ -159,7 +229,7 @@ export function ArtifactView({ selection, onClose, onRefresh }: {
   // 可写入口只有一种条件：候选是链头且尚无评审；已有回执则一律锁住。
   const candidate = facts.candidate
   const versionLabel = artifactVersionLabel(facts)
-  const canSubmit = draft !== null && !pending && facts.reviewable && receipt === null && reviewDraftComplete(draft, facts)
+  const canSubmit = contextAvailable && !pending && receipt === null && (attempt !== null || (draft !== null && facts.reviewable && facts.latest && reviewDraftComplete(draft, facts)))
   const documentTitle = preview.status === 'ready' && markdown ? /^\s*#\s+(.+)$/mu.exec(preview.text)?.[1] ?? fileName : fileName
 
   return <Dialog.Root open onOpenChange={next => { if (!next) onClose() }}>
@@ -172,7 +242,7 @@ export function ArtifactView({ selection, onClose, onRefresh }: {
           aria-describedby={undefined}
           onCloseAutoFocus={event => {
             event.preventDefault()
-            const target = opener.current
+            const target = opener.current?.isConnected ? opener.current : fallbackFocus
             if (target !== null && target.isConnected) target.focus({ preventScroll: true })
           }}
         >
@@ -196,6 +266,7 @@ export function ArtifactView({ selection, onClose, onRefresh }: {
             </span>
           </header>
 
+          {!contextAvailable && <div className="ln-artifact-state" role="alert">工作记录已变化或暂时无法核对。正文仍可阅读，重新取得当前记录前不能提交验收。<button type="button" className="ln-artifact-retry" onClick={()=>{void onRefresh().catch(error=>setFailure(readErrorMessage(error, '刷新失败')))}}>刷新记录</button></div>}
           <div className="ln-artifact-body">
             <div className="ln-artifact-document">
               <h2 className="ln-artifact-doc-title">{documentTitle}</h2>
@@ -278,27 +349,33 @@ export function ArtifactView({ selection, onClose, onRefresh }: {
                   ? <p className="ln-artifact-fact-note">历史版本不再接受或退回；接受只对最新候选生效。</p>
                   : null}
 
-              {candidate !== null && facts.latest && facts.review === null && receipt === null && draft === null
+              {contextAvailable && candidate !== null && facts.latest && facts.review === null && receipt === null && attempt === null && draft === null
                 && <div className="ln-artifact-review-composer">
-                  <textarea aria-label="审阅意见草稿" placeholder="写下审阅意见…" value={reviewNote} onChange={event => setReviewNote(event.target.value)} rows={2}/>
+                  <textarea aria-label="审阅意见草稿" placeholder="写下审阅意见…" value={reviewNote} onChange={event => {
+                    const note=event.target.value; setReviewNote(note)
+                    const store=savedDrafts(client); store.delete(draftKey)
+                    store.set(draftKey,{identity:draftIdentity,draft:null,note})
+                    while(store.size>32)store.delete(store.keys().next().value!)
+                  }} rows={2}/>
                   <div className="ln-artifact-actions">
                   <button
                     type="button" className="ln-artifact-accept" disabled={pending}
-                    onClick={() => { setFailure(null); setDraft({ ...newReviewDraft(candidate.candidateId, 'accepted'), reason: reviewNote }) }}
+                    onClick={() => { setFailure(null); saveDraft({ ...newReviewDraft(candidate.candidateId, 'accepted'), reason: reviewNote }) }}
                   >接受</button>
                   <button
                     type="button" className="ln-artifact-reject" disabled={pending}
-                    onClick={() => { setFailure(null); setDraft({ ...newReviewDraft(candidate.candidateId, 'rejected'), reason: reviewNote }) }}
+                    onClick={() => { setFailure(null); saveDraft({ ...newReviewDraft(candidate.candidateId, 'rejected'), reason: reviewNote }) }}
                   >退回</button>
                   </div>
                 </div>}
 
+              {attempt !== null && <p className="ln-artifact-fact-note" role="status">原验收请求已冻结。核对结束前不会改动理由或另建一次提交；关闭此面板后仍会在当前应用会话保留待确认请求。</p>}
               {draft !== null && candidate !== null && <form
                 className="ln-artifact-review-form"
                 data-verdict={draft.verdict}
                 onSubmit={event => { event.preventDefault(); void record() }}
               >
-                <fieldset className="ln-artifact-review-criteria">
+                <fieldset className="ln-artifact-review-criteria" disabled={pending || attempt !== null || !contextAvailable}>
                   <legend>逐条确认（接受需全部勾选）</legend>
                   {facts.criteria.length === 0
                     ? <p className="ln-artifact-fact-note">这份候选的快照没有逐条标准，只需要写明理由。</p>
@@ -315,22 +392,20 @@ export function ArtifactView({ selection, onClose, onRefresh }: {
                 <label className="ln-artifact-review-reason-label" htmlFor="ln-artifact-reason">验收理由（必填）</label>
                 <textarea
                   id="ln-artifact-reason"
+                  readOnly={pending || attempt !== null || !contextAvailable}
                   className="ln-artifact-review-reason"
                   rows={3}
                   value={draft.reason}
                   placeholder="说明依据；接受会按上面的逐条结论写入。"
-                  onChange={event => {
-                    const reason = event.target.value
-                    setDraft(current => current === null ? current : { ...current, reason })
-                  }}
+                  onChange={event => { if (draft !== null) saveDraft({ ...draft, reason: event.target.value }) }}
                 />
                 <div className="ln-artifact-actions">
                   <button type="submit" className="ln-artifact-accept" disabled={!canSubmit}>
-                    {draft.verdict === 'accepted' ? '确认接受' : '确认退回'}
+                    {pending ? '正在核对回执…' : attempt !== null ? '核对并重试原请求' : draft.verdict === 'accepted' ? '确认接受' : '确认退回'}
                   </button>
                   <button
-                    type="button" className="ln-artifact-cancel" disabled={pending}
-                    onClick={() => { setDraft(null); setFailure(null) }}
+                    type="button" className="ln-artifact-cancel" disabled={pending || attempt !== null}
+                    onClick={() => { saveDraft(null); setFailure(null) }}
                   >取消</button>
                 </div>
               </form>}
