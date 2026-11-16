@@ -82,6 +82,7 @@ test('every gate runs before the push step', () => {
     'node --test scripts/lib/loom-container-contract.test.mjs',
     'node scripts/build-server.mjs --target-key linux-x64 --debug',
     'Refuse a dirty or mismatched package manifest',
+    'node --test --test-concurrency=1 scripts/lib/host-lifecycle.test.mjs',
     'scripts/lib/server-install.test.mjs',
     'Run the repository Gate A smoke as uid 10001 inside the image',
     'Assert the runtime image is unprivileged, toolchain-free and Pi-free',

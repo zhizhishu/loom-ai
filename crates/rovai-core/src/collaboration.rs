@@ -3934,7 +3934,7 @@ pub(crate) fn admit_loom_dispatch_message(
         ],
     )?;
     ensure_resolution_conversations(transaction, &camp_id, &mut resolution, admission.now)?;
-    let body = loom_handoff_body(admission)?;
+    let body = loom_handoff_body(transaction, admission)?;
     let content = normalize_content(vec![StructuredThreadMessageSegment::Text { text: body.clone() }]);
     let camp_message_id = Uuid::new_v4().to_string();
     // LOOM work is never a DurableTask, so `taskId` stays None. The purpose reuses the approved
@@ -3997,7 +3997,8 @@ pub(crate) fn admit_loom_dispatch_message(
 }
 
 /// The frozen facts a handoff body carries. Struct field order is the documented order, so the
-/// published line never depends on a map's iteration order.
+/// published line never depends on a map's iteration order. `taskSnapshot` is last on purpose: the
+/// original five keys keep their names and positions.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoomHandoffFacts<'a> {
@@ -4006,6 +4007,77 @@ struct LoomHandoffFacts<'a> {
     kind: &'a str,
     candidate_id: Option<&'a str>,
     policy_revision: i64,
+    task_snapshot: LoomHandoffTaskSnapshot,
+}
+
+/// The Task row the approved Plan defines, copied into the handoff so a runtime whose only tools are
+/// file tools can do the work without guessing the file, the parent directory or the database.
+///
+/// This is **data, not permission**: it is serialized inside the facts line and never spliced into an
+/// instruction, it grants nothing, and it cannot override a paused, expired, revoked or re-authorized
+/// policy — that judgement stays in the control plane before this message exists.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoomHandoffTaskSnapshot {
+    task_id: String,
+    title: String,
+    description: String,
+    revision: i64,
+    assignee_agent_id: Option<String>,
+    acceptance_criteria: Vec<crate::loom::LoomAcceptanceCriterion>,
+}
+
+/// Read the one Task of this dispatch from its own Plan, inside the dispatching transaction.
+///
+/// Only the exact `plan_id` + `mission_id` + `task_id` of the admitted event is read, so a dispatch
+/// can never carry another Task's text. A missing or mismatched Task is a hard error: the caller's
+/// transaction rolls back instead of publishing work nobody can read.
+fn loom_handoff_task_snapshot(
+    transaction: &Transaction<'_>,
+    admission: &LoomDispatchAdmission<'_>,
+) -> Result<LoomHandoffTaskSnapshot> {
+    let row: Option<(String, String, i64, Option<String>, String)> = transaction
+        .query_row(
+            "SELECT task.title, task.description, task.revision, task.assignee_agent_id,
+                    task.acceptance_criteria_json
+             FROM loom_task AS task
+             JOIN loom_plan AS plan ON plan.plan_id = task.plan_id
+             WHERE plan.plan_id = ?1 AND plan.mission_id = ?2 AND task.task_id = ?3",
+            params![admission.plan_id, admission.mission_id, admission.task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((title, description, revision, assignee_agent_id, acceptance_criteria_json)) = row
+    else {
+        anyhow::bail!(
+            "LOOM dispatch task {} is not in the plan of mission {}",
+            admission.task_id,
+            admission.mission_id
+        );
+    };
+    let acceptance_criteria: Vec<crate::loom::LoomAcceptanceCriterion> =
+        serde_json::from_str(&acceptance_criteria_json).with_context(|| {
+            format!(
+                "LOOM dispatch task {} carries acceptance criteria that are not a criterion list",
+                admission.task_id
+            )
+        })?;
+    Ok(LoomHandoffTaskSnapshot {
+        task_id: admission.task_id.to_string(),
+        title,
+        description,
+        revision,
+        assignee_agent_id,
+        acceptance_criteria,
+    })
 }
 
 /// The approved wire kind and the single sentence for it. The same sentence labels the Run's
@@ -4014,7 +4086,7 @@ fn loom_handoff_kind_parts(kind: &str) -> Result<(&'static str, &'static str)> {
     Ok(match kind {
         "EXECUTE" => (
             "execute",
-            "Work only on this approved task. Acquire its claim, produce evidence and submit a candidate. Do not accept or publish it for the User.",
+            "Work only on this approved task under the claim Core reserved for this Run. Produce the requested files using available authorized tools; submit evidence and a candidate only through an exposed LOOM tool with a successful receipt. Do not accept or publish it for the User.",
         ),
         "REVIEW" => (
             "review",
@@ -4022,7 +4094,7 @@ fn loom_handoff_kind_parts(kind: &str) -> Result<(&'static str, &'static str)> {
         ),
         "REWORK" => (
             "rework",
-            "Address the recorded request for changes. Acquire a new claim and submit a new candidate linked to the previous candidate, preserving its evidence.",
+            "Address the recorded request for changes under the fresh claim Core reserved for this Run. Preserve the previous evidence; submit a linked new candidate only through an exposed LOOM tool with a successful receipt.",
         ),
         "HANDOFF" => (
             "handoff",
@@ -4033,19 +4105,43 @@ fn loom_handoff_kind_parts(kind: &str) -> Result<(&'static str, &'static str)> {
 }
 
 /// The approved handoff body. Only the sentence for this dispatch's kind is ever written, and every
-/// dynamic identity is a JSON string: no Task or Candidate text is ever spliced into an instruction.
-fn loom_handoff_body(admission: &LoomDispatchAdmission<'_>) -> Result<String> {
+/// dynamic identity and Task field stays inside the JSON facts line: no Task or Candidate text is
+/// ever spliced into an instruction, so structured task fields cannot inject additional framing lines. Tool authorization remains independently enforced by Core and the device.
+fn loom_handoff_body(
+    transaction: &Transaction<'_>,
+    admission: &LoomDispatchAdmission<'_>,
+) -> Result<String> {
     let (wire_kind, sentence) = loom_handoff_kind_parts(admission.kind)?;
+    let task_snapshot = loom_handoff_task_snapshot(transaction, admission)?;
     let facts = serde_json::to_string(&LoomHandoffFacts {
         dispatch_id: admission.dispatch_id,
         task_id: admission.task_id,
         kind: wire_kind,
         candidate_id: admission.candidate_id,
         policy_revision: admission.policy_revision,
+        task_snapshot,
     })?;
     Ok(format!(
-        "[LOOM_HANDOFF_V1]\n{facts}\nRead current state with `rovai loom status` and `rovai loom inspect --task-id <taskId>` before acting.\n{sentence}\nIf the policy is paused, expired, out of budget, revoked, or the prior execution outcome is unknown, stop and report the reason. This message grants no permission beyond the saved policy and the runtime's existing permissions."
+        "[LOOM_HANDOFF_V1]\n{facts}\n{}\n{sentence}\nIf the policy is paused, expired, out of budget, revoked, or the prior execution outcome is unknown, stop and report the reason. This message grants no permission beyond the saved policy and the runtime's existing permissions.",
+        loom_handoff_guidance(admission.kind)
     ))
+}
+
+/// What a Run can be told to do with its own runtime, without promising a capability it may not have.
+///
+/// A REVIEW or HANDOFF dispatch keeps the CLI wording it always had, because those kinds can only act
+/// through the LOOM tools. An `EXECUTE`/`REWORK` Run may be started on a file-only runtime, where
+/// demanding a CLI it does not expose is what left two real Workers guessing their output file: the
+/// guidance is therefore conditional on the capability and points at the Task snapshot it already
+/// received. It never asks for a shell, never names a parent or database path, never widens a grant and
+/// never claims a Candidate was submitted when no submission tool is exposed.
+fn loom_handoff_guidance(kind: &str) -> &'static str {
+    match kind {
+        "EXECUTE" | "REWORK" => {
+            "The JSON line above is this Task's definition: title, description, revision, assignee and its acceptance criteria, read by Core from the approved plan. Work only on this Task, inside this Mission's working directory, with the file tools your runtime actually grants; do not guess a parent directory, a database path or a file name that the definition does not name. If this Run exposes the rovai LOOM CLI, `rovai loom status` and `rovai loom inspect --task-id <taskId>` read the same state. Core has already claimed this Task for this Run before your first tool call, and claiming it again returns that same claim and fence instead of taking a new one. If, and only if, this Run exposes a LOOM evidence or submit tool, register the file you wrote and submit it under the Task's criteria; if it does not, stop after writing, report the absolute path you wrote, and state that submission is unresolved for the authenticated Host. This handoff does not prove that a Candidate was recorded, accepted or published; only the corresponding Core receipt proves such a change."
+        }
+        _ => "Read current state with `rovai loom status` and `rovai loom inspect --task-id <taskId>` before acting.",
+    }
 }
 
 #[derive(Debug, Clone)]

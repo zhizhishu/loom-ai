@@ -104,7 +104,7 @@ jobs:
       - name: Verify actual Core pre-execution claims and Persona admission
         run: |
           set -euo pipefail
-          for owner in a_claimed_loom_batch_rechecks_every_dispatch_before_runtime_start pi_purge_selection_roundtrips_without_entering_runtime_permissions; do
+          for owner in a_claimed_loom_batch_rechecks_every_dispatch_before_runtime_start loom_dispatch_writes_one_ledger_row_and_one_delivery_across_restarts pi_purge_selection_roundtrips_without_entering_runtime_permissions; do
             log="$RUNNER_TEMP/$owner.log"
             cargo test --locked -p rovai-core --features extended-tests --lib "$owner" -- --nocapture > "$log" 2>&1 || { tail -100 "$log"; exit 1; }
             tail -12 "$log"
@@ -141,7 +141,7 @@ jobs:
           ROVAI_SERVER_RELEASE_DIR: ${{ github.workspace }}/out/server/releases/linux-x64
           ROVAI_WEB_UI: ${{ github.workspace }}/out/server/linux-x64/web-ui
         run: |
-          node --test scripts/lib/host-lifecycle.test.mjs scripts/lib/host-web.test.mjs \
+          node --test --test-concurrency=1 scripts/lib/host-lifecycle.test.mjs scripts/lib/host-web.test.mjs \
             scripts/lib/host-web-channels.test.mjs scripts/lib/server-entry.test.mjs \
             scripts/lib/server-install.test.mjs
 
