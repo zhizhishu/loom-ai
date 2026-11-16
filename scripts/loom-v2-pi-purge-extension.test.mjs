@@ -355,9 +355,37 @@ test("16 receipt target swapped for a non-regular file is refused before append"
     await rm(binding.binding.receiptPath)
     await mkdir(binding.binding.receiptPath)
     const [prompt] = await host.trigger("before_agent_start", { systemPrompt: HOST_PROMPT, systemPromptOptions: { cwd: "C:/fake" } })
-    assert.ok(prompt && typeof prompt.systemPrompt === "string", "prompt path still works without a receipt")
+    assert.equal(prompt, undefined, "unrecorded persona must not be applied; preserve the native host prompt")
     assert.equal((await stat(binding.binding.receiptPath)).isDirectory(), true, "receipt target must be left untouched")
   } finally {
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("17 missing local receipt prevents both activation and prompt application", async () => {
+  // The two timings cover distinct transitions: reset admission and final prompt commit.
+  for (const timing of ["before_session", "after_activation"]) {
+    const dir = await makeRunDir()
+    try {
+      const { configPath } = await writeConfig(dir)
+      const loaded = loadManagedBinding({ configPath, expectedRun: RUN, env: {} })
+      assert.equal(loaded.ok, true)
+      const host = createMockApi()
+      await registerManagedPiPurge(host.api, loaded.binding)
+      if (timing === "after_activation") await host.trigger("session_start", {})
+      await rm(loaded.binding.receiptPath, { force: true })
+      await mkdir(loaded.binding.receiptPath)
+      if (timing === "before_session") await host.trigger("session_start", {})
+      const payload = { systemPrompt: HOST_PROMPT, systemPromptOptions: { cwd: "C:/fake" } }
+      assert.equal((await host.trigger("before_agent_start", payload))[0], undefined, timing)
+      assert.equal((await stat(loaded.binding.receiptPath)).isDirectory(), true)
+      // Removing the obstacle cannot silently reactivate the persona mid-session.
+      await rm(loaded.binding.receiptPath, { recursive: true })
+      assert.equal((await host.trigger("before_agent_start", payload))[0], undefined, timing)
+      await host.trigger("session_start", {})
+      assert.ok((await host.trigger("before_agent_start", payload))[0]?.systemPrompt.endsWith(HOST_PROMPT))
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   }
 })

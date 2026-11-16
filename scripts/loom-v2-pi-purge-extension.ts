@@ -324,7 +324,10 @@ export async function registerManagedPiPurge(api, binding) {
     return { ok: true }
   }
 
+  let activationAdmitted = false
+
   async function onSessionStart() {
+    activationAdmitted = false
     const checked = recheck()
     if (!checked.ok) {
       writeReceipt({ ...baseRecord("session_start"), activated: false, refused: checked.code })
@@ -342,11 +345,12 @@ export async function registerManagedPiPurge(api, binding) {
     await captured.purge.handler("mode append", ctx)
     await captured.purge.handler("on", ctx)
     const activated = ctx.notifications.some((entry) => entry.text.includes("已开启"))
-    writeReceipt({ ...baseRecord("session_start"), activated, reason: activated ? null : "activation_not_confirmed" })
+    const recorded = writeReceipt({ ...baseRecord("session_start"), activated, reason: activated ? null : "activation_not_confirmed" })
+    activationAdmitted = activated && recorded
   }
 
   async function onBeforeAgentStart(event) {
-    if (binding.mode === "off") return undefined
+    if (binding.mode === "off" || !activationAdmitted) return undefined
     const checked = recheck()
     if (!checked.ok) {
       writeReceipt({ ...baseRecord("before_agent_start"), applied: false, refused: checked.code })
@@ -364,13 +368,18 @@ export async function registerManagedPiPurge(api, binding) {
       writeReceipt({ ...baseRecord("before_agent_start"), applied: false, reason: "host_text_not_preserved" })
       return undefined
     }
-    writeReceipt({
+    const recorded = writeReceipt({
       ...baseRecord("before_agent_start"),
       applied: true,
       reason: null,
       promptDigest: sha256Hex(Buffer.from(result.systemPrompt, "utf8")),
       hostTextDigest: sha256Hex(Buffer.from(hostText, "utf8")),
     })
+    // Without a written local receipt, do not apply a persona the Host cannot account for.
+    if (!recorded) {
+      activationAdmitted = false
+      return undefined
+    }
     return result
   }
 
