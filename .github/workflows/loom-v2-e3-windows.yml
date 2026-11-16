@@ -23,6 +23,8 @@ on:
       - scripts/fixtures/loom-*/**
       - scripts/package-embedded-pi.mjs
       - scripts/runtime/pi-source/**
+      - scripts/start-loom-personal.cmd
+      - docs/loom/LOOM-PERSONAL-CANDIDATE.md
       - package.json
       - pnpm-workspace.yaml
       - pnpm-lock.yaml
@@ -255,6 +257,58 @@ jobs:
             E6 = 'NOT_RUN'
             E7 = 'NOT_RUN'
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence 'e3-manifest.json') -Encoding utf8
+
+      - name: Assemble isolated personal preview only after E3 passes
+        if: success()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kit = Join-Path $env:RUNNER_TEMP 'loom-personal-preview'
+          if (Test-Path $kit) { throw 'Refusing to replace an existing candidate package' }
+          New-Item -ItemType Directory -Path $kit | Out-Null
+          foreach ($name in @('rovai-host', 'rovai-server', 'rovai-core', 'rovai')) {
+            Copy-Item "target/debug/$name.exe" $kit
+          }
+          Copy-Item out/web (Join-Path $kit 'web-ui') -Recurse
+          Copy-Item skills (Join-Path $kit 'skills') -Recurse
+          New-Item -ItemType Directory -Path (Join-Path $kit 'runtime') | Out-Null
+          Copy-Item resources/runtime/pi (Join-Path $kit 'runtime/pi') -Recurse
+          node scripts/package-embedded-pi.mjs --verify --destination (Join-Path $kit 'runtime/pi')
+          if ($LASTEXITCODE -ne 0) { throw 'Copied candidate Pi bundle failed verification' }
+          Copy-Item LICENSE (Join-Path $kit 'LICENSE')
+          Copy-Item scripts/start-loom-personal.cmd (Join-Path $kit 'Start-Loom.cmd')
+          Copy-Item docs/loom/LOOM-PERSONAL-CANDIDATE.md (Join-Path $kit 'README.md')
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'loom-v2-e3/e3-manifest.json') (Join-Path $kit 'e3-manifest.json')
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          "schema=1`nversion=$version`ntarget=windows-x64`n" | Set-Content (Join-Path $kit 'package-info') -Encoding ascii
+          "[InternetShortcut]`r`nURL=http://127.0.0.1:64852/`r`n" | Set-Content (Join-Path $kit 'Open-Loom.url') -Encoding ascii
+          $hashes = [ordered]@{}
+          foreach ($file in (Get-ChildItem -LiteralPath $kit -File -Recurse -Force | Sort-Object FullName)) {
+            $relative = [System.IO.Path]::GetRelativePath($kit, $file.FullName).Replace('\', '/')
+            $hashes[$relative] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          [ordered]@{
+            qualification = 'isolated-personal-development-preview'
+            version = $version
+            target = 'windows-x64'
+            profile = 'debug'
+            commit = $env:LOOM_SOURCE_COMMIT
+            E3 = 'PASS_SCRIPTED_PROVIDER_ONLY'
+            realProviderVerified = $false
+            ownerAccepted = $false
+            dailyDataIncluded = $false
+            embeddedPiVersion = '0.85.1'
+            files = $hashes
+          } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $kit 'candidate-manifest.json') -Encoding utf8
+
+      - name: Upload complete non-release personal preview
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-personal-preview-windows-${{ env.LOOM_SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/loom-personal-preview/
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Upload only validated candidate E3 evidence (no build binaries)
         # A failed or credential-shaped TAP stays in restricted job logs; never upload it.
