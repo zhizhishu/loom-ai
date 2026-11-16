@@ -1507,9 +1507,15 @@ impl CodexRuntime {
         options: CodexThreadStartOptions<'_>,
         trust: Option<&hook_trust::NativeHookTrust>,
     ) -> Result<String> {
+        let requested_sandbox = options.sandbox.to_string();
         let (method, request) = thread_start_or_resume_request(cwd, existing_thread_id, options)?;
         let verification_request = trust.map(|_| request.clone());
         let result = self.rpc(method, request).await?;
+        // The native Host reports the policy it actually applies. A requested
+        // sandbox it did not adopt fails here, before this Run binds the Thread
+        // or sends any input: otherwise Core keeps reporting a write-capable Run
+        // while the native sandbox denies every write.
+        verify_effective_sandbox(&requested_sandbox, &result)?;
         let observed_model_id = runtime_model_id_from_thread_response(&result);
         let thread_id = result
             .pointer("/thread/id")
@@ -1847,6 +1853,114 @@ fn agent_runtime_workspace_roots(
         .into_iter()
         .map(|root| root.to_string_lossy().into_owned())
         .collect()
+}
+
+/// Map a requested native sandbox mode to the policy type the Thread response
+/// must echo. `sandbox` is a required field of the pinned v2 `thread/start` and
+/// `thread/resume` responses.
+fn expected_sandbox_policy_type(requested: &str) -> Result<&'static str> {
+    match requested {
+        "read-only" => Ok("readOnly"),
+        "workspace-write" => Ok("workspaceWrite"),
+        "danger-full-access" => Ok("dangerFullAccess"),
+        _ => bail!("codex_native_sandbox_mode_invalid"),
+    }
+}
+
+/// Fail unless the native Thread response echoes the requested sandbox policy.
+/// The diagnostic carries only the two mode names: no paths, credentials, or
+/// resolved native policy documents.
+fn verify_effective_sandbox(requested: &str, response: &Value) -> Result<()> {
+    let expected = expected_sandbox_policy_type(requested)?;
+    let effective = match response.pointer("/sandbox/type").and_then(Value::as_str) {
+        Some("readOnly") => "readOnly",
+        Some("workspaceWrite") => "workspaceWrite",
+        Some("dangerFullAccess") => "dangerFullAccess",
+        Some("externalSandbox") => "externalSandbox",
+        _ => "unknown",
+    };
+    anyhow::ensure!(
+        effective == expected,
+        "codex_native_sandbox_mismatch: requested {requested}, effective {effective}"
+    );
+    Ok(())
+}
+
+// The policy readback matrix is pure and security-critical, so it belongs to the
+// default cheap test suite, not the extended native-process fixture group.
+#[cfg(test)]
+mod native_policy_tests {
+    use super::verify_effective_sandbox;
+    use serde_json::json;
+
+    #[test]
+    fn effective_sandbox_readback_matches_the_requested_mode_or_fails_closed() {
+        // `None` accepts; otherwise the diagnostic code the case must raise.
+        let cases = [
+            ("read-only", json!({"sandbox": {"type": "readOnly"}}), None),
+            (
+                "workspace-write",
+                json!({"sandbox": {"type": "workspaceWrite"}}),
+                None,
+            ),
+            (
+                "danger-full-access",
+                json!({"sandbox": {"type": "dangerFullAccess"}}),
+                None,
+            ),
+            // The observed native Host kept its read-only policy.
+            (
+                "workspace-write",
+                json!({"sandbox": {"type": "readOnly"}}),
+                Some("codex_native_sandbox_mismatch"),
+            ),
+            (
+                "read-only",
+                json!({"thread": {"id": "thread-1"}}),
+                Some("codex_native_sandbox_mismatch"),
+            ),
+            (
+                "read-only",
+                json!({"sandbox": null}),
+                Some("codex_native_sandbox_mismatch"),
+            ),
+            (
+                "read-only",
+                json!({"sandbox": {"type": 7}}),
+                Some("codex_native_sandbox_mismatch"),
+            ),
+            (
+                "read_write",
+                json!({"sandbox": {"type": "readOnly"}}),
+                Some("codex_native_sandbox_mode_invalid"),
+            ),
+        ];
+        for (requested, response, expected) in cases {
+            match expected {
+                None => verify_effective_sandbox(requested, &response).unwrap(),
+                Some(code) => {
+                    let error = verify_effective_sandbox(requested, &response)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(error.contains(code), "{requested}: {error}");
+                    assert!(
+                        !error.contains('/'),
+                        "the diagnostic must not carry a path: {error}"
+                    );
+                }
+            }
+        }
+        let mismatch =
+            verify_effective_sandbox("workspace-write", &json!({"sandbox": {"type": "readOnly"}}))
+                .unwrap_err()
+                .to_string();
+        assert!(mismatch.contains("requested workspace-write"), "{mismatch}");
+        assert!(mismatch.contains("effective readOnly"), "{mismatch}");
+        let missing = verify_effective_sandbox("read-only", &json!({"thread": {"id": "thread-1"}}))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("effective unknown"), "{missing}");
+    }
 }
 
 fn runtime_model_id_from_thread_response(response: &Value) -> Option<String> {
@@ -3401,6 +3515,7 @@ root = os.path.dirname(__file__)
 assert sys.argv[1:] == ['-c', 'allow_login_shell=false', '-c', 'features.memories=false', '-c', 'memories.generate_memories=false', '-c', 'memories.use_memories=false', 'app-server', '--listen', 'stdio://']
 credential = open(os.path.join(root, 'credentials')).read()
 turn = 0
+sandbox_types = {'read-only': 'readOnly', 'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess'}
 for line in sys.stdin:
     req = json.loads(line)
     method = req['method']
@@ -3409,7 +3524,8 @@ for line in sys.stdin:
     if method in ('thread/start', 'thread/resume'):
         thread = req['params'].get('threadId', 'native-fixture')
         if os.path.exists(os.path.join(root, 'wrong-thread')): thread = 'wrong-thread'
-        result = {'thread': {'id': thread}}
+        requested = req['params'].get('sandbox') or 'workspace-write'
+        result = {'thread': {'id': thread}, 'sandbox': {'type': sandbox_types[requested]}}
         with open(os.path.join(root, 'sessions'), 'a') as f: f.write(method + ':' + thread + '\n')
     if method == 'turn/start':
         turn += 1
@@ -3988,6 +4104,7 @@ for line in sys.stdin:
             "init_failure",
             "memory_rejected",
             "fast_rejected",
+            "sandbox_mismatch",
         ] {
             let root = std::env::temp_dir()
                 .join(format!("rovai-codex-live-launch-{}", uuid::Uuid::new_v4()));
@@ -4019,9 +4136,12 @@ for line in sys.stdin:
     elif method == 'model/list':
         response['result'] = {'data': [{'id': 'selected', 'supportedReasoningEfforts': [{'reasoningEffort': 'low'}]}]}
     elif method in ('thread/start', 'thread/resume'):
-        response['result'] = {'thread': {'id': 'thread-fixture'}}
+        requested = request['params'].get('sandbox') or 'workspace-write'
+        response['result'] = {'thread': {'id': 'thread-fixture'}, 'sandbox': {'type': {'read-only': 'readOnly', 'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess'}[requested]}}
         if scenario == 'default':
             response['result']['serviceTier'] = 'priority' if method == 'thread/start' else 'default'
+        if scenario == 'sandbox_mismatch':
+            response['result']['sandbox'] = {'type': 'readOnly'}
     elif method == 'turn/start':
         with open(os.path.join(root, 'turns'), 'a') as log: log.write(json.dumps(request['params']) + '\n')
         if scenario == 'fast_rejected':
@@ -4106,7 +4226,36 @@ for line in sys.stdin:
                             .map(|error| error.code),
                         expected_error
                     );
-                    if authenticated && validation.is_ok() {
+                    if scenario == "sandbox_mismatch" {
+                        let error = runtime
+                            .start_or_resume_thread_with_config(
+                                &root,
+                                None,
+                                CodexThreadStartOptions {
+                                    developer_instructions: None,
+                                    sandbox: "workspace-write",
+                                    approval_policy: "on-request",
+                                    model: None,
+                                    config: None,
+                                    runtime_workspace_roots: None,
+                                    ephemeral: true,
+                                },
+                            )
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert!(error.contains("codex_native_sandbox_mismatch"), "{error}");
+                        assert!(error.contains("requested workspace-write"), "{error}");
+                        assert!(error.contains("effective readOnly"), "{error}");
+                        assert!(
+                            runtime.thread_id().await.is_none(),
+                            "a native policy mismatch must reject before binding the Thread"
+                        );
+                        assert!(
+                            !root.join("turns").exists(),
+                            "a native policy mismatch must reject before any prompt"
+                        );
+                    } else if authenticated && validation.is_ok() {
                         runtime
                             .start_or_resume_thread_with_config(
                                 &root,

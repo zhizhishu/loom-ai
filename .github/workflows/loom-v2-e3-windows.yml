@@ -51,6 +51,7 @@ jobs:
       ROVAI_REQUIRE_ELECTRON_INTEGRATION: '1'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
       LOOM_E3_READY_BUDGET_MS: '180000'
       LOOM_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
@@ -95,6 +96,30 @@ jobs:
           node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs scripts/lib/embedded-pi.test.mjs scripts/lib/windows-native-stack.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'V2 E3 CI contract test failed' }
 
+      - name: Checkout pinned optional Pi Purge source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ZiChuanLan/pi-purge
+          ref: d0196ccfd773b0ed342bd2f25372aff65f1a4a53
+          path: _artifacts/reference-repos/pi-purge-current
+          persist-credentials: false
+
+      - name: Verify Pi Purge source and managed adapter without a model
+        shell: pwsh
+        run: |
+          $source = (Resolve-Path '_artifacts/reference-repos/pi-purge-current').Path
+          $commit = (git -C $source rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $commit -ne 'd0196ccfd773b0ed342bd2f25372aff65f1a4a53') { throw 'Pi Purge reference moved' }
+          # The accepted Windows source pin uses CRLF; normalize only this isolated checkout.
+          git -C $source config --local core.autocrlf true
+          if ($LASTEXITCODE -ne 0) { throw 'Pi Purge checkout configuration failed' }
+          git -C $source -c core.autocrlf=true checkout-index --force --all
+          if ($LASTEXITCODE -ne 0) { throw 'Pi Purge fixed checkout materialization failed' }
+          $sha = (Get-FileHash (Join-Path $source 'extensions/pi-purge.ts') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -ne '983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d') { throw 'Pi Purge source byte pin mismatch' }
+          node --test --test-force-exit scripts/loom-v2-pi-purge-extension.test.mjs scripts/loom-pi-purge-bridge.test.mjs scripts/loom-v2-pi-purge-hook.test.mjs scripts/loom-v2-pi-purge-stage.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Managed Pi Purge regression failed' }
+
       - name: Fresh official Host and native Pi launcher
         shell: pwsh
         run: |
@@ -120,6 +145,17 @@ jobs:
               Write-Host "$name main-stack reserve: $reserve bytes"
             } finally { $reader.Dispose(); $stream.Dispose() }
           }
+
+      - name: Reject native Codex sandbox disagreement before model dispatch
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'loom-codex-policy-test.log'
+          cargo test --locked -p rovai-core --lib codex::native_policy_tests::effective_sandbox_readback_matches_the_requested_mode_or_fails_closed -- --exact *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log -Tail 30
+          if ($code -ne 0) { throw 'Native Codex policy regression failed to compile or pass' }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Native Codex policy regression did not execute exactly once' }
 
       - name: Fresh production Mikka Web bundle
         shell: pwsh
@@ -286,6 +322,14 @@ jobs:
           Copy-Item resources/runtime/pi (Join-Path $kit 'runtime/pi') -Recurse
           node scripts/package-embedded-pi.mjs --verify --destination (Join-Path $kit 'runtime/pi')
           if ($LASTEXITCODE -ne 0) { throw 'Copied candidate Pi bundle failed verification' }
+          $purge = Join-Path $kit 'runtime/extensions/pi-purge'
+          New-Item -ItemType Directory -Path $purge -Force | Out-Null
+          node scripts/loom-v2-pi-purge-stage.mjs --source (Resolve-Path '_artifacts/reference-repos/pi-purge-current').Path --output (Join-Path $purge 'upstream') --output-root $purge --apply
+          if ($LASTEXITCODE -ne 0) { throw 'Optional Pi Purge fixed-source staging failed' }
+          node scripts/loom-v2-pi-purge-stage.mjs --verify (Join-Path $purge 'upstream')
+          if ($LASTEXITCODE -ne 0) { throw 'Optional Pi Purge staged closure mismatch' }
+          Copy-Item scripts/loom-v2-pi-purge-extension.ts (Join-Path $purge 'loom-pi-purge-extension.ts')
+          [ordered]@{ schema = 1; extension = 'pi-purge'; version = '0.3.0'; upstreamCommit = 'd0196ccfd773b0ed342bd2f25372aff65f1a4a53'; defaultEnabled = $false; supportedManagedModes = @('off', 'append'); coreUiBindingVerified = $false; providerVerifiedByThisCi = $false } | ConvertTo-Json | Set-Content (Join-Path $purge 'extension-info.json') -Encoding utf8
           Copy-Item LICENSE (Join-Path $kit 'LICENSE')
           Copy-Item scripts/start-loom-personal.cmd (Join-Path $kit 'Start-Loom.cmd')
           Copy-Item docs/loom/LOOM-PERSONAL-CANDIDATE.md (Join-Path $kit 'README.md')
@@ -309,6 +353,9 @@ jobs:
             ownerAccepted = $false
             dailyDataIncluded = $false
             embeddedPiVersion = '0.85.1'
+            optionalPiPurgeVersion = '0.3.0'
+            piPurgeDefaultEnabled = $false
+            piPurgeCoreUiBindingVerified = $false
             files = $hashes
           } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $kit 'candidate-manifest.json') -Encoding utf8
 
@@ -357,6 +404,10 @@ jobs:
           }
           node scripts/package-embedded-pi.mjs --verify --destination (Join-Path $kit 'runtime/pi')
           if ($LASTEXITCODE -ne 0) { throw 'Delivered Pi closed manifest verification failed' }
+          node scripts/loom-v2-pi-purge-stage.mjs --verify (Join-Path $kit 'runtime/extensions/pi-purge/upstream')
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered optional Pi Purge closed manifest verification failed' }
+          $extensionInfo = Get-Content (Join-Path $kit 'runtime/extensions/pi-purge/extension-info.json') -Raw | ConvertFrom-Json
+          if ($extensionInfo.defaultEnabled -or $extensionInfo.coreUiBindingVerified -or $extensionInfo.providerVerifiedByThisCi) { throw 'Optional Pi Purge has an invalid delivery qualification' }
           [ordered]@{ commit = $env:LOOM_SOURCE_COMMIT; deliveryVerified = $true; verifiedFileCount = $admitted.Count; hiddenFilesPreserved = $true; realProviderVerified = $false; ownerAccepted = $false } | ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'loom-v2-e3/delivery-manifest.json') -Encoding utf8
 
       - name: Upload only validated candidate E3 evidence (no build binaries)
