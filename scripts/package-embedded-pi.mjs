@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -35,6 +36,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawn } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
 
 export const EMBEDDED_PI_VERSION = '0.85.1'
 export const EMBEDDED_PI_PACKAGE = '@earendil-works/pi-coding-agent'
@@ -839,9 +841,31 @@ export async function verifyBundledPi({ root, launchCheck = true }) {
 }
 
 /**
- * Stage the pinned bundle. Never deletes an existing non-empty destination:
- * the tree is built in a sibling temp directory and renamed into place.
+ * Windows scanners can briefly retain executable handles after a successful
+ * probe has closed. Retry only those transient rename errors, never delete a
+ * competing destination or fall back to a non-atomic copy. The bounded retry
+ * keeps a genuinely denied operation a failure.
  */
+export async function commitStagedPi(staging, destination, {
+  platform = process.platform,
+  rename = renameSync,
+  inspect = lstatSync,
+  wait = delay
+} = {}) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    let occupied = false
+    try { inspect(destination); occupied = true } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+    if (occupied) throw new Error('Pi destination appeared while committing the verified staging directory')
+    try { rename(staging, destination); return } catch (error) {
+      if (platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || attempt === 7) throw error
+      await wait(Math.min(50 * (2 ** attempt), 1000))
+    }
+  }
+}
+
+/** Stage a verified sibling tree atomically; never replace a non-empty installation. */
 export async function stageEmbeddedPi({
   source,
   destination,
@@ -925,7 +949,7 @@ export async function stageEmbeddedPi({
     if (launchCheck) await verifyBundledPi({ root: staging })
     // Only an empty destination directory is cleared, and never recursively.
     if (existsSync(destinationRoot)) rmdirSync(destinationRoot)
-    renameSync(staging, destinationRoot)
+    await commitStagedPi(staging, destinationRoot)
     return {
       destination: destinationRoot,
       manifestPath: join(destinationRoot, EMBEDDED_PI_MANIFEST_FILE),

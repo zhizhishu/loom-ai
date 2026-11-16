@@ -24,7 +24,7 @@ test('V2 E3 CI pins versions and isolates both native Host and managed Pi', () =
   assert.match(workflow, /pnpm@11\.20\.0/)
   assert.match(workflow, /rustup toolchain install 1\.97\.1/)
   assert.match(workflow, /pnpm install --frozen-lockfile/)
-  assert.match(workflow, /cargo build --locked -p rovai-host -p loom-pi-launcher --bins --jobs 2/)
+  assert.match(workflow, /cargo build --locked -p rovai-host -p rovai-core -p loom-pi-launcher --bins --jobs 2/)
   assert.match(workflow, /pnpm build:web/)
   assert.equal(sourcePackage.dependencies['@earendil-works/pi-coding-agent'], '0.85.1')
   assert.match(workflow, /npm ci --prefix \$sourceRoot --ignore-scripts --no-audit --no-fund/)
@@ -79,4 +79,16 @@ test('V2 E3 CI uploads only validated, short-lived text evidence', () => {
   assert.match(workflow, /e3-manifest\.json/)
   assert.match(workflow, /Potential credential-shaped output in TAP/)
   assert.doesNotMatch(workflow, /^\s+(?:docker\s+(?:push|login)|gh\s+release|git\s+push)/m)
+})
+
+test('compiler outputs stay explicitly unaccepted and omit runtime state', () => {
+  assert.match(workflow, /qualification = 'compile-only-development-candidate'/)
+  assert.match(workflow, /embeddedPiIncluded = \$false/)
+  assert.match(workflow, /E3 = 'NOT_RUN'/)
+  assert.match(workflow, /Same-source Core\/helper binaries missing/)
+  const upload = workflow.split('name: loom-v2-compile-only-windows-')[1]?.split('      - name:')[0]
+  assert.ok(upload)
+  for (const path of ['rovai-host.exe', 'rovai-core.exe', 'rovai.exe', 'compile-only-manifest.json', 'out/web/']) assert.ok(upload.includes(path))
+  assert.doesNotMatch(upload, /(?:auth\.json|models\.json|\.env|_artifacts|userData|\.sqlite|\.db|sessions\/)/)
+  assert.ok(workflow.indexOf('compile-only-development-candidate') < workflow.indexOf('Test real guarded Pi + official Host'))
 })

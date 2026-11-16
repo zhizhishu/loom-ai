@@ -17,6 +17,7 @@ import {
   assertPortableRelativePath,
   assertSupportedNode,
   bundleManifest,
+  commitStagedPi,
   hostArch,
   hostPlatform,
   stageEmbeddedPi,
@@ -128,6 +129,36 @@ function makeFixtureSource(root, { requestLog, withDependency = true } = {}) {
 function workspace() {
   return mkdtempSync(join(tmpdir(), 'loom-embedded-pi-test-'))
 }
+
+test('verified Pi staging retries only bounded Windows sharing violations without replacing a destination', async () => {
+  const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }) }
+  const transient = Object.assign(new Error('scanner still holds an executable'), { code: 'EPERM' })
+  const waits = []
+  let calls = 0
+  await commitStagedPi('staging', 'destination', {
+    platform: 'win32', inspect: missing, wait: async ms => { waits.push(ms) },
+    rename: () => { calls += 1; if (calls < 3) throw transient }
+  })
+  assert.equal(calls, 3)
+  assert.deepEqual(waits, [50, 100])
+
+  for (const [platform, code, expectedCalls] of [['linux', 'EPERM', 1], ['win32', 'ENOSPC', 1], ['win32', 'EPERM', 8]]) {
+    calls = 0
+    const error = Object.assign(new Error(code), { code })
+    await assert.rejects(commitStagedPi('staging', 'destination', {
+      platform, inspect: missing, wait: async () => {}, rename: () => { calls += 1; throw error }
+    }), candidate => candidate === error)
+    assert.equal(calls, expectedCalls)
+  }
+
+  calls = 0
+  let exists = false
+  await assert.rejects(commitStagedPi('staging', 'destination', {
+    platform: 'win32', inspect: () => { if (!exists) missing() },
+    wait: async () => { exists = true }, rename: () => { calls += 1; throw transient }
+  }), /destination appeared/)
+  assert.equal(calls, 1, 'a destination appearing during backoff must not be overwritten')
+})
 
 /**
  * Windows has no runnable shell launcher, so the fixture suite opts into the

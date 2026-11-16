@@ -49,11 +49,13 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
       LOOM_E3_READY_BUDGET_MS: '180000'
+      LOOM_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Checkout without retained credentials
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Node 24 (pinned runtime)
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -76,6 +78,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: loom-v2-e3-windows-msvc
+          cache-on-failure: true
 
       - name: Install locked project dependencies
         shell: pwsh
@@ -86,16 +89,17 @@ jobs:
       - name: Check the V2 workflow fail-closed contract
         shell: pwsh
         run: |
-          node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs
+          node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs scripts/lib/embedded-pi.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'V2 E3 CI contract test failed' }
 
       - name: Fresh official Host and native Pi launcher
         shell: pwsh
         run: |
-          cargo build --locked -p rovai-host -p loom-pi-launcher --bins --jobs 2
+          cargo build --locked -p rovai-host -p rovai-core -p loom-pi-launcher --bins --jobs 2
           if ($LASTEXITCODE -ne 0) { throw 'Fresh Host/launcher build failed' }
           if (!(Test-Path target/debug/rovai-host.exe)) { throw 'Fresh Host binary missing' }
           if (!(Test-Path target/debug/loom-pi-launcher.exe)) { throw 'Native Pi launcher missing' }
+          if (!(Test-Path target/debug/rovai-core.exe) -or !(Test-Path target/debug/rovai.exe)) { throw 'Same-source Core/helper binaries missing' }
 
       - name: Fresh production Mikka Web bundle
         shell: pwsh
@@ -103,6 +107,45 @@ jobs:
           pnpm build:web
           if ($LASTEXITCODE -ne 0) { throw 'Production Web bundle build failed' }
           if (!(Test-Path out/web/index.html)) { throw 'Production Web index missing' }
+
+      - name: Record compile-only candidate provenance (not an acceptance or release)
+        shell: pwsh
+        run: |
+          $files = [ordered]@{}
+          $actualCommit = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $env:LOOM_SOURCE_COMMIT) { throw 'Candidate checkout does not match the selected source commit' }
+          foreach ($path in @('target/debug/rovai-host.exe', 'target/debug/rovai-server.exe', 'target/debug/rovai-core.exe', 'target/debug/rovai.exe', 'target/debug/loom-pi-launcher.exe', 'out/web/index.html')) {
+            if (!(Test-Path -LiteralPath $path)) { throw "Missing compiler output: $path" }
+            $files[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          [ordered]@{
+            qualification = 'compile-only-development-candidate'
+            commit = $actualCommit
+            hostAndCoreBuiltTogether = $true
+            embeddedPiIncluded = $false
+            E3 = 'NOT_RUN'
+            E4 = 'NOT_RUN'
+            E5 = 'NOT_RUN'
+            E6 = 'NOT_RUN'
+            E7 = 'NOT_RUN'
+            files = $files
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath 'compile-only-manifest.json' -Encoding utf8
+
+      - name: Retain compiler outputs for isolated native verification only
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-v2-compile-only-windows-${{ env.LOOM_SOURCE_COMMIT }}
+          path: |
+            compile-only-manifest.json
+            target/debug/rovai-host.exe
+            target/debug/rovai-server.exe
+            target/debug/rovai-core.exe
+            target/debug/rovai.exe
+            target/debug/loom-pi-launcher.exe
+            out/web/
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Stage exact Pi 0.85.1 into isolated repository runtime directory
         shell: pwsh
@@ -165,7 +208,7 @@ jobs:
           $testSha = (Get-FileHash 'scripts/lib/loom-v2-official-host-electron-review.test.mjs' -Algorithm SHA256).Hash.ToLowerInvariant()
           [ordered]@{
             scope = 'E3-Windows-GitHub-candidate-only'
-            commit = $env:GITHUB_SHA
+            commit = $env:LOOM_SOURCE_COMMIT
             os = $env:RUNNER_OS
             runner = $env:RUNNER_NAME
             hostSha256 = $hostSha
@@ -202,7 +245,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: loom-v2-e3-win-${{ github.sha }}
+          name: loom-v2-e3-win-${{ env.LOOM_SOURCE_COMMIT }}
           path: |
             ${{ runner.temp }}/loom-v2-e3/e3-tap.txt
             ${{ runner.temp }}/loom-v2-e3/e3-manifest.json
