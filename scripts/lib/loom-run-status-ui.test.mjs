@@ -24,6 +24,13 @@ test('LOOM native run surface has honest context and recoverable interactions',{
   const timer=setTimeout(()=>child.kill(),120_000);let code;try{[code]=await closed}finally{clearTimeout(timer)}
   assert.equal(code,0,stdout+'\n'+stderr)
   const report=JSON.parse(await readFile(join(output,'report.json'),'utf8'));assert.equal(report.ok,true);assert.equal(report.cases.length,27);assert.equal(report.shots.length,10)
+  // Added with the automatic-relay range entry: the synthetic surface renders the production control
+  // panel, so it must declare the real read and pass real member profiles, and must never fake a write.
+  const fixtureSource=await readFile(join(source,'renderer.tsx'),'utf8')
+  assert.match(fixtureSource,/loom\.control\.get/, 'the run surface must declare the control read it renders')
+  assert.match(fixtureSource,/agents=\{controlAgents\}/, 'the run surface must pass real member profiles into the dialog')
+  assert.ok(!/loom\.control\.(configure|pause)/.test(fixtureSource), 'the synthetic surface must not fake a control write')
+  assert.match(fixtureSource,/policy:null/, 'an unapproved mission stays visibly unapproved instead of inventing a policy')
   console.log(JSON.stringify({output,cases:report.cases,realCore:false,realModel:false}));passed=true
  }finally{
   if(child&&child.exitCode===null&&child.signalCode===null){child.kill();await closed}

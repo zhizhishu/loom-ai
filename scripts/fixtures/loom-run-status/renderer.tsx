@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { CoreMethod, MissionRecord, ThreadSnapshot, LoomReviewRecordInput, LoomReviewRecordReceipt } from '@contracts'
+import type { AgentProfile, CoreMethod, MissionRecord, ThreadSnapshot, LoomReviewRecordInput, LoomReviewRecordReceipt } from '@contracts'
 import type { ArtifactSelection, WorkBundle } from '../../../apps/desktop/src/renderer/src/loom-native/types'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { RunStatusDialog } from '../../../apps/desktop/src/renderer/src/loom-native/RunStatusDialog'
@@ -20,6 +20,8 @@ let mode = 'success'
 let reviewMode = 'success'
 const calls: string[] = []
 const writes: LoomReviewRecordInput[] = []
+// 自动接力范围的合成读取：只读投影，无任何 control 写入（写入会直接抛错）。
+const controlReads: string[] = []
 const reviewReceipts = new Map<string, LoomReviewRecordReceipt>()
 const pending = new Map<string, (result:unknown)=>void>()
 const request = async<T,>(method:CoreMethod, params?:Record<string,unknown>):Promise<T> => {
@@ -42,6 +44,11 @@ const request = async<T,>(method:CoreMethod, params?:Record<string,unknown>):Pro
     if (reviewMode === 'lose-once') { reviewMode='success'; throw new Error('Fixture receipt lost after commit') }
     return result as T
   }
+  if (method === 'loom.control.get') {
+    const missionId=(params as {missionId:string}).missionId
+    controlReads.push(missionId)
+    return { missionId, policy:null, stageReviews:[], dispatches:[], evaluatedAt:now } as T
+  }
   if (method !== 'loom.claims.list') throw new Error('Unexpected method '+method)
   const id=(params as {missionId:string}).missionId
   calls.push(id)
@@ -50,6 +57,11 @@ const request = async<T,>(method:CoreMethod, params?:Record<string,unknown>):Pro
   return claimReceipt(id) as T
 }
 const client = { request, platform:'win32' } as unknown as ThreadClient
+// 真实成员档案的合成替身：独立审查者只能从当前 Thread 的活跃成员里选。
+const controlAgents = [
+  {agentId:'hanzi',displayName:'Hanzi',teamRole:'实现',presence:'present',removedAt:null,avatarRef:null,accent:null},
+  {agentId:'linxi',displayName:'Linxi',teamRole:'审查',presence:'present',removedAt:null,avatarRef:null,accent:null}
+] as unknown as AgentProfile[]
 const criteria = { version:'criteria-1', criteria:[{criterionId:'responsive',text:'桌面与手机布局均已检查'}] }
 const bundle=(id:string):WorkBundle=>{
   const review = [...reviewReceipts.values()].find(value=>value.missionId===id)
@@ -84,7 +96,7 @@ function Fixture() {
   const currentArtifact=useMemo(()=>artifact===null?null:refreshArtifactSelection(artifact,[data.bundle]),[artifact,data.bundle])
   const refresh=async()=>{setEpoch(x=>x+1);setData({bundle:bundle(id),thread:thread(id)})}
   window.runStatusQA={
-    calls,writes,setTheme,setMode:value=>{mode=value},setReviewMode:value=>{reviewMode=value},setReadTimeoutMs,
+    calls,controlReads,writes,setTheme,setMode:value=>{mode=value},setReviewMode:value=>{reviewMode=value},setReadTimeoutMs,
     refresh:()=>{void refresh()},switchWork:next=>{setId(next);setData({bundle:bundle(next),thread:thread(next)})},
     release:key=>{const resolve=pending.get(key);pending.delete(key);resolve?.(claimReceipt(key))},
     releaseExpired:key=>{const resolve=pending.get(key);pending.delete(key);const value=claimReceipt(key);value.claims[0].expired=true;resolve?.(value)},
@@ -93,7 +105,7 @@ function Fixture() {
   }
   return <ThreadClientProvider client={client}><div className="ln-app" data-theme={theme}>
     <header style={{padding:24}}><button id="open-runs" onClick={()=>{opener.current=document.activeElement as HTMLElement;setOpen(true)}}>打开运行与成果</button><p>独立交互验收 · 合成数据，不调用模型</p></header>
-    <RunStatusDialog readTimeoutMs={readTimeoutMs} open={open} port={client} bundle={empty?null:data.bundle} thread={data.thread} theme={theme}
+    <RunStatusDialog readTimeoutMs={readTimeoutMs} open={open} port={client} bundle={empty?null:data.bundle} thread={data.thread} agents={controlAgents} theme={theme}
       onClose={()=>setOpen(false)} onCreateWork={()=>setSelected('create-work')}
       onArtifact={selection=>{setSelected(selection.bundle.mission.missionId+':'+selection.artifact.artifactId);if(openArtifacts){setOpen(false);setArtifact(selection)}}}/>
     {artifact && <ArtifactView key={artifact.artifact.artifactId} selection={currentArtifact?.selection??artifact}
@@ -103,7 +115,7 @@ function Fixture() {
   </div></ThreadClientProvider>
 }
 declare global { interface Window { runStatusQA:{
-  calls:string[];writes:LoomReviewRecordInput[];setTheme(value:'day'|'night'):void;setMode(value:string):void;
+  calls:string[];controlReads:string[];writes:LoomReviewRecordInput[];setTheme(value:'day'|'night'):void;setMode(value:string):void;
   setReviewMode(value:string):void;setReadTimeoutMs(value:number):void;releaseExpired(id:string):void;refresh():void;switchWork(id:string):void;release(id:string):void;
   setEmpty(value:boolean):void;selected():string;epoch():number;setOpenArtifacts(value:boolean):void;invalidateArtifact():void
 } } }

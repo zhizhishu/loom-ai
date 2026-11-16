@@ -34,6 +34,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: loom-v2-e3-${{ github.event.pull_request.number || github.ref }}
@@ -360,6 +361,7 @@ jobs:
           } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $kit 'candidate-manifest.json') -Encoding utf8
 
       - name: Upload complete non-release personal preview
+        id: upload_preview
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -370,11 +372,40 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Wait for this immutable upload to appear in artifact metadata
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOOM_PREVIEW_ARTIFACT_ID: ${{ steps.upload_preview.outputs.artifact-id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactId = $env:LOOM_PREVIEW_ARTIFACT_ID
+          if ($artifactId -notmatch '^[1-9][0-9]*$') { throw 'Upload did not return an immutable artifact ID' }
+          $expectedName = "loom-personal-preview-windows-$env:LOOM_SOURCE_COMMIT"
+          $visible = $false
+          # Retry only the read of the exact artifact just uploaded. Do not rebuild,
+          # upload another package, select a previous run, or waive byte verification.
+          for ($attempt = 0; $attempt -lt 6; $attempt++) {
+            $raw = gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$artifactId" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $artifact = ($raw -join "`n") | ConvertFrom-Json
+              if ([string]$artifact.id -ne $artifactId -or $artifact.name -ne $expectedName -or $artifact.expired) { throw 'Uploaded artifact identity mismatch' }
+              if ([string]$artifact.workflow_run.id -ne $env:GITHUB_RUN_ID) { throw 'Uploaded artifact belongs to a different workflow run' }
+              $visible = $true
+              break
+            }
+            if ($attempt -lt 5) { Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt + 1))) }
+          }
+          if (!$visible) { throw 'Uploaded artifact is still unavailable; delivery verification remains blocked' }
+
       - name: Download the actual uploaded preview for delivery verification
         if: success()
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: loom-personal-preview-windows-${{ env.LOOM_SOURCE_COMMIT }}
+          artifact-ids: ${{ steps.upload_preview.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
           path: ${{ runner.temp }}/loom-personal-roundtrip/
 
       - name: Verify the delivered preview byte for byte including hidden dependencies

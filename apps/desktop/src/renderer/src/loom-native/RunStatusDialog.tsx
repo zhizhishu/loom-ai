@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ThreadSnapshot } from '@contracts'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { AgentProfile, ThreadSnapshot } from '@contracts'
 import { SurfaceDialog } from './Controls'
+import { ControlPanel } from './ControlPanel'
+import type { ControlAttempt } from './control-service'
 import { V2BotStatusPanel } from './V2BotStatusPanel'
 import { readV2RunFacts, type V2RunFacts, type V2RunPort } from './v2-run-service'
 import type { ArtifactSelection, WorkBundle } from './types'
@@ -14,8 +16,11 @@ type ReadInput = {
 /** A coherent snapshot is retained while a same-work refresh is pending. Polling
  * changes are coalesced instead of cancelling every read: a slow Host must not
  * be starved by a faster parent refresh. New work never renders old work data. */
-export function RunStatusDialog({ open, port, bundle, thread, theme, onClose, onArtifact, onCreateWork, readTimeoutMs=15000 }: {
+export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme, onClose, onArtifact, onCreateWork, readTimeoutMs=15000 }: {
   open:boolean; port:V2RunPort; bundle:WorkBundle|null; thread:ThreadSnapshot|null
+  /** 当前线程的真实成员档案：独立审查者只能在这些成员里选，不由本组件编造。
+   * 缺省空数组只服务旧的合成渲染夹具，不推举任何默认审查者。 */
+  agents?:AgentProfile[]
   theme:'day'|'night'; readTimeoutMs?:number; onClose():void; onArtifact(selection:ArtifactSelection):void; onCreateWork?():void
 }) {
   const [snapshot,setSnapshot]=useState<Snapshot|null>(null)
@@ -37,6 +42,20 @@ export function RunStatusDialog({ open, port, bundle, thread, theme, onClose, on
   }
   const current=snapshot && snapshot.port===port && snapshot.scope===scope ? snapshot : null
   const error=failure && failure.port===port && failure.scope===scope ? failure.message : null
+  // 未确认的接力写入只存 UI 请求意图（不是业务事实），按 port 实例隔离：换端口/退出即自然清空。
+  // 存在这里而不是 ControlPanel 内部，关掉对话框、切走再切回都不会丢同一个 commandId。
+  const attemptStore=useMemo(()=>({port,map:new Map<string,ControlAttempt>()}),[port])
+  const [,bumpAttemptStore]=useState(0)
+  const controlScope=current===null ? null : {
+    missionId:current.bundle.mission.missionId,
+    threadId:current.bundle.mission.threadId,
+    tasks:current.bundle.tasks
+  }
+  const setControlAttempt=(missionId:string,next:ControlAttempt|null):void=>{
+    if(next===null)attemptStore.map.delete(missionId)
+    else attemptStore.map.set(missionId,next)
+    bumpAttemptStore(value=>value+1)
+  }
 
   const beginRead=useCallback(function startLatestRead():void {
     const input=latest.current
@@ -95,7 +114,13 @@ export function RunStatusDialog({ open, port, bundle, thread, theme, onClose, on
         <div className="ln-run-toolbar"><span role="status">{busy ? current?'正在更新，保留上次读到的记录…':'正在读取工作记录…' : error?'更新未成功':'当前工作的主机记录'}</span>
           <button type="button" disabled={busy} onClick={()=>setRetry(value=>value+1)} aria-label="刷新运行与成果">{error?'重试读取':'刷新'}</button></div>
         {error && <div className="ln-run-state" role="alert">读取失败：{error}{current && <p>以下保留的是上次成功读取的内容。</p>}</div>}
-        {current ? <V2BotStatusPanel facts={current.facts} bundle={current.bundle} onArtifact={onArtifact}/>
+        {current && controlScope ? <><V2BotStatusPanel facts={current.facts} bundle={current.bundle} onArtifact={onArtifact}/>
+          {/* 自动接力范围只挂当前这项工作；控制投影与成员范围都取自同一个真实 Mission/Thread。 */}
+          <ControlPanel missionId={controlScope.missionId} threadId={controlScope.threadId} thread={thread}
+            tasks={controlScope.tasks} agents={agents} port={port} theme={theme} refreshToken={retry}
+            attempt={attemptStore.map.get(controlScope.missionId) ?? null}
+            onAttempt={next=>setControlAttempt(controlScope.missionId,next)}/>
+        </>
           : !busy && !error ? <p className="ln-run-state">尚未读取到这项工作的记录。</p> : null}
       </>}
   </SurfaceDialog>
