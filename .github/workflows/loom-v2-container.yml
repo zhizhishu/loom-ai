@@ -210,7 +210,7 @@ jobs:
             -v "$proof/gate-a:/proof" \
             "loom-server-candidate-verify:$GITHUB_SHA" \
             /opt/loom-verify/smoke-linux-server.py /opt/rovai \
-              --expected-source "$GITHUB_SHA" --output /proof/gate-a.json --startup-timeout 120
+              --expected-source "$GITHUB_SHA" --expected-profile debug --output /proof/gate-a.json --startup-timeout 120
 
       - name: Build the runtime candidate image
         run: |

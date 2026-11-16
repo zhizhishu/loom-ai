@@ -50,7 +50,7 @@ fixed commit, on an `ubuntu-22.04` runner:
 3. The allowlisted package plus `docker/Dockerfile`, `docker/entrypoint.sh` and
    `scripts/smoke-linux-server.py` are staged into a temporary directory. The
    Docker context contains **no source checkout, no `.git` and no credential**.
-4. `--target verify` runs `scripts/smoke-linux-server.py` inside the image as
+4. `--target verify` runs `scripts/smoke-linux-server.py --expected-profile debug` inside the image as
    uid 10001; `--target runtime` is the artifact.
 5. `ubuntu:22.04` is pulled and its digest resolved; the build uses
    `--build-arg BASE_IMAGE=ubuntu@sha256:…` and records that digest.
@@ -129,7 +129,9 @@ bundled Skills, exclusive data root, durable SIGTERM, restart persistence),
 runtime image unprivileged/toolchain-free/Pi-free assertions, and container
 acceptance (unauthenticated `GET /` = 200, unauthenticated API = 401,
 `docker stop` exit 0). A run is only evidence for the commit it names; nothing
-in this repository records a passed container run yet.
+in this document promotes a candidate smoke result to release qualification. The smoke
+keeps `release` as its default and records `packageProfile=debug` /
+`releaseProfileVerified=false` for this explicitly selected candidate.
 
 Not covered here: any agent Runtime execution, any model call, real-phone
 acceptance, and container-specific qualification. The Server-level Gate B

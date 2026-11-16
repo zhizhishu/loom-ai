@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Gate A: exercise an unchanged native release on a clean Linux account.
+"""Exercise an unchanged native Server package on a clean Linux account.
+
+Release qualification remains the default. A debug candidate requires explicit
+--expected-profile debug and is never reported as a release qualification.
 
 Uses only the Python standard library. Never installs or calls an Agent Runtime.
 Pass the directory selected by install-server.sh, and the expected source SHA.
@@ -25,6 +28,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('package', type=Path)
     parser.add_argument('--expected-source', required=True)
+    parser.add_argument('--expected-profile', choices=('release', 'debug'), default='release',
+                        help='Exact package profile; debug is candidate acceptance only')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--startup-timeout', type=int, default=30)
     args = parser.parse_args()
@@ -33,7 +38,7 @@ def main():
     package = args.package.resolve(strict=True)
     manifest = json.loads((package / 'manifest.json').read_text())
     assert manifest['commit'] == args.expected_source and not manifest['dirty']
-    assert manifest['target'] == 'linux-x64' and manifest['profile'] == 'release'
+    assert manifest['target'] == 'linux-x64' and manifest['profile'] == args.expected_profile, 'Package profile does not match explicit acceptance scope'
     for name, expected in manifest['files'].items():
         path = (package / name).resolve(strict=True)
         assert path.is_relative_to(package)
@@ -162,7 +167,8 @@ def main():
                         process.kill()
                         process.wait()
     report = {'schemaVersion': 1, 'gate': 'server_os', 'runtimeQualification': False,
-              'sourceCommit': manifest['commit'], 'packageManifestSha256': hashlib.sha256((package / 'manifest.json').read_bytes()).hexdigest(),
+              'sourceCommit': manifest['commit'], 'packageProfile': manifest['profile'],
+              'releaseProfileVerified': manifest['profile'] == 'release', 'packageManifestSha256': hashlib.sha256((package / 'manifest.json').read_bytes()).hexdigest(),
               'platform': platform.platform(), 'libc': platform.libc_ver(),
               'osRelease': Path('/etc/os-release').read_text(), 'checks': checks, 'status': 'passed'}
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -171,3 +171,12 @@ test('the repository-level dockerignore excludes everything by default', () => {
     assert.doesNotMatch(dockerignore, new RegExp(`^!${forbidden}`, 'm'), `${forbidden} must never be re-included`)
   }
 })
+
+
+test('native package smoke preserves release default and explicitly labels debug acceptance', () => {
+  const smoke = read('scripts/smoke-linux-server.py')
+  assert.match(smoke, /--expected-profile.*choices=\('release', 'debug'\), default='release'/)
+  assert.match(smoke, /manifest\['profile'\] == args.expected_profile/)
+  assert.match(smoke, /'releaseProfileVerified': manifest\['profile'\] == 'release'/)
+  assert.match(workflow, /--expected-profile debug/)
+})
