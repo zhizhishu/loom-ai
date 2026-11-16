@@ -19,8 +19,10 @@ use crate::acp::CompletedAcpAction;
 
 pub(crate) use file_grant::{
     PI_FILE_ACCESS_KEY, PI_FILE_ACCESS_NATIVE, PI_FILE_ACCESS_WORKSPACE_READ_ONLY,
-    PI_FILE_ACCESS_WORKSPACE_READ_WRITE, PI_FILE_GRANT_READ_ONLY_TOOLS, PI_FILE_GRANT_READ_WRITE_TOOLS,
-    PI_FILE_GRANT_SCHEMA, PiFileAccessMode, PiFileGrant, mode_from_permissions, now_epoch_ms,
+    PI_FILE_ACCESS_WORKSPACE_READ_WRITE, PI_FILE_ACCESS_WORKSPACE_WORKFLOW,
+    PI_FILE_GRANT_READ_ONLY_TOOLS, PI_FILE_GRANT_READ_WRITE_TOOLS, PI_FILE_GRANT_WORKFLOW_TOOLS,
+    PI_FILE_GRANT_SCHEMA, PI_LOOM_TOOL_NAME, PiFileAccessMode, PiFileGrant, mode_from_permissions,
+    now_epoch_ms,
 };
 pub(crate) use host::{
     PiActivationFailureKind, PiHost, PiPromptImage, PreparedPiPromptImage, activation_failure_kind,
@@ -29,11 +31,13 @@ pub(crate) use host::{
 pub use host::{PiAgentRunRuntimeRequest, PiMcpProjection, PiRpcRuntimeAdapter, PiRuntime};
 
 pub(crate) const PI_PROTOCOL_VERSION: &str = "pi-jsonl-rpc-v1";
-pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v10";
+pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v11";
 // The managed Host extension validates the OPTIONAL per-Run file grant (`ROVAI_PI_FILE_GRANT_FILE`)
-// and publishes `rovai-managed-guard-state`. v10 widens the accepted grant to the two exact frozen
-// tool sets (`read` or `read`/`write`/`edit`); every hard-coded copy of the version string was updated
-// in the same change (agent_runtime_adapter host-config metadata, the Host test fixture, and
+// and publishes `rovai-managed-guard-state`. v10 widened the accepted grant to the two exact frozen
+// tool sets (`read` or `read`/`write`/`edit`); v11 adds the third, explicitly chosen
+// `workspace_workflow` set (`read`/`write`/`edit` plus the one managed `rovai_loom` business tool)
+// and registers that tool at extension load time. Every hard-coded copy of the version string was
+// updated in the same change (agent_runtime_adapter host-config metadata, the Host test fixture, and
 // `scripts/smoke-member-environment-upgrade.mjs`).
 /// The shared Pi file guard is embedded from the single canonical source in `scripts/`. The Core
 /// materializes these exact bytes into the private Host root and loads them with an explicit
@@ -42,6 +46,12 @@ pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v10";
 pub(crate) const PI_FILE_GUARD_EXTENSION_SOURCE: &str =
     include_str!("../../../scripts/loom-v2-runtime-file-guard.ts");
 pub(crate) const PI_FILE_GUARD_EXTENSION_NAME: &str = "rovai-pi-file-guard.ts";
+/// The managed LOOM workflow bridge is the single canonical source of the one Core business tool the
+/// `workspace_workflow` policy adds. It is embedded here, written next to the managed Host extension,
+/// and imported by it, so production and the Node contract test validate the SAME bytes and the same
+/// closed operation table. Its digest is part of the Host compatibility identity.
+pub(crate) const MANAGED_WORKFLOW_TOOL_EXTENSION: &str = include_str!("pi/managed-workflow-tool.ts");
+pub(crate) const MANAGED_WORKFLOW_TOOL_EXTENSION_NAME: &str = "managed-workflow-tool.ts";
 /// The managed Pi MCP extension is a generated bundle: `scripts/build-pi-mcp.mjs`
 /// inlines the maintained MCP client so the Pi process needs no node_modules tree.
 pub(crate) const PI_MCP_EXTENSION_VERSION: &str = "rovai-pi-mcp-v1";
@@ -407,6 +417,9 @@ pub(crate) fn runtime_compatibility_digest_with_mcp(
         // The shared guard is part of the same compatibility identity: two Runs that would load a
         // different guard implementation must never share a warm Host.
         "managedFileGuardDigest": format!("{:x}", Sha256::digest(PI_FILE_GUARD_EXTENSION_SOURCE.as_bytes())),
+        // The managed workflow bridge is part of the same compatibility identity: two Runs that would
+        // load a different bridge implementation must never share a warm Host.
+        "managedWorkflowToolDigest": format!("{:x}", Sha256::digest(MANAGED_WORKFLOW_TOOL_EXTENSION.as_bytes())),
     });
     if let Some(document) = mcp_document {
         identity["managedMcpExtensionVersion"] = json!(PI_MCP_EXTENSION_VERSION);
@@ -852,7 +865,11 @@ mod tests {
         assert!(!source.contains("ANTHROPIC_AUTH_TOKEN"));
         assert!(!source.contains("mcpTools"));
         assert!(!source.contains("mcpProjectionDigest"));
-        assert!(!source.contains("registerTool"));
+        // Exactly one tool is registered: the managed LOOM workflow bridge, and only for the frozen
+        // `workspace_workflow` policy. No MCP bridge and no other tool surface may appear here.
+        assert_eq!(source.matches("pi.registerTool(").count(), 1);
+        assert!(source.contains("name: LOOM_TOOL_NAME"));
+        assert!(!source.contains("namespacedToolName"));
         assert!(!source.contains("Rovai MCP bridge"));
         assert!(!source.contains("pi.setActiveTools"));
         assert!(!source.contains("resources_discover"));
@@ -1042,6 +1059,66 @@ mod tests {
                 "id": "ui-confirm",
                 "confirmed": false,
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod managed_workflow_source_tests {
+    use super::*;
+
+    #[test]
+    fn workflow_tool_sources_agree_on_one_tool_name_and_the_eight_operations() {
+        // The name and the operation set live in three places that MUST agree: the Rust contract
+        // (file_grant.rs / builtin_tool_transport.rs), the managed Host extension that registers the
+        // tool, and the shared guard that re-checks every call. A drift here is a silent policy hole,
+        // so it is asserted rather than trusted.
+        assert_eq!(PI_LOOM_TOOL_NAME, "rovai_loom");
+        for source in [
+            include_str!("pi/managed-host.ts"),
+            MANAGED_WORKFLOW_TOOL_EXTENSION,
+            PI_FILE_GUARD_EXTENSION_SOURCE,
+        ] {
+            assert!(source.contains("rovai_loom"), "a managed source lost the tool name");
+        }
+        for operation in crate::builtin_tool_transport::MANAGED_WORKFLOW_OPERATIONS {
+            for source in [MANAGED_WORKFLOW_TOOL_EXTENSION, PI_FILE_GUARD_EXTENSION_SOURCE] {
+                assert!(
+                    source.contains(operation),
+                    "{operation} is missing from a managed workflow source"
+                );
+            }
+        }
+        // The bridge names no shell, no arbitrary command and no input-file argument.
+        for forbidden in [
+            "shell: true",
+            "execSync",
+            "\"--input-file\"",
+            "'--input-file'",
+            "powershell",
+            "cmd.exe",
+        ] {
+            assert!(
+                !MANAGED_WORKFLOW_TOOL_EXTENSION.contains(forbidden),
+                "the bridge must not use {forbidden}"
+            );
+        }
+        assert!(MANAGED_WORKFLOW_TOOL_EXTENSION.contains("shell: false"));
+        // The bridge must validate the SAME envelope version the CLI emits, or a readable result could
+        // be accepted under the wrong contract.
+        assert!(
+            MANAGED_WORKFLOW_TOOL_EXTENSION.contains(&format!(
+                "ENVELOPE_VERSION = {}",
+                crate::builtin_tool_transport::BUILTIN_TOOL_ENVELOPE_VERSION
+            )),
+            "the bridge envelope version drifted from BUILTIN_TOOL_ENVELOPE_VERSION"
+        );
+        // The legacy tool sets stay representable, unchanged, next to the new one.
+        assert_eq!(PI_FILE_GRANT_READ_ONLY_TOOLS, ["read"]);
+        assert_eq!(PI_FILE_GRANT_READ_WRITE_TOOLS, ["read", "write", "edit"]);
+        assert_eq!(
+            PI_FILE_GRANT_WORKFLOW_TOOLS,
+            ["read", "write", "edit", PI_LOOM_TOOL_NAME]
         );
     }
 }

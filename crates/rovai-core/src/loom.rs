@@ -7582,7 +7582,8 @@ mod tests {
         let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
         for (path, bytes) in [
             ("non-utf8.bin", vec![0xff, 0xfe]),
-            ("nul.bin", b"text\0content".to_vec()),
+            // Test NUL bytes, not the reserved Windows device filename NUL.bin.
+            ("nul-content.bin", b"text\0content".to_vec()),
         ] {
             std::fs::write(workspace.join(path), bytes).unwrap();
             let artifact = register(&mut database, &mission_id, path);

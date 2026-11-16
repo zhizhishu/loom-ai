@@ -226,6 +226,12 @@ fn reconcile_waiting_delivery_conversations(transaction: &Transaction<'_>) -> Re
 /// Cheap, read-only gate for the ordinary batch scheduler. A false result means
 /// the fallback tick can return without opening the immediate transaction used
 /// by `claim_waiting_delivery_batches`.
+///
+/// An unsettled LOOM dispatch row is pending work of its own: the scheduler pass is what folds the
+/// Delivery outcome back into the permanent ledger and reserves the next event of that chain. Its
+/// Delivery is usually already claimed by the time the Run finishes, so neither a waiting Delivery
+/// nor a queued Run exists any more — without this second source the bounded fallback tick would
+/// never look at the tail of a chain again.
 pub fn has_pending_delivery_batch_work(database: &Database) -> Result<bool> {
     Ok(database.connection().query_row(
         r#"
@@ -244,6 +250,10 @@ pub fn has_pending_delivery_batch_work(database: &Database) -> Result<bool> {
               AND agent_run.input_ready_at IS NOT NULL
               AND agent_run.cancel_requested_at IS NULL
               AND camp.deletion_operation_id IS NULL
+        ) OR EXISTS(
+            SELECT 1
+            FROM loom_control_dispatch AS dispatch
+            WHERE dispatch.status IN ('WAITING','DISPATCHED')
         )
         "#,
         [],
@@ -2357,6 +2367,261 @@ mod tests {
         assert_eq!(
             inputs, 2,
             "the handoff and the ordinary message behind it claim together"
+        );
+    }
+
+    // Owns the reconcile boundary of the ledger: a dispatch is complete only when the successor
+    // fact of that very Run exists. The regression it pins is the tail of a chain — the last
+    // dispatch, whose Delivery is already claimed and whose Run has already finished — which stayed
+    // `DISPATCHED` forever because no later pass was woken to look at it.
+    #[test]
+    fn loom_ledger_settles_only_on_the_matching_successor_fact() {
+        let mut fixture = Fixture::with_members(&["agent_1", "agent_2"]);
+        let worktree = fixture._directory.join("loom-ledger-worktree");
+        fixture.attach_completed_mission(Some(&worktree));
+        fixture.attach_loom_control(false, "2099-01-01T00:00:00Z");
+        let plan_id: String = fixture
+            .database
+            .connection()
+            .query_row(
+                "SELECT plan_id FROM loom_task WHERE task_id='delivery-queue-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let set_run_status = |fixture: &Fixture, run: &str, status: &str| {
+            let now = chrono::Utc::now().to_rfc3339();
+            fixture
+                .database
+                .connection()
+                .execute(
+                    "UPDATE agent_run SET status=?2, updated_at=?3,
+                            ended_at=CASE WHEN ?2 IN ('succeeded','failed','cancelled')
+                                          THEN ?3 ELSE ended_at END
+                     WHERE id=?1",
+                    params![run, status, now],
+                )
+                .unwrap();
+        };
+        let ledger = |fixture: &Fixture, kind: &str| -> (String, String, i64, Option<String>) {
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT status, dedupe_key, policy_revision, candidate_id
+                     FROM loom_control_dispatch WHERE kind=?1",
+                    [kind],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap()
+        };
+        let kind_of_run = |fixture: &Fixture, run: &str| -> String {
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT dispatch.kind
+                     FROM camp_message_delivery AS delivery
+                     JOIN loom_control_dispatch AS dispatch ON dispatch.delivery_id=delivery.id
+                     WHERE delivery.claimed_agent_run_id=?1",
+                    [run],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        // A dispatch completes on the Candidate its own Run produced, so the fixture writes that
+        // fact exactly where the Core writes it — including a Candidate from another Run.
+        let add_candidate = |fixture: &Fixture, candidate: &str, run: &str| {
+            fixture
+                .database
+                .connection()
+                .execute(
+                    "INSERT INTO loom_candidate(candidate_id,plan_id,task_id,agent_run_id,
+                            command_id,content_hash,evidence_ids_json,
+                            acceptance_criteria_version,previous_candidate_id,
+                            verification_status,acceptance_status,created_at)
+                     VALUES(?1,?2,'delivery-queue-task',?3,?4,'sha256:candidate','[]','ac-v1',
+                            NULL,'UNVERIFIED','PENDING','2026-11-16T00:00:00Z')",
+                    params![candidate, plan_id, run, format!("command-{candidate}")],
+                )
+                .unwrap();
+        };
+
+        // The EXECUTE handoff goes out and a real Run takes it.
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            1
+        );
+        let producer_run = fixture
+            .claim_with_prepared_mission_workspace(1)
+            .pop()
+            .unwrap();
+        assert_eq!(kind_of_run(&fixture, &producer_run), "EXECUTE");
+        assert_eq!(ledger(&fixture, "EXECUTE").0, "DISPATCHED");
+
+        // (1) A Run that finished without writing its Candidate proves nothing: the row stays out
+        //     instead of being read as done, even though its Delivery is still `claimed`.
+        set_run_status(&fixture, &producer_run, "succeeded");
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        assert_eq!(ledger(&fixture, "EXECUTE").0, "DISPATCHED");
+
+        // (2) Pending work is not only a waiting Delivery: with the Delivery claimed and no Run
+        //     queued, the unsettled ledger row alone has to keep the bounded fallback tick alive.
+        assert!(
+            has_pending_delivery_batch_work(&fixture.database).unwrap(),
+            "an unsettled LOOM dispatch is pending batch work of its own"
+        );
+
+        // (3) A Candidate produced by a different Run is not this dispatch's successor fact.
+        add_candidate(&fixture, "candidate_other_run", "run_of_another_dispatch");
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        assert_eq!(ledger(&fixture, "EXECUTE").0, "DISPATCHED");
+
+        // (4) The Candidate produced by this very Run completes it — with no later dispatch waiting
+        //     to trigger the look-up, which is exactly the tail-of-chain case.
+        let before = ledger(&fixture, "EXECUTE");
+        add_candidate(&fixture, "candidate_this_run", &producer_run);
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        let settled_execute = ledger(&fixture, "EXECUTE");
+        assert_eq!(settled_execute.0, "SETTLED");
+        assert_eq!(
+            settled_execute.1, before.1,
+            "the dedupe identity never moves"
+        );
+        assert_eq!(
+            fixture.loom_dispatch_counts(),
+            (1, 1, 1),
+            "a settled event is never sent a second time"
+        );
+
+        // The internal stage: the next event of the chain is the reviewer handoff.
+        fixture
+            .database
+            .connection()
+            .execute_batch(
+                "UPDATE loom_task SET status='IN_REVIEW' WHERE task_id='delivery-queue-task'",
+            )
+            .unwrap();
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            1
+        );
+        let (_, _, policy_revision, review_candidate) = ledger(&fixture, "REVIEW");
+        let review_candidate =
+            review_candidate.expect("a REVIEW dispatch names the Candidate under review");
+        assert_eq!(review_candidate, "candidate_this_run");
+        let reviewer_run = fixture
+            .claim_with_prepared_mission_workspace(1)
+            .pop()
+            .unwrap();
+        assert_eq!(kind_of_run(&fixture, &reviewer_run), "REVIEW");
+        let add_stage_review =
+            |fixture: &Fixture, stage_review_id: &str, revision: i64, run: &str, verdict: &str| {
+                fixture
+                    .database
+                    .connection()
+                    .execute(
+                        "INSERT INTO loom_stage_review(stage_review_id,plan_id,mission_id,task_id,
+                                candidate_id,command_id,reviewer_agent_id,reviewer_agent_run_id,
+                                policy_revision,manifest_hash,verdict,reason,
+                                criteria_results_json,reviewed_at)
+                         VALUES(?1,?2,'delivery-queue-mission','delivery-queue-task',?3,?4,
+                                'agent_2',?5,?6,'sha256:manifest',?7,
+                                'the internal stage judged this delivery','[]',
+                                '2026-11-16T00:00:00Z')",
+                        params![
+                            stage_review_id,
+                            plan_id,
+                            review_candidate,
+                            format!("command-{stage_review_id}"),
+                            run,
+                            revision,
+                            verdict
+                        ],
+                    )
+                    .unwrap();
+            };
+
+        // (5) A verdict recorded under a different policy revision is not this dispatch's fact.
+        add_stage_review(
+            &fixture,
+            "review_other_revision",
+            policy_revision + 1,
+            &reviewer_run,
+            "REQUEST_CHANGES",
+        );
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        assert_eq!(ledger(&fixture, "REVIEW").0, "DISPATCHED");
+
+        // (6) The matching verdict written while its reviewer Run is still running settles nothing,
+        //     although the recorded pass does reserve the handoff that follows it.
+        set_run_status(&fixture, &reviewer_run, "running");
+        add_stage_review(
+            &fixture,
+            "review_matching",
+            policy_revision,
+            &reviewer_run,
+            "PASS",
+        );
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            1
+        );
+        assert_eq!(ledger(&fixture, "REVIEW").0, "DISPATCHED");
+
+        // (7) The finished Run plus that same verdict settles it.
+        set_run_status(&fixture, &reviewer_run, "succeeded");
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        assert_eq!(ledger(&fixture, "REVIEW").0, "SETTLED");
+
+        // (8) A handoff completes only on its settled Delivery, never on a finished Run.
+        assert_eq!(ledger(&fixture, "HANDOFF").0, "DISPATCHED");
+        let handoff_run = fixture
+            .claim_with_prepared_mission_workspace(1)
+            .pop()
+            .expect("the recorded pass reserves a claimable handoff");
+        assert_eq!(kind_of_run(&fixture, &handoff_run), "HANDOFF");
+        set_run_status(&fixture, &handoff_run, "succeeded");
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        assert_eq!(ledger(&fixture, "HANDOFF").0, "DISPATCHED");
+        let now = chrono::Utc::now().to_rfc3339();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp_message_delivery
+                 SET status='settled', ended_at=?2, updated_at=?2, version=version+1
+                 WHERE claimed_agent_run_id=?1",
+                params![&handoff_run, now],
+            )
+            .unwrap();
+        assert_eq!(
+            crate::loom::control::admit_due_dispatches(&mut fixture.database).unwrap(),
+            0
+        );
+        assert_eq!(ledger(&fixture, "HANDOFF").0, "SETTLED");
+        assert_eq!(fixture.loom_dispatch_counts(), (3, 3, 3));
+        assert!(
+            !has_pending_delivery_batch_work(&fixture.database).unwrap(),
+            "a fully settled chain leaves no pending batch work"
         );
     }
 

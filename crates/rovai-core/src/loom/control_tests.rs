@@ -1326,6 +1326,32 @@ fn dispatch_admission_spends_the_ledger_and_rechecks_before_running() {
         Some("loom.dispatch_not_pending"),
         "assertion a_settled_ledger_row_is_never_re_executed"
     );
+
+    // Reconciliation only ever judges a dispatch that a Delivery actually carries: a row that never
+    // reached a Delivery is not settled by a later pass, and no pass rewrites the recorded event.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_later_pass_admits_nothing_for_an_event_already_recorded"
+    );
+    let reserved_row: (String, Option<String>, String) = database
+        .connection()
+        .query_row(
+            "SELECT status, delivery_id, dedupe_key FROM loom_control_dispatch
+             WHERE dispatch_id='dispatch_reserved'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (reserved_row.0.as_str(), reserved_row.1.as_deref()),
+        ("WAITING", None),
+        "assertion an_unbound_reserved_dispatch_is_never_settled_by_a_later_pass"
+    );
+    assert_eq!(
+        reserved_row.2, "[\"EXECUTE\",\"reserved\",\"task_a\"]",
+        "assertion a_pass_never_rewrites_the_recorded_event_identity"
+    );
 }
 
 /// Persistence boundary: the approval and the stage verdicts are Core SQLite facts. The database

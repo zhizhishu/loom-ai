@@ -158,6 +158,19 @@ jobs:
           $text = Get-Content -LiteralPath $log -Raw
           if ($text -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Native Codex policy regression did not execute exactly once' }
 
+      - name: Verify Core relay, file grants, and typed workflow isolation
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'loom-core-library-tests.log'
+          cargo test --locked -p rovai-core --lib *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log -Tail 60
+          if ($code -ne 0) { throw 'Core library regression failed' }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'test result: ok\. [1-9][0-9]* passed; 0 failed;') { throw 'Core library tests did not actually run' }
+          node --test --test-force-exit --test-timeout=120000 scripts/loom-v2-workflow-tool.test.mjs scripts/loom-v2-core-file-grant.test.mjs scripts/lib/accept-loom-live-lead.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Typed workflow and immutable artifact evidence tests failed' }
+
       - name: Fresh production Mikka Web bundle
         shell: pwsh
         run: |

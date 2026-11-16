@@ -30,6 +30,25 @@ const CONFIG_ENV = 'LOOM_RUN_GUARD'
 const GUARD_SCHEMA = 'loom.runtime.file-guard.v1'
 const GUARD_TOOLS = Object.freeze(['read', 'write', 'edit'])
 
+// The one managed Core business tool the explicitly chosen `workspace_workflow` policy adds. It is a
+// typed bridge to the eight `loom.*` operations Core already ships — never `bash`, never an arbitrary
+// command, never MCP. This guard stays authoritative for it: the operation must be one of the eight,
+// and a `loom.evidence` path goes through the SAME `read` path policy as the native tool.
+const LOOM_TOOL_NAME = 'rovai_loom'
+const LOOM_OPERATIONS = Object.freeze([
+  'loom.status', 'loom.plan', 'loom.release', 'loom.claim',
+  'loom.evidence', 'loom.submit', 'loom.inspect', 'loom.stage-review',
+])
+// Tools this guard knows at all. Anything outside it is blocked before any policy is consulted.
+const GRANT_TOOL_UNIVERSE = Object.freeze([...GUARD_TOOLS, LOOM_TOOL_NAME])
+// The exact tool sets a Core-written grant may carry, compared in order. The business tool is never
+// grantable on its own or beside a different file policy.
+const GRANT_TOOL_SETS = Object.freeze([
+  Object.freeze(['read']),
+  Object.freeze(['read', 'write', 'edit']),
+  Object.freeze(['read', 'write', 'edit', LOOM_TOOL_NAME])
+])
+
 // Deny-listed path segments (lowercased, compared per segment) and suffixes. A grant never grants
 // VCS internals, credentials, auth/models config, or private keys, even inside the workspace.
 const SENSITIVE_SEGMENTS = Object.freeze([
@@ -282,7 +301,10 @@ function validateGrantObject(parsed) {
   if (typeof parsed.logPath !== 'string' || parsed.logPath.length === 0) return { ok: false, reason: 'guard_log_path_missing' }
   if (typeof parsed.workspaceReal !== 'string' || !isAbsolute(parsed.workspaceReal)) return { ok: false, reason: 'guard_workspace_missing' }
   if (!Array.isArray(parsed.allowedTools) || parsed.allowedTools.length === 0) return { ok: false, reason: 'guard_tools_missing' }
-  if (!parsed.allowedTools.every((tool) => GUARD_TOOLS.includes(tool))) return { ok: false, reason: 'guard_tools_not_permitted' }
+  if (!GRANT_TOOL_SETS.some((toolSet) => toolSet.length === parsed.allowedTools.length
+    && toolSet.every((tool, index) => parsed.allowedTools[index] === tool))) {
+    return { ok: false, reason: 'guard_tools_not_permitted' }
+  }
   if (!Number.isInteger(parsed.expiresAtEpochMs) || parsed.expiresAtEpochMs <= 0) return { ok: false, reason: 'guard_expiry_missing' }
   return { ok: true, grant: parsed }
 }
@@ -393,7 +415,13 @@ export default async function loomRuntimeFileGuard(pi) {
   pi.on('tool_call', (event, ctx) => {
     const at = Date.now()
     const toolName = typeof event?.toolName === 'string' ? event.toolName : ''
-    const toolCallId = typeof event?.toolCallId === 'string' ? event.toolCallId : null
+    // A provider-supplied business call ID is opaque and may itself contain
+    // sensitive path text. Preserve correlation by digest, not by logging it.
+    // Existing native file-tool receipt identities remain unchanged.
+    const rawCallId = typeof event?.toolCallId === 'string' ? event.toolCallId : null
+    const toolCallId = toolName === LOOM_TOOL_NAME && rawCallId !== null
+      ? `sha256:${sha256(rawCallId)}`
+      : rawCallId
     const rawPath = event?.input?.path
 
     // A block whose own record cannot be written is still a block: the tool never runs.
@@ -405,12 +433,43 @@ export default async function loomRuntimeFileGuard(pi) {
     try {
       if (startupFailure) return block(startupFailure)
       if (at > grant.expiresAtEpochMs) return block('grant_expired')
-      if (!GUARD_TOOLS.includes(toolName)) return block('tool_not_allowed')
+      if (!GRANT_TOOL_UNIVERSE.includes(toolName)) return block('tool_not_allowed')
       if (!grant.allowedTools.includes(toolName)) return block('tool_not_granted')
 
       const handlerCwd = typeof ctx?.cwd === 'string' && ctx.cwd.length > 0 ? realpathOrNull(ctx.cwd) : null
       if (handlerCwd === null) return block('cwd_unresolvable')
       if (compareKey(handlerCwd) !== compareKey(grant.workspaceReal)) return block('cwd_mismatch')
+
+      // The managed business tool carries no file `path` argument of its own, so it gets its own
+      // decision instead of the native path policy: a closed operation, and for `loom.evidence` the
+      // SAME `read` path rules (existing regular file, in workspace, no symlink/hardlink escape).
+      if (toolName === LOOM_TOOL_NAME) {
+        const operation = typeof event?.input?.operation === 'string' ? event.input.operation : ''
+        if (!LOOM_OPERATIONS.includes(operation)) return block('loom_operation_not_allowed')
+        if (operation !== 'loom.evidence') {
+          const allowedLogged = log({
+            t: 'decision', at, toolCallId, toolName, decision: 'allow',
+            reasonCode: 'loom_operation_granted', operation, relPath: null, pathSha256: sha256('')
+          })
+          if (!allowedLogged) return block('guard_log_write_failed', { supersededDecision: 'allow' })
+          return undefined
+        }
+        const relativePath = event?.input?.input?.relativePath
+        const outcome = evaluatePath(relativePath, {
+          cwd: handlerCwd, workspaceReal: grant.workspaceReal, toolName: 'read', fsMode: true
+        })
+        const pathSha256 = sha256(typeof relativePath === 'string' ? relativePath : '')
+        const relPath = outcome.resolved ? toWorkspaceRelative(outcome.resolved, grant.workspaceReal) : null
+        const evidenceLogged = log({
+          t: 'decision', at, toolCallId, toolName, decision: outcome.decision,
+          reasonCode: outcome.reasonCode, operation, relPath, pathSha256
+        })
+        if (!evidenceLogged) return block('guard_log_write_failed', { supersededDecision: outcome.decision })
+        if (outcome.decision === 'block') {
+          return { block: true, reason: `LOOM guard blocked ${toolName}: ${outcome.reasonCode}` }
+        }
+        return undefined
+      }
 
       const outcome = evaluatePath(rawPath, { cwd: handlerCwd, workspaceReal: grant.workspaceReal, toolName, fsMode: true })
       const pathSha256 = sha256(typeof rawPath === 'string' ? rawPath : '')

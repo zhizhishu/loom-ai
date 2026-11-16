@@ -498,6 +498,8 @@ fn permissions_with_pi_purge(
 // only for a guarded `loom_file_access` mode (pi/host.rs `stage_pi_purge`). Reject the selection at
 // configuration time instead of failing the first Run, and never widen or upgrade the member's own
 // permission choice to satisfy the purge. An unreadable policy is not guarded, so it is rejected.
+// `workspace_workflow` is a guarded mode and is therefore accepted here as well; the legacy `native`
+// policy stays exactly as gated as before and is never upgraded.
 fn pi_purge_append_without_file_grant(
     selection: Option<&PiPurgeSelection>,
     permissions: &AdapterPermissionConfig,
@@ -507,7 +509,9 @@ fn pi_purge_append_without_file_grant(
     }
     !matches!(
         mode_from_permissions(&permissions.values),
-        Ok(PiFileAccessMode::WorkspaceReadOnly | PiFileAccessMode::WorkspaceReadWrite)
+        Ok(PiFileAccessMode::WorkspaceReadOnly
+            | PiFileAccessMode::WorkspaceReadWrite
+            | PiFileAccessMode::WorkspaceWorkflow)
     )
 }
 
@@ -6443,6 +6447,8 @@ fn pi_purge_selection_roundtrips_without_entering_runtime_permissions() {
         (json!({ "loom_file_access": { "mode": "workspace_read_only" } }), false),
         (json!({ "loom_file_access": "workspace_read_write" }), false),
         (json!({ "loom_file_access": { "mode": "workspace_read_write" } }), false),
+        (json!({ "loom_file_access": "workspace_workflow" }), false),
+        (json!({ "loom_file_access": { "mode": "workspace_workflow" } }), false),
         (json!({}), true),
         (json!({ "loom_file_access": "native" }), true),
         (json!({ "loom_file_access": { "mode": "native" } }), true),

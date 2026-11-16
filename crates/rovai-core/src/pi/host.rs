@@ -53,8 +53,8 @@ use crate::{
 
 use super::{
     PI_COMMAND_TIMEOUT, PI_HOST_EXTENSION_VERSION, PI_MAX_INBOUND_RECORD_BYTES,
-    PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiFileGrant, PiIncoming, PiTransportFailure,
-    mode_from_permissions, now_epoch_ms,
+    PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiFileAccessMode, PiFileGrant, PiIncoming,
+    PiTransportFailure, mode_from_permissions, now_epoch_ms,
     assistant_message_text, completed_action, read_jsonl_record, value_id,
 };
 
@@ -419,6 +419,9 @@ struct PiHostLaunch<'a> {
     file_grant: Option<&'a PiFileGrant>,
     /// Explicit Core-frozen Pi-only Persona intent; never inherited from Pi globals.
     pi_purge: Option<&'a PiPurgeSelection>,
+    /// `true` only for `workspace_workflow`: the managed business tool needs the Core-injected CLI
+    /// context, so a Host without it must fail closed instead of loading an unusable tool.
+    require_builtin_tools: bool,
 }
 
 struct PiProbeRootCleanup(PathBuf);
@@ -621,6 +624,12 @@ impl PiHost {
         .await
     }
     async fn spawn_in_environment(launch: PiHostLaunch<'_>) -> Result<Arc<Self>> {
+        // Fail closed before touching the filesystem: the workflow policy's managed business tool needs
+        // the Core-injected CLI context, so a Host that cannot carry it must not start at all.
+        anyhow::ensure!(
+            !launch.require_builtin_tools || launch.builtin_tools.is_some(),
+            "workspace_workflow_requires_builtin_tool_cli"
+        );
         create_private_directory(launch.private_runtime_dir)?;
         if let Some(session_dir) = launch.session_dir {
             create_private_directory(session_dir)?;
@@ -633,6 +642,13 @@ impl PiHost {
         create_private_directory(&config_root)?;
         let extension_path = config_root.join("rovai-pi-host.ts");
         write_private_file(&extension_path, MANAGED_HOST_EXTENSION.as_bytes())?;
+        // The managed Host extension imports the workflow bridge from this same private directory. It is
+        // written for every policy (one extra small file) so the import can never be the reason a Host
+        // fails to load; the bridge itself registers nothing unless the grant carries its tool.
+        write_private_file(
+            &config_root.join(super::MANAGED_WORKFLOW_TOOL_EXTENSION_NAME),
+            super::MANAGED_WORKFLOW_TOOL_EXTENSION.as_bytes(),
+        )?;
         let managed_mcp = match launch.mcp {
             Some(mcp) => {
                 anyhow::ensure!(super::managed_mcp_document_digest(&mcp.document)? == mcp.digest,
@@ -2192,6 +2208,10 @@ impl PiRpcRuntimeAdapter {
         // The policy comes from the frozen runtime permissions; the workspace is the canonical root Core
         // already chose for this AgentRun. Neither the prompt nor the environment may supply either.
         let file_access_mode = mode_from_permissions(&request.frozen_runtime.permissions.values)?;
+        // The workflow policy adds a managed Core business tool that runs the bundled CLI. The managed
+        // Host only gets the CLI context through `builtin_tools`, so the launch below asserts that
+        // requirement instead of registering a tool that could never authenticate.
+        let require_builtin_tools = file_access_mode == PiFileAccessMode::WorkspaceWorkflow;
         let guard_log_dir = self
             .private_runtime_dir
             .join("pi-file-guard")
@@ -2262,6 +2282,7 @@ impl PiRpcRuntimeAdapter {
                         },
                         file_grant: spawn_file_grant.as_ref(),
                         pi_purge: spawn_purge.as_ref(),
+                        require_builtin_tools,
                     })
                     .await?;
                     Ok(RuntimeProcessHost::Pi(host))
@@ -2515,6 +2536,7 @@ async fn spawn_probe_host(executable: &Path) -> Result<(Arc<PiHost>, PiProbeRoot
         mcp: None,
         file_grant: None,
         pi_purge: None,
+        require_builtin_tools: false,
     })
     .await?;
     Ok((host, _probe_root_cleanup))
@@ -3398,7 +3420,7 @@ write_session() {
 emit_managed_session_state() {
   host_instance_id=$(/usr/bin/sed -n 's/.*"hostInstanceId":"\([^"]*\)".*/\1/p' "$ROVAI_PI_HOST_BINDING_FILE")
   host_binding_generation=$(/usr/bin/sed -n 's/.*"hostBindingGeneration":\([0-9][0-9]*\).*/\1/p' "$ROVAI_PI_HOST_BINDING_FILE")
-  event=$(printf '{"type":"extension_ui_request","method":"setStatus","statusKey":"rovai-managed-session-state","statusText":"{\\"schemaVersion\\":3,\\"extensionVersion\\":\\"rovai-pi-host-v10\\",\\"hostInstanceId\\":\\"%s\\",\\"hostBindingGeneration\\":%s,\\"sessionId\\":\\"%s\\",\\"sessionFile\\":\\"%s\\",\\"cwd\\":\\"%s\\"}"}' "$host_instance_id" "$host_binding_generation" "$session_id" "$session_file" "$PWD")
+  event=$(printf '{"type":"extension_ui_request","method":"setStatus","statusKey":"rovai-managed-session-state","statusText":"{\\"schemaVersion\\":3,\\"extensionVersion\\":\\"rovai-pi-host-v11\\",\\"hostInstanceId\\":\\"%s\\",\\"hostBindingGeneration\\":%s,\\"sessionId\\":\\"%s\\",\\"sessionFile\\":\\"%s\\",\\"cwd\\":\\"%s\\"}"}' "$host_instance_id" "$host_binding_generation" "$session_id" "$session_file" "$PWD")
   printf '%s\n' "$event" >> "$event_log"
   printf '%s\n' "$event"
 }
@@ -3840,6 +3862,7 @@ done
         mcp: None,
             file_grant: None,
             pi_purge: None,
+            require_builtin_tools: false,
         })
         .await
         .unwrap();
@@ -4030,6 +4053,7 @@ done
         mcp: None,
                 file_grant: None,
                 pi_purge: None,
+                require_builtin_tools: false,
             })
             .await
             .unwrap();
@@ -4166,7 +4190,7 @@ done
 
     #[test]
     fn production_host_launch_preserves_pi_native_resources() {
-        let extension = Path::new("/private/rovai-pi-host-v10.ts");
+        let extension = Path::new("/private/rovai-pi-host-v11.ts");
         let mut production = Command::new("pi");
         append_host_arguments(&mut production, extension, None, None);
         let production_args = production
@@ -4182,7 +4206,7 @@ done
                 "--no-themes",
                 "--approve",
                 "--extension",
-                "/private/rovai-pi-host-v10.ts",
+                "/private/rovai-pi-host-v11.ts",
             ]
         );
         for forbidden in [
@@ -4199,11 +4223,12 @@ done
 
     #[test]
     fn guarded_host_launch_adds_only_the_granted_tools_and_the_managed_guard() {
-        let extension = Path::new("/private/rovai-pi-host-v10.ts");
+        let extension = Path::new("/private/rovai-pi-host-v11.ts");
         let guard = Path::new("/private/rovai-pi-file-guard.ts");
-        // One table over the two exact frozen tool sets Core can emit; the joined spelling is what the
-        // Host receives, so it is asserted verbatim.
-        for tools in ["read", "read,write,edit"] {
+        // One table over the three exact frozen tool sets Core can emit; the joined spelling is what the
+        // Host receives, so it is asserted verbatim. The workflow set adds exactly one managed business
+        // tool and still carries the three native file tools.
+        for tools in ["read", "read,write,edit", "read,write,edit,rovai_loom"] {
             let mut production = Command::new("pi");
             append_host_arguments(&mut production, extension, Some((guard, tools)), None);
             let production_args = production
@@ -4223,7 +4248,7 @@ done
                     "--extension",
                     "/private/rovai-pi-file-guard.ts",
                     "--extension",
-                    "/private/rovai-pi-host-v10.ts",
+                    "/private/rovai-pi-host-v11.ts",
                 ]
             );
             // Exactly one `--tools` flag, and no isolation switch is dropped by the guard slice.
@@ -4322,6 +4347,7 @@ done
         mcp: None,
                 file_grant: None,
                 pi_purge: None,
+                require_builtin_tools: false,
             })
             .await?;
             let state = host.command("get_state", json!({})).await;

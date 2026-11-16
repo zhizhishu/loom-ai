@@ -21,6 +21,11 @@
 // - `workspace_read_write`: the same boundary, widened to Pi's three native file tools
 //   `read`/`write`/`edit`. `bash` and every extension/MCP tool stay outside the grant; the tool set is
 //   derived here from the frozen mode, never from the caller.
+// - `workspace_workflow`: the same three native file tools plus exactly one managed Core business
+//   tool (`rovai_loom`) that reaches only the eight `loom.*` operations Core already ships. The
+//   additional tool can never be composed by a caller: the name and the operation set live here (Rust)
+//   and in the shared guard / managed Host extension (TypeScript), and a Run without this frozen mode
+//   neither loads nor may call it. `bash`, arbitrary CLI, MCP and every other tool stay outside.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +39,11 @@ pub(crate) const PI_FILE_ACCESS_KEY: &str = "loom_file_access";
 pub(crate) const PI_FILE_ACCESS_NATIVE: &str = "native";
 pub(crate) const PI_FILE_ACCESS_WORKSPACE_READ_ONLY: &str = "workspace_read_only";
 pub(crate) const PI_FILE_ACCESS_WORKSPACE_READ_WRITE: &str = "workspace_read_write";
+pub(crate) const PI_FILE_ACCESS_WORKSPACE_WORKFLOW: &str = "workspace_workflow";
+
+/// The one managed Core business tool the workflow policy adds. It is a Core-owned, typed bridge to
+/// the eight `loom.*` operations — never `bash`, never an arbitrary command, never MCP.
+pub(crate) const PI_LOOM_TOOL_NAME: &str = "rovai_loom";
 
 /// Must match `RUNTIME_GUARD_SCHEMA` in scripts/loom-v2-runtime-execution.mjs.
 pub(crate) const PI_FILE_GRANT_SCHEMA: &str = "loom.runtime.file-guard.v1";
@@ -44,6 +54,10 @@ pub(crate) const PI_FILE_GRANT_READ_ONLY_TOOLS: [&str; 1] = ["read"];
 /// and every extension/MCP tool stay outside the grant by construction — this is not a tool framework,
 /// it is the same closed list the shared guard already validates.
 pub(crate) const PI_FILE_GRANT_READ_WRITE_TOOLS: [&str; 3] = ["read", "write", "edit"];
+/// The exact tool set of the workflow policy: the same three native file tools plus the one managed
+/// Core business tool, in a fixed order. Nothing else is representable — the caller can never widen it.
+pub(crate) const PI_FILE_GRANT_WORKFLOW_TOOLS: [&str; 4] =
+    ["read", "write", "edit", PI_LOOM_TOOL_NAME];
 /// `native` gets no grant at all, so it never has a tool list.
 pub(crate) const PI_FILE_GRANT_NO_TOOLS: [&str; 0] = [];
 /// A grant is scoped to one Run; twelve hours is far beyond any accepted Run and still bounded.
@@ -54,6 +68,7 @@ pub(crate) enum PiFileAccessMode {
     Native,
     WorkspaceReadOnly,
     WorkspaceReadWrite,
+    WorkspaceWorkflow,
 }
 
 impl PiFileAccessMode {
@@ -62,6 +77,7 @@ impl PiFileAccessMode {
             Self::Native => PI_FILE_ACCESS_NATIVE,
             Self::WorkspaceReadOnly => PI_FILE_ACCESS_WORKSPACE_READ_ONLY,
             Self::WorkspaceReadWrite => PI_FILE_ACCESS_WORKSPACE_READ_WRITE,
+            Self::WorkspaceWorkflow => PI_FILE_ACCESS_WORKSPACE_WORKFLOW,
         }
     }
 
@@ -76,6 +92,7 @@ impl PiFileAccessMode {
             Self::Native => &PI_FILE_GRANT_NO_TOOLS,
             Self::WorkspaceReadOnly => &PI_FILE_GRANT_READ_ONLY_TOOLS,
             Self::WorkspaceReadWrite => &PI_FILE_GRANT_READ_WRITE_TOOLS,
+            Self::WorkspaceWorkflow => &PI_FILE_GRANT_WORKFLOW_TOOLS,
         }
     }
 }
@@ -107,6 +124,7 @@ pub(crate) fn mode_from_permissions(values: &Value) -> Result<PiFileAccessMode> 
         PI_FILE_ACCESS_NATIVE => Ok(PiFileAccessMode::Native),
         PI_FILE_ACCESS_WORKSPACE_READ_ONLY => Ok(PiFileAccessMode::WorkspaceReadOnly),
         PI_FILE_ACCESS_WORKSPACE_READ_WRITE => Ok(PiFileAccessMode::WorkspaceReadWrite),
+        PI_FILE_ACCESS_WORKSPACE_WORKFLOW => Ok(PiFileAccessMode::WorkspaceWorkflow),
         other => bail!("Pi permission {PI_FILE_ACCESS_KEY} has an unsupported mode: {other}"),
     }
 }
@@ -238,6 +256,8 @@ mod tests {
             (json!({ "mode": "workspace_read_only" }), PiFileAccessMode::WorkspaceReadOnly),
             (json!("workspace_read_write"), PiFileAccessMode::WorkspaceReadWrite),
             (json!({ "mode": "workspace_read_write" }), PiFileAccessMode::WorkspaceReadWrite),
+            (json!("workspace_workflow"), PiFileAccessMode::WorkspaceWorkflow),
+            (json!({ "mode": "workspace_workflow" }), PiFileAccessMode::WorkspaceWorkflow),
         ] {
             assert_eq!(
                 mode_from_permissions(&json!({ "loom_file_access": value })).unwrap(),
@@ -247,8 +267,19 @@ mod tests {
         // Every guarded mode loads the guard; only the frozen tool list differs.
         assert!(PiFileAccessMode::WorkspaceReadOnly.guarded());
         assert!(PiFileAccessMode::WorkspaceReadWrite.guarded());
+        assert!(PiFileAccessMode::WorkspaceWorkflow.guarded());
         assert!(!PiFileAccessMode::Native.guarded());
         assert!(PiFileAccessMode::Native.granted_tools().is_empty());
+        // The legacy tool sets are untouched by the workflow mode.
+        assert_eq!(PiFileAccessMode::WorkspaceReadOnly.granted_tools(), ["read"]);
+        assert_eq!(
+            PiFileAccessMode::WorkspaceReadWrite.granted_tools(),
+            ["read", "write", "edit"]
+        );
+        assert_eq!(
+            PiFileAccessMode::WorkspaceWorkflow.granted_tools(),
+            ["read", "write", "edit", PI_LOOM_TOOL_NAME]
+        );
     }
 
     #[test]
@@ -315,6 +346,15 @@ mod tests {
                 PiFileAccessMode::WorkspaceReadWrite,
                 vec!["read".to_string(), "write".to_string(), "edit".to_string()],
             ),
+            (
+                PiFileAccessMode::WorkspaceWorkflow,
+                vec![
+                    "read".to_string(),
+                    "write".to_string(),
+                    "edit".to_string(),
+                    PI_LOOM_TOOL_NAME.to_string(),
+                ],
+            ),
         ] {
             let workspace = temp_workspace(mode.as_str());
             let grant = PiFileGrant::for_run(
@@ -344,6 +384,13 @@ mod tests {
                         "{mode:?} must not grant {forbidden}"
                     );
                 }
+            }
+            // Only the workflow policy carries the managed Core business tool, and only alongside the
+            // three native file tools — never on its own.
+            if mode == PiFileAccessMode::WorkspaceWorkflow {
+                assert!(grant.allowed_tools.iter().any(|tool| tool == PI_LOOM_TOOL_NAME));
+            } else {
+                assert!(!grant.allowed_tools.iter().any(|tool| tool == PI_LOOM_TOOL_NAME));
             }
             // The document keys are exactly what the shared guard validates: eight, never more.
             let document = grant.to_document().unwrap();

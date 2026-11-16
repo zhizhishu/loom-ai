@@ -290,6 +290,123 @@ test('fail closed: missing, unparsable, expired and mismatched grants block ever
 })
 
 // ---------------------------------------------------------------------------
+// 5b · workspace_workflow: the same file boundary plus one managed business tool
+// ---------------------------------------------------------------------------
+
+test('workflow policy: the managed loom tool reaches the eight operations only, and its evidence path uses the read policy', { timeout: 60_000 }, async () => {
+  const root = freshDir('loom-workflow-grant-')
+  const workspace = join(root, 'ws')
+  const outside = join(root, 'outside')
+  mkdirSync(workspace)
+  mkdirSync(outside)
+  mkdirSync(join(workspace, 'out'))
+  writeFileSync(join(workspace, 'notes.md'), 'in scope\n', 'utf8')
+  writeFileSync(join(workspace, 'out', 'report.md'), 'deliverable\n', 'utf8')
+  writeFileSync(join(outside, 'secret.txt'), 'outside secret\n', 'utf8')
+  const logPath = join(root, 'guard.jsonl')
+  const workspaceReal = realpathSync(workspace)
+  const ctx = { cwd: workspaceReal }
+  const WORKFLOW = ['read', 'write', 'edit', 'rovai_loom']
+
+  let symlinkCreated = false
+  try {
+    symlinkSync(join(outside, 'secret.txt'), join(workspace, 'link.md'), 'file')
+    symlinkCreated = true
+  } catch (error) {
+    if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error
+  }
+
+  try {
+    const workflowFile = join(root, 'workflow.json')
+    writeFileSync(workflowFile, JSON.stringify(grantDocument({ workspaceReal, logPath, tools: WORKFLOW })), 'utf8')
+    const workflow = await loadGuard({ grantFile: workflowFile })
+
+    // The three native file tools keep working inside the workspace.
+    for (const [toolName, id] of [['read', 'f_read'], ['write', 'f_write'], ['edit', 'f_edit']]) {
+      assert.equal(workflow(toolEvent(toolName, id, { path: 'notes.md' }), ctx), undefined, `${toolName} must stay granted`)
+    }
+
+    // Every operation without a path argument is allowed.
+    for (const operation of ['loom.status', 'loom.plan', 'loom.release', 'loom.claim', 'loom.submit', 'loom.inspect', 'loom.stage-review']) {
+      assert.equal(
+        workflow(toolEvent('rovai_loom', `op_${operation}`, { operation, input: {} }), ctx),
+        undefined,
+        `${operation} must be allowed by the workflow grant`
+      )
+    }
+
+    // Nothing outside the eight operations is reachable, even with a plausible looking name.
+    for (const operation of ['loom.workspace.run', 'loom.accept', 'thread.message.send', 'bash', 'memory.write', '']) {
+      const outcome = workflow(toolEvent('rovai_loom', `op_bad_${operation}`, { operation, input: {} }), ctx)
+      assert.equal(outcome?.block, true, `${operation} must be refused`)
+      assert.match(String(outcome.reason), /loom_operation_not_allowed/)
+    }
+    const missingOperation = workflow(toolEvent('rovai_loom', 'op_missing', { input: {} }), ctx)
+    assert.equal(missingOperation?.block, true)
+    assert.match(String(missingOperation.reason), /loom_operation_not_allowed/)
+
+    // `loom.evidence` resolves its path through the same read policy.
+    assert.equal(
+      workflow(toolEvent('rovai_loom', 'op_evidence_ok', { operation: 'loom.evidence', input: { relativePath: 'out/report.md' } }), ctx),
+      undefined,
+      'an in-workspace regular file is valid evidence'
+    )
+    for (const [relativePath, pattern] of [
+      [join(outside, 'secret.txt'), /path_outside_workspace/],
+      ['../outside/secret.txt', /path_parent_escape/],
+      ['.git/config', /sensitive_path/],
+      ['id_rsa', /sensitive_path/],
+      ['missing.md', /path_missing_for_tool/],
+      ['', /path_missing/],
+    ]) {
+      const outcome = workflow(toolEvent('rovai_loom', `op_evidence_${relativePath}`, { operation: 'loom.evidence', input: { relativePath } }), ctx)
+      assert.equal(outcome?.block, true, `evidence ${relativePath || '<empty>'} must be refused`)
+      assert.match(String(outcome.reason), pattern)
+    }
+    if (symlinkCreated) {
+      const outcome = workflow(toolEvent('rovai_loom', 'op_evidence_link', { operation: 'loom.evidence', input: { relativePath: 'link.md' } }), ctx)
+      assert.equal(outcome?.block, true, 'a symlinked evidence path must be refused')
+      assert.match(String(outcome.reason), /path_symlink_escape/)
+    }
+
+    // The legacy policies never grant the business tool, so the call is refused there.
+    for (const tools of [['read'], ['read', 'write', 'edit']]) {
+      const legacyFile = join(root, `legacy-${tools.length}.json`)
+      writeFileSync(legacyFile, JSON.stringify(grantDocument({ workspaceReal, logPath, tools })), 'utf8')
+      const legacy = await loadGuard({ grantFile: legacyFile })
+      const outcome = legacy(toolEvent('rovai_loom', `op_legacy_${tools.length}`, { operation: 'loom.status', input: {} }), ctx)
+      assert.equal(outcome?.block, true, `${tools.join(',')} must not grant the business tool`)
+      assert.match(String(outcome.reason), /tool_not_granted/)
+    }
+
+    // A grant that mixes the business tool with anything else fails the load outright.
+    for (const tools of [
+      ['rovai_loom'],
+      ['read', 'rovai_loom'],
+      ['read', 'write', 'edit', 'bash', 'rovai_loom'],
+      ['read', 'write', 'edit', 'rovai_loom', 'rovai_loom'],
+      ['write', 'edit', 'rovai_loom'],
+      ['read', 'write', 'edit', 'mcp__server__tool'],
+    ]) {
+      const badFile = join(root, `bad-${tools.join('_')}.json`)
+      writeFileSync(badFile, JSON.stringify(grantDocument({ workspaceReal, logPath, tools })), 'utf8')
+      const blocked = await loadGuard({ grantFile: badFile })
+      const outcome = blocked(toolEvent('read', 'bad_read', { path: 'notes.md' }), ctx)
+      assert.equal(outcome?.block, true, `${tools.join(',')} must fail closed`)
+      assert.match(String(outcome.reason), /guard_tools_not_permitted/)
+    }
+
+    // Decisions are recorded with the operation, and no outside path is written in plaintext.
+    const log = readLog(logPath)
+    assert.ok(log.includes('loom_operation_granted'), 'allowed operations must be recorded')
+    assert.ok(log.includes('"operation":"loom.evidence"'), 'evidence decisions must name the operation')
+    assert.equal(log.includes('secret.txt'), false, 'outside paths never reach the log')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
 // 5 · a tool call whose decision cannot be logged is refused
 // ---------------------------------------------------------------------------
 

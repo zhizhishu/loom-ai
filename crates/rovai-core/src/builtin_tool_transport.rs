@@ -19,6 +19,29 @@ pub const BUILTIN_TOOL_RUNTIME_CAPABILITY: &str = "builtin_cli.transport.v45";
 pub const ROVAI_AGENT_CLI_ENV: &str = "ROVAI_AGENT_CLI";
 pub const ROVAI_CLI_CONTEXT_ENV: &str = "ROVAI_CLI_CONTEXT";
 pub const ROVAI_RUN_TMP_ENV: &str = "ROVAI_RUN_TMP";
+/// Per-invocation request identity for the managed LOOM workflow tool.
+///
+/// The Pi managed bridge sets this on the exact child process it spawns, derived from the provider
+/// tool-call id plus the authenticated Run binding and the operation. It is never read from model
+/// output, so a payload can never name its own command identity. The CLI accepts it for the eight
+/// `loom.*` operations only; every other operation keeps its previous request-id behaviour.
+pub const ROVAI_BUILTIN_REQUEST_ID_ENV: &str = "ROVAI_BUILTIN_REQUEST_ID";
+/// The complete operation set the managed workflow tool may reach: the eight LOOM business
+/// operations the CLI already ships. `bash`, MCP, and every other operation stay outside it.
+pub const MANAGED_WORKFLOW_OPERATIONS: [&str; 8] = [
+    "loom.status",
+    "loom.plan",
+    "loom.release",
+    "loom.claim",
+    "loom.evidence",
+    "loom.submit",
+    "loom.inspect",
+    "loom.stage-review",
+];
+
+pub fn is_managed_workflow_operation(operation: &str) -> bool {
+    MANAGED_WORKFLOW_OPERATIONS.contains(&operation)
+}
 pub const COMPACTION_HOOK_IPC_PROTOCOL_VERSION: u32 = 1;
 pub const COMPACTION_OBSERVATION_IPC_KIND: &str = "compaction_observation";
 pub const COMPACTION_OBSERVATION_OUTBOX_SCHEMA_VERSION: u32 = 1;
@@ -1306,6 +1329,38 @@ pub fn input_schema_properties(input_schema: &Value) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_workflow_operations_are_exactly_the_eight_loom_business_operations() {
+        assert_eq!(MANAGED_WORKFLOW_OPERATIONS.len(), 8);
+        for operation in MANAGED_WORKFLOW_OPERATIONS {
+            assert!(operation.starts_with("loom."), "{operation} is not a loom operation");
+            assert!(is_managed_workflow_operation(operation));
+            // Every one of them is a CLI operation the transport already ships.
+            assert!(
+                BUILTIN_TOOL_CLI_IDENTITIES
+                    .iter()
+                    .any(|identity| identity.operation == operation),
+                "{operation} is not a shipped CLI operation"
+            );
+        }
+        // Workspace RPC, bash and every other operation stay outside the managed workflow set.
+        for operation in [
+            "loom.workspace.list",
+            "loom.workspace.read",
+            "loom.workspace.run",
+            "loom.workspace.poll",
+            "loom.workspace.cancel",
+            "thread.list",
+            "thread.message.send",
+            "memory.write",
+            "mission.update",
+            "bash",
+            "",
+        ] {
+            assert!(!is_managed_workflow_operation(operation), "{operation} must stay outside");
+        }
+    }
 
     #[test]
     fn cli_mapping_is_complete_unique_and_contract_valid() {

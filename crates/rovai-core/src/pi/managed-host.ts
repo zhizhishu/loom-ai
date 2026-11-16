@@ -1,20 +1,40 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
+// The managed workflow bridge is the single canonical source of the one Core business tool the
+// `workspace_workflow` policy adds. It has no import side effects (crypto/fs/path only) and grants
+// nothing by itself; the child process module is loaded lazily on first use so a legacy Host keeps
+// exactly today's capability surface.
+import {
+  CLI_ENV,
+  LOOM_TOOL_NAME,
+  loomToolParameters,
+  planInvocation,
+  registrationFailureLine,
+  resolveTrustedCli,
+  runInvocation,
+} from "./managed-workflow-tool.ts";
 
 const SCHEMA_VERSION = 3;
-const EXTENSION_VERSION = "rovai-pi-host-v10";
+const EXTENSION_VERSION = "rovai-pi-host-v11";
 // Optional per-Run file-access policy. Absent => the unchanged legacy native policy (no guard).
 // Core writes the grant to a private file and points this env var at it; the same file is what the
 // shared guard reads, so the extension and the guard can never disagree about the policy.
 const FILE_GRANT_FILE_ENV = "ROVAI_PI_FILE_GRANT_FILE";
 const FILE_GRANT_SCHEMA = "loom.runtime.file-guard.v1";
-// The only two tool sets a Core-written grant may carry: the conservative read-only policy and the
-// read-write policy over Pi's three native file tools. Anything else (a subset, a duplicate, `bash`,
-// an extension/MCP tool) fails the extension load. The sets are compared in order, exactly.
+// The only three tool sets a Core-written grant may carry: the conservative read-only policy, the
+// read-write policy over Pi's three native file tools, and the explicitly chosen workflow policy that
+// adds the one managed Core business tool. Anything else (a subset, a duplicate, `bash`, an arbitrary
+// extension/MCP tool, or the business tool without the file tools) fails the extension load. The sets
+// are compared in order, exactly.
 const FILE_GRANT_READ_ONLY_TOOLS = ["read"];
 const FILE_GRANT_READ_WRITE_TOOLS = ["read", "write", "edit"];
-const FILE_GRANT_TOOL_SETS = [FILE_GRANT_READ_ONLY_TOOLS, FILE_GRANT_READ_WRITE_TOOLS];
+const FILE_GRANT_WORKFLOW_TOOLS = ["read", "write", "edit", LOOM_TOOL_NAME];
+const FILE_GRANT_TOOL_SETS = [
+  FILE_GRANT_READ_ONLY_TOOLS,
+  FILE_GRANT_READ_WRITE_TOOLS,
+  FILE_GRANT_WORKFLOW_TOOLS,
+];
 const FILE_GRANT_KEYS = [
   "schema",
   "runId",
@@ -117,8 +137,10 @@ function loadBinding(): any {
  * - absent / `native`: the unchanged legacy behaviour. A `runGrant` must NOT be present, so a guard can
  *   never be half-configured.
  * - `workspace_read_only` / `workspace_read_write`: a fully typed `runGrant` is mandatory and must be
- *   bound to THIS run, to one of the two exact frozen tool sets, and to a future expiry. Anything else
+ *   bound to THIS run, to one of the exact frozen tool sets, and to a future expiry. Anything else
  *   fails the extension load.
+ * - `workspace_workflow`: the read-write set plus the one managed `rovai_loom` business tool. Only this
+ *   grant shape registers that tool; every other policy registers nothing.
  */
 function validateFileAccess(binding: any): void {
   const grant = readRunGrant();
@@ -193,8 +215,7 @@ function publishManagedSessionState(ctx: any, current: any): void {
   );
 }
 
-function publishFailure(ctx: any, binding: any, phase: string, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
+function publishFailure(ctx: any, binding: any, phase: string, error: unknown): void {  const message = error instanceof Error ? error.message : String(error);
   ctx.ui.setStatus(
     "rovai-managed-failure",
     JSON.stringify({
@@ -236,7 +257,107 @@ function publishContextUsage(ctx: any): void {
   }
 }
 
+// --------------------------------------------------------------------------
+// Managed LOOM workflow tool
+// --------------------------------------------------------------------------
+
+/**
+ * Decide once, at extension load time, whether this Host may register the managed business tool.
+ *
+ * Registration is synchronous and load-time on purpose: Pi applies its tool allowlist to
+ * built-in/extension/custom tools alike, so the tool must exist before the first prompt instead of
+ * appearing after `session_start`. A policy that does not carry it registers nothing — there is no
+ * degraded variant, no PATH search and no fallback executable.
+ */
+function loomRegistration(pi: any): void {
+  let grant: any = null;
+  try {
+    grant = readRunGrant();
+  } catch {
+    writeLoadDiagnostic("loom_grant_unreadable");
+    return;
+  }
+  if (grant === null) return;
+  if (!Array.isArray(grant.allowedTools) || !grant.allowedTools.includes(LOOM_TOOL_NAME)) return;
+  const resolved = resolveTrustedCli(process.env[CLI_ENV]);
+  if (!resolved.ok) {
+    writeLoadDiagnostic(resolved.code);
+    return;
+  }
+  const cliPath = resolved.cliPath;
+
+  pi.registerTool({
+    name: LOOM_TOOL_NAME,
+    label: "LOOM workflow",
+    description:
+      "Run one LOOM operation for the current Thread's Mission: status, plan, release, claim, "
+      + "evidence, submit, inspect, stage-review. `evidence` registers a file you produced (a path "
+      + "relative to the Mission workspace). `submit` sends your claimed task for User acceptance; it "
+      + "never accepts a delivery. The Run, Member and Mission come from Core authentication — you "
+      + "cannot and need not name them.",
+    promptSnippet: "rovai_loom — record delivery evidence and submit a claimed task (8 LOOM operations only)",
+    parameters: loomToolParameters(),
+    async execute(toolCallId: string, params: any, signal?: AbortSignal) {
+      let binding: any;
+      let grantNow: any;
+      try {
+        // Re-validate the live binding and grant on EVERY call: an expired grant, a re-bound Host or a
+        // policy that no longer carries this tool must refuse here even if it was valid at load time.
+        binding = loadBinding();
+        grantNow = readRunGrant();
+      } catch (error: unknown) {
+        return toolFailure(`LOOM tool refused: ${errorMessage(error)}`);
+      }
+      const planned = planInvocation({
+        toolCallId,
+        params,
+        grant: grantNow,
+        binding: { agentRunId: binding.agentRunId, executionEpoch: binding.executionEpoch },
+        nowMs: Date.now(),
+        cliPath,
+        baseEnv: process.env,
+      });
+      if (!planned.ok) return toolFailure(`LOOM tool refused: ${planned.code}`);
+      let spawnFn;
+      try {
+        // Loaded lazily: a Host that never calls this tool never loads a child-process module.
+        spawnFn = (await import("node:child_process")).spawn;
+      } catch {
+        return toolFailure("LOOM tool refused: loom_spawn_unavailable");
+      }
+      const result = await runInvocation({
+        spawn: spawnFn as any,
+        plan: planned.plan,
+        signal,
+      });
+      // The bridge's own text already states an unknown outcome; nothing is appended here, so a retry
+      // decision can never be inferred from wording this extension invented.
+      return { content: [{ type: "text", text: result.text }], details: undefined, isError: result.isError };
+    },
+  });
+}
+
+function toolFailure(text: string) {
+  return { content: [{ type: "text", text }], details: undefined, isError: true };
+}
+
+function errorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 500);
+}
+
+/** Private diagnostics channel: stdout is the RPC stream, so a bounded stderr line is the only safe one. */
+function writeLoadDiagnostic(code: string): void {
+  try {
+    process.stderr.write(registrationFailureLine(code));
+  } catch {
+    // A diagnostic that cannot be written cannot change what was registered.
+  }
+}
+
 export default function (pi: any) {
+  // Register at load time, before any session state or prompt exists.
+  loomRegistration(pi);
   pi.on("turn_end", async (_event: any, ctx: any) => publishContextUsage(ctx));
   pi.on("session_compact", async (_event: any, ctx: any) => publishContextUsage(ctx));
   pi.on("session_start", async (_event: any, ctx: any) => {

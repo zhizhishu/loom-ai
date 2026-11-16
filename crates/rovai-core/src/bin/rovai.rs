@@ -19,8 +19,8 @@ use rovai_core::builtin_tool_transport::{
     BuiltinToolIpcRequestBody, BuiltinToolIpcResponse, COMPACTION_HOOK_IPC_PROTOCOL_VERSION,
     COMPACTION_OBSERVATION_IPC_KIND, COMPACTION_OBSERVATION_OUTBOX_SCHEMA_VERSION,
     CompactionHookIpcRequest, CompactionHookIpcResponse, CompactionObservationOutboxRecord,
-    LocalIpcEndpoint, ROVAI_CLI_CONTEXT_ENV, ROVAI_RUN_TMP_ENV, builtin_tool_description,
-    builtin_tool_identity_by_command,
+    LocalIpcEndpoint, ROVAI_BUILTIN_REQUEST_ID_ENV, ROVAI_CLI_CONTEXT_ENV, ROVAI_RUN_TMP_ENV,
+    builtin_tool_description, builtin_tool_identity_by_command, is_managed_workflow_operation,
 };
 use rovai_core::camp_message_send_teaching::{
     CAMP_MESSAGE_SEND_BODY_HELP, CAMP_MESSAGE_SEND_FILE_HELP, CAMP_MESSAGE_SEND_HELP_EXAMPLES,
@@ -2148,6 +2148,11 @@ fn write_indented_help(output: &mut String, help: &str) {
 }
 
 fn invocation_request_id(operation: &str, input: &Value) -> Result<String> {
+    if let Some(request_id) =
+        managed_workflow_request_id(operation, env::var(ROVAI_BUILTIN_REQUEST_ID_ENV).ok().as_deref())?
+    {
+        return Ok(request_id);
+    }
     if operation == "member.update" {
         return Ok(input["requestId"]
             .as_str()
@@ -2169,6 +2174,27 @@ fn invocation_request_id(operation: &str, input: &Value) -> Result<String> {
         }
     }
     Ok(Uuid::new_v4().to_string())
+}
+
+/// The managed LOOM workflow tool names each tool call's request identity through a per-child
+/// environment variable, never through the payload: a retry of the same provider call inside the same
+/// Run must replay in Core instead of executing the operation twice.
+///
+/// Only the eight `loom.*` operations accept it. Every other operation keeps its previous behaviour,
+/// and a malformed value is an error rather than a silent fallback, so a broken bridge can never
+/// quietly turn a retry into a second execution. The value carries no authority: Core still derives the
+/// command identity from the authenticated Run plus this request id.
+fn managed_workflow_request_id(operation: &str, raw: Option<&str>) -> Result<Option<String>> {
+    if !is_managed_workflow_operation(operation) {
+        return Ok(None);
+    }
+    let Some(raw) = raw else { return Ok(None) };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let parsed = Uuid::parse_str(raw).context("managed workflow request id is not a UUID")?;
+    Ok(Some(parsed.to_string()))
 }
 
 fn operation_help_examples(operation: &str) -> &'static [&'static str] {
@@ -3521,6 +3547,71 @@ mod tests {
         let help = operation_help_text(&description);
         assert!(help.starts_with(&format!("rovai loom plan\n{summary}\n")));
         assert!(help.contains("rovai loom plan --input-file plan.json"));
+    }
+}
+
+#[cfg(test)]
+mod managed_workflow_request_id_tests {
+    use super::*;
+
+    const ID: &str = "6e71a1b4-6b19-4f86-8c18-988552586a37";
+
+    #[test]
+    fn managed_workflow_request_id_is_accepted_for_the_eight_loom_operations_only() {
+        for operation in [
+            "loom.status",
+            "loom.plan",
+            "loom.release",
+            "loom.claim",
+            "loom.evidence",
+            "loom.submit",
+            "loom.inspect",
+            "loom.stage-review",
+        ] {
+            assert_eq!(
+                managed_workflow_request_id(operation, Some(ID)).unwrap(),
+                Some(ID.to_string()),
+                "{operation} must accept the bridge-supplied request id"
+            );
+        }
+        // Every other operation keeps its previous request-id behaviour, so an inherited environment
+        // value can never change how another tool names its command.
+        for operation in [
+            "loom.workspace.list",
+            "loom.workspace.read",
+            "loom.workspace.run",
+            "loom.workspace.poll",
+            "loom.workspace.cancel",
+            "thread.list",
+            "thread.message.send",
+            "memory.write",
+            "bash",
+            "",
+        ] {
+            assert_eq!(managed_workflow_request_id(operation, Some(ID)).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn managed_workflow_request_id_rejects_malformed_values_instead_of_falling_back() {
+        assert_eq!(managed_workflow_request_id("loom.claim", None).unwrap(), None);
+        assert_eq!(managed_workflow_request_id("loom.claim", Some("  ")).unwrap(), None);
+        for value in [
+            "not-a-uuid",
+            "6e71a1b4-6b19-4f86-8c18-988552586a3",
+            "agent-run:run-1:builtin-cli:x",
+            "{6e71a1b4-6b19-4f86-8c18-988552586a37}",
+        ] {
+            assert!(
+                managed_workflow_request_id("loom.submit", Some(value)).is_err(),
+                "{value} must be refused rather than silently replaced"
+            );
+        }
+        // A padded but otherwise valid value is accepted, so a formatting accident is not a rerun.
+        assert_eq!(
+            managed_workflow_request_id("loom.submit", Some(&format!(" {ID} "))).unwrap(),
+            Some(ID.to_string())
+        );
     }
 }
 

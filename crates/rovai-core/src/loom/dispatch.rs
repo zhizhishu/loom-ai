@@ -880,7 +880,9 @@ fn prior_dispatch_outcome(connection: &Connection, dispatch_id: &str) -> Result<
 
 /// Fold the real Delivery/Run outcome of every pending dispatch back into the ledger. Unknown is
 /// never read as success, and no dedupe key is ever reset, so a retry of the same event stays
-/// impossible after a restart.
+/// impossible after a restart. Settlement is derived from the dispatch's own successor fact, never
+/// from a terminal Run alone, because the Delivery can stay claimed after its Run finished and the
+/// ledger would otherwise keep that event out forever.
 fn reconcile_dispatches(transaction: &Transaction<'_>, now: &str) -> Result<()> {
     let mut rows: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
     {
@@ -910,6 +912,17 @@ fn reconcile_dispatches(transaction: &Transaction<'_>, now: &str) -> Result<()> 
                 Some(("BLOCKED", Some("loom.dispatch_run_failed".to_string())))
             }
             (_, Some("cancelled")) => Some(("CANCELLED", None)),
+            // A Delivery that is still only claimed proves nothing either way, and a Run that is
+            // still going proves nothing at all: the ledger may only be folded from a *finished*
+            // Run, and then only from the successor fact of that very dispatch — the Candidate
+            // produced by this Run, the stage verdict written by this reviewer Run under this
+            // Candidate and policy revision, the rework chained onto this Candidate, or a settled
+            // handoff. A Run that succeeded without writing its fact stays `Pending`, so a
+            // settlement is never read out of the Run alone and a running Run is never ended here.
+            (_, Some("succeeded")) => match prior_dispatch_outcome(transaction, &dispatch_id)? {
+                PriorOutcome::Completed => Some(("SETTLED", None)),
+                _ => None,
+            },
             _ => None,
         };
         let Some((status, reason)) = settled else {

@@ -82,7 +82,7 @@ export function commandCodeLabel(code: string): string {
         runtime_permission_option_invalid: '权限选项值无效，请调整权限。填写内容已保留。',
         runtime_permission_value_invalid: '权限选项值无效，请调整权限。填写内容已保留。',
         pi_purge_requires_file_grant:
-          'Pi Purge 的 Append 需要该助手自己的工作目录文件权限作为 Core 签发的文件授权（workspace_read_only 或 workspace_read_write）；Core 不会自动开启权限，本次修改尚未保存，填写内容已保留。',
+          'Pi Purge 的 Append 需要该助手自己的工作目录文件权限作为 Core 签发的文件授权（workspace_read_only、workspace_read_write 或 workspace_workflow）；Core 不会自动开启权限，本次修改尚未保存，填写内容已保留。',
         'agent_profile.default_lead_successor_required':
           '该队员仍是某个会话的默认负责人，请先在对应会话中指定继任者',
         'adapter_installation.already_exists': '这个智能体已经存在',
