@@ -238,6 +238,8 @@ export interface MemberRuntimeConfiguration {
   adapterKind: AdapterKind
   model: ModelSelection
   permissions: AdapterPermissionConfig
+  /** Pi-only; never a tool/OS permission. */
+  piPurge?: { mode: 'off' | 'append'; persona: string } | null
 }
 
 export type RuntimeReadinessStatus =
@@ -320,6 +322,7 @@ export interface SetMemberRuntimeConfigurationCommand {
   adapterKind: AdapterKind
   model: ModelSelection
   permissions: AdapterPermissionConfig
+  piPurge?: { mode: 'off' | 'append'; persona: string } | null
 }
 
 export interface ClearMemberRuntimeConfigurationCommand {

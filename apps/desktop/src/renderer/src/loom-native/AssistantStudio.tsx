@@ -93,6 +93,8 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, the
   const updatePermission = (key: string, value: unknown) => setRuntime(current => current ? {
     ...current, permissions: { ...current.permissions, values: { ...current.permissions.values, [key]: value } }
   } : current)
+  const updatePiPurge = (patch: Partial<{ mode: 'off' | 'append'; persona: string }>) => setRuntime(current =>
+    current?.adapterKind === 'pi' ? { ...current, piPurge: { mode: 'off', persona: '', ...current.piPurge, ...patch } } : current)
   const changedDangerous = useMemo(() => {
     if (!runtime || !option) return []
     const before = local?.runtimeConfiguration?.adapterKind === runtime.adapterKind ? local.runtimeConfiguration.permissions.values : {}
@@ -154,6 +156,11 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, the
               ...option.models.filter(model => !model.hidden && !model.deprecated).map(model => ({ value:model.id,label:model.displayName || model.id }))
             ]}/>{runtime.model.mode === 'explicit' && !option.models.some(model => runtime.model.mode === 'explicit' && model.id === runtime.model.modelId) && <small>当前已保存的模型不在最新目录中：{runtime.model.modelId}。不会自动换成其他模型。</small>}</label>
             {explicitModel && selectedModel?.options.map(modelOption => <label className="ln-field" key={modelOption.key}><span>{modelOption.label}</span><ChoiceMenu theme={theme} label={modelOption.label} value={String(explicitModel.options[modelOption.key] ?? modelOption.defaultValue ?? '')} disabled={busy} onChange={value => setRuntime(current => current?.model.mode === 'explicit' ? { ...current, model: { ...current.model, options: { ...current.model.options, [modelOption.key]:value } } } : current)} choices={modelOption.values.map(choice => ({value:choice.value,label:choice.label}))}/></label>)}
+            {runtime.adapterKind === 'pi' && <section className="ln-review-card" aria-label="Pi Purge 人格扩展">
+              <div className="ln-panel-title"><h3>Pi Purge · 原生人格扩展</h3></div>
+              <label className="ln-field"><span>下次运行的扩展模式</span><ChoiceMenu label="Pi Purge 模式" theme={theme} value={runtime.piPurge?.mode ?? 'off'} disabled={busy} onChange={value => updatePiPurge({mode: value as 'off' | 'append'})} choices={[{ value:'off', label:'Off · 不启用' }, { value:'append', label:'Append · 保留原生规则，前置人格' }]}/></label>
+              <label className="ln-field"><span>人格提示词（仅当前助手）</span><textarea aria-label="Pi Purge 人格提示词" rows={4} maxLength={16 * 1024} disabled={busy} value={runtime.piPurge?.persona ?? ''} placeholder="写清这个助手的角色、表达风格和任务偏好" onChange={event => updatePiPurge({persona:event.target.value})}/><small>仅在 Pi 的下一次受管 Run 中生效；不扩大文件、MCP 或设备权限。条件不满足时 Core 必须拒绝，而不是假装已启用。</small></label>
+            </section>}
             <div className="ln-panel-title"><h3>权限与确认方式</h3></div>
             {option.permissionOptions.length ? option.permissionOptions.map(permissionField) : <FormMessage>当前运行端没有提供可编辑的权限选项。实际操作仍以运行时授权为准。</FormMessage>}
             <FormMessage>对话中的“仅一次”和“本会话允许”来自运行端的真实授权选项。不会把一次授权扩大为永久权限。</FormMessage>

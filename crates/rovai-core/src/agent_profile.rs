@@ -453,6 +453,46 @@ pub struct AdapterPermissionConfig {
     pub values: Value,
 }
 
+/// Pi-only prompt extension, never a tool/OS authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiPurgeMode {
+    Off,
+    Append,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PiPurgeSelection {
+    pub mode: PiPurgeMode,
+    pub persona: String,
+}
+
+const PI_PURGE_PERSONA_MAX_BYTES: usize = 16 * 1024;
+
+// Legacy JSON column stores the Pi-only prompt extension alongside (not inside)
+// the permission value map. Core strips it before checking native permissions;
+// future V2 storage may give Persona its own table without changing the API.
+fn saved_pi_purge(json_text: &str) -> Result<Option<PiPurgeSelection>> {
+    let value: Value = serde_json::from_str(json_text)?;
+    value.get("piPurge")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()).map_err(Into::into))
+        .transpose()
+}
+
+fn permissions_with_pi_purge(
+    permissions: &AdapterPermissionConfig,
+    preference: Option<&PiPurgeSelection>,
+) -> Result<String> {
+    let mut document = serde_json::to_value(permissions)?;
+    if let Some(preference) = preference {
+        document.as_object_mut().context("permission document is not an object")?
+            .insert("piPurge".to_string(), serde_json::to_value(preference)?);
+    }
+    Ok(serde_json::to_string(&document)?)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResolvedRuntimeBinding {
@@ -468,6 +508,8 @@ pub struct MemberRuntimeConfiguration {
     pub adapter_kind: AdapterKind,
     pub model: ModelSelection,
     pub permissions: AdapterPermissionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_purge: Option<PiPurgeSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -503,6 +545,8 @@ pub struct FrozenAgentRuntimeConfig {
     pub protocol_version: String,
     pub model: ResolvedModelSelection,
     pub permissions: AdapterPermissionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_purge: Option<PiPurgeSelection>,
     pub native_session_compatibility_key: Option<String>,
     pub binding_compatibility_digest: Option<String>,
     pub host_config_digest: Option<String>,
@@ -936,6 +980,8 @@ pub struct SetMemberRuntimeConfigurationCommand {
     pub adapter_kind: AdapterKind,
     pub model: ModelSelection,
     pub permissions: AdapterPermissionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_purge: Option<PiPurgeSelection>,
 }
 
 impl sealed::Sealed for SetMemberRuntimeConfigurationCommand {}
@@ -3009,6 +3055,18 @@ impl AgentProfileService {
                     }),
                 ));
             }
+            if let Some(selection) = &envelope.payload.pi_purge {
+                if envelope.payload.adapter_kind != AdapterKind::Pi
+                    || selection.persona.len() > PI_PURGE_PERSONA_MAX_BYTES
+                    || selection.persona.contains('\0')
+                    || (selection.mode == PiPurgeMode::Append && selection.persona.trim().is_empty())
+                {
+                    return Ok(CommandHandlerResult::rejected(
+                        "pi_purge_configuration_invalid",
+                        json!({"adapterKind": envelope.payload.adapter_kind}),
+                    ));
+                }
+            }
             let mut binding = ResolvedRuntimeBinding {
                 adapter_kind: envelope.payload.adapter_kind,
                 installation_id: ready.installation_id.clone(),
@@ -3090,7 +3148,7 @@ impl AgentProfileService {
                     envelope.payload.adapter_kind.as_str(),
                     ready.installation_id,
                     serde_json::to_string(&binding.model)?,
-                    serde_json::to_string(&binding.permissions)?,
+                    permissions_with_pi_purge(&binding.permissions, envelope.payload.pi_purge.as_ref())?,
                     now,
                     envelope.payload.expected_version,
                     ready.installation_generation,
@@ -3880,6 +3938,7 @@ impl AgentProfileService {
             .context("invalid AgentProfile default capabilities")?;
         let personality_traits = serde_json::from_str(&raw.personality_traits_json)
             .context("invalid AgentProfile personality traits")?;
+        let mut pi_purge = None;
         let resolved_runtime_binding = match (
             raw.selected_runtime_adapter_kind,
             raw.installation_id,
@@ -3888,6 +3947,8 @@ impl AgentProfileService {
         ) {
             (None, None, None, None) => None,
             (Some(adapter_kind), Some(installation_id), Some(model), Some(permissions)) => {
+                pi_purge = saved_pi_purge(&permissions)
+                    .context("invalid AgentProfile Pi Purge selection")?;
                 Some(ResolvedRuntimeBinding {
                     adapter_kind: AdapterKind::from_str(&adapter_kind)?,
                     installation_id,
@@ -3907,6 +3968,7 @@ impl AgentProfileService {
                     adapter_kind: binding.adapter_kind,
                     model: binding.model.clone(),
                     permissions: binding.permissions.clone(),
+                    pi_purge: pi_purge.clone(),
                 });
         let execution_availability = crate::member_execution_availability::evaluate(
             database.connection(),
@@ -4737,6 +4799,15 @@ pub fn resolve_frozen_runtime(
     };
     // A malformed member record is a lane failure; SQL/storage errors above
     // remain outer errors so a database outage cannot be mistaken for bad input.
+    let pi_purge = match saved_pi_purge(&permissions_json) {
+        Ok(selection) => selection,
+        Err(_) => {
+            return Ok(Err(runtime_blocker(
+                "pi_purge_configuration_invalid",
+                json!({"agentId": agent_id}),
+            )));
+        }
+    };
     let binding = (|| -> Result<ResolvedRuntimeBinding> {
         Ok(ResolvedRuntimeBinding {
             adapter_kind: AdapterKind::from_str(&selected_runtime_adapter_kind)?,
@@ -4771,6 +4842,14 @@ pub fn resolve_frozen_runtime(
     )?;
     if let Ok(runtime) = &mut result {
         crate::camp_fast::freeze(transaction, conversation_id, agent_id, runtime)?;
+        if pi_purge.is_some() && runtime.adapter_kind != AdapterKind::Pi {
+            return Ok(Err(runtime_blocker(
+                "pi_purge_configuration_invalid",
+                json!({"agentId": agent_id}),
+            )));
+        }
+        runtime.pi_purge = pi_purge;
+        runtime.refresh_config_digest()?;
     }
     Ok(result)
 }
@@ -4958,6 +5037,7 @@ fn resolve_frozen_runtime_binding_with_snapshot(
         protocol_version: projection.protocol_version,
         model,
         permissions: binding.permissions.clone(),
+        pi_purge: None,
         native_session_compatibility_key,
         binding_compatibility_digest: projection.binding_compatibility_digest,
         host_config_digest: projection.host_config_digest,
@@ -5175,6 +5255,7 @@ pub(crate) fn resolve_remote_frozen_runtime(
         protocol_version: projection.protocol_version,
         model,
         permissions: target.selection.permissions.clone(),
+        pi_purge: None,
         native_session_compatibility_key: Some(native_session_compatibility_key),
         binding_compatibility_digest: remote_compatible_digest(
             projection.binding_compatibility_digest,
@@ -5921,6 +6002,7 @@ pub(crate) fn member_runtime_defaults(adapter_kind: AdapterKind) -> MemberRuntim
             schema_version: 1,
             values: AgentRuntimeAdapterRegistry::default().member_permission_defaults(adapter_kind),
         },
+        pi_purge: None,
     }
 }
 
@@ -6292,6 +6374,32 @@ fn professional_responsibilities_use_trimmed_unicode_scalar_limits() {
     ] {
         assert!(normalize_member_identity("A", &role, "", &[], &principles, &growth).is_err());
     }
+}
+
+// This is the sole scalar owner for Pi Purge persistence: old permission
+// projections stay byte-semantically equivalent, while Persona is round-tripped
+// separately and cannot become a native ToolGrant value.
+#[cfg(test)]
+#[test]
+fn pi_purge_selection_roundtrips_without_entering_runtime_permissions() {
+    let permissions = member_runtime_defaults(AdapterKind::Pi).permissions;
+    let selection = PiPurgeSelection {
+        mode: PiPurgeMode::Append,
+        persona: "Use concise responses".to_owned(),
+    };
+    let saved = permissions_with_pi_purge(&permissions, Some(&selection)).unwrap();
+    let native: AdapterPermissionConfig = serde_json::from_str(&saved).unwrap();
+    assert_eq!(native, permissions);
+    assert_eq!(saved_pi_purge(&saved).unwrap(), Some(selection));
+    let document: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(document["values"], permissions.values);
+    assert!(document["values"].get("piPurge").is_none());
+
+    let old_saved = permissions_with_pi_purge(&permissions, None).unwrap();
+    assert!(saved_pi_purge(&old_saved).unwrap().is_none());
+    let malformed = old_saved.trim_end_matches('}').to_owned()
+        + ",\"piPurge\":{\"mode\":\"unknown\",\"persona\":\"x\"}}";
+    assert!(saved_pi_purge(&malformed).is_err());
 }
 
 #[cfg(all(test, feature = "slow-tests"))]
@@ -7125,6 +7233,7 @@ mod slow_tests {
                     &user_command(
                         "expired-catalog-runtime-default",
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: profile.version,
@@ -7150,6 +7259,7 @@ mod slow_tests {
                     &user_command(
                         "expired-catalog-explicit-model",
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: configured.agent_id,
                             expected_version: configured.version,
@@ -7439,6 +7549,7 @@ mod slow_tests {
                 &user_command(
                     "set-runtime",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile_id.clone(),
                         expected_version: profile.version,
@@ -7879,6 +7990,7 @@ mod slow_tests {
                 &user_command(
                     "set-mismatched-runtime",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id,
                         expected_version: profile.version,
@@ -7939,6 +8051,7 @@ mod slow_tests {
                 &user_command(
                     "explicit-runtime-config",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,
@@ -7988,6 +8101,7 @@ mod slow_tests {
                 &user_command(
                     "invalid-runtime-config",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: configured.version,
@@ -8119,6 +8233,7 @@ mod slow_tests {
                     &user_command(
                         &format!("retain-model-{index}"),
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: if stale_version { version - 1 } else { version },
@@ -8167,6 +8282,7 @@ mod slow_tests {
                     &user_command(
                         &format!("manual-model-{index}"),
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: version,
@@ -8208,6 +8324,7 @@ mod slow_tests {
                 &user_command(
                     "select-unresolved-codex",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,
@@ -8497,6 +8614,7 @@ mod slow_tests {
                     &user_command(
                         "configure-detected",
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: profile.version,
@@ -8523,6 +8641,7 @@ mod slow_tests {
                             &user_command(
                                 &uuid::Uuid::new_v4().to_string(),
                                 SetMemberRuntimeConfigurationCommand {
+                                    pi_purge: None,
                                     environment_update: None,
                                     agent_id: profile.agent_id,
                                     expected_version: profile.version,
@@ -8570,6 +8689,7 @@ mod slow_tests {
                                 &user_command(
                                     &uuid::Uuid::new_v4().to_string(),
                                     SetMemberRuntimeConfigurationCommand {
+                                        pi_purge: None,
                                         environment_update: None,
                                         agent_id: profile.agent_id,
                                         expected_version: profile.version,
@@ -8643,6 +8763,7 @@ mod slow_tests {
                         &user_command(
                             "save-after-catalog-failure",
                             SetMemberRuntimeConfigurationCommand {
+                                pi_purge: None,
                                 environment_update: None,
                                 agent_id: profile.agent_id.clone(),
                                 expected_version: after_failure.version,
@@ -9046,6 +9167,7 @@ mod slow_tests {
                 &user_command(
                     "select-managed-codex",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id,
                         expected_version: profile.version,
@@ -9325,6 +9447,7 @@ mod slow_tests {
                 &user_command(
                     "configure-light-qwen",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,

@@ -2952,6 +2952,7 @@ mod tests {
             },
             permission_semantics: PermissionSemantics::RuntimeManagedV2,
             runtime: FrozenAgentRuntimeConfig {
+                pi_purge: None,
                 environment: cfg!(windows).then(|| {
                     let overlay: BTreeMap<String, String> = BTreeMap::from([(
                         "claude_code_disable_background_tasks".into(),

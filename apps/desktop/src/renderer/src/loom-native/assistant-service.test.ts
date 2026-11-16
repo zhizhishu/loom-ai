@@ -263,6 +263,40 @@ describe('assistant Runtime choice and save', () => {
     })
   })
 
+  it('persists Pi Purge as an independent per-assistant preference and refuses invalid input', async () => {
+    const defaultsPi: MemberRuntimeConfiguration = {
+      adapterKind: 'pi', model: { mode: 'runtime_default' },
+      permissions: { adapterKind: 'pi', schemaVersion: 1, values: { file_access: 'workspace_read_write' } }
+    }
+    const installedPi = installation({
+      adapterKind: 'pi', memberRuntimeDefaults: defaultsPi,
+      snapshot: { ...installation().snapshot!, permissionSchemaVersion: 1 }
+    })
+    const choice = assistantRuntimeChoice(profile, 'pi', installedPi)!
+    expect(choice.piPurge).toEqual({ mode: 'off', persona: '' })
+    const request = vi.fn(async () => applied({ version: 4 }))
+    await saveAssistantRuntime({
+      client: client(request), agent: profile,
+      choice: { ...choice, piPurge: { mode: 'append', persona: 'Be concise and cite evidence.' } }
+    })
+    const command = (request.mock.calls[0] as unknown as [string, { command: Record<string, unknown> }])[1].command
+    expect(command.piPurge).toEqual({ mode: 'append', persona: 'Be concise and cite evidence.' })
+    expect(command.permissions).toEqual(defaultsPi.permissions)
+    const reloaded = assistantRuntimeChoice({
+      ...profile, runtimeConfiguration: { ...choice, piPurge: { mode: 'append', persona: 'Saved.' } }
+    }, 'pi', installedPi)
+    expect(reloaded?.piPurge).toEqual({ mode: 'append', persona: 'Saved.' })
+    for (const invalid of [
+      { mode: 'append' as const, persona: '' },
+      { mode: 'append' as const, persona: 'x'.repeat(17 * 1024) },
+    ]) {
+      await expect(saveAssistantRuntime({
+        client: client(request), agent: profile, choice: { ...choice, piPurge: invalid }
+      })).rejects.toThrow('Pi Purge')
+    }
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
   it('surfaces a Core rejection and refuses an unconfirmed version', async () => {
     const rejected = vi.fn(async () => ({
       ...applied({}),

@@ -176,6 +176,7 @@ mod tests {
 
     fn local_configuration() -> MemberRuntimeConfiguration {
         MemberRuntimeConfiguration {
+            pi_purge: None,
             adapter_kind: AdapterKind::CodexCli,
             model: ModelSelection::RuntimeDefault,
             permissions: AdapterPermissionConfig {

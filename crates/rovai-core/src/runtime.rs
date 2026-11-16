@@ -7626,6 +7626,7 @@ mod tests {
             purpose: "resume safely".to_string(),
             effective_config: json!({}),
             runtime: FrozenAgentRuntimeConfig {
+                pi_purge: None,
                 environment: None,
                 custom_api: None,
                 camp_fast: None,

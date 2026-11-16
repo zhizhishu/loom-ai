@@ -200,7 +200,8 @@ export function assistantRuntimeChoice(
       adapterKind: kind,
       schemaVersion: installation.snapshot?.permissionSchemaVersion ?? permissions.schemaVersion,
       values: permissions.values
-    }
+    },
+    ...(kind === 'pi' ? { piPurge: structuredClone(kept?.piPurge ?? { mode: 'off', persona: '' }) } : {})
   }
 }
 
@@ -217,12 +218,19 @@ export async function saveAssistantRuntime({
   if (agent.presence === 'removed' || agent.removedAt !== null) {
     throw new Error(uiAttribute('该助手已不在团队中，无法保存智能体配置。'))
   }
+  if (choice.piPurge && (choice.adapterKind !== 'pi'
+    || (choice.piPurge.mode !== 'off' && choice.piPurge.mode !== 'append')
+    || new TextEncoder().encode(choice.piPurge.persona).byteLength > 16 * 1024
+    || (choice.piPurge.mode === 'append' && !choice.piPurge.persona.trim()))) {
+    throw new Error(uiAttribute('Pi Purge 仅允许 Pi 的 Off/Append，开启时必须填写不超过 16 KB 的人格提示词。'))
+  }
   const command = {
     agentId: agent.agentId,
     expectedVersion: agent.version,
     adapterKind: choice.adapterKind,
     model: structuredClone(choice.model),
-    permissions: structuredClone(choice.permissions)
+    permissions: structuredClone(choice.permissions),
+    ...(choice.adapterKind === 'pi' && choice.piPurge ? { piPurge: structuredClone(choice.piPurge) } : {})
   }
   const result = await client.request<StoredCommandResult | null>('members.runtime.set', {
     commandId: newCommandId(),

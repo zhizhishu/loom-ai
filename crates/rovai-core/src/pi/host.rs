@@ -17,7 +17,7 @@ use std::{fs::OpenOptions, io::Write as _};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rovai_core::{
-    agent_profile::{AdapterKind, FrozenAgentRuntimeConfig},
+    agent_profile::{AdapterKind, FrozenAgentRuntimeConfig, PiPurgeMode, PiPurgeSelection},
     agent_runtime_adapter::{
         AdapterRuntimeProjection, AdapterRuntimeResolutionInput, AgentRuntimeAdapter,
         AgentRuntimeAdapterRegistry, McpProjectionCapability, PI_RUNTIME_DEFAULT_MODEL_ID,
@@ -59,6 +59,73 @@ use super::{
 };
 
 const MANAGED_HOST_EXTENSION: &str = include_str!("managed-host.ts");
+const MANAGED_PURGE_ADAPTER: &str =
+    include_str!("../../../../scripts/loom-v2-pi-purge-extension.ts");
+const PI_PURGE_SOURCE_SHA256: &str =
+    "983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d";
+
+struct PreparedPiPurge {
+    adapter_path: PathBuf,
+    binding_path: PathBuf,
+    receipt_path: PathBuf,
+}
+
+/// Materialise only the frozen Run's selected Persona, after the native file
+/// grant is available. Never infer an opt-in from global Pi configuration.
+fn stage_pi_purge(
+    launch: &PiHostLaunch<'_>,
+    config_root: &Path,
+    grant_present: bool,
+) -> Result<Option<PreparedPiPurge>> {
+    let Some(selection) = launch.pi_purge else {
+        return Ok(None);
+    };
+    if selection.mode == PiPurgeMode::Off {
+        return Ok(None);
+    }
+    anyhow::ensure!(grant_present, "pi_purge_requires_core_file_grant");
+    anyhow::ensure!(
+        selection.mode == PiPurgeMode::Append
+            && !selection.persona.trim().is_empty()
+            && selection.persona.len() <= 16 * 1024
+            && !selection.persona.contains('\0'),
+        "pi_purge_persona_invalid"
+    );
+    let runtime_root = launch.executable.parent()
+        .and_then(Path::parent)
+        .context("pi_purge_bundled_runtime_root_missing")?;
+    let upstream_path = runtime_root
+        .join("extensions").join("pi-purge").join("upstream")
+        .join("extensions").join("pi-purge.ts");
+    let metadata = std::fs::symlink_metadata(&upstream_path)
+        .context("pi_purge_pinned_source_not_packaged")?;
+    anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink(),
+        "pi_purge_pinned_source_not_regular");
+    anyhow::ensure!(metadata.len() <= 256 * 1024, "pi_purge_pinned_source_oversized");
+    let bytes = std::fs::read(&upstream_path)?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    anyhow::ensure!(digest == PI_PURGE_SOURCE_SHA256, "pi_purge_upstream_digest_mismatch");
+
+    let persona_path = config_root.join("pi-purge-persona.md");
+    let binding_path = config_root.join("pi-purge-run.json");
+    let adapter_path = config_root.join("loom-pi-purge-extension.ts");
+    let receipt_path = config_root.join("pi-purge-receipt.jsonl");
+    write_private_file(&persona_path, selection.persona.as_bytes())?;
+    write_private_file(&adapter_path, MANAGED_PURGE_ADAPTER.as_bytes())?;
+    write_private_json(&binding_path, &json!({
+        "schema": "loom.pi-purge.run.v1",
+        "runId": launch.initial_binding.agent_run_id,
+        "botId": launch.agent_id,
+        "executionEpoch": launch.initial_binding.execution_epoch,
+        "mode": "append",
+        "upstreamPath": node_path(&upstream_path),
+        "upstreamSha256": PI_PURGE_SOURCE_SHA256,
+        "personaPath": node_path(&persona_path),
+        "personaSha256": format!("{:x}", Sha256::digest(selection.persona.as_bytes())),
+        "receiptPath": node_path(&receipt_path),
+    }))?;
+    Ok(Some(PreparedPiPurge { adapter_path, binding_path, receipt_path }))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -327,6 +394,7 @@ pub(crate) struct PiHost {
     managed_session_state: RwLock<Option<PiManagedSessionState>>,
     /// Core-issued per-Run file grant. `None` = the unchanged legacy native policy (no guard).
     file_grant: Option<PiFileGrant>,
+    purge_receipt_path: Option<PathBuf>,
     /// Binding-side guard acknowledgement published by the managed extension.
     guard_state: RwLock<Option<PiManagedGuardState>>,
     session_id: RwLock<String>,
@@ -343,11 +411,14 @@ struct PiHostLaunch<'a> {
     session_dir: Option<&'a Path>,
     initial_session_file: Option<&'a Path>,
     initial_binding: &'a PiBindingSeed,
+    agent_id: &'a str,
     incoming: mpsc::UnboundedSender<PiIncoming>,
     builtin_tools: Option<BuiltinToolProcessConfig>,
     mcp: Option<&'a PiMcpProjection>,
     /// `Some` only for an explicit guarded policy (`workspace_read_only` / `workspace_read_write`).
     file_grant: Option<&'a PiFileGrant>,
+    /// Explicit Core-frozen Pi-only Persona intent; never inherited from Pi globals.
+    pi_purge: Option<&'a PiPurgeSelection>,
 }
 
 struct PiProbeRootCleanup(PathBuf);
@@ -504,6 +575,7 @@ fn append_host_arguments(
     command: &mut Command,
     extension_path: &Path,
     file_access: Option<(&Path, &str)>,
+    purge_extension: Option<&Path>,
 ) {
     command.args(["--mode", "rpc"]);
     command.args(["--no-themes", "--approve"]);
@@ -514,6 +586,9 @@ fn append_host_arguments(
         command.args(["--tools", tools, "--extension"]).arg(guard_path);
     }
     command.args(["--extension"]).arg(extension_path);
+    if let Some(path) = purge_extension {
+        command.args(["--extension"]).arg(path);
+    }
 }
 
 fn configure_host_working_directory(command: &mut Command, cwd: &Path) -> Result<()> {
@@ -588,6 +663,7 @@ impl PiHost {
             }
             None => None,
         };
+        let prepared_purge = stage_pi_purge(&launch, &config_root, file_access.is_some())?;
 
         let mut command = Command::new(launch.executable);
         rovai_core::runtime_discovery::configure_runtime_command(AdapterKind::Pi, &mut command);
@@ -604,6 +680,7 @@ impl PiHost {
             file_access
                 .as_ref()
                 .map(|(guard_path, tools, _)| (guard_path.as_path(), tools.as_str())),
+            prepared_purge.as_ref().map(|p| p.adapter_path.as_path()),
         );
         append_session_directory_argument(&mut command, launch.session_dir);
         append_initial_session_argument(&mut command, launch.initial_session_file);
@@ -612,6 +689,9 @@ impl PiHost {
             .env("PI_TELEMETRY", "0");
         if let Some((_, _, grant_path)) = &file_access {
             command.env("ROVAI_PI_FILE_GRANT_FILE", node_path(grant_path));
+        }
+        if let Some(purge) = &prepared_purge {
+            command.env("LOOM_PI_PURGE_BINDING_FILE", node_path(&purge.binding_path));
         }
         if let Some((document_path, digest, _)) = &managed_mcp {
             command.envs(pi_mcp_environment(&config_root, document_path, digest, launch.cwd));
@@ -655,6 +735,7 @@ impl PiHost {
             binding_document: RwLock::new(Some(initial_document)),
             managed_session_state: RwLock::new(None),
             file_grant: launch.file_grant.cloned(),
+            purge_receipt_path: prepared_purge.map(|p| p.receipt_path),
             guard_state: RwLock::new(None),
             session_id: RwLock::new(String::new()),
             session_file: RwLock::new(PathBuf::new()),
@@ -1109,6 +1190,10 @@ impl PiHost {
         *self.managed_session_state.write().await = None;
         // The previous generation's guard ACK must never satisfy the next generation's gate.
         *self.guard_state.write().await = None;
+        // Ignore the preflight Session's receipt: this Run needs a fresh
+        // post-reset native extension activation before any model prompt.
+        let purge_receipt_offset = self.purge_receipt_path.as_ref()
+            .map(|path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0));
 
         if let Some(expected_session_id) = seed.expected_native_session_id.as_deref() {
             let locator = read_session_locator(locator_root, expected_session_id, &self.cwd)
@@ -1200,6 +1285,10 @@ impl PiHost {
             &self.cwd,
         )
         .map_err(|error| activation_failure(PiActivationFailureKind::ActivationFailed, error))?;
+        if let Some(offset) = purge_receipt_offset {
+            self.await_purge_receipt(seed, offset).await
+                .map_err(|error| activation_failure(PiActivationFailureKind::ActivationFailed, error))?;
+        }
         let options = frozen_runtime.model.options.as_object().ok_or_else(|| {
             activation_failure(
                 PiActivationFailureKind::ConfigurationFailed,
@@ -1355,6 +1444,49 @@ impl PiHost {
             model_fingerprint,
             model_supports_images,
         })
+    }
+
+    async fn await_purge_receipt(&self, seed: &PiBindingSeed, previous_size: u64) -> Result<()> {
+        let path = self.purge_receipt_path.as_ref()
+            .context("pi_purge_not_staged")?;
+        let bot_id = &self.file_grant.as_ref()
+            .context("pi_purge_file_grant_missing")?.bot_id;
+        let until = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Ok(metadata) = std::fs::symlink_metadata(path) {
+                anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink(),
+                    "pi_purge_receipt_invalid_file");
+                anyhow::ensure!(metadata.len() <= 128 * 1024,
+                    "pi_purge_receipt_oversized");
+                if metadata.len() > previous_size {
+                    let content = std::fs::read(path)?;
+                    let offset = usize::try_from(previous_size)?;
+                    anyhow::ensure!(offset <= content.len(), "pi_purge_receipt_truncated");
+                    for line in String::from_utf8_lossy(&content[offset..]).lines() {
+                        let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+                        if record.get("hook").and_then(Value::as_str) != Some("session_start") {
+                            continue;
+                        }
+                        anyhow::ensure!(
+                            record.get("schema").and_then(Value::as_str) == Some("loom.pi-purge.receipt.v1")
+                            && record.get("runtimeEvidence").and_then(Value::as_str) == Some("native_extension_local")
+                            && record.get("providerPromptSeen").and_then(Value::as_bool) == Some(false)
+                            && record.get("runId").and_then(Value::as_str) == Some(seed.agent_run_id.as_str())
+                            && record.get("botId").and_then(Value::as_str) == Some(bot_id.as_str())
+                            && record.get("executionEpoch").and_then(Value::as_i64) == Some(seed.execution_epoch)
+                            && record.get("mode").and_then(Value::as_str) == Some("append")
+                            && record.get("activated").and_then(Value::as_bool) == Some(true),
+                            "pi_purge_native_activation_refused"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= until {
+                bail!("pi_purge_native_activation_receipt_missing");
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
     }
 
     async fn bind(&self, owner: PiRuntimeOwner) -> Result<()> {
@@ -2055,6 +2187,8 @@ impl PiRpcRuntimeAdapter {
         let spawn_environment = request.frozen_runtime.environment.clone();
         let spawn_environment_source = rovai_core::member_environment::launch_source();
         let spawn_mcp = request.mcp.cloned();
+        let spawn_purge = request.frozen_runtime.pi_purge.clone();
+        let spawn_agent_id = request.agent_id.to_string();
         // The policy comes from the frozen runtime permissions; the workspace is the canonical root Core
         // already chose for this AgentRun. Neither the prompt nor the environment may supply either.
         let file_access_mode = mode_from_permissions(&request.frozen_runtime.permissions.values)?;
@@ -2116,6 +2250,7 @@ impl PiRpcRuntimeAdapter {
                         session_dir: None,
                         initial_session_file: None,
                         initial_binding: &spawn_seed,
+                        agent_id: &spawn_agent_id,
                         incoming: spawn_incoming,
                         builtin_tools: Some(spawn_builtin_tool_factory.create()?),
                         // A read-only Run never installs MCP: the policy grants exactly one native tool,
@@ -2126,6 +2261,7 @@ impl PiRpcRuntimeAdapter {
                             spawn_mcp.as_ref()
                         },
                         file_grant: spawn_file_grant.as_ref(),
+                        pi_purge: spawn_purge.as_ref(),
                     })
                     .await?;
                     Ok(RuntimeProcessHost::Pi(host))
@@ -2373,10 +2509,12 @@ async fn spawn_probe_host(executable: &Path) -> Result<(Arc<PiHost>, PiProbeRoot
         session_dir: Some(&session_dir),
         initial_session_file: Some(&initial_session_file),
         initial_binding: &seed,
+        agent_id: "pi-probe",
         incoming,
         builtin_tools: None,
         mcp: None,
         file_grant: None,
+        pi_purge: None,
     })
     .await?;
     Ok((host, _probe_root_cleanup))
@@ -3696,10 +3834,12 @@ done
             session_dir: None,
             initial_session_file: None,
             initial_binding: &seed,
+            agent_id: "pi-abort-test",
             incoming,
             builtin_tools: None,
         mcp: None,
             file_grant: None,
+            pi_purge: None,
         })
         .await
         .unwrap();
@@ -3884,10 +4024,12 @@ done
                 session_dir: None,
                 initial_session_file: Some(&root.join("session.jsonl")),
                 initial_binding: &seed,
+                agent_id: "pi-frame-test",
                 incoming,
                 builtin_tools: None,
         mcp: None,
                 file_grant: None,
+                pi_purge: None,
             })
             .await
             .unwrap();
@@ -4026,7 +4168,7 @@ done
     fn production_host_launch_preserves_pi_native_resources() {
         let extension = Path::new("/private/rovai-pi-host-v10.ts");
         let mut production = Command::new("pi");
-        append_host_arguments(&mut production, extension, None);
+        append_host_arguments(&mut production, extension, None, None);
         let production_args = production
             .as_std()
             .get_args()
@@ -4063,7 +4205,7 @@ done
         // Host receives, so it is asserted verbatim.
         for tools in ["read", "read,write,edit"] {
             let mut production = Command::new("pi");
-            append_host_arguments(&mut production, extension, Some((guard, tools)));
+            append_host_arguments(&mut production, extension, Some((guard, tools)), None);
             let production_args = production
                 .as_std()
                 .get_args()
@@ -4174,10 +4316,12 @@ done
                 session_dir: None,
                 initial_session_file: None,
                 initial_binding: &seed,
+                agent_id: "pi-cwd-test",
                 incoming,
                 builtin_tools: None,
         mcp: None,
                 file_grant: None,
+                pi_purge: None,
             })
             .await?;
             let state = host.command("get_state", json!({})).await;

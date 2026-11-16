@@ -29542,6 +29542,7 @@ mod tests {
         );
         let core = runtime_resolution_test_core(&root).unwrap();
         let runtime = FrozenAgentRuntimeConfig {
+            pi_purge: None,
             environment: None,
             custom_api: None,
             camp_fast: None,
@@ -29684,6 +29685,7 @@ mod tests {
                             &user_command_envelope(
                                 uuid::Uuid::new_v4().to_string(),
                                 SetMemberRuntimeConfigurationCommand {
+                                    pi_purge: None,
                                     agent_id: profile.agent_id.clone(),
                                     expected_version: profile.version,
                                     adapter_kind: adapter,
@@ -36747,6 +36749,7 @@ for line in sys.stdin:
             "#!/bin/sh\ntrap '' TERM\nread -r line\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nwhile read -r line; do :; done\n",
         );
         let runtime_config = FrozenAgentRuntimeConfig {
+            pi_purge: None,
             environment: None,
             custom_api: None,
             camp_fast: None,
