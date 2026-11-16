@@ -468,7 +468,7 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
     const html = await fetch(origin, { redirect: 'error' })
     assert.equal(html.status, 200)
     assert.match(html.headers.get('content-security-policy'), /frame-ancestors 'none'/)
-    assert.match(await html.text(), /<title>Rovai AI<\/title>/)
+    assert.match(await html.text(), /<title>LOOM<\/title>/)
     const assetDirectory = join(ownedUiDirectory, 'assets')
     const avatars = await Promise.all((await readdir(assetDirectory))
       .filter(name => /^icon-192-[\w-]+\.png$/.test(name))
