@@ -34,6 +34,7 @@ import {
   parseHostConfig,
   pickNewMission,
   relayStateJs,
+  relayTaskCheckboxSelector,
   resolveAdminToken,
   rosterJs,
   screenshotGate,
@@ -190,13 +191,44 @@ test('real page creates and starts the work, then approves the relay scope for t
       const shown = [...document.querySelectorAll(${JSON.stringify(UI.relayTaskTitle)})].map(e => e.textContent.trim());
       return ${JSON.stringify(authored.tasks.map(task => task.title))}.every(title => shown.includes(title));
     })()`, 60)
-    const panel = await evalValue(relayStateJs())
-    assert.equal(panel?.editing, true, 'the scope editor is not open')
+    let panel = await evalValue(relayStateJs())
+    // The explicit Mission-bundle refresh may finish just after the user first
+    // opens this *local-only* editor. If React remounted the panel, reopen
+    // the editor once, before any task click or Core write. This is not a
+    // retry of an unknown approval and is separately evidenced as a UX race.
+    if (panel?.editing !== true) {
+      report.steps.editorReopenedAfterBundleRefresh = true
+      assert.equal(panel?.state, 'unapproved', 'unexpected relay state while re-opening editor')
+      assert.equal(await clickText('.ln-control .ln-action', TEXT.scopeOpen, 'relay-reopen'), true,
+        'the local-only scope editor did not reopen after the Mission bundle refreshed')
+      await waitFor(`return !!document.querySelector('.ln-control-budgets')`, 30)
+      panel = await evalValue(relayStateJs())
+    }
+    assert.equal(panel?.editing, true, 'the scope editor is not open after the bounded local refresh')
+    assert.equal(authored.tasks.every(task => panel.tasks.some(row => row.title === task.title)), true,
+      'the scope editor lost the authoritative Lead tasks after reopening')
     for (const task of authored.tasks) {
       const index = panel.tasks.findIndex(row => row.title === task.title)
       assert.ok(index >= 0, `panel task ${task.taskId} ("${task.title}") is not on screen`)
-      assert.equal(await evalValue(tagNthJs(UI.relayTaskCheckbox, index, `task-${task.taskId}`)), true, 'task checkbox not found')
-      ab.abClick(tabId, `[data-loom-qa="task-${task.taskId}"]`, { env: process.env })
+      const selector = relayTaskCheckboxSelector(task.title)
+      try {
+        await waitFor(`return document.querySelectorAll(${JSON.stringify(selector)}).length === 1 && document.querySelector(${JSON.stringify(selector)})?.disabled === false`, 30)
+      } catch (error) {
+        report.steps.scopeCheckboxDiagnostic = await evalValue(`return ({
+          taskTitles: [...document.querySelectorAll('.ln-control-task-title')].map(el => el.textContent.trim()),
+          allCheckboxLabels: [...document.querySelectorAll('.ln-control-task input[type="checkbox"]')].map(el => el.getAttribute('aria-label')),
+          scopeEditing: !!document.querySelector('.ln-control-budgets'),
+          exactMatches: document.querySelectorAll(${JSON.stringify(selector)}).length
+        })`)
+        throw error
+      }
+      assert.equal(await evalValue(`return document.querySelector(${JSON.stringify(selector)}).checked`), false,
+        `task ${task.taskId} was already selected; refusing a second click`)
+      const click = ab.abClick(tabId, selector, { env: process.env })
+      // Never repeat an uncertain click. Query this exact checkbox instead.
+      await waitFor(`return document.querySelector(${JSON.stringify(selector)})?.checked === true`, 20)
+      report.steps.scopeTaskClicks ??= []
+      report.steps.scopeTaskClicks.push({ taskId: task.taskId, outcome: click.verdict, checkedReadback: true })
       const reviewerIndex = await tagReviewerForTask(index, `reviewer-${task.taskId}`)
       assert.equal(reviewerIndex.opened, true, `reviewer menu for ${task.taskId} did not open`)
       const assigneeName = task.assigneeAgentId === roles.workerA.agentId ? roles.workerA.displayName : roles.workerB.displayName

@@ -216,6 +216,18 @@ export const TEXT = Object.freeze({
   scopeOpen: ['批准接力范围', '修改接力范围', '重新批准范围']
 })
 
+/** Select the exact, user-visible task checkbox, not the nth checkbox in a
+ * periodically refreshed list. A title alone may be used only when unique.
+ * JSON-quoted CSS attribute strings keep quotes in task names from becoming
+ * another selector or targeting a different task.
+ */
+export function relayTaskCheckboxSelector (taskTitle) {
+  if (typeof taskTitle !== 'string' || taskTitle.trim() === '' || /[\r\n\0]/u.test(taskTitle)) {
+    throw new Error('a nonempty single-line task title is required for exact UI selection')
+  }
+  return `.ln-control-task input[type="checkbox"][aria-label=${JSON.stringify(`纳入自动接力：${taskTitle}`)}]`
+}
+
 /** Page expression that reads the roster rows (name + checked) without mutating anything. */
 export function rosterJs () {
   return `(() => [...document.querySelectorAll(${JSON.stringify(UI.memberRow)})].map(row => ({

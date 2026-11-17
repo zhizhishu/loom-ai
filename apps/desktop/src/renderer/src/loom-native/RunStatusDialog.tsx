@@ -16,15 +16,18 @@ type ReadInput = {
 /** A coherent snapshot is retained while a same-work refresh is pending. Polling
  * changes are coalesced instead of cancelling every read: a slow Host must not
  * be starved by a faster parent refresh. New work never renders old work data. */
-export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme, onClose, onArtifact, onCreateWork, readTimeoutMs=15000 }: {
+export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme, onClose, onArtifact, onCreateWork, onRefreshWork, readTimeoutMs=15000 }: {
   open:boolean; port:V2RunPort; bundle:WorkBundle|null; thread:ThreadSnapshot|null
   /** 当前线程的真实成员档案：独立审查者只能在这些成员里选，不由本组件编造。
    * 缺省空数组只服务旧的合成渲染夹具，不推举任何默认审查者。 */
   agents?:AgentProfile[]
   theme:'day'|'night'; readTimeoutMs?:number; onClose():void; onArtifact(selection:ArtifactSelection):void; onCreateWork?():void
+  /** An explicit refresh re-reads the Mission's tasks/candidates before V2 facts. */
+  onRefreshWork?():Promise<void>
 }) {
   const [snapshot,setSnapshot]=useState<Snapshot|null>(null)
   const [busy,setBusy]=useState(false)
+  const [refreshingWork,setRefreshingWork]=useState(false)
   const [failure,setFailure]=useState<{scope:string;port:V2RunPort;message:string}|null>(null)
   const [retry,setRetry]=useState(0)
   const tickets=useRef(0)
@@ -81,9 +84,14 @@ export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme
     let timer:ReturnType<typeof setTimeout>|undefined
     const deadline=new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('读取超时，请重试；保留的旧记录不会被当作新回执。')),input.timeoutMs)})
     void Promise.race([request,deadline]).then(facts=>{
-      if (relevant()) setSnapshot({scope:readScope,port:readPort,facts,bundle:readBundle})
+      // A newer WorkBundle for this same Mission may have arrived while this
+      // read was active. Never display an older task/candidate projection as
+      // though it belonged to that new bundle.
+      if (relevant() && latest.current.version===input.version) {
+        setSnapshot({scope:readScope,port:readPort,facts,bundle:readBundle})
+      }
     }).catch(cause=>{
-      if (relevant()) {
+      if (relevant() && latest.current.version===input.version) {
         failedRead.current={scope:readScope,port:readPort,retry:input.retry}
         setFailure({scope:readScope,port:readPort,message:cause instanceof Error?cause.message:'暂时无法读取工作记录'})
       }
@@ -105,14 +113,36 @@ export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme
   },[])
   useEffect(()=>{beginRead()},[open,scope,port,bundle,thread,retry,timeoutMs,beginRead])
 
+  const refreshVisibleWork = async ():Promise<void> => {
+    if (busy || refreshingWork) return
+    const requestedScope=scope
+    const requestedPort=port
+    setRefreshingWork(true)
+    try {
+      // V2 facts alone do not contain a fresh plan. The parent owns the
+      // WorkBundle cache; an explicit UI click may refresh it, not silently
+      // approve or dispatch anything.
+      if(onRefreshWork) await onRefreshWork()
+      if(latest.current.open && latest.current.scope===requestedScope && latest.current.port===requestedPort) {
+        setRetry(value=>value+1)
+      }
+    } catch(cause) {
+      if(latest.current.open && latest.current.scope===requestedScope && latest.current.port===requestedPort) {
+        setFailure({scope:requestedScope??'',port:requestedPort,message:cause instanceof Error?cause.message:'工作资料刷新失败'})
+      }
+    } finally {
+      if(mounted.current) setRefreshingWork(false)
+    }
+  }
+
   return <SurfaceDialog open={open} title="运行与成果" theme={theme} onClose={onClose} className="ln-run-dialog"
     onOpenAutoFocus={()=>{opener.current=document.activeElement instanceof HTMLElement?document.activeElement:null}}
     onCloseAutoFocus={event=>{if(opener.current?.isConnected){event.preventDefault();opener.current.focus({preventScroll:true})}}}>
     {!bundle ? <div className="ln-run-state"><p>选择一项工作，查看助手分工、执行记录和成果。</p>{onCreateWork && <button type="button" onClick={onCreateWork}>创建一项工作</button>}</div>
       : !threadMatches ? <div className="ln-run-state" role="status">正在对齐当前工作的对话记录，暂不显示其他工作的内容。</div>
       : <>
-        <div className="ln-run-toolbar"><span role="status">{busy ? current?'正在更新，保留上次读到的记录…':'正在读取工作记录…' : error?'更新未成功':'当前工作的主机记录'}</span>
-          <button type="button" disabled={busy} onClick={()=>setRetry(value=>value+1)} aria-label="刷新运行与成果">{error?'重试读取':'刷新'}</button></div>
+        <div className="ln-run-toolbar"><span role="status">{busy || refreshingWork ? current?'正在更新，保留上次读到的记录…':'正在读取工作记录…' : error?'更新未成功':'当前工作的主机记录'}</span>
+          <button type="button" disabled={busy || refreshingWork} onClick={()=>{void refreshVisibleWork()}} aria-label="刷新运行与成果">{error?'重试读取':'刷新'}</button></div>
         {error && <div className="ln-run-state" role="alert">读取失败：{error}{current && <p>以下保留的是上次成功读取的内容。</p>}</div>}
         {current && controlScope ? <><V2BotStatusPanel facts={current.facts} bundle={current.bundle} onArtifact={onArtifact}/>
           {/* 自动接力范围只挂当前这项工作；控制投影与成员范围都取自同一个真实 Mission/Thread。 */}

@@ -38,8 +38,22 @@ import {
   screenshotGate,
   tagChoiceItemJs,
   workerTasks,
-  workerIds
+  workerIds,
+  relayTaskCheckboxSelector
 } from './loom-browser-live-mode.mjs'
+
+test('scope selection identifies one exact task and never an unstable list index', () => {
+  const alpha = relayTaskCheckboxSelector('交付 Markdown 文件 A')
+  const beta = relayTaskCheckboxSelector('交付 Markdown 文件 B')
+  assert.notEqual(alpha, beta)
+  assert.match(alpha, /aria-label="纳入自动接力：交付 Markdown 文件 A"/u)
+  const quoted = relayTaskCheckboxSelector('修复 "A" 的选择')
+  assert.match(quoted, /修复 \\"A\\" 的选择/u)
+  for (const invalid of ['', ' ', 'first\nsecond', 'first\rsecond', null]) {
+    assert.throws(() => relayTaskCheckboxSelector(invalid), /single-line task title/u)
+  }
+  assert.equal(alpha.includes(':nth-child'), false)
+})
 
 const TOKEN = 'b'.repeat(64)
 const okRecord = (data = {}) => JSON.stringify({ schema: 'browser-gate/1', operation: 'call', verdict: 'OK', reason: 'NONE', tab: '1', data, artifact: null, warnings: [] })

@@ -231,7 +231,14 @@ export function LoomApp({ environment, onLogout }: Props) {
       <IconButton icon="home" label="对话" active={!studioOpen && !setupOpen} onClick={() => { setExpanded(false); setSidebarOpen(true); if (!active) beginConversation() }}/>
       <IconButton icon="plus" label="开始新对话" onClick={beginConversation}/>
       <IconButton icon="board" label="工作空间" onClick={() => openWork()}/>
-      <IconButton icon="branch" label="运行与成果" active={runSurfaceOpen} onClick={() => { runSurfaceOpener.current=document.activeElement instanceof HTMLElement?document.activeElement:null; setRunSurfaceOpen(true) }}/>
+      <IconButton icon="branch" label="运行与成果" active={runSurfaceOpen} onClick={() => {
+        runSurfaceOpener.current=document.activeElement instanceof HTMLElement?document.activeElement:null
+        setRunSurfaceOpen(true)
+        // The Mission shell can be unchanged while the Lead has just written a
+        // plan. An explicit open must re-read the work bundle, not only the
+        // run-facts projection cached before the plan existed.
+        void data.refresh().catch(report)
+      }}/>
       <IconButton icon="files" label="工作目录" onClick={() => setWorkspaceManagerOpen(true)}/>
       <IconButton icon="people" label="管理助手" active={studioOpen} onClick={() => manageAssistant(activeAgent?.agentId)}/>
       <IconButton icon="globe" label="连接与设备" active={setupOpen} onClick={() => setSetupOpen(true)}/>
@@ -253,6 +260,7 @@ export function LoomApp({ environment, onLogout }: Props) {
     {visitedPanels.library&&<Suspense fallback={<span role="status" className="ln-loading">正在打开能力库…</span>}><CapabilityLibrary open={libraryOpen} environment={environment} theme={theme} onClose={() => setLibraryOpen(false)} onChanged={() => { setCapabilityEpoch(value => value + 1); void data.refresh() }}/></Suspense>}
     <SurfaceDialog open={pendingInspectorAction !== null} title="保留能力修改？" theme={theme} onClose={() => setPendingInspectorAction(null)} className="ln-room-dialog"><UnsavedNotice onKeep={() => setPendingInspectorAction(null)} onDiscard={() => { const action = pendingInspectorAction; setPendingInspectorAction(null); setCapabilityDirty(false); action?.() }}/></SurfaceDialog>
     <RunStatusDialog open={runSurfaceOpen} port={environment.client} bundle={selectedRunBundle} thread={data.snapshot} agents={data.agents} theme={theme}
+      onRefreshWork={data.refresh}
       onClose={() => setRunSurfaceOpen(false)} onCreateWork={() => { setRunSurfaceOpen(false); beginWork() }}
       onArtifact={selection => { setRunSurfaceOpen(false); setArtifact(selection) }}/>
     {artifact && <ArtifactView key={`${artifact.bundle.mission.missionId}:${artifact.artifact.artifactId}:${artifact.candidate?.candidateId ?? "none"}`} theme={theme} fallbackFocus={runSurfaceOpener.current} selection={currentArtifact?.selection ?? artifact} contextAvailable={currentArtifact?.contextAvailable ?? false} onClose={() => setArtifact(null)} onRefresh={data.refresh}/>}
