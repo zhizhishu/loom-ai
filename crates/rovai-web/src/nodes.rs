@@ -80,6 +80,21 @@ enum Outbound {
     FlushAcks,
 }
 
+// Closing either sender does not discard receipts already queued on the other
+// lane. Pattern matching disables only an exhausted lane; both lanes must be
+// closed and drained before the writer may stop.
+async fn receive_outbound(
+    urgent: &mut mpsc::Receiver<Outbound>,
+    regular: &mut mpsc::Receiver<Outbound>,
+) -> Option<Outbound> {
+    tokio::select! {
+        biased;
+        Some(item) = urgent.recv() => Some(item),
+        Some(item) = regular.recv() => Some(item),
+        else => None,
+    }
+}
+
 #[derive(Clone)]
 struct Outbox {
     tx: mpsc::Sender<Outbound>,
@@ -1504,14 +1519,9 @@ impl Hub {
         let (tx, mut incoming) = mpsc::channel(OUTBOUND_QUEUE);
         let (urgent_tx, mut urgent_incoming) = mpsc::channel(16);
         let writer_acks = Arc::clone(&acks);
-        let writer = tokio::spawn(async move {
+        let mut writer = tokio::spawn(async move {
             loop {
-                let item = tokio::select! {
-                    biased;
-                    item=urgent_incoming.recv(),if !urgent_incoming.is_closed()=>item,
-                    item=incoming.recv()=>item,
-                };
-                let Some(item) = item else {
+                let Some(item) = receive_outbound(&mut urgent_incoming, &mut incoming).await else {
                     break;
                 };
                 if flush_acks(&mut sink, &writer_acks).await.is_err() {
@@ -1526,6 +1536,7 @@ impl Hub {
                     break;
                 }
             }
+            let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
         });
         let outbound = Outbox {
             tx: tx.clone(),
@@ -1895,7 +1906,12 @@ impl Hub {
         drop(stored_cancel);
         drop(tx);
         drop(urgent_tx);
-        let _ = writer.await;
+        if tokio::time::timeout(Duration::from_secs(2), &mut writer).await.is_err() {
+            // An unresponsive peer cannot keep a detached writer alive forever.
+            // No successful delivery or process completion is inferred here.
+            writer.abort();
+            let _ = writer.await;
+        }
     }
 }
 
@@ -2336,6 +2352,30 @@ pub(crate) struct WorkspaceFilesQuery {
     op: String,
 }
 
+// A remote workspace root is opaque to this Host. In particular a Windows
+// drive path is not an absolute Linux Path. Only the execution node can
+// resolve its root and enforce the canonical/symlink jail. The Host still
+// rejects every non-portable or parent-relative request before dispatch.
+pub(crate) fn workspace_query_relative(role: &str, root: &str, raw: &str) -> Result<String, &'static str> {
+    if role == "local" {
+        return loom_protocol::workspace_relative(root, raw);
+    }
+    if role != "remote" || raw.len() > 4096 || raw.contains('\0') || raw.contains(':')
+        || raw.starts_with('/') || raw.starts_with('\\')
+    {
+        return Err("path_rejected");
+    }
+    let portable = raw.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in portable.split('/') {
+        if part == ".." || (part != "." && (part.ends_with('.') || part.ends_with(' '))) {
+            return Err("path_rejected");
+        }
+        if !part.is_empty() && part != "." { parts.push(part); }
+    }
+    Ok(parts.join("/"))
+}
+
 pub(crate) async fn workspace_files(
     State(state): State<WebState>,
     Extension(_session): Extension<Arc<Session>>,
@@ -2364,9 +2404,10 @@ pub(crate) async fn workspace_files(
             return workspace_error(StatusCode::SERVICE_UNAVAILABLE, "node_store_unavailable");
         }
     };
-    if loom_protocol::workspace_relative(&record.worktree_path, &query.relative).is_err() {
-        return workspace_error(StatusCode::BAD_REQUEST, "path_rejected");
-    }
+    let relative = match workspace_query_relative(&record.owner_role, &record.worktree_path, &query.relative) {
+        Ok(relative) => relative,
+        Err(code) => return workspace_error(StatusCode::BAD_REQUEST, code),
+    };
     let read = query.op == "read";
     if record.owner_role == "local" {
         let root = std::path::Path::new(&record.worktree_path);
@@ -2407,13 +2448,13 @@ pub(crate) async fn workspace_files(
         ServerMessage::ReadFile {
             request_id: request_id.clone(),
             root: record.worktree_path.clone(),
-            relative: query.relative.clone(),
+            relative: relative.clone(),
         }
     } else {
         ServerMessage::ListDir {
             request_id: request_id.clone(),
             root: record.worktree_path.clone(),
-            relative: query.relative.clone(),
+            relative: relative.clone(),
         }
     };
     let reply = match state
@@ -2905,6 +2946,53 @@ mod tests {
     use super::*;
     use loom_protocol::run_bundle::RUN_BUNDLE_VERSION;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn remote_file_query_preserves_foreign_root_but_rejects_escape_before_dispatch() {
+        for root in [r"C:\Users\fixture\worktree", "/srv/fixture/worktree"] {
+            assert_eq!(workspace_query_relative("remote", root, ""), Ok(String::new()));
+            assert_eq!(workspace_query_relative("remote", root, "probe.txt"), Ok("probe.txt".into()));
+            assert_eq!(workspace_query_relative("remote", root, r"folder\proof.md"), Ok("folder/proof.md".into()));
+            for raw in ["../secret", r"..\secret", "a/../../secret", "/etc/passwd",
+                r"C:\secret", r"C:secret", r"\\server\share", r"\secret", "file:stream",
+                "a/.. /secret", "a/.../secret", "a\0b"] {
+                assert_eq!(workspace_query_relative("remote", root, raw), Err("path_rejected"), "{raw:?}");
+            }
+        }
+        let root = std::env::temp_dir().join("loom-query-local");
+        let root = root.to_str().unwrap();
+        assert_eq!(workspace_query_relative("local", root, "probe.txt"),
+            loom_protocol::workspace_relative(root, "probe.txt"));
+        assert_eq!(workspace_query_relative("remote", "opaque", &"a".repeat(4097)), Err("path_rejected"));
+        assert_eq!(workspace_query_relative("unknown", "opaque", "probe.txt"), Err("path_rejected"));
+    }
+
+    #[tokio::test]
+    async fn closing_one_outbound_lane_never_discards_the_other_lanes_receipt() {
+        let (urgent_tx, mut urgent_rx) = mpsc::channel(2);
+        let (regular_tx, mut regular_rx) = mpsc::channel(2);
+        urgent_tx.send(Outbound::Text("urgent_receipt".into())).await.unwrap();
+        regular_tx.send(Outbound::Text("administrator_rejected".into())).await.unwrap();
+        drop(urgent_tx);
+        drop(regular_tx);
+        assert!(matches!(receive_outbound(&mut urgent_rx, &mut regular_rx).await,
+            Some(Outbound::Text(text)) if text == "urgent_receipt"));
+        assert!(matches!(receive_outbound(&mut urgent_rx, &mut regular_rx).await,
+            Some(Outbound::Text(text)) if text == "administrator_rejected"));
+        assert!(receive_outbound(&mut urgent_rx, &mut regular_rx).await.is_none());
+
+        let (urgent_tx, mut urgent_rx) = mpsc::channel(1);
+        let (regular_tx, mut regular_rx) = mpsc::channel(1);
+        drop(regular_tx);
+        // A closed regular lane must not end a still-live urgent lane.
+        assert!(tokio::time::timeout(Duration::from_millis(10),
+            receive_outbound(&mut urgent_rx, &mut regular_rx)).await.is_err());
+        urgent_tx.send(Outbound::Pong(vec![7])).await.unwrap();
+        assert!(matches!(receive_outbound(&mut urgent_rx, &mut regular_rx).await,
+            Some(Outbound::Pong(bytes)) if bytes == vec![7]));
+        drop(urgent_tx);
+        assert!(receive_outbound(&mut urgent_rx, &mut regular_rx).await.is_none());
+    }
 
     fn test_hub() -> Hub {
         let admin = crate::new_token().unwrap();

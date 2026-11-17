@@ -2,7 +2,11 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
 export function launchHost(binary, args, options = {}) {
-  const child = spawn(binary, args, { ...options, stdio: ['pipe', 'pipe', 'pipe'] })
+  const { requestTimeoutMs = 15000, ...spawnOptions } = options
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 120000) {
+    throw new RangeError('Host fixture request timeout must be 1..120000 milliseconds')
+  }
+  const child = spawn(binary, args, { ...spawnOptions, stdio: ['pipe', 'pipe', 'pipe'] })
   const pending = new Map()
   const unmatchedResponses = []
   const notifications = new Set()
@@ -39,13 +43,13 @@ export function launchHost(binary, args, options = {}) {
     onNotification(listener) { notifications.add(listener); return () => notifications.delete(listener) },
     child, ready, closed, unmatchedResponses, stderr: () => stderr,
     async request(method, params = {}) {
-      await within(ready)
+      await within(ready, requestTimeoutMs, `Host readiness for ${method}`)
       const id = nextId++
       try {
         return await within(new Promise((resolve, reject) => {
           pending.set(id, { resolve, reject })
           child.stdin.write(`${JSON.stringify({ id, method, params })}\n`)
-        }))
+        }), requestTimeoutMs, `Host request ${method}`)
       } finally { pending.delete(id) }
     },
     async close() {
@@ -56,11 +60,15 @@ export function launchHost(binary, args, options = {}) {
   }
 }
 
-export async function within(promise) {
+export async function within(promise, timeoutMs = 15000, label = 'Host Web step') {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120000) {
+    throw new RangeError('Host fixture timeout must be 1..120000 milliseconds')
+  }
   let timer
   try {
     return await Promise.race([promise, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Host Web step exceeded 15 seconds')), 15_000)
+      timer = setTimeout(() => reject(Object.assign(new Error(`${label} exceeded ${timeoutMs} milliseconds; outcome unconfirmed`),
+        { code: 'HOST_FIXTURE_TIMEOUT', outcome: 'unconfirmed' })), timeoutMs)
     })])
   } finally { clearTimeout(timer) }
 }

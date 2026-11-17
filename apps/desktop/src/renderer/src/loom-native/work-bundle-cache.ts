@@ -30,7 +30,9 @@ export class WorkBundleCache {
     const need = missions.filter(mission => force || this.allDirty || this.dirtyIds.has(mission.missionId)
       || this.cache.get(mission.missionId)?.fingerprint !== JSON.stringify(mission))
     let fetched=0
-    const key=need.map(mission=>mission.missionId+':'+JSON.stringify(mission)).join('|')
+    // An invalidation starts a different read generation even when the Mission
+    // record did not change (plans and candidates have independent revisions).
+    const key=ticket+':'+need.map(mission=>mission.missionId+':'+JSON.stringify(mission)).join('|')
     const fallback={bundles:[] as WorkBundle[],errors:[] as string[]}
     let work=fallback
     if(need.length){
@@ -43,10 +45,12 @@ export class WorkBundleCache {
       try {
         work=await task
         const incoming=new Map(work.bundles.map(bundle=>[bundle.mission.missionId,bundle]))
-        for(const mission of need){
-          const bundle=incoming.get(mission.missionId)
-          if(bundle) this.cache.set(mission.missionId,{fingerprint:JSON.stringify(mission),value:bundle})
-          else this.cache.delete(mission.missionId)
+        if(this.epoch===ticket){
+          for(const mission of need){
+            const bundle=incoming.get(mission.missionId)
+            if(bundle) this.cache.set(mission.missionId,{fingerprint:JSON.stringify(mission),value:bundle})
+            else this.cache.delete(mission.missionId)
+          }
         }
       }finally{
         if(this.pending.get(key)===task) this.pending.delete(key)

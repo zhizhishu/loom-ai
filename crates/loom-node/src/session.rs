@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use loom_protocol::{ClientMessage, OutputStream, RunReport, ServerMessage};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     process::Stdio,
@@ -53,6 +54,37 @@ struct LiveRun {
     alive: bool,
 }
 
+/// What this node may execute locally. `catalog: None` is the device-only shape:
+/// no admitted Agent CLI, therefore no R1 runtime and no process pipe.
+pub(crate) struct NodeHands {
+    clis: Vec<CliReport>,
+    catalog: Option<crate::installation_catalog::InstallationCatalog>,
+    builtin: Option<crate::builtin_bridge::BuiltinBridge>,
+}
+
+impl NodeHands {
+    /// A pure device daemon. It never probes for, admits or launches an Agent CLI.
+    pub(crate) fn device_only() -> Self {
+        Self {
+            clis: Vec::new(),
+            catalog: None,
+            builtin: None,
+        }
+    }
+
+    pub(crate) fn with_runtime(
+        clis: Vec<CliReport>,
+        catalog: crate::installation_catalog::InstallationCatalog,
+        builtin: Option<crate::builtin_bridge::BuiltinBridge>,
+    ) -> Self {
+        Self {
+            clis,
+            catalog: Some(catalog),
+            builtin,
+        }
+    }
+}
+
 struct Shared {
     data_dir: std::path::PathBuf,
     server: String,
@@ -60,7 +92,8 @@ struct Shared {
     clis: Vec<CliReport>,
     /// The physical desktop this node owns, if the operator opted in.
     computer: Arc<crate::computer_provider::ComputerHost>,
-    pipes: Arc<crate::process_wire::NodePipes>,
+    /// `None` on a device-only node: it owns no R1 process boundary at all.
+    pipes: Option<Arc<crate::process_wire::NodePipes>>,
     authority: crate::workspace_authority::WorkspaceAuthority,
     workspace_rpc: crate::workspace_rpc::WorkspaceRpcWire,
     client_output: Mutex<Option<mpsc::Sender<ClientMessage>>>,
@@ -103,22 +136,38 @@ pub(crate) async fn serve(
     server: &str,
     node_id: &str,
     token: &str,
-    clis: Vec<CliReport>,
-    catalog: crate::installation_catalog::InstallationCatalog,
+    hands: NodeHands,
     computer: Arc<crate::computer_provider::ComputerHost>,
-    builtin: Option<crate::builtin_bridge::BuiltinBridge>,
 ) -> Result<()> {
     let authority =
         crate::workspace_authority::WorkspaceAuthority::open(data_dir, node_id.to_owned())
             .map_err(|code| anyhow::anyhow!(code.code()))?;
-    let pipes = crate::process_wire::NodePipes::new(
-        data_dir.to_path_buf(),
-        node_id,
+    // No catalog means no admitted Agent CLI, so no process manager is built and
+    // no installation/pipe directory is created or touched on this host.
+    let NodeHands {
+        clis,
         catalog,
-        authority.clone(),
         builtin,
-    )
-    .map_err(|code| anyhow::anyhow!(code))?;
+    } = hands;
+    let pipes = match catalog {
+        Some(catalog) => Some(
+            crate::process_wire::NodePipes::new(
+                data_dir.to_path_buf(),
+                node_id,
+                catalog,
+                authority.clone(),
+                builtin,
+            )
+            .map_err(|code| anyhow::anyhow!(code))?,
+        ),
+        None => {
+            debug_assert!(
+                builtin.is_none(),
+                "device-only hands must not own a builtin bridge"
+            );
+            None
+        }
+    };
     let rpc = crate::workspace_rpc::WorkspaceRpcExecutor::open(
         node_id.to_owned(),
         data_dir.join("workspace-rpc"),
@@ -172,7 +221,15 @@ pub(crate) async fn serve(
     };
     flusher.abort();
     shared.workspace_rpc.disconnect();
-    let (legacy_cleanup, ()) = tokio::join!(shutdown_legacy(&shared), shared.pipes.shutdown());
+    // A device-only node owns no pipe manager; its shutdown is a no-op rather
+    // than a skipped cleanup step.
+    let pipes_shutdown = async {
+        if let Some(pipes) = shared.pipes.as_ref() {
+            pipes.shutdown().await;
+        }
+    };
+    let (legacy_cleanup, ()) =
+        tokio::join!(shutdown_legacy(&shared), pipes_shutdown);
     legacy_cleanup?;
     result
 }
@@ -209,6 +266,8 @@ async fn connect_once(
     let _guard = ConnectionGuard { shared, bridges };
 
     let runs = hello_runs(shared);
+    let (run_bundle_versions, process_pipe_versions, workspace_rpc_versions) =
+        hands_advertisement(shared.pipes.as_deref());
     send_control(
         &control,
         &ClientMessage::Hello {
@@ -219,19 +278,9 @@ async fn connect_once(
             clis: shared.clis.clone(),
             runs,
             hostname: crate::machine_hostname(),
-            run_bundle_versions: vec![
-                loom_protocol::run_bundle::RUN_BUNDLE_VERSION,
-                loom_protocol::run_bundle::RUN_BUNDLE_REFERENCE_VERSION,
-            ],
-            process_pipe_versions: if shared.pipes.supported() {
-                vec![
-                    loom_protocol::process_pipe::PROCESS_PIPE_VERSION,
-                    loom_protocol::command_hooks::CODEX_HOOK_PIPE_VERSION,
-                ]
-            } else {
-                Vec::new()
-            },
-            workspace_rpc_versions: vec![loom_protocol::workspace_rpc::RPC_VERSION],
+            run_bundle_versions,
+            process_pipe_versions,
+            workspace_rpc_versions,
             // Empty unless this node's own metadata probe succeeded. A headless
             // node therefore advertises nothing instead of a fake screen.
             computer_versions: shared.computer.advertised_versions(),
@@ -248,7 +297,12 @@ async fn connect_once(
     *shared.control.lock().expect("node control lock") = Some(control.clone());
     *shared.output.lock().expect("node output lock") = Some(output);
     *shared.client_output.lock().expect("node client output") = Some(client_output.clone());
-    shared.pipes.attach(client_control, client_output).await;
+    match shared.pipes.as_ref() {
+        Some(pipes) => pipes.attach(client_control, client_output).await,
+        // A device-only node has no pipe consumer, so the pipe control lane is
+        // closed instead of being left half-attached.
+        None => drop(client_control),
+    }
     shared.wake.notify_one();
 
     let heartbeat_control = control.clone();
@@ -302,7 +356,9 @@ impl Drop for ConnectionGuard<'_> {
         for bridge in &self.bridges {
             bridge.abort();
         }
-        self.shared.pipes.disconnect();
+        if let Some(pipes) = self.shared.pipes.as_ref() {
+            pipes.disconnect();
+        }
         // A new socket owns a new computer epoch: any in-flight capture or input
         // reply is dropped instead of being delivered on the replacement.
         self.shared.computer.disconnect();
@@ -340,6 +396,36 @@ fn live_ids(shared: &Shared) -> Vec<String> {
         .filter(|(_, run)| run.alive)
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+/// Bundle and pipe transport belong to R1. A node that owns no pipe manager
+/// advertises neither, so the server refuses those frames before they arrive.
+/// `Some` keeps the exact advertisement the node sent before this split.
+fn hands_advertisement(
+    pipes: Option<&crate::process_wire::NodePipes>,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let Some(pipes) = pipes else {
+        return (
+            Vec::new(),
+            Vec::new(),
+            vec![loom_protocol::workspace_rpc::RPC_VERSION],
+        );
+    };
+    (
+        vec![
+            loom_protocol::run_bundle::RUN_BUNDLE_VERSION,
+            loom_protocol::run_bundle::RUN_BUNDLE_REFERENCE_VERSION,
+        ],
+        if pipes.supported() {
+            vec![
+                loom_protocol::process_pipe::PROCESS_PIPE_VERSION,
+                loom_protocol::command_hooks::CODEX_HOOK_PIPE_VERSION,
+            ]
+        } else {
+            Vec::new()
+        },
+        vec![loom_protocol::workspace_rpc::RPC_VERSION],
+    )
 }
 
 async fn connect(
@@ -391,6 +477,17 @@ fn try_control(shared: &Shared, message: &ClientMessage) {
     if let Some(tx) = control.as_ref() {
         let _ = tx.try_send(Wire::Text(message.to_json()));
     }
+}
+
+/// A node without a process manager still answers the controller instead of
+/// leaving the request unanswered. No native process API is reachable here.
+fn refuse_pipe(shared: &Shared, command: &loom_protocol::process_pipe::ProcessPipeCommand) {
+    try_control(
+        shared,
+        &ClientMessage::ProcessPipeControl {
+            control: crate::process_wire::refusal_for(command, "device_only"),
+        },
+    );
 }
 
 async fn next_server(
@@ -449,12 +546,25 @@ async fn read_loop(
                 let message: ServerMessage =
                     serde_json::from_str(text.as_str()).context("server frame was not JSON")?;
                 match message {
-                    ServerMessage::ProcessPipe { command } => shared.pipes.handle(command).await,
+                    ServerMessage::ProcessPipe { command } => match shared.pipes.as_ref() {
+                        Some(pipes) => pipes.handle(command).await,
+                        // No pipe transport was advertised, so this command has
+                        // no local owner. Echo a bounded refusal; never spawn.
+                        None => refuse_pipe(shared, &command),
+                    },
                     ServerMessage::BuiltinReply { reply } => {
-                        shared
-                            .pipes
-                            .complete_builtin(reply)
-                            .map_err(|code| anyhow::anyhow!(code))?;
+                        if let Some(pipes) = shared.pipes.as_ref() {
+                            match pipes.complete_builtin(reply) {
+                                Ok(()) => {}
+                                // No builtin helper was advertised on this
+                                // connection, so there is no pending call to
+                                // complete. Dropping the authenticated socket
+                                // would be a self-inflicted reconnect, not a
+                                // safety property.
+                                Err("builtin_helper_missing") => {}
+                                Err(code) => return Err(anyhow::anyhow!(code)),
+                            }
+                        }
                     }
                     ServerMessage::WorkspaceRpcDispatch { dispatch } => {
                         let output = shared
@@ -893,6 +1003,17 @@ async fn accept_start(
             return Ok(());
         }
     };
+    if shared.pipes.is_none() {
+        // This node admits no Agent CLI, so no program could ever match. Refuse
+        // before the durable R1 journal or any bundle materialization, and
+        // therefore before any possible spawn. The code is a real A-side
+        // rejection; it is deliberately not `legacy_no_process`, which asserts a
+        // durable no-spawn transition this node never wrote.
+        try_control(shared, &ClientMessage::Rejected {
+            run_id, attempt, code: "program_not_allowed".into(),
+        });
+        return Ok(());
+    }
     let choice = {
         let mut runs = lock_runs(&shared);
         if let Some(existing) = runs.get(&run_id) {
@@ -959,9 +1080,14 @@ async fn accept_start(
                     shutdown: &owner.shutdown, armed: true };
                 let result = drive_process(owner.clone(), key.clone(), adapter_kind, path,
                     args, cwd, env, shim_token, prepared).await;
-                if result.is_err() {
+                if let Err(error) = &result {
+                    // Closed stage, attempt and one-way run label only. The wire
+                    // code and the durable Unknown transition are unchanged, so
+                    // nothing here can authorize another spawn.
+                    eprintln!("{}", legacy_diagnostic(legacy_stage(error),
+                        key.attempt, &key.run_id));
                     mark_unknown(&owner, &key);
-                    reject_start(&owner, &key, "legacy_outcome_unknown");
+                    reject_start(&owner, &key, LEGACY_UNKNOWN_WIRE);
                 }
                 // Output loss is not the same as cleanup failure. Only positive
                 // tree confirmation permits this owner to finish as cleaned.
@@ -1064,6 +1190,96 @@ fn fresh_run(key: LaunchKey) -> LiveRun {
         next_seq: 0, terminal_seq: None, acked: 0, queued: 0, pending: VecDeque::new(), alive: false }
 }
 
+/// Closed, static diagnosis for the legacy owner error path.
+///
+/// `drive_process` can fail after a process may already exist, so every failure
+/// stays `legacy_outcome_unknown` on the wire and `Unknown` in the journal: the
+/// stages below never authorize a retry and never claim "no process". Each stage
+/// is a fixed string so the nine paths stay distinguishable while no raw error
+/// text (command line, path, environment value, account or token) is ever
+/// promoted into a log line or a wire code.
+const LEGACY_STAGE_OWNER_CHANGED: &str = "owner_changed";
+const LEGACY_STAGE_SPAWN: &str = "spawn";
+const LEGACY_STAGE_PHASE_RUNNING: &str = "phase_running";
+const LEGACY_STAGE_PIPE_MISSING: &str = "pipe_missing";
+const LEGACY_STAGE_CLEANUP_IO: &str = "cleanup_io";
+const LEGACY_STAGE_TREE_NOT_EMPTY: &str = "tree_not_empty";
+const LEGACY_STAGE_OUTPUT_LOST: &str = "output_lost";
+const LEGACY_STAGE_PHASE_FINISHED: &str = "phase_finished";
+const LEGACY_STAGE_TERMINAL_ENQUEUE: &str = "terminal_enqueue";
+const LEGACY_STAGES: &[&str] = &[
+    LEGACY_STAGE_OWNER_CHANGED, LEGACY_STAGE_SPAWN, LEGACY_STAGE_PHASE_RUNNING,
+    LEGACY_STAGE_PIPE_MISSING, LEGACY_STAGE_CLEANUP_IO, LEGACY_STAGE_TREE_NOT_EMPTY,
+    LEGACY_STAGE_OUTPUT_LOST, LEGACY_STAGE_PHASE_FINISHED, LEGACY_STAGE_TERMINAL_ENQUEUE,
+];
+const LEGACY_STAGE_UNKNOWN: &str = "unknown";
+/// The only wire code this path may emit. It must never become `legacy_no_process`.
+const LEGACY_UNKNOWN_WIRE: &str = "legacy_outcome_unknown";
+
+/// Carries exactly one static stage. `Debug`/`Display` print that stage and
+/// nothing else, because the inner error can name commands, paths, environment
+/// values or accounts. It stays reachable only through `source()`.
+struct LegacyStaged {
+    stage: &'static str,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for LegacyStaged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.stage)
+    }
+}
+
+impl std::fmt::Debug for LegacyStaged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LegacyStaged")
+            .field("stage", &self.stage)
+            .finish()
+    }
+}
+
+impl std::error::Error for LegacyStaged {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let source: &(dyn std::error::Error + 'static) = self.source.as_ref();
+        Some(source)
+    }
+}
+
+fn staged(stage: &'static str, source: anyhow::Error) -> anyhow::Error {
+    LegacyStaged { stage, source }.into()
+}
+
+/// Exact, closed-set match over the error chain: an unrecognized shape is
+/// `unknown`, and no arbitrary text is ever turned into a code.
+fn legacy_stage(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(found) = cause.downcast_ref::<LegacyStaged>() {
+            return LEGACY_STAGES
+                .iter()
+                .copied()
+                .find(|known| *known == found.stage)
+                .unwrap_or(LEGACY_STAGE_UNKNOWN);
+        }
+    }
+    LEGACY_STAGE_UNKNOWN
+}
+
+fn legacy_run_label(run_id: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(run_id.as_bytes());
+    format!("{:x}", hash.finalize()).chars().take(12).collect()
+}
+
+/// Stage, attempt and a one-way run label only. Never child output, never a
+/// command line, never the inner error text.
+fn legacy_diagnostic(stage: &'static str, attempt: u32, run_id: &str) -> String {
+    format!(
+        "loom-node: legacy owner unknown stage={} attempt={} run={}",
+        stage, attempt, legacy_run_label(run_id),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_process(
     shared: Arc<Shared>, key: LaunchKey, adapter_kind: String,
@@ -1114,7 +1330,10 @@ async fn drive_process(
         } else {
             let owned = runs.get(&key.run_id).is_some_and(|run|
                 run.key == key && run.phase == Phase::Prepared && !run.closed);
-            if !owned { bail!("legacy owner changed"); }
+            if !owned {
+                return Err(staged(LEGACY_STAGE_OWNER_CHANGED,
+                    anyhow::anyhow!("legacy owner changed")));
+            }
             Some(spawn_legacy(&spec))
         }
     };
@@ -1122,7 +1341,7 @@ async fn drive_process(
         mark_no_process(&shared, &key, "legacy_stopping");
         return Ok(());
     };
-    let mut process = spawned?;
+    let mut process = spawned.map_err(|error| staged(LEGACY_STAGE_SPAWN, error))?;
     if let Err(error) = mark_phase(&shared, &key, Phase::Running, true) {
         if process.terminate_and_wait(Duration::from_secs(5)).await
             .is_ok_and(|receipt| receipt.tree_empty)
@@ -1133,10 +1352,12 @@ async fn drive_process(
                 run.tree_stopped = true;
             }
         }
-        return Err(error);
+        return Err(staged(LEGACY_STAGE_PHASE_RUNNING, error));
     }
-    let stdout = process.take_stdout().context("legacy stdout pipe missing")?;
-    let stderr = process.take_stderr().context("legacy stderr pipe missing")?;
+    let stdout = process.take_stdout().ok_or_else(|| staged(LEGACY_STAGE_PIPE_MISSING,
+        anyhow::anyhow!("legacy stdout pipe missing")))?;
+    let stderr = process.take_stderr().ok_or_else(|| staged(LEGACY_STAGE_PIPE_MISSING,
+        anyhow::anyhow!("legacy stderr pipe missing")))?;
     let mut readers = tokio::task::JoinSet::new();
     {
         let owner = shared.clone(); let key = key.clone();
@@ -1166,8 +1387,12 @@ async fn drive_process(
     }
     // Leader exit does not imply descendants stopped or stdio EOF. Terminate
     // the exact owned boundary first; this path is independent of ACK capacity.
-    let receipt = process.terminate_and_wait(Duration::from_secs(5)).await?;
-    if !receipt.tree_empty { bail!("legacy_cleanup_unknown"); }
+    let receipt = process.terminate_and_wait(Duration::from_secs(5)).await
+        .map_err(|error| staged(LEGACY_STAGE_CLEANUP_IO, error.into()))?;
+    if !receipt.tree_empty {
+        return Err(staged(LEGACY_STAGE_TREE_NOT_EMPTY,
+            anyhow::anyhow!("legacy_cleanup_unknown")));
+    }
     {
         let mut runs = lock_runs(&shared);
         if let Some(run) = runs.get_mut(&key.run_id).filter(|run| run.key == key) {
@@ -1178,7 +1403,8 @@ async fn drive_process(
     if stopped || stream_failed {
         readers.abort_all();
         while readers.join_next().await.is_some() {}
-        bail!("legacy_output_unknown");
+        return Err(staged(LEGACY_STAGE_OUTPUT_LOST,
+            anyhow::anyhow!("legacy_output_unknown")));
     }
     while !readers.is_empty() {
         tokio::select! {
@@ -1186,21 +1412,74 @@ async fn drive_process(
             _ = stop.changed() => {
                 readers.abort_all();
                 while readers.join_next().await.is_some() {}
-                bail!("legacy_output_unknown");
+                return Err(staged(LEGACY_STAGE_OUTPUT_LOST,
+                    anyhow::anyhow!("legacy_output_unknown")));
             }
             result = readers.join_next() => {
                 match result {
                     Some(Ok(Ok(()))) => {},
-                    _ => bail!("legacy_output_unknown"),
+                    _ => return Err(staged(LEGACY_STAGE_OUTPUT_LOST,
+                        anyhow::anyhow!("legacy_output_unknown"))),
                 }
             }
         }
     }
-    mark_phase(&shared, &key, Phase::Finished, false)?;
-    enqueue_exit(&shared, &key, exit_code(receipt.exit_status)).await?;
+    mark_phase(&shared, &key, Phase::Finished, false)
+        .map_err(|error| staged(LEGACY_STAGE_PHASE_FINISHED, error))?;
+    enqueue_exit(&shared, &key, exit_code(receipt.exit_status)).await
+        .map_err(|error| staged(LEGACY_STAGE_TERMINAL_ENQUEUE, error))?;
     drop(prepared);
     drop(shim);
     Ok(())
+}
+
+/// Two closed detail phases inside `spawn_legacy`, which reports the single
+/// `LEGACY_STAGE_SPAWN` stage upward. They separate "the child could not be
+/// created at all" from "the created child was refused by the process
+/// boundary" without widening the nine-stage set or the wire contract.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LEGACY_SPAWN_CHILD_CREATE: &str = "child_create";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LEGACY_SPAWN_BOUNDARY_ADOPT: &str = "boundary_adopt";
+
+/// Closed vocabulary. Anything unlisted is `unknown`; no OS text is echoed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn legacy_io_kind(kind: std::io::ErrorKind) -> &'static str {
+    use std::io::ErrorKind as Kind;
+    match kind {
+        Kind::NotFound => "not_found",
+        Kind::PermissionDenied => "permission_denied",
+        Kind::AlreadyExists => "already_exists",
+        Kind::InvalidInput => "invalid_input",
+        Kind::InvalidData => "invalid_data",
+        Kind::WouldBlock => "would_block",
+        Kind::BrokenPipe => "broken_pipe",
+        Kind::Interrupted => "interrupted",
+        Kind::TimedOut => "timed_out",
+        Kind::Unsupported => "unsupported",
+        Kind::OutOfMemory => "out_of_memory",
+        Kind::WriteZero => "write_zero",
+        Kind::UnexpectedEof => "unexpected_eof",
+        Kind::ConnectionAborted => "connection_aborted",
+        Kind::ConnectionRefused => "connection_refused",
+        Kind::ConnectionReset => "connection_reset",
+        _ => "unknown",
+    }
+}
+
+/// Phase, closed kind label and the raw errno only. Never the error text, the
+/// program path, argv or any environment value.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn legacy_spawn_detail(phase: &'static str, error: Option<&std::io::Error>) -> String {
+    match error {
+        Some(error) => format!(
+            "loom-node: legacy spawn detail phase={} io={} os={}",
+            phase, legacy_io_kind(error.kind()), error.raw_os_error().unwrap_or(-1),
+        ),
+        None => format!(
+            "loom-node: legacy spawn detail phase={} io=unknown os=-1", phase,
+        ),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1212,7 +1491,20 @@ fn spawn_legacy(spec: &ProcessSpec) -> Result<NativeProcess> {
         .env_clear().envs(spec.environment())
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .kill_on_drop(true).process_group(0);
-    NativeProcess::adopt_legacy_process_group(command.spawn()?)
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // Nothing was created, but the attempt is still UNKNOWN upward: the
+            // boundary never ran, and the journal must not learn "no spawn".
+            eprintln!("{}", legacy_spawn_detail(LEGACY_SPAWN_CHILD_CREATE, Some(&error)));
+            return Err(error.into());
+        }
+    };
+    NativeProcess::adopt_legacy_process_group(child).map_err(|error| {
+        let io = error.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>());
+        eprintln!("{}", legacy_spawn_detail(LEGACY_SPAWN_BOUNDARY_ADOPT, io));
+        error
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1425,5 +1717,416 @@ mod legacy_owner_guard_tests {
         }
         drop(rows); drop(journal);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Owns the closed diagnosis boundary of the legacy owner error path: the nine
+/// static stages stay distinguishable, an unrecognized shape stays `unknown`,
+/// and no inner error text (command line, path, account, token) can reach the
+/// diagnostic line. It also pins the wire code to `legacy_outcome_unknown`,
+/// because a post-spawn failure must never become a no-process receipt.
+#[cfg(test)]
+mod legacy_stage_tests {
+    use super::*;
+
+    const SECRET_TOKEN: &str = "sk-live-0123456789abcdef0123456789abcdef";
+    const ACCOUNT_PATH: &str = "/home/alice/.codex/auth.json";
+    const ACCOUNT_MAIL: &str = "alice@example.com";
+
+    #[test]
+    fn every_drive_process_stage_maps_to_its_own_closed_code() {
+        assert_eq!(LEGACY_STAGES.len(), 9, "the drive_process error path has nine stages");
+        for stage in LEGACY_STAGES {
+            let failure = staged(*stage,
+                anyhow::anyhow!("boom {} {}", ACCOUNT_PATH, SECRET_TOKEN));
+            assert_eq!(legacy_stage(&failure), *stage, "{stage}");
+            let line = legacy_diagnostic(legacy_stage(&failure), 3, "run_stage_table");
+            assert!(line.contains(&format!("stage={stage}")), "{line}");
+            assert!(line.contains("attempt=3"), "{line}");
+            for leak in ["boom", "alice", "auth.json", "sk-live"] {
+                assert!(!line.contains(leak), "{leak} leaked: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn credentials_paths_and_raw_text_never_reach_the_diagnostic() {
+        let failure = staged(LEGACY_STAGE_SPAWN, anyhow::anyhow!(
+            "spawn failed token={} path={} account={}", SECRET_TOKEN, ACCOUNT_PATH,
+            ACCOUNT_MAIL));
+        assert_eq!(legacy_stage(&failure), LEGACY_STAGE_SPAWN);
+        let line = legacy_diagnostic(legacy_stage(&failure), 2, "run_secret_identity");
+        for leak in [SECRET_TOKEN, ACCOUNT_PATH, ACCOUNT_MAIL, "sk-live", "auth.json",
+            "example.com"] {
+            assert!(!line.contains(leak), "diagnostic leaked {leak}: {line}");
+        }
+        assert_eq!(line, format!("loom-node: legacy owner unknown stage=spawn attempt=2 run={}",
+            legacy_run_label("run_secret_identity")));
+        assert!(!line.contains("run_secret_identity"), "run id stays one-way: {line}");
+    }
+
+    #[test]
+    fn an_unshaped_or_nested_error_stays_unknown_and_prints_no_text() {
+        let raw = anyhow::anyhow!("exec /usr/local/bin/secret-cli --token {}", SECRET_TOKEN);
+        assert_eq!(legacy_stage(&raw), LEGACY_STAGE_UNKNOWN);
+        let line = legacy_diagnostic(legacy_stage(&raw), 1, "run_plain");
+        assert!(line.contains("stage=unknown"), "{line}");
+        for leak in ["secret-cli", "sk-live", "/usr/local/bin"] {
+            assert!(!line.contains(leak), "{leak} leaked: {line}");
+        }
+        // A later outer context must not hide the exact stage.
+        let nested = Err::<(), anyhow::Error>(staged(LEGACY_STAGE_OUTPUT_LOST,
+            anyhow::anyhow!("lost")))
+            .context("legacy owner task")
+            .expect_err("staged failure");
+        assert_eq!(legacy_stage(&nested), LEGACY_STAGE_OUTPUT_LOST);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn spawn_detail_keeps_a_closed_phase_kind_and_errno_without_text() {
+        let denied = std::io::Error::from_raw_os_error(13);
+        assert_eq!(legacy_spawn_detail(LEGACY_SPAWN_CHILD_CREATE, Some(&denied)),
+            "loom-node: legacy spawn detail phase=child_create io=permission_denied os=13");
+        // A boundary error whose chain carries a token and a path keeps only the
+        // closed fields: no inner text may reach the diagnostic.
+        let boundary = Err::<(), anyhow::Error>(anyhow::anyhow!(
+            "adopt failed token={} path={}", SECRET_TOKEN, ACCOUNT_PATH))
+            .context(std::io::Error::from_raw_os_error(1))
+            .expect_err("boundary failure");
+        let io = boundary.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>());
+        let line = legacy_spawn_detail(LEGACY_SPAWN_BOUNDARY_ADOPT, io);
+        for leak in [SECRET_TOKEN, ACCOUNT_PATH, "sk-live", "adopt failed"] {
+            assert!(!line.contains(leak), "{leak} leaked: {line}");
+        }
+        assert!(line.contains("phase=boundary_adopt"), "{line}");
+        assert!(line.contains("io=permission_denied") && line.contains("os=1"), "{line}");
+        assert_eq!(legacy_spawn_detail(LEGACY_SPAWN_CHILD_CREATE, None),
+            "loom-node: legacy spawn detail phase=child_create io=unknown os=-1");
+    }
+
+    #[test]
+    fn the_only_wire_code_is_outcome_unknown_and_never_no_process() {
+        assert_eq!(LEGACY_UNKNOWN_WIRE, "legacy_outcome_unknown");
+        assert_ne!(LEGACY_UNKNOWN_WIRE, "legacy_no_process",
+            "a post-spawn failure must not authorize another attempt");
+        assert!(!LEGACY_STAGES.iter().any(|stage| *stage == LEGACY_STAGE_UNKNOWN),
+            "the closed set and the fallback stay disjoint");
+    }
+}
+
+/// H1 device-only owner: a pure device daemon must advertise no R1 transport and
+/// must answer a misdirected Start or pipe command without spawning anything.
+#[cfg(test)]
+mod device_only_tests {
+    use super::*;
+    use std::{net::TcpListener, path::Path, time::Duration};
+
+    const NODE: &str = "node_device_only";
+    const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn fixture_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("loom-device-only-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// The same construction `serve` performs, minus the socket loop. A
+    /// device-only node builds no pipe manager, so `pipes` stays `None`.
+    fn device_only_shared(root: &Path) -> Arc<Shared> {
+        let authority =
+            match crate::workspace_authority::WorkspaceAuthority::open(root, NODE.into()) {
+                Ok(authority) => authority,
+                Err(_) => panic!("workspace authority refused the fixture root"),
+            };
+        let rpc = match crate::workspace_rpc::WorkspaceRpcExecutor::open(
+            NODE.into(),
+            root.join("workspace-rpc"),
+            Vec::new(),
+        ) {
+            Ok(rpc) => rpc,
+            Err(_) => panic!("workspace rpc owner refused the fixture root"),
+        };
+        let workspace_rpc =
+            crate::workspace_rpc::WorkspaceRpcWire::with_authority(rpc, authority.clone());
+        let journal = match Journal::open(root, NODE) {
+            Ok(journal) => journal,
+            Err(code) => panic!("journal refused the fixture root: {code}"),
+        };
+        let (shutdown, _) = watch::channel(false);
+        Arc::new(Shared {
+            data_dir: root.to_path_buf(),
+            server: "ws://127.0.0.1:1".to_owned(),
+            node_token: TOKEN.to_owned(),
+            clis: Vec::new(),
+            computer: crate::computer_provider::ComputerHost::open(None, None),
+            pipes: None,
+            authority,
+            workspace_rpc,
+            client_output: Mutex::new(None),
+            fs_jobs: Arc::new(tokio::sync::Semaphore::new(4)),
+            runs: Mutex::new(HashMap::new()),
+            journal,
+            owners: Mutex::new(tokio::task::JoinSet::new()),
+            shutdown,
+            control: Mutex::new(None),
+            output: Mutex::new(None),
+            wake: Notify::new(),
+        })
+    }
+
+    fn start_frame(run_id: &str, program: &Path) -> String {
+        serde_json::json!({
+            "type": "start",
+            "runId": run_id,
+            "attempt": 1,
+            "adapterKind": "codex-cli",
+            "program": program.to_string_lossy().into_owned(),
+            "args": ["exec", "hello"],
+            "cwd": program.parent().unwrap_or(Path::new("")).to_string_lossy().into_owned(),
+            "env": [],
+            "shimToken": "b".repeat(64),
+        })
+        .to_string()
+    }
+
+    fn ack_frame() -> String {
+        serde_json::json!({
+            "type": "processPipe",
+            "command": {
+                "operation": "ack",
+                "key": {"nodeId": NODE, "processId": "proc_absent", "processEpoch": 1},
+                "controllerId": "controller_1",
+                "eventSeq": 0,
+            },
+        })
+        .to_string()
+    }
+
+    fn builtin_reply_frame() -> String {
+        serde_json::json!({
+            "type": "builtinReply",
+            "reply": {
+                "version": 1,
+                "key": {"nodeId": NODE, "processId": "proc_absent", "processEpoch": 1},
+                "bindingSeq": 0,
+                "requestId": "request_absent",
+                "requestDigest": "c".repeat(64),
+                "response": null,
+            },
+        })
+        .to_string()
+    }
+
+    fn read_text(
+        socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+    ) -> Result<String, String> {
+        loop {
+            match socket.read() {
+                Ok(tungstenite::Message::Text(text)) => return Ok(text.to_string()),
+                Ok(tungstenite::Message::Ping(data)) => {
+                    let _ = socket.send(tungstenite::Message::Pong(data));
+                }
+                Ok(tungstenite::Message::Close(_)) => return Err("socket closed".to_owned()),
+                Ok(_) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
+    /// Bounded so a silent node fails the case instead of hanging the suite.
+    fn read_until(
+        socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+        needle: &str,
+    ) -> Result<String, String> {
+        let mut seen = String::new();
+        for _ in 0..8 {
+            seen.push_str(&read_text(socket)?);
+            seen.push('\n');
+            if seen.contains(needle) {
+                return Ok(seen);
+            }
+        }
+        Err(format!("no {needle} frame arrived: {seen}"))
+    }
+
+    fn fake_server(
+        listener: TcpListener,
+        program: std::path::PathBuf,
+    ) -> std::thread::JoinHandle<Result<(), String>> {
+        std::thread::spawn(move || {
+            use tungstenite::Message;
+            let (stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .map_err(|error| error.to_string())?;
+            let mut socket = tungstenite::accept(stream).map_err(|error| error.to_string())?;
+
+            let hello = read_text(&mut socket)?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(&hello).map_err(|error| error.to_string())?;
+            if parsed["type"] != "hello" {
+                return Err(format!("first frame was {hello}"));
+            }
+            if !parsed["clis"].as_array().is_some_and(|clis| clis.is_empty()) {
+                return Err(format!("device-only hello advertised a CLI: {hello}"));
+            }
+            for field in ["processPipeVersions", "runBundleVersions"] {
+                if parsed.get(field).is_some() {
+                    return Err(format!("device-only hello advertised {field}: {hello}"));
+                }
+            }
+            if parsed["workspaceRpcVersions"] != serde_json::json!([1]) {
+                return Err(format!("workspace rpc was not advertised: {hello}"));
+            }
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"type": "welcome", "nodeId": NODE})
+                        .to_string()
+                        .into(),
+                ))
+                .map_err(|error| error.to_string())?;
+
+            // A misdirected legacy Start is refused by name and never spawns.
+            socket
+                .send(Message::Text(
+                    start_frame("run_device_only_1", &program).into(),
+                ))
+                .map_err(|error| error.to_string())?;
+            let refused = read_until(&mut socket, "\"type\":\"rejected\"")?;
+            if !refused.contains("\"code\":\"program_not_allowed\"") {
+                return Err(format!("start refusal was {refused}"));
+            }
+
+            // A misdirected pipe command gets a bounded refusal for its own
+            // identity instead of silence or a spawn.
+            socket
+                .send(Message::Text(ack_frame().into()))
+                .map_err(|error| error.to_string())?;
+            let pipe = read_until(&mut socket, "\"type\":\"processPipeControl\"")?;
+            if !pipe.contains("\"reply\":\"refused\"")
+                || !pipe.contains("\"code\":\"device_only\"")
+                || !pipe.contains("\"processId\":\"proc_absent\"")
+            {
+                return Err(format!("pipe refusal was {pipe}"));
+            }
+
+            // A reply for a builtin call this node never advertised must not
+            // tear the authenticated socket down: the next Start still answers.
+            socket
+                .send(Message::Text(builtin_reply_frame().into()))
+                .map_err(|error| error.to_string())?;
+            socket
+                .send(Message::Text(
+                    start_frame("run_device_only_2", &program).into(),
+                ))
+                .map_err(|error| error.to_string())?;
+            let again = read_until(&mut socket, "\"type\":\"rejected\"")?;
+            if !again.contains("\"code\":\"program_not_allowed\"") {
+                return Err(format!("second start refusal was {again}"));
+            }
+            let _ = socket.send(Message::Close(None));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn device_only_advertises_no_runtime_bundle_or_pipe() {
+        let (bundle, pipe, rpc) = hands_advertisement(None);
+        assert!(bundle.is_empty(), "device-only must not advertise an R1 bundle");
+        assert!(pipe.is_empty(), "device-only must not advertise a process pipe");
+        assert_eq!(rpc, vec![loom_protocol::workspace_rpc::RPC_VERSION]);
+    }
+
+    #[test]
+    fn pipe_refusal_echoes_the_requested_identity() {
+        use loom_protocol::process_pipe::{
+            ProcessControlBody, ProcessPipeCommand, RemoteProcessKey,
+        };
+        let key = RemoteProcessKey {
+            node_id: NODE.into(),
+            process_id: "proc_absent".into(),
+            process_epoch: 1,
+        };
+        let commands = [
+            ProcessPipeCommand::Ack {
+                key: key.clone(),
+                controller_id: "controller_1".into(),
+                event_seq: 7,
+            },
+            ProcessPipeCommand::Terminate {
+                key: key.clone(),
+                request_id: "request_1".into(),
+                budget_ms: 1000,
+            },
+            ProcessPipeCommand::Release {
+                key: key.clone(),
+                controller_id: "controller_1".into(),
+                request_id: "request_2".into(),
+                acked_event_seq: 0,
+                abandon_output: false,
+            },
+        ];
+        for command in commands {
+            let reply = crate::process_wire::refusal_for(&command, "device_only");
+            assert_eq!(reply.key, key, "refusal must echo the command identity");
+            assert!(reply.validate().is_ok(), "refusal must be a valid control frame");
+            match &reply.body {
+                ProcessControlBody::Refused { request_id, code } => {
+                    assert_eq!(code, "device_only");
+                    match &command {
+                        ProcessPipeCommand::Ack { .. } => assert!(request_id.is_none()),
+                        _ => assert!(request_id.is_some()),
+                    }
+                }
+                _ => panic!("a device-only node may only refuse a pipe command"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn misrouted_start_and_pipe_commands_are_refused_without_spawning() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).expect("fixture root");
+        // The program would leave this marker behind if any path ever ran it.
+        let marker = root.join("spawned");
+        let program = root.join(if cfg!(windows) { "codex.cmd" } else { "codex" });
+        std::fs::write(&program, format!("would write {}\n", marker.display()))
+            .expect("fixture program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                .expect("fixture permissions");
+        }
+
+        let shared = device_only_shared(&root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = fake_server(listener, program);
+        let stop = connect_once(
+            &format!("ws://{address}/api/v1/nodes/connect"),
+            NODE,
+            TOKEN,
+            &shared,
+        )
+        .await;
+        let outcome = server.join().expect("fake server thread panicked");
+        assert!(outcome.is_ok(), "fake server reported {outcome:?}");
+        match stop {
+            Ok(Stop::Closed) => {}
+            Ok(Stop::Revoked) => panic!("a device-only node must not be revoked"),
+            Err(error) => panic!("socket loop failed: {error:#}"),
+        }
+        assert!(!marker.exists(), "a refused Start reached a spawn path");
+        let mut durable = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root.join("legacy-runs")) {
+            for entry in entries.flatten() {
+                durable.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        assert!(
+            durable.iter().all(|name| !name.ends_with(".json")),
+            "a refused Start wrote a durable R1 record: {durable:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

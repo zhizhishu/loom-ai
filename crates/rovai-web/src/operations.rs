@@ -1109,6 +1109,7 @@ mod tests {
                 "verdict":"pass","reason":"ok",
                 "criteriaResults":[{"criterionId":"criterion_fixture","satisfied":true,
                     "evidenceIds":["artifact_fixture"],"note":null,
+                    "archivePath":"private-archive",
                     "futureCredentialField":"criteria-secret"}],
                 "reviewedAt":"2026-01-01T00:00:00Z","reviewerId":"payload-forged"}],
             "dispatches":[{"dispatchId":"dispatch_fixture","taskId":"task_fixture",
@@ -1131,8 +1132,9 @@ mod tests {
         assert_eq!(projected["stageReviews"][0]["verdict"], json!("pass"));
         assert_eq!(
             projected["stageReviews"][0]["criteriaResults"],
-            json!([{"criterionId":"criterion_fixture","satisfied":true,"note":null}]),
-            "a nested per-criterion verdict keeps only criterionId, satisfied and note"
+            json!([{"criterionId":"criterion_fixture","satisfied":true,
+                "evidenceIds":["artifact_fixture"],"note":null}]),
+            "a nested per-criterion verdict keeps only criterionId, satisfied, evidenceIds and note"
         );
         assert_eq!(projected["dispatches"][0]["status"], json!("waiting"));
         assert_eq!(projected["evaluatedAt"], json!("2026-01-01T00:00:00Z"));
@@ -1141,7 +1143,10 @@ mod tests {
             !projected.to_string().contains("payload-forged"),
             "a payload cannot nominate its own reviewer"
         );
-        assert!(!projected.to_string().contains("artifact_fixture"));
+        assert!(
+            !projected.to_string().contains("private-archive"),
+            "a criterion verdict never carries the artifact's private archive path"
+        );
         // A real "never approved" gate stays an explicit null.
         assert_eq!(
             Operation::LoomControlPause

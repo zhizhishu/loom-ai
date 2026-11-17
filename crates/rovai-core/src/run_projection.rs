@@ -70,7 +70,8 @@ pub(crate) struct MemberRunProjection {
     pub mcp: Value,
     /// Toolbox skills the next Run's additional-skill section will carry.
     pub skills: Vec<crate::member_capability::ProjectedCapability>,
-    /// Selected rule snippets. They are not written into the session bootstrap.
+    /// Selected rule snippets. Their bodies already travel in the frozen Session
+    /// Charter inside `[SELECTED_ASSISTANT_RULES]`; this copy only feeds the UI preview.
     pub rules: Vec<crate::member_capability::ProjectedCapability>,
     /// Selected hooks. They are not written into the session bootstrap.
     pub hooks: Vec<crate::member_capability::ProjectedCapability>,

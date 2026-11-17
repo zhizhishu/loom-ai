@@ -36,6 +36,32 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
     Ok(())
 }
 
+// Only synthetic migration fixtures reverse this projection; product code never drops it.
+// A missing receipt means a fixture already pre-downgraded this step, so the drop is skipped
+// instead of being hidden behind IF EXISTS for a table that should still be there.
+#[cfg(test)]
+pub(super) fn downgrade_for_test(connection: &Connection) {
+    if connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=234)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    {
+        // The newest child table goes first; 233 then 232 keep reverting below it.
+        connection
+            .execute_batch(
+                "DROP TABLE member_skill_source;
+                 DELETE FROM schema_migration WHERE version=234;
+                 UPDATE rovai_data_contract SET projection_schema_version=183
+                   WHERE singleton=1 AND projection_schema_version IN (184);",
+            )
+            .unwrap();
+    }
+    super::member_hook_review_migration::downgrade_for_test(connection);
+}
+
 #[cfg(test)]
 pub(super) fn test_replay_183(database: &mut Database) {
     let c = database.connection();

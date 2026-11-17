@@ -103,6 +103,9 @@ fn acceptance() -> Result<()> {
         .to_owned();
     assert_local_host_unchanged(&a, &local_id)?;
     seed_tasks(&a, &local_id, &remote_id)?;
+    // Bounded fixture-local diagnosis only: it reads A's own rows and this
+    // process' PATH and never changes how a task is dispatched.
+    b5_diagnose(&a, &local_id, &remote_id);
 
     let local_run = run_task(&a, &work, "task_local")?;
     if !local_run.stdout.contains("LOOM_B5_LOCAL") {
@@ -225,6 +228,59 @@ con.commit()
         );
     }
     Ok(())
+}
+
+/// Prints three closed facts about the local half of the split: whether the task
+/// pin names the local node, that node's role, and whether this process' PATH
+/// (the one the server inherits) resolves a codex-cli entry. No path, no
+/// credential and no environment value is printed, and it never fails the test.
+#[cfg(target_os = "linux")]
+fn b5_diagnose(data_dir: &Path, local_id: &str, remote_id: &str) {
+    let script = r#"
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+pin = con.execute("select execution_host_id from loom_task where task_id='task_local'").fetchone()
+role = con.execute("select role from execution_node where node_id=?", (sys.argv[2],)).fetchone()
+clis = con.execute("select count(*) from execution_node_cli where node_id=?", (sys.argv[2],)).fetchone()
+print(pin[0] if pin else '')
+print(role[0] if role else '')
+print(clis[0] if clis else 0)
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(data_dir.join("rovai.sqlite"))
+        .arg(local_id)
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            eprintln!("B5 diagnosis: unavailable (sqlite read failed)");
+            return;
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut lines = text.lines();
+    let pin = lines.next().unwrap_or("");
+    let role = lines.next().unwrap_or("");
+    let reported = lines.next().unwrap_or("");
+    eprintln!(
+        "B5 diagnosis: pin_is_local={} pin_is_remote={} role={} reported_clis={} server_path_has_codex={}",
+        pin == local_id,
+        pin == remote_id,
+        role,
+        reported,
+        server_path_has_codex(),
+    );
+}
+
+/// Whether the PATH this process passes to the server resolves `codex`.
+#[cfg(target_os = "linux")]
+fn server_path_has_codex() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| directory.join("codex").is_file())
 }
 
 #[cfg(target_os = "linux")]

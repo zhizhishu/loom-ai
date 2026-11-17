@@ -406,21 +406,37 @@ mod tests {
 
     #[test]
     fn malformed_helper_stdout_is_never_accepted_as_a_frame() {
+        // A raw string keeps the four-space Python indentation. A `\`-continued Rust
+        // literal strips the leading whitespace of every continued line, which turned
+        // each `if`/`elif` body into an IndentationError: the child then exited before
+        // writing, so a `Failed` here would only prove the helper never ran.
         let Some((launch, root)) = script(
-            "import json, sys\n\
-             request = json.loads(sys.stdin.readline())\n\
-             mode = request.get('op')\n\
-             if mode == 'garbage':\n\
-                 sys.stdout.write('not json\\n')\n\
-             elif mode == 'mismatch':\n\
-                 sys.stdout.write(json.dumps({'ok': True, 'bytes': 99}) + '\\n' + 'short')\n\
-             else:\n\
-                 sys.stdout.write(json.dumps({'ok': True, 'bytes': 0}) + '\\n')\n\
-             sys.stdout.flush()\n",
+            r#"import json, sys
+request = json.loads(sys.stdin.readline())
+mode = request.get('op')
+if mode == 'garbage':
+    sys.stdout.write('not json\n')
+elif mode == 'mismatch':
+    sys.stdout.write(json.dumps({'ok': True, 'bytes': 99}) + '\n' + 'short')
+else:
+    sys.stdout.write(json.dumps({'ok': True, 'bytes': 0}) + '\n')
+sys.stdout.flush()
+"#,
         ) else {
             eprintln!("NOT TESTED: no python3/python on PATH; helper framing unverified");
             return;
         };
+        // Positive control: the fixture must really start and produce one well-formed
+        // frame, otherwise the assertions below cannot distinguish a rejection from a
+        // helper that wrote nothing at all.
+        let (control, control_body) = run(
+            &launch,
+            &serde_json::json!({"op": "control"}),
+            Duration::from_secs(20),
+        )
+        .expect("helper fixture must produce one well-formed frame");
+        assert!(control.ok);
+        assert!(control_body.is_empty());
         for (op, failure) in [("garbage", Failure::Failed), ("mismatch", Failure::Invalid)] {
             assert_eq!(
                 run(

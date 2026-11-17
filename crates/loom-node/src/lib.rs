@@ -43,8 +43,14 @@ struct Cli {
     #[arg(long, conflicts_with = "pair_code")]
     pair_code_stdin: bool,
     /// Local Rovai CLI helper; defaults to rovai beside loom-node.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "device_only")]
     agent_cli: Option<PathBuf>,
+    /// Run as a pure device daemon: no Agent CLI discovery or probe, no R1
+    /// runtime and no ProcessPipe/builtin advertisement. Workspace RPC
+    /// (list/read/fixed git.status) and an explicitly configured computer stay
+    /// available.
+    #[arg(long)]
+    device_only: bool,
     /// Absolute path to the desktop helper script. Computer support stays off
     /// unless this and `--computer-python` are both absolute existing files.
     #[arg(long)]
@@ -95,9 +101,17 @@ fn read_pair_code(reader: impl Read) -> Result<String> {
 
 async fn run_async(cli: Cli) -> Result<()> {
     prepare_data_dir(&cli.data_dir)?;
-    let (clis, catalog) = discover::installed_clis(&cli.data_dir)
-        .await
-        .map_err(|code| anyhow::anyhow!(code))?;
+    // A device-only node never looks for an Agent CLI, so it performs no PATH
+    // scan, no `--version` probe and no installation catalog open.
+    let discovered = if cli.device_only {
+        None
+    } else {
+        Some(
+            discover::installed_clis(&cli.data_dir)
+                .await
+                .map_err(|code| anyhow::anyhow!(code))?,
+        )
+    };
     let mut credentials = if let Some(code) = cli.pair_code.as_deref() {
         let issued = session::pair(&cli.server, code).await?;
         let credentials = Credentials {
@@ -119,15 +133,26 @@ async fn run_async(cli: Cli) -> Result<()> {
         cli.computer_helper.clone(),
         cli.computer_python.clone(),
     );
+    // Same order as before for the default node: the local `rovai` helper is
+    // still verified last, right before serving. A device-only node verifies no
+    // helper and can therefore never admit an R1 runtime.
+    let hands = match discovered {
+        Some((clis, catalog)) => {
+            session::NodeHands::with_runtime(
+                clis,
+                catalog,
+                load_builtin_bridge(&cli.data_dir, cli.agent_cli.as_deref()).await?,
+            )
+        }
+        None => session::NodeHands::device_only(),
+    };
     session::serve(
         &cli.data_dir,
         &cli.server,
         &credentials.node_id,
         &credentials.token,
-        clis,
-        catalog,
+        hands,
         computer,
-        load_builtin_bridge(&cli.data_dir, cli.agent_cli.as_deref()).await?,
     )
     .await
 }
@@ -350,5 +375,38 @@ mod pairing_stdin_tests {
     #[test]
     fn code_sources_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["loom-node", "--data-dir", "/owned/node", "--server", "ws://127.0.0.1:1", "--pair-code", "sample", "--pair-code-stdin"]).is_err());
+    }
+    #[test]
+    fn device_only_is_an_explicit_operator_choice() {
+        let base = ["loom-node", "--data-dir", "/owned/node", "--server", "ws://127.0.0.1:1"];
+        let device = Cli::try_parse_from(base.into_iter().chain(["--device-only"]))
+            .expect("device-only parses");
+        assert!(device.device_only);
+        assert!(device.agent_cli.is_none());
+        // The default node keeps its current runtime behavior and helper lookup.
+        assert!(!Cli::try_parse_from(base).expect("default parses").device_only);
+        // An Agent CLI helper is meaningless without an R1 runtime.
+        assert!(
+            Cli::try_parse_from(
+                base.into_iter()
+                    .chain(["--device-only", "--agent-cli", "/owned/rovai"])
+            )
+            .is_err(),
+            "device-only must refuse an Agent CLI helper"
+        );
+        // A computer helper stays an independent, explicit device capability.
+        let computer = Cli::try_parse_from(base.into_iter().chain([
+            "--device-only",
+            "--computer-helper",
+            "/owned/helper.py",
+            "--computer-python",
+            "/owned/python",
+        ]))
+        .expect("device-only may declare a computer");
+        assert_eq!(
+            computer.computer_helper,
+            Some(PathBuf::from("/owned/helper.py"))
+        );
+        assert_eq!(computer.computer_python, Some(PathBuf::from("/owned/python")));
     }
 }

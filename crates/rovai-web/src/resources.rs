@@ -193,7 +193,7 @@ fn is_core_file_source_kind(kind: Option<&str>) -> bool {
 
 // Resolve the path portion only. The production TS reference parser remains the
 // presentation owner for line/heading targets; Core validates the original source.
-fn reference_path(raw: &str, base: &std::path::Path) -> Result<PathBuf> {
+fn reference_path_text(raw: &str) -> Result<&str> {
     ensure!(
         raw.len() <= 16_384 && !raw.contains(['\0', '\r', '\n']),
         "source_not_authorized"
@@ -239,6 +239,11 @@ fn reference_path(raw: &str, base: &std::path::Path) -> Result<PathBuf> {
         }
     };
     ensure!(!path.is_empty(), "source_not_authorized");
+    Ok(path)
+}
+
+fn reference_path(raw: &str, base: &std::path::Path) -> Result<PathBuf> {
+    let path = reference_path_text(raw)?;
     // URL joining treats a Windows drive letter as a scheme. Normalize only
     // absolute local-drive references, preserving the existing one-time URL decoding.
     #[cfg(windows)]
@@ -343,6 +348,22 @@ async fn resolve(state: &WebState, client: &DraftClient, source: &Value) -> Resu
     })
 }
 
+// Mission identity is opaque application data, never a filesystem component.
+// Hashing preserves a stable cache namespace without accepting path syntax from
+// an authenticated workspace record (including foreign Windows drive paths).
+fn remote_preview_cache_root(directory: &std::path::Path, mission_id: &str) -> PathBuf {
+    directory.join("workspace-preview")
+        .join(format!("{:x}", Sha256::digest(mission_id.as_bytes())))
+}
+
+fn check_handle_capacity<'a>(clients: impl Iterator<Item = &'a str>, client: &str) -> Result<()> {
+    let (total, owned) = clients.fold((0usize, 0usize), |(total, owned), owner| {
+        (total + 1, owned + usize::from(owner == client))
+    });
+    ensure!(total < 128 && owned < 32, "too_many_open_files");
+    Ok(())
+}
+
 async fn cached_remote_workspace(
     state: &WebState,
     client: &DraftClient,
@@ -354,7 +375,7 @@ async fn cached_remote_workspace(
         return Ok(None);
     };
     let raw = request["rawReference"].as_str().unwrap_or(".");
-    let relative = raw.split(['#', ':']).next().unwrap_or(raw);
+    let relative = reference_path_text(raw)?;
     if relative.is_empty() || relative == "." {
         return Ok(None);
     }
@@ -369,7 +390,7 @@ async fn cached_remote_workspace(
     if record.owner_role != "remote" {
         return Ok(None);
     }
-    let relative = loom_protocol::workspace_relative(&record.worktree_path, relative)
+    let relative = crate::nodes::workspace_query_relative("remote", &record.worktree_path, relative)
         .map_err(|_| anyhow::anyhow!("outside_authorized_root"))?;
     let request_id = new_token()?;
     let reply = state
@@ -405,8 +426,9 @@ async fn cached_remote_workspace(
         .store
         .sqlite_directory()
         .context("node_offline")?;
-    let cache_root = directory.join("workspace-preview").join(&record.mission_id);
+    let cache_root = remote_preview_cache_root(&directory, &record.mission_id);
     let cache_path = cache_root.join(&relative);
+    ensure!(cache_path.starts_with(&cache_root), "outside_authorized_root");
     if let Some(parent) = cache_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -699,7 +721,7 @@ async fn file_operation(
         handle.analysis = Some(analysis);
         handle.version = file["contentVersion"].clone();
         let mut handles = state.files.0.lock().expect("file registry poisoned");
-        ensure!(handles.len() < 128, "too_many_open_files");
+        check_handle_capacity(handles.values().map(|handle| handle.client.as_str()), client.id())?;
         handles.insert(id, handle);
         return Ok(json!({"ok":true,"value":{"kind":"file_preview","file":file}}));
     }
@@ -800,15 +822,7 @@ async fn file_operation(
         handle.analysis = Some(analysis);
         handle.version = file["contentVersion"].clone();
         let mut handles = state.files.0.lock().expect("file registry poisoned");
-        ensure!(
-            handles.len() < 128
-                && handles
-                    .values()
-                    .filter(|handle| handle.client == client.id())
-                    .count()
-                    < 32,
-            "too_many_open_files"
-        );
+        check_handle_capacity(handles.values().map(|handle| handle.client.as_str()), client.id())?;
         handles.insert(id, handle);
         return Ok(json!({"ok":true,"value":{"kind":"file_preview","file":file}}));
     }
@@ -1201,6 +1215,58 @@ pub async fn preview_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_preview_identity_cannot_select_a_filesystem_root() {
+        let directory = std::env::temp_dir().join("loom-owned-data");
+        let namespace = directory.join("workspace-preview");
+        let mut seen = std::collections::HashSet::new();
+        for mission_id in ["rvm_example", "../../outside", "/tmp/outside", r"C:\outside",
+            r"..\..\outside", r"\\server\share", "a:b", "", "mission\0id"] {
+            let root = remote_preview_cache_root(&directory, mission_id);
+            assert_eq!(root.parent(), Some(namespace.as_path()));
+            let segment = root.file_name().unwrap().to_str().unwrap();
+            assert_eq!(segment.len(), 64);
+            assert!(segment.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(root, remote_preview_cache_root(&directory, mission_id));
+            assert!(seen.insert(root));
+        }
+    }
+
+    #[test]
+    fn cached_and_local_previews_share_per_client_and_global_capacity() {
+        let mut clients = vec!["alice"; 31];
+        clients.extend(vec!["bob"; 96]);
+        assert!(check_handle_capacity(clients.iter().copied(), "alice").is_ok());
+        clients.push("alice");
+        assert!(check_handle_capacity(clients.iter().copied(), "charlie").is_err());
+        clients.pop();
+        clients[31] = "alice";
+        assert!(check_handle_capacity(clients.iter().copied(), "alice").is_err());
+        assert!(check_handle_capacity(clients.iter().copied(), "charlie").is_ok());
+        clients.remove(0);
+        assert!(check_handle_capacity(clients.iter().copied(), "alice").is_ok());
+        assert!(check_handle_capacity(std::iter::empty(), "alice").is_ok());
+    }
+
+    #[test]
+    fn remote_preview_uses_executor_relative_paths_without_truncating_drive_or_stream_names() {
+        for root in [r"C:\Users\fixture\worktree", "/srv/fixture/worktree"] {
+            for reference in ["docs/a.md", "docs/a.md#L3", "docs/a.md:3:2", "`docs/a.md:3-5`"] {
+                let path = reference_path_text(reference).unwrap();
+                assert_eq!(crate::nodes::workspace_query_relative("remote", root, path),
+                    Ok("docs/a.md".to_owned()));
+            }
+            for reference in [r"C:\secret.md", "C:secret.md", "file:stream", "../secret.md:3",
+                r"..\secret.md#L3", "/etc/passwd", r"\\server\share\a.md"] {
+                let path = reference_path_text(reference).unwrap();
+                assert!(crate::nodes::workspace_query_relative("remote", root, path).is_err(),
+                    "{reference:?} must not gain authorization by losing its prefix");
+            }
+        }
+        assert!(reference_path_text("a\0b").is_err());
+        assert!(reference_path_text("a\nb").is_err());
+    }
 
     #[test]
     fn core_file_sources_include_exact_run_activity_files() {

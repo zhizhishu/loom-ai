@@ -339,8 +339,11 @@ export function useLoomData(environment: BusinessEnvironment): LoomData {
       if (event.method === 'navigation.invalidated' || event.method === 'members.invalidated') refreshFromEvent()
     }
     const offEvent = client.onEvent?.(onEvent)
-    const offInvalidated = client.onInvalidated?.(() => refreshFromEvent())
-    const onFocus = (): void => { if (document.visibilityState === 'visible') refreshFromEvent() }
+    // Browser transport emits read-invalidations instead of raw Core events.
+    // A plan/candidate write can leave Mission.updatedAt unchanged, so keeping
+    // the bundle cache here would redraw a stale empty plan indefinitely.
+    const offInvalidated = client.onInvalidated?.(() => refreshFromEvent(true))
+    const onFocus = (): void => { if (document.visibilityState === 'visible') refreshFromEvent(true) }
     window.addEventListener('focus', onFocus)
     document.addEventListener('visibilitychange', onFocus)
     return () => {

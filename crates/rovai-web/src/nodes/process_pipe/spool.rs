@@ -886,9 +886,13 @@ mod tests {
     }
 
     fn private_root(name: &str) -> PathBuf {
-        // Deliberately not created here: the spool must create its own private
-        // child and parent through the native policy.
-        std::env::temp_dir().join(format!("loom-spool-{name}-{}", Uuid::new_v4()))
+        // Mirrors production: `PipeRegistry::new` prepares `data_dir/process-pipe`
+        // through the same native private-directory policy before any child exists
+        // (process_pipe.rs:1799-1800). `Spool::create` deliberately creates only its
+        // one deterministic child (`new_private_child`), so the fixture must supply
+        // the admitted root instead of asking production for a recursive mkdir.
+        let root = std::env::temp_dir().join(format!("loom-spool-{name}-{}", Uuid::new_v4()));
+        rovai_private_storage::prepare_private_directory(&root).expect("prepare private spool root")
     }
 
     fn output(event_seq: u64, stream: PipeStream, text: &str) -> ProcessOutputEvent {

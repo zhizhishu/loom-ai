@@ -180,7 +180,10 @@ export function startQualificationCore({
     if (!request) return
     clearTimeout(request.timer)
     pending.delete(message.id)
-    if (message.error) request.reject(new Error(message.error.message))
+    if (message.error) request.reject(Object.assign(new Error(message.error.message), {
+      code: message.error.code, kind: message.error.kind,
+      retryable: message.error.retryable, details: message.error.details
+    }))
     else request.resolve(message.result)
   })
 

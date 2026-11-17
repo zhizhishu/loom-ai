@@ -404,9 +404,15 @@ fn fake_dispatch(listener: std::net::TcpListener, evil: PathBuf, cwd: PathBuf) -
         .to_string()
         .into(),
     ))?;
-    let rejected = read_until(&mut socket, "program_not_allowed", Duration::from_secs(10))?;
-    if !rejected.contains("program_not_allowed") {
-        bail!("disallowed program was not rejected: {rejected}");
+    let rejected = read_frame_matching(&mut socket, Duration::from_secs(10), |frame| {
+        frame["type"] == "rejected"
+            && frame["runId"] == "run_evil"
+            && frame["attempt"] == 1
+            && frame["code"] == "legacy_no_process"
+    })
+    .context("disallowed program did not get an exact pre-spawn receipt")?;
+    if rejected["type"] != "rejected" {
+        bail!("unexpected frame: {rejected}");
     }
     socket.send(Message::Text(
         serde_json::json!({
@@ -423,8 +429,42 @@ fn fake_dispatch(listener: std::net::TcpListener, evil: PathBuf, cwd: PathBuf) -
         .to_string()
         .into(),
     ))?;
-    let _ = read_until(&mut socket, "\"type\":\"output\"", Duration::from_secs(10));
+    read_frame_matching(&mut socket, Duration::from_secs(10), |frame| {
+        frame["type"] == "exit" && frame["runId"] == "run_ok" && frame["exitCode"] == 0
+    })
+    .context("the discovered program was dispatched but never finished")?;
     Ok(())
+}
+
+/// One exact frame, parsed. A needle that spans several frames is never a match,
+/// and heartbeat frames are simply skipped.
+#[cfg(target_os = "linux")]
+fn read_frame_matching(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    limit: Duration,
+    accept: impl Fn(&serde_json::Value) -> bool,
+) -> Result<serde_json::Value> {
+    let started = Instant::now();
+    let mut seen: Vec<serde_json::Value> = Vec::new();
+    while started.elapsed() < limit {
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                let frame: serde_json::Value =
+                    serde_json::from_str(text.as_str()).context("server frame was not JSON")?;
+                if accept(&frame) {
+                    return Ok(frame);
+                }
+                seen.push(frame);
+            }
+            Ok(tungstenite::Message::Ping(data)) => {
+                socket.send(tungstenite::Message::Pong(data))?;
+            }
+            Ok(tungstenite::Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(error) => bail!("websocket read failed: {error}"),
+        }
+    }
+    bail!("no matching server frame within {limit:?}; saw {seen:?}")
 }
 
 #[cfg(target_os = "linux")]
@@ -442,44 +482,6 @@ where
             _ => {}
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn read_until(
-    socket: &mut tungstenite::WebSocket<TcpStream>,
-    needle: &str,
-    limit: Duration,
-) -> Result<String> {
-    let started = Instant::now();
-    let mut seen = String::new();
-    while started.elapsed() < limit {
-        match socket.read() {
-            Ok(tungstenite::Message::Text(text)) => {
-                seen.push_str(&text);
-                seen.push('\n');
-                if seen.contains(needle) {
-                    return Ok(seen);
-                }
-            }
-            Ok(tungstenite::Message::Ping(data)) => {
-                socket.send(tungstenite::Message::Pong(data))?;
-            }
-            Ok(tungstenite::Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(error) => {
-                if started.elapsed() >= limit {
-                    break;
-                }
-                if format!("{error}").contains("timed out")
-                    || format!("{error}").contains("WouldBlock")
-                {
-                    continue;
-                }
-                return Err(error).context(seen);
-            }
-        }
-    }
-    Ok(seen)
 }
 
 #[cfg(target_os = "linux")]

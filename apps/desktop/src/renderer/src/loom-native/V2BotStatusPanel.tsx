@@ -71,7 +71,7 @@ export function V2BotStatusPanel({ facts, bundle, onArtifact }: {
     <Group title={uiAttribute('成果')}>
       <p className="ln-run-hint">{uiAttribute('打开文件查看正文与审阅记录。打开不会自动接受成果。')}</p>
       {facts.artifacts.length === 0 ? <p className="ln-run-empty">{uiAttribute('尚无已登记成果。执行完成不等于成果已经交付。')}</p>
-        : <ul className="ln-run-list">{facts.artifacts.map(entry => <li key={entry.artifact.artifactId} className="ln-run-artifact">
+        : <ul className="ln-run-list">{facts.artifacts.map(entry => <li key={entry.artifact.artifactId} className="ln-run-artifact" data-artifact-id={entry.artifact.artifactId}>
           <button type="button" className="ln-run-file" aria-label={uiAttribute('打开产物：') + fileName(entry.artifact.relativePath)}
             onClick={()=>onArtifact({ artifact:entry.artifact,candidate:entry.candidate,bundle })}>
             <Icon name="file" size={21}/><span><strong>{fileName(entry.artifact.relativePath)}</strong><small>{uiAttribute('已登记 · ')}{resolveName(entry.artifact.creatorId)}</small></span><Icon name="right" size={15}/>

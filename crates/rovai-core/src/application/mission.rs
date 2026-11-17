@@ -1311,7 +1311,14 @@ impl Core {
                     &self.data_dir,
                     params.command.project_binding_kind == ProjectBindingKind::QuickChat,
                 )?;
-                if !request.client.is_desktop() {
+                // Directory paths are authorized by the Host and must remain exact.
+                // Quick Chat is different: Core has just replaced any caller path
+                // with its own data-dir child. Its native canonical spelling may
+                // add a Windows verbatim prefix without changing that authority.
+                // Match the already-established camps.create boundary here.
+                if !request.client.is_desktop()
+                    && params.command.project_binding_kind == ProjectBindingKind::Directory
+                {
                     anyhow::ensure!(
                         selection.project_path == params.command.project_path,
                         "Authorized workspace changed before Mission creation"

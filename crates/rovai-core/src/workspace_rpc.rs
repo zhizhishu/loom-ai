@@ -1860,16 +1860,13 @@ mod tests {
     // cap read and insert must share one IMMEDIATE transaction; a mutex around
     // one Rust instance alone cannot establish this invariant.
     fn concurrent_admission_cap() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../_artifacts/core-rpc-tests")
-            .join(format!(
-                "{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+        // A private temporary root keeps the raced SQLite fixture out of the source
+        // tree, so a read-only checkout cannot turn this invariant into a
+        // filesystem-permission failure.
+        let dir = std::env::temp_dir().join(format!(
+            "rovai-workspace-rpc-admission-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("concurrent.sqlite");
         let conn = Connection::open(&path).unwrap();
@@ -1911,6 +1908,8 @@ mod tests {
         assert_eq!(totals, (32, 8));
         let conn = Connection::open(path).unwrap();
         assert_eq!(state_count(&conn), 32);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).expect("remove the owned workspace RPC fixture");
     }
 
     #[test]

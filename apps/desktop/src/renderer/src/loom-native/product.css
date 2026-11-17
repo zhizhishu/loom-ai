@@ -138,6 +138,22 @@
 /* A single contextual workspace; readable materials instead of repeated drawers. */
 .ln-workspace-dock .ln-inspector-header{height:62px;flex-basis:62px;gap:12px;padding:10px 16px}
 .ln-dock-heading{display:flex;flex-direction:column;gap:2px;min-width:0}.ln-dock-heading strong{font-size:14px;font-weight:650}.ln-dock-heading small{font-size:12px;color:var(--ln-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px}
+/* Current-conversation identity sits above the dock, so the workspace heading
+   and the four tabs begin about one third of the visible panel height lower.
+   The hero is the only shrinkable row: header and tabs keep fixed flex so a
+   shrinking hero can never squeeze them or the scroll area out of the panel. */
+.ln-workspace-dock{--ln-dock-hero-h:clamp(112px,calc((100vh - 50px)/3),300px)}
+.ln-dock-hero{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;flex:0 1 auto;height:var(--ln-dock-hero-h);min-height:72px;padding:6px 16px 10px;overflow:hidden;text-align:center}
+.ln-dock-hero-avatar{display:grid;place-items:center;min-height:0}
+.ln-dock-hero-copy{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0;max-width:100%}
+.ln-dock-hero-copy strong{font-size:14px;font-weight:600;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ln-dock-hero-copy small{font-size:12px;color:var(--ln-muted);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ln-workspace-dock .ln-inspector-header{flex:0 0 62px}
+.ln-workspace-dock .ln-dock-tabs{flex:0 0 auto}
+.ln-workspace-dock.is-expanded .ln-dock-hero{--ln-dock-hero-h:clamp(112px,20vh,200px)}
+@media(max-height:640px){.ln-workspace-dock{--ln-dock-hero-h:clamp(76px,24vh,150px)}.ln-dock-hero{gap:6px;padding:4px 16px 8px}.ln-dock-hero .ln-avatar{--ln-avatar-size:72px!important}}
+@media(max-width:520px){.ln-dock-hero{gap:6px;padding:4px 12px 8px}.ln-dock-hero .ln-avatar{--ln-avatar-size:64px!important}}
+
 .ln-dock-tabs{display:flex;gap:4px;margin:0 16px 12px;padding:4px;background:var(--ln-soft-fill);border-radius:12px;flex:0 0 auto}.ln-dock-tabs>button{display:flex;flex:1;min-width:0;align-items:center;justify-content:center;gap:7px;height:34px;padding:5px 8px;color:var(--ln-muted);border-radius:9px;font-size:13px;white-space:nowrap}.ln-dock-tabs>button.is-selected{color:var(--ln-text);background:var(--ln-glass-raised);box-shadow:0 1px 4px #23303b0c}.ln-dock-tabs i{font-style:normal;font-size:10px;line-height:16px;min-width:16px;border-radius:8px;background:#155dff0f;color:var(--ln-blue)}
 .ln-dock-context{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 16px 14px;min-height:28px}.ln-dock-context .ln-choice-trigger{background:transparent;font-size:12px;min-width:0}.ln-dock-context .ln-choice-trigger:hover{background:var(--ln-soft-fill)}
 .ln-dock-view-switch{display:flex;gap:3px}.ln-dock-view-switch>button{font-size:12px;padding:4px 8px;border-radius:7px;color:var(--ln-muted)}.ln-dock-view-switch>button[aria-pressed=true]{background:var(--ln-soft-fill);color:var(--ln-text)}

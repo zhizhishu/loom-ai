@@ -1343,6 +1343,12 @@ mod tests {
             .expect("fresh database has a member");
         let agent_id = profile.agent_id.clone();
 
+        // A fixture-unique marker keeps this rule unambiguous: no product
+        // sentence, default note, or charter line can collide with it.
+        const RULE_NAME: &str = "只读工作区";
+        const RULE_BODY: &str = "RULE_SELECTION_MARKER 不要写工作区。";
+        const RULE_MARKER: &str = "RULE_SELECTION_MARKER";
+
         let rule = put_capability_item(
             &database,
             &store,
@@ -1350,10 +1356,10 @@ mod tests {
             &MemberCapabilityPutParams {
                 item_id: Some("rule_readonly".to_string()),
                 kind: "rule".to_string(),
-                name: Some("只读工作区".to_string()),
+                name: Some(RULE_NAME.to_string()),
                 note: Some("样例片段".to_string()),
                 scope: Some("project".to_string()),
-                body: Some("不要写工作区。".to_string()),
+                body: Some(RULE_BODY.to_string()),
                 source_label: None,
                 tool_names: vec!["read_file".to_string()],
             },
@@ -1551,7 +1557,7 @@ mod tests {
         assert!(
             rules
                 .iter()
-                .any(|rule| rule.name == "只读工作区" && rule.body == "不要写工作区。")
+                .any(|rule| rule.id == "rule_readonly" && rule.name == RULE_NAME)
         );
         assert!(
             hooks
@@ -1585,10 +1591,99 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preview.bootstrap, bootstrap);
-        assert!(!preview.bootstrap.contains("不要写工作区"));
+        // A selected rule is user-layer guidance inside the bounded
+        // [SELECTED_ASSISTANT_RULES] section of the frozen charter, so the preview
+        // bootstrap must quote its body exactly once and nowhere else.
+        let (charter_head, rules_section) = preview
+            .bootstrap
+            .split_once("[SELECTED_ASSISTANT_RULES]")
+            .expect("the preview bootstrap carries the selected-rules section");
+        assert!(!charter_head.contains(RULE_MARKER));
+        assert_eq!(rules_section.matches(RULE_MARKER).count(), 1);
         assert_eq!(preview.rules, rules);
         assert_eq!(preview.hooks, hooks);
         assert_eq!(preview.skills, skills);
+
+        // Same owner case, the negative direction: an explicit unselect through
+        // the real catalog write keeps every other choice, yet both the rules
+        // projection and the next preview lose the body.
+        let selected_catalog = get_member_capability_catalog(&database, &store, &agent_id).unwrap();
+        let deselected = set_member_capability_catalog(
+            &mut database,
+            &store,
+            &library,
+            &MemberCapabilitySetParams {
+                reviewed_hooks: Vec::new(),
+                agent_id: agent_id.clone(),
+                expected_revision: selected_catalog.revision.clone(),
+                acknowledge_high_risk: false,
+                selections: selected_catalog
+                    .items
+                    .iter()
+                    .map(|item| MemberCapabilitySelection {
+                        kind: item.kind.clone(),
+                        id: item.id.clone(),
+                        selected: item.selected && item.id != "rule_readonly",
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        let (_, deselected_rules, deselected_hooks) =
+            projection_additions(&database, &store, &agent_id).unwrap();
+        assert!(deselected_rules.iter().all(|rule| !rule.body.contains(RULE_MARKER)));
+        assert!(
+            deselected_hooks
+                .iter()
+                .any(|hook| hook.name == "format-on-stop")
+        );
+        let preview_without_rule = crate::run_projection::preview_member_run_projection(
+            &database,
+            &directory,
+            &store,
+            &crate::run_projection::MemberRunProjectionParams {
+                member: agent_id.clone(),
+                runtime: Some("codex-cli".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(!preview_without_rule.bootstrap.contains(RULE_MARKER));
+
+        // Restore the exact starting selection so the following import and hook
+        // cases keep the catalog this test began with.
+        set_member_capability_catalog(
+            &mut database,
+            &store,
+            &library,
+            &MemberCapabilitySetParams {
+                reviewed_hooks: Vec::new(),
+                agent_id: agent_id.clone(),
+                expected_revision: deselected.revision.clone(),
+                acknowledge_high_risk: false,
+                selections: selected_catalog
+                    .items
+                    .iter()
+                    .map(|item| MemberCapabilitySelection {
+                        kind: item.kind.clone(),
+                        id: item.id.clone(),
+                        selected: item.selected,
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        let (_, restored_rules, restored_hooks) =
+            projection_additions(&database, &store, &agent_id).unwrap();
+        assert!(
+            restored_rules
+                .iter()
+                .any(|rule| rule.id == "rule_readonly" && rule.body == RULE_BODY)
+        );
+        assert!(
+            restored_hooks
+                .iter()
+                .any(|hook| hook.name == "format-on-stop")
+        );
 
         // An imported Library Skill only enters the catalog when the user registers it explicitly.
         let import_source = directory.join("import-source");

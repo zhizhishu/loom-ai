@@ -45,6 +45,17 @@ fn acceptance() -> Result<()> {
             .as_nanos()
     ));
     let _cleanup = RemoveDir(root.clone());
+    let outcome = acceptance_at(&root);
+    if outcome.is_err() {
+        // Opt-in and allowlisted only. The temp root also holds node.json and the
+        // per-run shim credentials, so it is never copied wholesale.
+        preserve_evidence(&root);
+    }
+    outcome
+}
+
+#[cfg(target_os = "linux")]
+fn acceptance_at(root: &Path) -> Result<()> {
     let a = root.join("a");
     let b = root.join("b");
     let bin = root.join("bin");
@@ -57,9 +68,16 @@ fn acceptance() -> Result<()> {
         ui.join("index.html"),
         "<!doctype html><title>loom-b1</title>\n",
     )?;
+    // The one-shot body the acceptance reads, plus the identity probe every real
+    // CLI answers, so discovery reports a version instead of a bare path.
     fs::write(
         bin.join("codex"),
-        "#!/bin/sh\nprintf 'LOOM_B1_OK\\n'\nexit 0\n",
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         --version) printf 'loom-b1-fake 0.0.0\\n'; exit 0 ;;\n\
+         esac\n\
+         printf 'LOOM_B1_OK\\n'\n\
+         exit 0\n",
     )?;
     #[cfg(unix)]
     {
@@ -149,6 +167,12 @@ fn acceptance() -> Result<()> {
     );
     let node_pid = processes.node.as_ref().unwrap().id();
 
+    // B1 used to dispatch before B's Hello, so a node that never came online
+    // looked like a run failure. This is a bounded fixture read, not a skip.
+    let _node_id = wait_node_online(&origin, &a, Duration::from_secs(30))?;
+    // Independent fixture read only: it never decides B1's result.
+    record_direct_exec(&bin, root);
+
     let exec = Command::new(std::env::current_exe()?)
         .env("LOOM_B1_ROLE", "server")
         .args([
@@ -228,6 +252,298 @@ fn acceptance() -> Result<()> {
 
     processes.stop();
     Ok(())
+}
+
+/// The server's own authenticated view of B, read before dispatch. This is a
+/// bounded fixture read (30 s, no skip): it separates "B never came online"
+/// from "B refused the run", which both used to surface as a run failure.
+#[cfg(target_os = "linux")]
+fn wait_node_online(origin: &str, data_dir: &Path, limit: Duration) -> Result<String> {
+    let admin =
+        rovai_web::stored_administrator_token(data_dir)?.context("administrator token")?;
+    let host = origin
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_owned();
+    let login = serde_json::json!({
+        "protocolVersion": rovai_web::HOST_WEB_PROTOCOL_VERSION,
+        "administratorToken": admin,
+    })
+    .to_string();
+    let started = Instant::now();
+    let mut last = String::from("no remote node reported codex-cli");
+    while started.elapsed() < limit {
+        match online_remote_node(&host, &login) {
+            Ok(Some(node_id)) => return Ok(node_id),
+            Ok(None) => {}
+            Err(error) => last = format!("{error:#}"),
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    bail!("no online remote node reported codex-cli within {limit:?}: {last}")
+}
+
+#[cfg(target_os = "linux")]
+fn online_remote_node(host: &str, login_body: &str) -> Result<Option<String>> {
+    let (status, text) = http_request(host, "POST", "/api/v1/login", None, Some(login_body))?;
+    if status != 200 {
+        bail!("administrator login returned {status}");
+    }
+    let session = serde_json::from_str::<serde_json::Value>(&text)
+        .context("login was not JSON")?["token"]
+        .as_str()
+        .context("login had no session token")?
+        .to_owned();
+    let (status, text) = http_request(host, "GET", "/api/v1/nodes", Some(&session), None)?;
+    if status != 200 {
+        bail!("node list returned {status}");
+    }
+    let listed: serde_json::Value = serde_json::from_str(&text).context("node list was not JSON")?;
+    for node in listed["nodes"].as_array().cloned().unwrap_or_default() {
+        if node["role"].as_str() != Some("remote") || node["status"].as_str() != Some("online") {
+            continue;
+        }
+        let reports_codex = node["clis"]
+            .as_array()
+            .is_some_and(|clis| clis.iter().any(|cli| cli["adapterKind"] == "codex-cli"));
+        if let Some(node_id) = node["nodeId"]
+            .as_str()
+            .filter(|id| !id.is_empty() && reports_codex)
+        {
+            return Ok(Some(node_id.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// The three logs B1 already reports plus B's durable legacy journal. The
+/// journal names only run identity, attempt and phase; it holds no token. The
+/// temp root is never copied because it also holds node.json and the per-run
+/// shim credentials, and no profile or environment file is ever collected.
+#[cfg(target_os = "linux")]
+const EVIDENCE_ALLOWLIST: &[&str] = &["node.stderr", "server.stderr", "exec.stderr"];
+
+#[cfg(target_os = "linux")]
+fn preserve_evidence(root: &Path) {
+    let Some(directory) = std::env::var_os("LOOM_B1_EVIDENCE_DIR") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    if !directory.is_absolute() {
+        eprintln!("B1 evidence: LOOM_B1_EVIDENCE_DIR must be absolute; nothing was copied");
+        return;
+    }
+    // The owner directory is never followed: a symlink or a file is refused.
+    if let Ok(meta) = fs::symlink_metadata(&directory)
+        && (!meta.is_dir() || meta.file_type().is_symlink())
+    {
+        eprintln!("B1 evidence: LOOM_B1_EVIDENCE_DIR is not a plain directory; nothing was copied");
+        return;
+    }
+    // A fresh run subdirectory: an existing run is never overwritten.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let target = directory.join(format!("run-{stamp}"));
+    if fs::create_dir(&target).is_err() {
+        eprintln!("B1 evidence: a fresh run directory could not be created; nothing was copied");
+        return;
+    }
+    let mut copied = 0_u32;
+    for name in EVIDENCE_ALLOWLIST {
+        if copy_new(&root.join(*name), &target.join(*name)) {
+            copied += 1;
+        }
+    }
+    let journal = root.join("b").join("legacy-runs");
+    let journal_target = target.join("legacy-runs");
+    if let Ok(entries) = fs::read_dir(&journal)
+        && fs::create_dir(&journal_target).is_ok()
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let label = name.to_string_lossy().into_owned();
+            // Exactly the journal's own `<64 hex>.json` record name, which also
+            // skips owner.lock and every unexpected file.
+            if label.len() != 69
+                || !label.ends_with(".json")
+                || !label.as_bytes()[..64]
+                    .iter()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            if copy_new(&entry.path(), &journal_target.join(&name)) {
+                copied += 1;
+            }
+        }
+    }
+    eprintln!("B1 evidence: copied {copied} file(s) to {}", target.display());
+}
+
+/// `create_new` refuses an existing file or symlink, so an earlier run is never
+/// replaced and no copy is redirected through a link.
+#[cfg(target_os = "linux")]
+fn copy_new(source: &Path, target: &Path) -> bool {
+    let Ok(mut input) = fs::File::open(source) else {
+        return false;
+    };
+    let Ok(mut output) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+    else {
+        return false;
+    };
+    std::io::copy(&mut input, &mut output).is_ok()
+}
+
+/// A second, independent read of the fixture: the same absolute fake CLI, run
+/// directly by this test with a cleared environment. It never decides B1's
+/// result (the run below and its exact stdout assertion stay authoritative);
+/// it only separates "the fixture cannot be executed here" from "the node's
+/// own boundary refused it". Only a closed kind label and the raw errno are
+/// printed, never the error text and never a path.
+#[cfg(target_os = "linux")]
+fn record_direct_exec(bin: &Path, root: &Path) {
+    let cli = bin.join("codex");
+    let outcome = Command::new(&cli)
+        .env_clear()
+        .env("PATH", bin)
+        .args(["exec", "diagnostic"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match outcome {
+        Ok(_) => eprintln!("B1 direct exec: ok"),
+        Err(error) => eprintln!(
+            "B1 direct exec: failed io={} os={}",
+            exec_io_label(error.kind()),
+            error.raw_os_error().unwrap_or(-1)
+        ),
+    }
+    eprintln!("B1 temp mount: noexec={}", temp_mount_is_noexec(root));
+}
+
+/// Closed vocabulary, matching the node-side spawn diagnostic.
+#[cfg(target_os = "linux")]
+fn exec_io_label(kind: std::io::ErrorKind) -> &'static str {
+    use std::io::ErrorKind as Kind;
+    match kind {
+        Kind::NotFound => "not_found",
+        Kind::PermissionDenied => "permission_denied",
+        Kind::AlreadyExists => "already_exists",
+        Kind::InvalidInput => "invalid_input",
+        Kind::InvalidData => "invalid_data",
+        Kind::WouldBlock => "would_block",
+        Kind::BrokenPipe => "broken_pipe",
+        Kind::Interrupted => "interrupted",
+        Kind::TimedOut => "timed_out",
+        Kind::Unsupported => "unsupported",
+        Kind::OutOfMemory => "out_of_memory",
+        Kind::WriteZero => "write_zero",
+        Kind::UnexpectedEof => "unexpected_eof",
+        _ => "unknown",
+    }
+}
+
+/// One fixed boolean: whether the mount owning the fixture root carries
+/// `noexec`. No path, no option list and no environment detail is printed.
+#[cfg(target_os = "linux")]
+fn temp_mount_is_noexec(root: &Path) -> bool {
+    let Ok(mounts) = fs::read_to_string("/proc/self/mounts") else {
+        return false;
+    };
+    let mut best: Option<(usize, bool)> = None;
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(_device), Some(point), Some(_fstype), Some(options)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let point = PathBuf::from(point.replace("\\040", " "));
+        if !root.starts_with(&point) {
+            continue;
+        }
+        let noexec = options.split(',').any(|option| option == "noexec");
+        let depth = point.components().count();
+        if best.map_or(true, |(current, _)| depth > current) {
+            best = Some((depth, noexec));
+        }
+    }
+    best.map_or(false, |(_, noexec)| noexec)
+}
+
+#[cfg(target_os = "linux")]
+fn http_request(
+    host: &str,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: Option<&str>,
+) -> Result<(u16, String)> {
+    let mut stream = TcpStream::connect(host).with_context(|| format!("dial {host}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(20)))?;
+    let body = body.unwrap_or("");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    if let Some(bearer) = bearer {
+        request.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
+    }
+    if !body.is_empty() || method == "POST" {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes())?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let text = String::from_utf8_lossy(&response).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse::<u16>()
+        .unwrap_or(0);
+    let head = text
+        .split_once("\r\n\r\n")
+        .map(|(head, _)| head)
+        .unwrap_or(&text);
+    let raw = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    Ok((status, decode_http_body(head, &raw)))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_http_body(head: &str, raw: &str) -> String {
+    if !head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        return raw.to_owned();
+    }
+    let mut rest = raw;
+    let mut out = String::new();
+    loop {
+        let Some((size, after)) = rest.split_once("\r\n") else {
+            break;
+        };
+        let size = usize::from_str_radix(size.trim().split(';').next().unwrap_or("0"), 16)
+            .unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        if after.len() < size {
+            out.push_str(after);
+            break;
+        }
+        out.push_str(&after[..size]);
+        rest = after.get(size + 2..).unwrap_or("");
+    }
+    out
 }
 
 #[cfg(target_os = "linux")]

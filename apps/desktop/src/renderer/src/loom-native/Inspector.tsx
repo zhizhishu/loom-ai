@@ -88,6 +88,12 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
       : <section key={group} className="ln-work-group"><h3>{group}（{rows.length}）<i/></h3>{list}</section>
   })}{!shown.length && <div className="ln-dock-empty"><Icon name="board" size={30}/><strong>{loading ? '正在读取工作' : query || owner ? '没有匹配的工作' : '从一个目标开始'}</strong><p>{scope === 'conversation' && threadId ? '这段对话还没有关联的任务。创建工作后，就能在这里跟进分工和成果。' : '把目标交给主助手，分工、待你处理的决定和成果都会出现在这里。'}</p>{onCreateWork && !loading && <button type="button" className="ln-action" onClick={onCreateWork}>创建一项工作</button>}{scope === 'conversation' && threadId && <button type="button" className="ln-text-action" onClick={() => setScope('all')}>查看所有工作</button>}</div>}</div>
   return <aside className={`ln-inspector ln-workspace-dock${expanded ? ' is-expanded' : ''}`} aria-label="工作空间面板">
+    {/* Current-conversation identity: the real member avatar, never a stand-in
+        illustration. Header and tabs keep their own fixed rows below it. */}
+    <div className="ln-dock-hero">
+      <div className="ln-dock-hero-avatar"><Avatar agent={agent} name={conversationTitle} size={104}/></div>
+      <div className="ln-dock-hero-copy"><strong title={agent?.displayName || conversationTitle}>{agent?.displayName || conversationTitle || '工作空间'}</strong><small>{conversationTitle && conversationTitle !== agent?.displayName ? conversationTitle : agent ? '当前对话' : '这段对话还没有指定助手'}</small></div>
+    </div>
     <header className="ln-inspector-header"><div className="ln-dock-heading"><strong>工作空间</strong><small title={conversationTitle}>{conversationTitle || '与你的助手一起完成工作'}</small></div>
       <div className="ln-inspector-header-actions">{panel === 'work' && onCreateWork && <IconButton icon="plus" label="创建工作" onClick={onCreateWork}/>}<IconButton icon="search" label="搜索工作空间" disabled={panel === 'computer'} onClick={() => setSearchOpen(value => !value)}/><IconButton icon="expand" label={expanded ? '还原面板' : '展开面板'} onClick={onExpand}/><IconButton icon="close" label="关闭右侧面板" onClick={onClose}/></div>
     </header>

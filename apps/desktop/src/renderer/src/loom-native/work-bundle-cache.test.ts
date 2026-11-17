@@ -47,6 +47,44 @@ describe('one authenticated LOOM work projection cache', () => {
     expect(a.bundles).toHaveLength(1);expect(b.bundles).toHaveLength(1)
     expect(client.request).toHaveBeenCalledTimes(1)
   })
+  it('does not join a pre-invalidation request or let its late response overwrite new work',async () => {
+    const cache=new WorkBundleCache()
+    const resolveRead:Array<(value:unknown)=>void>=[]
+    const request=vi.fn((method:string)=>{
+      expect(method).toBe('loom.bundles.getMany')
+      return new Promise<unknown>(resolve=>resolveRead.push(resolve))
+    })
+    const client={request} as unknown as Pick<ThreadClient,'request'>
+    const response=(title:string)=>({bundles:[{missionId:'a',plan:null,
+      tasks:[{taskId:'task-a',title}],candidates:[],reviews:[],verifications:[],artifacts:{artifacts:[]}}]})
+    const stale=cache.read(client,[mission('a')])
+    cache.invalidate('a')
+    const fresh=cache.read(client,[mission('a')])
+    expect(request).toHaveBeenCalledTimes(2)
+    resolveRead[1](response('after approval'))
+    expect((await fresh).bundles[0].tasks[0].title).toBe('after approval')
+    resolveRead[0](response('before approval'))
+    await stale
+    const cached=await cache.read(client,[mission('a')])
+    expect(cached.bundles[0].tasks[0].title).toBe('after approval')
+    expect(cached.fetched).toBe(0)
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+  it('keeps an invalidation dirty when only the old in-flight read has finished',async () => {
+    const cache=new WorkBundleCache()
+    const resolveRead:Array<(value:unknown)=>void>=[]
+    const request=vi.fn(()=>new Promise<unknown>(resolve=>resolveRead.push(resolve)))
+    const client={request} as unknown as Pick<ThreadClient,'request'>
+    const response={bundles:[{missionId:'a',plan:null,tasks:[],candidates:[],reviews:[],verifications:[],artifacts:{artifacts:[]}}]}
+    const stale=cache.read(client,[mission('a')])
+    cache.invalidate()
+    resolveRead[0](response)
+    expect((await stale).bundles).toHaveLength(0)
+    const fresh=cache.read(client,[mission('a')])
+    expect(request).toHaveBeenCalledTimes(2)
+    resolveRead[1](response)
+    expect((await fresh).bundles).toHaveLength(1)
+  })
   it('marks a failed projection as error and retries instead of showing cached success',async () => {
     const cache=new WorkBundleCache()
     let broken = false

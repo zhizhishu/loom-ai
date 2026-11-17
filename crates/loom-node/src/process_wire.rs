@@ -609,6 +609,17 @@ fn command_identity(command: &ProcessPipeCommand) -> (RemoteProcessKey, Option<S
     }
 }
 
+/// A node that owns no process manager still owes the caller a bounded refusal
+/// receipt instead of silence. The identity echoed back is the one the command
+/// carried, so the controller can retire exactly that request.
+pub(crate) fn refusal_for(
+    command: &ProcessPipeCommand,
+    code: &'static str,
+) -> ProcessControlReply {
+    let (key, request_id) = command_identity(command);
+    refusal(key, request_id, code)
+}
+
 #[cfg(test)]
 #[path = "process_wire/tests.rs"]
 mod tests;

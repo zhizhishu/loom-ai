@@ -516,7 +516,7 @@ function piFileAccessMode (permissions) {
   return 'invalid'
 }
 
-function buildIsolatedEnvironment ({ fixtureRoot, agentDir, piBundle, gitBash, providerKey }) {
+export function buildIsolatedEnvironment ({ fixtureRoot, agentDir, piBundle, gitBash, providerKey }) {
   const env = {}
   for (const key of OS_ENV_ALLOWLIST) if (process.env[key] !== undefined) env[key] = process.env[key]
   const systemRoot = env.SystemRoot ?? env.windir
@@ -559,7 +559,7 @@ function buildIsolatedEnvironment ({ fixtureRoot, agentDir, piBundle, gitBash, p
   return env
 }
 
-async function writeIsolatedPiProfile ({ agentDir, config, gitBash }) {
+export async function writeIsolatedPiProfile ({ agentDir, config, gitBash }) {
   await mkdir(agentDir, { recursive: true })
   const models = {
     providers: {
@@ -622,7 +622,7 @@ const MEMBER_ROLES = [
   }
 ]
 
-async function createMembers (host, existingAgentIds) {
+export async function createMembers (host, existingAgentIds) {
   const members = {}
   for (const definition of MEMBER_ROLES) {
     const created = await host.request('members.create', {
@@ -645,7 +645,7 @@ async function createMembers (host, existingAgentIds) {
   return members
 }
 
-async function configureRuntime (host, agentId, installation) {
+export async function configureRuntime (host, agentId, installation) {
   const defaults = installation.memberRuntimeDefaults
   assert.ok(defaults?.model && defaults?.permissions, 'the managed Pi installation exposes no member runtime defaults')
   const mode = piFileAccessMode(defaults.permissions)
@@ -682,7 +682,7 @@ async function configureRuntime (host, agentId, installation) {
   }
 }
 
-async function waitForManagedPiInstallation (host, launcherPath) {
+export async function waitForManagedPiInstallation (host, launcherPath) {
   const expected = resolve(launcherPath).toLowerCase()
   for (let attempt = 0; attempt < 120; attempt += 1) {
     const installations = await host.request('runtime.installations.list')
