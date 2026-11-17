@@ -288,12 +288,13 @@ export function runSelfTest() {
 // ---------------------------------------------------------------------------
 
 // Production source: Core writes this file into the private Host root (one file per Host, rewritten
-// on every binding generation). The isolated Runner keeps using `LOOM_RUN_GUARD`, so both paths share
-// exactly one validation routine and one path policy.
+// on every binding generation). The isolated Runner keeps using `LOOM_RUN_GUARD`.
+// Both sources share identity/path/expiry checks. Only the isolated Runner may
+// request a smaller native-file-tool subset; Core files retain exact mode sets.
 const GRANT_FILE_ENV = 'ROVAI_PI_FILE_GRANT_FILE'
 
 /** Validate a parsed grant object. Shared by the env source and the Core-written file source. */
-function validateGrantObject(parsed) {
+function validateGrantObject(parsed, isolatedRunner = false) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'guard_config_not_object' }
   if (parsed.schema !== GUARD_SCHEMA) return { ok: false, reason: 'guard_schema_mismatch' }
   if (typeof parsed.runId !== 'string' || parsed.runId.length === 0) return { ok: false, reason: 'guard_run_id_missing' }
@@ -301,8 +302,15 @@ function validateGrantObject(parsed) {
   if (typeof parsed.logPath !== 'string' || parsed.logPath.length === 0) return { ok: false, reason: 'guard_log_path_missing' }
   if (typeof parsed.workspaceReal !== 'string' || !isAbsolute(parsed.workspaceReal)) return { ok: false, reason: 'guard_workspace_missing' }
   if (!Array.isArray(parsed.allowedTools) || parsed.allowedTools.length === 0) return { ok: false, reason: 'guard_tools_missing' }
-  if (!GRANT_TOOL_SETS.some((toolSet) => toolSet.length === parsed.allowedTools.length
-    && toolSet.every((tool, index) => parsed.allowedTools[index] === tool))) {
+  // Source is chosen by the loader, never by a field in the grant. Restoring
+  // write-only Runner grants must not widen Core modes or admit business tools
+  // through the environment path.
+  const permittedTools = isolatedRunner
+    ? new Set(parsed.allowedTools).size === parsed.allowedTools.length
+      && parsed.allowedTools.every((tool) => GUARD_TOOLS.includes(tool))
+    : GRANT_TOOL_SETS.some((toolSet) => toolSet.length === parsed.allowedTools.length
+      && toolSet.every((tool, index) => parsed.allowedTools[index] === tool))
+  if (!permittedTools) {
     return { ok: false, reason: 'guard_tools_not_permitted' }
   }
   if (!Number.isInteger(parsed.expiresAtEpochMs) || parsed.expiresAtEpochMs <= 0) return { ok: false, reason: 'guard_expiry_missing' }
@@ -342,7 +350,7 @@ function loadGrant() {
   } catch {
     return { ok: false, reason: 'guard_config_unparsable' }
   }
-  return validateGrantObject(parsed)
+  return validateGrantObject(parsed, true)
 }
 
 function toWorkspaceRelative(target, workspaceReal) {

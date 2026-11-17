@@ -428,3 +428,166 @@ test('log failure: an unrecordable allow is downgraded to a block', { timeout: 6
     await rm(root, { recursive: true, force: true })
   }
 })
+
+// ---------------------------------------------------------------------------
+// 6 · isolated Runner (env) source: any non-empty duplicate-free native subset
+// ---------------------------------------------------------------------------
+
+// Sequential on purpose: loadGuard swaps process.env for each source.
+test('env source: every non-empty duplicate-free read/write/edit subset loads with exactly that guard_ready tool set', { timeout: 120_000, concurrency: false }, async () => {
+  const root = freshDir('loom-env-subset-')
+  const workspace = join(root, 'ws')
+  const outside = join(root, 'outside')
+  mkdirSync(workspace)
+  mkdirSync(outside)
+  writeFileSync(join(workspace, 'notes.md'), 'in scope\n', 'utf8')
+  writeFileSync(join(outside, 'secret.txt'), 'outside secret\n', 'utf8')
+  const workspaceReal = realpathSync(workspace)
+  const ctx = { cwd: workspaceReal }
+  const NATIVE = ['read', 'write', 'edit']
+
+  // Raw log lines only: the guard_ready records this grant actually produced.
+  const readyRecords = (path) => readLog(path).split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line))
+    .filter((record) => record?.t === 'guard_ready')
+
+  try {
+    let seq = 0
+    // The seven non-empty subsets, plus two reordered requests: order is not part of the contract.
+    for (const tools of [
+      ['read'], ['write'], ['edit'],
+      ['read', 'write'], ['read', 'edit'], ['write', 'edit'],
+      ['read', 'write', 'edit'],
+      ['write', 'read'], ['edit', 'read', 'write']
+    ]) {
+      seq += 1
+      const requested = [...tools]
+      const logPath = join(root, `env-${seq}.jsonl`)
+      const handler = await loadGuard({ envGrant: JSON.stringify(grantDocument({ workspaceReal, logPath, tools: requested })) })
+
+      const ready = readyRecords(logPath)
+      assert.equal(ready.length, 1, `${requested.join(',')}: the guard must write exactly one guard_ready`)
+      assert.equal(ready[0].workspaceReal, workspaceReal, `${requested.join(',')}: guard_ready must carry this workspace`)
+      const logged = ready[0].allowedTools
+      assert.ok(Array.isArray(logged), `${requested.join(',')}: guard_ready must record the tool set`)
+      assert.equal(logged.length, requested.length, `${requested.join(',')}: guard_ready must record exactly ${requested.length} tools`)
+      assert.deepEqual([...logged].sort(), [...requested].sort(), `${requested.join(',')}: guard_ready tool set must equal the request`)
+
+      for (const toolName of requested) {
+        assert.equal(handler(toolEvent(toolName, `ok_${toolName}_${seq}`, { path: 'notes.md' }), ctx), undefined,
+          `${requested.join(',')}: the granted ${toolName} must be allowed inside the workspace`)
+      }
+      for (const toolName of NATIVE.filter((native) => !requested.includes(native))) {
+        const outcome = handler(toolEvent(toolName, `ungranted_${toolName}_${seq}`, { path: 'notes.md' }), ctx)
+        assert.equal(outcome?.block, true, `${requested.join(',')}: ungranted ${toolName} must be refused`)
+        assert.match(String(outcome.reason), /tool_not_(granted|allowed)/, `${requested.join(',')}: ${outcome?.reason}`)
+      }
+      // A smaller native subset never admits the business tool, a shell or an MCP tool.
+      for (const toolName of ['rovai_loom', 'bash', 'mcp__server__tool']) {
+        const outcome = handler(toolEvent(toolName, `foreign_${toolName}_${seq}`, { path: 'notes.md' }), ctx)
+        assert.equal(outcome?.block, true, `${requested.join(',')}: ${toolName} must be refused`)
+        assert.match(String(outcome.reason), /tool_not_(granted|allowed)/, `${requested.join(',')}: ${outcome?.reason}`)
+      }
+    }
+
+    // The write-only subset keeps the whole path boundary and never writes its outside target.
+    const writeOnlyLog = join(root, 'env-write-only-paths.jsonl')
+    const writeOnly = await loadGuard({ envGrant: JSON.stringify(grantDocument({ workspaceReal, logPath: writeOnlyLog, tools: ['write'] })) })
+    for (const [path, id, pattern] of [
+      ['../outside/secret.txt', 'wo_dotdot', /path_parent_escape/],
+      [join(outside, 'secret.txt'), 'wo_abs', /path_outside_workspace/],
+      ['.git/config', 'wo_git', /sensitive_path/],
+      ['', 'wo_empty', /path_missing/],
+    ]) {
+      const outcome = writeOnly(toolEvent('write', id, { path }), ctx)
+      assert.equal(outcome?.block, true, `write-only subset: ${path || '<empty>'} must be refused`)
+      assert.match(String(outcome.reason), pattern)
+    }
+    assert.equal(readLog(writeOnlyLog).includes('secret.txt'), false, 'outside paths never reach the guard log')
+
+    // Anything that is not a native file tool subset fails the load outright, before any guard_ready.
+    for (const [label, tools, expectedReason] of [
+      ['empty', [], /guard_tools_missing/],
+      ['duplicate', ['read', 'read'], /guard_tools_not_permitted/],
+      ['duplicate write', ['write', 'write'], /guard_tools_not_permitted/],
+      ['unknown', ['bash'], /guard_tools_not_permitted/],
+      ['unknown mixed', ['read', 'bash'], /guard_tools_not_permitted/],
+      ['business only', ['rovai_loom'], /guard_tools_not_permitted/],
+      ['business plus every native tool', ['read', 'write', 'edit', 'rovai_loom'], /guard_tools_not_permitted/],
+      ['mcp only', ['mcp__server__tool'], /guard_tools_not_permitted/],
+      ['mcp mixed', ['write', 'mcp__server__tool'], /guard_tools_not_permitted/],
+    ]) {
+      seq += 1
+      const logPath = join(root, `env-refused-${seq}.jsonl`)
+      const handler = await loadGuard({ envGrant: JSON.stringify(grantDocument({ workspaceReal, logPath, tools })) })
+      assert.deepEqual(readyRecords(logPath), [], `${label}: a refused env grant must never write guard_ready`)
+      for (const toolName of NATIVE) {
+        const outcome = handler(toolEvent(toolName, `refused_${toolName}_${seq}`, { path: 'notes.md' }), ctx)
+        assert.equal(outcome?.block, true, `${label}: ${toolName} must be blocked`)
+        assert.match(String(outcome.reason), expectedReason, `${label}: ${outcome?.reason}`)
+      }
+    }
+
+    // Expiry and cwd binding still decide every call, not only the load.
+    const expiredLog = join(root, 'env-expired.jsonl')
+    const expired = await loadGuard({ envGrant: JSON.stringify(grantDocument({
+      workspaceReal, logPath: expiredLog, tools: ['write'], expiresAtEpochMs: Date.now() - 1_000
+    })) })
+    const expiredOutcome = expired(toolEvent('write', 'expired_write', { path: 'notes.md' }), ctx)
+    assert.equal(expiredOutcome?.block, true, 'an expired env grant must block its own granted tool')
+    assert.match(String(expiredOutcome.reason), /grant_expired/)
+
+    const mismatchLog = join(root, 'env-cwd-mismatch.jsonl')
+    const mismatch = await loadGuard({ envGrant: JSON.stringify(grantDocument({ workspaceReal, logPath: mismatchLog, tools: ['write'] })) })
+    const mismatchOutcome = mismatch(toolEvent('write', 'mismatch_write', { path: 'notes.md' }), { cwd: realpathSync(outside) })
+    assert.equal(mismatchOutcome?.block, true, 'a handler cwd outside the granted workspace must be refused')
+    assert.match(String(mismatchOutcome.reason), /cwd_mismatch/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 6b · the Core-written file source can never ask for a Runner-only subset
+// ---------------------------------------------------------------------------
+
+// The source is chosen by the loader, so a payload field must never unlock the subset path.
+test('core grant file: payload fields cannot turn a write-only or reordered grant into a Runner subset', { timeout: 60_000, concurrency: false }, async () => {
+  const root = freshDir('loom-file-source-binding-')
+  const workspace = join(root, 'ws')
+  mkdirSync(workspace)
+  writeFileSync(join(workspace, 'notes.md'), 'in scope\n', 'utf8')
+  const workspaceReal = realpathSync(workspace)
+  const ctx = { cwd: workspaceReal }
+  const readyRecords = (path) => readLog(path).split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line))
+    .filter((record) => record?.t === 'guard_ready')
+
+  try {
+    let seq = 0
+    for (const [label, tools, extra] of [
+      ['write only', ['write'], {}],
+      ['write only + isolatedRunner', ['write'], { isolatedRunner: true }],
+      ['write only + source', ['write'], { source: 'env' }],
+      ['write only + both', ['write'], { isolatedRunner: true, source: 'env', grantSource: 'isolated-runner' }],
+      ['reordered three', ['write', 'read', 'edit'], {}],
+      ['reordered two + isolatedRunner', ['write', 'read'], { isolatedRunner: true }],
+    ]) {
+      seq += 1
+      const logPath = join(root, `file-${seq}.jsonl`)
+      const grantFile = join(root, `file-${seq}.json`)
+      writeFileSync(grantFile, JSON.stringify({ ...grantDocument({ workspaceReal, logPath, tools }), ...extra }), 'utf8')
+      const handler = await loadGuard({ grantFile })
+      assert.deepEqual(readyRecords(logPath), [], `${label}: a refused Core file grant must never write guard_ready`)
+      for (const toolName of ['read', 'write', 'edit']) {
+        const outcome = handler(toolEvent(toolName, `file_${toolName}_${seq}`, { path: 'notes.md' }), ctx)
+        assert.equal(outcome?.block, true, `${label}: ${toolName} must stay blocked`)
+        assert.match(String(outcome.reason), /guard_tools_not_permitted/, `${label}: ${outcome?.reason}`)
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
