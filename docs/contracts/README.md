@@ -17,7 +17,7 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 
 - [Workspace RPC v1](workspace-rpc-v1.md)：真实 AgentRun 权威、已准备工作区、幂等与 unknown、逐工具流和 Core 实际字节归档。
 - [Built-in Tool Transport v45](builtin-tool-transport-v45.md)：五个 Workspace 命令及当前 CLI/IPC/schema/输出准入。
-- 组件关系见[跨主机架构](../architecture/cross-host-execution.md)；R1 持续管道的当前实施/证据见[process pipe](../loom/process-pipe-v1-implementation-2026-11-04.md)，不把实施记录当作整体已验收。
+- 组件关系见[跨主机架构](../architecture/cross-host-execution.md)；R1 持续管道的当前实施/证据见[process pipe](../loom/archive/legacy-plans-2026-11-15/process-pipe-v1-implementation-2026-11-04.md)，不把实施记录当作整体已验收。
 
 ## Hermes Runtime
 

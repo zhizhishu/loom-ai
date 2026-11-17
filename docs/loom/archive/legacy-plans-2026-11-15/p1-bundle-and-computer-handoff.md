@@ -4,7 +4,7 @@
 >
 > **当前交付范围**：P1.1「内置引擎与原生环境发现」和 P3.1「真实电脑画面与人工可撤回接管」基础阶段。不是 P0–P4 全部完成，也不将“人可以控制电脑”包装成“Agent 已可以自主控制电脑”。用户最新明确允许小阶段完成后交接。
 >
-> 恢复主线先读本页与根 `TASK.md`；接口读 [统一接口](ultimate-interface-contracts.md)，总计划读 [完整工作空间计划](ultimate-workspace-plan.md)。不要重新做已证明的封包和界面，不要启用尚未通过安全回归的 Agent 电脑授权。
+> 恢复主线先读本页与根 `TASK.md`；接口读 [统一接口](ultimate-interface-contracts.md)，总计划读 [完整工作空间计划](../../ultimate-workspace-plan.md)。不要重新做已证明的封包和界面，不要启用尚未通过安全回归的 Agent 电脑授权。
 
 ## 1. 这次确实做到了什么
 

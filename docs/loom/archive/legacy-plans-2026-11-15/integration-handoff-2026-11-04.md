@@ -71,7 +71,7 @@ Target: source commit `7ba65b3ebfdd0660fd87bd7031f8414439d27858` on Windows. Run
 - Parent authorized the B7/B8 bundle and necessary Core/protocol/node/web glue, with real selected source bytes, digest, private storage, cleanup and next-Run semantics. R1/R2 and persistent sessions remain separate work packages.
 - Read local base and Pi skills. Pi phase 1 completed read-only in session `60ce317d5181483397b0f351b24f1fef`, run `286740df3dd1455195699435dc55adbe`. Supervisor rejected its proposed rules-files-only acceptance and blanket Codex/Windows limitations.
 - Same-session phase 2A approved only NEW `loom-protocol/src/run_bundle.rs` and `rovai-core/src/remote_run_bundle.rs`, pure input builders/validators; no existing files, runtime, secrets or deployment.
-- Full before/after proposal: [v1.72 run-bundle context change](../versions/v1.72/model-context-change-loom-run-bundle.md), revision 1, submitted for parent technical review. Current-session implementation authorization is recorded honestly; no new human second-confirmation is fabricated.
+- Full before/after proposal: [v1.72 run-bundle context change](../../../versions/v1.72/model-context-change-loom-run-bundle.md), revision 1, submitted for parent technical review. Current-session implementation authorization is recorded honestly; no new human second-confirmation is fabricated.
 - Confirmed migration 228 already exists for task execution host. Reserve 229 for B7 snapshot/digest evidence.
 - Parent approved extracting existing native private-storage/security code to a small shared crate with Core compatibility re-exports; node must not depend on Core/SQLite. Preserve original permission tests and semantics.
 

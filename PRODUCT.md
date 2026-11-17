@@ -14,7 +14,7 @@ LOOM 面向希望直接与 AI 助手协作的人。用户描述需求，挑选�
 
 一个以 Mikka 体验为中心、内置 Pi Agent、连接本机与云端执行环境的多 Agent 工作空间。用户只需要创建助手、选择能力、组建群聊并提出目标；系统负责协作、执行、电脑控制、成果追踪和人工验收。
 
-这是用户已批准的最终产品目标；各项当前实施/发布状态以 `docs/loom/ultimate-workspace-plan.md` 的验收表为准，不把愿景当成完成事实。
+这是用户已批准的最终产品目标；各项当前实施/发布状态以根目录 `LOOM-IMPLEMENTATION.md` 的 E0–E7 验收表为准，不把愿景当成完成事实。
 
 当前默认 UI 是 `apps/desktop/src/renderer/src/loom-native/`，不是旧 Rovai 业务页面的样式覆盖。用户已认可 Mikka/PiBot 方向，后续在同一方向打磨，不再恢复旧导航和 Mission 抽屉。
 
@@ -27,6 +27,13 @@ LOOM 面向希望直接与 AI 助手协作的人。用户描述需求，挑选�
 - **成果**：真实文件、不可变版本、来源和审阅上下文。接受与发布是不同操作。
 - **电脑与工作区**：明确运行在哪台主机、哪个准备好的目录。设备进程执行不等于图形远程控制。
 
+## 云端、本机与未来企业扩展（产品目标）
+
+- **T：Cloud Brain + Tool Node**。长期 Bot 与任务事实由云端 Core 管理；用户的 Windows/macOS/Linux 设备可只运行受控 Node，提供经授权的文件、终端、浏览器或电脑能力，**不强制安装本地 Agent Runtime**。
+- **R：可选 Local Runner**。用户可在受控设备上安装并运行四种 Runtime 中实际支持的一种，执行有界本地任务；设备仍受 Core 的身份、工作区和 Grant 约束。
+- **H：Hybrid**。按任务组合云端 Runtime、纯工具设备和本地 Runner；Bot 身份、成果与审查不因换设备而重建。三种模式是架构目标，跨机配对、屏幕控制和恢复必须独立实测，不能由 TLS 连通推定为已交付。
+- **未来企业版**：先交付个人多项目/多设备；后续才评估 Tenant → Organization → User → Role → Resource → Permission → Quota → Audit。借鉴 [AgenTeam、MOVO 等固定参考项目](docs/loom/LOOM-V2-REFERENCE-LOCK.md)，不宣称当前已有多租户隔离、完整 RBAC 或企业级资源 ACL。
+
 ## Capabilities and Constraints
 
 本期运行端选择只有 Claude Code、Codex、DSH、Pi。列表来自实际安装，缺失不显示为就绪，不自动换模型或运行端。远程绑定当前只对已提供对应 descriptor 的 Claude/Codex 开放；其余不冒称支持。
@@ -37,7 +44,7 @@ Skill 是方法/资源；MCP 是连接；Rule 是约定；Hook 是生命周期�
 
 原生客户端与账号配置仍由用户控制；LOOM 不修改主机全局模型默认，不偷偷复制凭据。运行和安全合同沿用唯一 Core 权威。ACCP 仅是控制面设计参照，不等于 LOOM 已兼容其线协议。
 
-内置 Pi 路线已规划为受管 RPC 子进程，但当前 `packaged:false`，没有分发内置引擎。电脑页尚无屏幕流提供者时必须明确未连接。任何待实现能力不得伪装成可用按钮或演示桌面。
+Pi 采用受管 RPC 子进程；隔离开发候选已包含固定版本 Pi，但候选封包不等于正式发行。**Pi Purge 是 4–6 周个人可用版范围内的 Pi 可选原生扩展**：Core 管理每 Bot/Run 的 Persona 和模式，原版 Pi 引擎不改，默认关闭；先实现保留宿主提示词的 Append，其他高级模式另行受限验收。扩展加载、激活、模型请求生效和完整 UI→Core→成果链分别验证，具体状态只看 `LOOM-IMPLEMENTATION.md`。电脑页尚无屏幕流提供者时必须明确未连接，任何待实现能力不得伪装成可用按钮或演示桌面。
 
 ## Experience
 

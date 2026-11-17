@@ -119,4 +119,4 @@ receipt 保存在原 workspace_rpc_requests 行的 archive_receipts_json，默�
 
 五个 Builtin 操作共享有界状态投影，最多 256 个事件一页。deliveryError 是闭集投递故障码，不改变原状态，不制造终态。poll/cancel 请求 ID 必须符合 wrpc_64hex；既有真实 owner 验证仍是读取的权威。
 
-本合同是必须满足的语义，技术接受不等于人工治理字段或端到端验收完成。模块 owner、实际生产 crate 编译、真实 native helper 与 A+B 正反角色业务分别记证据。最低实际闭环为同一真实 AgentRun 连续 list/read/git.status、请求重试不重跑、owner/node/旧 socket 拒绝、取消与原文件字节归档；只能使用真实 Core enqueue/claim/lease，不得用测试伪 owner 宣称通过。当前进度见[实施与验收](../loom/workspace-rpc-v1-implementation-2026-11-04.md)。
+本合同是必须满足的语义，技术接受不等于人工治理字段或端到端验收完成。模块 owner、实际生产 crate 编译、真实 native helper 与 A+B 正反角色业务分别记证据。最低实际闭环为同一真实 AgentRun 连续 list/read/git.status、请求重试不重跑、owner/node/旧 socket 拒绝、取消与原文件字节归档；只能使用真实 Core enqueue/claim/lease，不得用测试伪 owner 宣称通过。当前进度见[实施与验收](../loom/archive/legacy-plans-2026-11-15/workspace-rpc-v1-implementation-2026-11-04.md)。

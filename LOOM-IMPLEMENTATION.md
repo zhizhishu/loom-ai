@@ -1,168 +1,130 @@
-> **当前交付（2026-11-14）**：见 [工作空间交付与实测](docs/loom/ship-2026-11-14.md)。Pi 真实链、工作空间 UI 和电脑授权修复已按该文档验证；以下内容为此前阶段历史，其中旧入口、未实现列表和测试计数不代表当前状态。
+# LOOM 当前实现与 E0–E7 验收
 
-> 后续终极方案主线与本轮小阶段交接见 `docs/loom/ultimate-workspace-plan.md` 和 `docs/loom/p1-bundle-and-computer-handoff.md`；本文件保留此前产品化历史，不代表P0–P4全部完成。
+> **CURRENT IMPLEMENTATION STATUS · 2026-11-17 续开发，未签收。** 本页是 LOOM V2 **实现进度、失败和真实验收唯一汇总**，不是架构规范、第二开发书、发布声明或用户审批。最新状态看下面续开发实测；原固定 SHA 的历史证据保留，不冒充本次全量回归。
 
-# LOOM 用户级工作台 · 实施与阶段交接
+产品要做什么看 [PRODUCT.md](PRODUCT.md)，已选 Mikka/PiBot 三栏 UI 与用户指定猫耳品牌看 [DESIGN.md](DESIGN.md)，具体 Runtime/能力/设备接口看 [productization-interfaces](docs/loom/productization-interfaces-2026-11-13.md)，13 个参考项目看 [参考锁](docs/loom/LOOM-V2-REFERENCE-LOCK.md)。P0–P14 原设计保留于 [冻结蓝图](docs/loom/LOOM-V2-MASTER-PLAN.md)，不在本页重复叙述。
 
-> **新一轮已批准并实施**：完整目标、四 Runtime、内置 Pi、真实电脑控制、流程/资产图及新 Core 发布，统一转到 [终极工作空间计划](docs/loom/ultimate-workspace-plan.md)。以下是已交付的上一阶段历史，不代表新范围已经验收。
+## 2026-11-17 续开发实测（未签收）
 
-> **用户纠偏入口（置顶）**
-> 你认可当前 Mikka / PiBot 式 UI 大方向，只要求继续打磨；不要退回 Rovai 页面。
-> 你要的是：表达需求 → 选择助手和四类能力 → 选工作区 → 拉群、指定主助手 → 观察工作/成果/电脑 → 需要时授权一次或在明确范围内持续允许。
-> 你可以直接在对话里说“P2 的能力页这里不对”或引用下面的阶段编号。本文件记录你最新纠偏，不要求你读技术资料、手动配 JSON 或中途批准普通实现细节。
-> **最新纠偏记录**：2026-11-13：整体 UI 已认可；负责人选择硬边框不对、白色过多，需要克制的毛玻璃；不要旧 Rovai 助手人格/冗长提示词；四类能力为 Skill / MCP / Rules / Hooks；先支持 Claude / Codex / DSH / Pi；主管负责 UI 和架构，默认 Pi 工兵负责有界实现。
+- 已推送 `50c998f`（容器健康探针）、`9dcbd86`（原生接力范围 UI 与候选下载核验）、`ab22407`（调度尾项结算及显式受限 Pi 工作流工具）。当前未提交修复继续保留，不等于上述提交已经包含全部后续改动。
+- 本机新 Core/Host 编译完成，生产 Web 构建与类型检查完成。DE-BERO 对固定 `ab22407` 曾为 **631 passed / 5 failed / 1 ignored**，原失败保留于 `bero-core-final.json`；后续限定修复经 `resume-02/full-r2-device-observe.json` 复核为 **636 passed / 0 failed / 1 ignored**，Web Node 专项 **22/22**。这是带记录补丁的工作树验收，不伪称原 `ab22407` 已自动变绿；原 SHA Windows E3 仍失败，无最终候选包。
+- 真实模型首次服务旅程曾因尾项调度未结算和错误使用可变工作区校验旧归档而失败；旧失败保留于 `_artifacts/delivery-20261116/live-lead-01/`。后续修复已由下述 `ui-07` 的同次正式 UI 旅程及独立归档复核验证，旧失败仍原样保留。
+- **节点回归已取回终态**：`resume-03/bero-regression-readback.json` 确认同一限定补丁全套执行退出 0：Core 636/0/1、Web Node 22/22、Linux B1–B6 六个真实二进制进程级验收全部 exit 0。它们涵盖配对/拒绝、恢复、能力、shim、执行主机和文件，不替代当前另跑的商用模型 DevicePort 跨物理主机闭环。
+- **正式 UI 同次真实旅程已通过**：`resume-02/ui-07/report.json` 证明页面创建并启动工作、模型 Lead 建两个任务、页面明确批准范围与独立 reviewer、两 Worker 首稿与返工、真实归档预览；`supervisor-verification.json` 另以只读 SQLite + 原始归档独立核对 **13 Run 全成功、4 Claim、4 Artifact/4 Candidate、REQUEST_CHANGES 2 + PASS 2、10 dispatch 全 SETTLED、重复派发 0、批准前 Worker 0**。四份归档 SHA 与字节完整，Candidate 全 PENDING，**Owner Review 0**。真实截图已检查；早期 `ui-01` 至 `ui-06` 失败原样保留。测试模型配置由隔离 setup 准备，不冒称用户从空白安装完成全部配置。
+- Windows Node 真配对已证实。跨机验收首次因脚本标签非法而失败，修正后到达文件读取并暴露 Linux Host 用本机 Path 解释 Windows 根路径的缺陷；修复保留设备端路径围栏，尚待回归。证据：`bero-mission-readback.json`、`cross-workspace-valid.json`。不把 pairing 当作完整 Grant/Artifact/执行中恢复通过。
 
-## 历史状态（2026-11-13 产品化阶段）
+- **现代 DevicePort 真实跨机与运行中恢复已通过**：`resume-02/device-model-05/report.json` 和 `supervisor-verification.json`。Windows 本地商用模型在真实 Run 内通过已授权 Workspace RPC 读取 DE-BERO 的 device-only Node；同一 Run 在 online generation 1/2 各完成一次读取，掉线期间保持运行，重连后同一 Node 执行 `git.status` 并再次读取。主管从只读 SQLite、4 条真实 completed RPC 和原始归档独立核对：两次远端读取与源文件及 116 字节归档 SHA 完全一致，Candidate PENDING、Owner Review 0。模型凭据未发到远端；这是本地 Runtime + 远端 DevicePort，**不是远端模型推理，也不是 UI 发起的跨机用例**。本轮的旧失败（属主、回执误判、新隧道 DNS 尚未就绪）全部保留。
 
-- 阶段：本轮用户级产品化交付；P1–P4 已发布并验收。P5 新 Core 已构建并隔离验证，原运行入口的 Core 切换尚未完成；P6 内置 Pi 尚未封包。
-- 工作目录：`C:\Users\echo\Downloads\claude\skill-cli\loom`。
-- 现有运行入口：`http://127.0.0.1:56286/`；发布前验证真实资产和数据接线。
-- 证据目录：`_artifacts/loom-productization-20261113/`。
-- 不把“计划”“有源码”“单测通过”“真实运行通过”混为一个完成状态。此表会随实施更新。
+### 本批集成提交与当前阻断（resume-04）
 
-| 阶段 | 目标 | 验收标准 | 状态 |
-|---|---|---|---|
-| P0 | 接口盘点、备份、分工、计划 | 当前 WIP 保留；工兵首轮只读；修改白名单互斥 | 已完成 |
-| P1 | 厂商无关服务接口 | 助手/能力/群聊/运行/工作区/审批有明确 owner 和类型；前端不写数据库 | 已接线、接口测试通过 |
-| P2 | 助手详情和四类能力 | 新 UI 中编辑职责、选择能力、保存读回、版本冲突/风险/不支持状态正确 | 已接线；隔离真实写入通过 |
-| P3 | 群聊、主副助手和工作区域 | 选择多个助手、一个主助手、真实 workspace；创建/加人/换主助手沿 Core 合同 | 群聊创建/加人/换主助手/刷新持久化通过 |
-| P4 | UI 材质、授权和事实图 | 负责人改柔和浮层；适度玻璃；现有审批 options 原样映射；图只投影真实事实 | 发布版实际浏览器 24/24 通过 |
-| P5 | Prompt 和四 Runtime 适配 | 新助手简洁身份；新 Run 提示瘦身不破同 Run 冻结输入；明确支持矩阵 | 四 Runtime 配置入口已接；四位默认助手已更新；新 Core 隔离运行验证通过，原入口 Core 未替换 |
-| P6 | 内置 Pi 路线 | 精确依赖/许可/进程/配置隔离可解释；不冒称已有完整内置 runtime | 已定受管子进程路线，尚未封包发布 |
-| P7 | 独立验收和交接 | 本机 build/typecheck/窄测试/UI；远程 Linux 隔离验证；记录剩余项 | 本机149单测/24界面/14新Core写入通过；Linux构建与窄测试通过，全量及文档门禁仍有失败 |
+- **已独立提交并推送 `b9b5f82`（40 文件）**：正式 UI 接力、现代 DevicePort 恢复、迁移修复、缓存代次和跨 OS 预览。源码核对、提交范围与测试回执分别在 `resume-04/integration-commit.json`、`tested-source-verification.json`。原 WIP、私有配置和其他研究没有打包混入。
+- 第二视角指出的预览缓存目录拼接与客户端限额问题已修；主管复跑 DE-BERO Web 全库 **132 passed / 0 failed / 0 ignored**，原生 UI **322/322**、辅助验收 **107/107** 和类型检查通过。独立安全复核仅批准该两处，不冒充完整产品安全认证。
+- **DSH 真实 relay 模型、Rule、MCP 和反选负例通过**：`resume-02/dsh-07/supervisor-verification.json` 独立核对原 Run 的持久 Bootstrap 原文/哈希与回复；原失败报告未覆盖。`dsh-08` 使用正式证据读取器，在运行期间捕获了选中 Skill 的冻结正文与版本，但原生 `skill()` 未加载它，Skill 仍不通过；Hook 尚无已验证传输。55 项路由/证据单测通过不能替代这两格实测。
+- `b9b5f82` Windows E3 在全库门得到 **645 passed / 11 failed / 8 ignored**，没有生成个人版包。正修测试目录创建前置和 Windows 路径夹具；产品权限检查和原断言未关闭。两份 v1.72 模型上下文变更的真实人工确认仍缺失，未伪造确认字段。
+- 原生 DSH Skill 接线改写的工具请求被安全检查拦截，未重试或绕过；诊断与上游原生 Provider 接口依据留在 `resume-04/dsh-skill-native-conclusion.json`。这部分未实现、未验收，不能用已有文件物化替代原生加载。
 
-## 产品范围与既定决策
+本批主要证据目录 `_artifacts/delivery-20261117/`；已通过 UI、Core 与跨机复测位于 `resume-02/`，继续施工位于 `resume-03/`。当前剩余是四端实际支持矩阵、同源候选和完整门禁；扩大 Web 全库曾得 117 PASS / 13 FAIL；限定测试前置/契约黄金值/夹具语法修复后，已从 DE-BERO 取回 **130 passed / 0 failed / 0 ignored、容器 exit 0**（`resume-04/bero-web-final.json`）。原生 UI 全量 **24 文件 / 322 测试通过**（`resume-03/native-ui-full.log`）。这些是当前带记录补丁的回归，不把旧 Git SHA 的 CI 失败改写为成功。以下 2026-11-16 的 E0–E7 表及固定 SHA 分项作为历史基线保留；本节新失败与实测优先，**不代表正式发布或最终签收**。
 
-### 面向用户
+## 2026-11-16 历史交付位置
 
-**助手**拥有名字、动态头像、用途与沟通方式、运行端/模型、能力集合、工作位置。主助手是当前群聊中的协调职责，不是全局更高权限。副助手是同群参与者，可以成为另一群的主助手。
+LOOM V2 已有 Windows 隔离预览、双真实 Core→Pi Worker、Codex 原生文件 Artifact、DSH 原生压缩、正式 Web 的两份待审结果和 GHCR→DE-BERO 隔离 Host/Web 镜像；**尚未通过完整四端能力矩阵、真实设备配对与跨机任务、运行中断线恢复、真人 Owner 验收或正式发行**。最近一次只读巡检未见日常 `64851` 监听，原因未知；本轮文档收口不更改或替换原服务与用户数据。当前已发布版本指针仍是 `v1.72`，V2 开发分支不自动切版。
 
-**能力**分四个独立分类，不限制为四个条目：
-- Skill：工作方法和资源，按需读取正文；选择不自动增加系统权限。
-- MCP：工具连接；定义、凭据、连接状态与助手绑定分开。
-- Rules：声明式约束；不能伪装成系统强制权限。
-- Hooks：生命周期行为；可执行正文/作用范围需审阅；不随选择自动扩大权限。
+## E0–E7 核验表
 
-**工作区**明确属于哪台主机及哪个路径。选择路径不是授予整机访问，外部路径不可冒充已授权。界面显示实际可选择能力；Web 与 Desktop 路径选择使用各自宿主接口。
-
-**授权**“仅一次”“始终允许”只映射 Core/Runtime 实际提供的决策选项，并显示范围；不能把某次 approval 的一次允许偷偷改成全局信任。没有受支持的持续选项时明确说明，不生成虚假持久策略。
-
-**电脑、工作、资产图**只显示已连接服务与已有数据。没有屏幕流就不展示假桌面；尚无数据的图不放伪造任务。
-
-### 面向架构
-
-1. 继续使用已认可 `loom-native` 独立组件树和样式，不重新导入旧页面或其 CSS。
-2. 把 UI 与 Core 请求分开为 typed service/port：Assistant、Capability、Room、Work、Runtime、Workspace、Approval。
-3. 当前第一实现仍是现有 Core adapter；不新增第二份任务/审批/能力真源。
-4. ACCP 借鉴 Task/Run/Candidate/Evidence/Review/Acceptance 的控制面边界；不冒称实现 ACCP 线协议、也不引入企业消息总线。
-5. Runtime 产品层本期四种：Claude Code、Codex、DSH、Pi。能力支持由实际适配器事实决定，不用一个“全部支持”布尔值掩盖差异。
-6. Runtime 传输、配置装载与模型循环留在对应适配器。内置 Pi 是可替换运行端，不可以另建一个与 Core 争权的调度器。
-7. 配置保存、下一 Run 冻结、节点实际应用、工具真正调用是不同事实。重试沿原冻结配置；撤权是独立的实时安全动作。
-8. 人工验收与技术核验、运行完成、发布分开；不通过 Prompt 或图节点替代 Core 状态。
-
-## 接口与实施分工
-
-| Owner | 白名单 | 交付 |
+| Gate | 已确认的实证范围 | 尚未通过 / 不可冒称 |
 |---|---|---|
-| 默认 Pi 工兵 A | `loom-native/capability-service.ts`、对应测试 | 四类 catalog/save/import/preview 封装，精确版本和 Hook 审阅 |
-| 默认 Pi 工兵 B | `loom-native/room-service.ts`、对应测试 | 群聊 draft/创建/加人/换主助手/工作区适配 |
-| 默认 Pi 工兵 C | `loom-native/assistant-service.ts`、对应测试 | 助手资料、四 Runtime 配置与厂商无关接口 |
-| 默认 Pi 工兵 D | 首轮只读；批准后限定具体 Prompt 文件 | 提示词来源、最小改造方案、版本/冻结测试；Pi 内置可行性 |
-| 主管 | 新 UI、整合、架构、文档、最终验证 | 视觉与交互、入口接线、冲突复核、真实浏览器和远程测试 |
+| **E0 · 初始设计/合同** | 产品边界、V2 阶段蓝图与首批设计合同已建立 | 设计蓝图不等于全部 V2 正式 IDL 和数据迁移冻结 |
+| **E1 · Core 与 UI** | 新 Core/协调器/Adapter、`loom-native` 工作台、能力/任务只读投影有实际实现 | 旧用户数据到 V2 的完整迁移与产品所有闭环尚未验收 |
+| **E2 · 基线测试** | 此前有 Rust **76/76**、Node **78/78**、UI **67/67** 通过的阶段基线 | 此处不是对每次新改动重新跑过的全量通过声明 |
+| **E3 · Windows/Linux 隔离候选** | Windows E3 [#43864920990](https://github.com/zhizhishu/loom-ai/actions/runs/43864920990)、Linux 容器 [#43864912038](https://github.com/zhizhishu/loom-ai/actions/runs/43864912038) 对 `e4a0aea` 均 **success**；`8310fcd` 预览包 **6786 文件 SHA256 一致**；旧 `7ee4fdf` E3 亦通过 | E3 主要是候选构建/模拟 Provider，非正式 Release；Linux debug Host/Web **未封包 Pi**，不代表四 Runtime 已可用 |
+| **E4 · 真实模型/多 Worker** | 旧 `7ee4fdf` Pi Purge 单 Run 通过；`8310fcd` 同 Mission **两个真实 Core→Pi→DeepSeek/max Worker**，执行前 Claim/Fence、108/147 字节 Artifact、错误 Fence 拒绝、人格隔离及两份 PENDING Candidate；`6150aed` Core→原生 Codex `workspace-write`→78 字节 Artifact 通过 | **部分通过**：Candidate 由受信 Host 录入，不是自动 Lead 审查返工；正式 Web 只读查看，未从 UI 点击启动整链；DSH 原生压缩不等于 Core→DSH，Windows Claude 仅发现，四端四能力尚未全验 |
+| **E5 · 跨机** | GHCR 固定 digest 镜像已在 DE-BERO 真实拉取并以 uid 10001、本机回环运行，实际认证、Mission 写入读回、未认证 API 401、受控退出和同卷重启持久化通过 | **未通过**：镜像不含 Pi；没有 Windows Node 真配对、授权跨机工作区/工具任务、Artifact 回传及失联恢复 |
+| **E6 · 恢复/副作用** | 已完成 Pi Artifact 恢复 **3/3**；DE-BERO Host/Web 同卷重启后 Mission/Thread 与登录数据保持 | **部分通过**：已完成成果与 Host 存活性，不代表执行途中断线、旧 Lease/Fence、未知副作用及跨机续执 |
+| **E7 · 用户验收/发行** | Windows 候选和 Linux debug 镜像已出；正式 Web 能读两份真实 Artifact 并显示 Review 控件，Candidate 仍为 PENDING；[PR #17](https://github.com/zhizhishu/loom-ai/pull/17) 为 Draft | **未通过**：Owner Review=0、尚无正式 Release、日常升级/回滚及真人签收；自动化鼠标不代用户接受 |
 
-工兵默认模型不覆盖，最大思考；首轮只交计划，主管审过后同会话批准。不开全局 shell/凭据/嵌套派工权限。工兵自报不等于最终验收。
+## 跨仓接口与个人版门禁分项（2026-11-16；基于既有证据，非新运行）
 
-## UI 细化规格
+> 以下 PASS 仅指固定源码或原生专项的**单切片**；本轮更新计划和接口文档，没有再次启动模型/设备。FAIL / NOT_RUN 不得折算成整体百分比，用户 Owner 仍未签收。
 
-保留现有主骨架、动态头像和蓝色用户气泡。负责人筛选改为有头像/选中标记的柔和浮层菜单，不使用显眼的系统 select 外框。侧栏、Inspector、浮层使用轻微半透明材质和受控 blur；聊天正文保持高可读性，不把整页做成炫光玻璃。能力页使用紧凑分区、清晰计数、保存状态与短错误说明，不把技术 JSON 当默认主界面。
-
-助手详情加入“能力”入口；顶部或详情可进入“管理助手”。新对话对话框支持“单聊/群聊”，勾选成员并指定主助手，再选择真实工作区。敏感配置必须由用户显式点击保存，不在读取页面时改写。
-
-## Prompt 改造边界
-
-短 Host 行为约束 + 助手用途/风格 + 本次工作上下文。去掉旧品牌叙述和人格表演，但保留必需工具语法、真实权限边界、消息路由和成果提交合同。旧 Native Session 的冻结输入不回写；新内容有版本证据。用户自定义身份不批量覆盖。用户本轮已授权实施，不伪造额外“二次确认”元数据，文档检查若因此不通过就照实记录。
-
-## 验收矩阵
-
-- 服务：读取失败不是空列表；保存拒绝不丢草稿；expectedRevision 和 commandId 正确；异步过期响应隔离；Hook 取消不写；不支持状态显式。
-- 群聊：一个主助手必须属于成员集合；成员去重；名称/工作区校验；普通浏览不创建/派工；后端拒绝保持 UI 可修复。
-- 权限：一次/持续的 option identity 与后端一致，作用范围可见，不自动勾选持续授权。
-- UI：1600/1440/1040/760/390、深浅色、键盘、焦点、浮层、真实资料/任务/成果；不使用 fake live status。
-- 执行：本机 typecheck/build/新测试；远程 Linux 单独源码快照及依赖隔离；没有运行的目标不得标绿。
-- 回归：既有 71 条 targeted 与实际 browser gates；全量结果与已知历史失败分开说明。
-
-## 阶段性交接
-
-### P0
-
-- 已保留开工前 git diff/status 和 `loom-native` 源码副本至证据目录。
-- 现有 UI 认可方向不再探索三套样式；本轮是选定方向迭代。
-- Pi doctor：默认工兵可用；旧 Windows observe 未配置；目录缺两项新模型，不影响当前默认工兵。不修改全局模型/凭据。
-- 下一步：审工兵计划，冻结服务签名，再实现新 UI。
-
-## 历史阶段未完成/限制（原记录保留，当前见置顶交付）
-
-本轮已验收的功能见下方最终记录。仍未交付：内置 Pi 分发包、图形屏幕流/输入提供者、新 MCP 账号连接/OAuth管理页、跨全部 Runtime 的 Hook 同等支持。已有 MCP 定义可按助手选择，不能写成新 MCP 接入管理已完成。
-
-**新 Core 的原入口激活尚未完成。** 新 `rovai-server` 已在独立测试数据下通过真实 UI 写入验收，但原试运行服务的环境读取被 Windows 拒绝，且项目运行清单缺少可确认的原始 HOME/隔离信息。部署守卫在停止旧进程之前退出，没有提权、猜环境或强杀原服务。原端口56286继续使用旧 Core 与已发布新前端。四位助手资料已正常保存，不等于底层新引导已在原服务生效。
-
-
-### P1–P4 实际交接
-
-- `assistant-service / capability-service / room-service / execution-service` + 独立测试由默认 Pi 工兵完成，主管修正接口类型、失败 Promise、未知结果和前端错误后独立验收。
-- 新增原生助手配置窗口、四类能力面板和能力库、群聊创建/成员/主助手、工作区域配置与事实关系视图。旧 Rovai 页面/CSS 未重新引入。
-- 隔离真实 Core 的 UI 写入验收 **12/12**：创建助手、资料保存、规则创建、能力勾选保存、创建群聊、换主助手、添加成员、刷新保留。未发送消息或调用模型。
-- 发现并修正“创建群聊错误要求所有成员已配好 Runtime”：实际 Core `create_camp_in_tx` 只要求 present 身份。现在允许先组队再配置，执行仍受后端独立准入门禁。
-- 用户授权的四位内置助手简化角色已通过正常 UI / CAS 更新；只命中未被自定义的原始种子。旧字段备份在 `default-assistants-before.json`；名字、动态头像、Runtime、模型及权限保留，没有发送任何任务。
-- 实际浏览器已验证自定义负责人菜单、材质、四类能力读取、助手配置、运行端选项、工作位置、工作/资产图、390–1605宽度和深色。
-
-### P5 / P7 当前验证事实
-
-- Windows `rovai-server` 新源码构建通过，尚未凭此声称运行入口已切换到新 Core。
-- 本机窄测试 **149/149**，TypeScript检查/生产Web构建通过。
-- 第一份 Linux 源码快照 Web类型检查/构建/窄测试 **148/148**；Core未过的原因是旧Rust镜像1.88与实际工程不匹配，且首包缺编译期qualification/docs夹具。失败日志保留；已换与本机构建一致的1.99.1镜像并补齐夹具重新验证。
-- MCP当前支持按助手勾选已有Host定义；不在此轮新增凭据/OAuth管理。Graphical Computer仍未连接屏幕提供者，不能冒充已可接管。
-
-
-## 历史最终交接（此前产品化阶段）
-
-### 可直接使用
-
-1. 左侧“管理助手”人物图标：新建/编辑助手；资料、能力、运行与权限、工作位置四个分区。
-2. 助手详情“能力”：Skills/MCP/规则/Hooks 独立选择并保存；“添加能力”进入技能导入与规则/Hook定义库。保存与实际装载分开显示。
-3. “开始新对话”：单聊/群聊、成员勾选、主助手、主机文件夹。创建不派工。
-4. 聊天顶部“管理群聊成员”：查看主副助手、添加成员、切换主助手。
-5. 分支图标“工作与资产图”：真实任务依赖、候选版本和文件关系。负责人下拉已换为柔和菜单，界面使用克制的半透明材质。
-
-### 最终实测
-
-| 验收 | 结果 | 证据（相对本轮证据目录） |
+| 验收切片 | 状态 | 证据及不应扩大的边界 |
 |---|---|---|
-| 最终TypeScript与生产Web构建 | 通过 | `typecheck-delivery.log` / `build-visual-final.log` |
-| 本机针对性单测 | 149/149 | `tests-delivery.log` |
-| 已发布真实页面只读验收 | 24/24，无浏览器错误 | `browser-visual-final/acceptance.json` |
-| 新构建Core真实UI写入/读回/刷新/主机目录 | 14/14，无模型调用 | `isolated-acceptance/browser-write-release/acceptance.json` |
-| Windows新Core构建 | 通过 | `build-core-windows.log` |
-| Linux源码快照Web类型/构建/窄测试 | 通过，148/148 | `bero-ci-observe.json` |
-| Linux更新快照Host Core check | 通过 | `bero-ci-v2-observe.json` |
-| Linux全量Vitest | 3261项：3258通过、1失败、2跳过 | `bero-ci-v2-observe.json` |
-| Linux精确新Charter测试 | 实际1项通过（开启slow-tests） | `bero-core-focused-result.json` |
-| Linux冻结绑定合同测试 | 实际1项通过 | `bero-binding-recheck.json` |
-| Linux种子相关测试 | 实际2项通过 | `bero-core-focused-result.json` |
-| 文档版本门禁 | 未通过：新旧两份上下文文档缺单独二次签署字段，未伪造 | `docs-version-final.log` |
-| Git diff空白检查 | 通过；原有CRLF警告保留 | `diff-check-final.log` |
+| E4-A 双 Pi Worker、执行前 Claim/Fence、108/147 字节真实 Artifact | **PASS** | `8310fcd`，`_artifacts/loom-personal-delivery-20261116/dual-supervisor-verification.json`；Candidate=PENDING |
+| E4-B Core→Codex 原生 workspace-write 真实文件 | **PASS** | `6150aed`，`codex-supervisor-verification.json`；不等于 Codex 全场景可写 |
+| E4-C DSH 原生压缩和故障专项 | **PASS（原生专项）** | `dsh-supervisor-verification.json`，`CoreIntegrated=false` |
+| E4-D 生产 Web 已有 Artifact 的正文和 Review 控件展示 | **PASS（只读展示）** | `production-ui-verification.json`；不含 UI 发起真实 Run 和 Owner 接收 |
+| E4-E Lead 自动拆 Goal / 从正式 UI 发起全旅程 / 自动返工 | **NOT_RUN** | 两个 Host 受信启动 Worker 不能替代此项 |
+| E4-F 四 Runtime × 四能力完整 Loaded/Invoked/Evidenced | **NOT_RUN（完整矩阵）** | Pi/Codex/DSH 分项不代表全部 16 格；Windows Claude 仍不执行 |
+| E5-A DE-BERO Linux Host/Web 登录与 Mission 持久化 | **PASS（分项）** | `e4a0aea`，`bero-container-supervisor-verification.json`；镜像无 Pi |
+| E5-B Device Node 真 pairing、Grant、跨机工具、Artifact 回传 | **NOT_RUN** | TLS/登录不能当配对 |
+| E6-A 已完成 Artifact 与 Host 重新启动持久化 | **PASS（分项）** | 已有 3/3 已完成 Pi 成果恢复和 Linux 重启证据 |
+| E6-B 执行途中掉线、旧 Fence、未知副作用对账 | **NOT_RUN** | 完成后能读不代表中断时安全恢复 |
+| E7 Owner 真人 Review、正式 Release、升级与回滚 | **NOT_RUN** | Owner Review=0；不以脚本代签 |
+| 旧 v1.72 通用文档 CI 人工确认 | **FAIL（历史已知）** | 两份 `model-context-change-loom-*` 缺真实 `confirmed_*`；不得自动造批准 |
 
-Linux全量唯一失败为未修改的 `evaluation-host.test.ts:129` 自动化回执预期completed、实际failed；未删测试或隐藏失败。远程快照晚于大部分服务改动、早于最终Host目录弹窗/图标小改，本机最终149测试与新Core实际UI验收覆盖最终界面。曾出现0项测试匹配的命令仅是编译结果，不计入上表已执行项。
-
-### 数据与进程处理
-
-- 真实用户数据只修改了4位**逐字段匹配原始种子**的默认助手用途/风格；通过UI和版本化接口完成。原值已备份，自定义身份不覆盖，头像/Runtime/模型/权限不变。
-- 群聊/规则/能力保存的写入测试全在独立 `data2`；没有发送消息、调用模型、代替用户验收或产生发布。
-- 独立测试服务器已停止，清理记录 `isolated-acceptance/cleanup.json`；原试运行进程5580保留。
-- 新Core二进制在 `target/debug/rovai-server.exe`，另有原kit下 `.product-next.exe` 暂存，但**未替换运行中的原二进制**。`rollback-core/runtime-before.json`只是原运行信息备份，不冒称完整数据回滚包。
-- 旧页面未重新导入，未创建Git提交或推送，用户原有WIP保留。后续以本文件未完成清单继续，不能将P6/屏控等计划项标成已交付。
+今后每条验收至少绑定 **Git SHA、实际 Runner/Runtime、Run/Grant/Fence、原生结果、Artifact SHA、PENDING/Review 状态、负例与退出码**。正式字段/错误码只能在既有 Contract 内冻结；不能因为这份治理附注出现某词，就宣称新字段/新功能已实现。
 
 
-### 最终视觉复核补记
+## 2026-11-16 最新分项实测（固定源码 `6150aed` → `8310fcd` → `e4a0aea`）
 
-主管逐图复核发现群聊成员头像被行内通用span弹性规则拉大，已修正文本轨与头像轨的选择器，并增加群聊/负责人菜单头像几何断言。重新构建、发布与真实浏览器验收 **24/24** 通过；最终截图位于 `browser-visual-final/`。文档链接门禁的 `DESIGN.md#colors` 真实章节已补回，`docs:check:decisions` 重跑通过；`docs:check:version` 仍因二次签署字段未填而不通过，未更改检查器。
+> 以下结果取自本机 `_artifacts/loom-personal-delivery-20261116/` 的**主管复核 JSON**及相应 GitHub SHA；与后面的 `7ee4fdf` 历史单 Run 记录分开保留。原始会话/凭据不上传 Git。
+
+| 验收切片 | 实际证明 | 未证明 |
+|---|---|---|
+| **双 Pi Worker** · `8310fcd` | `dual-supervisor-verification.json`：同一 Mission 两个 Core 创建的真实 Run，`deepseek-v4.1-flash/max`，两个 Claim **都早于 Prompt/文件写入**，14.8 秒执行重叠，108/147 字节独立 Artifact；错误 Fence 被拒、人格隔离，两份 Candidate **PENDING**，Owner Review=0 | Candidate 由受信 Host 提交，非自动 Lead 规划与审查返工 |
+| **Core→Codex 文件** · `6150aed` | `codex-supervisor-verification.json`：真实原生 `workspace-write`（无网络），78 字节真实 Artifact、输入标记、Run succeeded，权限冻结与有效回读一致 | 只是一个真实文件任务，不等于全机权限或四能力可用 |
+| **DSH 原生压缩** | `dsh-supervisor-verification.json`：压力触发、溢出自动重试、usage、取消/失败不破坏状态、冷启动恢复六类检查通过 | `CoreIntegrated=false`，不能冒充 Core→DSH |
+| **正式 Host/Web 待审 UI** · `8310fcd` | `production-ui-verification.json`：真实 Bearer 登录，两个已生成的实际 Artifact 可预览正文和 Persona/nonce，Review 控件可操作，未认证 API 被拒 | **只读查看**，不包含 UI 发起模型任务，未代用户点击接受 |
+| **候选构建与实机 Linux** · `e4a0aea` | Windows E3 [#43864920990](https://github.com/zhizhishu/loom-ai/actions/runs/43864920990) 与 Linux 镜像 [#43864912038](https://github.com/zhizhishu/loom-ai/actions/runs/43864912038) completed success；`download-verification-8310.json` 证明 6786 文件闭包完整；`bero-container-supervisor-verification.json` 证明 DE-BERO 按 digest 拉取、登录/真实 Mission、同卷重启保持 | Host/Web debug 镜像无 Pi；没有设备 pairing、跨机工具；同 SHA 通用 [CI #43864920977](https://github.com/zhizhishu/loom-ai/actions/runs/43864920977) 仍失败 |
+
+**实际镜像不可变引用**：`ghcr.io/zhizhishu/loom-ai-server-candidate@sha256:82a58638f459ef679f68315c03d96b9abfaf044ff4d0e64d4981421d6674cee0`。仅作为已部署的 **Host/Web candidate**，不是全功能个人版发行包。
+## `7ee4fdf` 阶段：Pi Purge 与真实上游原始实证（历史记录）
+
+| 交付 | 实际结果 | 边界与证据 |
+|---|---|---|
+| 本地架构图 | 已原位写入 `LOOM-V2-MASTER-PLAN.md` 的 B 节，Pi Purge 独立列入 4–6 周范围 | 产品目标图，不是所有功能已交付的状态图 |
+| 原生上游协议 | DeepSeek V4.1 Flash/max 的 Chat、Responses、Anthropic **3/3** 真实请求通过 | 是三个协议通道，不是四个 Core Runtime 已完成；`provider-matrix-results.json` |
+| 受管 Pi Purge 原生适配 | 新 `scripts/loom-v2-pi-purge-extension.ts` 与对应测试；固定原版 v0.3.0/SHA，Off/Append，按运行身份校验，重启后重新激活、拒绝漂移 | **78/78** 适配/桥/原钩子/stage 回归通过（含回执失败时不应用 Persona）；原有模拟桥仍明确模拟 |
+| Pi Purge 真模型效果 | 早期原生三协议 Append + Chat Off **4/4**；本轮另完成真实 Core Append 与 Off/冻结控制各一例 | 早期 4/4 使用测试 Binding；本轮 Core 自建 Binding 证据单列下行，不能把几种不同验收相加为全产品完成 |
+| Codex 权限事实修复 | 无模型请求的原生探针复现：workspace-write 请求返回 readOnly；已新增线程绑定/发 Prompt 前拒绝不一致的补丁 | 不修改原生权限、不强行开启写入；Bero 同提交的纯策略与进程边界回归 **2/2**，GitHub Windows 同一策略回归亦通过 |
+| 可选扩展候选封包 | 保留上游 LICENSE/源码/SHA；默认 Off；`7ee4fdf` 下载包包含正确的 `runtime/extensions/pi-purge` 布局并通过全闭包哈希校验 | 不复制真实 Persona/账号/会话；不等于正式安装或日常升级 |
+| Mindkit | TASK/PROJECT_CONTEXT 只留当前工作流与稳定约定，旧原字节与哈希归档；写入门/完整性检查通过 | 只写 LOOM 子项目，不写父 skill-cli 或全局默认 |
+| **本轮 Pi Purge 接线与隔离闭环已验** | 助手服务 UI 34/34、原生78/78、新增 Rust 库测试1/1；Core 保存/冻结 Persona、真实新会话激活和 applied 回执、真实文件、Artifact 及 PENDING Candidate 均已核验 | Mindkit 本次冲刺 **5/5（100%）**；不是全个人版。UI自动测试/E3与真模型Core API切片分别记账，未冒充同一次真实UI点击旅程；TypeScript/Web构建属于此前同源码已通过记录 |
+
+先前源码已分两次提交并推送：`d666c51`（适配器/权限回读/候选包）和 `5fc9142`（回执不可写时拒绝应用）。两次提交各自的完整 Windows E3 均通过；此前 `5fc9142` 本机 **78/78 + 新隔离目录真模型4/4**，GitHub run `43835826323` 的固定源码编译、Codex 策略回读回归、正式 Host/Electron E3、含隐藏依赖的 **6786 文件下载后闭包校验**全部通过，证明文件已取回本机。通用 CI 仍因既有 v1.72 真实人工确认元数据缺失而红；没有伪造批准或把 E3 写成完整 E4/E7。
+
+上述早期原生增量的原始结果在 `_artifacts/loom-purge-next-20261116/`，不再新建交接书。`provider-matrix-results.json`、`purge-live-results.json`、`purge-unit-final.log`、`codex-policy-probe.json` 是相互独立的证据；本轮过程保存了实际失败与 Root 修正，不以工兵自报代替结果。
+
+### 本次闭环收口证据（固定源码 7ee4fdf）
+
+现有认证通过正常 Pi Skill 环境引用复用；未提取、外发或替换日常凭据。主管只读核对隔离 SQLite、原生 Pi 会话和实际文件：Append 的 Persona 随机标记未出现在用户消息中，却进入真实 **122 字节**成果；原生模型记录为 `deepseek-v4.1-flash`、思考档位 `max`。Artifact/归档预览/Candidate 哈希均为 `73cb63c2fe89bf117bcc6187769e804a53c74d94e75c8e0a04a2ded002e7f2aa`；Candidate 为 PENDING/UNVERIFIED，Owner Review 为 0。另一个独立 Off 用例在运行中保存 Append，数据库确认当前 Run 仍冻结 Off，成果无 Persona 标记，Candidate 同样待审。
+
+原始证据与主管复核在 `_artifacts/loom-purge-ui-core-20261116/`：`supervisor-verification.json`、`off-freeze-verification.json`、`real-artifact-recovery.json`、`download-verification.json`；Rust/UI/Node 日志分别为 `rust-purge-resume.log`、`ui-resume.log`、`native-resume.log`。Host 配置目录可能在恢复启动时清理，激活及 applied 原始回执保存在归档的 `live-evidence-r2.private.json`，不声称重启后又读到了已清理原文件。原始会话与私有报告不随公开 PR 上传。
+
+保留失败边界：首次在 `runtime.product.check` 超时，未创建 Run；编译结束后同命令、同安全门、全新隔离根重试通过，不能据此断言超时根因。补充 Host Rust 过滤命中 **0 测试**，不记作回归通过。本轮 Claim 为完成后取得、Artifact/Candidate 由受信本地 Host 验收入口提交；不代证执行前租约、自动 Lead 派工或用户最终认可。既有 7 个受保护文件哈希及日常监听归属未变。
+
+## 下一段执行工作流（旧 P0 双 Worker 已实测，继续完成用户旅程）
+
+**当前链路**：助手选择 Persona/Purge → Core 校验并冻结 Run Binding → 原生 Pi 激活 → 真实模型与授权工具 → Artifact/Candidate → 用户 Review。
+
+| 顺序 | 实施位置 | 下一项必须实际出现的结果 |
+|---|---|---|
+| 1 | Lead 自动规划 / Review 返工 | 在已通过的两个真实 Worker 及执行前 Claim/Fence 之上，证明 Lead 可以按用户 Goal 自动拆分、分配、拒绝及重新派工，不重复做已完成的受信 Host 双 Worker 测试 |
+| 2 | 同一次正式 UI 用户旅程 | 从助手/能力/Persona 保存→真实 Core Run→两个 Artifact→用户 Review；补 Pi Purge 无 Guard、错 Bot、旧 epoch/Applied 回执失败反馈 |
+| 3 | 四端 × 四能力 | Pi/Codex/DSH/Claude 按平台实际支持，分别验证 Skill/MCP/Rule/Hook 选择→冻结→装载→调用→证据；DSH 单独压缩与 Codex 单文件已通过，不能代替整矩阵 |
+| 4 | 真设备与恢复 | DE-BERO Host/Web 已部署；继续 Windows Node pairing、Grant、真实跨机工具回执、Artifact 回传、断线与旧 Fence/未知副作用 |
+| 5 | 个人版发行收口 | 安装迁移与 dry-run、升级/回滚、日常实例状态确认、真人 Owner 审阅；完整 E7 未通过前不得标 100% |
+
+## 阻塞和独立待验（不重复创建交接）
+
+- **Codex 实效已补单切片**：先前 workspace-write 请求被原生回报 readOnly 的失败历史保留；`6150aed` 经独立受控 unelevated 原生沙箱得到真实 `workspace-write`，写入 78 字节并归档。尚不能推广到任意主机或完整四能力。
+- **协作下个缺口**：`8310fcd` 双真实 Worker、执行前 Claim/Fence、两份独立 Candidate 已核验；仍欠自动 Lead 规划/返工、从正式 UI 启动的完整操作链、四端四能力实际 Load/Invoke 证据。
+- **Purge 配置与反例**：当前通过用例显式使用 Core workspace 文件 Grant；Append 与无 Grant 的原生权限组合仍是运行时拒绝，配置期反馈待补。只读审查提出激活回执缺专属代次、Core 未将 applied 回执作为强制门禁的风险，尚未完成相关故障反例；不以本次正向通过消除此风险。
+- **DSH/跨机恢复**：DSH 原生 0.1.5-rc.2 的自动压力压缩、溢出重试、用量、取消/失败隔离及冷恢复 **六类通过**；`CoreIntegrated=false`。跨机配对/工作区 Grant/真实工具任务与运行中故障恢复依然缺证。
+- **治理门禁**：Windows E3 与 Linux 容器对 `e4a0aea` 均通过；通用 [CI #43864920977](https://github.com/zhizhishu/loom-ai/actions/runs/43864920977) **failure**，两份旧 v1.72 `model-context-change-loom-{productization,run-bundle}.md` 缺真实人工确认元数据，不得伪造 `confirmed_*` 消红。
+- **发布边界**：GitHub 候选与 GHCR Linux debug Host/Web **不等于正式 Release**，镜像不含 Pi。最近 64851 监听缺失原因未明，不因文档整理启动替换日常进程；User Owner 必须亲自审阅。
+
+## 证据、历史与更新规则
+
+- 真实模型及恢复原始记录：[LOOM-LIVE-ACCEPTANCE-2026-11-16.md](docs/loom/LOOM-LIVE-ACCEPTANCE-2026-11-16.md)；本机隔离证据位于 `_artifacts/loom-live-resume-20261116/`，包括 `real-pi-file-artifact-summary.json`、`real-artifact-recovery.json`、`codex-native-summary.json`、`fixed-package-local-verification.json`、`bero-tls-admission.json`；含私有数据的文件不可随 PR 上传。
+- 早期 P0–P7 产品化阶段、旧施工/交接和实验纪录已 [归档](docs/loom/archive/legacy-plans-2026-11-15/README.md)，其中 [旧版实施全文](docs/loom/archive/legacy-plans-2026-11-15/LOOM-IMPLEMENTATION-history-2026-11-13.md) 只用于来源追溯。
+- 后续**只更新本页当前状态及证据链接**；产品边界归 PRODUCT、UI 归 DESIGN、接口归 productization-interfaces、参考 SHA 归 REFERENCE-LOCK。不要再开新的“总交接”“最新计划”“进度看板”抢占权威。

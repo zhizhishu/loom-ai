@@ -6,7 +6,7 @@ last_updated: 2026-11-05
 
 # R2 Workspace RPC v1：实施与验收
 
-状态：2026-11-05 R2 protocol、Node executor/authority/wire、Core journal/可信入口/CLI、Web child 已落并注册；实际 Node 生产库 check 已通过，当前 Core 及 Agent-facing CLI 全链 gate 正由 Core owner 执行。模块 S 已有证据，真实 A+B 同一 AgentRun 闭环仍待主 harness，不能标完成。当前字段规范为 [Workspace RPC v1](../contracts/workspace-rpc-v1.md) 与 [Transport v45](../contracts/builtin-tool-transport-v45.md)。本文保存工作包实施和验收事实，不代填人工治理确认。
+状态：2026-11-05 R2 protocol、Node executor/authority/wire、Core journal/可信入口/CLI、Web child 已落并注册；实际 Node 生产库 check 已通过，当前 Core 及 Agent-facing CLI 全链 gate 正由 Core owner 执行。模块 S 已有证据，真实 A+B 同一 AgentRun 闭环仍待主 harness，不能标完成。当前字段规范为 [Workspace RPC v1](../../../contracts/workspace-rpc-v1.md) 与 [Transport v45](../../../contracts/builtin-tool-transport-v45.md)。本文保存工作包实施和验收事实，不代填人工治理确认。
 
 ## 范围与已核实的基线
 
@@ -14,11 +14,11 @@ R2 使 A 上同一个 agent 会话连续调用 B 的工作区 list、read、run�
 
 真实入口：
 
-- [现有节点 wire](../../crates/loom-protocol/src/lib.rs)：ClientMessage 的 Exit / AlreadyRunning、ServerMessage 的 Start；不存在可直接充当 R2 的通用 RPC。
-- [现有文件边界](../../crates/loom-protocol/src/workspace.rs)：list_directory/read_file/resolve_inside；R2 在复用前增加严格相对路径校验，根内绝对路径也拒绝。
-- [Hub](../../crates/rovai-web/src/nodes.rs)：已认证节点连接、代次、B6 文件等待者、per-run shim；现有 shim 只允许 loom status。
-- [NodeStore](../../crates/rovai-core/src/execution_node.rs)：workspace owner 和 run credential；run_grant 当前只返回 member/mission/usable，不能宣称已含完整 Run/Session 身份。
-- [节点执行](../../crates/loom-node/src/session.rs)：现有 ChildGroup 只在 Unix 群杀，不能证明 Windows 子孙进程清理。
+- [现有节点 wire](../../../../crates/loom-protocol/src/lib.rs)：ClientMessage 的 Exit / AlreadyRunning、ServerMessage 的 Start；不存在可直接充当 R2 的通用 RPC。
+- [现有文件边界](../../../../crates/loom-protocol/src/workspace.rs)：list_directory/read_file/resolve_inside；R2 在复用前增加严格相对路径校验，根内绝对路径也拒绝。
+- [Hub](../../../../crates/rovai-web/src/nodes.rs)：已认证节点连接、代次、B6 文件等待者、per-run shim；现有 shim 只允许 loom status。
+- [NodeStore](../../../../crates/rovai-core/src/execution_node.rs)：workspace owner 和 run credential；run_grant 当前只返回 member/mission/usable，不能宣称已含完整 Run/Session 身份。
+- [节点执行](../../../../crates/loom-node/src/session.rs)：现有 ChildGroup 只在 Unix 群杀，不能证明 Windows 子孙进程清理。
 
 B7/B8 持有 lib.rs、session.rs、nodes.rs、execution_node.rs 和 migration 229。R2 先新增独立模块；共享 seam 释放后才注册。migration 230 预留，必须检查当时真实数据库版本后注册。
 
@@ -83,7 +83,7 @@ cancel 精确作用于一个 request。Core 记 cancelRequested 并发往该 own
 
 ## 测试归属与证据
 
-遵守 [Rust 测试准入](../development/testing.md#新增独立测试)。不按测试数量定义完成。
+遵守 [Rust 测试准入](../../../development/testing.md#新增独立测试)。不按测试数量定义完成。
 
 | owner | 独立失败语义与最低成本验证 |
 | --- | --- |

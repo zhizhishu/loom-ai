@@ -20,7 +20,7 @@ last_updated: 2026-10-27
 
 ## LOOM 远端 Run 能力快照（2026-11-04）
 
-B7/B8 正在按本轮用户授权实现。字段级前后合同、原生交付、私有存储、秘密拒绝和验证边界见 [独立变更说明](model-context-change-loom-run-bundle.md)；集成过程见 [本轮交接](../../loom/integration-handoff-2026-11-04.md)。技术复核与实际测试状态分别记录，不把源码完成当作真实远端验收。
+B7/B8 正在按本轮用户授权实现。字段级前后合同、原生交付、私有存储、秘密拒绝和验证边界见 [独立变更说明](model-context-change-loom-run-bundle.md)；集成过程见 [本轮交接](../../loom/archive/legacy-plans-2026-11-15/integration-handoff-2026-11-04.md)。技术复核与实际测试状态分别记录，不把源码完成当作真实远端验收。
 
 ## LOOM 编排与交付工作区（2026-10-27）
 

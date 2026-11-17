@@ -1,0 +1,121 @@
+{
+  "status": "HISTORICAL_SNAPSHOT",
+  "createdAtUtc": "2026-11-15T10:08:56.7609033Z",
+  "purpose": "Preserve pre-V2 LOOM planning and evidence docs verbatim; original file paths retained for old links",
+  "count": 16,
+  "files": [
+    {
+      "name": "loom-mikka-first-execution-plan-2026-11-15.md",
+      "sha256": "36C5B99D4F3142EB50F2369670545FD0283BBF7E866532ECFF89E22448C47DA2",
+      "bytes": 14266,
+      "source": "docs/loom/loom-mikka-first-execution-plan-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/loom-mikka-first-execution-plan-2026-11-15.md"
+    },
+    {
+      "name": "loom-mikka-first-worker-orders-2026-11-15.md",
+      "sha256": "0149E96B07FB1D79754EAE1EA512E8713A55900726293DE41CAA73CA4AFDA2A7",
+      "bytes": 9882,
+      "source": "docs/loom/loom-mikka-first-worker-orders-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/loom-mikka-first-worker-orders-2026-11-15.md"
+    },
+    {
+      "name": "loom-mikka-first-execution-board-2026-11-15.md",
+      "sha256": "C0F63C7DB7544D4BB0D5B61DC61E8BF4AD6ABF1EA5421F886986DBD6B4639494",
+      "bytes": 7538,
+      "source": "docs/loom/loom-mikka-first-execution-board-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/loom-mikka-first-execution-board-2026-11-15.md"
+    },
+    {
+      "name": "loom-mikka-first-progress-2026-11-15.html",
+      "sha256": "F63C2442FD63347BCD56F6BEDCADA2E47B0D5F966419F22D67C043ACF6A42D7E",
+      "bytes": 7984,
+      "source": "docs/loom/loom-mikka-first-progress-2026-11-15.html",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/loom-mikka-first-progress-2026-11-15.html"
+    },
+    {
+      "name": "loom-mikka-first-implementation-handoff-2026-11-15.md",
+      "sha256": "828C28E01C90C3BF306873E25B5BDA6CD1CD800C1666A4BE57B4E6740D564571",
+      "bytes": 12618,
+      "source": "docs/loom/loom-mikka-first-implementation-handoff-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/loom-mikka-first-implementation-handoff-2026-11-15.md"
+    },
+    {
+      "name": "loom-mikka-first-acceptance-2026-11-15.md",
+      "sha256": "4354E177D13E5C294C3146BC034D87F7AE3B74A3537C34E5272EEBCF4FED49B9",
+      "bytes": 7723,
+      "source": "docs/loom/loom-mikka-first-acceptance-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/loom-mikka-first-acceptance-2026-11-15.md"
+    },
+    {
+      "name": "loom-mikka-first-plain-language-2026-11-15.md",
+      "sha256": "50435C66B93215F753D0ED5CC73ED0F8D1043E6119145B0A84B42ADB0AA321C0",
+      "bytes": 4627,
+      "source": "docs/loom/loom-mikka-first-plain-language-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/loom-mikka-first-plain-language-2026-11-15.md"
+    },
+    {
+      "name": "loom-mikka-first-device-invocation-seam-2026-11-15.md",
+      "sha256": "51C32B435C5818773B4E40EF8DDFB8FE50635D7930300106DE775A6D1955766E",
+      "bytes": 9341,
+      "source": "docs/loom/loom-mikka-first-device-invocation-seam-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/loom-mikka-first-device-invocation-seam-2026-11-15.md"
+    },
+    {
+      "name": "pi-work-orders-architecture-proposal-2026-11-15.md",
+      "sha256": "3BD7B7CD94A6EBF513C8A3EC68CF60E893EB3C00EBF193F8EEBEBB15CCAA8FAC",
+      "bytes": 17179,
+      "source": "docs/loom/pi-work-orders-architecture-proposal-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/pi-work-orders-architecture-proposal-2026-11-15.md"
+    },
+    {
+      "name": "ultimate-workspace-plan.md",
+      "sha256": "3571FFC5DFE793C7845A0E264D4B3CBA452E75F7ABC80CAB8B8A8F95A37E65CD",
+      "bytes": 5886,
+      "source": "docs/loom/ultimate-workspace-plan.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/ultimate-workspace-plan.md"
+    },
+    {
+      "name": "ultimate-interface-contracts.md",
+      "sha256": "706EE0AAF997D5006D705796C5256A310E7A2BFD536941B26853D2500EDCC546",
+      "bytes": 11471,
+      "source": "docs/loom/ultimate-interface-contracts.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/ultimate-interface-contracts.md"
+    },
+    {
+      "name": "MASTER-HANDOFF-2026-10-28.md",
+      "sha256": "0E28CCE8536951C489F11E07D62CD4F239BEE75C931C1D021641A3C8C3B62590",
+      "bytes": 20761,
+      "source": "docs/loom/MASTER-HANDOFF-2026-10-28.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/MASTER-HANDOFF-2026-10-28.md"
+    },
+    {
+      "name": "plan-b-a-controls-b-2026-11-01.md",
+      "sha256": "4F7F2B33496B996839EA74BE38A20ABD71941D860A0E1283A872DCE47B04D8DA",
+      "bytes": 71843,
+      "source": "docs/loom/plan-b-a-controls-b-2026-11-01.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/plan-b-a-controls-b-2026-11-01.md"
+    },
+    {
+      "name": "single-brain-device-implementation-handoff-2026-11-15.md",
+      "sha256": "EF7313747C47714B1802A2873E11B9D73B130F993F24D36CE2C1C33F5AB7A245",
+      "bytes": 11505,
+      "source": "docs/loom/single-brain-device-implementation-handoff-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/single-brain-device-implementation-handoff-2026-11-15.md"
+    },
+    {
+      "name": "architecture-discussion-master-plan-2026-11-15.md",
+      "sha256": "F3621F5816B55C74EEC8F78CA157E7A80EC320480BD7AC305A013A550D81C70D",
+      "bytes": 50769,
+      "source": "docs/loom/architecture-discussion-master-plan-2026-11-15.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/architecture-discussion-master-plan-2026-11-15.md"
+    },
+    {
+      "name": "productization-interfaces-2026-11-13.md",
+      "sha256": "0E1DC1067039220C7397E05273E4399F793A5D5BF04E4D77BB147AC8CE1A6D7E",
+      "bytes": 9318,
+      "source": "docs/loom/productization-interfaces-2026-11-13.md",
+      "snapshot": "_artifacts/loom-v2-planning-archive-20261115/productization-interfaces-2026-11-13.md"
+    }
+  ],
+  "archive_storage": "_artifacts/loom-v2-planning-archive-20261115/"
+}

@@ -62,4 +62,4 @@ R2的连接代数检查必须与实际发送/接受事件保持同一fence。过
 
 当前Windows进程边界、B7原生CLI投递、R2协议/journal/private-storage owner和Node生产crate check已有分项证据。全体当前Core/Web/native helper构建、真实A+B的正反角色业务、A本地同Run R2、active取消、断线恢复与最终产物链仍需各自实际结果；模块PASS不等于已部署或整体E通过。Linux/Darwin原生矩阵、完整ACP Client FS/Terminal和未实现文件方向均不扩张声明。
 
-理由见 [V1.72-D68](../versions/v1.72/decisions.md#v1-72-d68)，实施记录见[LOOM集成交接](../loom/integration-handoff-2026-11-04.md)与[R2实施证据](../loom/workspace-rpc-v1-implementation-2026-11-04.md)。这些记录与人工治理门禁分别记账，不通过改写确认字段来消除实际未满足项。
+理由见 [V1.72-D68](../versions/v1.72/decisions.md#v1-72-d68)，实施记录见[LOOM集成交接](../loom/archive/legacy-plans-2026-11-15/integration-handoff-2026-11-04.md)与[R2实施证据](../loom/archive/legacy-plans-2026-11-15/workspace-rpc-v1-implementation-2026-11-04.md)。这些记录与人工治理门禁分别记账，不通过改写确认字段来消除实际未满足项。

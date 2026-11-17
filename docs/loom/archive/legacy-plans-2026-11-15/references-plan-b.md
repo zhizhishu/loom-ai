@@ -1,6 +1,6 @@
 # 方案 B 的本地参考仓库
 
-给 [`plan-b-a-controls-b-2026-11-01.md`](plan-b-a-controls-b-2026-11-01.md) 用。核对日期 2026-11-01。
+给 [`plan-b-a-controls-b-2026-11-01.md`](../../plan-b-a-controls-b-2026-11-01.md) 用。核对日期 2026-11-01。
 
 这些目录只放在仓库外面，建议 `~/loom-refs/`。不要放进本仓库，不要做成 submodule，不要把其中的源码抄进 LOOM。LOOM 继承 Rovai 的 MIT；AGPL 和 Business Source License 的仓库连参考目录都不要克隆，需要时读官方文档。
 

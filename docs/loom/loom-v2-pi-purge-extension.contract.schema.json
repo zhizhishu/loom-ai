@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:loom:proposal:pi-purge-extension:loom.v2alpha1",
+  "title": "LOOM Core V2 optional Pi Purge extension binding and receipt (discussion only)",
+  "description": "NOT IMPLEMENTED. Only applies to runtimeKind=pi, does not grant tool or device privileges, and never changes provider policies. Source review pinned at ZiChuanLan/pi-purge d0196ccfd773b0ed342bd2f25372aff65f1a4a53.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/PiPurgeBinding"
+    },
+    {
+      "$ref": "#/$defs/PiPurgeApplyReceipt"
+    }
+  ],
+  "$defs": {
+    "PiPurgeBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "strict"}}, "required": ["mode"]},
+          "then": {"properties": {"scope": {"const": "lab"}}}
+        }
+      ],
+      "required": [
+        "kind",
+        "apiVersion",
+        "bindingId",
+        "botId",
+        "extensionId",
+        "runtimeKind",
+        "enabled",
+        "mode",
+        "sourceCommit",
+        "packageVersion",
+        "packageDigest",
+        "personaDigest",
+        "scope",
+        "revision"
+      ],
+      "properties": {
+        "kind": {
+          "const": "pi-purge.binding"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "bindingId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "botId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "extensionId": {
+          "const": "pi-purge"
+        },
+        "runtimeKind": {
+          "const": "pi"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "off",
+            "append",
+            "replace",
+            "fallback",
+            "strict"
+          ]
+        },
+        "sourceCommit": {
+          "const": "d0196ccfd773b0ed342bd2f25372aff65f1a4a53"
+        },
+        "packageVersion": {
+          "const": "0.3.0"
+        },
+        "packageDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "personaDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "personaRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "scope": {
+          "enum": [
+            "bot",
+            "project",
+            "run",
+            "lab"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "applyOnNextAttempt": {
+          "const": true
+        },
+        "riskReviewRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        }
+      }
+    },
+    "PiPurgeApplyReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "apiVersion",
+        "receiptId",
+        "runAttemptId",
+        "bindingId",
+        "runtimeKind",
+        "extensionId",
+        "sourceCommit",
+        "packageVersion",
+        "modeRequested",
+        "status",
+        "extensionDigest",
+        "personaDigest",
+        "observedAt"
+      ],
+      "properties": {
+        "kind": {
+          "const": "pi-purge.applyReceipt"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "receiptId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runAttemptId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "bindingId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runtimeKind": {
+          "const": "pi"
+        },
+        "extensionId": {
+          "const": "pi-purge"
+        },
+        "sourceCommit": {
+          "const": "d0196ccfd773b0ed342bd2f25372aff65f1a4a53"
+        },
+        "packageVersion": {
+          "const": "0.3.0"
+        },
+        "modeRequested": {
+          "enum": [
+            "off",
+            "append",
+            "replace",
+            "fallback",
+            "strict"
+          ]
+        },
+        "modeActual": {
+          "enum": [
+            "off",
+            "append",
+            "replace",
+            "fallback",
+            "strict"
+          ]
+        },
+        "status": {
+          "enum": [
+            "selected",
+            "bundled",
+            "loaded",
+            "activated",
+            "prompt_composed",
+            "prompt_seen",
+            "unsupported",
+            "failed",
+            "revoked"
+          ]
+        },
+        "extensionDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "personaDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "promptDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "identitySegmentRemoved": {
+          "type": "boolean"
+        },
+        "docsSegmentRemoved": {
+          "type": "boolean"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+          }
+        },
+        "approvalBypassed": {
+          "const": false
+        },
+        "grantRefsUnchanged": {
+          "const": true
+        }
+      }
+    }
+  }
+}

@@ -1,12 +1,14 @@
 # LOOM 方案 B：A 调度，B 出站执行（2026-11-01）
 
+> **历史归档 / SUPERSEDED_TOPOLOGY / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](archive/legacy-plans-2026-11-15/README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
+
 > 用户要的结果：机器 A 是有公网地址的 LOOM 服务器。机器 B（例如家里的电脑）可以没有公网地址。A 要能让 B 干活。一次使命可以拆给多个 CLI（Claude Code、Codex，以及其他已接入的运行时）和多个助手；有的助手在 A 上跑，有的在 B 上跑，都由 A 排。每个助手从云端目录里勾选技能、MCP、规则和 hook。产品仍然是「当前项目的一个文件夹」，带文件管理。界面要和本机桌面一样全，并加上一块看得清现场进度的编排视图。
 >
 > 这就是方案 B：A 上只有一个 Core。B 上跑一个节点代理，主动连到 A，接受执行。
 >
 > 本文只定方案。不改 Rust、不改界面、不改数据库。行号对着写本文时的 `main`（`5b44585`）。函数名比行号稳，行号会随别人的提交漂移。
 >
-> 事实底稿：[`plan-remote-2026-10-31.md`](plan-remote-2026-10-31.md) §1、[`handoff-remote-2026-11-01.md`](handoff-remote-2026-11-01.md)、[`architecture-round4-2026-10-29.md`](architecture-round4-2026-10-29.md)、仓库根的 [`LOOM.md`](../../LOOM.md)。克隆哪些参考仓库见 [`references-plan-b.md`](references-plan-b.md)。
+> 事实底稿：[`plan-remote-2026-10-31.md`](archive/legacy-plans-2026-11-15/plan-remote-2026-10-31.md) §1、[`handoff-remote-2026-11-01.md`](archive/legacy-plans-2026-11-15/handoff-remote-2026-11-01.md)、[`architecture-round4-2026-10-29.md`](archive/legacy-plans-2026-11-15/architecture-round4-2026-10-29.md)、仓库根的 [`LOOM.md`](../../LOOM.md)。克隆哪些参考仓库见 [`references-plan-b.md`](archive/legacy-plans-2026-11-15/references-plan-b.md)。
 
 ## 0. 结论
 
@@ -20,7 +22,7 @@ A 自己也算一台节点，只是这台节点不走网络，直接调用现有
 
 ## 1. 别人怎么做的
 
-2026-11-01 核对过公开仓库的许可文件、默认分支或发行标签，以及官方文档。钉死的提交在 [`references-plan-b.md`](references-plan-b.md)。下面每条都写：谁拨谁、凭什么相信对方、断了怎么接、工作 / 进程 / 文件走哪条通道、LOOM 该借什么、要不要克隆到本机旁边读。
+2026-11-01 核对过公开仓库的许可文件、默认分支或发行标签，以及官方文档。钉死的提交在 [`references-plan-b.md`](archive/legacy-plans-2026-11-15/references-plan-b.md)。下面每条都写：谁拨谁、凭什么相信对方、断了怎么接、工作 / 进程 / 文件走哪条通道、LOOM 该借什么、要不要克隆到本机旁边读。
 
 「克隆」指放到仓库外面的 `~/loom-refs/`，当阅读材料。不要 submodule，不要把别人的源码抄进这个 MIT 仓库。AGPL 和 BUSL 的仓库只读文档，不克隆进参考目录。
 

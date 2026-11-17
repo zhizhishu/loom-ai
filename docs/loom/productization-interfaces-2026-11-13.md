@@ -2,6 +2,25 @@
 
 > 本文记录 2026-11-13 实施的接口，而非另造控制面。实施状态与用户纠偏入口以根目录 `LOOM-IMPLEMENTATION.md` 为准。下文的 ACCP 指设计参照，不表示 LOOM 已兼容 ACCP 服务器或 wire protocol。
 
+## 0. 2026-11-16 跨仓 Owner 与证据门（治理说明，非新 Wire Schema）
+
+> 这里说明 LOOM V2 接口由谁拥有、如何验证，不修改已发布 v1.72，也不发明正式字段。任何新命令/JSON/错误码，必须进入本仓 `docs/contracts/`、`docs/architecture/`、`docs/decisions/` 的既有治理；实际功能与未通过门槛仍只看根目录 `LOOM-IMPLEMENTATION.md`。
+
+| 交互层 | 唯一 Owner | 必须回执 | 当前真实范围 |
+|---|---|---|---|
+| 用户级 Skill/Hook/Rule/MCP 源本与宿主适配 | 项目外 `~/.claude` 各 Skill 源本、独立父仓 `skill-cli` 负责四端分发治理 | 登记目录/版本/适配支持和原生 doctor；LOOM 不能覆盖全局配置或复制用户密钥 | 同步完成 ≠ 本次 Run Loaded/Invoked |
+| UI → Core | LOOM Core，UI 仅是经过认证的消费者 | 已持久化 Bot/Thread/Goal/配置版本，错误时保留指令身份 | 已有部分真实读写；正式 UI 全旅程未验 |
+| Core → RuntimePort | LOOM Core 保存/冻结，Pi/Codex/DSH/Claude 各 Adapter 实际执行 | Run/Assistant/Assignment/Claim/Fence、冻结 Persona/能力/Workspace Grant 的关联，原生应用/拒绝和实际调用回执 | 双真实 Pi Worker、Codex 文件为单项；DSH 仅原生压缩专测 |
+| Runtime/Tool Broker → DevicePort | Core Grant + 实际 Node/OS 负责 enforcement | 配对 Node 身份、资源范围、Lease/Fence、工具结果和未知副作用对账 | **E5 实际跨机未通过**；DE-BERO Host/Web 在线不等于 pairing |
+| Artifact → Candidate → Review → Owner | LOOM Core Artifact/Review 与真实用户 | 不可变 hash/来源、PENDING 状态、Review 决定、用户接收和发布分别记录 | 真实 Artifact 有证，Owner Review=0 |
+
+**四能力必须逐个验证**：`Discover → Inspect → Select → Configure → Freeze → Materialize → Loaded → Invoked → Evidenced`。Skill、MCP、Rule、Hook 分开；Memory/Persona 独立治理。UI “已保存”不等于原生 Runtime “已生效”；Pi Purge 是 Pi Extension、不是第五 Runtime，ACP 是协议、ACCP 是设计参考。
+
+**所需语义清单，不是新增 wire 字段**：任何真实执行可追溯 Goal/Assignment/Run/Claim/Fence/权限快照、设备 Grant、原生加载与调用、不可变 Artifact SHA 与 Candidate/Owner 状态。精确字段名和服务形状仍由正式 Contract 拥有，不能把本段示例映射成已实现 API。
+
+**负例验收**：旧 Fence 与错误 Bot/epoch 必须拒绝；没 Grant 不能写；原生 readOnly 不能报写入成功；未完成 Device pairing 不得显示为跨机任务已完成；PENDING 不得被脚本代用户签收。本轮仅补接口分治文档，未增加 Runtime/Device 功能。
+
+
 ## 1. 产品模型
 
 用户面对 Assistant / Conversation / Work / Artifact / Computer。内部继续以唯一 Core 保存真实身份、成员关系、任务、运行、能力选择与人工决定。新 `loom-native` 前端不拥有另一份业务数据库。
@@ -47,7 +66,7 @@
 | Claude Code | `claude-code-cli` | 依真实安装/默认/schema | 依节点 descriptor 与工作区 | 已有 Core 接口 | 不打包第三方 CLI |
 | Codex | `codex-cli` | 同上 | 同上 | 已有 Core 接口 | 不打包第三方 CLI |
 | DSH | `deepseek-harness` | 依真实安装/模型来源 | 当前不宣称支持 | 当前统一预览不支持 | 不打包第三方 CLI |
-| Pi | `pi` | 依真实安装 | 当前不宣称支持 | 当前统一预览不支持 | `packaged:false`，见下节 |
+| Pi | `pi` | 依真实安装/独立受管包 | 当前不宣称完整支持 | 以实际 Core 接口支持矩阵为准 | 隔离候选已封包；旧 UI 元数据与发行门槛见下节 |
 
 “产品选项”不是“本机已经安装”。安装缺失、路径不可用、未登录、无法探测需要分别呈现，不可以自动选择另一运行端或模型。
 
@@ -66,7 +85,7 @@ LOOM Core 的 Run / 权限 / 事实
 
 本地参考包 `@earendil-works/pi-coding-agent@0.85.1` 的 manifest 声明 MIT，Node 最低版本 22.19；公开 RPC entry 位于 `dist/bundle/rpc-entry.js`。这是固定本地快照，不是上游最新版本声明。
 
-本次已设置 `AssistantRuntimePort` 的 transport/embedded 类型，Pi 标记 **packaged:false**。没有偷偷安装、下载、覆盖用户 Pi，也没有把该选项显示成已内置。真正交付打包版需：锁定实际依赖完整性与许可证、独立配置/会话根、无凭据自动迁移、工具审批语义对齐、Windows/Linux 启停取消恢复测试、模型账单/认证清晰、打包产物验证。不能用“有 SDK”替代这些门槛。
+早期 `AssistantRuntimePort` 的 `packaged:false` 是当时 UI/接口元数据，不能据此否定后来已验证的固定 Pi 隔离候选；实际包版本和闭包由 manifest 证明，正式发行另验。不得覆盖用户 Pi、复制账号或通过一个 UI 标志假称安装完成。依赖/许可证、独立 Home、工具权限、启停取消恢复和下载完整性必须分别核验。Pi Purge 为 Pi 侧可选扩展：当前原生适配 Off/Append，冻结的 Run/Bot/epoch 与 Persona/上游摘要必须一致；后续产品 Core 生成绑定及 UI 选择仍需要接线，不能把隔离测试 Binding 当成正式授权。
 
 ## 5. 能力与权限分层
 
@@ -104,4 +123,12 @@ WorkMap 当前是**真实数据的只读关系视图**：依赖来自 `loom.depe
 - Hook/规则创建与启用分开，保存选择与实际生效分开。
 - 数据错版本/读不到显示错误，不伪造空状态。
 - 生产 UI、隔离 Core 写入测试、fixture tests 和真实模型运行分别标记。
-- 计划内不等于交付。完整验收记录与当前缺口在根目录阶段文件和证据目录。
+- 计划内不等于交付。完整验收结果与当前缺口只汇总在根 [LOOM-IMPLEMENTATION.md](../../LOOM-IMPLEMENTATION.md)，本文件不维护第二份进度表。
+
+## 9. 云端执行位置、企业扩展与能力真相
+
+- **同一个 Bot / Core，三个部署模式**：T = Cloud Brain + 纯工具 Node（设备可无本地 CLI），R = 可选本地 Runner（明确四 Runtime 的实际适配与就绪），H = Hybrid（按任务选云端、设备工具或本地 Runner）。BotIdentity、Goal/Run、Artifact/Review、Grant 的事实归同一个 Core；设备只是执行地点或工具来源，UI 不持有第二真源。
+- **Node 与授权不同层**：Node 在线、TLS 通、真实配对、工作区 Grant、工具可执行和远程屏幕控制分别要有回执。File/PTY/Browser/Computer 是独立 DevicePort 能力，屏幕 Provider/人工接管需要单独许可；断线后的未知副作用不换 requestId 无条件重试。
+- **ACCP 借协作机制，不加新运行端**：Goal/Step → Claim/Lease/Fence → Run/Artifact → Independent Review → Owner Acceptance 分别持久记录；ACP 是协议，与 ACCP 不是同一事物。
+- **未来企业化隔离（未实现，不得宣传为已交付）**：Tenant/Organization/User/Role/Resource/Permission/Quota/Audit，前提是实际的租户边界、权限拒绝、数据和凭据隔离，以及可测审计。参考 [AgenTeam/MOVO](LOOM-V2-REFERENCE-LOCK.md) 的思路；MOVO Community 代码不提供完整企业 ACL。
+- 借鉴 [DeskFleet、MindFS、UFO³ Galaxy](LOOM-V2-REFERENCE-LOCK.md) 的设备目录、daemon、工具分离和多设备调度；不等于已经接入它们的线协议或可以直接操控任意用户电脑。规划历史保留在 [V2 设计基线](LOOM-V2-MASTER-PLAN.md)，未冻结细节在 [研究](research/loom-v2-universal-architecture-and-ports-proposal-2026-11-15.md)。

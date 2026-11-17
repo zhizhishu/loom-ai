@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>LOOM · Mikka-first 开工阶段板（2026-11-15）</title>
+<style>
+:root{color-scheme:dark;--bg:#10151d;--surface:#1a212d;--edge:#303949;--muted:#9baac0;--text:#f5f7fa;--blue:#85b9ff;--green:#7fd1ad;--yellow:#f5c77b;--red:#e8a1a1}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#121c2c,transparent 40%),var(--bg);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Microsoft YaHei",Segoe UI,Arial,sans-serif;color:var(--text)}main{max-width:1160px;margin:0 auto;padding:44px 24px 76px}
+h1{font-size:clamp(29px,5vw,48px);line-height:1.16;letter-spacing:-1.1px;margin:8px 0 15px}h2{font-size:19px;margin:0 0 14px}h3{font-size:15px;margin:0 0 7px}p{margin:6px 0 14px;color:var(--muted)}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
+small{font-size:12px;color:var(--muted)}.eyebrow{letter-spacing:.2em;text-transform:uppercase;color:var(--blue);font-size:12px;font-weight:700}.lead{max-width:780px;font-size:17px}
+.bar{height:13px;background:#344150;border-radius:999px;overflow:hidden;margin:16px 0 8px}.bar>span{display:block;width:37.5%;height:100%;background:linear-gradient(90deg,#78b5ff,#74d0b4);border-radius:999px}.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:25px 0}.tile,.stage,.detail{background:var(--surface);border:1px solid var(--edge);border-radius:14px;padding:17px 19px}
+.tile strong{display:block;font-size:28px;margin-top:4px}.tile em{font-size:12px;font-style:normal;color:var(--muted)}.stages{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0 28px}.stage{min-height:161px;position:relative}.stage .number{font-size:12px;letter-spacing:.1em;color:var(--muted)}.stage .state{display:inline-block;font-size:11px;padding:2px 8px;border-radius:15px;margin:8px 0 7px;border:1px solid var(--edge)}
+.done{border-left:4px solid var(--green)}.done .state{color:var(--green)}.doing{border-left:4px solid var(--blue)}.doing .state{color:var(--blue)}.pending{border-left:4px solid var(--edge)}.pending .state{color:var(--muted)}.blocked{border-left:4px solid var(--yellow)}.blocked .state{color:var(--yellow)}
+.stage p{font-size:13px;margin:4px 0}.detail{margin:15px 0}.detail strong{color:var(--text)}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.result{color:var(--green)}.warning{color:var(--yellow)}ul{padding-left:20px;margin:8px 0}li{margin:5px 0;color:var(--muted)}li b{color:var(--text)}nav{display:flex;flex-wrap:wrap;gap:15px;margin:20px 0 0}code{overflow-wrap:anywhere;color:#e3eaf1;background:#26303d;border-radius:4px;padding:1px 4px}footer{border-top:1px solid var(--edge);margin-top:25px;padding-top:18px;color:var(--muted);font-size:12px}
+@media(max-width:900px){.summary,.stages{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:590px){.summary,.stages,.two{grid-template-columns:1fr}main{padding:26px 15px}}
+@media(prefers-reduced-motion:no-preference){.stage{transition:transform .18s ease,border-color .18s ease}.stage:hover{transform:translateY(-2px);border-color:#536a84}}
+</style>
+</head>
+<body>
+<main>
+<div class="detail" style="border:2px solid #f5c77b; background:#322820;"><strong style="color:#f5c77b">历史进度板 · 已退役</strong><p>这里的旧 3/8 任务进度不是 Core V2 的 P0–P14 总计划进度。当前用户要求只整理架构、不施工。请从 <a href="../../LOOM-V2-MASTER-PLAN.md">Core V2 唯一总计划</a> 继续。</p></div>
+<div class="eyebrow">LOOM / MIKKA-FIRST / ENGINEERING HANDOFF</div>
+<h1>从漂亮工作台，<br>到真正能跨电脑工作的 Bot。</h1>
+<p class="lead">你满意的 LOOM 左中右 UI 保留。当前主线：Linux 云端 Bot/Core → DevicePort → Win/macOS 的真实工具 → Evidence/Artifact/Review。先做到能用，再做多设备、高级 Runtime 和企业化。</p>
+<div class="detail"><h2>主控任务进度 · <strong>3 / 8 步完成</strong></h2><div class="bar" role="progressbar" aria-valuenow="3" aria-valuemin="0" aria-valuemax="8" aria-label="AgentDock任务步骤"><span></span></div><small>仅表示 AgentDock 本轮流程步骤 37.5%，不是 LOOM 功能完成比例；当前停在第四步“Device 实用闭环”。静态快照，非实时轮询。</small></div>
+<div class="summary">
+<div class="tile"><em>独立 Web↔Device</em><strong class="result">E3 PASS</strong><small>真实文件读取 44B、越界拒绝</small></div>
+<div class="tile"><em>Protocol Rust 测试</em><strong class="result">33/33</strong><small>候选 Grant/Receipt 尚未上线</small></div>
+<div class="tile"><em>Windows Node 新二进制</em><strong class="result">BUILD PASS</strong><small>--device-only；新单测仍待验</small></div>
+<div class="tile"><em>云端真实双机 E5</em><strong class="warning">NOT_RUN</strong><small>Bero 已恢复 23.4 GiB；E5 未跑</small></div>
+</div>
+<h2>八个执行阶段</h2>
+<div class="stages">
+<div class="stage done"><div class="number">01 / P0</div><div class="state">已完成</div><h3>保护原有现场</h3><p>五份历史 WIP 逐字节备份；64851 原服务保留。</p></div>
+<div class="stage done"><div class="number">02 / P1</div><div class="state">已完成</div><h3>计划落盘与 Mindkit</h3><p>工程版 / 用户版 / Pi 工单 / T0–T22 / 项目记忆。</p></div>
+<div class="stage done"><div class="number">03 / P2</div><div class="state">已完成</div><h3>真实 Pi 多工兵</h3><p>3 路 Scout、2 路 Worker 都取得真实执行回执。</p></div>
+<div class="stage doing"><div class="number">04 / P3</div><div class="state">当前阶段</div><h3>Device 实用闭环</h3><p>FilePort E3 已过；旧冻结 Run 要求 CLI，现按 W12A/B/C 分别补可信设备调用与传输，Artifact E4 未通。</p></div>
+<div class="stage pending"><div class="number">05 / P4</div><div class="state">待进行</div><h3>Runtime 比较</h3><p>Pi / DSH 实测；Skills、MCP、Rules、Hooks 加载与调用回执。</p></div>
+<div class="stage pending"><div class="number">06 / P5</div><div class="state">待进行</div><h3>Mikka Bot 与体验</h3><p>事件唤醒、Attention，Hero 眼动；品牌图三待原图。</p></div>
+<div class="stage pending"><div class="number">07 / P6</div><div class="state">跨机验收待进行</div><h3>跨物理机与安全</h3><p>Bero 已恢复 23.4 GiB；Linux A↔Win B 真实 E5 仍未运行。</p></div>
+<div class="stage pending"><div class="number">08 / P7</div><div class="state">待进行</div><h3>综合 QA + 交接</h3><p>E5/E6、安全、多机、用户验收、下一阶段发布。</p></div>
+</div>
+<div class="two">
+<div class="detail"><h2>本轮已证明</h2><ul><li><b>真实单机双进程</b>：Host 走 HTTP/WS 操作独立 Node。</li><li><b>无 Agent CLI</b>：Node 汇报 <code>clis=[]</code>、<code>activeRunCount=0</code>。</li><li><b>真实资源</b>：File list、read 44B，越界返回 <code>path_rejected</code>。</li><li><b>代码存在</b>：新增 Git 只读工具编译通过，协议 33 项 Rust 测试通过。</li></ul></div>
+<div class="detail"><h2>尚不能称完成</h2><ul><li><b>Linux→物理 Win B</b>：还未真实跨机。</li><li><b>Bot AgentRun→Artifact</b>：Core 业务回执未接通。</li><li><b>完整授权</b>：Grant 模块仍是 <code>UNWIRED_PROPOSAL</code>。</li><li><b>设备 GUI、PTY、Mac、Logo</b>：相关 E5/UI 验收未完成。</li><li><b>文档门禁</b>：两份历史 v1.72 确认字段仍需真实治理。</li></ul></div>
+</div>
+<div class="detail"><h2>施工入口</h2>
+<nav><a href="loom-mikka-first-execution-plan-2026-11-15.md">工程总方案</a><a href="loom-mikka-first-worker-orders-2026-11-15.md">Pi 工兵任务卡</a><a href="loom-mikka-first-acceptance-2026-11-15.md">完整验收矩阵</a><a href="loom-mikka-first-plain-language-2026-11-15.md">用户易读版</a><a href="loom-mikka-first-implementation-handoff-2026-11-15.md">恢复/交接</a></nav>
+</div>
+<footer>快照日期：2026-11-15 · AgentDock 任务 tsk_407c504cc8494d6d · 所有 PASS 必须对应本机原始日志或不可变回执。本页面是静态离线 HTML，并非实时生产监控；下次执行由工兵更新文件。</footer>
+</main>
+</body></html>

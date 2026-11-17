@@ -57,4 +57,4 @@ Execution Evidence 只投影请求/Run/Session 标识、允许的操作参数元
 
 旧操作的输入/输出、历史 Envelope、成功结果和摘要不重写。历史 v44 合同保持；v45 只改变当前命令集合和五项新操作的字段/投递语义。新增 output golden fixture v16 保留 v15 文件；fixture 文件编号与 Agent Output 合同版本是不同的既有编号空间。
 
-本合同规定实现必须满足的行为，不等同于端到端验收已完成。源代码 owner、当前编译、原生 helper 与真实 A+B 结果在[实施证据](../loom/workspace-rpc-v1-implementation-2026-11-04.md)分开记录。人工治理字段由对应版本决定文档拥有，本合同不代填人工确认。
+本合同规定实现必须满足的行为，不等同于端到端验收已完成。源代码 owner、当前编译、原生 helper 与真实 A+B 结果在[实施证据](../loom/archive/legacy-plans-2026-11-15/workspace-rpc-v1-implementation-2026-11-04.md)分开记录。人工治理字段由对应版本决定文档拥有，本合同不代填人工确认。

@@ -11,7 +11,7 @@ last_updated: 2026-11-01
 
 # LOOM 编排入口：Agent CLI `rovai loom` 与 cli-operations 参考
 
-本稿 r1 为 LOOM 独立副本补上 Agent 侧入口：Agent 通过 `rovai loom ...` 导入计划、放行、认领、登记证据、提交交付；User 仍是唯一验收方。设计与审计见 [`docs/loom/plan-accp-entry-2026-10-31.md`](../../loom/plan-accp-entry-2026-10-31.md)。
+本稿 r1 为 LOOM 独立副本补上 Agent 侧入口：Agent 通过 `rovai loom ...` 导入计划、放行、认领、登记证据、提交交付；User 仍是唯一验收方。设计与审计见 [`docs/loom/plan-accp-entry-2026-10-31.md`](../../loom/archive/legacy-plans-2026-11-15/plan-accp-entry-2026-10-31.md)。
 
 ## 基线与依据
 

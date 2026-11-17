@@ -1,10 +1,12 @@
 ---
 document_type: documentation-index
 authority: documentation-routing
-last_updated: 2026-11-05
+last_updated: 2026-11-16
 ---
 
 # Rovai-ai 文档导航
+
+> **LOOM V2 下一代开发线**：从 [LOOM 文档导航](loom/README.md) 查找唯一的产品、UI、接口、参考项目与历史入口；当前实际验收及未通过门槛只看 [LOOM-IMPLEMENTATION.md](../LOOM-IMPLEMENTATION.md)。用户选定的品牌与三栏 UI 属于 [DESIGN.md](../DESIGN.md)，勿把过时的交接文件当成新命令。已发布的当前 v1.72 仍按本页的版本/架构/合同治理管理。
 
 人类用户统一称 User，旧 Session 与别名规则见 [User Naming v1](contracts/user-naming-v1.md)。
 
