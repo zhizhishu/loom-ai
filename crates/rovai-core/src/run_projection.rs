@@ -388,6 +388,8 @@ mod tests {
     fn preview_matches_the_run_bundle_for_a_fixture_member() {
         let directory =
             std::env::temp_dir().join(format!("rovai-run-projection-{}", uuid::Uuid::new_v4()));
+        let directory =
+            crate::platform::private_storage::prepare_private_directory(&directory).unwrap();
         let database = Database::open(&directory).unwrap();
         let store = McpConfigStore::new(directory.join("mcp.json"));
         let profiles = AgentProfileService::default()

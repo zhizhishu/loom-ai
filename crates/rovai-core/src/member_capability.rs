@@ -1271,6 +1271,8 @@ mod tests {
     fn selected_rules_match_the_projected_selection_truth() {
         let directory =
             std::env::temp_dir().join(format!("rovai-selected-rules-{}", Uuid::new_v4()));
+        let directory =
+            crate::platform::private_storage::prepare_private_directory(&directory).unwrap();
         let database = Database::open(&directory).unwrap();
         let store = McpConfigStore::new(directory.join("mcp.json"));
         let library = SkillLibraryService::new(directory.join("skill-library")).unwrap();
@@ -1332,6 +1334,8 @@ mod tests {
     fn selection_keeps_inherited_defaults_records_explicit_overrides_and_projects_them() {
         let directory =
             std::env::temp_dir().join(format!("rovai-member-capability-{}", Uuid::new_v4()));
+        let directory =
+            crate::platform::private_storage::prepare_private_directory(&directory).unwrap();
         let mut database = Database::open(&directory).unwrap();
         let store = McpConfigStore::new(directory.join("mcp.json"));
         let library = SkillLibraryService::new(directory.join("skill-library")).unwrap();
@@ -2123,6 +2127,8 @@ mod tests {
     #[test]
     fn exact_hook_review_survives_only_identical_definitions_and_workspace_scope() {
         let directory = std::env::temp_dir().join(format!("rovai-hook-review-{}", Uuid::new_v4()));
+        let directory =
+            crate::platform::private_storage::prepare_private_directory(&directory).unwrap();
         let mut database = Database::open(&directory).unwrap();
         let store = McpConfigStore::new(directory.join("mcp.json"));
         let library = SkillLibraryService::new(directory.join("skill-library")).unwrap();
@@ -2331,12 +2337,15 @@ mod tests {
                 risk_acknowledged: false,
             },
         );
-        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
-        fs::write(store.path(), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let bytes = serde_json::to_vec_pretty(&config).unwrap();
         #[cfg(unix)]
         {
+            fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+            fs::write(store.path(), &bytes).unwrap();
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
         }
+        #[cfg(windows)]
+        crate::platform::private_storage::atomic_write_private_bytes(store.path(), &bytes).unwrap();
     }
 }

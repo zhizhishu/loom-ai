@@ -826,6 +826,8 @@ mod tests {
     fn catalog_capture_freezes_selected_sources_and_next_run_observes_deselection() {
         let directory =
             std::env::temp_dir().join(format!("loom-bundle-source-{}", uuid::Uuid::new_v4()));
+        let directory =
+            crate::platform::private_storage::prepare_private_directory(&directory).unwrap();
         let mut database = Database::open(&directory).unwrap();
         let store = McpConfigStore::new(directory.join("mcp.json"));
         let library = crate::skill::SkillLibraryService::new(directory.join("skill-library")).unwrap();

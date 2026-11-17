@@ -509,6 +509,15 @@ mod tests {
         let persisted_quick_chat = data_dir.join("quick-chat");
         let canonical_quick_chat =
             validate_workspace_directory(&persisted_quick_chat, &data_dir, true).unwrap();
+        // This comparator accepts only the verbatim-path representation change,
+        // not a short-name alias (GitHub's TEMP may contain RUNNER~1). Build the
+        // persisted form from the canonical spelling rather than assuming TEMP
+        // already carries that spelling. Directory admission above is unchanged.
+        #[cfg(windows)]
+        let persisted_quick_chat = PathBuf::from(
+            canonical_quick_chat.to_str().unwrap().strip_prefix(r"\\?\")
+                .unwrap_or(canonical_quick_chat.to_str().unwrap()),
+        );
         assert!(persisted_workspace_path_matches_canonical(
             &persisted_quick_chat,
             &canonical_quick_chat

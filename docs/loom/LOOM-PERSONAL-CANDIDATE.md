@@ -1,7 +1,7 @@
 ---
 document_type: development-guide
 authority: isolated-personal-preview-operation
-last_updated: 2026-11-16
+last_updated: 2026-11-17
 ---
 
 # LOOM 个人测试版
@@ -24,6 +24,8 @@ last_updated: 2026-11-16
 
 标签图标和品牌标记使用已选定的 LOOM 图片，个人助手头像保持独立。Pi 新增 `workspace_read_write` 显式选项，只允许在 Core 选定工作目录内执行原生 read/write/edit；受控模式不开放 shell、MCP、未知工具或任意文件系统访问。这是可信本地主机中的工具权限边界，不是对同一操作系统账号下其他进程的强隔离承诺。
 
+另外的 `workspace_workflow` 是显式选择的受限工作流模式：在文件工具之外，只接入既有的八类 LOOM 业务操作，继续经过 Core 身份、授权、Claim/Fence 和幂等校验，不借此开放任意 shell。它不改变已有只读、读写或 native 模式的默认选择。
+
 ## 可选 Pi Purge 扩展
 
 带有 `optionalPiPurgeVersion` 清单字段的新候选会在 `runtime/extensions/pi-purge/` 内附带固定 v0.3.0 的原始源码、许可证、闭包清单，以及 LOOM 受管适配器。已有旧候选可能没有此目录，以实际清单为准。
@@ -37,3 +39,7 @@ CI 只跑无模型回归和交付包闭包检查，不含账号配置、Persona 
 `candidate-manifest.json` 记录源码提交和包内文件哈希。`e3-manifest.json` 记录同一源码的干净 Windows 构建与隔离集成测试结果。E3 使用真实 Pi 进程、正式界面和自动化鼠标输入，但模型响应来自受控的本地测试服务；它不是真实模型验收，也不是用户亲自作出的 Owner 验收。
 
 真实模型执行、完整的四 Runtime × 四能力矩阵、独立设备恢复，以及正式发行资格仍是单独的验收项。打包过程不会写入用户验收结论，不复制凭据，不晋升正式版本，也不迁移日常数据。
+
+项目已经另行完成正式 UI 发起的真实 Lead／双 Worker／返工审查闭环，以及本地模型使用远端 DevicePort 的运行中重连验证；这些记录不能自动替代本包的商用模型验证。当前明确的限制是：DSH 的显式模型路由、Rule 和 MCP 已有真实证据，但选中 Skill 虽已冻结，原生技能注册表尚未加载它；DSH Hook 也没有已验证传输。Windows Claude 保持原有发现与执行准入边界。不要把界面中的“已选择”或进程启动成功当作这几项能力已经可用。
+
+使用前应核对包内的源码提交与文件清单；尚未通过的项目不因“测试包”名称而被视为完成，用户最终接受始终留给本人。

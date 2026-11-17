@@ -268,17 +268,21 @@ mod tests {
     use serde_json::json;
     #[test]
     fn codex_dedup_requires_matching_admitted_path_kind_and_body() {
-        let workspace = json!({"executionRoot":"/fixture/repo"}).to_string();
+        // A rooted POSIX spelling is not an absolute path on Windows. Exercise
+        // the same admitted-path semantics with this platform's native root.
+        let root = if cfg!(windows) { "C:/fixture/repo" } else { "/fixture/repo" };
+        let outside = if cfg!(windows) { "C:/outside/removed.rs" } else { "/outside/removed.rs" };
+        let workspace = json!({"executionRoot":root}).to_string();
         for (kind, path, moved) in [
-            ("update", "src/file.rs", None),
-            ("update", "/fixture/repo/src/file.rs", None),
+            ("update", "src/file.rs".to_owned(), None),
+            ("update", format!("{root}/src/file.rs"), None),
             (
                 "update",
-                "/fixture/repo/src/old.rs",
-                Some("/fixture/repo/src/new.rs"),
+                format!("{root}/src/old.rs"),
+                Some(format!("{root}/src/new.rs")),
             ),
-            ("add", "/fixture/repo/src/界.rs", None),
-            ("delete", "/outside/removed.rs", None),
+            ("add", format!("{root}/src/界.rs"), None),
+            ("delete", outside.to_owned(), None),
         ] {
             let (_, mut payload) = crate::codex::normalize_event(
                 "item/completed",

@@ -7414,7 +7414,11 @@ mod tests {
     #[test]
     fn mission_batch_claim_uses_ready_worktree_and_defers_unprepared_workspace() {
         let mut ready = Fixture::new();
-        let ready_worktree = ready._directory.join("mission-worktree");
+        // Production workspace preparation persists the canonical spelling.
+        // Windows CI may expose TEMP through an 8.3 alias, which is not the
+        // same string as that canonical path and must not weaken drift checks.
+        let ready_worktree = std::fs::canonicalize(&ready._directory)
+            .unwrap().join("mission-worktree");
         ready.attach_completed_mission(Some(&ready_worktree));
         ready.enqueue("ready-message", "继续使命");
         assert!(
