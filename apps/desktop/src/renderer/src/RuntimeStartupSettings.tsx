@@ -249,7 +249,7 @@ export function RuntimeStartupSettings({ runtimeKind, health, onBack, backLabel,
         {environmentIncomplete && <p className="runtime-startup-result is-warning" role="status"><UiText zh={"部分查找来源不可用，本次结果使用已读取的可用环境。"} /></p>}
       </section>
 
-      <CommonEnvironmentEditor environment={common} disabled={locked} onChange={() => { sequence.current++; setInspection(null); setError(null); setSaveCompleted(false) }}/>
+      <CommonEnvironmentEditor environment={common} fields={Boolean(nativeTheme)} disabled={locked} onChange={() => { sequence.current++; setInspection(null); setError(null); setSaveCompleted(false) }}/>
       {saved && error && <p className="inline-error" role="alert">{error}</p>}
       {conflicts.map((conflict) => <div className="runtime-save-conflict" role="alert" key={JSON.stringify(conflict.path)}>
         <p>{conflict.label}<UiText zh={"也在外部修改过，请选择保留哪一项。其他编辑已保留。"} /></p>

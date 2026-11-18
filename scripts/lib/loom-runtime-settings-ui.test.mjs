@@ -41,7 +41,9 @@ test('LOOM runtime connection settings retain real editor behavior and fit both 
     assert.equal(report.visibleWindow, false)
     assert.equal(report.shots.length, 4)
     assert.ok(report.cases.includes('four production runtime cards open their own saved settings'))
-    assert.ok(report.cases.includes('save uses runtime.startup.save and reopening reads the stored result'))
+    assert.ok(report.cases.includes('ordinary fields save through runtime.startup.save and reopen without editing JSON'))
+    assert.ok(report.cases.includes('values are hidden by default and revealing them neither saves nor dirties settings'))
+    assert.ok(report.cases.includes('duplicate and incomplete field names cannot save or discard a draft value; removing a new row restores the saved state'))
     assert.ok(report.cases.includes('cancel leaving preserves unsaved JSON without a write'))
     console.log(JSON.stringify({ output, ...report }))
     passed = true

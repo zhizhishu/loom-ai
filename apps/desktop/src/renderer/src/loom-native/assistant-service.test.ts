@@ -308,7 +308,7 @@ describe('assistant Runtime choice and save', () => {
     }))
     await expect(saveAssistantRuntime({
       client: client(missingGrant), agent: profile, choice: nativeDraft
-    })).rejects.toThrow('Core 不会自动开启权限')
+    })).rejects.toThrow('设置助手的工作目录文件权限')
     expect(nativeDraft.permissions.values).toEqual({})
     expect(nativeDraft.piPurge.persona).toBe('Keep this draft.')
     expect(missingGrant).toHaveBeenCalledTimes(1)

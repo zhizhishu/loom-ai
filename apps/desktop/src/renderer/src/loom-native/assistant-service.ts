@@ -141,6 +141,22 @@ function defaultsFor(
   return defaults
 }
 
+function permissionDisplayOptions(kind: AssistantRuntimeKind, options: PermissionOptionDescriptor[]): PermissionOptionDescriptor[] {
+  if (kind !== 'pi') return options
+  const labels: Record<string, string> = {
+    native: '使用 Pi 原生权限（不限工作目录）',
+    workspace_read_only: '只读工作目录',
+    workspace_read_write: '读写工作目录',
+    workspace_workflow: '读写文件并处理任务'
+  }
+  return options.map(option => option.key === 'loom_file_access' ? {
+    ...option,
+    label: '文件与任务权限',
+    description: '选择助手能在工作目录内做什么。受限模式不执行命令行或额外工具；原生模式不限制文件范围。',
+    choices: option.choices.map(choice => ({ ...choice, label: labels[String(choice.value)] ?? choice.label }))
+  } : option)
+}
+
 function optionFor(
   kind: AssistantRuntimeKind,
   installations: readonly AdapterInstallation[]
@@ -154,7 +170,7 @@ function optionFor(
     installation,
     usable: Boolean(installation && installation.enabled && installation.pathState === 'valid' && defaults),
     models: snapshot?.models ?? [],
-    permissionOptions: installation?.permissionOptions ?? snapshot?.permissionOptions ?? [],
+    permissionOptions: permissionDisplayOptions(kind, installation?.permissionOptions ?? snapshot?.permissionOptions ?? []),
     permissionSchemaVersion: snapshot?.permissionSchemaVersion ?? defaults?.permissions.schemaVersion ?? null,
     defaults
   }

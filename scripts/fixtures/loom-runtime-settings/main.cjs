@@ -95,9 +95,13 @@ app.whenReady().then(async () => {
   const close = '.ln-runtime-settings > .ln-surface-title [aria-label="关闭窗口"]'
   const edit = '.ln-runtime-settings textarea'
   const save = '.ln-runtime-settings button[type=submit]'
-  const openCodex = async () => {
+  const openCodex = async (advanced = true) => {
     await click('[aria-label="Codex 连接设置"]')
-    await wait("!!document.querySelector('.ln-runtime-settings textarea:not(:disabled)')")
+    await wait("!!document.querySelector('.ln-runtime-settings input[aria-label=\"设置值 1\"]:not(:disabled)')")
+    if (advanced) {
+      await click('.common-environment-field-actions button:last-child')
+      await wait("!!document.querySelector('.ln-runtime-settings textarea:not(:disabled)')")
+    }
   }
   const report = (ok, extra = {}) => {
     const value = { ok, scope: 'production-react-with-in-memory-transport', realCore: false, realRuntime: false,
@@ -115,7 +119,7 @@ app.whenReady().then(async () => {
     for (const [label, kind] of [['Claude Code', 'claude-code-cli'], ['Codex', 'codex-cli'], ['DSH', 'deepseek-harness'], ['Pi', 'pi']]) {
       stage = 'open ' + kind
       await click('[aria-label="' + label + ' 连接设置"]')
-      await wait("!!document.querySelector('.ln-runtime-settings textarea:not(:disabled)')")
+      await wait("!!document.querySelector('.ln-runtime-settings input[aria-label=\"设置值 1\"]:not(:disabled)')")
       assert(await js(`document.querySelector('.ln-runtime-settings').innerText.includes(${JSON.stringify((kind === 'codex-cli' ? 'Codex CLI' : label) + ' 连接设置')})`))
       assert(await js(`runtimeSettingsQA.calls.some(row => row.method === 'runtime.startup.get' && row.params.runtimeKind === '${kind}')`))
       await click(close)
@@ -125,9 +129,12 @@ app.whenReady().then(async () => {
     assert.equal(await js('runtimeSettingsQA.writes.length'), 0)
 
     stage = 'save and read back'
-    await openCodex()
-    assert.equal(await js(`JSON.parse(document.querySelector('${edit}').value).LOOM_QA_NOTE`), 'initial fixture value')
-    await fill(edit, JSON.stringify({ LOOM_QA_NOTE: 'saved via production editor' }, null, 2))
+    await openCodex(false)
+    const firstValue = '.ln-runtime-settings input[aria-label="设置值 1"]'
+    assert.equal(await js(`document.querySelector('${firstValue}').value`), 'initial fixture value')
+    assert.equal(await js(`document.querySelector('${firstValue}').type`), 'password')
+    assert.equal(await js(`!!document.querySelector('${edit}')`), false)
+    await fill(firstValue, 'saved via production editor')
     await click(save)
     await wait("document.querySelector('.member-editor-save-status')?.textContent.includes('已保存')")
     const firstWrite = await js('runtimeSettingsQA.writes[0]')
@@ -136,9 +143,35 @@ app.whenReady().then(async () => {
     assert.equal(firstWrite.commonEnvironment.expectedRevision, 7)
     assert.deepEqual(JSON.parse(firstWrite.commonEnvironment.json), { LOOM_QA_NOTE: 'saved via production editor' })
     await click(close); await wait("!document.querySelector('.ln-runtime-settings')")
-    await openCodex()
-    assert.equal(await js(`JSON.parse(document.querySelector('${edit}').value).LOOM_QA_NOTE`), 'saved via production editor')
-    cases.push('save uses runtime.startup.save and reopening reads the stored result')
+    await openCodex(false)
+    assert.equal(await js(`document.querySelector('${firstValue}').value`), 'saved via production editor')
+    cases.push('ordinary fields save through runtime.startup.save and reopen without editing JSON')
+
+    stage = 'field values and invalid draft names'
+    await click('[aria-label="显示设置值 1"]')
+    assert.equal(await js(`document.querySelector('${firstValue}').type`), 'text')
+    assert.equal(await js(`document.querySelector('${save}').disabled`), true)
+    await click('[aria-label="隐藏设置值 1"]')
+    assert.equal(await js(`document.querySelector('${firstValue}').type`), 'password')
+    cases.push('values are hidden by default and revealing them neither saves nor dirties settings')
+    await click('.common-environment-field-actions button:first-child')
+    await fill('[aria-label="设置名称 2"]', 'LOOM_QA_NOTE')
+    await fill('[aria-label="设置值 2"]', 'duplicate draft is retained')
+    await click(save)
+    await wait("document.querySelector('.environment-error')?.textContent.includes('变量名重复')")
+    assert.equal(await js('runtimeSettingsQA.writes.length'), 1)
+    assert.equal(await js("document.querySelector('[aria-label=\"设置值 2\"]').value"), 'duplicate draft is retained')
+    await fill('[aria-label="设置名称 2"]', '')
+    await click(save)
+    await wait("document.querySelector('.environment-error')?.textContent.includes('变量名只能')")
+    assert.equal(await js('runtimeSettingsQA.writes.length'), 1)
+    await click('[aria-label="删除设置 2"]')
+    await wait(`document.querySelector('${save}').disabled`)
+    assert.equal(await js('document.querySelectorAll(".common-environment-row").length'), 1)
+    assert.equal(await js('runtimeSettingsQA.writes.length'), 1)
+    cases.push('duplicate and incomplete field names cannot save or discard a draft value; removing a new row restores the saved state')
+    await click('.common-environment-field-actions button:last-child')
+    await wait(`!!document.querySelector('${edit}')`)
 
     stage = 'draft leave guard'
     const draft = JSON.stringify({ LOOM_QA_NOTE: 'unsaved draft stays here' }, null, 2)
@@ -184,6 +217,8 @@ app.whenReady().then(async () => {
     cases.push('version conflict retains edits and explicit resolution uses the updated baseline')
 
     stage = 'responsive themes'
+    await click('.common-environment-field-actions button:last-child')
+    await wait(`!document.querySelector('${edit}')`)
     for (const [width, height] of [[1440, 920], [390, 844]]) for (const theme of ['day', 'night']) {
       win.setContentSize(width, height)
       await js(`runtimeSettingsQA.setTheme('${theme}')`)

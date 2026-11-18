@@ -19,10 +19,33 @@ function fixture(t, chosenRoot) {
   if (chosenRoot) mkdirSync(createdRoot)
   // Windows CI can expose TEMP through an 8.3 alias (RUNNER~1). Match the
   // installer's canonical parent before comparing the chosen data directory.
-  const root = realpathSync(createdRoot)
+  const root = realpathSync.native(createdRoot)
   t.after(() => rmSync(root, { recursive: true, force: true }))
   return { root, install: join(root, 'LOOM programs'), data: join(root, 'personal data') }
 }
+
+test('fixture expands a real Windows 8.3 parent before comparing data directories', { skip: !windows }, t => {
+  const parent = fixture(t)
+  const script = `Add-Type -TypeDefinition 'using System; using System.Text; using System.Runtime.InteropServices;
+public static class LoomFixtureShortPath { [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+public static extern uint GetShortPathName(string path, StringBuilder output, uint size); }';
+$buffer = New-Object System.Text.StringBuilder 32768;
+$size = [LoomFixtureShortPath]::GetShortPathName($env:LOOM_FIXTURE_LONG_PATH, $buffer, 32768);
+if ($size -eq 0 -or $size -ge 32768) { throw 'GetShortPathNameW failed'; }
+$buffer.ToString()`
+  const result = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8', timeout: 30000, windowsHide: true,
+    env: { ...process.env, LOOM_FIXTURE_LONG_PATH: parent.root }
+  })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const alias = result.stdout.trim()
+  if (!alias.includes('~')) return t.skip('This Windows volume does not provide an 8.3 alias')
+  assert.notEqual(alias.toLowerCase(), parent.root.toLowerCase())
+  assert.equal(realpathSync.native(alias).toLowerCase(), parent.root.toLowerCase())
+  const child = fixture(t, join(alias, 'nested fixture'))
+  assert.equal(child.root, join(parent.root, 'nested fixture'))
+  assert.equal(child.data, join(parent.root, 'nested fixture', 'personal data'))
+})
 
 function makePackage(root, letter, contract = { version: 'v1.72', projectionSchema: 184 }) {
   const directory = join(root, 'package-' + letter)
