@@ -1,7 +1,7 @@
 ---
 document_type: development-guide
 authority: isolated-personal-preview-operation
-last_updated: 2026-11-18
+last_updated: 2026-11-17
 ---
 
 # LOOM 个人测试版
@@ -45,6 +45,8 @@ last_updated: 2026-11-18
 标签图标和品牌标记使用已选定的 LOOM 图片，个人助手头像保持独立。Pi 新增 `workspace_read_write` 显式选项，只允许在 Core 选定工作目录内执行原生 read/write/edit；受控模式不开放 shell、MCP、未知工具或任意文件系统访问。这是可信本地主机中的工具权限边界，不是对同一操作系统账号下其他进程的强隔离承诺。
 
 另外的 `workspace_workflow` 是显式选择的受限工作流模式：在文件工具之外，只接入既有的八类 LOOM 业务操作，继续经过 Core 身份、授权、Claim/Fence 和幂等校验，不借此开放任意 shell。它不改变已有只读、读写或 native 模式的默认选择。
+
+带有 `dshHookExecutor` 清单字段的包，还包括 DSH 本地 Hook 执行所需的固定依赖和许可证，位置为 `runtime/dsh-hook-executor`。它使用随包 Node，执行前核对本次任务和依赖文件；不依赖系统里另装或改装的 DSH 执行器。这只说明本地 Hook 执行链，原生 DSH 的模型、会话和工具仍按各自的验收结果判断。
 
 ## 电脑查看与控制
 

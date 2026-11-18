@@ -23,6 +23,9 @@ on:
       - scripts/fixtures/host-web-parity/**
       - scripts/fixtures/loom-*/**
       - scripts/package-embedded-pi.mjs
+      - scripts/package-dsh-hook-executor.mjs
+      - scripts/accept-local-hook-executor.mjs
+      - resources/dsh-hook-executor/**
       - scripts/runtime/pi-source/**
       - scripts/start-loom-personal.cmd
       - scripts/install-loom-personal.cmd
@@ -269,6 +272,24 @@ jobs:
           node scripts/package-embedded-pi.mjs --verify --destination resources/runtime/pi
           if ($LASTEXITCODE -ne 0) { throw 'Pi manifest verification failed' }
 
+      - name: Stage the fixed private DSH Hook executor
+        shell: pwsh
+        run: |
+          node scripts/package-dsh-hook-executor.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed DSH Hook executor staging failed' }
+          node scripts/package-dsh-hook-executor.mjs --verify
+          if ($LASTEXITCODE -ne 0) { throw 'DSH Hook executor closed manifest verification failed' }
+          $hookProofPath = Join-Path $env:RUNNER_TEMP 'loom-hook-executor-evidence.json'
+          node scripts/accept-local-hook-executor.mjs --bundle resources/runtime/dsh-hook-executor --node resources/runtime/pi/node/node.exe --output $hookProofPath
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled Hook executor confinement regression failed' }
+          $hookProof = Get-Content -LiteralPath $hookProofPath -Raw | ConvertFrom-Json
+          if ($hookProof.status -cne 'PASS_PRIVATE_EXECUTOR_ONLY' -or
+              $hookProof.checks.Count -ne 5 -or
+              @($hookProof.checks | Where-Object { $_.status -cne 'PASS' }).Count -ne 0 -or
+              $hookProof.modelCalls -ne 0 -or $hookProof.globalRuntimeModified) {
+            throw 'Bundled Hook executor checks did not all execute'
+          }
+
       - name: Test real guarded Pi + official Host + production Web Electron (E3 only)
         shell: pwsh
         run: |
@@ -336,6 +357,7 @@ jobs:
             humanClickedUI = $false
             mockProvider = $true
             realExternalProvider = $false
+            localHookExecutor = 'PASS_PRIVATE_EXECUTOR_ONLY'
             E4 = 'NOT_RUN'
             E5 = 'NOT_RUN'
             E6 = 'NOT_RUN'
@@ -357,6 +379,12 @@ jobs:
           Copy-Item skills (Join-Path $kit 'skills') -Recurse
           New-Item -ItemType Directory -Path (Join-Path $kit 'runtime') | Out-Null
           Copy-Item resources/runtime/pi (Join-Path $kit 'runtime/pi') -Recurse
+          Copy-Item resources/runtime/dsh-hook-executor (Join-Path $kit 'runtime/dsh-hook-executor') -Recurse
+          node scripts/package-dsh-hook-executor.mjs --verify --destination (Join-Path $kit 'runtime/dsh-hook-executor')
+          if ($LASTEXITCODE -ne 0) { throw 'Copied candidate DSH Hook executor failed verification' }
+          $hookManifestPath = Join-Path $kit 'runtime/dsh-hook-executor/hook-executor-bundle.json'
+          $hookBundle = Get-Content -LiteralPath $hookManifestPath -Raw | ConvertFrom-Json
+          $hookManifestSha = (Get-FileHash -LiteralPath $hookManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
           & ./scripts/package-computer-runtime.ps1 -Destination (Join-Path $kit 'runtime/computer') -CacheDirectory (Join-Path $env:RUNNER_TEMP 'loom-computer-downloads')
           if ($LASTEXITCODE -ne 0) { throw 'Pinned computer runtime staging failed' }
           $computerBundle = Get-Content (Join-Path $kit 'runtime/computer/computer-bundle.json') -Raw | ConvertFrom-Json
@@ -402,6 +430,7 @@ jobs:
             ownerAccepted = $false
             dailyDataIncluded = $false
             computerRuntime = [ordered]@{ python = $computerBundle.pythonVersion; pillow = $computerBundle.pillowVersion }
+            dshHookExecutor = [ordered]@{ dshVersion = $hookBundle.dshVersion; manifestSha256 = $hookManifestSha; treeSha256 = $hookBundle.treeSha256; lockSha256 = $hookBundle.lockSha256; packageCount = $hookBundle.packages.Count }
             embeddedPiVersion = '0.85.1'
             optionalPiPurgeVersion = '0.3.0'
             piPurgeDefaultEnabled = $false
@@ -484,6 +513,18 @@ jobs:
           }
           node scripts/package-embedded-pi.mjs --verify --destination (Join-Path $kit 'runtime/pi')
           if ($LASTEXITCODE -ne 0) { throw 'Delivered Pi closed manifest verification failed' }
+          node scripts/package-dsh-hook-executor.mjs --verify --destination (Join-Path $kit 'runtime/dsh-hook-executor')
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered DSH Hook executor closed manifest verification failed' }
+          $hookPath = Join-Path $kit 'runtime/dsh-hook-executor/hook-executor-bundle.json'
+          $deliveredHook = Get-Content -LiteralPath $hookPath -Raw | ConvertFrom-Json
+          $deliveredHookSha = (Get-FileHash -LiteralPath $hookPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($manifest.dshHookExecutor.manifestSha256 -cne $deliveredHookSha -or
+              $manifest.dshHookExecutor.treeSha256 -cne $deliveredHook.treeSha256 -or
+              $manifest.dshHookExecutor.lockSha256 -cne $deliveredHook.lockSha256 -or
+              $manifest.dshHookExecutor.dshVersion -cne $deliveredHook.dshVersion -or
+              $manifest.dshHookExecutor.packageCount -ne $deliveredHook.packages.Count) {
+            throw 'Delivered Hook provenance does not match the candidate manifest'
+          }
           & ./scripts/package-computer-runtime.ps1 -Verify -Destination (Join-Path $kit 'runtime/computer')
           if ($LASTEXITCODE -ne 0) { throw 'Delivered computer runtime verification failed' }
           node scripts/loom-v2-pi-purge-stage.mjs --verify (Join-Path $kit 'runtime/extensions/pi-purge/upstream')
@@ -502,5 +543,6 @@ jobs:
             ${{ runner.temp }}/loom-v2-e3/e3-tap.txt
             ${{ runner.temp }}/loom-v2-e3/e3-manifest.json
             ${{ runner.temp }}/loom-v2-e3/delivery-manifest.json
+            ${{ runner.temp }}/loom-hook-executor-evidence.json
           if-no-files-found: error
           retention-days: 3

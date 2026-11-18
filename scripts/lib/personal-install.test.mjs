@@ -99,6 +99,42 @@ test('portable launcher rejects a missing manager before attempting to start any
   assert.equal(existsSync(join(f.root, 'isolated-local-data')), false)
 })
 
+test('declared Hook runtime is complete, bound to its manifest, and checked before startup', { skip: !windows }, t => {
+  const f = fixture(t)
+  const pkg = makePackage(f.root, 'a')
+  const manifestPath = join(pkg, 'candidate-manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.dshHookExecutor = { dshVersion: '0.1.5-rc.2', manifestSha256: '0'.repeat(64) }
+  const save = () => writeFileSync(manifestPath, JSON.stringify(manifest))
+  save()
+  const incomplete = run('Install', f.install, ['-PackageDirectory', pkg])
+  assert.notEqual(incomplete.status, 0)
+  assert.match(incomplete.stderr, /DSH Hook runtime is incomplete/)
+  assert.equal(existsSync(f.install), false)
+  for (const name of ['hook-executor-bundle.json', 'executor.mjs', 'verify.mjs', 'package.json', 'package-lock.json', 'THIRD-PARTY-NOTICES.txt']) {
+    const relative = 'runtime/dsh-hook-executor/' + name
+    const value = name.endsWith('.json') ? '{}\n' : 'owned installer fixture: ' + name
+    mkdirSync(dirname(join(pkg, relative)), { recursive: true })
+    writeFileSync(join(pkg, relative), value)
+    manifest.files[relative] = hash(value)
+  }
+  save()
+  const unbound = run('Install', f.install, ['-PackageDirectory', pkg])
+  assert.notEqual(unbound.status, 0)
+  assert.match(unbound.stderr, /DSH Hook manifest does not match/)
+  assert.equal(existsSync(f.install), false)
+  manifest.dshHookExecutor.manifestSha256 = manifest.files['runtime/dsh-hook-executor/hook-executor-bundle.json']
+  save()
+  installPackage(pkg, f)
+  const installed = join(f.install, 'versions', 'a'.repeat(40))
+  assert.equal(readFileSync(join(installed, 'runtime/dsh-hook-executor/THIRD-PARTY-NOTICES.txt'), 'utf8'), 'owned installer fixture: THIRD-PARTY-NOTICES.txt')
+  writeFileSync(join(installed, 'runtime/dsh-hook-executor/executor.mjs'), 'changed after installation')
+  const damaged = run('Start', f.install)
+  assert.notEqual(damaged.status, 0)
+  assert.match(damaged.stderr, /Damaged program file: runtime\/dsh-hook-executor\/executor\.mjs/)
+  assert.equal(existsSync(f.data), false, 'a rejected package must not start its Server or create data')
+})
+
 test('install, upgrade and compatible rollback keep data and both program versions', { skip: !windows }, t => {
   const f = fixture(t)
   const a = makePackage(f.root, 'a')

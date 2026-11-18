@@ -100,11 +100,27 @@ function Verify-Package([string]$Root, [switch]$InstalledStart) {
             if (-not $allowed.Contains($required)) { throw "Computer runtime is incomplete: $required" }
         }
     }
+    if ($manifest.ContainsKey('dshHookExecutor')) {
+        $hook = $manifest.dshHookExecutor
+        foreach ($required in @('runtime/dsh-hook-executor/hook-executor-bundle.json',
+            'runtime/dsh-hook-executor/executor.mjs', 'runtime/dsh-hook-executor/verify.mjs',
+            'runtime/dsh-hook-executor/package.json', 'runtime/dsh-hook-executor/package-lock.json',
+            'runtime/dsh-hook-executor/THIRD-PARTY-NOTICES.txt')) {
+            if (-not $allowed.Contains($required)) { throw "DSH Hook runtime is incomplete: $required" }
+        }
+        if ($hook.manifestSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $hook.manifestSha256 -cne $manifest.files.'runtime/dsh-hook-executor/hook-executor-bundle.json') {
+            throw 'DSH Hook manifest does not match the package file list.'
+        }
+    }
     if ($InstalledStart) {
         # The whole closure was verified before activation. Recheck entry
         # points on launch without rereading thousands of Pi dependency files.
         $entries = @('rovai-server.exe', 'rovai-core.exe', 'rovai.exe', 'web-ui/index.html') +
-            @($allowed | Where-Object { $_.StartsWith('runtime/computer/', [StringComparison]::Ordinal) })
+            @($allowed | Where-Object { $_.StartsWith('runtime/computer/', [StringComparison]::Ordinal) }) +
+            @($allowed | Where-Object {
+                $_ -match '^runtime/dsh-hook-executor/(hook-executor-bundle\.json|executor\.mjs|verify\.mjs|package(?:-lock)?\.json|THIRD-PARTY-NOTICES\.txt)$'
+            })
         foreach ($relative in $entries) {
             $file = Resolve-Directory (Join-Path $Root $relative)
             if ((File-Hash $file) -cne $manifest.files.$relative) { throw "Damaged program file: $relative" }
