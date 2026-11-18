@@ -20,6 +20,18 @@ test('V2 E3 Windows CI is opt-in/PR only with read-only repository access', () =
   assert.match(workflow, /runs-on: windows-2022/)
 })
 
+test('V2 E3 runs the same-source managed workflow CLI owner without an optional skip', () => {
+  const gate = workflow.split('      - name: Verify same-source managed workflow CLI through real processes')[1]?.split('      - name:')[0]
+  assert.ok(gate, 'the real CLI owner must be a dedicated post-build gate')
+  assert.ok(workflow.indexOf('cargo build --locked') < workflow.indexOf('name: Verify same-source managed workflow CLI through real processes'))
+  assert.match(gate, /LOOM_MANAGED_WORKFLOW_CLI = \(Resolve-Path 'target\/debug\/rovai\.exe' -ErrorAction Stop\)\.Path/)
+  assert.match(gate, /Remove-Item Env:LOOM_MANAGED_WORKFLOW_BASELINE_CLI -ErrorAction SilentlyContinue/)
+  assert.match(gate, /node --test --test-reporter=tap scripts\/lib\/loom-workflow-cli\.test\.mjs/)
+  assert.match(gate, /\$workflowCliExit -ne 0/)
+  for (const count of ['# tests 1', '# pass 1', '# fail 0', '# skipped 0']) assert.ok(gate.includes(count))
+  assert.doesNotMatch(gate, /continue-on-error|if:.*false/)
+})
+
 test('V2 E3 CI pins versions and isolates both native Host and managed Pi', () => {
   assert.match(workflow, /node-version: 24\.14\.1/)
   assert.match(workflow, /pnpm@11\.20\.0/)

@@ -156,6 +156,20 @@ jobs:
             } finally { $reader.Dispose(); $stream.Dispose() }
           }
 
+      - name: Verify same-source managed workflow CLI through real processes
+        shell: pwsh
+        run: |
+          $env:LOOM_MANAGED_WORKFLOW_CLI = (Resolve-Path 'target/debug/rovai.exe' -ErrorAction Stop).Path
+          Remove-Item Env:LOOM_MANAGED_WORKFLOW_BASELINE_CLI -ErrorAction SilentlyContinue
+          $workflowCliTap = Join-Path $env:RUNNER_TEMP 'loom-workflow-cli-tap.txt'
+          node --test --test-reporter=tap scripts/lib/loom-workflow-cli.test.mjs 2>&1 | Tee-Object -FilePath $workflowCliTap
+          $workflowCliExit = $LASTEXITCODE
+          if ($workflowCliExit -ne 0) { throw 'Same-source managed workflow CLI regression failed' }
+          $workflowCliResult = Get-Content -LiteralPath $workflowCliTap -Raw
+          foreach ($expected in @('# tests 1', '# pass 1', '# fail 0', '# skipped 0')) {
+            if ($workflowCliResult -notmatch ('(?m)^' + [regex]::Escape($expected) + '\s*$')) { throw 'Managed workflow CLI owner did not run exactly once without skips' }
+          }
+
       - name: Reject native Codex sandbox disagreement before model dispatch
         shell: pwsh
         run: |
