@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import type { LoomClaim } from '@contracts'
 import type { ArtifactSelection, WorkBundle } from './types'
 import { Icon } from './icons'
+import { artifactCandidateFacts, artifactVersionLabel } from './artifact-service'
 import { agentRunWaitDetail } from '../../../shared/execution-presentation'
 import { uiAttribute } from '../interface-language'
 import { claimLeaseState, type V2ReadState, type V2RunFacts, type V2StatusFact, type V2UnavailableReason } from './v2-run-service'
@@ -15,8 +16,8 @@ function reasonText(reason: V2UnavailableReason): string {
     method_unsupported: '当前主机版本不支持读取认领信息',
     interface_not_available: '该扩展记录暂不可用',
     no_candidate: '尚未关联候选成果',
-    thread_mismatch: '对话与工作不匹配，未混用记录',
-    mission_mismatch: '工作标识不匹配，未读取其他工作的记录',
+    thread_mismatch: '对话已变化，请刷新',
+    mission_mismatch: '工作已变化，请刷新',
     mission_required: '请先选择一项工作'
   }
   return uiAttribute(labels[reason] ?? '这项记录暂不可用')
@@ -45,6 +46,14 @@ function leaseLabel(claim:LoomClaim): string {
   return label(claimLeaseState(claim), { held:'认领有效',expired:'认领已过期',released:'认领已释放' })
 }
 function fileName(path:string): string { return path.split(/[\\/]/u).filter(Boolean).pop() ?? path }
+function blockedText(reason:string): string {
+  return uiAttribute(({
+    'loom.rework_budget_exhausted':'已达到返工次数上限，仍未通过审核。可在下方调整上限后继续。',
+    'loom.dispatch_budget_exhausted':'已达到执行次数上限。可在下方调整上限后继续。',
+    'loom.dispatch_previous_outcome_unknown':'上次执行结果尚未确认，暂时无法继续。请先查看执行记录。',
+    'loom.dispatch_recipient_unavailable':'负责的助手暂时无法运行，请检查它的运行设置。'
+  } as Record<string,string>)[reason] ?? reason)
+}
 
 export function V2BotStatusPanel({ facts, bundle, onArtifact }: {
   facts:V2RunFacts; bundle:WorkBundle; onArtifact(selection:ArtifactSelection):void
@@ -59,6 +68,8 @@ export function V2BotStatusPanel({ facts, bundle, onArtifact }: {
   const titles = new Map(facts.workers.map(worker => [worker.taskId, worker.title]))
   const runs = facts.runs.status === 'observed' ? facts.runs.value : []
   const lead = facts.lead.status === 'observed' ? facts.lead.value : null
+  const artifacts = facts.artifacts.map(entry => ({ entry, context: artifactCandidateFacts(bundle, entry.artifact, entry.candidate) }))
+    .sort((left, right) => Number(right.context.latest) - Number(left.context.latest))
   return <section className="ln-run-panel" aria-label={uiAttribute('运行与成果概览')} data-mission-id={facts.missionId}>
     <div className="ln-run-goal">
       <div className="ln-run-line"><h2>{facts.goal.mission.title}</h2><span className="ln-run-badge">{goalLabel(facts.goal.mission.status)}</span></div>
@@ -69,12 +80,11 @@ export function V2BotStatusPanel({ facts, bundle, onArtifact }: {
     </div>
 
     <Group title={uiAttribute('成果')}>
-      <p className="ln-run-hint">{uiAttribute('打开文件查看正文与审阅记录。打开不会自动接受成果。')}</p>
-      {facts.artifacts.length === 0 ? <p className="ln-run-empty">{uiAttribute('尚无已登记成果。执行完成不等于成果已经交付。')}</p>
-        : <ul className="ln-run-list">{facts.artifacts.map(entry => <li key={entry.artifact.artifactId} className="ln-run-artifact" data-artifact-id={entry.artifact.artifactId}>
+      {facts.artifacts.length === 0 ? <p className="ln-run-empty">{uiAttribute('还没有成果文件。')}</p>
+        : <ul className="ln-run-list">{artifacts.map(({ entry, context }) => <li key={entry.artifact.artifactId} className="ln-run-artifact" data-artifact-id={entry.artifact.artifactId}>
           <button type="button" className="ln-run-file" aria-label={uiAttribute('打开产物：') + fileName(entry.artifact.relativePath)}
             onClick={()=>onArtifact({ artifact:entry.artifact,candidate:entry.candidate,bundle })}>
-            <Icon name="file" size={21}/><span><strong>{fileName(entry.artifact.relativePath)}</strong><small>{uiAttribute('已登记 · ')}{resolveName(entry.artifact.creatorId)}</small></span><Icon name="right" size={15}/>
+            <Icon name="file" size={21}/><span><strong>{fileName(entry.artifact.relativePath)}</strong><small>{artifactVersionLabel(context) ?? uiAttribute('已登记')} · {resolveName(entry.artifact.creatorId)}</small></span><Icon name="right" size={15}/>
           </button>
           <dl className="ln-run-facts">
             <div data-fact="verification"><dt>{uiAttribute('技术核验')}</dt><dd>{statusText(entry.verification,v=>uiAttribute(v.result==='passed'?'已通过':'未通过'),'未核验')}</dd></div>
@@ -91,12 +101,11 @@ export function V2BotStatusPanel({ facts, bundle, onArtifact }: {
           const claim = worker.claim.status==='observed' ? worker.claim.value : null
           const activeClaim = claim !== null && claimLeaseState(claim)==='held'
           return <li key={worker.taskId} className="ln-run-task" data-task-id={worker.taskId}>
-            <div className="ln-run-line"><strong>{worker.title}</strong><span className="ln-run-badge">{taskLabel(worker.status)}</span></div>
+            <div className="ln-run-line"><strong>{worker.title}</strong><span className="ln-run-badge">{worker.blockedReason ? uiAttribute('需要处理') : taskLabel(worker.status)}</span></div>
             <p className="ln-run-meta">{uiAttribute('负责：')}{resolveName(worker.assigneeAgentId)}
-              {claim && <span> · {leaseLabel(claim)}{activeClaim && ' · '+uiAttribute('认领者：')+resolveName(claim.claimantAgentId)}</span>}
-              {worker.claim.status==='observed' && claim===null && <span> · {uiAttribute('暂无认领记录')}</span>}
+              {activeClaim && claim.claimantAgentId!==worker.assigneeAgentId && <span> · {uiAttribute('正在处理：')}{resolveName(claim.claimantAgentId)}</span>}
             </p>
-            {worker.blockedReason && <p className="ln-run-note">{worker.blockedReason}</p>}
+            {worker.blockedReason && <p className="ln-run-note" role="status">{blockedText(worker.blockedReason)}</p>}
           </li>
         })}</ul>}
     </Group>
@@ -112,15 +121,15 @@ export function V2BotStatusPanel({ facts, bundle, onArtifact }: {
     </Group>
 
     <details className="ln-run-diagnostics"><summary>{uiAttribute('来源与诊断')}</summary>
-      <p>{uiAttribute('这里只展示当前工作已有的主机记录，不推断模型来源、能力调用或完整交付。执行、核验、评审和用户接受分别读取，不相互代替。')}</p>
       <dl><div><dt>{uiAttribute('工作')}</dt><dd>{facts.missionId}</dd></div>
         <div><dt>{uiAttribute('认领读取')}</dt><dd>{facts.claims.status}{facts.claims.status==='unavailable' ? ' / '+facts.claims.reason : ''}</dd></div>
         {facts.claims.status==='observed' && <div><dt>{uiAttribute('主机判定时间')}</dt><dd>{facts.claims.value.evaluatedAt}</dd></div>}
         {Object.entries(facts.pendingInterfaces).map(([name,state])=><div key={name}><dt>{name}</dt><dd>{state.status+' / '+state.reason}</dd></div>)}
       </dl>
-      {facts.claims.status==='observed' && facts.claims.value.claims.length===0 && <p>{uiAttribute('主机返回空认领列表；不据此推断助手空闲或没有执行。')}</p>}
+      {facts.claims.status==='observed' && facts.claims.value.claims.length===0 && <p>{uiAttribute('主机返回空认领列表')}</p>}
       {facts.claims.status==='observed' && facts.claims.value.claims.map(claim=><p key={claim.claimId}>{uiAttribute('任务：')}{claim.taskId} · {uiAttribute('认领者：')}{claim.claimantAgentId ?? uiAttribute('未记录')} · {leaseLabel(claim)} · {uiAttribute('代次：')}{claim.fenceGeneration}</p>)}
       {runs.map(run=><p key={run.agentRunId}>{uiAttribute('执行：')}{run.agentRunId}{run.status==='waiting' && run.waitReason ? ' · '+run.waitReason : ''}</p>)}
+      {facts.workers.filter(worker=>worker.blockedReason).map(worker=><p key={worker.taskId}>{worker.title} · {worker.blockedReason}</p>)}
       {facts.artifacts.map(entry=><p key={entry.artifact.artifactId}>{fileName(entry.artifact.relativePath)} · sha256 {entry.artifact.sha256}</p>)}
     </details>
   </section>

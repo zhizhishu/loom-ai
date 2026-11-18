@@ -29,6 +29,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { delimiter, dirname, join, resolve, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
+import { candidateLineage, stageReviewForCandidate, taskDeliveryOutcomes } from './lib/loom-chain-outcome.mjs'
 
 import {
   readPiBundleManifest,
@@ -230,10 +231,13 @@ export function buildMissionDescription ({ workers, acceptanceMarker = ACCEPTANC
     '本描述不指定。',
     '本轮的边界（用户要求）：你只建包含两个交付任务的计划；本轮不要 release，不要 agent.send，',
     '阶段评审与返工由 Core 接力完成，因此不要为它们建独立任务；完成 plan 后停下来等待用户批准。',
-    `每个交付文件的正文必须包含一行 ${acceptanceMarker}，并且必须由产出它的执行成员自己完成证据登记与提交。`,
-    `评审规则（用户要求）：评审第一轮必须提出 1 个明确改进要求——交付文件必须新增一行 ${revisionMarker}；`,
-    `首版不得包含 ${revisionMarker}。评审收到修改后的新交付时，必须实际读取文件、确认 ${revisionMarker} 存在，`,
-    '才可以给出 pass。',
+    `最终交付的验收条件：每个交付文件正文必须同时包含独立的 ${acceptanceMarker} 和 ${revisionMarker} 两行，`,
+    '并且必须由该执行成员自己完成证据登记与提交。计划中的每个任务应把这两项列作最终验收条件，',
+    `不能把“首稿没有 ${revisionMarker}”写成已满足的最终验收条件。`,
+    `用户另要求首轮必须真实返工：执行成员交首稿时仅写 ${acceptanceMarker}，不得提前写 ${revisionMarker}，`,
+    `所以第一次独立阶段审查应因缺少最终条件 ${revisionMarker} 而明确要求修改；`,
+    `该成员收到返工请求后，应在首稿的同一文件中新增 ${revisionMarker}，保持原路径并重新提交；评审必须重新读取新版本且核对证据，`,
+    '全部满足最终验收条件后才可以给出 pass。',
     '任何成员都不得替代用户接受交付，也不得声称用户已经验收。'
   ].join('')
 }
@@ -298,186 +302,193 @@ export function verifyArchivedArtifact ({ registered, preview } = {}) {
  * Derive every success condition from persisted Core facts only. Nothing here reads a model
  * message, and nothing is inferred from a receipt that was not persisted by Core.
  *
- * `fileTexts` must come from archived previews, never from the workspace: a later legitimate
- * workspace edit must not be able to re-judge an older candidate.
+ * Text comes from each primary artifact's verified archived preview. Supporting evidence and
+ * later workspace edits must not be able to re-judge the delivery's archived bytes.
  */
 export function summarizeLeadChain ({
-  plan = null,
-  tasks = [],
-  candidates = [],
-  artifacts = [],
-  claims = [],
-  control = null,
-  runs = [],
-  ownerReviews = [],
-  workerAgentIds = [],
-  acceptanceMarker = ACCEPTANCE_MARKER,
-  revisionMarker = REVISION_MARKER,
-  fileTexts = {},
-  archiveChecks = {},
-  policyApprovedAt = null
+  plan = null, tasks = [], candidates = [], artifacts = [], claims = [], control = null,
+  runs = [], ownerReviews = [], workerAgentIds = [], expectedTaskIds = null,
+  acceptanceMarker = ACCEPTANCE_MARKER, revisionMarker = REVISION_MARKER,
+  archiveChecks = {}, policyApprovedAt = null
 } = {}) {
   const reasons = []
   const stageReviews = Array.isArray(control?.stageReviews) ? control.stageReviews : []
   const dispatches = Array.isArray(control?.dispatches) ? control.dispatches : []
-  const runById = new Map((runs ?? []).map((run) => [run.id, run]))
-  const candidatesByTask = new Map()
-  for (const candidate of candidates ?? []) {
-    if (!candidatesByTask.has(candidate.taskId)) candidatesByTask.set(candidate.taskId, [])
-    candidatesByTask.get(candidate.taskId).push(candidate)
+  const runById = new Map(runs.map(run => [run.id, run]))
+  const artifactById = new Map(artifacts.map(artifact => [artifact.artifactId, artifact]))
+  const authorizationRevision = control?.policy?.authorizationRevision ?? null
+  const taskIds = expectedTaskIds ?? control?.policy?.taskIds
+    ?? tasks.filter(task => workerAgentIds.includes(task.assigneeAgentId)).map(task => task.taskId)
+  const outcome = taskDeliveryOutcomes({
+    taskIds, tasks, candidates, stageReviews, dispatches, authorizationRevision
+  })
+  reasons.push(...outcome.reasons)
+  const scopedTasks = tasks.filter(task => taskIds.includes(task.taskId))
+  if (taskIds.length !== 2 || new Set(taskIds).size !== 2
+    || workerAgentIds.length !== 2 || new Set(workerAgentIds).size !== 2
+    || !workerAgentIds.every(id => scopedTasks.filter(task => task.assigneeAgentId === id).length === 1)) {
+    reasons.push('approved_scope_did_not_assign_one_task_to_each_worker')
   }
 
-  const leadRuns = (runs ?? []).filter((run) => !workerAgentIds.includes(run.agentId))
-  const leadRunSucceeded = leadRuns.some((run) => run.status === 'succeeded')
-  if (!leadRunSucceeded) reasons.push('lead_run_not_succeeded')
-
-  const planAuthoredByModel = Boolean(plan && plan.planId)
+  const leadRuns = runs.filter(run => !workerAgentIds.includes(run.agentId))
+  if (!leadRuns.some(run => run.status === 'succeeded')) reasons.push('lead_run_not_succeeded')
+  const planAuthoredByModel = Boolean(plan?.planId)
   if (!planAuthoredByModel) reasons.push('plan_not_authored')
 
-  const workerReports = (workerAgentIds ?? []).map((agentId) => {
-    const workerRuns = (runs ?? []).filter((run) => run.agentId === agentId)
-    const ownCandidates = (candidates ?? []).filter((candidate) =>
-      workerRuns.some((run) => run.id === candidate.agentRunId))
-    const ownArtifacts = (artifacts ?? []).filter((artifact) => artifact.creatorId === agentId)
-    const latest = ownCandidates
-      .slice()
-      .sort((left, right) => String(left.createdAt ?? '').localeCompare(String(right.createdAt ?? '')))
-      .at(-1) ?? null
+  const workerReports = workerAgentIds.map(agentId => {
+    const workerRuns = runs.filter(run => run.agentId === agentId)
+    const task = scopedTasks.find(row => row.assigneeAgentId === agentId)
+    const ownCandidates = candidates.filter(candidate => candidate.taskId === task?.taskId
+      && runById.get(candidate.agentRunId)?.agentId === agentId)
+    const latest = candidateLineage(candidates, task?.taskId).latest
     return {
-      agentId,
-      runIds: workerRuns.map((run) => run.id),
-      candidateIds: ownCandidates.map((candidate) => candidate.candidateId),
-      artifactIds: ownArtifacts.map((artifact) => artifact.artifactId),
+      agentId, runIds: workerRuns.map(run => run.id),
+      candidateIds: ownCandidates.map(candidate => candidate.candidateId),
+      artifactIds: artifacts.filter(artifact => artifact.creatorId === agentId).map(artifact => artifact.artifactId),
       latestCandidateId: latest?.candidateId ?? null,
-      candidatesOwnedByRun: ownCandidates.length > 0
-        && ownCandidates.every((candidate) => runById.get(candidate.agentRunId)?.agentId === agentId)
+      candidatesOwnedByRun: Boolean(latest) && runById.get(latest.agentRunId)?.agentId === agentId
+        && runById.get(latest.agentRunId)?.status === 'succeeded'
     }
   })
   const bothWorkersSubmitted = workerReports.length === 2
-    && workerReports.every((report) => report.candidatesOwnedByRun && report.latestCandidateId)
+    && workerReports.every(report => report.candidatesOwnedByRun && report.latestCandidateId)
   if (!bothWorkersSubmitted) reasons.push('workers_did_not_submit_their_own_candidates')
 
-  const claimsAreCoreOwned = (claims ?? []).every((claim) =>
-    (workerAgentIds ?? []).includes(claim.claimantAgentId)
-      && runById.has(claim.agentRunId))
-  if (!(claims ?? []).length) reasons.push('no_claim_recorded')
+  const claimsAreCoreOwned = claims.every(claim => workerAgentIds.includes(claim.claimantAgentId)
+    && runById.get(claim.agentRunId)?.agentId === claim.claimantAgentId)
+  if (claims.length === 0) reasons.push('no_claim_recorded')
+  if (!claimsAreCoreOwned) reasons.push('claim_run_owner_mismatch')
 
-  // One task must show: request_changes on v1 → a chained v2 candidate → pass on v2.
+  const separateReview = (review, candidate) => {
+    const producer = runById.get(candidate?.agentRunId)
+    const reviewer = runById.get(review?.reviewerAgentRunId)
+    return Boolean(producer && reviewer && review?.reviewerAgentId
+      && producer.status === 'succeeded' && reviewer.status === 'succeeded'
+      && review.reviewerAgentId === reviewer.agentId
+      && review.reviewerAgentId !== producer.agentId
+      && review.reviewerAgentRunId !== candidate.agentRunId)
+  }
+  // This acceptance asks each Worker for one deliverable file. A candidate may also cite
+  // historical supporting evidence; only evidence made by this candidate's own Task/Run
+  // can prove its primary output or supply the required file-body markers.
+  const primaryFor = (candidate, task, label) => {
+    const primary = [...new Set(candidate?.evidenceIds ?? [])]
+      .map(id => artifactById.get(id))
+      .filter(artifact => artifact && artifact.taskId === task.taskId
+        && artifact.agentRunId === candidate.agentRunId && artifact.creatorId === task.assigneeAgentId)
+    if (primary.length !== 1) {
+      reasons.push('task:' + task.taskId + ':' + label + '_primary_artifact_' + (primary.length === 0 ? 'missing' : 'ambiguous'))
+      return null
+    }
+    const artifact = primary[0]
+    const archive = archiveChecks[artifact.artifactId]
+    if (archive?.ok !== true) reasons.push('task:' + task.taskId + ':' + label + '_archive_unverified')
+    return { artifact, archive, text: archive?.ok === true ? archive.text : null }
+  }
   const reworkedTasks = []
-  for (const [taskId, taskCandidates] of candidatesByTask) {
-    const ordered = taskCandidates
-      .slice()
-      .sort((left, right) => String(left.createdAt ?? '').localeCompare(String(right.createdAt ?? '')))
-    if (ordered.length < 2) continue
-    const chained = ordered.some((candidate) => ordered.some((other) => other.candidateId === candidate.previousCandidateId))
-    const reviews = stageReviews
-      .filter((review) => review.taskId === taskId)
-      .sort((left, right) => String(left.reviewedAt ?? '').localeCompare(String(right.reviewedAt ?? '')))
-    const firstChange = reviews.find((review) => review.verdict === 'request_changes') ?? null
-    const laterPass = reviews.find((review) =>
-      review.verdict === 'pass'
-        && firstChange
-        && String(review.reviewedAt ?? '') >= String(firstChange.reviewedAt ?? '')) ?? null
-    if (!firstChange || !laterPass || !chained) continue
-    const firstCandidate = ordered[0]
-    const secondCandidate = ordered.find((candidate) => candidate.previousCandidateId === firstCandidate.candidateId)
-    if (!secondCandidate) continue
-    const firstText = fileTexts[firstCandidate.candidateId] ?? null
-    const secondText = fileTexts[secondCandidate.candidateId] ?? null
-    const producerAgentId = runById.get(firstCandidate.agentRunId)?.agentId ?? null
-    const reviewerRunAgentId = runById.get(firstChange.reviewerAgentRunId)?.agentId ?? null
+  const reviewedArtifactIds = []
+  for (const task of scopedTasks) {
+    const { ordered, latest } = candidateLineage(candidates, task.taskId)
+    const finalReview = stageReviewForCandidate(latest, stageReviews, authorizationRevision)
+    const taskResult = outcome.outcomes.find(row => row.taskId === task.taskId)
+    if (!latest) continue
+    if (runById.get(latest.agentRunId)?.agentId !== task.assigneeAgentId) {
+      reasons.push('task:' + task.taskId + ':latest_candidate_owner_mismatch')
+    }
+    if (finalReview && !separateReview(finalReview, latest)) reasons.push('reviewer_not_separate')
+    const finalPrimary = primaryFor(latest, task, 'latest')
+    const finalText = finalPrimary?.text
+    const finalMarkersPresent = typeof finalText === 'string'
+      && finalText.includes(acceptanceMarker) && finalText.includes(revisionMarker)
+    if (!finalMarkersPresent) reasons.push('task:' + task.taskId + ':latest_acceptance_markers_missing')
+    if (taskResult?.passed && separateReview(finalReview, latest)
+      && finalPrimary?.archive?.ok === true && finalMarkersPresent) {
+      reviewedArtifactIds.push(finalPrimary.artifact.artifactId)
+    }
+
+    // First and latest are selected by the immutable candidate chain, never timestamps.
+    const firstCandidate = ordered.length > 1 ? ordered[0] : null
+    const firstReview = stageReviewForCandidate(firstCandidate, stageReviews, authorizationRevision)
+    if (!firstCandidate || firstReview?.verdict !== 'request_changes' || finalReview?.verdict !== 'pass') continue
+    const firstPrimary = primaryFor(firstCandidate, task, 'first')
+    const firstText = firstPrimary?.text
+    const primaryPathPreserved = typeof firstPrimary?.artifact.relativePath === 'string'
+      && firstPrimary.artifact.relativePath.length > 0
+      && firstPrimary.artifact.relativePath === finalPrimary?.artifact.relativePath
+    const distinctArtifactVersions = Boolean(firstPrimary && finalPrimary
+      && firstPrimary.artifact.artifactId !== finalPrimary.artifact.artifactId)
+    if (firstPrimary && finalPrimary && !primaryPathPreserved) reasons.push('task:' + task.taskId + ':rework_changed_primary_path')
+    if (firstPrimary && finalPrimary && !distinctArtifactVersions) reasons.push('task:' + task.taskId + ':rework_reused_primary_artifact')
+    const reworkDispatch = dispatches.some(row => row.taskId === task.taskId && row.kind === 'rework'
+      && row.candidateId === firstCandidate.candidateId && row.status === 'settled'
+      && (authorizationRevision == null || row.policyRevision === authorizationRevision))
     reworkedTasks.push({
-      taskId,
-      firstCandidateId: firstCandidate.candidateId,
-      secondCandidateId: secondCandidate.candidateId,
-      firstReviewVerdict: firstChange.verdict,
-      secondReviewVerdict: laterPass.verdict,
-      firstReviewerAgentId: firstChange.reviewerAgentId ?? null,
-      secondReviewerAgentId: laterPass.reviewerAgentId ?? null,
-      producerAgentId,
-      reviewerRunAgentId,
-      // A reviewer must be a different member, in a different Run, from the producer.
-      reviewerIsSeparate: Boolean(firstChange.reviewerAgentId)
-        && reviewerRunAgentId !== null
-        && firstChange.reviewerAgentId !== producerAgentId
-        && reviewerRunAgentId !== producerAgentId,
-      firstCandidateLackedRevisionMarker: firstText === null ? null : !String(firstText).includes(revisionMarker),
-      secondCandidateHasRevisionMarker: secondText === null ? null : String(secondText).includes(revisionMarker),
-      firstCandidateHasAcceptanceMarker: firstText === null ? null : String(firstText).includes(acceptanceMarker),
-      secondCandidateHasAcceptanceMarker: secondText === null ? null : String(secondText).includes(acceptanceMarker)
+      taskId: task.taskId, firstCandidateId: firstCandidate.candidateId, secondCandidateId: latest.candidateId,
+      firstReviewVerdict: firstReview.verdict, secondReviewVerdict: finalReview.verdict,
+      firstReviewerAgentId: firstReview.reviewerAgentId, secondReviewerAgentId: finalReview.reviewerAgentId,
+      producerAgentId: runById.get(firstCandidate.agentRunId)?.agentId ?? null,
+      reviewerRunAgentId: runById.get(firstReview.reviewerAgentRunId)?.agentId ?? null,
+      reviewerIsSeparate: separateReview(firstReview, firstCandidate) && separateReview(finalReview, latest),
+      firstArtifactId: firstPrimary?.artifact.artifactId ?? null,
+      secondArtifactId: finalPrimary?.artifact.artifactId ?? null,
+      firstRelativePath: firstPrimary?.artifact.relativePath ?? null,
+      secondRelativePath: finalPrimary?.artifact.relativePath ?? null,
+      firstArchiveVerified: firstPrimary?.archive?.ok === true,
+      primaryPathPreserved, distinctArtifactVersions,
+      firstCandidateLackedRevisionMarker: typeof firstText === 'string' && !firstText.includes(revisionMarker),
+      secondCandidateHasRevisionMarker: typeof finalText === 'string' && finalText.includes(revisionMarker),
+      firstCandidateHasAcceptanceMarker: typeof firstText === 'string' && firstText.includes(acceptanceMarker),
+      secondCandidateHasAcceptanceMarker: typeof finalText === 'string' && finalText.includes(acceptanceMarker),
+      reworkDispatchSettled: reworkDispatch
     })
   }
-  const reworkObserved = reworkedTasks.length > 0
-    && reworkedTasks.some((entry) => entry.firstCandidateLackedRevisionMarker === true
-      && entry.secondCandidateHasRevisionMarker === true)
+  const reworkObserved = taskIds.length === 2 && taskIds.every(taskId => reworkedTasks.some(entry =>
+    entry.taskId === taskId && entry.firstCandidateLackedRevisionMarker
+      && entry.secondCandidateHasRevisionMarker && entry.firstCandidateHasAcceptanceMarker
+      && entry.secondCandidateHasAcceptanceMarker && entry.reworkDispatchSettled
+      && entry.firstArchiveVerified && entry.primaryPathPreserved && entry.distinctArtifactVersions))
   if (!reworkObserved) reasons.push('rework_not_observed')
-  if (reworkedTasks.some((entry) => entry.reviewerIsSeparate === false)) reasons.push('reviewer_not_separate')
+  if (reworkedTasks.some(entry => !entry.reviewerIsSeparate)) reasons.push('reviewer_not_separate')
 
-  // Archived bytes that no longer verify make the review unverifiable. The workspace is never
-  // consulted here: it may legitimately drift after the archive row was written.
-  const archiveFailures = Object.values(archiveChecks ?? {}).filter((check) => check?.ok !== true)
+  const archiveFailures = Object.values(archiveChecks).filter(check => check?.ok !== true)
   for (const failure of archiveFailures) {
     for (const reason of failure?.reasons ?? []) if (typeof reason === 'string') reasons.push(reason)
   }
   if (archiveFailures.length > 0) reasons.push('archive_verification_failed')
-
-  // Core must be the one that starts the Workers after the Owner approval (`EXECUTE` dispatch).
-  const executeDispatches = dispatches.filter((entry) => String(entry.kind ?? '') === 'execute')
+  const executeDispatches = dispatches.filter(entry => entry.kind === 'execute')
   if (executeDispatches.length === 0) reasons.push('core_execute_dispatch_missing')
   const approvedAtMs = typeof policyApprovedAt === 'string' && policyApprovedAt !== ''
-    ? Date.parse(policyApprovedAt)
-    : Number.NaN
-  const workersStartedBeforeApproval = Number.isNaN(approvedAtMs)
-    ? null
-    : (runs ?? []).some((run) => workerAgentIds.includes(run.agentId)
-      && typeof run.startedAt === 'string'
-      && !Number.isNaN(Date.parse(run.startedAt))
-      && Date.parse(run.startedAt) < approvedAtMs)
+    ? Date.parse(policyApprovedAt) : Number.NaN
+  const workersStartedBeforeApproval = Number.isNaN(approvedAtMs) ? null : runs.some(run =>
+    workerAgentIds.includes(run.agentId) && typeof run.startedAt === 'string'
+      && !Number.isNaN(Date.parse(run.startedAt)) && Date.parse(run.startedAt) < approvedAtMs)
   if (workersStartedBeforeApproval === true) reasons.push('workers_started_before_approval')
-
   const ownerReviewCount = Array.isArray(ownerReviews) ? ownerReviews.length : -1
   if (ownerReviewCount !== 0) reasons.push('owner_review_not_zero')
-
-  const dispatchKinds = [...new Set(dispatches.map((entry) => String(entry.kind ?? '')))]
-  // `execute` is judged above with its own reason, so it is not repeated here.
+  const dispatchKinds = [...new Set(dispatches.map(entry => String(entry.kind ?? '')))]
   for (const required of ['review', 'rework']) {
-    if (!dispatchKinds.includes(required)) reasons.push(`dispatch_kind_missing:${required}`)
+    if (!dispatchKinds.includes(required)) reasons.push('dispatch_kind_missing:' + required)
   }
-
-  const tasksInReview = (tasks ?? [])
-    .filter((task) => workerReports.some((report) =>
-      (candidatesByTask.get(task.taskId) ?? []).some((candidate) => report.runIds.includes(candidate.agentRunId))))
-    .map((task) => ({ taskId: task.taskId, status: task.status }))
-  const passesNeverAccepted = tasksInReview.every((task) => task.status !== 'done')
+  const tasksInReview = scopedTasks.map(task => ({ taskId: task.taskId, status: task.status }))
+  const passesNeverAccepted = tasksInReview.every(task => task.status !== 'done')
   if (!passesNeverAccepted) reasons.push('host_or_model_accepted_a_delivery')
-
-  const failedRuns = (runs ?? []).filter((run) => ['failed', 'cancelled'].includes(run.status))
+  const failedRuns = runs.filter(run => ['failed', 'cancelled'].includes(run.status))
   if (failedRuns.length > 0) reasons.push('a_run_failed')
-
-  const pendingDispatches = dispatches.filter((entry) =>
-    PENDING_DISPATCH_STATUSES.includes(String(entry.status ?? '').toLowerCase()))
+  const pendingDispatches = dispatches.filter(entry => taskIds.includes(entry.taskId)
+    && (authorizationRevision == null || entry.policyRevision === authorizationRevision)
+    && PENDING_DISPATCH_STATUSES.includes(String(entry.status ?? '').toLowerCase()))
   if (pendingDispatches.length > 0) reasons.push('a_dispatch_is_still_pending')
 
   return {
-    planAuthoredByModel,
-    leadAuthoredPlanRunIds: leadRuns.map((run) => run.id),
-    workers: workerReports,
-    bothWorkersSubmitted,
-    claimsAreCoreOwned,
-    reworkObserved,
-    reworkedTasks,
-    ownerReviewCount,
-    dispatchKinds,
-    tasksInReview,
-    passesNeverAccepted,
-    failedRuns: failedRuns.map((run) => ({ id: run.id, agentId: run.agentId, status: run.status })),
-    pendingDispatches: pendingDispatches.map((entry) => ({ kind: entry.kind, status: entry.status })),
-    executeDispatchCount: executeDispatches.length,
-    workersStartedBeforeApproval,
-    archiveFailures: archiveFailures.map((failure) => ({
-      artifactId: failure?.artifactId ?? null,
-      relativePath: failure?.relativePath ?? null,
-      reasons: failure?.reasons ?? []
+    planAuthoredByModel, leadAuthoredPlanRunIds: leadRuns.map(run => run.id), workers: workerReports,
+    bothWorkersSubmitted, claimsAreCoreOwned, reworkObserved, reworkedTasks,
+    allTasksPassed: outcome.allPassed, taskOutcomes: outcome.outcomes, reviewedArtifactIds: [...new Set(reviewedArtifactIds)],
+    ownerReviewCount, dispatchKinds, tasksInReview, passesNeverAccepted,
+    failedRuns: failedRuns.map(run => ({ id: run.id, agentId: run.agentId, status: run.status })),
+    pendingDispatches: pendingDispatches.map(entry => ({ kind: entry.kind, status: entry.status })),
+    executeDispatchCount: executeDispatches.length, workersStartedBeforeApproval,
+    archiveFailures: archiveFailures.map(failure => ({
+      artifactId: failure?.artifactId ?? null, relativePath: failure?.relativePath ?? null, reasons: failure?.reasons ?? []
     })),
     reasons: [...new Set(reasons)]
   }
@@ -1146,7 +1157,13 @@ async function runAcceptance (options, { log = () => {} } = {}) {
     while (Date.now() < dispatchDeadline) {
       state = await readChainState(host, ctx)
       if (state.approvals.length > 0) break
-      if (chainIsSettled(state) && (state.control?.stageReviews ?? []).length > 0) break
+      const outcome = taskDeliveryOutcomes({
+        taskIds: inScope, tasks: state.tasks, candidates: state.candidates,
+        stageReviews: state.control?.stageReviews ?? [], dispatches: state.control?.dispatches ?? [],
+        authorizationRevision: approval?.policy?.authorizationRevision ?? null
+      })
+      if (outcome.terminalFailure || (chainIsSettled(state)
+        && (outcome.allPassed || state.runs.some(run => ['failed', 'cancelled'].includes(run.status))))) break
       if (chainIsSettled(state) && Date.now() > dispatchDeadline - options.timeoutMs + 60_000 && (state.control?.dispatches ?? []).length === 0) {
         // Nothing was dispatched at all: stop instead of waiting out the whole budget.
         break

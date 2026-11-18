@@ -64,14 +64,14 @@ export function ComputerAgentAccess({ port, client, agent, device, theme }: {
         expectedConfigDigest: selected.digest, ttlSeconds: Math.min(300, catalog?.limits.maxGrantSeconds ?? 300)
       })
       if (result.assistantId !== selected.agentId || result.deviceId !== selected.deviceId || result.scope !== selected.scope || result.state !== 'active') {
-        throw new Error('授权回执与本次选择不一致，请检查当前授权。没有自动重试。')
+        throw new Error('授权结果与所选助手或电脑不一致，请刷新检查。')
       }
       setReview(null)
-      setNotice('已添加本次电脑工具；助手下一次运行会读取。不会自动发送消息或启动任务。')
+      setNotice('已授权。下次发消息时，助手就能使用电脑工具。')
       await reload()
     } catch (cause) {
       setReview(null)
-      setError(`授权结果未确认；请先刷新核对，不要重复授权。${hostFeatureError(cause)}`)
+      setError(`暂时无法确认授权结果，请刷新后查看。${hostFeatureError(cause)}`)
       // Reads reconcile unknown outcomes; mutations are never replayed here.
       try { setCatalog(await port.list()) } catch { /* The original error is retained. */ }
     } finally { setBusy(false) }
@@ -81,8 +81,8 @@ export function ComputerAgentAccess({ port, client, agent, device, theme }: {
     setBusy(true); setError(''); setNotice('')
     try {
       const result = await port.revoke(item.grantId)
-      if (!result.revoked || result.grantId !== item.grantId) throw new Error('主机尚未确认撤销，请刷新检查。')
-      setNotice('已撤销本次电脑授权。旧输入不会被重放。')
+      if (!result.revoked || result.grantId !== item.grantId) throw new Error('尚未确认权限已撤销，请刷新检查。')
+      setNotice('已撤销电脑权限。')
       await reload()
     } catch (cause) { setError(hostFeatureError(cause)) }
     finally { setBusy(false) }
@@ -90,16 +90,16 @@ export function ComputerAgentAccess({ port, client, agent, device, theme }: {
   if (!agent) return null
   return <div className="ln-computer-agent-access">
     <header><Avatar agent={agent} size={25}/><strong>让 {agent.displayName} 使用电脑</strong><button type="button" className="ln-text-action" disabled={busy || !port} onClick={() => { void reload() }}>刷新</button></header>
-    <p>这是助手的临时电脑权限，与上方你的手动接管分开。最长五分钟，退出登录或撤销后立即失效。</p>
+    <p>单独授权后，助手才能使用电脑。五分钟后、退出登录或撤销时结束。</p>
     {error && <FormMessage error>{error}</FormMessage>}
     {notice && <FormMessage>{notice}</FormMessage>}
-    {!port || catalog?.limits.configured === false ? <p className="ln-muted">当前主机还没有接入助手电脑工具。</p> : <>
+    {!port || catalog?.limits.configured === false ? <p className="ln-muted">这台电脑尚未启用助手操作。</p> : <>
       {owned.map(item => <div key={item.grantId} className="ln-computer-grant-row"><span><strong>{item.scope === 'control' ? '查看与点击、输入' : '仅查看屏幕'}</strong><small>{item.state === 'active' && item.expiresAt > now ? `剩余约 ${Math.ceil((item.expiresAt - now) / 1000)} 秒` : '已失效，可清理'}</small></span><button type="button" className="ln-action is-danger" disabled={busy} onClick={() => { void revoke(item) }}>撤销</button></div>)}
-      {!runtime && <p className="ln-muted">先为这个助手配置运行端，再授权电脑工具。</p>}
-      {!!runtime && !runtimeSupported && <p className="ln-muted">这个运行端尚未通过当前主机的电脑工具准入，未开放授权。</p>}
-      {needsCleanup && <p className="ln-muted">先清理上方已过期的授权，再创建新的权限，避免遗留连接。</p>}
+      {!runtime && <p className="ln-muted">先为助手选择运行方式。</p>}
+      {!!runtime && !runtimeSupported && <p className="ln-muted">这个助手当前的运行方式暂不支持电脑操作。</p>}
+      {needsCleanup && <p className="ln-muted">先撤销上方已过期的授权，再重新授权。</p>}
       <div className="ln-computer-actions"><button type="button" className="ln-action" disabled={busy || !catalog?.limits.configured || !device || active || needsCleanup || !runtimeSupported} onClick={() => { void prepare('view') }}>授权查看</button><button type="button" className="ln-action" disabled={busy || !catalog?.limits.configured || !device || active || needsCleanup || !runtimeSupported} onClick={() => { void prepare('control') }}>授权电脑操作</button></div>
     </>}
-    <SurfaceDialog open={review !== null} title={review?.scope === 'control' ? '允许助手操作这台电脑？' : '允许助手查看这台电脑？'} theme={theme} onClose={() => { if (!busy) setReview(null) }} className="ln-room-dialog"><div className="ln-room-content"><p>{agent.displayName} 将获得当前连接主机的{review?.scope === 'control' ? '截图、点击、按键和文字输入' : '截图'}工具。桌面上的内容可能作为工具结果发送给你为该助手选择的模型。</p><p className="ln-settings-copy">最长五分钟；随时撤销。不会授予通用命令、文件访问或永久信任，不会自动开始任务。请先关闭不希望助手或模型看到的内容。</p><div className="ln-form-actions"><button type="button" className="ln-action" disabled={busy} onClick={() => setReview(null)}>取消</button><button type="button" className="ln-action is-primary" disabled={busy} onClick={() => { void grant() }}>{busy ? '核对并授权…' : '允许本次'}</button></div></div></SurfaceDialog>
+    <SurfaceDialog open={review !== null} title={review?.scope === 'control' ? '允许助手操作这台电脑？' : '允许助手查看这台电脑？'} theme={theme} onClose={() => { if (!busy) setReview(null) }} className="ln-room-dialog"><div className="ln-room-content"><p>{agent.displayName} 将可以使用这台电脑的{review?.scope === 'control' ? '截图、点击、按键和文字输入' : '截图'}工具。屏幕内容会随截图发送给这个助手使用的模型。</p><p className="ln-settings-copy">授权最长五分钟，可随时撤销。请先关闭不希望助手看到的内容，再发消息安排任务。</p><div className="ln-form-actions"><button type="button" className="ln-action" disabled={busy} onClick={() => setReview(null)}>取消</button><button type="button" className="ln-action is-primary" disabled={busy} onClick={() => { void grant() }}>{busy ? '正在授权…' : '允许本次'}</button></div></div></SurfaceDialog>
   </div>
 }

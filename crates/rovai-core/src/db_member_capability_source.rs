@@ -41,6 +41,7 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
 // instead of being hidden behind IF EXISTS for a table that should still be there.
 #[cfg(test)]
 pub(super) fn downgrade_for_test(connection: &Connection) {
+    super::loom::downgrade_artifact_versions_for_test(connection);
     if connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=234)",
@@ -90,6 +91,9 @@ pub(super) fn test_replay_183(database: &mut Database) {
     c.execute_batch("DROP TRIGGER fail_skill_source_receipt;")
         .unwrap();
     migrate(database).unwrap();
+    assert!(matches!(classify_database_contract(database.connection()).unwrap(),
+        DatabaseContractClassification::SupportedMigrationSource(ref m) if m.projection_schema_version==184));
+    super::loom::migrate_artifact_versions(database).unwrap();
     let c = database.connection();
     assert!(connection_has_current_data_contract(c).unwrap());
     for sql in [

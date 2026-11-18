@@ -842,7 +842,16 @@ pub(super) fn restore_local_artifact_contract_for_test(connection: &Connection) 
 
 fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     if artifact_origin_present(connection)? {
-        return crate::loom::remote_artifact::schema_matches(connection, &artifact_sql());
+        let versioned: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=235)",
+            [],
+            |row| row.get(0),
+        )?;
+        return if versioned {
+            crate::loom::remote_artifact::versioned_schema_matches(connection, &artifact_sql())
+        } else {
+            crate::loom::remote_artifact::schema_matches(connection, &artifact_sql())
+        };
     }
     let columns: i64 = connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
@@ -878,6 +887,93 @@ fn artifact_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
         }
     }
     Ok(columns == 10 && triggers == 3 && declared && path_index && triggers_match)
+}
+
+/// Migration 235: immutable artifact versions may share one logical path. Replays are scoped
+/// to the original producer and bytes; an updated file or a new Run receives its own evidence id.
+pub(super) fn migrate_artifact_versions(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 184),
+        "LOOM artifact version migration requires schema 184"
+    );
+    anyhow::ensure!(
+        crate::loom::remote_artifact::schema_matches(&tx, &artifact_sql())?,
+        "LOOM artifact version migration requires the unchanged prior artifact contract"
+    );
+    tx.execute_batch(crate::loom::remote_artifact::VERSION_MIGRATION_SQL)?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(235,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=185,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(
+        &tx,
+        &[ARTIFACT_TABLE, "loom_artifact_snapshot", "loom_artifact_archive"],
+    )?;
+    anyhow::ensure!(
+        crate::loom::remote_artifact::versioned_schema_matches(&tx, &artifact_sql())?,
+        "LOOM artifact version schema invalid"
+    );
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 185
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "LOOM artifact version schema admission failed");
+    tx.commit()?;
+    Ok(())
+}
+
+/// Only synthetic fixtures reverse this index. Real artifacts are never removed or rewritten.
+#[cfg(test)]
+pub(super) fn downgrade_artifact_versions_for_test(connection: &Connection) {
+    let applied: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=235)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !applied {
+        return;
+    }
+    let expected = Connection::open_in_memory().unwrap();
+    expected.execute_batch(&artifact_sql()).unwrap();
+    expected
+        .execute_batch(crate::loom::remote_artifact::ORIGIN_MIGRATION_SQL)
+        .unwrap();
+    let legacy: Vec<String> = expected
+        .prepare(
+            "SELECT sql FROM sqlite_master WHERE name IN
+             ('loom_artifact_plan_path_idx','loom_artifact_no_replace') ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX loom_artifact_plan_path_idx;
+             DROP TRIGGER loom_artifact_no_replace;",
+        )
+        .unwrap();
+    for sql in legacy {
+        connection.execute_batch(&sql).unwrap();
+    }
+    connection
+        .execute_batch(
+            "DELETE FROM schema_migration WHERE version=235;
+             UPDATE rovai_data_contract SET projection_schema_version=184
+               WHERE singleton=1 AND projection_schema_version=185;",
+        )
+        .unwrap();
 }
 
 /// Migration 224: the artifact row an evidence id can point at.
@@ -1619,6 +1715,95 @@ mod tests {
             !artifact_schema_matches(database.connection()).unwrap(),
             "assertion a missing path index is not accepted"
         );
+    }
+
+    /// A real archived artifact survives both a failed upgrade and the completed upgrade.
+    /// A later revision must neither rewrite that row nor lose its readable snapshot.
+    #[test]
+    fn artifact_version_migration_preserves_snapshots_and_rolls_back_with_receipt() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let mission_id = create_mission(&mut database, &directory, "LOOM version upgrade");
+        plan_import(
+            &mut database,
+            LoomPlanImportInput {
+                mission_id: mission_id.clone(),
+                goal: "Retain prior evidence while revising the same file".into(),
+                acceptance_criteria_version: "ac-v1".into(),
+                criteria: vec![LoomPlanImportCriterion {
+                    criterion_id: "readable".into(),
+                    text: "Archived versions remain readable".into(),
+                }],
+                tasks: vec![LoomPlanImportTask {
+                    task_id: "version-task".into(),
+                    title: "Revise report".into(),
+                    description: String::new(),
+                    assignee_agent_id: None,
+                }],
+                dependencies: vec![],
+            },
+        ).unwrap();
+        let workspace: String = database.connection().query_row(
+            "SELECT c.project_path FROM mission m JOIN camp c ON c.id=m.camp_id WHERE m.id=?1",
+            [&mission_id], |row| row.get(0),
+        ).unwrap();
+        let file = std::path::Path::new(&workspace).join("report.md");
+        std::fs::write(&file, "before migration").unwrap();
+        let input = || crate::loom::LoomArtifactRegisterInput {
+            mission_id: mission_id.clone(),
+            task_id: None,
+            agent_run_id: None,
+            relative_path: "report.md".into(),
+            content_type: Some("text/plain".into()),
+        };
+        let first = crate::loom::artifact_register(&mut database, "local_user", input()).unwrap();
+        downgrade_artifact_versions_for_test(database.connection());
+        assert_eq!(projection_version(&database), 184);
+        database.connection().execute_batch(
+            "CREATE TEMP TABLE prior_artifact_versions AS SELECT * FROM loom_artifact;
+             CREATE TEMP TABLE prior_artifact_snapshots AS SELECT * FROM loom_artifact_snapshot;
+             CREATE TEMP TRIGGER fail_artifact_version_receipt BEFORE INSERT ON schema_migration
+             WHEN NEW.version=235 BEGIN SELECT RAISE(ABORT,'fixture version receipt failure'); END;",
+        ).unwrap();
+        assert!(migrate_artifact_versions(&mut database).is_err());
+        assert_eq!(projection_version(&database), 184);
+        assert_eq!(migration_receipts(&database, 235), 0);
+        assert!(crate::loom::remote_artifact::schema_matches(
+            database.connection(), &artifact_sql(),
+        ).unwrap());
+        assert!(matches!(classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref m)
+                if m.projection_schema_version == 184));
+        database.connection().execute_batch("DROP TRIGGER fail_artifact_version_receipt;").unwrap();
+        migrate_artifact_versions(&mut database).unwrap();
+        assert!(connection_has_current_data_contract(database.connection()).unwrap());
+        assert_eq!(migration_receipts(&database, 235), 1);
+        for sql in [
+            "SELECT COUNT(*) FROM (SELECT * FROM prior_artifact_versions EXCEPT SELECT * FROM loom_artifact)",
+            "SELECT COUNT(*) FROM (SELECT * FROM loom_artifact EXCEPT SELECT * FROM prior_artifact_versions)",
+            "SELECT COUNT(*) FROM (SELECT * FROM prior_artifact_snapshots EXCEPT SELECT * FROM loom_artifact_snapshot)",
+            "SELECT COUNT(*) FROM (SELECT * FROM loom_artifact_snapshot EXCEPT SELECT * FROM prior_artifact_snapshots)",
+            "SELECT COUNT(*) FROM pragma_foreign_key_check",
+        ] {
+            assert_eq!(database.connection().query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap(), 0, "{sql}");
+        }
+        std::fs::write(&file, "after migration").unwrap();
+        let revised = crate::loom::artifact_register(&mut database, "local_user", input()).unwrap();
+        assert_ne!(first.artifact.artifact_id, revised.artifact.artifact_id);
+        for (artifact, expected) in [
+            (&first.artifact, "before migration"),
+            (&revised.artifact, "after migration"),
+        ] {
+            let preview = crate::loom::artifact_preview(
+                &database, &directory,
+                crate::loom::LoomArtifactPreviewInput {
+                    mission_id: mission_id.clone(),
+                    artifact_id: artifact.artifact_id.clone(),
+                },
+            ).unwrap();
+            assert_eq!(preview.text.as_deref(), Some(expected));
+            assert_eq!(preview.sha256, artifact.sha256);
+        }
     }
 
     fn plan_criteria_version_columns(database: &Database) -> i64 {

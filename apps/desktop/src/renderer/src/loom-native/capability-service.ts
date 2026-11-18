@@ -4,6 +4,7 @@ import type { ThreadClient } from '../camp-client'
 import { readErrorMessage } from '../error-message'
 import {
   highRiskToConfirm,
+  hookDefinitionMissing,
   itemKey,
   pendingHookReview,
   previewRuntime,
@@ -42,6 +43,7 @@ export type CapabilityErrorCode =
   | 'local.selection_not_in_catalog'
   | 'local.snapshot_mismatch'
   | 'local.hook_review_required'
+  | 'local.hook_definition_missing'
   | 'local.high_risk_acknowledgement_required'
   | 'local.projection_mismatch'
   | 'local.inspection_mismatch'
@@ -158,8 +160,9 @@ export function readCapabilityCatalog(rpc: CapabilityRpc, agentId: string): Prom
 }
 
 /**
- * 下一次 Run 的运行投影。只有 Codex / Claude Code 能预览；
- * 其他（含没选运行端）直接 unsupported，不当作「未应用」。
+ * 下一次 Run 的运行投影。任何非空运行端都发真实请求，
+ * 能不能给出投影由 Core 裁决（runtime_required / runtime_unsupported 都算 unsupported，
+ * 不当作「未应用」）。没选运行端才在本地短路。
  */
 export async function readRunProjection(
   rpc: CapabilityRpc,
@@ -177,9 +180,24 @@ export async function readRunProjection(
     return { status: 'ready', preview }
   } catch (error: unknown) {
     const code = requestCode(error)
-    if (code === 'runtime_required') return { status: 'unsupported', runtime }
+    if (code === 'runtime_required' || code === 'runtime_unsupported') return { status: 'unsupported', runtime }
     return { status: 'error', code, message: readErrorMessage(error, '运行投影读取失败') }
   }
+}
+
+/**
+ * 定义、风险和审阅范围只能来自 Core 这次读取的目录；草稿只改 selected。
+ * 草稿里自带的 hookDefinition / risk 不能用来替自己授权。
+ */
+function coreOwnedItems(catalog: CapabilityCatalog, draft: readonly CapabilityItem[]): CapabilityItem[] {
+  const baseline = new Map(catalog.items.map((item) => [itemKey(item), item]))
+  return draft.map((item) => {
+    const saved = baseline.get(itemKey(item))
+    if (!saved) return item
+    return saved.kind === 'hook'
+      ? { ...item, risk: saved.risk, hookDefinition: saved.hookDefinition ?? null }
+      : { ...item, risk: saved.risk }
+  })
 }
 
 /**
@@ -188,6 +206,9 @@ export async function readRunProjection(
  *
  * 提供了 reviewed 就必须和这次请求严格同源：同一队员、同一版本、同一组勾选；
  * 不比对 token（token 由界面自己生成与持有）。
+ *
+ * 定义、风险与审阅范围一律取这份 catalog（Core-owned），草稿只提供 selected；
+ * 新勾上一条缺 Core 定义的 hook 在发请求前就拒绝。
  */
 export async function saveCapabilitySelections(
   rpc: CapabilityRpc,
@@ -195,12 +216,23 @@ export async function saveCapabilitySelections(
   draft: readonly CapabilityItem[],
   reviewed?: HookReviewSnapshot | null
 ): Promise<CapabilityCatalog> {
-  const known = new Set(catalog.items.map(itemKey))
+  const baseline = new Map(catalog.items.map((item) => [itemKey(item), item]))
   for (const item of draft) {
-    if (!known.has(itemKey(item))) {
+    if (!baseline.has(itemKey(item))) {
       throw localError('local.selection_not_in_catalog', `目录里没有 ${item.kind} ${item.id}。`)
     }
   }
+  // 只拦「新勾上一条缺 Core 定义的 hook」。已经勾上的、这轮没改的保持原样，
+  // 不能因为保存其他项就自动撤销它们。
+  for (const item of draft) {
+    const saved = baseline.get(itemKey(item))!
+    if (!item.selected || saved.selected) continue
+    if (hookDefinitionMissing(saved)) {
+      throw localError('local.hook_definition_missing', `${item.name} 当前运行范围没有可审阅的 Hook 定义，暂不能启用。`)
+    }
+  }
+  // 后面的审阅与风险判断全部用 Core 这次读取的定义，不用草稿里塞进来的定义。
+  const owned = coreOwnedItems(catalog, draft)
   const selections = selectionsOf(draft)
   if (reviewed) {
     if (reviewed.agentId !== catalog.agentId
@@ -209,22 +241,22 @@ export async function saveCapabilitySelections(
       throw localError('local.snapshot_mismatch', '这份审阅快照不属于这次勾选，请重新读取目录。')
     }
     const approved = new Set(reviewed.entries.map((entry) => entry.id))
-    for (const item of pendingHookReview(draft)) {
+    for (const item of pendingHookReview(owned)) {
       if (!approved.has(item.id)) {
         throw localError('local.hook_review_required', '还有 hook 的正文没审过。')
       }
     }
   } else {
     // Core 同样会拒绝；先在本地拒绝，省一次必然失败的写入，也绝不替用户批准。
-    if (pendingHookReview(draft).length > 0) {
+    if (pendingHookReview(owned).length > 0) {
       throw localError('local.hook_review_required', '这条 hook 要先把正文和运行范围审一遍。')
     }
-    if (highRiskToConfirm(draft, catalog.items).length > 0) {
+    if (highRiskToConfirm(owned, catalog.items).length > 0) {
       throw localError('local.high_risk_acknowledgement_required', '这条高风险项要用户确认之后才会勾上。')
     }
   }
   const acknowledgeHighRisk = reviewed ? reviewed.acknowledgeHighRisk : false
-  if (!acknowledgeHighRisk && highRiskToConfirm(draft, catalog.items).length > 0) {
+  if (!acknowledgeHighRisk && highRiskToConfirm(owned, catalog.items).length > 0) {
     throw localError('local.high_risk_acknowledgement_required', '这条高风险项要用户确认之后才会勾上。')
   }
   return rpc.request<CapabilityCatalog>('members.capabilityCatalog.set', {

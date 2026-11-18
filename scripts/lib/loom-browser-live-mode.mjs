@@ -5,6 +5,8 @@
 // (`loom-native/Controls.tsx` for `SurfaceDialog`/`ChoiceMenu`, `loom-native/RoomDialog.tsx` for the
 // room form, `loom-native/ControlPanel.tsx` for the relay scope), not guessed from class names.
 
+import { taskDeliveryOutcomes } from './loom-chain-outcome.mjs'
+
 export const LIVE_GATE_ENV = 'LOOM_ALLOW_LIVE_ACCEPTANCE'
 export const HOST_CONFIG_ENV = 'LOOM_BROWSER_HOST_CONFIG'
 export const TOKEN_ENV_REF = 'LOOM_ADMIN_TOKEN_ENV'
@@ -37,19 +39,19 @@ const ABSOLUTE_PATH = /^(?:[a-zA-Z]:[\\/]|\/)/u
 export function parseHostConfig (value) {
   const config = typeof value === 'string' ? JSON.parse(value) : value
   if (config === null || typeof config !== 'object' || Array.isArray(config)) throw new Error('host config must be a JSON object')
-  const { origin, uiDirectory = null, fixtureDirectory = null, memberAgentIds = null, missionId = null } = config
+  const { origin, uiDirectory = null, fixtureDirectory = null, dataDir = null, memberAgentIds = null, missionId = null } = config
   if (typeof origin !== 'string' || !LOOPBACK_ORIGIN.test(origin)
       || Number(LOOPBACK_ORIGIN.exec(origin)?.[1]) < 1
       || Number(LOOPBACK_ORIGIN.exec(origin)?.[1]) > 65535) {
     throw new Error('host config origin must be an HTTP loopback origin http://127.0.0.1:<port>')
   }
-  for (const [label, directory] of [['uiDirectory', uiDirectory], ['fixtureDirectory', fixtureDirectory]]) {
+  for (const [label, directory] of [['uiDirectory', uiDirectory], ['fixtureDirectory', fixtureDirectory], ['dataDir', dataDir]]) {
     if (directory === null) continue
     if (typeof directory !== 'string' || !ABSOLUTE_PATH.test(directory)) throw new Error(`host config ${label} must be an absolute path`)
   }
   const roles = normalizeRoles(memberAgentIds)
   if (roles === null) throw new Error('memberAgentIds must name all four roles')
-  return { origin, uiDirectory, fixtureDirectory, roles, missionId: typeof missionId === 'string' ? missionId : null }
+  return { origin, uiDirectory, fixtureDirectory, dataDir, roles, missionId: typeof missionId === 'string' ? missionId : null }
 }
 
 /**
@@ -108,6 +110,47 @@ export function workerTasks (tasks, roles) {
 }
 
 /**
+ * Called only while this newly created Mission still lacks its two worker tasks.
+ * A failed Lead cannot make a plan by waiting after every queued/retrying unit has
+ * ended. Use the exact Mission snapshot and latest Lead Run; unknown or active
+ * work stays pending instead of borrowing a terminal result from another Run.
+ */
+export function leadPlanTerminalOutcome ({ snapshot, missionId, threadId, leadAgentId } = {}) {
+  const pending = reason => ({ terminal: false, reason, evidence: null })
+  if (snapshot?.thread?.id !== threadId || snapshot?.thread?.missionId !== missionId
+    || snapshot?.thread?.defaultLeadAgentId !== leadAgentId) return pending('lead_scope_unverified')
+  if (![snapshot.agentRuns, snapshot.messageDeliveries, snapshot.turns].every(Array.isArray)) {
+    return pending('lead_snapshot_incomplete')
+  }
+  const terminalRuns = ['succeeded', 'failed', 'cancelled']
+  if (snapshot.agentRuns.some(run => !terminalRuns.includes(run.status))) return pending('a_run_is_still_pending')
+  if (snapshot.messageDeliveries.some(row => !['settled', 'failed', 'cancelled', 'interrupted_before_dispatch'].includes(row.status))) {
+    return pending('a_delivery_is_still_pending')
+  }
+  if (snapshot.turns.some(row => !['completed', 'failed', 'cancelled'].includes(row.status))) {
+    return pending('a_turn_is_still_pending')
+  }
+  const runs = snapshot.agentRuns.filter(run => run.agentId === leadAgentId)
+  if (runs.length === 0) return pending('lead_not_started')
+  if (runs.some(run => typeof run.id !== 'string' || !Number.isFinite(Date.parse(run.createdAt)))
+    || new Set(runs.map(run => run.id)).size !== runs.length) return pending('lead_run_identity_ambiguous')
+  const newest = Math.max(...runs.map(run => Date.parse(run.createdAt)))
+  const latest = runs.filter(run => Date.parse(run.createdAt) === newest)
+  if (latest.length !== 1) return pending('latest_lead_run_ambiguous')
+  const run = latest[0]
+  const cause = run.terminalReasonCode ?? run.failure?.code ?? null
+  return {
+    terminal: true,
+    reason: run.status === 'succeeded' ? 'lead_finished_without_two_worker_tasks'
+      : `lead_run_${run.status}${cause ? ':' + cause : ''}`,
+    evidence: { missionId, threadId, latestLeadRun: {
+      id: run.id, agentId: run.agentId, status: run.status,
+      createdAt: run.createdAt, endedAt: run.endedAt ?? null, terminalReasonCode: cause
+    }, pendingRuns: 0, pendingDeliveries: 0, pendingTurns: 0 }
+  }
+}
+
+/**
  * Post-approval chain gate, derived from persisted Core facts only: dispatches must show EXECUTE and
  * REVIEW (and REWORK when the first round was rejected), every dispatch must be settled, both
  * candidates must be PENDING, and every archived artifact must match its registered digest.
@@ -128,6 +171,23 @@ export function chainGate ({ dispatches = [], candidates = [], archiveChecks = [
     if (check?.ok !== true) reasons.push(`archive_failed:${(check?.reasons ?? []).join('|') || 'unknown'}`)
   }
   return { ok: reasons.length === 0, reasons }
+}
+
+/** A fully settled two-task first pass cannot turn into a model-authored rework
+ * without a NEW authorized action. This ends a forced-rework acceptance with an
+ * explicit failure instead of waiting twenty-five minutes for impossible facts.
+ */
+export function terminalFirstPassWithoutRework ({
+  dispatches = [], candidates = [], stageReviews = [], taskIds = [], authorizationRevision = null
+} = {}) {
+  if (new Set(taskIds).size !== 2 || taskIds.length !== 2
+    || candidates.length !== 2 || stageReviews.length !== 2 || dispatches.length !== 6) return false
+  const outcome = taskDeliveryOutcomes({
+    taskIds, tasks: taskIds.map(taskId => ({ taskId, status: 'in_review' })),
+    candidates, stageReviews, dispatches, authorizationRevision
+  })
+  return outcome.allPassed && taskIds.every(taskId => ['execute', 'review', 'handoff'].every(kind =>
+    dispatches.filter(row => row.taskId === taskId && row.kind === kind).length === 1))
 }
 
 /** A screenshot that was not written is a gate failure, not a soft skip. */

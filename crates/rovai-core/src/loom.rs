@@ -2260,10 +2260,9 @@ fn mission_workspace(
 /// The bytes are archived in the Managed Blob store before the artifact row commits, so a later
 /// verification re-reads what was registered instead of whatever the workspace file holds then.
 ///
-/// Registering the same path again with the same bytes replays the original row (and gives an
-/// artifact registered before archiving existed its snapshot); the same path with different bytes
-/// is refused, because changed evidence must arrive as a new artifact rather than silently
-/// rewriting what an earlier verdict was based on.
+/// Registering the same path, Task, producer and bytes replays that immutable version (and gives
+/// a historical artifact its missing snapshot). Changed bytes or a new producer Run create a new
+/// artifact id at the same logical path. Older candidates continue to read their own archives.
 pub fn artifact_register(
     database: &mut Database,
     creator_id: &str,
@@ -2376,22 +2375,19 @@ pub fn artifact_register(
         ));
     }
 
-    let existing: Option<(String, String)> = transaction
+    // A path names a mutable workspace file, not an immutable artifact identity.
+    // Keep the producer and bytes in the replay key so rework creates a new row
+    // without borrowing another Run's evidence or changing any older snapshot.
+    let existing: Option<String> = transaction
         .query_row(
-            "SELECT artifact_id, sha256 FROM loom_artifact WHERE plan_id=?1 AND origin_key='local' AND relative_path=?2",
-            params![&plan_id, &relative_path],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT artifact_id FROM loom_artifact
+             WHERE plan_id=?1 AND origin_key='local' AND relative_path=?2
+               AND task_id IS ?3 AND agent_run_id IS ?4 AND creator_id=?5 AND sha256=?6",
+            params![&plan_id, &relative_path, &task_id, &agent_run_id, &creator_id, &sha256],
+            |row| row.get(0),
         )
         .optional()?;
-    if let Some((artifact_id, stored_sha256)) = existing {
-        if stored_sha256 != sha256 {
-            return Err(LoomCommandError::rejection(
-                LOOM_ARTIFACT_CONTENT_CHANGED,
-                format!(
-                    "artifact {relative_path} was registered with sha256 {stored_sha256} and the file has since changed; register the new content under a new path"
-                ),
-            ));
-        }
+    if let Some(artifact_id) = existing {
         // Same bytes: replay the row. An artifact registered before archiving existed gets its
         // snapshot here, and only because the file still has the digest that row recorded.
         snapshot::record(&transaction, &artifact_id, &candidate.id, &sha256, size_bytes)?;
@@ -7703,36 +7699,62 @@ mod tests {
     }
 
     #[test]
-    fn artifact_register_refuses_changed_bytes_under_a_used_path() {
+    fn artifact_register_versions_a_path_without_rewriting_prior_evidence() {
         let mut database = fixture();
-        let mission_id = create_mission(&mut database, "LOOM artifact changed");
+        let mission_id = create_mission(&mut database, "LOOM artifact versions");
         plan_import(&mut database, plan_input(&mission_id)).unwrap();
         write_workspace_file(&database, &mission_id, "report.md", "original");
-        register(&mut database, &mission_id, "report.md");
+        let first = register(&mut database, &mission_id, "report.md");
 
-        write_workspace_file(
-            &database,
-            &mission_id,
-            "report.md",
-            "rewritten after the verdict",
-        );
-        let error = artifact_register(
-            &mut database,
-            "local_user",
-            LoomArtifactRegisterInput {
-                mission_id: mission_id.clone(),
-                task_id: None,
-                agent_run_id: None,
-                relative_path: "report.md".into(),
-                content_type: None,
-            },
-        )
-        .unwrap_err();
+        write_workspace_file(&database, &mission_id, "report.md", "reviewed revision");
+        let revised = register(&mut database, &mission_id, "report.md");
+        assert_ne!(revised.artifact_id, first.artifact_id);
+        assert_ne!(revised.sha256, first.sha256);
         assert_eq!(
-            error.downcast_ref::<LoomCommandError>().unwrap().code(),
-            LOOM_ARTIFACT_CONTENT_CHANGED,
-            "assertion changed bytes under a registered path are refused: {error}"
+            register(&mut database, &mission_id, "report.md").artifact_id,
+            revised.artifact_id,
+            "manual registration with no Run remains idempotent"
         );
+        for (artifact, expected) in [(&first, "original"), (&revised, "reviewed revision")] {
+            let preview = artifact_preview(
+                &database,
+                database.directory(),
+                LoomArtifactPreviewInput {
+                    mission_id: mission_id.clone(),
+                    artifact_id: artifact.artifact_id.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(preview.text.as_deref(), Some(expected));
+            assert_eq!(preview.sha256, artifact.sha256);
+        }
+
+        // The tool boundary supplies the authenticated Run and creator. Equal bytes in a new
+        // Run cannot replay an old producer's identity, including after a no-change rework.
+        let producer_input = |run: &str| LoomArtifactRegisterInput {
+            mission_id: mission_id.clone(),
+            task_id: Some("task_a".into()),
+            agent_run_id: Some(run.into()),
+            relative_path: "report.md".into(),
+            content_type: None,
+        };
+        let produced = artifact_register(
+            &mut database, "agent_1", producer_input("run-first"),
+        ).unwrap();
+        let replay = artifact_register(
+            &mut database, "agent_1", producer_input("run-first"),
+        ).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.artifact.artifact_id, produced.artifact.artifact_id);
+        let next_run = artifact_register(
+            &mut database, "agent_1", producer_input("run-rework"),
+        ).unwrap();
+        assert!(!next_run.replayed);
+        assert_ne!(next_run.artifact.artifact_id, produced.artifact.artifact_id);
+        assert_eq!(next_run.artifact.sha256, produced.artifact.sha256);
+        assert_eq!(next_run.artifact.agent_run_id.as_deref(), Some("run-rework"));
+        assert_eq!(next_run.artifact.task_id.as_deref(), Some("task_a"));
+        assert_eq!(next_run.artifact.creator_id, "agent_1");
     }
 
     #[test]

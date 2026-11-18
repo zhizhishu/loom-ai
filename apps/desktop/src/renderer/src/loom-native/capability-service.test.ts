@@ -132,15 +132,32 @@ describe('目录读取与运行投影', () => {
     expect(catalog.revision).toBe('rev-1')
   })
 
-  it('only previews runtimes that can actually take a run package', async () => {
+  it('asks Core for a preview of any configured runtime instead of filtering by brand', async () => {
     const request = vi.fn().mockResolvedValue({ agentId: 'member' })
+    // 没选运行端是唯一一个本地短路：没有 runtime 可问。
     expect(await readRunProjection(rpc(request), 'member', null)).toEqual({ status: 'unsupported', runtime: null })
-    expect(await readRunProjection(rpc(request), 'member', 'other')).toEqual({ status: 'unsupported', runtime: 'other' })
+    expect(await readRunProjection(rpc(request), 'member', '   ')).toEqual({ status: 'unsupported', runtime: '   ' })
     expect(request).not.toHaveBeenCalled()
+    // Pi 和未知名字都真的发 RPC，能不能预览由 Core 说。
+    for (const runtime of ['pi', 'codex-cli', 'other']) {
+      await readRunProjection(rpc(request), 'member', runtime)
+      expect(request).toHaveBeenLastCalledWith('members.runProjection.preview', { member: 'member', runtime })
+    }
+    // 旧别名说的还是同一个运行端，请求用规范 id。
     await readRunProjection(rpc(request), 'member', 'claude-code-cli')
     expect(request).toHaveBeenLastCalledWith('members.runProjection.preview', { member: 'member', runtime: 'claude-code' })
-    await readRunProjection(rpc(request), 'member', 'codex-cli')
-    expect(request).toHaveBeenLastCalledWith('members.runProjection.preview', { member: 'member', runtime: 'codex-cli' })
+  })
+
+  it('reports whatever Core answers for pi instead of pretending it is unsupported', async () => {
+    const piPreview = { agentId: 'member', runtime: 'pi', bootstrap: 'pi', mcp: {}, skills: [], rules: [], hooks: [] }
+    const ready = vi.fn().mockResolvedValue(piPreview)
+    expect(await readRunProjection(rpc(ready), 'member', 'pi')).toEqual({ status: 'ready', preview: piPreview })
+    // Core 真的拒绝时才算 unsupported，两个号都保留 Core 的说法。
+    for (const code of ['runtime_required', 'runtime_unsupported']) {
+      const refused = vi.fn().mockRejectedValue({ code })
+      expect(await readRunProjection(rpc(refused), 'member', 'pi')).toEqual({ status: 'unsupported', runtime: 'pi' })
+      expect(refused).toHaveBeenCalledWith('members.runProjection.preview', { member: 'member', runtime: 'pi' })
+    }
   })
 
   it('a preview says only that it was read, never that the run applied it', async () => {
@@ -224,6 +241,55 @@ describe('保存勾选', () => {
     await expect(saveCapabilitySelections(rpc(request), risky, [item('mcp', 'risky', true, { risk: 'high' })]))
       .rejects.toMatchObject({ code: 'local.high_risk_acknowledgement_required' })
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('refuses to newly enable a hook that has no Core definition, before any RPC', async () => {
+    const request = vi.fn()
+    const savedHook = catalogOf([item('hook', 'no_scope', false, { risk: 'high' })])
+    await expect(saveCapabilitySelections(rpc(request), savedHook, [item('hook', 'no_scope', true, { risk: 'high' })]))
+      .rejects.toMatchObject({ code: 'local.hook_definition_missing' })
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('does not let a draft definition authorize what Core never gave', async () => {
+    // 草稿里塞了一份 reviewed 的假定义：Core 的目录才是唯一来源，不能拿它过闸。
+    const request = vi.fn()
+    const savedHook = catalogOf([item('hook', 'no_scope', false, { risk: 'high' })])
+    const forged = hookItem('no_scope', true, true)
+    await expect(saveCapabilitySelections(rpc(request), savedHook, [forged]))
+      .rejects.toMatchObject({ code: 'local.hook_definition_missing' })
+    expect(request).not.toHaveBeenCalled()
+    // 目录里是未审阅定义，草稿自己写 reviewed:true 也不能跳过审阅。
+    const unreviewed = catalogOf([hookItem('review_hook', false, false)])
+    await expect(saveCapabilitySelections(rpc(request), unreviewed, [hookItem('review_hook', true, true)]))
+      .rejects.toMatchObject({ code: 'local.hook_review_required' })
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('keeps a saved selection without a definition instead of revoking it while other items change', async () => {
+    const request = vi.fn().mockResolvedValue(catalogOf([]))
+    const savedCatalog = catalogOf([
+      item('hook', 'no_scope', true, { risk: 'high' }),
+      item('skill', 'search', false)
+    ])
+    const draft = [
+      item('hook', 'no_scope', true, { risk: 'high' }),
+      item('skill', 'search', true)
+    ]
+    await saveCapabilitySelections(rpc(request), savedCatalog, draft)
+    const payload = request.mock.calls[0][1] as Record<string, unknown>
+    expect(payload.selections).toEqual([
+      { kind: 'hook', id: 'no_scope', selected: true },
+      { kind: 'skill', id: 'search', selected: true }
+    ])
+  })
+
+  it('allows removing a saved hook that has no definition', async () => {
+    const request = vi.fn().mockResolvedValue(catalogOf([]))
+    const savedCatalog = catalogOf([item('hook', 'no_scope', true, { risk: 'high' })])
+    await saveCapabilitySelections(rpc(request), savedCatalog, [item('hook', 'no_scope', false, { risk: 'high' })])
+    const payload = request.mock.calls[0][1] as Record<string, unknown>
+    expect(payload.selections).toEqual([{ kind: 'hook', id: 'no_scope', selected: false }])
   })
 
   it('sends the frozen approvals once the user reviewed the hook body and scope', async () => {

@@ -90,7 +90,7 @@ import { pathToFileURL } from 'node:url'
 import { createConfiguredCampAndSend } from './lib/create-configured-camp.mjs'
 import { startQualificationCore } from './lib/qualification-core.mjs'
 import { removeEphemeralRuntimeCampFilesRoot } from './lib/runtime-camp-files-root.mjs'
-import { readFrozenRule, readSelectedMaterial } from './lib/dsh-frozen-evidence.mjs'
+import { readFrozenRule, readSelectedMaterial, readNativeSelectedSkill } from './lib/dsh-frozen-evidence.mjs'
 
 export const ACCEPT_VERSION = 1
 export const SCRIPT_NAME = 'accept-core-dsh-capabilities'
@@ -117,6 +117,7 @@ const VALUE_FLAGS = {
   '--dsh-bin': 'dshBin',
   '--permission-mode': 'permissionMode',
   '--approval-policy': 'approvalPolicy',
+  '--skill-transport': 'skillTransport',
   '--run-timeout-ms': 'runTimeoutMs',
   '--label': 'label'
 }
@@ -150,6 +151,9 @@ export function parseArguments (argv) {
   }
   if (!DSH_APPROVAL_POLICIES.includes(options.approvalPolicy)) {
     throw new UsageError('usage', `--approval-policy must be one of ${DSH_APPROVAL_POLICIES.join(', ')}`)
+  }
+  if (options.skillTransport !== undefined && !['native-registry', 'core-index-read'].includes(options.skillTransport)) {
+    throw new UsageError('usage', '--skill-transport must be native-registry or core-index-read')
   }
   const timeout = Number(options.runTimeoutMs)
   if (!Number.isInteger(timeout) || timeout < 30_000 || timeout > 1_800_000) {
@@ -208,6 +212,26 @@ export function assertNoSecrets (value, secrets = []) {
 }
 
 export const sha256 = bytes => createHash('sha256').update(bytes).digest('hex')
+
+/** Separate acceptance variant for the already published frozen-resource path.
+ * No provider configuration, permission, or native-registry support is changed.
+ */
+export function capabilityAcceptancePrompt({ skillTransport = 'native-registry', echoMarker }) {
+  if (!['native-registry', 'core-index-read'].includes(skillTransport)) throw new UsageError('usage', 'unknown Skill transport')
+  const reading = skillTransport === 'core-index-read'
+  return [
+    'This is an isolated LOOM acceptance. Use the provided capabilities exactly as instructed.',
+    reading
+      ? '1. Read exactly the SKILL.md of the isolated acceptance skill listed under this Run\'s [ROVAI_ADDITIONAL_SKILLS] root using the native read tool. Return its skill marker. This checks the published frozen-resource path, not the native skill registry; do not invoke skill(), glob, shell, or read a different resource.'
+      : '1. Load the isolated acceptance skill and return the skill marker it contains.',
+    '2. Return the rule marker from your selected rule.',
+    `3. Call the parity MCP tool echo exactly once with text ${echoMarker} and return its actual result.`,
+    '4. Then reply exactly DONE.',
+    reading
+      ? 'The single selected SKILL.md read above is the only permitted file read. Do not write any file or run a shell command. If the current index has no such skill or the native tool refuses, stop that step and report it; do not search other roots, change configuration, request broader permissions, or bypass the refusal.'
+      : 'Do not read or write files, do not run shell commands, and do not ask for broader permissions.'
+  ].join('\n')
+}
 
 /* ------------------------------------------------------------ public route */
 
@@ -799,6 +823,31 @@ export function overallVerdict (cells) {
  * claim is only proven by the deselection Run: an unskipped negative that still returns
  * the marker, or a skipped negative, must not leave the whole acceptance green.
  */
+export function deselectionVerdict ({ runId, runStatus, catalog, expectedRevision,
+  skillId, ruleId, materialObservations, skillMarkerAbsent, ruleMarkerAbsent }) {
+  const reasons = []
+  if (runStatus !== 'succeeded') reasons.push('negative_run_not_succeeded')
+  const selectionStable = typeof expectedRevision === 'string' && catalog?.revision === expectedRevision
+  if (!selectionStable) reasons.push('negative_selection_changed')
+  const selectionCleared = [['skill', skillId], ['rule', ruleId]].every(([kind, id]) => {
+    const matches = (catalog?.items ?? []).filter(item => item?.kind === kind && item?.id === id)
+    return matches.length === 1 && matches[0].selected === false
+  })
+  if (!selectionCleared) reasons.push('negative_selection_not_cleared')
+  // These observations come from this Run while active or just settled. A
+  // previous Run's retained material is never used to fill a missing record.
+  const skillNotPublished = Array.isArray(materialObservations) && materialObservations.length > 0
+    && materialObservations.every(result => result?.runId === runId && result?.status === 'NOT_RUN'
+      && result?.reasons?.length === 1 && result.reasons[0] === 'selected_material_missing')
+  if (!skillNotPublished) reasons.push('negative_skill_exclusion_unproven')
+  if (skillMarkerAbsent !== true) reasons.push('negative_skill_marker_present')
+  if (ruleMarkerAbsent !== true) reasons.push('negative_rule_marker_present')
+  return { runId, runStatus, revisionAfterClear: expectedRevision,
+    revisionAfterRun: catalog?.revision ?? null, selectionStable, selectionCleared,
+    skillNotPublished, materialObservations: materialObservations?.length ?? 0,
+    skillMarkerAbsent, ruleMarkerAbsent, reasons, status: reasons.length ? 'FAIL' : 'PASS' }
+}
+
 export function applyNegativeScope (overall, negative) {
   if (negative === undefined || negative === null) {
     return {
@@ -950,6 +999,7 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
   const echoMarker = `MCP_MARK_${randomBytes(8).toString('hex')}`
   const hookMarker = `HOOK_MARK_${randomBytes(8).toString('hex')}`
   const events = []
+  const skillTransport = options.skillTransport ?? 'native-registry'
 
   const report = {
     version: ACCEPT_VERSION,
@@ -959,6 +1009,9 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
     platform: `${process.platform}-${process.arch}`,
     permissionMode: options.permissionMode,
     approvalPolicy: options.approvalPolicy,
+    skillTransport,
+    acceptanceVariant: skillTransport === 'core-index-read' ? 'core-frozen-resource-native-read-v1' : 'native-registry-v1',
+    nativeSkillRegistryVerified: false,
     isolated: paths,
     providerKeyEnv: providerKey.name,
     providerKeyPersisted: false,
@@ -1107,7 +1160,8 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
           && candidate?.installationClass === 'managed_default'
           && candidate?.authScope === 'default'
           && candidate?.memberRuntimeDefaults) ?? null
-        record('observe', 'runtime.installations.list', installation === null ? 'absent' : 'ready')
+        record('observe', 'runtime.installations.list', installation === null ? 'absent'
+          : installation.snapshot?.probeStatus === 'ready' ? 'ready' : 'installed_unverified')
         if (installation !== null) break
       }
     } catch (error) {
@@ -1120,6 +1174,31 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
       return await abortSetup(deadlineHit
         ? 'dsh_setup_budget_exhausted'
         : (observations >= MAX_OBSERVATIONS ? 'dsh_installation_unavailable' : 'dsh_setup_aborted'))
+    }
+    // Availability and model discovery are distinct Core operations. Use the
+    // same explicit model-menu request as the product instead of treating a
+    // discovered executable as ready, or retrying a startup write.
+    if (installation.snapshot?.probeStatus !== 'ready') {
+      const originalInstallationId = installation.installationId ?? installation.id
+      if (typeof originalInstallationId !== 'string' || !originalInstallationId) {
+        return await abortSetup('dsh_installation_identity_missing')
+      }
+      const catalog = await readOnly('catalog', 'runtime.modelCatalog.open', {
+        runtimeKind: ADAPTER_KIND, waitForRefresh: true
+      })
+      report.catalogDiscovery = { refreshStatus: catalog?.refreshStatus ?? null,
+        diagnosticCode: catalog?.diagnosticCode ?? null,
+        modelCount: Array.isArray(catalog?.models) ? catalog.models.length : 0 }
+      const refreshed = await readOnly('catalog', 'runtime.installations.list')
+      const exact = (Array.isArray(refreshed) ? refreshed : []).find(row =>
+        (row.installationId ?? row.id) === originalInstallationId && row.adapterKind === ADAPTER_KIND)
+      if (!exact || exact.snapshot?.probeStatus !== 'ready') {
+        // Preserve Core's bounded public diagnostic on the exact installation.
+        // A discovered executable alone cannot explain a failed model refresh.
+        report.catalogDiscovery.probeFailure = exact?.lastProbeAttempt?.failure ?? null
+        return await abortSetup('dsh_catalog_not_ready')
+      }
+      installation = exact
     }
     report.probeStatus = installation?.snapshot?.probeStatus ?? null
     report.dshDiscovery = {
@@ -1318,14 +1397,7 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
     const revisionAtProjection = report.selectionRevision
 
     // --- Run ----------------------------------------------------------------
-    const prompt = [
-      'This is an isolated LOOM acceptance. Use the provided capabilities exactly as instructed.',
-      '1. Load the isolated acceptance skill and return the skill marker it contains.',
-      '2. Return the rule marker from your selected rule.',
-      `3. Call the parity MCP tool echo exactly once with text ${echoMarker} and return its actual result.`,
-      '4. Then reply exactly DONE.',
-      'Do not read or write files, do not run shell commands, and do not ask for broader permissions.'
-    ].join('\n')
+    const prompt = capabilityAcceptancePrompt({ skillTransport, echoMarker })
     assert.equal(prompt.includes(skillMarker), false, 'the Skill marker must never be in the user prompt')
     assert.equal(prompt.includes(ruleMarker), false, 'the Rule marker must never be in the user prompt')
     report.promptSha256 = sha256(prompt)
@@ -1409,6 +1481,15 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
       selectionStable
     })
 
+    const nativeSkillRead = skillTransport === 'core-index-read'
+      ? await readNativeSelectedSkill({ dataDir: paths.data, fixtureRoot: root,
+          runId, skillName, marker: skillMarker, selectedMaterial })
+      : null
+    const skillLoadEvidence = skillTransport === 'core-index-read'
+      ? nativeSkillRead
+      : selectedMaterial.status === 'PASS' ? selectedMaterial : skillExposureVerdict({
+          skillExposure: manifest?.skillExposure, expected: selectedSkillIdentity
+        })
     const verdicts = applySelectionStability({
       skill: skillVerdict({
         prompt,
@@ -1416,9 +1497,7 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
         projectedSkills: projection?.skills,
         itemId: registeredSkill.id,
         marker: skillMarker,
-        exposed: selectedMaterial.status === 'PASS' ? selectedMaterial : skillExposureVerdict({
-          skillExposure: manifest?.skillExposure, expected: selectedSkillIdentity
-        })
+        exposed: skillLoadEvidence
       }),
       rule: ruleVerdict({
         prompt,
@@ -1436,7 +1515,8 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
       })
     }, selectionStable)
     report.cells = {
-      skill: { ...verdicts.skill, itemId: registeredSkill.id, markerSha256: sha256(skillMarker) },
+      skill: { ...verdicts.skill, itemId: registeredSkill.id, markerSha256: sha256(skillMarker),
+        transport: skillTransport, nativeRead: nativeSkillRead, nativeRegistryVerified: false },
       rule: { ...verdicts.rule, itemId: ruleItem.id, markerSha256: sha256(ruleMarker) },
       mcp: { ...verdicts.mcp, itemId: mcpItem.id, callsBefore, callsAfter },
       hook: { ...verdicts.hook, itemId: hookItem.id, selected: hookSelected, receiptExists: hookReceipt !== null }
@@ -1475,15 +1555,27 @@ export async function main (argv = process.argv.slice(2), env = process.env) {
       const negativeCommand = negativeIntake.commandResult ?? negativeIntake
       assert.equal(negativeCommand.status, 'accepted')
       const negativeRunId = await waitForAdmittedRun(core, negativeCommand.payload.threadId, agentId, negativeCommand.payload)
-      const negativeSnapshot = await waitForRun(core, negativeCommand.payload.threadId, negativeRunId, options.runTimeoutMs)
+      const negativeMaterial = []
+      const negativeSnapshot = await waitForRun(core, negativeCommand.payload.threadId, negativeRunId,
+        options.runTimeoutMs, async (_snapshot, run) => {
+          if (!run || !['running', 'succeeded'].includes(run.status)) return
+          const material = await readSelectedMaterial({ dataDir: paths.data, fixtureRoot: root,
+            runId: negativeRunId, memberId: agentId, expected: selectedSkillIdentity })
+          negativeMaterial.push({ ...material, runId: negativeRunId })
+        })
       const negativeNarration = runNarration(negativeSnapshot, negativeRunId)
-      report.negative = {
-        revisionAfterClear: cleared.revision,
+      const negativeCatalog = await core.request('members.capabilityCatalog.get', { agentId })
+      report.negative = deselectionVerdict({
+        runId: negativeRunId,
+        expectedRevision: cleared.revision,
+        catalog: negativeCatalog,
+        skillId: registeredSkill.id,
+        ruleId: ruleItem.id,
+        materialObservations: negativeMaterial,
         runStatus: negativeSnapshot.agentRuns.find(entry => entry?.id === negativeRunId)?.status ?? null,
         skillMarkerAbsent: !negativeNarration.includes(skillMarker),
-        ruleMarkerAbsent: !negativeNarration.includes(ruleMarker),
-        status: !negativeNarration.includes(skillMarker) && !negativeNarration.includes(ruleMarker) ? 'PASS' : 'FAIL'
-      }
+        ruleMarkerAbsent: !negativeNarration.includes(ruleMarker)
+      })
     }
 
     const scoped = applyNegativeScope(overallVerdict(report.cells), report.negative)

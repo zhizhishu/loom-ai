@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  hookDefinitionMissing,
   hookReviewSnapshot,
   pendingHookReview,
+  previewRuntime,
   revertPending,
   selectRefusal,
   snapshotApplies,
@@ -97,9 +99,50 @@ describe('hook review snapshot', () => {
     })).toBeNull()
   })
 
-  it('leaves an unscoped local hook alone: Core already fails closed there', () => {
-    const local = hook('stop: format', false, { hookDefinition: null, selected: false })
-    expect(selectRefusal(local)).toBe('')
+  it('refuses a new check on a hook without a Core-owned readable definition', () => {
+    // 未勾选的 hook 没有 Core 给的定义：不能新启用，也不说永远不支持。
+    const unread = hook('stop: format', false, { hookDefinition: null, selected: false })
+    expect(hookDefinitionMissing(unread)).toBe(true)
+    expect(selectRefusal(unread)).toBe('hook-scope')
+    // 已勾上的仍可取消，不被同一条门禁拦住。
+    expect(selectRefusal({ ...unread, selected: true })).toBe('')
+  })
+
+  it('treats an incomplete Core scope as no definition rather than guessing', () => {
+    const complete = { ...hook('stop: format', false), selected: false }
+    expect(selectRefusal(complete)).toBe('')
+    for (const patch of [{ definitionDigest: '' }, { scopeDigest: '' }, { body: '   ' }]) {
+      expect(selectRefusal({ ...complete, hookDefinition: { ...complete.hookDefinition!, ...patch } })).toBe('hook-scope')
+    }
+    for (const patch of [
+      { memberId: '' }, { workspaceId: '' }, { nodeId: '' }, { workspaceRoot: ' ' },
+      { workspaceTokenDigest: '' }, { adapterKind: '' }, { workspaceGeneration: Number.NaN }
+    ]) {
+      expect(selectRefusal({
+        ...complete,
+        hookDefinition: { ...complete.hookDefinition!, reviewScope: { ...scope, ...patch } }
+      })).toBe('hook-scope')
+    }
+  })
+
+  it('asks Core about every non-empty runtime instead of refusing a brand locally', () => {
+    // Pi 的 preview 由 Core 决定，不在界面里伪 unsupported。
+    expect(previewRuntime('pi')).toBe('pi')
+    expect(previewRuntime('codex-cli')).toBe('codex-cli')
+    expect(previewRuntime('claude-code')).toBe('claude-code')
+    // 旧持久化别名归一成规范 id，说的还是同一个运行端。
+    expect(previewRuntime('claude-code-cli')).toBe('claude-code')
+    // 没选运行端才在本地短路；未知名字交给 Core 裁决。
+    expect(previewRuntime(null)).toBeNull()
+    expect(previewRuntime('  ')).toBeNull()
+    expect(previewRuntime('some-new-runtime')).toBe('some-new-runtime')
+  })
+
+  it('leaves a fully defined hook selectable and a non-hook untouched', () => {
+    expect(selectRefusal({ ...hook('stop: format', false), selected: false })).toBe('')
+    const skill: CapabilityItem = { ...hook('stop: format', false), kind: 'skill', selected: false, hookDefinition: null }
+    expect(hookDefinitionMissing(skill)).toBe(false)
+    expect(selectRefusal(skill)).toBe('')
   })
 
   it('blocks a new check on a broken source but still allows removing an existing one', () => {

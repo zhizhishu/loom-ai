@@ -4,7 +4,24 @@
 
 产品要做什么看 [PRODUCT.md](PRODUCT.md)，已选 Mikka/PiBot 三栏 UI 与用户指定猫耳品牌看 [DESIGN.md](DESIGN.md)，具体 Runtime/能力/设备接口看 [productization-interfaces](docs/loom/productization-interfaces-2026-11-13.md)，13 个参考项目看 [参考锁](docs/loom/LOOM-V2-REFERENCE-LOCK.md)。P0–P14 原设计保留于 [冻结蓝图](docs/loom/LOOM-V2-MASTER-PLAN.md)，不在本页重复叙述。
 
+## 给云上施工 Agent 的用户建议（2026-11-17，非规范）
+
+> 下面是 User 给任何来仓干活的 Agent（含云上长跑任务）的三条建议。**是建议、不是规范；User 明说可能讲错**——与仓内文档或实测证据冲突时，以文档和实测为准，并把冲突点在交付报告里指出来，别静默二选一。
+
+1. **放心学参考项目，别不舍得花时间。** 已批准的 13 个参考项目与"借什么、不许借什么"逐条写在 [docs/loom/LOOM-V2-REFERENCE-LOCK.md](docs/loom/LOOM-V2-REFERENCE-LOCK.md)，施工前把对应条目读透再动手，研究比闷头写代码值钱。注意：固定镜像在本机 `_artifacts/reference-repos/` 与父仓 `_references/`、**不随仓库分发**；云上环境若读不到镜像，以锁定文件里的固定 SHA 和第二节研究结论为准，能溯源公开上游时自行核对。
+2. **别把本机环境当成通用平台事实。** 本机 Claude/Codex/DSH/Pi 四端的 Skill/MCP/Hook/Rule 是以本机 `~/.claude` 为源本定制适配过的，行为特殊。你在本机观察到的某个端的行为（如原生 skill()/hook 不触发）可能是这份适配造成的；给 Runtime 接入或探测下结论时按目标端的官方文档和通用默认环境判断。
+3. **Runtime 对接优先走 ACP 通用协议。** 尽量按 ACP（Agent Client Protocol）公开文档的通用规范实现，ACP 覆盖不到的端能力再考虑该端私有 SDK。注意 **ACP ≠ ACCP**：ACP 是线协议，ACCP 只是参考项目里的协作控制面，两者不得合并成"第五 Runtime"。
+
 ## 2026-11-17 续开发实测（未签收）
+
+**2026-11-17 本轮个人版收尾（以下新证据优先）**：c399 的 Windows E3 `44158565571` 已通过；本节修复与该旧包分开记录，新源码候选须另行构建验证。
+
+- **真实返工卡点已修，整链复验继续**：`web-refresh-ui-04` 暴露同路径新内容被 Core 拒绝登记，Worker 改用新文件名又被审核要求原路径，A 任务耗尽返工次数。现按 Task/生产 Run/作者/SHA 保留同路径的不可变版本，旧 Candidate 继续指向旧归档；schema 185 / receipt 235 迁移不改历史记录。18 项针对性 Rust、68 项验收脚本与真实旧 SQLite 只读迁移核对通过，来源见 `resume-05/artifact-version-core-build.json`。整链要求两项任务最新稿都通过独立审查、原路径返工、旧归档仍可读，不能用一项任务成功代表整体通过。
+- **成果界面与连接入口已修**：持续更新时不再漏文件，同一工作刷新不清掉控制表单草稿；最新版先显示，历史版保留，卡住直接显示原因。实际 Electron 29 项交互与 10 张桌面/手机日夜截图通过，见 `_artifacts/loom-v2-user-authorized-20261115/ui/run-kI0HTs/screenshots/report.json`。原连接配置编辑器已接回新壳，四运行端入口、保存后读回、草稿保留、冲突处理和桌面/手机日夜布局等 8 项通过，见 `resume-05/runtime-settings-ui/run-TcZkwH/screenshots/report.json`。两组使用生产界面和合成传输，不代替真实模型链；类型检查与生产 Web 构建已通过。
+- **安装与电脑运行包已补齐**：`resume-05/personal-install-live.json` 用当前安装器配 c399 实包，实际安装、原 Start-Loom.cmd 启动、登录、重启后身份/助手/偏好保持通过。程序与个人数据分开，跨数据格式降级拒绝，启动前核对完整文件清单；缺管理脚本时明确报包不完整。原候选遗漏的 helper/bridge/Python/Pillow 已加入固定版本、哈希和许可证打包；当前电脑授权 Rust 27/27、包内 Python 43/43（另 1 项非 Windows 适用项跳过）、专用测试窗口截图/点击/输入/停止 4/4 通过。页面授权与助手真实桥接仍在验证，不能把本机 helper 成功当作整段已通过。
+- **运行端结果按实际记录**：`resume-05/dsh-diagnostic-03/evidence.json` 的 Rule、MCP、原生 read 读取冻结 Skill 与反选新 Run 通过；原生 Skill 注册表仍未验证，Hook 仍 NOT_RUN。健康失败诊断修复的两条远端测试通过，见 `dsh-health-regression.json`。`resume-05/codex-capabilities-02/evidence.json` 的原生读取冻结 Skill、Rule 与反选通过；原生 MCP 目录和首轮工具声明存在，但模型实际调用为 0，MCP 不通过。Windows Claude 保持既有准入边界。旧受管接线写入的安全拒绝保留，不绕过。
+
+**测试入口纠正**：`current-ui-versioned-01` 已停止并作废。Host 静态内嵌 Core，旁置新 Core.exe 不会替换 Host 内部实现，该轮实测库仍为 schema 184。新编译 Host 在 `current-ui-versioned-02` 已通过实际数据库 185/235 检查，但发现本机 GNU 构建主线程栈只有 2 MiB；该轮在打开 UI 前停止。现已将项目 build.rs 的既有 Windows 8 MiB 设置补齐到 GNU 与 MSVC，四个二进制重链 exit 0，PE 实读均为 8388608，见 `computer-current-host-build.json`。新增入口缺管理脚本拒绝、双工具链栈检查以及 11 项 workflow 契约回归通过。正式再跑前同时检查二进制、实际库版本和生产 Web 来源；只复用经核验未变的 Pi 运行包。新增 Host 版本与 Lead 失败提前结束检查 24/24 通过，见 `host-schema-lead-guard-result.json`。旧失败原样保留，脚本不代用户接受成果；同源候选须从本轮提交重新构建。
 
 - 已推送 `50c998f`（容器健康探针）、`9dcbd86`（原生接力范围 UI 与候选下载核验）、`ab22407`（调度尾项结算及显式受限 Pi 工作流工具）。当前未提交修复继续保留，不等于上述提交已经包含全部后续改动。
 - 本机新 Core/Host 编译完成，生产 Web 构建与类型检查完成。DE-BERO 对固定 `ab22407` 曾为 **631 passed / 5 failed / 1 ignored**，原失败保留于 `bero-core-final.json`；后续限定修复经 `resume-02/full-r2-device-observe.json` 复核为 **636 passed / 0 failed / 1 ignored**，Web Node 专项 **22/22**。这是带记录补丁的工作树验收，不伪称原 `ab22407` 已自动变绿；原 SHA Windows E3 仍失败，无最终候选包。

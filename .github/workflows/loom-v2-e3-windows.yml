@@ -25,6 +25,12 @@ on:
       - scripts/package-embedded-pi.mjs
       - scripts/runtime/pi-source/**
       - scripts/start-loom-personal.cmd
+      - scripts/install-loom-personal.cmd
+      - scripts/manage-loom-personal.ps1
+      - scripts/package-computer-runtime.ps1
+      - scripts/runtime/computer-windows.json
+      - scripts/lib/personal-install.test.mjs
+      - resources/computer/**
       - docs/loom/LOOM-PERSONAL-CANDIDATE.md
       - package.json
       - pnpm-workspace.yaml
@@ -94,7 +100,7 @@ jobs:
       - name: Check the V2 workflow fail-closed contract
         shell: pwsh
         run: |
-          node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs scripts/lib/embedded-pi.test.mjs scripts/lib/windows-native-stack.test.mjs
+          node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs scripts/lib/embedded-pi.test.mjs scripts/lib/windows-native-stack.test.mjs scripts/lib/personal-install.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'V2 E3 CI contract test failed' }
 
       - name: Checkout pinned optional Pi Purge source
@@ -170,6 +176,23 @@ jobs:
           if ($text -notmatch 'test result: ok\. [1-9][0-9]* passed; 0 failed;') { throw 'Core library tests did not actually run' }
           node --test --test-force-exit --test-timeout=120000 scripts/loom-v2-workflow-tool.test.mjs scripts/loom-v2-core-file-grant.test.mjs scripts/lib/accept-loom-live-lead.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Typed workflow and immutable artifact evidence tests failed' }
+
+      - name: Verify computer consent and assistant revocation
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'loom-computer-safety-tests.log'
+          cargo test --locked -p rovai-web --lib computer_agent::tests:: -- --test-threads=1 *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log -Tail 35
+          if ($code -ne 0) { throw 'Assistant computer authorization regression failed' }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw 'Assistant computer tests did not execute' }
+          cargo test --locked -p rovai-web --lib computer::tests:: -- --test-threads=1 *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log -Tail 25
+          if ($code -ne 0) { throw 'Manual computer consent or lease regression failed' }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw 'Manual computer tests did not execute' }
 
       - name: Fresh production Mikka Web bundle
         shell: pwsh
@@ -334,6 +357,11 @@ jobs:
           Copy-Item skills (Join-Path $kit 'skills') -Recurse
           New-Item -ItemType Directory -Path (Join-Path $kit 'runtime') | Out-Null
           Copy-Item resources/runtime/pi (Join-Path $kit 'runtime/pi') -Recurse
+          & ./scripts/package-computer-runtime.ps1 -Destination (Join-Path $kit 'runtime/computer') -CacheDirectory (Join-Path $env:RUNNER_TEMP 'loom-computer-downloads')
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned computer runtime staging failed' }
+          $computerBundle = Get-Content (Join-Path $kit 'runtime/computer/computer-bundle.json') -Raw | ConvertFrom-Json
+          & (Join-Path $kit 'runtime/computer/python/python.exe') -I -B -m unittest discover -s resources/computer -p 'test_*.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled computer helper/bridge regression failed' }
           node scripts/package-embedded-pi.mjs --verify --destination (Join-Path $kit 'runtime/pi')
           if ($LASTEXITCODE -ne 0) { throw 'Copied candidate Pi bundle failed verification' }
           $purge = Join-Path $kit 'runtime/extensions/pi-purge'
@@ -346,11 +374,17 @@ jobs:
           [ordered]@{ schema = 1; extension = 'pi-purge'; version = '0.3.0'; upstreamCommit = 'd0196ccfd773b0ed342bd2f25372aff65f1a4a53'; defaultEnabled = $false; supportedManagedModes = @('off', 'append'); coreUiBindingVerified = $false; providerVerifiedByThisCi = $false } | ConvertTo-Json | Set-Content (Join-Path $purge 'extension-info.json') -Encoding utf8
           Copy-Item LICENSE (Join-Path $kit 'LICENSE')
           Copy-Item scripts/start-loom-personal.cmd (Join-Path $kit 'Start-Loom.cmd')
+          Copy-Item scripts/install-loom-personal.cmd (Join-Path $kit 'Install-Loom.cmd')
+          Copy-Item scripts/manage-loom-personal.ps1 (Join-Path $kit 'Manage-Loom.ps1')
           Copy-Item docs/loom/LOOM-PERSONAL-CANDIDATE.md (Join-Path $kit 'README.md')
           Copy-Item (Join-Path $env:RUNNER_TEMP 'loom-v2-e3/e3-manifest.json') (Join-Path $kit 'e3-manifest.json')
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           "schema=1`nversion=$version`ntarget=windows-x64`n" | Set-Content (Join-Path $kit 'package-info') -Encoding ascii
           "[InternetShortcut]`r`nURL=http://127.0.0.1:64852/`r`n" | Set-Content (Join-Path $kit 'Open-Loom.url') -Encoding ascii
+          $databaseSource = Get-Content crates/rovai-core/src/db.rs -Raw
+          $contractVersion = [regex]::Match($databaseSource, 'pub\(crate\) const CURRENT_DATA_CONTRACT_VERSION: &str = "([^"]+)";')
+          $projectionVersion = [regex]::Match($databaseSource, 'pub\(crate\) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = ([0-9]+);')
+          if (!$contractVersion.Success -or !$projectionVersion.Success) { throw 'Core data compatibility metadata is missing' }
           $hashes = [ordered]@{}
           foreach ($file in (Get-ChildItem -LiteralPath $kit -File -Recurse -Force | Sort-Object FullName)) {
             $relative = [System.IO.Path]::GetRelativePath($kit, $file.FullName).Replace('\', '/')
@@ -358,6 +392,7 @@ jobs:
           }
           [ordered]@{
             qualification = 'isolated-personal-development-preview'
+            dataContract = [ordered]@{ version = $contractVersion.Groups[1].Value; projectionSchema = [int]$projectionVersion.Groups[1].Value }
             version = $version
             target = 'windows-x64'
             profile = 'debug'
@@ -366,6 +401,7 @@ jobs:
             realProviderVerified = $false
             ownerAccepted = $false
             dailyDataIncluded = $false
+            computerRuntime = [ordered]@{ python = $computerBundle.pythonVersion; pillow = $computerBundle.pillowVersion }
             embeddedPiVersion = '0.85.1'
             optionalPiPurgeVersion = '0.3.0'
             piPurgeDefaultEnabled = $false
@@ -448,6 +484,8 @@ jobs:
           }
           node scripts/package-embedded-pi.mjs --verify --destination (Join-Path $kit 'runtime/pi')
           if ($LASTEXITCODE -ne 0) { throw 'Delivered Pi closed manifest verification failed' }
+          & ./scripts/package-computer-runtime.ps1 -Verify -Destination (Join-Path $kit 'runtime/computer')
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered computer runtime verification failed' }
           node scripts/loom-v2-pi-purge-stage.mjs --verify (Join-Path $kit 'runtime/extensions/pi-purge/upstream')
           if ($LASTEXITCODE -ne 0) { throw 'Delivered optional Pi Purge closed manifest verification failed' }
           $extensionInfo = Get-Content (Join-Path $kit 'runtime/extensions/pi-purge/extension-info.json') -Raw | ConvertFrom-Json

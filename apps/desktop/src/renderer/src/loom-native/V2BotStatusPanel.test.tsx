@@ -209,7 +209,24 @@ describe('V2 run surface: actual records, readable actions, independent facts', 
     const html=await renderPanel({thread:thread({agentRuns:[run('run-a','bot-a','task-a','running'),run('run-b','bot-b','task-b','queued')]}),receipt:claimsReceipt([claim('claim-a','task-a','bot-a')])})
     expect(html).toContain('BotA');expect(html).toContain('BotB')
     expect(html).toContain('认领有效');expect(html).toContain('执行中');expect(html).toContain('排队中')
-    expect(html).toContain('暂无认领记录');expect(html).not.toContain('无人工作');expect(html).not.toContain('>bot-a<')
+    expect(html.split('<details')[0]).not.toContain('认领');expect(html).not.toContain('无人工作');expect(html).not.toContain('>bot-a<')
+  })
+  it('shows an exhausted task as needing attention even when Core keeps it ready', async()=>{
+    const html=await renderPanel({bundle:bundle({tasks:[{...task('task-a','bot-a'),blockedReason:'loom.rework_budget_exhausted'}]})})
+    const main=html.split('<details')[0]
+    expect(main).toContain('需要处理')
+    expect(main).toContain('已达到返工次数上限，仍未通过审核')
+    expect(main).not.toContain('loom.rework_budget_exhausted')
+    expect(main).not.toContain('待开始')
+    expect(html).toContain('loom.rework_budget_exhausted')
+  })
+  it('puts the current revision before an older file at the same logical path', async()=>{
+    const first=candidate('draft',['file-draft'])
+    const second={...candidate('revision',['file-revision']),previousCandidateId:'draft',createdAt:'2026-11-15T04:00:00Z'}
+    const html=await renderPanel({bundle:bundle({candidates:[first,second],artifacts:[artifact('file-draft'),artifact('file-revision')]})})
+    expect(html.indexOf('data-artifact-id="file-revision"')).toBeLessThan(html.indexOf('data-artifact-id="file-draft"'))
+    expect(html).toContain('v2 · 最新')
+    expect(html).toContain('v1 · 历史版本')
   })
   it('does not expose a released or expired claim as the active owner', async()=>{
     for(const patch of [{expired:true},{releasedAt:'2026-11-15T00:20:00Z'}]) {

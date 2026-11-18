@@ -76,8 +76,8 @@ const summary = (over: Partial<Parameters<typeof ControlSummary>[0]> = {}): stri
 describe('automatic relay control surface', () => {
   it('says the read failed instead of claiming the range is unapproved', () => {
     const html = summary({ state: 'unreadable', policy: null })
-    expect(html).toContain('接力范围暂时读不到')
-    expect(html).toContain('这不代表尚未批准')
+    expect(html).toContain('自动协作状态读取失败，请重试。')
+    expect(html).toContain('role="alert"')
     expect(html).not.toContain('尚未批准自动接力')
   })
 
@@ -104,7 +104,7 @@ describe('automatic relay control surface', () => {
 
   it('keeps an unapproved mission honest: nothing is dispatched until the user approves', () => {
     const html = summary({ state: 'unapproved', policy: null })
-    expect(html).toContain('不会自动派发')
+    expect(html).toContain('设置任务和审核人后')
     expect(html).not.toContain('<button')
   })
 

@@ -97,10 +97,10 @@ export function ControlSummary({ state, policy, dispatches, stageReviews, tasks,
 }) {
   if (state === 'reading') return <p className="ln-control-note">正在读取接力范围…</p>
   if (state === 'unreadable') {
-    return <p className="ln-control-note is-warning" role="alert">接力范围暂时读不到，请重新读取；这不代表尚未批准。</p>
+    return <p className="ln-control-note is-warning" role="alert">自动协作状态读取失败，请重试。</p>
   }
   if (policy === null) {
-    return <p className="ln-control-note">这项工作的任务不会自动派发。批准前，主助手仍需逐条安排。</p>
+    return <p className="ln-control-note">设置任务和审核人后，即可自动执行、审核和返工。</p>
   }
   const tally = loomDispatchTally(dispatches)
   return <>
@@ -165,7 +165,8 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
   /** 写入被真实接受后通知父层刷新其他投影 */
   onChanged?(): void
 }) {
-  const [read, setRead] = useState<ControlRead | null>(null)
+  const [readSnapshot, setReadSnapshot] = useState<{ missionId:string; port:ControlPort; value:ControlRead } | null>(null)
+  const read = readSnapshot?.missionId === missionId && readSnapshot.port === port ? readSnapshot.value : null
   const [draft, setDraft] = useState<LoomControlDraft>(EMPTY_LOOM_CONTROL_DRAFT)
   const [editing, setEditing] = useState(false)
   const [pending, setPending] = useState<'' | 'configure' | 'pause'>('')
@@ -173,6 +174,12 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
   const [conflict, setConflict] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
   const generation = useRef(0)
+  // Background reads may advance without invalidating an in-flight write.
+  // Only a different Mission or authenticated connection changes its scope.
+  const writeScope = useRef({ missionId, port, generation:0 })
+  if (writeScope.current.missionId !== missionId || writeScope.current.port !== port) {
+    writeScope.current = { missionId, port, generation:writeScope.current.generation + 1 }
+  }
   const missionRef = useRef(missionId)
   missionRef.current = missionId
   const mounted = useRef(true)
@@ -191,13 +198,13 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
     setConflict(false)
   }, [missionId])
 
-  // 读真实快照。切工作或重读时先回到「正在读取」，绝不把上一项工作的策略当答案。
+  // Keep the last same-work result during a refresh. The scoped projection
+  // above hides another Mission's policy immediately, before effects run.
   useEffect(() => {
     const ticket = ++generation.current
-    setRead(null)
     void readControl(port, missionId).then(value => {
       if (!mounted.current || generation.current !== ticket || missionRef.current !== missionId) return
-      setRead(value)
+      setReadSnapshot({ missionId, port, value })
     })
     return () => { generation.current += 1 }
   }, [port, missionId, refreshToken, reloadToken])
@@ -237,12 +244,12 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
 
   // 所有回执只回填到发起它的那一次渲染：切 A→B→A 后旧 A 的回执不能覆盖新 A。
   const submit = async (issued: ControlAttempt): Promise<void> => {
-    const token = generation.current
+    const token = writeScope.current.generation
     setPending(issued.kind)
     setFailure('')
     setConflict(false)
     const outcome = await submitControl(port, issued)
-    if (!mounted.current || token !== generation.current) return
+    if (!mounted.current || token !== writeScope.current.generation) return
     if (missionRef.current !== issued.missionId) return
     applyOutcome(issued, outcome)
   }
@@ -251,12 +258,13 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
     if (!mounted.current || missionRef.current !== issued.missionId) return
     setPending('')
     if (outcome.status === 'applied') {
+      generation.current += 1
       onAttempt(null)
       setEditing(false)
       setDraft(EMPTY_LOOM_CONTROL_DRAFT)
       setFailure('')
       setConflict(false)
-      setRead({ status: 'observed', snapshot: outcome.snapshot })
+      setReadSnapshot({ missionId, port, value:{ status: 'observed', snapshot: outcome.snapshot } })
       reload()
       onChanged?.()
       return
@@ -330,13 +338,13 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
     <div className="ln-control-head">
       <div>
         <h3>自动接力</h3>
-        <small>批准后 Core 只把列出的任务派给对应助手；暂停只挡住后续派发，不会停止正在运行的任务。成果仍需你自己验收。</small>
+        <small>按选定的任务自动执行、审核和返工。</small>
       </div>
       <span className="ln-control-state" data-state={state}>{STATE_LABEL[state]}</span>
       <div className="ln-control-actions">
         {state === 'unreadable' && <button type="button" className="ln-action" disabled={pending !== ''} onClick={reload}>重新读取</button>}
         {!editing && pauseVisible && <button type="button" className="ln-action"
-          disabled={!pausePressable} onClick={() => { void flipPause() }}>
+          disabled={!pausePressable} title="暂停后，正在运行的任务仍会继续。" onClick={() => { void flipPause() }}>
           {pending === 'pause' ? '正在提交…' : policy!.paused ? '继续接力' : '暂停接力'}
         </button>}
         {!editing && !locked && factsVisible && <button type="button" className="ln-action is-primary"
@@ -350,7 +358,7 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
       tasks={tasks} agents={agents}/>
 
     {state === 'expired' && <p className="ln-control-note is-warning" role="status">
-      授权已过期（按主机判定的时间），不会继续派发；请重新确认范围。
+      授权已过期。重新确认任务范围后才能继续。
     </p>}
 
     {pending !== '' && <p className="ln-control-note" role="status">
@@ -358,7 +366,7 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
     </p>}
 
     {locked && attempt !== null && pending === '' && <div className="ln-control-note is-warning" role="alert">
-      上次提交结果尚未确认。为免重复写入，范围与预算已锁定，只会用同一个请求编号原样核对。
+      上次提交是否成功还未确认。请先核对，再修改设置。
       <div className="ln-control-actions">
         <button type="button" className="ln-action" disabled={pending !== ''} onClick={() => { void verify() }}>
           核对上次提交
@@ -368,7 +376,7 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
 
     {editing && !locked && <div>
       {scope.status !== 'known' && <p className="ln-control-note is-warning" role="status">
-        当前对话的成员尚未读到，暂时不能选择独立审查者；已选的审查者也不能提交。
+        成员列表正在加载，暂时无法选择审核人或保存。
       </p>}
       <div className="ln-control-tasks">
         {tasks.length === 0 && <p className="ln-control-empty">这项工作的计划里还没有可接力的任务。</p>}
@@ -416,7 +424,7 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
         {problems.map(problem => <li key={problem}>{PROBLEM_LABEL[problem]}</li>)}
       </ul>}
       <div className="ln-form-actions">
-        <small>批准的是一次范围与预算，不是替你验收成果。</small>
+        <small>成果完成后，由你决定接受或退回。</small>
         <button type="button" className="ln-action" disabled={pending !== ''} onClick={closeSettings}>取消</button>
         <button type="button" className="ln-action is-primary" disabled={!canApprove}
           onClick={() => { void approve() }}>{pending === 'configure' ? '正在批准…' : '批准此范围'}</button>
@@ -424,7 +432,7 @@ export function ControlPanel({ missionId, threadId, thread, tasks, agents = [], 
     </div>}
 
     {conflict && <div className="ln-control-note is-warning" role="alert">
-      接力范围已被改写，请重新读取后再按当前修订操作。
+      设置已在别处更新，请刷新后再修改。
       <div className="ln-control-actions">
         <button type="button" className="ln-action" onClick={() => { setConflict(false); setFailure(''); reload() }}>重新读取</button>
       </div>

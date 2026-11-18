@@ -62,6 +62,28 @@ CREATE TRIGGER loom_artifact_archive_no_direct_delete
     BEGIN SELECT RAISE(ABORT, 'a LOOM archive locator is immutable'); END;
 "#;
 
+/// A logical path may have many immutable versions. Replay belongs to the same
+/// producer, Task and bytes; a later Run never inherits an earlier Run's evidence id.
+pub(crate) const VERSION_MIGRATION_SQL: &str = r#"
+DROP INDEX loom_artifact_plan_path_idx;
+CREATE UNIQUE INDEX loom_artifact_plan_path_idx
+    ON loom_artifact(plan_id,origin_key,relative_path,
+        COALESCE(task_id,''),COALESCE(agent_run_id,''),creator_id,sha256);
+DROP TRIGGER loom_artifact_no_replace;
+CREATE TRIGGER loom_artifact_no_replace
+    BEFORE INSERT ON loom_artifact
+    WHEN EXISTS(
+        SELECT 1 FROM loom_artifact
+        WHERE artifact_id=NEW.artifact_id OR rowid=NEW.rowid
+          OR (plan_id=NEW.plan_id AND origin_key=NEW.origin_key
+              AND relative_path=NEW.relative_path
+              AND COALESCE(task_id,'')=COALESCE(NEW.task_id,'')
+              AND COALESCE(agent_run_id,'')=COALESCE(NEW.agent_run_id,'')
+              AND creator_id=NEW.creator_id AND sha256=NEW.sha256)
+    )
+    BEGIN SELECT RAISE(ABORT, 'a recorded LOOM artifact is immutable'); END;
+"#;
+
 fn normalized_sql(sql: &str) -> String {
     let mut result = String::new();
     let mut quote = None;
@@ -111,6 +133,17 @@ pub(crate) fn schema_matches(connection: &Connection, legacy_sql: &str) -> rusql
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(legacy_sql)?;
     expected.execute_batch(ORIGIN_MIGRATION_SQL)?;
+    Ok(schema_objects(connection)? == schema_objects(&expected)?)
+}
+
+pub(crate) fn versioned_schema_matches(
+    connection: &Connection,
+    legacy_sql: &str,
+) -> rusqlite::Result<bool> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(legacy_sql)?;
+    expected.execute_batch(ORIGIN_MIGRATION_SQL)?;
+    expected.execute_batch(VERSION_MIGRATION_SQL)?;
     Ok(schema_objects(connection)? == schema_objects(&expected)?)
 }
 
@@ -408,15 +441,48 @@ pub(crate) struct ArchiveLocator {
 
 /// Capture only retained metadata under the database lock. The model cannot
 /// provide a locator, and the later publishing transaction compares it again.
+fn version_artifact_id(
+    connection: &Connection,
+    auth: &AuthenticatedTeamToolRun,
+    prepared: &PreparedRemoteArtifact,
+    sha256: &str,
+) -> Result<Option<String>> {
+    let origin = origin_key(&prepared.target)?;
+    let mismatched_task: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loom_artifact
+         WHERE plan_id=?1 AND origin_key=?2 AND relative_path=?3
+           AND agent_run_id=?4 AND creator_id=?5 AND task_id IS NOT ?6)",
+        params![
+            prepared.plan_id, origin, prepared.relative_path,
+            auth.agent_run_id, auth.agent_id, prepared.task_id
+        ],
+        |row| row.get(0),
+    )?;
+    if mismatched_task {
+        return Err(path_rejected(
+            "This producer's artifact path belongs to a different Task",
+        ));
+    }
+    Ok(connection.query_row(
+        "SELECT artifact_id FROM loom_artifact
+         WHERE plan_id=?1 AND origin_key=?2 AND relative_path=?3
+           AND agent_run_id=?4 AND creator_id=?5 AND task_id IS ?6 AND sha256=?7",
+        params![
+            prepared.plan_id, origin, prepared.relative_path,
+            auth.agent_run_id, auth.agent_id, prepared.task_id, sha256
+        ],
+        |row| row.get(0),
+    ).optional()?)
+}
+
 pub(crate) fn registration_snapshot(
     connection: &Connection,
+    auth: &AuthenticatedTeamToolRun,
     prepared: &PreparedRemoteArtifact,
+    sha256: &str,
 ) -> Result<Option<ArchiveLocator>> {
-    let origin = origin_key(&prepared.target)?;
-    let id: Option<String> = connection.query_row(
-        "SELECT artifact_id FROM loom_artifact WHERE plan_id=?1 AND origin_key=?2 AND relative_path=?3",
-        params![prepared.plan_id,origin,prepared.relative_path],|r| r.get(0),
-    ).optional()?;
+    revalidate_prepared(connection, auth, prepared)?;
+    let id = version_artifact_id(connection, auth, prepared, sha256)?;
     id.map(|id| {
         read_archive_locator(connection, &prepared.plan_id, &id)?.ok_or_else(|| {
             unreadable("A remote artifact cannot replay a local filesystem artifact")
@@ -493,22 +559,11 @@ pub(crate) fn register(
     crate::workspace_rpc_authority::revalidate_dispatch(&tx, &dispatch)
         .map_err(|_| path_rejected("The archive producer is no longer authorized"))?;
     let origin = origin_key(&prepared.target)?;
-    let existing: Option<String> = tx.query_row(
-        "SELECT artifact_id FROM loom_artifact WHERE plan_id=?1 AND origin_key=?2 AND relative_path=?3",
-        params![prepared.plan_id,origin,prepared.relative_path],|r| r.get(0),
-    ).optional()?;
+    let existing = version_artifact_id(&tx, auth, &prepared, &actual_sha)?;
     if let Some(id) = existing {
         let stored = read_stored_artifact(&tx, &id)?;
         if stored.sha256 != actual_sha || stored.size_bytes != actual_size {
-            return Err(LoomCommandError::rejection(
-                LOOM_ARTIFACT_CONTENT_CHANGED,
-                "This origin and path already names different evidence bytes; use a new artifact path",
-            ));
-        }
-        if stored.task_id != prepared.task_id {
-            return Err(path_rejected(
-                "This artifact path is already registered for a different Task",
-            ));
+            return Err(unreadable("The immutable artifact metadata does not match its archive"));
         }
         let current_locator = read_archive_locator(&tx, &prepared.plan_id, &id)?;
         if current_locator.is_none() || current_locator != verified_existing {
@@ -723,7 +778,7 @@ fn register_from_receipt(
     dispatch: WorkspaceDispatch,
     receipt: WorkspaceArchiveReceipt,
 ) -> Result<LoomArtifactRegisterResult> {
-    let existing = registration_snapshot(database.connection(), &prepared)?;
+    let existing = registration_snapshot(database.connection(), auth, &prepared, &receipt.sha256)?;
     let verified = verify_registration(data_dir, dispatch, receipt, existing)?;
     register(database, auth, prepared, verified)
 }
@@ -880,7 +935,7 @@ pub(crate) fn test_archive_contract_on(
     );
 
     let stale_prepared = prepare(database.connection(), auth, &input).unwrap();
-    let stale_existing = registration_snapshot(database.connection(), &stale_prepared).unwrap();
+    let stale_existing = registration_snapshot(database.connection(), auth, &stale_prepared, &receipt.sha256).unwrap();
     assert!(stale_existing.is_none());
     let stale_verified =
         verify_registration(data_dir, dispatch.clone(), receipt.clone(), stale_existing).unwrap();
@@ -1009,6 +1064,36 @@ pub(crate) fn test_archive_contract_on(
         .connection()
         .execute_batch("ROLLBACK TO artifact_origins; RELEASE artifact_origins;")
         .unwrap();
+
+    // A same-path revision preserves the prior archive and gets its own immutable identity.
+    let revised_bytes = b"remote reviewed revision";
+    let (revised_dispatch, revised_receipt) = completed_read(
+        database, data_dir, auth, &workspace, "out/report.md", revised_bytes,
+    );
+    let revised_prepared = prepare(database.connection(), auth, &input).unwrap();
+    let revised = register_from_receipt(
+        database, data_dir, auth, revised_prepared,
+        revised_dispatch.clone(), revised_receipt.clone(),
+    ).unwrap();
+    assert!(!revised.replayed);
+    assert_ne!(revised.artifact.artifact_id, *artifact_id);
+    for (id, expected) in [
+        (artifact_id, bytes.as_slice()),
+        (&revised.artifact.artifact_id, revised_bytes.as_slice()),
+    ] {
+        assert_eq!(
+            read_verified_bytes(database.connection(), data_dir, &plan, id)
+                .unwrap().as_deref(),
+            Some(expected),
+        );
+    }
+    let replay_prepared = prepare(database.connection(), auth, &input).unwrap();
+    let replayed_revision = register_from_receipt(
+        database, data_dir, auth, replay_prepared,
+        revised_dispatch, revised_receipt,
+    ).unwrap();
+    assert!(replayed_revision.replayed);
+    assert_eq!(replayed_revision.artifact.artifact_id, revised.artifact.artifact_id);
 
     // Archive+artifact publication is atomic even when the locator insert fails.
     let rollback_input = serde_json::json!({"relativePath":"out/rollback.md","taskId":"r1-task"});

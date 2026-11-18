@@ -5617,6 +5617,15 @@ impl Core {
                 match checked {
                     IdentityCheckedProbe::Stable(Ok(deep_probe)) => break deep_probe,
                     IdentityCheckedProbe::Stable(Err(error)) => {
+                        // Keep a bounded, redacted failure detail on the probe
+                        // *attempt*, including for transient errors. Previously
+                        // `failure: None` discarded the only diagnostic after
+                        // a failed DSH model-preparation/ACP handshake, so
+                        // repeated product checks could only say "transient".
+                        // This does not elevate a failed probe to a ready
+                        // capability snapshot or change retry/admission policy.
+                        let public_failure =
+                            health::model_catalog_failure(kind, &error, &canonical);
                         eprintln!(
                             "Runtime deep probe construction failed for {} at {}: {error:#}",
                             kind.as_str(),
@@ -5658,7 +5667,7 @@ impl Core {
                                 source: Some(source),
                                 failure_class,
                                 diagnostic_code,
-                                failure: None,
+                                failure: Some(&public_failure),
                             },
                         )?;
                         commit_target = runtime_installation_revision(&database, kind)?;

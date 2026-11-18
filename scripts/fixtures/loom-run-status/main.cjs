@@ -16,6 +16,11 @@ app.whenReady().then(async()=>{
  await click('.ln-run-file');assert.equal(await js('runStatusQA.selected()'),'A:artifact-A');cases.push('file click keeps exact mission and artifact identity');
  await js("runStatusQA.setMode('failure');runStatusQA.refresh()");await wait("document.body.innerText.includes('Fixture connection unavailable')");cases.push('read failure visible with local refresh action');
  await js("runStatusQA.setMode('success')");await click('[aria-label="刷新运行与成果"]');await wait("!document.body.innerText.includes('Fixture connection unavailable')");cases.push('same-view retry recovers');
+ const controlBefore=await js('runStatusQA.controlReads.length');
+ await click('.ln-control-head button.is-primary');await wait("!!document.querySelector('.ln-control-task input')");await click('.ln-control-task input');
+ await js('runStatusQA.refresh()');await wait(`runStatusQA.controlReads.length>${controlBefore}`);
+ assert(await js("document.querySelector('.ln-control-task input').checked"));
+ await click('.ln-control .ln-form-actions button');cases.push('live control facts refresh without discarding the selected task draft');
  await js("runStatusQA.setMode('deferred');runStatusQA.refresh()");await wait("document.body.innerText.includes('正在更新')");assert(await js("!!document.querySelector('.ln-run-file')"));cases.push('same-work refresh preserves coherent content');
  await js("runStatusQA.switchWork('B')");await wait("!document.querySelector('[data-mission-id=\"A\"]')");cases.push('switching work hides old snapshot before reply');
  await js("runStatusQA.release('B')");await wait("!!document.querySelector('[data-mission-id=\"B\"]')");await js("runStatusQA.release('A')");await sleep(120);assert(await js("!!document.querySelector('[data-mission-id=\"B\"]')&&!document.querySelector('[data-mission-id=\"A\"]')"));cases.push('late reply cannot overwrite current work');
@@ -37,10 +42,22 @@ app.whenReady().then(async()=>{
   assert.equal(await js('runStatusQA.calls.length'),countBefore+1);
   await js("runStatusQA.setMode('success');runStatusQA.release('P')");await wait("!document.body.innerText.includes('正在更新')");
   assert.equal(await js('runStatusQA.calls.length'),countBefore+2);cases.push('same-work polling coalesces and cannot starve the Host read');
+  // A completed coherent read must become visible even while another update is
+  // queued. Waiting for a perfectly quiet parent can hide new files forever.
+  await js("runStatusQA.setMode('deferred');runStatusQA.addArtifact('first-result')");
+  await wait("document.body.innerText.includes('正在更新')");
+  await js("runStatusQA.addArtifact('second-result')");await sleep(80);
+  await js("runStatusQA.release('P')");
+  await wait("!!document.querySelector('[data-artifact-id=\"first-result\"]')");
+  assert(!(await js("!!document.querySelector('[data-artifact-id=\"second-result\"]')")));
+  assert(await js("document.body.innerText.includes('正在更新')"));
+  await js("runStatusQA.release('P')");
+  await wait("!!document.querySelector('[data-artifact-id=\"second-result\"]')&&!document.body.innerText.includes('正在更新')");
+  cases.push('completed file snapshots stay visible during continuous same-work updates');
   await js("runStatusQA.setReadTimeoutMs(500);runStatusQA.setMode('deferred');runStatusQA.refresh()");await wait("document.body.innerText.includes('读取超时')");
   assert(await js("!!document.querySelector('[data-mission-id=\"P\"]')&&!document.querySelector('[aria-label=\"刷新运行与成果\"]').disabled"));
-  await js("runStatusQA.setMode('success')");await click('[aria-label="刷新运行与成果"]');await wait("!document.body.innerText.includes('读取超时')&&document.body.innerText.includes('认领有效')");
-  await js("runStatusQA.releaseExpired('P')");await sleep(120);assert(!(await js("document.querySelector('.ln-run-panel').innerText.includes('认领已过期')")));
+  await js("runStatusQA.setMode('success')");await click('[aria-label="刷新运行与成果"]');await wait("!document.body.innerText.includes('读取超时')&&document.querySelector('.ln-run-diagnostics').textContent.includes('认领有效')");
+  await js("runStatusQA.releaseExpired('P')");await sleep(120);assert(!(await js("document.querySelector('.ln-run-diagnostics').textContent.includes('认领已过期')")));
   await js('runStatusQA.setReadTimeoutMs(15000)');cases.push('hung read times out, supports explicit retry, and rejects its late reply');
 
   win.webContents.sendInputEvent({type:'keyDown',keyCode:'Escape'});win.webContents.sendInputEvent({type:'keyUp',keyCode:'Escape'});await wait("!document.querySelector('[role=dialog]')");
@@ -72,13 +89,13 @@ app.whenReady().then(async()=>{
   cases.push('unknown review remains readable at desktop and mobile sizes');
   win.setContentSize(1440,920);
   await click('[aria-label="关闭成果正文"]');await wait("!document.querySelector('.ln-artifact-dialog')&&document.activeElement?.id==='open-runs'");cases.push('artifact close restores focus even when originating run dialog is gone');
-  await click('#open-runs');await wait("!!document.querySelector('.ln-run-file')");await click('.ln-run-file');await wait("document.body.innerText.includes('此前的验收请求尚未确认')");
+  await click('#open-runs');await wait("!!document.querySelector('.ln-run-file')");await click('.ln-run-file');await wait("document.body.innerText.includes('上次验收结果尚未确认')");
   assert.equal(await js('runStatusQA.writes.length'),1);assert.equal(await js("document.querySelector('#ln-artifact-reason').value"),'Verified responsive fixture evidence.');cases.push('reopening restores the same unknown review without automatic writes');
   await click('.ln-artifact-review-form button[type=submit]');await wait("document.body.innerText.includes('验收已记录：')");
   const sent=await js('runStatusQA.writes');assert.equal(sent.length,2);assert.deepEqual(sent[0],sent[1]);assert(!('reviewerId' in sent[0]));cases.push('explicit retry replays exact commandId and payload without claiming Owner identity');
   assert(!(await js("!!document.querySelector('.ln-artifact-review-composer')")));cases.push('confirmed receipt locks further review actions');
   await click('[aria-label="关闭成果正文"]');await js("runStatusQA.switchWork('D')");await click('#open-runs');await wait("!!document.querySelector('[data-mission-id=\"D\"]')");await click('.ln-run-file');await wait("!!document.querySelector('.ln-artifact-dialog')");
-  await js('runStatusQA.invalidateArtifact()');await wait("document.body.innerText.includes('重新取得当前记录前不能提交验收')");
+  await js('runStatusQA.invalidateArtifact()');await wait("document.body.innerText.includes('工作记录已更新，请刷新后再验收')");
   assert(!(await js("!!document.querySelector('.ln-artifact-review-composer')")));assert.equal(await js('runStatusQA.writes.length'),2);cases.push('changed artifact identity keeps text read-only and blocks review');
   await click('[aria-label="关闭成果正文"]');
   const report={ok:true,scope:'production-react-with-fixture-transport',realCore:false,realModel:false,cases,shots};fs.writeFileSync(path.join(output,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report));win.destroy();app.exit(0);

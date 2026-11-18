@@ -157,16 +157,16 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, the
             ]}/>{runtime.model.mode === 'explicit' && !option.models.some(model => runtime.model.mode === 'explicit' && model.id === runtime.model.modelId) && <small>当前已保存的模型不在最新目录中：{runtime.model.modelId}。不会自动换成其他模型。</small>}</label>
             {explicitModel && selectedModel?.options.map(modelOption => <label className="ln-field" key={modelOption.key}><span>{modelOption.label}</span><ChoiceMenu theme={theme} label={modelOption.label} value={String(explicitModel.options[modelOption.key] ?? modelOption.defaultValue ?? '')} disabled={busy} onChange={value => setRuntime(current => current?.model.mode === 'explicit' ? { ...current, model: { ...current.model, options: { ...current.model.options, [modelOption.key]:value } } } : current)} choices={modelOption.values.map(choice => ({value:choice.value,label:choice.label}))}/></label>)}
             {runtime.adapterKind === 'pi' && <section className="ln-review-card" aria-label="Pi Purge 人格扩展">
-              <div className="ln-panel-title"><h3>Pi Purge · 原生人格扩展</h3></div>
-              <label className="ln-field"><span>下次运行的扩展模式</span><ChoiceMenu label="Pi Purge 模式" theme={theme} value={runtime.piPurge?.mode ?? 'off'} disabled={busy} onChange={value => updatePiPurge({mode: value as 'off' | 'append'})} choices={[{ value:'off', label:'Off · 不启用' }, { value:'append', label:'Append · 保留原生规则，前置人格' }]}/></label>
-              <label className="ln-field"><span>人格提示词（仅当前助手）</span><textarea aria-label="Pi Purge 人格提示词" rows={4} maxLength={16 * 1024} disabled={busy} value={runtime.piPurge?.persona ?? ''} placeholder="写清这个助手的角色、表达风格和任务偏好" onChange={event => updatePiPurge({persona:event.target.value})}/><small>仅在 Pi 的下一次受管 Run 中生效；不扩大文件、MCP 或设备权限。条件不满足时 Core 必须拒绝，而不是假装已启用。</small></label>
+              <div className="ln-panel-title"><h3>Pi Purge · 助手设定</h3></div>
+              <label className="ln-field"><span>启用方式</span><ChoiceMenu label="Pi Purge 模式" theme={theme} value={runtime.piPurge?.mode ?? 'off'} disabled={busy} onChange={value => updatePiPurge({mode: value as 'off' | 'append'})} choices={[{ value:'off', label:'关闭' }, { value:'append', label:'追加助手设定' }]}/></label>
+              <label className="ln-field"><span>角色与偏好</span><textarea aria-label="Pi Purge 人格提示词" rows={4} maxLength={16 * 1024} disabled={busy} value={runtime.piPurge?.persona ?? ''} placeholder="写清这个助手的角色、表达风格和任务偏好" onChange={event => updatePiPurge({persona:event.target.value})}/><small>保存后从下次运行开始生效，仅用于当前助手。</small></label>
             </section>}
             <div className="ln-panel-title"><h3>权限与确认方式</h3></div>
             {option.permissionOptions.length ? option.permissionOptions.map(permissionField) : <FormMessage>当前运行端没有提供可编辑的权限选项。实际操作仍以运行时授权为准。</FormMessage>}
-            <FormMessage>对话中的“仅一次”和“本会话允许”来自运行端的真实授权选项。不会把一次授权扩大为永久权限。</FormMessage>
+            <FormMessage>运行中需要授权时，会在对话里向你确认。</FormMessage>
           </>}
           {error && <FormMessage error>{error}</FormMessage>}{message && <FormMessage>{message}</FormMessage>}
-          <footer className="ln-form-actions"><small>保存影响后续运行，不会启动任务。</small><button type="button" className="ln-action is-primary" disabled={!runtimeDirty || !runtime || busy || !option?.usable} onClick={() => { if (changedDangerous.length) setDangerConfirm(true); else void saveRuntime() }}>{busy ? '保存中…' : '保存运行配置'}</button></footer>
+          <footer className="ln-form-actions"><small>新配置从下次运行开始生效。</small><button type="button" className="ln-action is-primary" disabled={!runtimeDirty || !runtime || busy || !option?.usable} onClick={() => { if (changedDangerous.length) setDangerConfirm(true); else void saveRuntime() }}>{busy ? '保存中…' : '保存运行配置'}</button></footer>
         </>}
       </div></>}
     </div></div>

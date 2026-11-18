@@ -1,0 +1,22 @@
+.ln-runtime-settings{width:min(720px,calc(100vw - 32px));--ink:var(--ln-text);--muted:var(--ln-muted);--line:var(--ln-line);--line-strong:var(--ln-line);--input:var(--ln-card);--surface:var(--ln-bg);--surface-muted:var(--ln-card);--danger:var(--ln-danger)}
+.ln-runtime-settings .runtime-startup-page{min-width:0}
+.ln-runtime-settings .runtime-startup-heading{display:none}
+.ln-runtime-settings .runtime-startup-back{margin-bottom:22px;color:var(--ln-muted)}
+.ln-runtime-settings .runtime-startup-form{display:grid;gap:24px}
+.ln-runtime-settings .runtime-startup-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;font-size:13px;font-weight:600}
+.ln-runtime-settings .runtime-startup-path{display:flex;gap:8px;min-width:0}
+.ln-runtime-settings .runtime-startup-path input{flex:1;min-width:0;padding:10px 12px;border:1px solid var(--ln-line);border-radius:9px;background:var(--ln-card);font-size:13px}
+.ln-runtime-settings .runtime-startup-inspection{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-top:10px;color:var(--ln-muted);font-size:12px}
+.ln-runtime-settings .runtime-startup-version{margin-left:8px}
+.ln-runtime-settings .quiet-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:7px 10px;border-radius:8px;background:var(--ln-card);font-size:12px}
+.ln-runtime-settings .quiet-button:hover{background:var(--ln-hover)}
+.ln-runtime-settings .quiet-button svg{width:15px;height:15px}
+.ln-runtime-settings .runtime-startup-actions{display:flex;justify-content:space-between;gap:12px;align-items:center;padding-top:16px;border-top:1px solid var(--ln-line)}
+.ln-runtime-settings .runtime-startup-actions>div{display:flex;gap:8px}
+.ln-runtime-settings .member-editor-save{background:var(--ln-blue);color:white}
+.ln-runtime-settings .member-environment-json{width:100%;min-height:100px;padding:12px;border:1px solid var(--ln-line);border-radius:9px;background:var(--ln-card);font:12px/1.6 ui-monospace,monospace;resize:vertical}
+.ln-runtime-settings .runtime-startup-read-error,.ln-runtime-settings .runtime-save-conflict{display:grid;gap:10px;padding:12px;border-radius:9px;background:var(--ln-card);overflow-wrap:anywhere}
+.ln-runtime-settings .runtime-conflict-actions{display:flex;gap:8px;flex-wrap:wrap}
+.ln-runtime-settings .runtime-conflict-value{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}
+.ln-runtime-settings .inline-error,.ln-runtime-settings .is-error,.ln-runtime-settings .environment-error{color:var(--ln-danger);font-size:12px;overflow-wrap:anywhere}
+.ln-runtime-settings .common-environment-heading>label{font-size:13px}

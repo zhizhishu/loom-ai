@@ -23,7 +23,8 @@ test('LOOM native run surface has honest context and recoverable interactions',{
   let stdout='',stderr='';child.stdout.on('data',x=>stdout+=x);child.stderr.on('data',x=>stderr+=x)
   const timer=setTimeout(()=>child.kill(),120_000);let code;try{[code]=await closed}finally{clearTimeout(timer)}
   assert.equal(code,0,stdout+'\n'+stderr)
-  const report=JSON.parse(await readFile(join(output,'report.json'),'utf8'));assert.equal(report.ok,true);assert.equal(report.cases.length,27);assert.equal(report.shots.length,10)
+  const report=JSON.parse(await readFile(join(output,'report.json'),'utf8'));assert.equal(report.ok,true);assert.equal(report.cases.length,29);assert.equal(report.shots.length,10)
+  assert.ok(report.cases.includes('completed file snapshots stay visible during continuous same-work updates'))
   // Added with the automatic-relay range entry: the synthetic surface renders the production control
   // panel, so it must declare the real read and pass real member profiles, and must never fake a write.
   const fixtureSource=await readFile(join(source,'renderer.tsx'),'utf8')

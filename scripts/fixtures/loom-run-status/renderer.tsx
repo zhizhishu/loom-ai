@@ -101,6 +101,8 @@ function Fixture() {
     release:key=>{const resolve=pending.get(key);pending.delete(key);resolve?.(claimReceipt(key))},
     releaseExpired:key=>{const resolve=pending.get(key);pending.delete(key);const value=claimReceipt(key);value.claims[0].expired=true;resolve?.(value)},
     setEmpty,selected:()=>selected,epoch:()=>epoch,setOpenArtifacts,
+    addArtifact:artifactId=>setData(old=>({...old,bundle:{...old.bundle,artifacts:[...old.bundle.artifacts,
+      {...old.bundle.artifacts[0],artifactId,relativePath:'output/'+artifactId+'.md'}]}})),
     invalidateArtifact:()=>setData(old=>({...old,bundle:{...old.bundle,artifacts:old.bundle.artifacts.map(a=>({...a,sha256:'b'.repeat(64)}))}}))
   }
   return <ThreadClientProvider client={client}><div className="ln-app" data-theme={theme}>
@@ -117,6 +119,6 @@ function Fixture() {
 declare global { interface Window { runStatusQA:{
   calls:string[];controlReads:string[];writes:LoomReviewRecordInput[];setTheme(value:'day'|'night'):void;setMode(value:string):void;
   setReviewMode(value:string):void;setReadTimeoutMs(value:number):void;releaseExpired(id:string):void;refresh():void;switchWork(id:string):void;release(id:string):void;
-  setEmpty(value:boolean):void;selected():string;epoch():number;setOpenArtifacts(value:boolean):void;invalidateArtifact():void
+  setEmpty(value:boolean):void;selected():string;epoch():number;setOpenArtifacts(value:boolean):void;invalidateArtifact():void;addArtifact(id:string):void
 } } }
 createRoot(document.getElementById('root')!).render(<Fixture/>)

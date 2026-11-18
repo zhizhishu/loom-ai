@@ -103,7 +103,9 @@ impl Core {
         })?;
         let previous = {
             let database = self.database.lock().await;
-            crate::loom::remote_artifact::registration_snapshot(database.connection(), &prepared)?
+            crate::loom::remote_artifact::registration_snapshot(
+                database.connection(), authenticated, &prepared, &receipt.sha256,
+            )?
         };
         let data_dir = self.data_dir.clone();
         let verified = tokio::task::spawn_blocking(move || {

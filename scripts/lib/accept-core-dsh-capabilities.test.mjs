@@ -34,6 +34,7 @@ import {
   bindingPathInsideFixture,
   compareModelIdentity,
   decodeRelayModel,
+  deselectionVerdict,
   countLines,
   fileOrNull,
   findSecret,
@@ -732,6 +733,37 @@ test('a FAIL cell outranks a NOT_RUN cell and a missing cell is NOT_RUN', () => 
   const partial = overallVerdict({ skill: { status: 'PASS', reasons: [] } })
   assert.equal(partial.status, 'NOT_RUN')
   assert.deepEqual(partial.cells.find(entry => entry.cell === 'hook').reasons, ['cell_missing'])
+})
+
+test('deselection needs the current Run resource exclusion and stable cleared choices', () => {
+  const fixture = {
+    runId: 'negative-run', runStatus: 'succeeded', expectedRevision: 'revision-cleared',
+    catalog: { revision: 'revision-cleared', items: [
+      { kind: 'skill', id: 'skill-1', selected: false },
+      { kind: 'rule', id: 'rule-1', selected: false }
+    ] },
+    skillId: 'skill-1', ruleId: 'rule-1', skillMarkerAbsent: true, ruleMarkerAbsent: true,
+    materialObservations: [{ runId: 'negative-run', status: 'NOT_RUN', reasons: ['selected_material_missing'] }]
+  }
+  assert.equal(deselectionVerdict(fixture).status, 'PASS')
+  for (const materialObservations of [
+    [], [{ status: 'PASS', runId: 'positive-run' }],
+    [{ status: 'NOT_RUN', runId: 'positive-run', reasons: ['selected_material_missing'] }],
+    [{ status: 'NOT_RUN', reasons: ['selected_material_unreadable_or_unconfined'] }],
+    [...fixture.materialObservations, { status: 'PASS', runId: 'negative-run' }]
+  ]) {
+    const result = deselectionVerdict({ ...fixture, materialObservations })
+    assert.equal(result.status, 'FAIL')
+    assert.ok(result.reasons.includes('negative_skill_exclusion_unproven'))
+  }
+  for (const catalog of [
+    { ...fixture.catalog, revision: 'changed' },
+    { ...fixture.catalog, items: [] },
+    { ...fixture.catalog, items: fixture.catalog.items.map(item => ({ ...item, selected: true })) }
+  ]) assert.equal(deselectionVerdict({ ...fixture, catalog }).status, 'FAIL')
+  assert.equal(deselectionVerdict({ ...fixture, runStatus: 'failed' }).status, 'FAIL')
+  assert.equal(deselectionVerdict({ ...fixture, skillMarkerAbsent: false }).status, 'FAIL')
+  assert.equal(deselectionVerdict({ ...fixture, ruleMarkerAbsent: false }).status, 'FAIL')
 })
 
 test('the deselection negative is required before overall acceptance can pass', () => {

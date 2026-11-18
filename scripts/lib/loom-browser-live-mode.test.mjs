@@ -39,8 +39,92 @@ import {
   tagChoiceItemJs,
   workerTasks,
   workerIds,
-  relayTaskCheckboxSelector
+  relayTaskCheckboxSelector,
+  terminalFirstPassWithoutRework,
+  leadPlanTerminalOutcome
 } from './loom-browser-live-mode.mjs'
+
+const terminalLeadFixture = () => ({
+  missionId: 'mission-current', threadId: 'thread-current', leadAgentId: 'lead',
+  snapshot: { thread: { id: 'thread-current', missionId: 'mission-current', defaultLeadAgentId: 'lead' },
+    agentRuns: [{ id: 'lead-failed', agentId: 'lead', status: 'failed',
+      createdAt: '2026-11-18T04:00:00Z', endedAt: '2026-11-18T04:00:02Z',
+      terminalReasonCode: 'runtime_configuration_invalid' }],
+    messageDeliveries: [], turns: [{ id: 'turn-1', status: 'failed' }] }
+})
+
+test('a terminal current Lead with no queued work fails plan waiting immediately and retains the reason', () => {
+  const result = leadPlanTerminalOutcome(terminalLeadFixture())
+  assert.equal(result.terminal, true)
+  assert.equal(result.reason, 'lead_run_failed:runtime_configuration_invalid')
+  assert.equal(result.evidence.latestLeadRun.id, 'lead-failed')
+  assert.equal(result.evidence.pendingRuns, 0)
+})
+
+test('a failed Lead cannot mask queued retries, active deliveries, active turns or another active Run', () => {
+  for (const status of ['queued', 'running', 'waiting']) {
+    const fixture = terminalLeadFixture()
+    fixture.snapshot.agentRuns.push({ id: 'retry', agentId: 'lead', status, createdAt: '2026-11-18T04:00:03Z' })
+    assert.equal(leadPlanTerminalOutcome(fixture).terminal, false)
+  }
+  const delivery = terminalLeadFixture()
+  delivery.snapshot.messageDeliveries.push({ recipientAgentId: 'lead', status: 'pending', dispatchPhase: 'attempted_waiting' })
+  assert.equal(leadPlanTerminalOutcome(delivery).terminal, false)
+  const turn = terminalLeadFixture()
+  turn.snapshot.turns[0].status = 'running'
+  assert.equal(leadPlanTerminalOutcome(turn).terminal, false)
+  const other = terminalLeadFixture()
+  other.snapshot.agentRuns.push({ id: 'worker', agentId: 'worker', status: 'running' })
+  assert.equal(leadPlanTerminalOutcome(other).terminal, false)
+})
+
+test('Lead terminal assessment binds the exact Mission, thread and Lead and refuses incomplete or tied facts', () => {
+  for (const field of ['missionId', 'threadId', 'leadAgentId']) {
+    const fixture = terminalLeadFixture()
+    fixture[field] = 'foreign'
+    assert.equal(leadPlanTerminalOutcome(fixture).terminal, false)
+  }
+  const incomplete = terminalLeadFixture()
+  delete incomplete.snapshot.messageDeliveries
+  assert.equal(leadPlanTerminalOutcome(incomplete).terminal, false)
+  const tied = terminalLeadFixture()
+  tied.snapshot.agentRuns.push({ ...tied.snapshot.agentRuns[0], id: 'other-same-time' })
+  assert.equal(leadPlanTerminalOutcome(tied).terminal, false)
+  const newer = terminalLeadFixture()
+  newer.snapshot.agentRuns.push({ id: 'new-result', agentId: 'lead', status: 'succeeded', createdAt: '2026-11-18T04:00:03Z' })
+  const latest = leadPlanTerminalOutcome(newer)
+  assert.equal(latest.reason, 'lead_finished_without_two_worker_tasks')
+  assert.equal(latest.evidence.latestLeadRun.id, 'new-result')
+})
+
+test('fully settled first-pass reviews fail the required-rework gate immediately', () => {
+  const fixture = {
+    taskIds: ['a', 'b'],
+    candidates: ['a', 'b'].map(taskId => ({ taskId, candidateId: taskId + '-c1', acceptanceStatus: 'pending' })),
+    stageReviews: ['a', 'b'].map(taskId => ({ taskId, candidateId: taskId + '-c1', verdict: 'pass' })),
+    dispatches: ['a', 'b'].flatMap(taskId => ['execute', 'review', 'handoff'].map(kind =>
+      ({ taskId, kind, candidateId: kind === 'execute' ? null : taskId + '-c1', status: 'settled' })))
+  }
+  assert.equal(terminalFirstPassWithoutRework(fixture), true)
+  const withRework = structuredClone(fixture)
+  withRework.dispatches.push({ taskId: 'a', kind: 'rework', status: 'settled' })
+  assert.equal(terminalFirstPassWithoutRework(withRework), false)
+  const running = structuredClone(fixture)
+  running.dispatches[0].status = 'dispatched'
+  assert.equal(terminalFirstPassWithoutRework(running), false)
+  const rejected = structuredClone(fixture)
+  rejected.stageReviews[0].verdict = 'request_changes'
+  assert.equal(terminalFirstPassWithoutRework(rejected), false)
+  const wrongTask = structuredClone(fixture)
+  wrongTask.stageReviews[0].taskId = 'not-in-scope'
+  assert.equal(terminalFirstPassWithoutRework(wrongTask), false)
+  const duplicateTaskDispatch = structuredClone(fixture)
+  duplicateTaskDispatch.dispatches[3].taskId = 'a'
+  assert.equal(terminalFirstPassWithoutRework(duplicateTaskDispatch), false)
+  const wrongCandidate = structuredClone(fixture)
+  wrongCandidate.stageReviews[1].candidateId = 'a-c1'
+  assert.equal(terminalFirstPassWithoutRework(wrongCandidate), false)
+})
 
 test('scope selection identifies one exact task and never an unstable list index', () => {
   const alpha = relayTaskCheckboxSelector('交付 Markdown 文件 A')

@@ -20,6 +20,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { prepareLivePiHost } from './loom-live-pi-host.mjs'
 import { buildMissionDescription, redactDeep, summarizeLeadChain, verifyArchivedArtifact } from '../accept-loom-live-lead.mjs'
+import { taskDeliveryOutcomes } from './loom-chain-outcome.mjs'
+import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 import * as ab from './ab-browser.mjs'
 import {
   HOST_CONFIG_ENV,
@@ -35,6 +37,8 @@ import {
   pickNewMission,
   relayStateJs,
   relayTaskCheckboxSelector,
+  terminalFirstPassWithoutRework,
+  leadPlanTerminalOutcome,
   resolveAdminToken,
   rosterJs,
   screenshotGate,
@@ -80,6 +84,7 @@ test('real page creates and starts the work, then approves the relay scope for t
     secrets.push(...prepared.secrets)
     facts = prepared.facts
     roles = prepared.roles
+    report.steps.hostSchema = prepared.evidence?.hostSchema ?? prepared.hostSchema
     await mkdir(OUT, { recursive: true })
 
     const before = await facts('missions.list')
@@ -169,9 +174,10 @@ test('real page creates and starts the work, then approves the relay scope for t
     assert.equal(await facts('loom.reviews.list', { missionId }).then(rows => Array.isArray(rows) && rows.length === 0), true, 'a review existed before any human verdict')
 
     // ---- wait for the Lead to actually author two worker tasks ----
-    const authored = await waitForTasks(missionId)
+    const authored = await waitForTasks(missionId, mission.threadId)
+    report.steps.leadPlan = { ok: authored.ok, reason: authored.reason, evidence: authored.evidence,
+      taskIds: authored.tasks.map(task => task.taskId), workers: workerIds(roles) }
     assert.equal(authored.ok, true, `the Lead did not author two worker tasks: ${authored.reason}`)
-    report.steps.leadPlan = { taskIds: authored.tasks.map(task => task.taskId), workers: workerIds(roles) }
     console.log(JSON.stringify({ liveUiStage: 'model_plan_observed', taskCount: authored.tasks.length }))
 
     const beforeApproval = await facts('threads.snapshot', { threadId: mission.threadId })
@@ -225,8 +231,19 @@ test('real page creates and starts the work, then approves the relay scope for t
       assert.equal(await evalValue(`return document.querySelector(${JSON.stringify(selector)}).checked`), false,
         `task ${task.taskId} was already selected; refusing a second click`)
       const click = ab.abClick(tabId, selector, { env: process.env })
+      report.steps.scopeClickAttempt = { taskId: task.taskId, verdict: click.verdict, reason: click.reason }
       // Never repeat an uncertain click. Query this exact checkbox instead.
-      await waitFor(`return document.querySelector(${JSON.stringify(selector)})?.checked === true`, 20)
+      try {
+        await waitFor(`return document.querySelector(${JSON.stringify(selector)})?.checked === true`, 20)
+      } catch (error) {
+        report.steps.scopeAfterClick = await evalValue(`return ({
+          scopeEditing: !!document.querySelector('.ln-control-budgets'),
+          scopeState: document.querySelector('.ln-control')?.getAttribute('data-control-state') ?? null,
+          matchingCheckboxes: document.querySelectorAll(${JSON.stringify(selector)}).length,
+          checked: document.querySelector(${JSON.stringify(selector)})?.checked ?? null
+        })`)
+        throw error
+      }
       report.steps.scopeTaskClicks ??= []
       report.steps.scopeTaskClicks.push({ taskId: task.taskId, outcome: click.verdict, checkedReadback: true })
       const reviewerIndex = await tagReviewerForTask(index, `reviewer-${task.taskId}`)
@@ -278,13 +295,14 @@ test('real page creates and starts the work, then approves the relay scope for t
     }
 
     // ---- wait for the real chain: EXECUTE / REVIEW / REWORK / settled ----
-    const chain = await waitForChain(missionId, mission.threadId, control.policy.reviewers)
+    const chain = await waitForChain(missionId, mission.threadId, control.policy)
+    report.steps.chain = { ...chain.evidence, ok: chain.ok, reasons: chain.reasons }
     assert.equal(chain.ok, true, `the relay chain did not settle: ${JSON.stringify(chain.reasons)}`)
-    report.steps.chain = chain.evidence
     console.log(JSON.stringify({ liveUiStage: 'model_chain_verified', evidence: chain.evidence }))
 
     // ---- UI preview of the archived result ----
     const currentArtifactRows = `.ln-run-panel[data-mission-id="${missionId}"] .ln-run-artifact[data-artifact-id="${chain.artifactId}"] button.ln-run-file`
+    await waitFor(`return (() => { const rows = document.querySelectorAll(${JSON.stringify(currentArtifactRows)}); const row = rows[0]; return rows.length === 1 && !row.disabled && row.getClientRects().length > 0 })()`, 60)
     assert.equal(await clickNth(currentArtifactRows, 0, 'artifact-open'), true, 'the exact reviewed artifact row was not clickable')
     await waitFor(`return !!document.querySelector(${JSON.stringify(UI.artifactDialog)})`, 60)
     const previewChars = await evalValue(`return (document.querySelector(${JSON.stringify(UI.artifactDialog)})?.innerText ?? '').trim().length`)
@@ -303,6 +321,7 @@ test('real page creates and starts the work, then approves the relay scope for t
     report.status = 'passed-ui-created-started-and-approved-scope'
   } catch (error) {
     report.status = 'failed'
+    if (error?.hostSchema) report.steps.hostSchema = error.hostSchema
     report.error = { name: error?.name ?? null, message: String(error?.message ?? error).slice(0, 1500) }
     if (tabId && report.steps.login === 'app-root-visible') {
       const shot = await ab.abScreenshot(tabId, join(OUT, 'failed-ui.png'), { env: process.env })
@@ -376,70 +395,102 @@ test('real page creates and starts the work, then approves the relay scope for t
     return { opened: true, picked: true, labels: menu.labels ?? [], pickedLabel: roles.reviewer.displayName }
   }
 
-  async function waitForTasks (missionId) {
+  async function waitForTasks (missionId, threadId) {
     const deadline = Date.now() + LEAD_PLAN_BUDGET_MS
-    let last = 'no_read'
+    let last = 'no_read', evidence = null, latestTasks = []
     while (Date.now() < deadline) {
-      const plan = await facts('loom.plan.get', { missionId })
-      const tasks = await facts('loom.tasks.list', { missionId })
+      // Read plan/tasks after this Run snapshot. A terminal Run must not be paired
+      // with a plan read from just before its final tool call committed.
+      const snapshot = await facts('threads.snapshot', { threadId })
+      const [plan, tasks] = await Promise.all([
+        facts('loom.plan.get', { missionId }), facts('loom.tasks.list', { missionId })
+      ])
       if (plan !== null && Array.isArray(tasks)) {
         const pickedTasks = workerTasks(tasks, roles)
-        if (pickedTasks.complete) return { ok: true, tasks: pickedTasks.tasks, reason: null }
+        latestTasks = pickedTasks.tasks
+        if (pickedTasks.complete) return { ok: true, tasks: pickedTasks.tasks, reason: null, evidence: null }
         last = pickedTasks.reason ?? 'incomplete'
       }
+      const terminal = leadPlanTerminalOutcome({ snapshot, missionId, threadId, leadAgentId: roles.lead.agentId })
+      evidence = terminal.evidence
+      if (terminal.terminal) return { ok: false, tasks: latestTasks, reason: terminal.reason, evidence }
       await sleep(4000)
     }
-    return { ok: false, tasks: [], reason: last }
+    return { ok: false, tasks: latestTasks, reason: last, evidence }
   }
 
-  async function waitForChain (missionId, threadId, reviewers) {
+  async function waitForChain (missionId, threadId, policy) {
     const deadline = Date.now() + CHAIN_BUDGET_MS
     let evidence = null
     while (Date.now() < deadline) {
       const control = await facts('loom.control.get', { missionId })
+      const tasks = await facts('loom.tasks.list', { missionId })
       const candidates = await facts('loom.candidates.list', { missionId })
       const artifacts = await facts('loom.artifacts.list', { missionId })
+      assert.ok(Array.isArray(tasks) && Array.isArray(candidates), 'task and candidate facts must be readable')
       const rows = Array.isArray(artifacts) ? artifacts : Array.isArray(artifacts?.artifacts) ? artifacts.artifacts : []
+      const outcome = taskDeliveryOutcomes({
+        taskIds: policy.taskIds, tasks, candidates,
+        stageReviews: control?.stageReviews ?? [], dispatches: control?.dispatches ?? [],
+        authorizationRevision: policy.authorizationRevision
+      })
+      evidence = {
+        dispatches: (control?.dispatches ?? []).map(row => ({
+          taskId: row.taskId, candidateId: row.candidateId, kind: row.kind, status: row.status
+        })),
+        candidates: candidates.length, artifacts: rows.length, archiveOk: 0,
+        stageReviews: (control?.stageReviews ?? []).map(row => ({
+          taskId: row.taskId, candidateId: row.candidateId, verdict: row.verdict
+        })),
+        reviewers: policy.reviewers.length, taskOutcomes: outcome.outcomes,
+        allTasksPassed: outcome.allPassed
+      }
+      // A task that needs a new approval cannot finish by waiting longer. Preserve its
+      // actual reason; do not turn one successful task into success for the whole scope.
+      if (outcome.terminalFailure) return { ok: false, reasons: outcome.reasons, evidence }
+      if (terminalFirstPassWithoutRework({
+        dispatches: control?.dispatches ?? [], candidates,
+        stageReviews: control?.stageReviews ?? [], taskIds: policy.taskIds,
+        authorizationRevision: policy.authorizationRevision
+      })) {
+        return { ok: false, reasons: ['model_passed_first_drafts_without_required_rework'], evidence }
+      }
       const archiveChecks = []
       for (const artifact of rows) {
         const preview = await facts('loom.artifact.preview', { missionId, artifactId: artifact.artifactId })
         archiveChecks.push(verifyArchivedArtifact({ registered: artifact, preview }))
       }
-      const verdict = chainGate({ dispatches: control?.dispatches ?? [], candidates: candidates ?? [], archiveChecks })
-      evidence = {
-        dispatches: (control?.dispatches ?? []).map(row => ({ kind: row.kind, status: row.status })),
-        candidates: (candidates ?? []).length,
-        artifacts: rows.length,
-        archiveOk: archiveChecks.filter(check => check.ok).length,
-        stageReviews: (control?.stageReviews ?? []).map(row => row.verdict),
-        reviewers: reviewers.length
-      }
-      if (verdict.ok) {
+      evidence.archiveOk = archiveChecks.filter(check => check.ok).length
+      const verdict = chainGate({ dispatches: control?.dispatches ?? [], candidates, archiveChecks })
+      if (outcome.allPassed && verdict.ok) {
         const snapshot = await facts('threads.snapshot', { threadId })
         const claimResult = await facts('loom.claims.list', { missionId })
         const ownerReviews = await facts('loom.reviews.list', { missionId })
         assert.ok(Array.isArray(snapshot?.agentRuns), 'actual model Run receipts are required')
         assert.ok(Array.isArray(ownerReviews), 'Owner review facts must be readable')
-        // Reuse the shared summary for the model-authored facts it can judge from persisted rows.
         const summary = summarizeLeadChain({
-          plan: await facts('loom.plan.get', { missionId }),
-          tasks: await facts('loom.tasks.list', { missionId }),
-          candidates: candidates ?? [],
-          artifacts: rows,
-          control,
-          runs: snapshot.agentRuns,
-          claims: Array.isArray(claimResult) ? claimResult : claimResult?.claims ?? [],
-          ownerReviews,
-          workerAgentIds: workerIds(roles),
-          fileTexts: Object.fromEntries(candidates.map(candidate => [candidate.candidateId, candidate.evidenceIds.map(id => archiveChecks.find(check => check.ok && check.artifactId === id)?.text ?? '').join('\n')])),
+          plan: await facts('loom.plan.get', { missionId }), tasks, candidates, artifacts: rows, control,
+          runs: snapshot.agentRuns, claims: Array.isArray(claimResult) ? claimResult : claimResult?.claims ?? [],
+          ownerReviews, workerAgentIds: workerIds(roles), expectedTaskIds: policy.taskIds,
+          policyApprovedAt: policy.approvedAt,
+          fileTexts: Object.fromEntries(candidates.map(candidate => [candidate.candidateId,
+            candidate.evidenceIds.map(id => archiveChecks.find(check => check.ok && check.artifactId === id)?.text ?? '').join('\n')])),
           archiveChecks: Object.fromEntries(archiveChecks.map(check => [check.artifactId, check]))
         })
-        evidence.summaryReasons = summary.reasons ?? []
-        evidence.planAuthoredByModel = summary.planAuthoredByModel === true
+        evidence.summaryReasons = summary.reasons
+        evidence.planAuthoredByModel = summary.planAuthoredByModel
         if (summary.reasons.length === 0) {
-          const artifactIndex = archiveChecks.findIndex(check => check.ok && check.text.includes('REVIEW-REVISION-2'))
-          assert.ok(artifactIndex >= 0, 'an archived reviewed revision is required')
-          return { ok: true, reasons: [], evidence, artifactIndex, artifactId: archiveChecks[artifactIndex].artifactId }
+          const artifact = archiveChecks.find(check => summary.reviewedArtifactIds.includes(check.artifactId)
+            && check.ok && check.text.includes('REVIEW-REVISION-2'))
+          assert.ok(artifact, 'the latest passed candidate must cite the previewed archive')
+          evidence.previewArtifactId = artifact.artifactId
+          return { ok: true, reasons: [], evidence, artifactId: artifact.artifactId }
+        }
+        // All current candidates and handoffs are final; missing proof will not appear
+        // through an extra model run. Return the precise acceptance failure now.
+        if (!summary.reasons.includes('a_dispatch_is_still_pending')
+          && snapshot.agentRuns.every(run => ['succeeded', 'failed', 'cancelled'].includes(run.status))) {
+          return { ok: false, reasons: summary.reasons, evidence }
         }
       }
       await sleep(5000)
@@ -457,14 +508,18 @@ test('real page creates and starts the work, then approves the relay scope for t
       assert.ok(typeof adminToken === 'string' && adminToken.trim() !== '',
         'external mode needs the isolated Host administrator token via LOOM_ADMIN_TOKEN_ENV or LOOM_ADMIN_TOKEN_FILE')
       const session = await loginApi(config.origin, adminToken)
+      const facts = (operation, params = {}) => requestApi(config.origin, session, operation, params)
+      assert.ok(config.dataDir, 'external acceptance must name its isolated dataDir for the running Host schema check')
+      const hostSchema = await verifyRunningHostSchema({ request: facts, databasePath: join(config.dataDir, 'rovai.sqlite') })
       report.steps.hostMode = 'external-read-only'
       report.steps.externalHostClosed = false
       return {
         origin: config.origin,
         adminToken,
         roles: config.roles,
+        hostSchema,
         secrets: [adminToken, session],
-        facts: (operation, params = {}) => requestApi(config.origin, session, operation, params)
+        facts
       }
     }
     const prepared = await prepareLivePiHost({

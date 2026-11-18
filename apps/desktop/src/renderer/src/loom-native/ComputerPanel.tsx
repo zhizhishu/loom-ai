@@ -37,7 +37,7 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day' }: { p
     setControl(null)
     if (previous && port) {
       try { await port.release({ viewId: previous.viewId, controlId: previous.controlId, generation: previous.generation }) }
-      catch (cause) { if (notify) setError(`已停止发送输入；主机撤销回执未确认。${hostFeatureError(cause)}`) }
+      catch (cause) { if (notify) setError(`已停止输入，尚未确认权限已撤销。${hostFeatureError(cause)}`) }
     }
   }, [port])
   const stop = useCallback(async (notify = true) => {
@@ -49,7 +49,7 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day' }: { p
     if (objectUrl.current) { URL.revokeObjectURL(objectUrl.current); objectUrl.current = null }
     if (previous && port) {
       try { await port.stop(previous.viewId) }
-      catch (cause) { if (notify) setError(`本页已停止看屏和输入；主机断开回执未确认。${hostFeatureError(cause)}`) }
+      catch (cause) { if (notify) setError(`画面和输入已停止，尚未确认连接已关闭。${hostFeatureError(cause)}`) }
     }
   }, [port])
   const refreshStatus = useCallback(async () => {
@@ -152,7 +152,7 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day' }: { p
       if (ticket !== epoch.current || !latest || latest.controlId !== id || document.visibilityState !== 'visible') return
       const seq = ++nextSequence.current
       const result = await port.input({ viewId: latest.viewId, controlId: latest.controlId, generation: latest.generation }, seq, event)
-      if (!result.applied || result.seq !== seq || result.generation !== latest.generation) throw new Error('主机未确认输入，已停止控制，未重放。')
+      if (!result.applied || result.seq !== seq || result.generation !== latest.generation) throw new Error('未收到输入确认，控制已停止。')
     }).catch(cause => { if (controlRef.current?.controlId === id) { setError(hostFeatureError(cause)); void dropControl(false) } })
   }, [port, dropControl])
   useEffect(() => {
@@ -170,18 +170,18 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day' }: { p
     return () => target.removeEventListener('wheel', wheel)
   }, [control?.controlId, frame?.bounds.x, frame?.bounds.y, frame?.bounds.width, frame?.bounds.height, send])
   const seconds = control ? Math.max(0, Math.ceil((control.totalDeadline - tick - clockSkew.current) / 1000)) : 0
-  return <section className="ln-computer-panel" aria-label="当前主机的电脑">
-    <div className="ln-computer-title"><div><strong>电脑</strong><span>{control ? '由你控制' : view ? '仅查看' : '尚未看屏'}</span></div><IconButton icon="refresh" label="检查电脑连接" disabled={busy || !!view} onClick={() => { void refreshStatus() }}/></div>
-    <p className="ln-computer-scope">当前连接主机的真实桌面。查看和控制分别授权；不会因此开放命令或文件权限。</p>
+  return <section className="ln-computer-panel" aria-label="电脑控制">
+    <div className="ln-computer-title"><div><strong>电脑</strong><span>{control ? '由你控制' : view ? '仅查看' : '未连接'}</span></div><IconButton icon="refresh" label="检查电脑连接" disabled={busy || !!view} onClick={() => { void refreshStatus() }}/></div>
+    <p className="ln-computer-scope">先允许查看屏幕，再按需接管鼠标和键盘。</p>
     {error && <FormMessage error>{error}</FormMessage>}
-    <div ref={screen} className={`ln-computer-screen${control ? ' is-controlled' : ''}`} tabIndex={control ? 0 : -1} role={control ? 'application' : undefined} aria-label={control ? '远程桌面输入区域；Escape归还控制' : '当前主机屏幕'} onKeyDown={event => {
+    <div ref={screen} className={`ln-computer-screen${control ? ' is-controlled' : ''}`} tabIndex={control ? 0 : -1} role={control ? 'application' : undefined} aria-label={control ? '远程桌面输入区域；Escape归还控制' : '所选电脑屏幕'} onKeyDown={event => {
       if (!controlRef.current) return
       if (event.key === 'Escape') { event.preventDefault(); void dropControl(); return }
       if (event.ctrlKey || event.metaKey || event.altKey || event.nativeEvent.isComposing) return
       if (KEYS[event.key]) { event.preventDefault(); send({ kind: 'key', key: KEYS[event.key]! }) }
       else if ([...event.key].length === 1) { event.preventDefault(); send({ kind: 'text', text: event.key }) }
     }}>
-      {frame ? <img ref={image} src={frame.url} alt="当前主机实时屏幕" draggable={false} onClick={event => {
+      {frame ? <img ref={image} src={frame.url} alt="所选电脑实时屏幕" draggable={false} onClick={event => {
         if (!controlRef.current) return
         const point = screenPoint(event.currentTarget.getBoundingClientRect(), frame.bounds, event.clientX, event.clientY)
         if (point) { screen.current?.focus(); send({ kind: 'pointer', action: 'click', button: 'left', ...point }) }
@@ -190,12 +190,12 @@ export function ComputerPanel({ port, client, agent = null, theme = 'day' }: { p
         event.preventDefault()
         const point = screenPoint(event.currentTarget.getBoundingClientRect(), frame.bounds, event.clientX, event.clientY)
         if (point) send({ kind: 'pointer', action: 'click', button: 'right', ...point })
-      }}/> : <div className="ln-computer-placeholder"><Icon name="computer" size={43}/><strong>{view ? '正在获取真实画面…' : !port ? '当前连接未提供电脑接口' : status?.ready ? '按需查看这台电脑' : '电脑服务尚未启用'}</strong><span>{view ? '画面只保存在当前页面内存中' : '不会在你打开页面时自动截图'}</span></div>}
+      }}/> : <div className="ln-computer-placeholder"><Icon name="computer" size={43}/><strong>{view ? '正在连接屏幕…' : !port ? '此设备暂不支持查看屏幕' : status?.ready ? '查看这台电脑的屏幕' : '电脑连接未就绪'}</strong><span>{view ? '请稍候' : status?.ready ? '点击下方按钮开始查看' : '请检查电脑连接'}</span></div>}
     </div>
     <div className="ln-computer-actions">{!view ? <button type="button" className="ln-action is-primary" disabled={busy || !port || !status?.ready || !status.device} onClick={() => { void beginView() }}>允许本次查看屏幕</button> : <><button type="button" className="ln-action" onClick={() => { void stop() }}>断开画面</button>{control ? <button type="button" className="ln-action is-danger" onClick={() => { void dropControl() }}>归还控制 · {seconds}秒</button> : <button type="button" className="ln-action is-primary" disabled={busy || !frame} onClick={() => setConsentOpen(true)}>接管电脑</button>}</>}</div>
-    {control && <div className="ln-computer-inputs"><p>点击画面后可打字。按 Esc 立即归还控制；无操作或离开页面会自动停止。</p><div className="ln-computer-keys">{[['Enter','enter'],['Tab','tab'],['Esc','escape'],['⌫','backspace'],['↑','up'],['↓','down']].map(([label,key]) => <button key={key} type="button" className="ln-action" onClick={() => send({ kind: 'key', key: key! })}>{label}</button>)}</div><form onSubmit={event => { event.preventDefault(); if (text.trim()) { send({ kind: 'text', text }); setText('') } }}><input value={text} onChange={event => setText(event.target.value)} maxLength={2048} placeholder="向电脑输入文字…" aria-label="发送到电脑的文字" autoComplete="off"/><button type="submit" className="ln-action" disabled={!text}>输入</button></form></div>}
+    {control && <div className="ln-computer-inputs"><p>点击画面后可打字。按 Esc 归还控制；离开页面或五分钟后自动停止。</p><div className="ln-computer-keys">{[['Enter','enter'],['Tab','tab'],['Esc','escape'],['⌫','backspace'],['↑','up'],['↓','down']].map(([label,key]) => <button key={key} type="button" className="ln-action" onClick={() => send({ kind: 'key', key: key! })}>{label}</button>)}</div><form onSubmit={event => { event.preventDefault(); if (text.trim()) { send({ kind: 'text', text }); setText('') } }}><input value={text} onChange={event => setText(event.target.value)} maxLength={2048} placeholder="向电脑输入文字…" aria-label="发送到电脑的文字" autoComplete="off"/><button type="submit" className="ln-action" disabled={!text}>输入</button></form></div>}
     {frame && <small className="ln-computer-footnote">{frame.width} × {frame.height} · {view?.platform} · 查看授权仅限本次连接</small>}
     {client && <ComputerAgentAccess key={agent?.agentId} port={port?.agents} client={client} agent={agent} device={status?.device ?? null} theme={theme}/>}
-    <SurfaceDialog open={consentOpen} title="接管这台电脑？" description="你在此画面上的点击和键盘输入将发送到当前连接的主机。" theme={theme} onClose={() => setConsentOpen(false)} className="ln-room-dialog"><div className="ln-room-content"><p className="ln-settings-copy">授权最长五分钟，离开页面或点击“归还控制”即停止。本次控制不授予任何助手永久电脑权限；不会自动输入、执行命令或复制剪贴板。</p><div className="ln-form-actions"><button type="button" className="ln-action" onClick={() => setConsentOpen(false)}>取消</button><button type="button" className="ln-action is-primary" disabled={busy} onClick={() => { void acquire() }}>允许本次控制</button></div></div></SurfaceDialog>
+    <SurfaceDialog open={consentOpen} title="接管这台电脑？" description="点击和输入会直接作用于所选电脑。" theme={theme} onClose={() => setConsentOpen(false)} className="ln-room-dialog"><div className="ln-room-content"><p className="ln-settings-copy">本次授权最长五分钟。离开页面、按 Esc 或点击“归还控制”即可停止。</p><div className="ln-form-actions"><button type="button" className="ln-action" onClick={() => setConsentOpen(false)}>取消</button><button type="button" className="ln-action is-primary" disabled={busy} onClick={() => { void acquire() }}>允许本次控制</button></div></div></SurfaceDialog>
   </section>
 }

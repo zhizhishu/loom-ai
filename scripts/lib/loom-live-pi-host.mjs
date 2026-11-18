@@ -8,6 +8,7 @@ import { mkdir, mkdtemp, readFile, realpath } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { launchHost } from './host-test-client.mjs'
+import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 import { coreDataDirectoryArguments } from './runtime-camp-files-root.mjs'
 import {
   buildIsolatedEnvironment, writeIsolatedPiProfile, createMembers,
@@ -63,6 +64,9 @@ export async function prepareLivePiHost({ configPath, providerKey, readyBudgetMs
       setTimeout(() => reject(new Error('isolated Host readiness timed out')), readyBudgetMs).unref()
     })])
     const guarded = createHostRequestGuard((method, params) => host.request(method, params))
+    progress('verify_running_host_schema')
+    const hostSchema = await verifyRunningHostSchema({ request: guarded.request,
+      databasePath: join(dataDir, 'rovai.sqlite'), expectedProjectionSchema: config.expectedProjectionSchema })
     progress('runtime_product_check')
     await guarded.request('runtime.product.check', { runtimeKind: 'pi' })
     const installation = await waitForManagedPiInstallation(guarded, piBundle.launcher)
@@ -87,7 +91,7 @@ export async function prepareLivePiHost({ configPath, providerKey, readyBudgetMs
       host, origin: started.origin, adminToken: started.administratorToken, roles,
       facts: (operation, params = {}) => guarded.request(operation, params),
       secrets: [providerKey, started.administratorToken],
-      evidence: { sourceCommit: config.sourceCommit, coreSha256: binary.sha256, hostSha256,
+      evidence: { sourceCommit: config.sourceCommit, coreSha256: binary.sha256, hostSha256, hostSchema,
         helperSha256: helper.sha256, piVersion: piBundle.piVersion, fixture, dataDir,
         skillRoot, mcpPath, uiDirectory, isolatedProfile: agentDir,
         missionCreatedBySetup: false, modelStartedBySetup: false, nativePiMode: true,

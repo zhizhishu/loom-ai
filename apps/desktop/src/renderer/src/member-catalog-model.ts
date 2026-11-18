@@ -152,10 +152,16 @@ export function sameSelection(left: readonly CapabilityItem[], right: readonly C
   return signature(left) === signature(right)
 }
 
+/**
+ * 任何非空的 Core runtime 名称都值得问一次真实预览：能不能给出投影由 Core 裁决
+ * （runtime_required / runtime_unsupported），界面不再按品牌自己判死。
+ * claude-code-cli 只是同一个运行端的旧持久化别名，请求仍用规范 id。
+ */
 export function previewRuntime(runtime: string | null): string | null {
-  if (runtime === 'codex-cli' || runtime === 'claude-code') return runtime
-  if (runtime === 'claude-code-cli') return 'claude-code'
-  return null
+  const name = runtime?.trim()
+  if (!name) return null
+  if (name === 'claude-code-cli') return 'claude-code'
+  return name
 }
 
 export function highRiskToConfirm(draft: readonly CapabilityItem[], saved: readonly CapabilityItem[]): CapabilityItem[] {
@@ -191,10 +197,33 @@ export function pendingHookReview(items: readonly CapabilityItem[]): CapabilityI
     && !!item.hookDefinition && !item.hookDefinition.reviewed)
 }
 
+/** 只在 off → on 时生效的本地前置拒绝。取消选择永远不被拦。 */
+export type SelectionRefusal = '' | 'source' | 'hook-scope'
+
+/** Core 精确审阅范围里真正绑定目标的字段（与 Core 的 matches_target 同一组）。 */
+const HOOK_SCOPE_KEYS = ['memberId', 'workspaceId', 'nodeId', 'workspaceRoot', 'workspaceTokenDigest', 'adapterKind'] as const
+
+/**
+ * 这条 hook 是否缺 Core 给出的可审阅定义。缺了就既不能审也不能新启用，
+ * 但已经勾上的仍要能取消。这里只看 Core 给的定义，不猜品牌、系统或本地路径。
+ */
+export function hookDefinitionMissing(item: Pick<CapabilityItem, 'kind' | 'hookDefinition'>): boolean {
+  if (item.kind !== 'hook') return false
+  const definition = item.hookDefinition
+  if (!definition) return true
+  if (!definition.body.trim()) return true
+  if (!definition.definitionDigest.trim() || !definition.scopeDigest.trim()) return true
+  const scope = definition.reviewScope
+  if (!scope) return true
+  if (!Number.isFinite(scope.workspaceGeneration)) return true
+  return HOOK_SCOPE_KEYS.some((key) => !String(scope[key] ?? '').trim())
+}
+
 /** Off to on only. A broken source never blocks unchecking; Core fails closed on its own. */
-export function selectRefusal(item: CapabilityItem): '' | 'source' {
+export function selectRefusal(item: CapabilityItem): SelectionRefusal {
   if (item.selected) return ''
-  return item.sourceError ? 'source' : ''
+  if (item.sourceError) return 'source'
+  return hookDefinitionMissing(item) ? 'hook-scope' : ''
 }
 
 /** Returns null when a pending hook has no readable definition, so nothing can send an empty approval. */

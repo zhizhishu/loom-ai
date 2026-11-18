@@ -113,7 +113,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
     setAttempt(recovered)
     setDraft(restored)
     setReviewNote(restored?.reason ?? (saved?.identity === draftIdentity ? saved.note : ''))
-    setFailure(recovered === null ? null : '此前的验收请求尚未确认。已保留原请求，重试不会新增一次验收。')
+    setFailure(recovered === null ? null : '上次验收结果尚未确认，请核对。')
     setReceipt(null)
     setPending(false)
     return () => { writeScope.current += 1 }
@@ -187,9 +187,9 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
         discardUnconfirmedReviewAttempt(client, intent, 'confirmed_rejection')
         if (!current()) return
         setAttempt(null)
-        setFailure('请求被主机拒绝：'+outcome.message)
+        setFailure('无法保存：'+outcome.message)
       } else if (current()) {
-        setFailure(outcome.message+'。结果仍未确认；请重试原请求，不要改写为另一条验收。')
+        setFailure(outcome.message+'。请核对上次提交。')
       }
     } catch (error) {
       if (current()) setFailure(readErrorMessage(error, '暂时不能提交验收'))
@@ -266,7 +266,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
             </span>
           </header>
 
-          {!contextAvailable && <div className="ln-artifact-state" role="alert">工作记录已变化或暂时无法核对。正文仍可阅读，重新取得当前记录前不能提交验收。<button type="button" className="ln-artifact-retry" onClick={()=>{void onRefresh().catch(error=>setFailure(readErrorMessage(error, '刷新失败')))}}>刷新记录</button></div>}
+          {!contextAvailable && <div className="ln-artifact-state" role="alert">工作记录已更新，请刷新后再验收。<button type="button" className="ln-artifact-retry" onClick={()=>{void onRefresh().catch(error=>setFailure(readErrorMessage(error, '刷新失败')))}}>刷新记录</button></div>}
           <div className="ln-artifact-body">
             <div className="ln-artifact-document">
               <h2 className="ln-artifact-doc-title">{documentTitle}</h2>
@@ -275,7 +275,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
             </div>
 
             <aside className="ln-artifact-context" aria-label="验收上下文">
-              <h3 className="ln-artifact-context-title">{facts.task?.title || bundle.mission.title}</h3>
+              <h3 className="ln-artifact-context-title">验收</h3>
               {facts.task?.description && <p className="ln-artifact-request">{facts.task.description}</p>}
 
               <div className="ln-artifact-fact" data-fact="task">
@@ -314,13 +314,13 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
 
               <details className="ln-artifact-criteria">
                 <summary className="ln-artifact-criteria-head">
-                  验收标准{facts.criteriaVersion === '' ? '' : ` · ${facts.criteriaVersion}`}
+                  验收标准
                 </summary>
                 {facts.criteria.length === 0
-                  ? <p className="ln-artifact-fact-note">这份候选没有钉住验收标准。</p>
+                  ? <p className="ln-artifact-fact-note">尚未设置验收标准。</p>
                   : <ul className="ln-artifact-criteria-list">
                       {facts.criteria.map(criterion => <li key={criterion.criterionId} className="ln-artifact-criterion">
-                        <span className="ln-artifact-criterion-id">{criterion.criterionId}</span>
+
                         <span className="ln-artifact-criterion-text">{criterion.text}</span>
                       </li>)}
                     </ul>}
@@ -344,9 +344,9 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                   : null}
 
               {facts.candidate === null
-                ? <p className="ln-artifact-fact-note">这份产物还没有候选引用，没有可验收的对象。</p>
+                ? <p className="ln-artifact-fact-note">这份文件尚未提交审核。</p>
                 : !facts.latest
-                  ? <p className="ln-artifact-fact-note">历史版本不再接受或退回；接受只对最新候选生效。</p>
+                  ? <p className="ln-artifact-fact-note">这是历史版本，请查看最新版本后再验收。</p>
                   : null}
 
               {contextAvailable && candidate !== null && facts.latest && facts.review === null && receipt === null && attempt === null && draft === null
@@ -369,7 +369,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                   </div>
                 </div>}
 
-              {attempt !== null && <p className="ln-artifact-fact-note" role="status">原验收请求已冻结。核对结束前不会改动理由或另建一次提交；关闭此面板后仍会在当前应用会话保留待确认请求。</p>}
+              {attempt !== null && <p className="ln-artifact-fact-note" role="status">请先核对上次提交，再修改验收意见。</p>}
               {draft !== null && candidate !== null && <form
                 className="ln-artifact-review-form"
                 data-verdict={draft.verdict}
@@ -378,14 +378,14 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                 <fieldset className="ln-artifact-review-criteria" disabled={pending || attempt !== null || !contextAvailable}>
                   <legend>逐条确认（接受需全部勾选）</legend>
                   {facts.criteria.length === 0
-                    ? <p className="ln-artifact-fact-note">这份候选的快照没有逐条标准，只需要写明理由。</p>
+                    ? <p className="ln-artifact-fact-note">尚无逐条标准，请写明验收理由。</p>
                     : facts.criteria.map(criterion => <label key={criterion.criterionId} className="ln-artifact-criterion">
                         <input
                           type="checkbox"
                           checked={draft.satisfied.includes(criterion.criterionId)}
                           onChange={() => toggleCriterion(criterion.criterionId)}
                         />
-                        <span className="ln-artifact-criterion-id">{criterion.criterionId}</span>
+
                         <span className="ln-artifact-criterion-text">{criterion.text}</span>
                       </label>)}
                 </fieldset>
@@ -396,12 +396,12 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
                   className="ln-artifact-review-reason"
                   rows={3}
                   value={draft.reason}
-                  placeholder="说明依据；接受会按上面的逐条结论写入。"
+                  placeholder="说明接受或退回的理由…"
                   onChange={event => { if (draft !== null) saveDraft({ ...draft, reason: event.target.value }) }}
                 />
                 <div className="ln-artifact-actions">
                   <button type="submit" className="ln-artifact-accept" disabled={!canSubmit}>
-                    {pending ? '正在核对回执…' : attempt !== null ? '核对并重试原请求' : draft.verdict === 'accepted' ? '确认接受' : '确认退回'}
+                    {pending ? '正在核对…' : attempt !== null ? '核对上次提交' : draft.verdict === 'accepted' ? '确认接受' : '确认退回'}
                   </button>
                   <button
                     type="button" className="ln-artifact-cancel" disabled={pending || attempt !== null}

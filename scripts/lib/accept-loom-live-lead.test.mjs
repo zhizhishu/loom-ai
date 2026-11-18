@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
+import { taskDeliveryOutcomes } from './loom-chain-outcome.mjs'
 
 import {
   FORBIDDEN_HOST_METHODS,
@@ -238,6 +239,19 @@ test('the mission description carries the user requirement and both markers', ()
   assert.match(description, /不得替代用户接受交付/)
 })
 
+test('final acceptance must require the revision marker although the first draft omits it', () => {
+  const description = buildMissionDescription({ workers: ['agent_a', 'agent_b'],
+    acceptanceMarker: 'ACCEPTANCE_MARK_A', revisionMarker: 'REVISION_MARK_B' })
+  assert.match(description, /最终交付的验收条件/u)
+  assert.match(description, /同时包含独立的 ACCEPTANCE_MARK_A 和 REVISION_MARK_B/u)
+  assert.match(description, /每个任务应把这两项列作最终验收条件/u)
+  assert.match(description, /首稿时仅写 ACCEPTANCE_MARK_A/u)
+  assert.match(description, /不得提前写 REVISION_MARK_B/u)
+  assert.match(description, /第一次独立阶段审查应因缺少最终条件 REVISION_MARK_B 而明确要求修改/u)
+  assert.match(description, /重新读取新版本且核对证据/u)
+  assert.match(description, /首稿的同一文件.*保持原路径/u)
+})
+
 test('the mission description contains no plan structure the Lead would only have to copy', () => {
   const description = buildMissionDescription({ workers: ['agent_a', 'agent_b'] })
   for (const forbidden of ['taskId', 'criterionId', '"criteria"', 'dependencies', 'upstreamTaskId', 'assigneeAgentId', '```json']) {
@@ -265,62 +279,82 @@ test('the mission description refuses anything but two distinct workers', () => 
 // ---------------------------------------------------------------------------
 
 function happyChain () {
-  return {
+  const chain = {
     plan: { planId: 'plan_1' },
     tasks: [
-      { taskId: 'task-a', status: 'in_review', assigneeAgentId: 'agent_a' },
-      { taskId: 'task-b', status: 'in_review', assigneeAgentId: 'agent_b' }
+      { taskId: 'task-a', status: 'in_review', assigneeAgentId: 'agent_a', blockedReason: null },
+      { taskId: 'task-b', status: 'in_review', assigneeAgentId: 'agent_b', blockedReason: null }
     ],
     candidates: [
       { candidateId: 'c1', taskId: 'task-a', agentRunId: 'run-a', createdAt: '2026-01-01T00:00:01Z', previousCandidateId: null, evidenceIds: ['art1'], acceptanceStatus: 'pending', verificationStatus: 'unverified' },
       { candidateId: 'c2', taskId: 'task-a', agentRunId: 'run-a2', createdAt: '2026-01-01T00:00:04Z', previousCandidateId: 'c1', evidenceIds: ['art2'], acceptanceStatus: 'pending', verificationStatus: 'unverified' },
-      { candidateId: 'c3', taskId: 'task-b', agentRunId: 'run-b', createdAt: '2026-01-01T00:00:02Z', previousCandidateId: null, evidenceIds: ['art3'], acceptanceStatus: 'pending', verificationStatus: 'unverified' }
+      { candidateId: 'c3', taskId: 'task-b', agentRunId: 'run-b', createdAt: '2026-01-01T00:00:02Z', previousCandidateId: null, evidenceIds: ['art3'], acceptanceStatus: 'pending', verificationStatus: 'unverified' },
+      { candidateId: 'c4', taskId: 'task-b', agentRunId: 'run-b2', createdAt: '2026-01-01T00:00:05Z', previousCandidateId: 'c3', evidenceIds: ['art4'], acceptanceStatus: 'pending', verificationStatus: 'unverified' }
     ],
     artifacts: [
       { artifactId: 'art1', taskId: 'task-a', agentRunId: 'run-a', creatorId: 'agent_a', relativePath: 'a.md', sha256: 'x1' },
-      { artifactId: 'art2', taskId: 'task-a', agentRunId: 'run-a2', creatorId: 'agent_a', relativePath: 'a-v2.md', sha256: 'x2' },
-      { artifactId: 'art3', taskId: 'task-b', agentRunId: 'run-b', creatorId: 'agent_b', relativePath: 'b.md', sha256: 'x3' }
+      { artifactId: 'art2', taskId: 'task-a', agentRunId: 'run-a2', creatorId: 'agent_a', relativePath: 'a.md', sha256: 'x2' },
+      { artifactId: 'art3', taskId: 'task-b', agentRunId: 'run-b', creatorId: 'agent_b', relativePath: 'b.md', sha256: 'x3' },
+      { artifactId: 'art4', taskId: 'task-b', agentRunId: 'run-b2', creatorId: 'agent_b', relativePath: 'b.md', sha256: 'x4' }
     ],
     claims: [
       { claimId: 'cl1', taskId: 'task-a', agentRunId: 'run-a', claimantAgentId: 'agent_a' },
       { claimId: 'cl2', taskId: 'task-a', agentRunId: 'run-a2', claimantAgentId: 'agent_a' },
-      { claimId: 'cl3', taskId: 'task-b', agentRunId: 'run-b', claimantAgentId: 'agent_b' }
+      { claimId: 'cl3', taskId: 'task-b', agentRunId: 'run-b', claimantAgentId: 'agent_b' },
+      { claimId: 'cl4', taskId: 'task-b', agentRunId: 'run-b2', claimantAgentId: 'agent_b' }
     ],
     control: {
+      policy: { taskIds: ['task-a', 'task-b'], authorizationRevision: 1 },
       stageReviews: [
-        { taskId: 'task-a', candidateId: 'c1', verdict: 'request_changes', reviewerAgentId: 'agent_r', reviewerAgentRunId: 'run-r1', reviewedAt: '2026-01-01T00:00:03Z' },
-        { taskId: 'task-a', candidateId: 'c2', verdict: 'pass', reviewerAgentId: 'agent_r', reviewerAgentRunId: 'run-r2', reviewedAt: '2026-01-01T00:00:05Z' },
-        { taskId: 'task-b', candidateId: 'c3', verdict: 'pass', reviewerAgentId: 'agent_r', reviewerAgentRunId: 'run-r3', reviewedAt: '2026-01-01T00:00:03Z' }
+        { taskId: 'task-a', candidateId: 'c1', verdict: 'request_changes', reviewerAgentId: 'agent_r', reviewerAgentRunId: 'run-r1', reviewedAt: '2026-01-01T00:00:03Z', policyRevision: 1 },
+        { taskId: 'task-a', candidateId: 'c2', verdict: 'pass', reviewerAgentId: 'agent_r', reviewerAgentRunId: 'run-r2', reviewedAt: '2026-01-01T00:00:06Z', policyRevision: 1 },
+        { taskId: 'task-b', candidateId: 'c3', verdict: 'request_changes', reviewerAgentId: 'agent_r', reviewerAgentRunId: 'run-r3', reviewedAt: '2026-01-01T00:00:04Z', policyRevision: 1 },
+        { taskId: 'task-b', candidateId: 'c4', verdict: 'pass', reviewerAgentId: 'agent_r', reviewerAgentRunId: 'run-r4', reviewedAt: '2026-01-01T00:00:07Z', policyRevision: 1 }
       ],
       dispatches: [
-        { kind: 'execute', status: 'settled', taskId: 'task-a' },
-        { kind: 'execute', status: 'settled', taskId: 'task-b' },
-        { kind: 'review', status: 'settled', taskId: 'task-a' },
-        { kind: 'rework', status: 'settled', taskId: 'task-a' },
-        { kind: 'review', status: 'settled', taskId: 'task-a' },
-        { kind: 'handoff', status: 'settled', taskId: 'task-a' }
-      ]
+        ['task-a', 'c1', 'c2'], ['task-b', 'c3', 'c4']
+      ].flatMap(([taskId, firstId, finalId]) => [
+        { kind: 'execute', candidateId: null },
+        { kind: 'review', candidateId: firstId },
+        { kind: 'rework', candidateId: firstId },
+        { kind: 'review', candidateId: finalId },
+        { kind: 'handoff', candidateId: finalId }
+      ].map(row => ({ ...row, taskId, status: 'settled', policyRevision: 1 })))
     },
     runs: [
       { id: 'run-lead', agentId: 'agent_lead', status: 'succeeded' },
       { id: 'run-a', agentId: 'agent_a', status: 'succeeded' },
       { id: 'run-a2', agentId: 'agent_a', status: 'succeeded' },
       { id: 'run-b', agentId: 'agent_b', status: 'succeeded' },
+      { id: 'run-b2', agentId: 'agent_b', status: 'succeeded' },
       { id: 'run-r1', agentId: 'agent_r', status: 'succeeded' },
       { id: 'run-r2', agentId: 'agent_r', status: 'succeeded' },
-      { id: 'run-r3', agentId: 'agent_r', status: 'succeeded' }
+      { id: 'run-r3', agentId: 'agent_r', status: 'succeeded' },
+      { id: 'run-r4', agentId: 'agent_r', status: 'succeeded' }
     ],
     ownerReviews: [],
     workerAgentIds: ['agent_a', 'agent_b'],
     fileTexts: {
-      c1: `# worker a\n${MARKER}\nDRAFT\n`,
-      c2: `# worker a\n${MARKER}\n${REVISION}\n`,
-      c3: `# worker b\n${MARKER}\n`
+      c1: '# worker a\n' + MARKER + '\nDRAFT\n',
+      c2: '# worker a\n' + MARKER + '\n' + REVISION + '\n',
+      c3: '# worker b\n' + MARKER + '\nDRAFT\n',
+      c4: '# worker b\n' + MARKER + '\n' + REVISION + '\n'
     }
   }
+  chain.archiveChecks = Object.fromEntries(chain.candidates.map(candidate =>
+    [candidate.evidenceIds[0], { artifactId: candidate.evidenceIds[0], ok: true, reasons: [], text: chain.fileTexts[candidate.candidateId] }]))
+  return chain
 }
 
-test('the happy chain proves model plan, two worker submissions, one rework and zero Owner reviews', () => {
+function taskOutcome (chain) {
+  return taskDeliveryOutcomes({
+    taskIds: chain.control.policy.taskIds, tasks: chain.tasks, candidates: chain.candidates,
+    stageReviews: chain.control.stageReviews, dispatches: chain.control.dispatches,
+    authorizationRevision: chain.control.policy.authorizationRevision
+  })
+}
+
+test('the happy chain proves both workers passed after rework and leaves Owner review pending', () => {
   const summary = summarizeLeadChain(happyChain())
   assert.deepEqual(summary.reasons, [])
   assert.equal(summary.planAuthoredByModel, true)
@@ -329,11 +363,168 @@ test('the happy chain proves model plan, two worker submissions, one rework and 
   assert.equal(summary.reworkObserved, true)
   assert.equal(summary.ownerReviewCount, 0)
   assert.equal(summary.passesNeverAccepted, true)
-  assert.equal(summary.reworkedTasks.length, 1)
+  assert.equal(summary.reworkedTasks.length, 2)
+  assert.equal(summary.allTasksPassed, true)
+  assert.deepEqual(summary.reviewedArtifactIds, ['art2', 'art4'])
   assert.equal(summary.reworkedTasks[0].firstCandidateLackedRevisionMarker, true)
   assert.equal(summary.reworkedTasks[0].secondCandidateHasRevisionMarker, true)
   assert.equal(summary.reworkedTasks[0].reviewerIsSeparate, true)
   assert.equal(exitCodeFor(summary), 0)
+})
+
+test('same-path rework requires distinct versions and a still-readable first archive', () => {
+  const valid = summarizeLeadChain(happyChain())
+  assert.ok(valid.reworkedTasks.every(task => task.primaryPathPreserved
+    && task.distinctArtifactVersions && task.firstArchiveVerified))
+  assert.deepEqual(valid.reworkedTasks.map(task => [task.firstRelativePath, task.secondRelativePath]),
+    [['a.md', 'a.md'], ['b.md', 'b.md']])
+  const moved = happyChain()
+  moved.artifacts[1].relativePath = 'a-final.md'
+  assert.ok(summarizeLeadChain(moved).reasons.includes('task:task-a:rework_changed_primary_path'))
+  assert.equal(exitCodeFor(summarizeLeadChain(moved)), 1)
+  const lost = happyChain()
+  delete lost.archiveChecks.art1
+  assert.ok(summarizeLeadChain(lost).reasons.includes('task:task-a:first_archive_unverified'))
+  assert.equal(exitCodeFor(summarizeLeadChain(lost)), 1)
+  const reused = happyChain()
+  reused.candidates[1].agentRunId = 'run-a'
+  reused.candidates[1].evidenceIds = ['art1']
+  assert.ok(summarizeLeadChain(reused).reasons.includes('task:task-a:rework_reused_primary_artifact'))
+  assert.equal(exitCodeFor(summarizeLeadChain(reused)), 1)
+})
+
+test('historical support can be cited without replacing the current primary deliverable', () => {
+  const chain = happyChain()
+  chain.candidates[1].evidenceIds.push('art1')
+  chain.candidates[3].evidenceIds.push('art3')
+  const summary = summarizeLeadChain(chain)
+  assert.deepEqual(summary.reasons, [])
+  assert.deepEqual(summary.reviewedArtifactIds, ['art2', 'art4'])
+  assert.equal(exitCodeFor(summary), 0)
+})
+
+test('supporting evidence cannot supply markers missing from the primary file', () => {
+  const chain = happyChain()
+  chain.candidates[1].evidenceIds.push('art4')
+  chain.archiveChecks.art2.text = MARKER
+  // The old combined text would look sufficient because the supporting file contains both.
+  chain.fileTexts.c2 += chain.fileTexts.c4
+  const summary = summarizeLeadChain(chain)
+  assert.ok(summary.reasons.includes('task:task-a:latest_acceptance_markers_missing'))
+  assert.ok(!summary.reviewedArtifactIds.includes('art2'))
+  assert.equal(exitCodeFor(summary), 1)
+})
+
+test('one passed task cannot hide another task whose rework budget is exhausted', () => {
+  const chain = happyChain()
+  chain.tasks[1].status = 'ready'
+  chain.tasks[1].blockedReason = 'loom.rework_budget_exhausted'
+  chain.control.stageReviews.find(row => row.candidateId === 'c4').verdict = 'request_changes'
+  chain.control.dispatches = chain.control.dispatches.filter(row => !(row.taskId === 'task-b' && row.kind === 'handoff'))
+  const outcome = taskOutcome(chain)
+  assert.equal(outcome.allPassed, false)
+  assert.equal(outcome.terminalFailure, true, 'the live poll must stop without waiting for a new authorization')
+  assert.equal(outcome.outcomes[0].passed, true)
+  assert.equal(outcome.outcomes[1].passed, false)
+  assert.ok(outcome.reasons.includes('task:task-b:task_blocked:loom.rework_budget_exhausted'))
+  const summary = summarizeLeadChain(chain)
+  assert.equal(summary.allTasksPassed, false)
+  assert.equal(exitCodeFor(summary), 1)
+  assert.deepEqual(summary.reviewedArtifactIds, ['art2'])
+})
+
+test('a replaced authorization cannot make a current passed task fail or provide its rework proof', () => {
+  const chain = happyChain()
+  chain.control.dispatches.push({ taskId: 'task-a', kind: 'review', candidateId: 'c1',
+    policyRevision: 0, status: 'cancelled' })
+  assert.equal(taskOutcome(chain).allPassed, true)
+  assert.equal(taskOutcome(chain).terminalFailure, false)
+  assert.equal(exitCodeFor(summarizeLeadChain(chain)), 0)
+  chain.control.dispatches.find(row => row.taskId === 'task-a' && row.kind === 'rework').policyRevision = 0
+  assert.equal(summarizeLeadChain(chain).reworkObserved, false)
+})
+
+test('both latest deliveries must pass even when every dispatch has settled', () => {
+  const chain = happyChain()
+  chain.control.stageReviews.find(row => row.candidateId === 'c4').verdict = 'request_changes'
+  const summary = summarizeLeadChain(chain)
+  assert.equal(summary.allTasksPassed, false)
+  assert.ok(summary.reasons.includes('task:task-b:latest_candidate_not_passed'))
+  assert.equal(exitCodeFor(summary), 1)
+})
+
+test('a PASS on a previous candidate never blesses a rejected newer revision', () => {
+  const chain = happyChain()
+  chain.candidates.push({ ...chain.candidates[1], candidateId: 'c5', previousCandidateId: 'c2',
+    createdAt: '2026-01-01T00:00:10Z', evidenceIds: ['art5'] })
+  chain.control.stageReviews.push({ ...chain.control.stageReviews[1], candidateId: 'c5',
+    verdict: 'request_changes', reviewedAt: '2026-01-01T00:00:11Z' })
+  const summary = summarizeLeadChain(chain)
+  assert.equal(summary.taskOutcomes[0].latestCandidateId, 'c5')
+  assert.equal(summary.allTasksPassed, false)
+  assert.ok(!summary.reviewedArtifactIds.includes('art2'), 'the old passed artifact is not the current delivery')
+  assert.equal(exitCodeFor(summary), 1)
+})
+
+test('review identity includes task, candidate and the current authorization', () => {
+  for (const change of [
+    review => { review.taskId = 'task-a' },
+    review => { review.candidateId = 'c2' },
+    review => { review.policyRevision = 0 }
+  ]) {
+    const chain = happyChain()
+    change(chain.control.stageReviews.find(row => row.candidateId === 'c4'))
+    const summary = summarizeLeadChain(chain)
+    assert.equal(summary.allTasksPassed, false)
+    assert.ok(summary.reasons.includes('task:task-b:latest_candidate_not_passed'))
+  }
+})
+
+test('each task must have its own current review and handoff dispatch', () => {
+  for (const kind of ['review', 'handoff']) {
+    const chain = happyChain()
+    const dispatch = chain.control.dispatches.find(row => row.taskId === 'task-b'
+      && row.kind === kind && row.candidateId === 'c4')
+    dispatch.candidateId = 'c3'
+    const outcome = taskOutcome(chain)
+    assert.equal(outcome.allPassed, false)
+    assert.ok(outcome.reasons.includes('task:task-b:latest_' + kind + '_dispatch_missing'))
+  }
+})
+
+test('revision links select the latest candidate even with tied timestamps and shuffled API rows', () => {
+  const chain = happyChain()
+  chain.candidates = chain.candidates.reverse().map(candidate => ({ ...candidate, createdAt: '2026-01-01T00:00:01Z' }))
+  const summary = summarizeLeadChain(chain)
+  assert.deepEqual(summary.reasons, [])
+  assert.deepEqual(summary.taskOutcomes.map(row => row.latestCandidateId), ['c2', 'c4'])
+  assert.deepEqual(summary.reviewedArtifactIds, ['art2', 'art4'])
+})
+
+test('ambiguous branches and cross-task revision links cannot select a successful-looking candidate', () => {
+  for (const mutate of [
+    chain => chain.candidates.push({ ...chain.candidates[1], candidateId: 'branch' }),
+    chain => { chain.candidates[1].previousCandidateId = 'c3' }
+  ]) {
+    const chain = happyChain()
+    mutate(chain)
+    const summary = summarizeLeadChain(chain)
+    assert.equal(summary.allTasksPassed, false)
+    assert.equal(exitCodeFor(summary), 1)
+  }
+})
+
+test('final evidence must belong to the reviewed candidate and remain verifiable', () => {
+  for (const mutate of [
+    chain => { chain.candidates[1].evidenceIds = ['art1'] },
+    chain => { chain.artifacts[1].agentRunId = 'run-b2' },
+    chain => { delete chain.archiveChecks.art2 },
+    chain => { chain.archiveChecks.art2.text = MARKER }
+  ]) {
+    const chain = happyChain()
+    mutate(chain)
+    assert.equal(exitCodeFor(summarizeLeadChain(chain)), 1)
+  }
 })
 
 test('an Owner review on the reviews axis fails the run', () => {
@@ -345,14 +536,18 @@ test('an Owner review on the reviews axis fails the run', () => {
   assert.equal(exitCodeFor(summary), 1)
 })
 
-test('a pass without a rework is reported as unobserved, not as success', () => {
+test('two completed first passes are unobserved rework, not acceptance success', () => {
   const chain = happyChain()
-  chain.candidates = chain.candidates.filter((candidate) => candidate.candidateId !== 'c2')
-  chain.artifacts = chain.artifacts.filter((artifact) => artifact.artifactId !== 'art2')
-  chain.control.stageReviews = chain.control.stageReviews.filter((review) => review.candidateId !== 'c2')
-  chain.control.dispatches = chain.control.dispatches.filter((dispatch) => dispatch.kind !== 'rework')
-  delete chain.fileTexts.c2
+  chain.candidates = chain.candidates.filter(candidate => ['c1', 'c3'].includes(candidate.candidateId))
+  chain.artifacts = chain.artifacts.filter(artifact => ['art1', 'art3'].includes(artifact.artifactId))
+  chain.control.stageReviews = chain.control.stageReviews.filter(review => ['c1', 'c3'].includes(review.candidateId))
+    .map(review => ({ ...review, verdict: 'pass' }))
+  chain.control.dispatches = [['task-a', 'c1'], ['task-b', 'c3']].flatMap(([taskId, candidateId]) =>
+    ['execute', 'review', 'handoff'].map(kind => ({ taskId, kind, candidateId: kind === 'execute' ? null : candidateId,
+      status: 'settled', policyRevision: 1 })))
+  for (const id of ['art1', 'art3']) chain.archiveChecks[id].text = MARKER + '\n' + REVISION + '\n'
   const summary = summarizeLeadChain(chain)
+  assert.equal(summary.allTasksPassed, true)
   assert.equal(summary.reworkObserved, false)
   assert.ok(summary.reasons.includes('rework_not_observed'))
   assert.ok(summary.reasons.includes('dispatch_kind_missing:rework'))
@@ -389,7 +584,7 @@ test('a candidate produced by another agent Run does not count as a worker submi
 
 test('a first candidate that already carries the revision marker weakens the rework proof', () => {
   const chain = happyChain()
-  chain.fileTexts.c1 = `# worker a\n${MARKER}\n${REVISION}\n`
+  chain.archiveChecks.art1.text = `# worker a\n${MARKER}\n${REVISION}\n`
   const summary = summarizeLeadChain(chain)
   assert.equal(summary.reworkedTasks[0].firstCandidateLackedRevisionMarker, false)
   assert.equal(summary.reworkObserved, false)
@@ -500,7 +695,8 @@ test('archived bytes decide the markers even when the workspace copy has drifted
   chain.archiveChecks = {
     art1: { artifactId: 'art1', ok: true, reasons: [], text: chain.fileTexts.c1 },
     art2: { artifactId: 'art2', ok: true, reasons: [], text: chain.fileTexts.c2 },
-    art3: { artifactId: 'art3', ok: true, reasons: [], text: chain.fileTexts.c3 }
+    art3: { artifactId: 'art3', ok: true, reasons: [], text: chain.fileTexts.c3 },
+    art4: { artifactId: 'art4', ok: true, reasons: [], text: chain.fileTexts.c4 }
   }
   const summary = summarizeLeadChain(chain)
   assert.deepEqual(summary.reasons, [], 'workspace drift must never re-judge an archived candidate')

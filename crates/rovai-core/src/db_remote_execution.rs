@@ -75,6 +75,7 @@ pub(super) fn migrate(database: &mut Database) -> Result<()> {
 #[cfg(test)]
 pub(super) fn test_replay_180_workspace_scope(database: &mut Database) {
     let connection = database.connection();
+    super::loom::downgrade_artifact_versions_for_test(connection);
     assert_eq!(connection.query_row(
         "SELECT (SELECT count(*) FROM loom_artifact_snapshot)
               + (SELECT count(*) FROM loom_stage_review)

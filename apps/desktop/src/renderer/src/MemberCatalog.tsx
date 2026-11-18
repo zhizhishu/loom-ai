@@ -409,7 +409,7 @@ export function MemberCatalog({
     }).catch((error) => {
       if (cancelled) return
       const code = errorCode(error)
-      if (code === 'runtime_required') {
+      if (code === 'runtime_required' || code === 'runtime_unsupported') {
         setProjection({ status: 'unsupported', preview: null, message: '' })
         return
       }
@@ -427,7 +427,9 @@ export function MemberCatalog({
     }
     const refusal = selectRefusal(item)
     if (refusal) {
-      setNotice(t('这条的来源读不到，不能新勾选；已勾选的仍可以取消。'))
+      setNotice(t(refusal === 'hook-scope'
+        ? '当前运行范围没有可审阅的 Hook 定义，暂不能启用；已勾选的仍可以取消。'
+        : '这条的来源读不到，不能新勾选；已勾选的仍可以取消。'))
       return
     }
     setNotice('')

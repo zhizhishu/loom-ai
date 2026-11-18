@@ -7,7 +7,7 @@ import { V2BotStatusPanel } from './V2BotStatusPanel'
 import { readV2RunFacts, type V2RunFacts, type V2RunPort } from './v2-run-service'
 import type { ArtifactSelection, WorkBundle } from './types'
 
-type Snapshot = { scope:string; port:V2RunPort; facts:V2RunFacts; bundle:WorkBundle }
+type Snapshot = { scope:string; port:V2RunPort; facts:V2RunFacts; bundle:WorkBundle; readToken:number }
 type ReadInput = {
   open:boolean; scope:string|null; port:V2RunPort; bundle:WorkBundle|null;
   thread:ThreadSnapshot|null; retry:number; version:number; timeoutMs:number
@@ -44,15 +44,22 @@ export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme
     latest.current={open,scope,port,bundle,thread,retry,version:previous.version+1,timeoutMs}
   }
   const current=snapshot && snapshot.port===port && snapshot.scope===scope ? snapshot : null
+  // Keep the *same Mission's* local-only scope editor mounted while its
+  // latest WorkBundle/thread projection is being refreshed. Unmounting it on
+  // a transient read gap discards the user's checkbox/reviewer draft even
+  // before any Core write. A different Mission never inherits the editor.
+  const retained=snapshot && bundle && snapshot.port===port
+    && snapshot.bundle.mission.missionId===bundle.mission.missionId
+    && snapshot.bundle.mission.threadId===bundle.mission.threadId ? snapshot : null
   const error=failure && failure.port===port && failure.scope===scope ? failure.message : null
   // 未确认的接力写入只存 UI 请求意图（不是业务事实），按 port 实例隔离：换端口/退出即自然清空。
   // 存在这里而不是 ControlPanel 内部，关掉对话框、切走再切回都不会丢同一个 commandId。
   const attemptStore=useMemo(()=>({port,map:new Map<string,ControlAttempt>()}),[port])
   const [,bumpAttemptStore]=useState(0)
-  const controlScope=current===null ? null : {
-    missionId:current.bundle.mission.missionId,
-    threadId:current.bundle.mission.threadId,
-    tasks:current.bundle.tasks
+  const controlScope=retained===null || bundle===null ? null : {
+    missionId:bundle.mission.missionId,
+    threadId:bundle.mission.threadId,
+    tasks:bundle.tasks
   }
   const setControlAttempt=(missionId:string,next:ControlAttempt|null):void=>{
     if(next===null)attemptStore.map.delete(missionId)
@@ -82,17 +89,17 @@ export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme
       preferredFor:artifact=>readBundle.candidates.find(candidate=>candidate.taskId===artifact.taskId && candidate.evidenceIds.includes(artifact.artifactId))??null
     })
     let timer:ReturnType<typeof setTimeout>|undefined
-    const deadline=new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('读取超时，请重试；保留的旧记录不会被当作新回执。')),input.timeoutMs)})
+    const deadline=new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('读取超时，请重试。')),input.timeoutMs)})
     void Promise.race([request,deadline]).then(facts=>{
-      // A newer WorkBundle for this same Mission may have arrived while this
-      // read was active. Never display an older task/candidate projection as
-      // though it belonged to that new bundle.
-      if (relevant() && latest.current.version===input.version) {
-        setSnapshot({scope:readScope,port:readPort,facts,bundle:readBundle})
+      // Publish the completed facts with the exact bundle they were read from.
+      // A queued update follows below; requiring a quiet parent here would
+      // starve the UI while active assistants keep invalidating their records.
+      if (relevant()) {
+        setSnapshot({scope:readScope,port:readPort,facts,bundle:readBundle,readToken:ticket})
       }
     }).catch(cause=>{
-      if (relevant() && latest.current.version===input.version) {
-        failedRead.current={scope:readScope,port:readPort,retry:input.retry}
+      if (relevant()) {
+        failedRead.current={scope:readScope,port:readPort,retry:latest.current.retry}
         setFailure({scope:readScope,port:readPort,message:cause instanceof Error?cause.message:'暂时无法读取工作记录'})
       }
     }).finally(()=>{
@@ -139,19 +146,22 @@ export function RunStatusDialog({ open, port, bundle, thread, agents = [], theme
     onOpenAutoFocus={()=>{opener.current=document.activeElement instanceof HTMLElement?document.activeElement:null}}
     onCloseAutoFocus={event=>{if(opener.current?.isConnected){event.preventDefault();opener.current.focus({preventScroll:true})}}}>
     {!bundle ? <div className="ln-run-state"><p>选择一项工作，查看助手分工、执行记录和成果。</p>{onCreateWork && <button type="button" onClick={onCreateWork}>创建一项工作</button>}</div>
-      : !threadMatches ? <div className="ln-run-state" role="status">正在对齐当前工作的对话记录，暂不显示其他工作的内容。</div>
+      : !threadMatches ? <div className="ln-run-state" role="status">正在加载工作记录…</div>
       : <>
-        <div className="ln-run-toolbar"><span role="status">{busy || refreshingWork ? current?'正在更新，保留上次读到的记录…':'正在读取工作记录…' : error?'更新未成功':'当前工作的主机记录'}</span>
+        <div className="ln-run-toolbar"><span role="status">{busy || refreshingWork ? current?'正在更新…':'正在读取工作记录…' : error?'更新失败':'工作记录'}</span>
           <button type="button" disabled={busy || refreshingWork} onClick={()=>{void refreshVisibleWork()}} aria-label="刷新运行与成果">{error?'重试读取':'刷新'}</button></div>
-        {error && <div className="ln-run-state" role="alert">读取失败：{error}{current && <p>以下保留的是上次成功读取的内容。</p>}</div>}
-        {current && controlScope ? <><V2BotStatusPanel facts={current.facts} bundle={current.bundle} onArtifact={onArtifact}/>
-          {/* 自动接力范围只挂当前这项工作；控制投影与成员范围都取自同一个真实 Mission/Thread。 */}
-          <ControlPanel missionId={controlScope.missionId} threadId={controlScope.threadId} thread={thread}
-            tasks={controlScope.tasks} agents={agents} port={port} theme={theme} refreshToken={retry}
-            attempt={attemptStore.map.get(controlScope.missionId) ?? null}
-            onAttempt={next=>setControlAttempt(controlScope.missionId,next)}/>
-        </>
+        {error && <div className="ln-run-state" role="alert">读取失败：{error}{current && <p>当前显示上次的记录。</p>}</div>}
+        {current ? <V2BotStatusPanel facts={current.facts} bundle={current.bundle} onArtifact={onArtifact}/>
           : !busy && !error ? <p className="ln-run-state">尚未读取到这项工作的记录。</p> : null}
       </>}
+    {controlScope && <div hidden={!threadMatches} aria-hidden={!threadMatches}>
+      {/* This is only a local editor while the Thread is aligned. The Core
+          remains the sole authority for permissions, revisions and writes. */}
+      <ControlPanel missionId={controlScope.missionId} threadId={controlScope.threadId}
+        thread={threadMatches?thread:null} tasks={controlScope.tasks} agents={agents}
+        port={port} theme={theme} refreshToken={retained?.readToken ?? retry}
+        attempt={attemptStore.map.get(controlScope.missionId) ?? null}
+        onAttempt={next=>setControlAttempt(controlScope.missionId,next)}/>
+    </div>}
   </SurfaceDialog>
 }
