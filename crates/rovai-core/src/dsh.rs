@@ -12,9 +12,17 @@ use crate::{
 };
 
 pub const MINIMUM_VERSION: &str = "0.1.5-rc.2";
-pub const BOOTSTRAP_REVISION: &str = "dsh-native-web-models-v6";
+pub const BOOTSTRAP_REVISION: &str = "dsh-local-hook-private-executor-v8";
 const BOOTSTRAP_PLUGIN: &str = include_str!("dsh/bootstrap.mjs");
 const MODEL_PLUGIN: &str = include_str!("dsh/models.mjs");
+const LOCAL_HOOK_PLUGIN: &str = include_str!("dsh/local-hooks.mjs");
+const LOCAL_HOOK_CLIENT: &str = include_str!("dsh/local-hook-executor.mjs");
+const LOCAL_HOOK_EXECUTOR: &str = include_str!("../../../resources/dsh-hook-executor/executor.mjs");
+const LOCAL_HOOK_VERIFY: &str = include_str!("../../../resources/dsh-hook-executor/verify.mjs");
+const LOCAL_HOOK_PACKAGE: &str = include_str!("../../../resources/dsh-hook-executor/package.json");
+const LOCAL_HOOK_LOCK: &str =
+    include_str!("../../../resources/dsh-hook-executor/package-lock.json");
+
 const MAX_OBSERVED_FILE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 
 pub fn supported_version(version: Option<&str>) -> bool {
@@ -350,6 +358,7 @@ pub fn enrich_message(root: &Path, message: &mut Value) -> Result<()> {
         .context("dsh_session_id_missing")?
         .to_string();
     let update = &mut params["update"];
+    append_hook_observations(root, &session_id, update)?;
     if update["sessionUpdate"] == "usage_update" {
         let prefix = format!("{:x}.usage-", Sha256::digest(session_id.as_bytes()));
         let mut observations = Vec::new();
@@ -437,6 +446,214 @@ pub fn enrich_message(root: &Path, message: &mut Value) -> Result<()> {
         }
     }
     fs::remove_file(path)?;
+    Ok(())
+}
+
+pub(crate) fn configure_local_hooks(
+    root: &Path,
+    launch: &crate::local_hook::LocalHookLaunch,
+) -> Result<()> {
+    anyhow::ensure!(
+        launch.schema_version == 1 && launch.execution_epoch >= 0,
+        "local_hook_launch_invalid"
+    );
+    let path = root.join("rovai.patch.json");
+    let mut patches: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let bootstrap = patches
+        .as_array_mut()
+        .context("local_hook_patch_invalid")?
+        .iter_mut()
+        .filter_map(|p| p.get_mut("insert").and_then(Value::as_array_mut))
+        .flat_map(|v| v.iter_mut())
+        .find(|p| p["id"] == "rovai-bootstrap")
+        .context("local_hook_bootstrap_missing")?;
+    anyhow::ensure!(
+        bootstrap["config"].get("localHook").is_none(),
+        "local_hook_duplicate_configuration"
+    );
+    bootstrap["config"]["localHook"] = serde_json::to_value(launch)?;
+    for (name, source) in [
+        ("local-hooks.mjs", LOCAL_HOOK_PLUGIN),
+        ("local-hook-executor.mjs", LOCAL_HOOK_CLIENT),
+    ] {
+        let plugin = root.join(name);
+        fs::write(&plugin, source)?;
+        private_file(&plugin)?;
+    }
+    let marker = root.join("local-hook-launch.json");
+    let launch_bytes = serde_json::to_vec(launch)?;
+    fs::write(&marker, &launch_bytes)?;
+    private_file(&marker)?;
+    let executor = local_hook_executor_configuration(&marker, &launch_bytes)?;
+    bootstrap["config"]["localHookExecutor"] = executor.clone();
+    let executor_marker = root.join("local-hook-executor.json");
+    fs::write(&executor_marker, serde_json::to_vec(&executor)?)?;
+    private_file(&executor_marker)?;
+    fs::write(&path, serde_json::to_vec(&patches)?)?;
+    private_file(&path)?;
+    Ok(())
+}
+
+fn local_hook_executor_configuration(launch_path: &Path, launch_bytes: &[u8]) -> Result<Value> {
+    anyhow::ensure!(cfg!(windows), "local_hook_executor_platform_unsupported");
+    let configured_pi = std::env::var_os(crate::embedded_pi::EMBEDDED_PI_ROOT_ENV)
+        .map(std::path::PathBuf::from)
+        .context("local_hook_bundled_node_unavailable")?;
+    anyhow::ensure!(
+        configured_pi.is_absolute(),
+        "local_hook_bundled_node_unavailable"
+    );
+    let pi = crate::embedded_pi::embedded_pi_bundle(&configured_pi)
+        .context("local_hook_bundled_node_unverified")?;
+    // The installed kit keeps both closures under the same runtime directory.
+    // The Node binary is admitted by Pi's existing complete bundle verifier.
+    let root = configured_pi
+        .parent()
+        .context("local_hook_bundle_missing")?
+        .join("dsh-hook-executor")
+        .canonicalize()
+        .context("local_hook_bundle_missing")?;
+    for (name, expected) in [
+        ("executor.mjs", LOCAL_HOOK_EXECUTOR),
+        ("verify.mjs", LOCAL_HOOK_VERIFY),
+        ("package.json", LOCAL_HOOK_PACKAGE),
+        ("package-lock.json", LOCAL_HOOK_LOCK),
+    ] {
+        let path = root.join(name);
+        let meta = fs::symlink_metadata(&path).context("local_hook_bundle_file_missing")?;
+        anyhow::ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "local_hook_bundle_file_invalid"
+        );
+        anyhow::ensure!(
+            fs::read(path)? == expected.as_bytes(),
+            "local_hook_bundle_source_mismatch"
+        );
+    }
+    let manifest_path = root.join("hook-executor-bundle.json");
+    let metadata =
+        fs::symlink_metadata(&manifest_path).context("local_hook_bundle_manifest_missing")?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= 2 * 1024 * 1024,
+        "local_hook_bundle_manifest_invalid"
+    );
+    let bytes = fs::read(manifest_path)?;
+    let manifest: Value = serde_json::from_slice(&bytes)?;
+    let candidate_path = configured_pi
+        .parent()
+        .and_then(Path::parent)
+        .context("local_hook_candidate_manifest_missing")?
+        .join("candidate-manifest.json");
+    let candidate_metadata =
+        fs::symlink_metadata(&candidate_path).context("local_hook_candidate_manifest_missing")?;
+    anyhow::ensure!(
+        candidate_metadata.is_file()
+            && !candidate_metadata.file_type().is_symlink()
+            && candidate_metadata.len() <= 8 * 1024 * 1024,
+        "local_hook_candidate_manifest_invalid"
+    );
+    let candidate: Value = serde_json::from_slice(&fs::read(candidate_path)?)?;
+    let expected = &candidate["dshHookExecutor"];
+    let manifest_digest = format!("{:x}", Sha256::digest(&bytes));
+    anyhow::ensure!(
+        expected["dshVersion"] == MINIMUM_VERSION
+            && expected["manifestSha256"] == manifest_digest
+            && candidate["files"]["runtime/dsh-hook-executor/hook-executor-bundle.json"]
+                == manifest_digest
+            && expected["treeSha256"] == manifest["treeSha256"]
+            && expected["lockSha256"] == manifest["lockSha256"]
+            && expected["packageCount"].as_u64()
+                == manifest["packages"]
+                    .as_array()
+                    .map(|items| items.len() as u64),
+        "local_hook_candidate_bundle_mismatch"
+    );
+    anyhow::ensure!(
+        manifest["schemaVersion"] == 1
+            && manifest["kind"] == "loom-local-hook-executor"
+            && manifest["platform"] == "win32"
+            && manifest["arch"] == "x64"
+            && manifest["dshVersion"] == MINIMUM_VERSION
+            && manifest["closureComplete"] == true
+            && manifest["entry"] == "executor.mjs",
+        "local_hook_bundle_manifest_invalid"
+    );
+    Ok(json!({
+        "schemaVersion":1, "node":pi.node, "root":root,
+        "manifestDigest":manifest_digest,
+        "launchPath":launch_path.canonicalize()?,
+        "launchDigest":format!("{:x}",Sha256::digest(launch_bytes))
+    }))
+}
+
+pub(crate) async fn await_local_hook_preparation(root: &Path) -> Result<()> {
+    let marker = root.join("local-hook-launch.json");
+    if !marker.exists() {
+        return Ok(());
+    }
+    let launch: crate::local_hook::LocalHookLaunch = serde_json::from_slice(&fs::read(marker)?)?;
+    let executor: Value =
+        serde_json::from_slice(&fs::read(root.join("local-hook-executor.json"))?)?;
+    tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        loop {
+            match fs::read(root.join("observations/local-hook-ready.json")) {
+                Ok(bytes) => {
+                    let ready: Value = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        ready["schemaVersion"] == 1
+                            && ready["status"] == "ready"
+                            && ready["agentRunId"] == launch.agent_run_id
+                            && ready["executionEpoch"] == launch.execution_epoch
+                            && ready["snapshotDigest"] == launch.snapshot_digest
+                            && ready["sandboxMode"] == launch.sandbox_mode
+                            && ready["chain"] == "private-pinned"
+                            && ready["manifestDigest"] == executor["manifestDigest"],
+                        "local_hook_preparation_mismatch"
+                    );
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => bail!("local_hook_preparation_unreadable"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("local_hook_preparation_timed_out")?
+}
+fn append_hook_observations(root: &Path, session_id: &str, update: &mut Value) -> Result<()> {
+    let prefix = format!("{:x}.hook-", Sha256::digest(session_id.as_bytes()));
+    let mut rows = Vec::new();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root.join("observations"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        anyhow::ensure!(
+            rows.len() < 256 && entry.file_type()?.is_file() && entry.metadata()?.len() <= 16384,
+            "local_hook_observation_budget"
+        );
+        let row: crate::local_hook::HookObservation =
+            serde_json::from_slice(&fs::read(entry.path())?)?;
+        anyhow::ensure!(
+            row.session_id == session_id && row.schema_version == 1,
+            "local_hook_observation_mismatch"
+        );
+        rows.push(row);
+        files.push(entry.path());
+    }
+    if !rows.is_empty() {
+        rows.sort_by_key(|r| r.seq);
+        update["_meta"]["dshHooks"] = serde_json::to_value(rows)?;
+        for file in files {
+            fs::remove_file(file)?;
+        }
+    }
     Ok(())
 }
 

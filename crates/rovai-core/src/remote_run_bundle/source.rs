@@ -999,6 +999,7 @@ mod tests {
         let catalog=get_member_capability_catalog(&database,&store,&member).unwrap();
         let view=catalog.items.iter().find(|item|item.id=="source_hook").unwrap().hook_definition.as_ref().unwrap();
         set_member_capability_catalog(&mut database,&store,&library,&MemberCapabilitySetParams {
+            local_camp_id: None,
             agent_id:member.clone(),expected_revision:catalog.revision.clone(),acknowledge_high_risk:false,
             selections:Vec::new(),
             reviewed_hooks:vec![HookReviewApproval{id:"source_hook".into(),definition_digest:view.definition_digest.clone(),scope_digest:view.scope_digest.clone()}],
@@ -1025,12 +1026,14 @@ mod tests {
         let current=get_member_capability_catalog(&database,&store,&member).unwrap();
         let view=current.items.iter().find(|item|item.id=="source_hook").unwrap().hook_definition.as_ref().unwrap();
         let newer=set_member_capability_catalog(&mut database,&store,&library,&MemberCapabilitySetParams {
+            local_camp_id: None,
             agent_id:member.clone(),expected_revision:current.revision.clone(),acknowledge_high_risk:false,
             selections:Vec::new(),
             reviewed_hooks:vec![HookReviewApproval{id:"source_hook".into(),definition_digest:view.definition_digest.clone(),scope_digest:view.scope_digest.clone()}],
         }).unwrap();
         assert!(unreviewed.bind_real_run("old_unreviewed_run",9,1,&reviewed.default_bootstrap).is_err());
         set_member_capability_catalog(&mut database,&store,&library,&MemberCapabilitySetParams {
+            local_camp_id: None,
             agent_id:member.clone(),expected_revision:newer.revision,acknowledge_high_risk:false,
             selections:vec![MemberCapabilitySelection{kind:"hook".into(),id:"source_hook".into(),selected:false}],
             reviewed_hooks:Vec::new(),
@@ -1142,6 +1145,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 agent_id: member.clone(),
                 expected_revision: catalog.revision.clone(),
                 acknowledge_high_risk: false,
@@ -1269,6 +1273,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 agent_id: member.clone(),
                 expected_revision: catalog.revision.clone(),
                 acknowledge_high_risk: false,
@@ -1300,6 +1305,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 agent_id: member.clone(),
                 expected_revision: catalog.revision.clone(),
                 acknowledge_high_risk: false,
@@ -1328,6 +1334,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 agent_id: member.clone(),
                 expected_revision: catalog.revision.clone(),
                 acknowledge_high_risk: false,
@@ -1506,6 +1513,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 agent_id: member.clone(),
                 expected_revision: catalog.revision.clone(),
                 acknowledge_high_risk: false,

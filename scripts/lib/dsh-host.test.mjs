@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { apply, readinessService } from '../../crates/rovai-core/src/dsh/bootstrap.mjs'
+import { installLocalHooks, validateLaunch, validatePolicy, rootBinding, rejectKnownSandboxBypass } from '../../crates/rovai-core/src/dsh/local-hooks.mjs'
+import { hookExecutorEnvironment, validateExecutor } from '../../crates/rovai-core/src/dsh/local-hook-executor.mjs'
 import { prepareModels, withResponsesDefaults, observeNativeImport } from '../../crates/rovai-core/src/dsh/models.mjs'
 
 test('DSH Web supplementation preserves whole native routes and localizes unknown sources', () => {
@@ -118,6 +120,7 @@ test('DSH official prompt seam binds immutable root identity per session and fai
     assert.deepEqual(denied, ['mcp__fixture__echo', 'mcp__fixture__native_only'])
     assert.equal(toolChangeEvent, 'tools/change')
     assert.equal(events.has('tools/pre-execute'), false)
+    assert.equal(events.has('tools/post-execute'), false, 'an unselected Hook must install no executor')
     const bootstrap = 'Member A: {{literal}}'
     const binding = { schemaVersion: 1, sessionId: 'session-a', bootstrap,
       sha256: createHash('sha256').update(bootstrap).digest('hex') }
@@ -219,4 +222,132 @@ test('DSH bootstrap publishes ACP readiness only after native MCP entries settle
   await pending
   assert.equal(ready, true)
   assert.deepEqual(calls, ['refresh', 'await'])
+})
+
+test('DSH selected local Hook fences the root session, exact command, policy and disposal', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rovai-dsh-local-hook-test-'))
+  const launch = { schemaVersion: 1, agentRunId: 'run-a', executionEpoch: 2,
+    snapshotDigest: 'a'.repeat(64), hookId: 'reviewed-hook', workspaceRoot: root,
+    sandboxMode: 'workspace-write', model: 'reviewed-model',
+    settings: { hooks: { PostToolUse: [{ matcher: '^read$', hooks: [
+      { type: 'command', command: 'reviewed command', timeout: 1 }
+    ] }] } } }
+  try {
+    assert.deepEqual(validateLaunch(launch), { tool: 'read', command: 'reviewed command', timeoutSec: 1 })
+    for (const mutate of [
+      x => { x.settings.hooks.Stop = [] },
+      x => { x.settings.hooks.PostToolUse[0].matcher = '.*' },
+      x => { x.settings.hooks.PostToolUse[0].hooks[0].timeout = 6 },
+      x => { x.settings.hooks.PostToolUse[0].hooks[0].async = true },
+      x => { x.sandboxMode = 'danger-full-access' }
+    ]) {
+      const invalid = structuredClone(launch); mutate(invalid)
+      assert.throws(() => validateLaunch(invalid), /local_hook_/)
+    }
+    const policy = { mode: launch.sandboxMode, workspaceRoot: root, additionalWritableRoots: [] }
+    assert.doesNotThrow(() => validatePolicy(policy, launch))
+    assert.throws(() => validatePolicy({ ...policy, mode: 'read-only' }, launch), /scope_mismatch/)
+    assert.throws(() => validatePolicy({ ...policy, additionalWritableRoots: [root] }, launch), /scope_mismatch/)
+    const config = { localHook: launch, bindingRoot: root, observationRoot: root,
+      localHookExecutor: { schemaVersion: 1, node: process.execPath, root,
+        launchPath: join(root, 'local-hook-launch.json'), manifestDigest: 'b'.repeat(64), launchDigest: 'c'.repeat(64) } }
+    assert.doesNotThrow(() => validateExecutor(config.localHookExecutor))
+    assert.throws(() => validateExecutor({ ...config.localHookExecutor, launchPath: 'relative' }))
+    assert.deepEqual(hookExecutorEnvironment({ PATH: 'path', SystemRoot: 'root',
+      PROVIDER_API_KEY: 'secret', NODE_OPTIONS: '--require=untrusted', LOOM_E4_PROVIDER_KEY: 'secret',
+      DSH_HOME: 'native-home', npm_config_userconfig: 'credentials' }), { PATH: 'path', SystemRoot: 'root' })
+    const bind = id => {
+      const bootstrap = 'Frozen root bootstrap for ' + id
+      writeFileSync(join(root, id + '.json'), JSON.stringify({ schemaVersion: 1, sessionId: id, bootstrap,
+        sha256: createHash('sha256').update(bootstrap).digest('hex') }))
+    }
+    bind('session-a'); bind('session-b')
+    assert.equal(rootBinding(config, { id: 'session-a', header: {} }), true)
+    assert.equal(rootBinding(config, { id: 'child', header: { parentSession: 'session-a' } }), false)
+    assert.throws(() => rootBinding(config, { id: '../session-a', header: {} }), /session_invalid/)
+
+    // This is an adapter contract test. The separate native sandbox acceptance
+    // is required before any claim about actual process confinement.
+    const events = new Map(), cleanups = []
+    let calls = 0, parked = false, settled = false, sequence = 1
+    const execute = async (executor, exactLaunch, mode, input, signal) => {
+      assert.deepEqual(executor, config.localHookExecutor)
+      assert.deepEqual(exactLaunch, launch)
+      if (mode === 'verify') return { manifestDigest: executor.manifestDigest }
+      calls++
+      assert.equal(input.payload.tool_name, 'read')
+      assert.equal(input.payload.cwd, root)
+      assert.equal(input.sessionId, 'session-a')
+      if (parked) {
+        await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+        settled = true
+        return { output: { exitCode: undefined, stderr: 'cancelled-private-text' }, durationMs: 1,
+          facts: { aborted: true, timedOut: false, sandboxEnforcement: 'partial', sandboxDenied: false } }
+      }
+      return { output: { exitCode: 0, stderr: 'private hook stderr' }, durationMs: 1,
+        facts: { aborted: false, timedOut: false, sandboxEnforcement: 'partial', sandboxDenied: false } }
+    }
+    const protocol = {
+      appendHookInvoked(session, record) { session.append('hook/invoked', record) },
+      appendHookResult(session, { output, ...record }) {
+        session.append('hook/result', { ...record, exitCode: output.exitCode,
+          stderrSummary: output.stderr, decision: 'pass' })
+      }
+    }
+    assert.throws(() => rejectKnownSandboxBypass({ confine(argv) {
+      // [dsh-purge] sandbox bypass
+      return { argv: [...argv], enforcement: 'full' }
+    } }), /native_sandbox_modified/)
+    const local = {
+      sandbox: { confine() { throw new Error('contract fixture never executes an OS process') } },
+      loader: { import: async name => { assert(name.endsWith('hook-protocol')); return protocol } },
+      get shell() { throw new Error('the native global shell must never execute a reviewed local Hook') },
+      sandboxPolicy: { resolve: () => policy },
+      agents: { turnBoundaryOf: () => ({ lastTurn: 7 }) },
+      workingDirectory: { ensure: async () => root },
+      effect: factory => cleanups.push(factory()),
+      on: (name, listener) => events.set(name, listener)
+    }
+    const ctx = { plugin: definition => { const task = definition.apply(local); return { await: () => task } } }
+    await installLocalHooks(ctx, config, execute)
+    const ready = JSON.parse(readFileSync(join(root, 'local-hook-ready.json'), 'utf8'))
+    assert.equal(ready.agentRunId, launch.agentRunId)
+    assert.equal(ready.chain, 'private-pinned')
+    assert.equal(ready.manifestDigest, config.localHookExecutor.manifestDigest)
+    const session = { id: 'session-a', header: {},
+      append(type, data) { events.get('session/event')(this, { type, data, seq: sequence++ }) } }
+    const exec = { agent: { session }, name: 'read', callId: 'native-call', arguments: {},
+      signal: new AbortController().signal }
+    const invoke = events.get('tools/post-execute')
+    const result = { content: [{ type: 'text', text: 'owned tool output' }] }
+    await invoke({ ...exec, name: 'write' }, result, async () => ({ kind: 'pass' }))
+    await invoke({ ...exec, agent: { session: { id: 'child', header: { parentSession: 'session-a' } } } },
+      result, async () => ({ kind: 'pass' }))
+    assert.equal(calls, 0)
+    await invoke(exec, result, async () => ({ kind: 'pass' }))
+    assert.equal(calls, 1)
+    const observations = () => readdirSync(root).filter(name => name.includes('.hook-'))
+      .map(name => JSON.parse(readFileSync(join(root, name), 'utf8')))
+    const records = observations()
+    assert.deepEqual(records.map(row => row.kind), ['invoked', 'result'])
+    for (const row of records) {
+      assert.equal(row.agentRunId, 'run-a'); assert.equal(row.executionEpoch, 2)
+      assert.equal(row.sessionId, 'session-a'); assert.equal(row.snapshotDigest, launch.snapshotDigest)
+      assert.equal(JSON.stringify(row).includes('private hook stderr'), false)
+      assert.equal(JSON.stringify(row).includes('reviewed command'), false)
+    }
+    assert.equal(records[1].sandboxEnforcement, 'partial')
+    assert.match(records[1].stderrDigest, /^sha256:[a-f0-9]{64}$/)
+    await assert.rejects(invoke({ ...exec, agent: { session: { ...session, id: 'session-b' } } },
+      result, async () => ({ kind: 'pass' })), /second_root_session/)
+    assert.equal(calls, 1)
+    parked = true
+    const pending = invoke({ ...exec, callId: 'cancelled-call' }, result, async () => ({ kind: 'pass' }))
+    const rejected = assert.rejects(pending)
+    while (calls !== 2) await Promise.resolve()
+    await cleanups[0]()
+    await rejected
+    assert.equal(settled, true, 'disposal must wait for the owned executor to settle')
+    assert.equal(observations().filter(row => row.kind === 'result' && row.aborted).length, 1)
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })

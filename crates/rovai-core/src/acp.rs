@@ -1439,6 +1439,7 @@ pub(crate) struct AcpHost {
     next_compaction_observation_sequence: AtomicU64,
     grok_acceptance_auto_compact_armed: AtomicBool,
     retire_after_steer: AtomicBool,
+    has_local_hooks: bool,
     qwen_steering: Mutex<HashMap<String, QueuedSteeringInput>>,
     routes: RwLock<HashMap<String, AcpSessionRoute>>,
     late_context_owners: RwLock<HashMap<String, (AcpRuntimeOwner, Instant)>>,
@@ -1763,6 +1764,40 @@ impl AcpHost {
         attachment_access_root: Option<&Path>,
         startup_bootstrap: Option<&str>,
     ) -> Result<Arc<Self>> {
+        Self::spawn_with_local_hooks(
+            cwd,
+            workspace,
+            permission_semantics,
+            frozen_runtime,
+            incoming,
+            builtin_tools,
+            compaction_detector_policy,
+            allow_client_fs,
+            external_mcp_servers,
+            private_runtime_dir,
+            attachment_access_root,
+            startup_bootstrap,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_local_hooks(
+        cwd: &Path,
+        workspace: &AgentRunWorkspace,
+        permission_semantics: PermissionSemantics,
+        frozen_runtime: &FrozenAgentRuntimeConfig,
+        incoming: mpsc::UnboundedSender<AcpIncoming>,
+        builtin_tools: Option<BuiltinToolProcessConfig>,
+        compaction_detector_policy: CompactionDetectorPolicy,
+        allow_client_fs: bool,
+        external_mcp_servers: &BTreeMap<String, McpServerDefinition>,
+        private_runtime_dir: &Path,
+        attachment_access_root: Option<&Path>,
+        startup_bootstrap: Option<&str>,
+        local_hooks: Option<&crate::local_hook::LocalHookLaunch>,
+    ) -> Result<Arc<Self>> {
         rovai_core::runtime_discovery::with_launch_environment(
             frozen_runtime.environment.clone(),
             Self::spawn_in_environment(
@@ -1778,6 +1813,7 @@ impl AcpHost {
                 private_runtime_dir,
                 attachment_access_root,
                 startup_bootstrap,
+                local_hooks,
             ),
         )
         .await
@@ -1797,6 +1833,7 @@ impl AcpHost {
         private_runtime_dir: &Path,
         attachment_access_root: Option<&Path>,
         startup_bootstrap: Option<&str>,
+        local_hooks: Option<&crate::local_hook::LocalHookLaunch>,
     ) -> Result<Arc<Self>> {
         if !runtime_launch_allowed(
             frozen_runtime.adapter_kind,
@@ -1867,6 +1904,16 @@ impl AcpHost {
                 .map(BuiltinToolProcessConfig::run_tmp),
         )
         .context("failed to configure ACP Runtime command")?;
+        if let Some(local_hooks) = local_hooks {
+            anyhow::ensure!(
+                frozen_runtime.adapter_kind == AdapterKind::DeepseekHarness,
+                "local_hook_runtime_unsupported"
+            );
+            crate::dsh::configure_local_hooks(
+                private_config_root.context("local Hook Host directory missing")?,
+                local_hooks,
+            )?;
+        }
         let mut command_bootstrap_nonce =
             if frozen_runtime.adapter_kind == AdapterKind::CommandCodeCli {
                 Some(crate::command_code_acp::configure_host(
@@ -2029,6 +2076,7 @@ impl AcpHost {
             next_compaction_observation_sequence: AtomicU64::new(1),
             grok_acceptance_auto_compact_armed: AtomicBool::new(false),
             retire_after_steer: AtomicBool::new(false),
+            has_local_hooks: local_hooks.is_some(),
             qwen_steering: Mutex::new(HashMap::new()),
             routes: RwLock::new(HashMap::new()),
             late_context_owners: RwLock::new(HashMap::new()),
@@ -2087,6 +2135,18 @@ impl AcpHost {
                         }
                         Ok(())
                     })
+            {
+                host.shutdown().await;
+                return Err(error);
+            }
+        }
+        if host.adapter_kind == AdapterKind::DeepseekHarness {
+            if let Err(error) = crate::dsh::await_local_hook_preparation(
+                host.private_config_root
+                    .as_deref()
+                    .context("DSH private configuration missing")?,
+            )
+            .await
             {
                 host.shutdown().await;
                 return Err(error);
@@ -6730,6 +6790,51 @@ impl AcpCliRuntimeAdapter {
         F: FnOnce(FrozenAgentRuntimeConfig) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<FrozenAgentRuntimeConfig>> + Send + 'static,
     {
+        self.ensure_agent_run_runtime_with_local_hooks(
+            agent_run_id,
+            execution_epoch,
+            camp_id,
+            agent_id,
+            native_binding_id,
+            workspace,
+            permission_semantics,
+            frozen_runtime,
+            builtin_tool_factory,
+            external_mcp_servers,
+            mcp_projection_digest,
+            attachment_access_root,
+            runtime_compatibility_digest,
+            startup_bootstrap,
+            None,
+            prepare_cold,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ensure_agent_run_runtime_with_local_hooks<F, Fut>(
+        &self,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        camp_id: &str,
+        agent_id: &str,
+        native_binding_id: &str,
+        workspace: &AgentRunWorkspace,
+        permission_semantics: PermissionSemantics,
+        frozen_runtime: &FrozenAgentRuntimeConfig,
+        builtin_tool_factory: &BuiltinToolProcessConfigFactory,
+        external_mcp_servers: &BTreeMap<String, McpServerDefinition>,
+        mcp_projection_digest: &str,
+        attachment_access_root: &Path,
+        runtime_compatibility_digest: &Option<String>,
+        startup_bootstrap: Option<&str>,
+        local_hooks: Option<crate::local_hook::LocalHookLaunch>,
+        prepare_cold: F,
+    ) -> Result<Arc<AcpRuntime>>
+    where
+        F: FnOnce(FrozenAgentRuntimeConfig) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<FrozenAgentRuntimeConfig>> + Send + 'static,
+    {
         if frozen_runtime.adapter_kind != self.kind {
             bail!("ACP Runtime received an AgentRun for another Adapter");
         }
@@ -6801,6 +6906,7 @@ impl AcpCliRuntimeAdapter {
         let spawn_attachment_access_root = attachment_access_root.to_path_buf();
         let spawn_private_runtime_dir = self.private_runtime_dir.clone();
         let spawn_startup_bootstrap = startup_bootstrap.map(str::to_owned);
+        let spawn_local_hooks = local_hooks;
         let spawn_incoming = self.incoming.clone();
         let spawn_compaction_policy = self.compaction_detector_policy;
         if self.kind == AdapterKind::DeepseekHarness {
@@ -6836,7 +6942,7 @@ impl AcpCliRuntimeAdapter {
                     {
                         spawn_frozen_runtime.custom_api = None;
                     }
-                    let host = AcpHost::spawn(
+                    let host = AcpHost::spawn_with_local_hooks(
                         &spawn_execution_root,
                         &spawn_workspace,
                         permission_semantics,
@@ -6849,6 +6955,7 @@ impl AcpCliRuntimeAdapter {
                         &spawn_private_runtime_dir,
                         Some(&spawn_attachment_access_root),
                         spawn_startup_bootstrap.as_deref(),
+                        spawn_local_hooks.as_ref(),
                     )
                     .await?;
                     Ok(RuntimeProcessHost::Acp(host))
@@ -6966,6 +7073,9 @@ impl AcpCliRuntimeAdapter {
                 None
             }
         };
+        let has_local_hooks = runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.host.has_local_hooks);
         if let Some(runtime) = runtime {
             runtime.detach().await;
         }
@@ -6973,7 +7083,14 @@ impl AcpCliRuntimeAdapter {
             .release(
                 agent_run_id,
                 execution_epoch,
-                completed_run_release_disposition(self.kind),
+                if has_local_hooks {
+                    // A reviewed Hook belongs to exactly this Run/epoch. Stop
+                    // its native Host and drain the official executor before
+                    // publishing a durable terminal or admitting a successor.
+                    FleetReleaseDisposition::Stop
+                } else {
+                    completed_run_release_disposition(self.kind)
+                },
             )
             .await;
     }

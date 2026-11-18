@@ -10,6 +10,7 @@ import {
 import { createCapabilityPort } from './capability-service'
 import { FormMessage, SurfaceDialog } from './Controls'
 import { Icon, type IconName } from './icons'
+import { HookScopeSummary } from './HookScopeSummary'
 
 const categories: { kind: CapabilityKind; label: string; icon: IconName; help: string }[] = [
   { kind: 'skill', label: 'Skills', icon: 'bulb', help: '选择这个助手可以按需使用的工作方法。' },
@@ -51,15 +52,15 @@ export function CapabilityRow({ item, icon, saving, refusal, onToggle }: {
     </div>
     {item.sourceError && <div className="ln-cap-detail">来源不可用，仍可关闭已有选择。</div>}
     {hint && <div className="ln-cap-detail">{hint}</div>}
-    {item.hookDefinition && <details className="ln-cap-detail"><summary>查看 Hook 正文和范围</summary><p>{item.hookDefinition.reviewScope.workspaceRoot} · {item.hookDefinition.reviewScope.adapterKind}</p><pre>{item.hookDefinition.body}</pre></details>}
+    {item.hookDefinition && <details className="ln-cap-detail"><summary>查看 Hook 正文和范围</summary><HookScopeSummary scope={item.hookDefinition.reviewScope}/><pre>{item.hookDefinition.body}</pre></details>}
   </article>
 }
 
-export function CapabilityPanel({ client, agent, theme = 'day', compact = false, onDirtyChange, onSaved, onLibrary }: {
-  client: ThreadClient; agent: AgentProfile; theme?: 'day' | 'night'; compact?: boolean
+export function CapabilityPanel({ client, agent, threadId, theme = 'day', compact = false, onDirtyChange, onSaved, onLibrary }: {
+  client: ThreadClient; agent: AgentProfile; threadId?: string; theme?: 'day' | 'night'; compact?: boolean
   onDirtyChange?(dirty: boolean): void; onSaved?(): void; onLibrary?(): void
 }) {
-  const port = useMemo(() => createCapabilityPort(client), [client])
+  const port = useMemo(() => createCapabilityPort(client,threadId), [client,threadId])
   const [catalog, setCatalog] = useState<CapabilityCatalog | null>(null)
   const [items, setItems] = useState<CapabilityItem[]>([])
   const [kind, setKind] = useState<CapabilityKind>('skill')
@@ -164,7 +165,7 @@ export function CapabilityPanel({ client, agent, theme = 'day', compact = false,
     <SurfaceDialog open={review !== null} title="确认这次能力授权" description="只适用于列出的内容和运行范围，不授予整机或其他助手的权限。" theme={theme} onClose={() => { if (!saving) setReview(null) }} className="ln-room-dialog">
       <div className="ln-room-content">{review && <>
         {highRiskToConfirm(items, catalog?.items ?? []).map(item => <div className="ln-review-card" key={itemKey(item)}><h3>{item.name}</h3><p>{item.note || '此能力可能执行命令或修改外部资源。'}</p></div>)}
-        {review.entries.map(entry => <div className="ln-review-card" key={entry.id}><h3>{entry.name}</h3><p>{entry.scope.workspaceRoot} · {entry.scope.adapterKind}</p><pre>{entry.body}</pre></div>)}
+        {review.entries.map(entry => <div className="ln-review-card" key={entry.id}><h3>{entry.name}</h3><HookScopeSummary scope={entry.scope}/><pre>{entry.body}</pre></div>)}
         {error && <FormMessage error>{error}</FormMessage>}
         <footer className="ln-form-actions"><button type="button" className="ln-action" disabled={saving} onClick={() => setReview(null)}>取消</button><button type="button" className="ln-action is-primary" disabled={saving} onClick={() => { void submit(review) }}>{saving ? '保存中…' : '确认范围并保存'}</button></footer>
       </>}</div>

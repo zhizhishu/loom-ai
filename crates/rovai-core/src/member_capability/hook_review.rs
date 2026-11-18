@@ -35,10 +35,9 @@ pub(crate) fn schema_matches(connection: &Connection) -> rusqlite::Result<bool> 
     Ok(actual.is_some_and(|sql| compact(&sql) == compact(SCHEMA_SQL)))
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct HookReviewScope {
+pub(crate) struct RemoteHookReviewScope {
     pub member_id: String,
     pub mission_id: String,
     pub camp_id: String,
@@ -49,10 +48,27 @@ pub(crate) struct HookReviewScope {
     pub workspace_token_digest: String,
     pub adapter_kind: crate::agent_profile::AdapterKind,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum HookReviewScope {
+    Remote(RemoteHookReviewScope),
+    Local(crate::local_hook::LocalHookScope),
+}
 impl HookReviewScope {
     pub(super) fn digest(&self) -> Result<String> {
-        Ok(format!("sha256:{}", canonical_json_digest(&serde_json::to_value(self)?)?))
+        Ok(format!(
+            "sha256:{}",
+            canonical_json_digest(&serde_json::to_value(self)?)?
+        ))
     }
+    pub(super) fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+    fn matches_target(&self, target: &crate::remote_execution::FrozenRunTarget) -> bool {
+        matches!(self,Self::Remote(scope) if scope.matches_target(target))
+    }
+}
+impl RemoteHookReviewScope {
     fn matches_target(&self, target: &crate::remote_execution::FrozenRunTarget) -> bool {
         self.member_id == target.member_id
             && self.workspace_id == target.selection.workspace_id
@@ -68,12 +84,18 @@ impl HookReviewScope {
 
 /// A project label or a path supplied by the caller is never approval authority.
 /// Local selection has no remote consent scope and keeps its existing behavior.
-pub(super) fn current_scope(connection: &Connection, member_id: &str) -> Result<Option<HookReviewScope>> {
-    let Some(selection) = crate::remote_execution::load_member_target(connection, member_id)?.selection else {
+pub(super) fn current_scope(
+    connection: &Connection,
+    member_id: &str,
+) -> Result<Option<HookReviewScope>> {
+    let Some(selection) =
+        crate::remote_execution::load_member_target(connection, member_id)?.selection
+    else {
         return Ok(None);
     };
-    let authority = crate::remote_execution::workspace_authority(connection, member_id, &selection)?;
-    Ok(Some(HookReviewScope {
+    let authority =
+        crate::remote_execution::workspace_authority(connection, member_id, &selection)?;
+    Ok(Some(HookReviewScope::Remote(RemoteHookReviewScope {
         member_id: member_id.to_owned(),
         mission_id: authority.mission_id,
         camp_id: authority.camp_id,
@@ -83,7 +105,36 @@ pub(super) fn current_scope(connection: &Connection, member_id: &str) -> Result<
         workspace_generation: authority.generation,
         workspace_token_digest: authority.preparation_token_digest,
         adapter_kind: selection.adapter_kind,
-    }))
+    })))
+}
+
+/// Local Camp is only a selector for Core authority; no caller-supplied path.
+pub(super) fn current_scope_for_camp(
+    connection: &Connection,
+    member_id: &str,
+    local_camp_id: Option<&str>,
+) -> Result<Option<HookReviewScope>> {
+    if let Some(remote) = current_scope(connection, member_id)? {
+        return Ok(Some(remote));
+    }
+    let Some(camp_id) = local_camp_id else {
+        return Ok(None);
+    };
+    let adapter: Option<String> = connection.query_row(
+        "SELECT selected_runtime_adapter_kind FROM agent_profile WHERE id=?1",
+        [member_id],
+        |r| r.get(0),
+    )?;
+    if adapter.as_deref() != Some("deepseek-harness") {
+        return Ok(None);
+    }
+    match crate::local_hook::current_scope(connection, member_id, camp_id) {
+        Ok(scope) => Ok(Some(HookReviewScope::Local(scope))),
+        // A missing/changed local workspace disables Hook review without hiding
+        // the rest of this member's catalog. SQL failures remain visible.
+        Err(error) if error.downcast_ref::<rusqlite::Error>().is_none() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -174,15 +225,20 @@ pub(super) fn matches(piece: &CatalogPiece) -> Result<bool> {
     let Some(review) = &piece.hook_review else {
         return Ok(false);
     };
-    let Some(scope) = &piece.hook_scope else { return Ok(false); };
-    Ok(piece.kind == "hook" && review.definition_digest == definition_digest(piece)?
+    let Some(scope) = &piece.hook_scope else {
+        return Ok(false);
+    };
+    Ok(piece.kind == "hook"
+        && review.definition_digest == definition_digest(piece)?
         && review.scope_digest == scope.digest()?)
 }
 pub(super) fn view(piece: &CatalogPiece) -> Result<Option<HookDefinitionView>> {
     if piece.kind != "hook" {
         return Ok(None);
     }
-    let Some(scope) = &piece.hook_scope else { return Ok(None); };
+    let Some(scope) = &piece.hook_scope else {
+        return Ok(None);
+    };
     Ok(Some(HookDefinitionView {
         body: piece.body.clone(),
         definition_digest: definition_digest(piece)?,
@@ -196,12 +252,14 @@ pub(super) fn load(
     agent_id: &str,
     scope: Option<&HookReviewScope>,
 ) -> Result<BTreeMap<String, StoredReview>> {
-    let Some(scope) = scope else { return Ok(BTreeMap::new()); };
+    let Some(scope) = scope else {
+        return Ok(BTreeMap::new());
+    };
     let mut statement = connection.prepare(
         "SELECT item_id,definition_digest,reviewed_revision,reviewed_at,scope_digest
          FROM member_hook_review WHERE agent_id=?1 AND scope_digest=?2 ORDER BY item_id",
     )?;
-    let rows = statement.query_map(params![agent_id,scope.digest()?], |row| {
+    let rows = statement.query_map(params![agent_id, scope.digest()?], |row| {
         Ok((
             row.get(0)?,
             StoredReview {
@@ -222,10 +280,9 @@ pub(super) fn validate_request(
 ) -> Result<BTreeSet<String>> {
     let mut ids = BTreeSet::new();
     for approval in approvals {
-        let Some(piece) = next
-            .iter()
-            .find(|p| p.kind == "hook" && p.id == approval.id && p.selected && p.hook_scope.is_some())
-        else {
+        let Some(piece) = next.iter().find(|p| {
+            p.kind == "hook" && p.id == approval.id && p.selected && p.hook_scope.is_some()
+        }) else {
             return Err(review_error("capability.hook_review_invalid", &approval.id));
         };
         if !ids.insert(approval.id.clone())
@@ -238,7 +295,10 @@ pub(super) fn validate_request(
             ));
         }
     }
-    for piece in next.iter().filter(|p| p.kind == "hook" && p.selected && p.hook_scope.is_some()) {
+    for piece in next
+        .iter()
+        .filter(|p| p.kind == "hook" && p.selected && p.hook_scope.is_some())
+    {
         if !matches(piece)? && !ids.contains(&piece.id) {
             return Err(review_error("capability.hook_review_required", &piece.id));
         }
@@ -252,13 +312,16 @@ pub(super) fn revalidate_before_write(
     agent_id: &str,
     next: &[CatalogPiece],
     approvals: &[HookReviewApproval],
+    local_camp_id: Option<&str>,
 ) -> Result<()> {
     ensure!(
         !connection.is_autocommit(),
         "hook_review_transaction_required"
     );
-    if !next.iter().any(|p| p.kind == "hook") { return Ok(()); }
-    let scope = current_scope(connection, agent_id)?;
+    if !next.iter().any(|p| p.kind == "hook") {
+        return Ok(());
+    }
+    let scope = current_scope_for_camp(connection, agent_id, local_camp_id)?;
     let reviews = load(connection, agent_id, scope.as_ref())?;
     let claims = super::load_claims(connection)?;
     let mut fresh = Vec::new();
@@ -284,7 +347,10 @@ pub(super) fn revalidate_before_write(
         current.hook_review = reviews.get(&piece.id).cloned();
         current.hook_scope = scope.clone();
         if current.hook_scope != piece.hook_scope {
-            return Err(review_error("capability.hook_review_scope_changed", &piece.id));
+            return Err(review_error(
+                "capability.hook_review_scope_changed",
+                &piece.id,
+            ));
         }
         if current.kind != "hook" || definition_digest(&current)? != definition_digest(piece)? {
             return Err(review_error("capability.hook_review_conflict", &piece.id));
@@ -310,8 +376,12 @@ pub(super) fn persist(
     for piece in next.iter().filter(|p| p.kind == "hook") {
         // Selection only controls inclusion in the next Run. Exact scoped
         // consent remains stored; definition/scope drift still makes it unusable.
-        if !piece.selected { continue; }
-        let Some(scope) = &piece.hook_scope else { continue; };
+        if !piece.selected {
+            continue;
+        }
+        let Some(scope) = &piece.hook_scope else {
+            continue;
+        };
         if approvals.contains(&piece.id) && !matches(piece)? {
             connection.execute(
                 "INSERT INTO member_hook_review(agent_id,item_id,definition_digest,reviewed_revision,reviewed_at,scope_digest)
@@ -344,7 +414,11 @@ pub(super) fn freeze(pieces: &[CatalogPiece]) -> Result<Vec<FrozenHookReview>> {
             risk: piece.risk.clone(),
             definition_digest: review.definition_digest.clone(),
             body_digest: loom_protocol::command_hooks::digest(piece.body.as_bytes()),
-            review_scope: piece.hook_scope.as_ref().expect("matching scoped review").clone(),
+            review_scope: piece
+                .hook_scope
+                .as_ref()
+                .expect("matching scoped review")
+                .clone(),
             scope_digest: review.scope_digest.clone(),
             reviewed_revision: review.reviewed_revision.clone(),
             reviewed_at: review.reviewed_at.clone(),
@@ -363,7 +437,8 @@ pub(crate) fn validate_frozen(
     let mut ids = BTreeSet::new();
     for review in reviews {
         ensure!(
-            review.version == 1 && ids.insert(&review.id)
+            review.version == 1
+                && ids.insert(&review.id)
                 && review.review_scope.digest()? == review.scope_digest,
             "bundle_hook_review_invalid"
         );
@@ -409,8 +484,25 @@ pub(crate) fn validate_frozen_scope(
     target: &crate::remote_execution::FrozenRunTarget,
 ) -> Result<()> {
     for review in reviews {
-        ensure!(review.review_scope.digest()? == review.scope_digest
-            && review.review_scope.matches_target(target), "bundle_hook_review_scope");
+        ensure!(
+            review.review_scope.digest()? == review.scope_digest
+                && review.review_scope.matches_target(target),
+            "bundle_hook_review_scope"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_frozen_local_scope(
+    reviews: &[FrozenHookReview],
+    scope: &crate::local_hook::LocalHookScope,
+) -> Result<()> {
+    for review in reviews {
+        ensure!(
+            review.review_scope == HookReviewScope::Local(scope.clone())
+                && review.scope_digest == review.review_scope.digest()?,
+            "local_hook_review_scope_mismatch"
+        );
     }
     Ok(())
 }
@@ -434,26 +526,34 @@ pub(crate) fn test_remote_scope(
     database: &mut crate::db::Database,
     member: &str,
     directory: &std::path::Path,
-) -> HookReviewScope {
+) -> RemoteHookReviewScope {
     let command = serde_json::from_value::<crate::mission::CreateMissionCommand>(json!({
         "title":"Hook scope fixture", "description":"", "projectPath":directory,
         "projectBindingKind":"directory", "memberAgentIds":[member],
         "defaultLeadAgentId":member, "tags":[],
-    })).unwrap();
+    }))
+    .unwrap();
     let created = crate::mission::MissionService::default()
-        .create(database, &super::user_envelope(command)).unwrap();
+        .create(database, &super::user_envelope(command))
+        .unwrap();
     let mission = created.result.payload["missionId"].as_str().unwrap();
-    let camp: String = database.connection().query_row(
-        "SELECT camp_id FROM mission WHERE id=?1", [mission], |r| r.get(0),
-    ).unwrap();
+    let camp: String = database
+        .connection()
+        .query_row("SELECT camp_id FROM mission WHERE id=?1", [mission], |r| {
+            r.get(0)
+        })
+        .unwrap();
     let node = format!("hook-node-{}", uuid::Uuid::new_v4().simple());
     let workspace = format!("hook-workspace-{}", uuid::Uuid::new_v4().simple());
     let root = format!("B:/fixture/{workspace}");
-    database.connection().execute(
-        "INSERT INTO execution_node(node_id,display_name,role,os,arch,token_digest,paired_at)
+    database
+        .connection()
+        .execute(
+            "INSERT INTO execution_node(node_id,display_name,role,os,arch,token_digest,paired_at)
          VALUES(?1,?1,'remote','windows','x86_64',lower(hex(randomblob(32))),datetime('now'))",
-        [&node],
-    ).unwrap();
+            [&node],
+        )
+        .unwrap();
     database.connection().execute(
         "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,source_directory,
             repository_root,git_common_dir,worktree_path,working_directory,branch,base_sha,
@@ -473,5 +573,11 @@ pub(crate) fn test_remote_scope(
              selection_json=excluded.selection_json,updated_at=excluded.updated_at",
         params![member,node,selection.to_string()],
     ).unwrap();
-    current_scope(database.connection(), member).unwrap().unwrap()
+    let HookReviewScope::Remote(scope) = current_scope(database.connection(), member)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("remote fixture scope");
+    };
+    scope
 }

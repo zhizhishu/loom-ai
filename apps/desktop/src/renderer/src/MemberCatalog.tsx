@@ -247,7 +247,7 @@ export function MemberCatalogBody({
           {reviewSnapshot && reviewSnapshot.entries.length > 0 && <div className="member-catalog-review">
             {reviewSnapshot.entries.map((entry) => <section key={entry.id}>
               <h3>{entry.name}</h3>
-              <p className="member-catalog-hint">{t('成员 {0} · 节点 {1} · 工作区 {2} · 运行端 {3}', entry.scope.memberId, entry.scope.nodeId || t('本机'), entry.scope.workspaceRoot, entry.scope.adapterKind)}</p>
+              <p className="member-catalog-hint">{t('成员 {0} · 节点 {1} · 工作区 {2} · 运行端 {3}', entry.scope.memberId, ('executionHostId' in entry.scope ? entry.scope.executionHostId : entry.scope.nodeId) || t('本机'), entry.scope.workspaceRoot, entry.scope.adapterKind)}</p>
               <pre>{entry.body}</pre>
               <details>
                 <summary>{t('定义摘要')}</summary>

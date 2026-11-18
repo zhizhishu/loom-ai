@@ -18,8 +18,8 @@ import {
 const blankIdentity = (): AssistantIdentity => ({ name: '', role: '', purpose: '', style: [], instructions: '' })
 const purposeTemplates = ASSISTANT_PRESETS.map(preset => ({ value:preset.id, label:`${preset.name} · ${preset.role}`, role:preset.role, purpose:preset.purpose }))
 
-export function AssistantStudio({ open, environment, agents, initialAgentId, theme = 'day', onClose, onRefresh, onLibrary, catalogEpoch = 0, onCreatedConversation, onOpenConnections }: {
-  open: boolean; environment: BusinessEnvironment; agents: AgentProfile[]; initialAgentId?: string
+export function AssistantStudio({ open, environment, agents, initialAgentId, threadId, theme = 'day', onClose, onRefresh, onLibrary, catalogEpoch = 0, onCreatedConversation, onOpenConnections }: {
+  open: boolean; environment: BusinessEnvironment; agents: AgentProfile[]; initialAgentId?: string; threadId?: string
   theme?: 'day' | 'night'; onClose(): void; onRefresh(): Promise<void>; onLibrary?(): void; catalogEpoch?: number; onCreatedConversation?(threadId: string): Promise<void> | void; onOpenConnections?(): void
 }) {
   const [selected, setSelected] = useState<string | null>(null)
@@ -142,7 +142,7 @@ export function AssistantStudio({ open, environment, agents, initialAgentId, the
           {error && <FormMessage error>{error}</FormMessage>}{message && <FormMessage>{message}</FormMessage>}
           <footer className="ln-form-actions"><small>头像和既有运行配置不会被资料保存覆盖。</small><button type="button" className="ln-action is-primary" disabled={busy || !identityDirty || !identity.name.trim()} onClick={() => { void saveIdentity() }}>{busy ? '保存中…' : local ? '保存资料' : '创建助手'}</button></footer>
         </>}
-        {tab === 'capabilities' && local && <AssistantCapabilityEditor key={`${local.agentId}:${catalogEpoch}`} environment={environment} agent={local} theme={theme} onDirtyChange={setCapDirty} onBusyChange={setWizardBusy} onSaved={() => { void onRefresh() }}/>}
+        {tab === 'capabilities' && local && <AssistantCapabilityEditor key={`${local.agentId}:${catalogEpoch}`} environment={environment} agent={local} threadId={threadId} theme={theme} onDirtyChange={setCapDirty} onBusyChange={setWizardBusy} onSaved={() => { void onRefresh() }}/>}
         {tab === 'location' && local && <ExecutionPanel environment={environment} agentId={local.agentId} theme={theme} onDirtyChange={setLocationDirty} onSaved={() => { void onRefresh() }}/>}
         {tab === 'runtime' && local && <>
           <label className="ln-field"><span>运行端</span><ChoiceMenu label="助手运行端" theme={theme} value={runtime?.adapterKind ?? ''} onChange={switchRuntime} disabled={busy || loadingRuntime} choices={[

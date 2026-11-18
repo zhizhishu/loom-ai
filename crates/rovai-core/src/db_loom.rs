@@ -634,9 +634,11 @@ fn control_schema_matches_shape_tokens(connection: &Connection) -> rusqlite::Res
     let normalize = |sql: &str| sql.split_whitespace().collect::<String>();
     let policy_declared = table_sql(connection, CONTROL_POLICY_TABLE)?.is_some_and(|sql| {
         let sql = normalize(&sql);
-        sql.contains(&normalize("max_dispatches INTEGER NOT NULL CHECK(max_dispatches BETWEEN 1 AND 1000)"))
-            && sql.contains(&normalize("max_reworks_per_task INTEGER NOT NULL CHECK(max_reworks_per_task BETWEEN 0 AND 20)"))
-            && sql.contains(&normalize("CHECK(enabled IN (0,1))"))
+        sql.contains(&normalize(
+            "max_dispatches INTEGER NOT NULL CHECK(max_dispatches BETWEEN 1 AND 1000)",
+        )) && sql.contains(&normalize(
+            "max_reworks_per_task INTEGER NOT NULL CHECK(max_reworks_per_task BETWEEN 0 AND 20)",
+        )) && sql.contains(&normalize("CHECK(enabled IN (0,1))"))
             && sql.contains(&normalize("REFERENCESloom_plan(plan_id)"))
     });
     let stage_declared = table_sql(connection, STAGE_REVIEW_TABLE)?.is_some_and(|sql| {
@@ -912,7 +914,11 @@ pub(super) fn migrate_artifact_versions(database: &mut Database) -> Result<()> {
     )?;
     validate_migration_foreign_keys(
         &tx,
-        &[ARTIFACT_TABLE, "loom_artifact_snapshot", "loom_artifact_archive"],
+        &[
+            ARTIFACT_TABLE,
+            "loom_artifact_snapshot",
+            "loom_artifact_archive",
+        ],
     )?;
     anyhow::ensure!(
         crate::loom::remote_artifact::versioned_schema_matches(&tx, &artifact_sql())?,
@@ -933,6 +939,7 @@ pub(super) fn migrate_artifact_versions(database: &mut Database) -> Result<()> {
 /// Only synthetic fixtures reverse this index. Real artifacts are never removed or rewritten.
 #[cfg(test)]
 pub(super) fn downgrade_artifact_versions_for_test(connection: &Connection) {
+    super::local_hook_migration::downgrade_for_test(connection);
     let applied: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=235)",
@@ -1742,11 +1749,16 @@ mod tests {
                 }],
                 dependencies: vec![],
             },
-        ).unwrap();
-        let workspace: String = database.connection().query_row(
-            "SELECT c.project_path FROM mission m JOIN camp c ON c.id=m.camp_id WHERE m.id=?1",
-            [&mission_id], |row| row.get(0),
-        ).unwrap();
+        )
+        .unwrap();
+        let workspace: String = database
+            .connection()
+            .query_row(
+                "SELECT c.project_path FROM mission m JOIN camp c ON c.id=m.camp_id WHERE m.id=?1",
+                [&mission_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         let file = std::path::Path::new(&workspace).join("report.md");
         std::fs::write(&file, "before migration").unwrap();
         let input = || crate::loom::LoomArtifactRegisterInput {
@@ -1768,16 +1780,26 @@ mod tests {
         assert!(migrate_artifact_versions(&mut database).is_err());
         assert_eq!(projection_version(&database), 184);
         assert_eq!(migration_receipts(&database, 235), 0);
-        assert!(crate::loom::remote_artifact::schema_matches(
-            database.connection(), &artifact_sql(),
-        ).unwrap());
-        assert!(matches!(classify_database_contract(database.connection()).unwrap(),
+        assert!(
+            crate::loom::remote_artifact::schema_matches(database.connection(), &artifact_sql(),)
+                .unwrap()
+        );
+        assert!(
+            matches!(classify_database_contract(database.connection()).unwrap(),
             DatabaseContractClassification::SupportedMigrationSource(ref m)
-                if m.projection_schema_version == 184));
-        database.connection().execute_batch("DROP TRIGGER fail_artifact_version_receipt;").unwrap();
+                if m.projection_schema_version == 184)
+        );
+        database
+            .connection()
+            .execute_batch("DROP TRIGGER fail_artifact_version_receipt;")
+            .unwrap();
         migrate_artifact_versions(&mut database).unwrap();
-        assert!(connection_has_current_data_contract(database.connection()).unwrap());
+        assert!(matches!(classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 185));
         assert_eq!(migration_receipts(&database, 235), 1);
+        crate::db::local_hook_migration::migrate(&mut database).unwrap();
+        assert!(connection_has_current_data_contract(database.connection()).unwrap());
         for sql in [
             "SELECT COUNT(*) FROM (SELECT * FROM prior_artifact_versions EXCEPT SELECT * FROM loom_artifact)",
             "SELECT COUNT(*) FROM (SELECT * FROM loom_artifact EXCEPT SELECT * FROM prior_artifact_versions)",
@@ -1785,7 +1807,14 @@ mod tests {
             "SELECT COUNT(*) FROM (SELECT * FROM loom_artifact_snapshot EXCEPT SELECT * FROM prior_artifact_snapshots)",
             "SELECT COUNT(*) FROM pragma_foreign_key_check",
         ] {
-            assert_eq!(database.connection().query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap(), 0, "{sql}");
+            assert_eq!(
+                database
+                    .connection()
+                    .query_row(sql, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{sql}"
+            );
         }
         std::fs::write(&file, "after migration").unwrap();
         let revised = crate::loom::artifact_register(&mut database, "local_user", input()).unwrap();
@@ -1795,12 +1824,14 @@ mod tests {
             (&revised.artifact, "after migration"),
         ] {
             let preview = crate::loom::artifact_preview(
-                &database, &directory,
+                &database,
+                &directory,
                 crate::loom::LoomArtifactPreviewInput {
                     mission_id: mission_id.clone(),
                     artifact_id: artifact.artifact_id.clone(),
                 },
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(preview.text.as_deref(), Some(expected));
             assert_eq!(preview.sha256, artifact.sha256);
         }

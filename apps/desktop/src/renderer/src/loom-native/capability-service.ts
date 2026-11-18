@@ -5,6 +5,7 @@ import { readErrorMessage } from '../error-message'
 import {
   highRiskToConfirm,
   hookDefinitionMissing,
+  isLocalHookScope,
   itemKey,
   pendingHookReview,
   previewRuntime,
@@ -154,8 +155,8 @@ function snippetPayload(kind: 'rule' | 'hook', draft: RuleDraft | HookDraft): Re
 }
 
 /** 一次目录读取。Core 是勾选状态的唯一来源，这里不做乐观合并。 */
-export function readCapabilityCatalog(rpc: CapabilityRpc, agentId: string): Promise<CapabilityCatalog> {
-  return rpc.request<CapabilityCatalog>('members.capabilityCatalog.get', { agentId })
+export function readCapabilityCatalog(rpc: CapabilityRpc, agentId: string, localCampId?: string): Promise<CapabilityCatalog> {
+  return rpc.request<CapabilityCatalog>('members.capabilityCatalog.get', { agentId, ...(localCampId ? { localCampId } : {}) })
     .catch((error: unknown) => { throw asCapabilityError(error) })
 }
 
@@ -214,7 +215,8 @@ export async function saveCapabilitySelections(
   rpc: CapabilityRpc,
   catalog: CapabilityCatalog,
   draft: readonly CapabilityItem[],
-  reviewed?: HookReviewSnapshot | null
+  reviewed?: HookReviewSnapshot | null,
+  localCampId?: string
 ): Promise<CapabilityCatalog> {
   const baseline = new Map(catalog.items.map((item) => [itemKey(item), item]))
   for (const item of draft) {
@@ -233,6 +235,12 @@ export async function saveCapabilitySelections(
   }
   // 后面的审阅与风险判断全部用 Core 这次读取的定义，不用草稿里塞进来的定义。
   const owned = coreOwnedItems(catalog, draft)
+  for (const item of owned) {
+    const scope = item.hookDefinition?.reviewScope
+    if (item.selected && item.kind === 'hook' && scope && isLocalHookScope(scope) && scope.campId !== localCampId) {
+      throw localError('local.snapshot_mismatch', '工作位置已改变，请重新读取后确认。')
+    }
+  }
   const selections = selectionsOf(draft)
   if (reviewed) {
     if (reviewed.agentId !== catalog.agentId
@@ -261,6 +269,7 @@ export async function saveCapabilitySelections(
   }
   return rpc.request<CapabilityCatalog>('members.capabilityCatalog.set', {
     agentId: catalog.agentId,
+    ...(localCampId ? { localCampId } : {}),
     expectedRevision: catalog.revision,
     acknowledgeHighRisk,
     selections,
@@ -363,11 +372,11 @@ export type CapabilityPort = {
 }
 
 /** 把 useThreadClient() 的返回值直接绑成一个端口，界面只管调用。 */
-export function createCapabilityPort(rpc: CapabilityRpc): CapabilityPort {
+export function createCapabilityPort(rpc: CapabilityRpc, localCampId?: string): CapabilityPort {
   return {
-    read: (agentId) => readCapabilityCatalog(rpc, agentId),
+    read: (agentId) => readCapabilityCatalog(rpc, agentId, localCampId),
     preview: (agentId, runtime) => readRunProjection(rpc, agentId, runtime),
-    save: (catalog, draft, reviewed) => saveCapabilitySelections(rpc, catalog, draft, reviewed),
+    save: (catalog, draft, reviewed) => saveCapabilitySelections(rpc, catalog, draft, reviewed, localCampId),
     inspectSkill: (sourcePath) => inspectSkill(rpc, sourcePath),
     commitSkill: (inspection, pick) => commitSkill(rpc, inspection, pick),
     registerSkill: (skillId) => registerSkill(rpc, skillId),

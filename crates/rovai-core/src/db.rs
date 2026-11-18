@@ -14,18 +14,20 @@ mod execution_storage;
 mod hermes;
 #[path = "db_live_directory.rs"]
 mod live_directory;
+#[path = "db_local_hook.rs"]
+mod local_hook_migration;
 #[path = "db_loom.rs"]
 mod loom;
 #[path = "db_member_capability.rs"]
 mod member_capability_migration;
 #[path = "db_member_capability_source.rs"]
 mod member_capability_source_migration;
-#[path = "db_member_hook_review.rs"]
-mod member_hook_review_migration;
 #[path = "db_member_creation.rs"]
 mod member_creation;
 #[path = "db_member_environment.rs"]
 mod member_environment;
+#[path = "db_member_hook_review.rs"]
+mod member_hook_review_migration;
 #[path = "db_member_routing.rs"]
 mod member_routing;
 #[path = "db_message_mentions.rs"]
@@ -515,7 +517,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 185;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 186;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -1025,6 +1027,7 @@ struct CurrentMigrationState {
     v233: bool,
     v234: bool,
     v235: bool,
+    v236: bool,
 }
 
 impl CurrentMigrationState {
@@ -1046,6 +1049,14 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v236 {
+            let mut previous = *self;
+            previous.v236 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 186
+                && self.v235
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 185, classifier);
+        }
         if self.v235 {
             let mut previous = *self;
             previous.v235 = false;
@@ -3943,6 +3954,7 @@ pub(crate) fn classify_database_contract(
                 | 183
                 | 184
                 | 185
+                | 186
         )
     {
         let expected_migration = marker.projection_schema_version + 50;
@@ -3973,6 +3985,8 @@ pub(crate) fn classify_database_contract(
                 || crate::member_capability::hook_review_schema_matches(connection)?)
             && (marker.projection_schema_version < 184
                 || crate::member_capability::skill_source_schema_matches(connection)?)
+            && (marker.projection_schema_version < 186
+                || crate::local_hook::schema_matches(connection)?)
             && (marker.projection_schema_version < 167
                 || hermes::rules_schema_matches(connection)?)
             && (marker.projection_schema_version < 166 || hermes::schema_matches(connection)?)
@@ -6306,7 +6320,8 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=232),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=233),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=234),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=235)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=235),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=236)
         "#,
         [],
         |row| {
@@ -6477,6 +6492,7 @@ fn load_current_migration_state(
                 v233: row.get(163)?,
                 v234: row.get(164)?,
                 v235: row.get(165)?,
+                v236: row.get(166)?,
             })
         },
     )
@@ -9850,6 +9866,9 @@ impl Database {
             if !self.schema_migration_applied(235)? {
                 migration_step!("migration_235", loom::migrate_artifact_versions(self));
             }
+            if !self.schema_migration_applied(236)? {
+                migration_step!("migration_236", local_hook_migration::migrate(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10788,6 +10807,9 @@ impl Database {
         }
         if !self.schema_migration_applied(235)? {
             migration_step!("migration_235", loom::migrate_artifact_versions(self));
+        }
+        if !self.schema_migration_applied(236)? {
+            migration_step!("migration_236", local_hook_migration::migrate(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42619,6 +42641,7 @@ mod tests {
             v233: version >= 233,
             v234: version >= 234,
             v235: version >= 235,
+            v236: version >= 236,
         }
     }
 
@@ -42885,10 +42908,16 @@ mod tests {
                 234,
             ),
             (
+                "v1.72/schema 185 before local Hook snapshots",
+                "v1.72",
+                185,
+                235,
+            ),
+            (
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                235,
+                236,
             ),
             (
                 "v1.72/schema 152 before compact operations",
@@ -43464,7 +43493,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(235);
+        let current = migration_state_through(236);
         assert!(current.admits(
             CURRENT_DATA_CONTRACT_VERSION,
             CURRENT_PROJECTION_SCHEMA_VERSION,
@@ -44240,7 +44269,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(235));
+        assert_eq!(state, migration_state_through(236));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
@@ -44352,7 +44381,9 @@ mod tests {
                         .unwrap();
                 }
                 "member_skill_source" => {
-                    connection.execute_batch("DROP TABLE member_skill_source").unwrap();
+                    connection
+                        .execute_batch("DROP TABLE member_skill_source")
+                        .unwrap();
                 }
                 "member_skill_source_shape" => {
                     connection.execute_batch("ALTER TABLE member_skill_source RENAME COLUMN library_root TO unavailable_root").unwrap();
@@ -44464,11 +44495,14 @@ mod tests {
         // stepped back to 182; 233 then admits itself as an exact supported 183 source
         // for the 234 replay that follows, instead of a fabricated 183 marker.
         remote_execution_migration::test_replay_180_workspace_scope(&mut database);
-        database.connection().execute_batch(
-            "DROP TABLE member_hook_review;
+        database
+            .connection()
+            .execute_batch(
+                "DROP TABLE member_hook_review;
              DELETE FROM schema_migration WHERE version=233;
-             UPDATE rovai_data_contract SET projection_schema_version=182 WHERE singleton=1;"
-        ).unwrap();
+             UPDATE rovai_data_contract SET projection_schema_version=182 WHERE singleton=1;",
+            )
+            .unwrap();
         member_hook_review_migration::test_replay_182(&mut database);
         member_capability_source_migration::test_replay_183(&mut database);
 
@@ -44496,10 +44530,14 @@ mod tests {
              DROP TABLE runtime_usage_run_summary;",
             )
             .unwrap();
-        let retained_receipts = database.connection()
-            .prepare("SELECT version FROM schema_migration ORDER BY version").unwrap()
-            .query_map([], |row| row.get::<_, i64>(0)).unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let retained_receipts = database
+            .connection()
+            .prepare("SELECT version FROM schema_migration ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
         drop(database);
         // Exercise the production opening seam: missing historical receipts
         // and optional statistics must not invoke old migrations or reset data.
@@ -44513,10 +44551,14 @@ mod tests {
         let reopened = Database::open_admitted(*ticket).unwrap();
         assert!(connection_has_current_data_contract(reopened.connection()).unwrap());
         assert_eq!(
-            reopened.connection()
-                .prepare("SELECT version FROM schema_migration ORDER BY version").unwrap()
-                .query_map([], |row| row.get::<_, i64>(0)).unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>().unwrap(),
+            reopened
+                .connection()
+                .prepare("SELECT version FROM schema_migration ORDER BY version")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
             retained_receipts,
             "reopening must preserve exactly the retained migration receipts"
         );
@@ -45963,19 +46005,35 @@ mod tests {
         };
         assert_eq!(
             seed_identity(LUOKE_AGENT_ID),
-            ("Hanzi".to_string(), "实现工程师".to_string(), "[]".to_string())
+            (
+                "Hanzi".to_string(),
+                "实现工程师".to_string(),
+                "[]".to_string()
+            )
         );
         assert_eq!(
             seed_identity(MUWA_AGENT_ID),
-            ("Linxi".to_string(), "独立审查".to_string(), "[]".to_string())
+            (
+                "Linxi".to_string(),
+                "独立审查".to_string(),
+                "[]".to_string()
+            )
         );
         assert_eq!(
             seed_identity(MIANZHI_AGENT_ID),
-            ("Beichen".to_string(), "研究与排障".to_string(), "[]".to_string())
+            (
+                "Beichen".to_string(),
+                "研究与排障".to_string(),
+                "[]".to_string()
+            )
         );
         assert_eq!(
             seed_identity(QILU_AGENT_ID),
-            ("Yezi".to_string(), "产品与视觉设计".to_string(), "[]".to_string())
+            (
+                "Yezi".to_string(),
+                "产品与视觉设计".to_string(),
+                "[]".to_string()
+            )
         );
     }
 

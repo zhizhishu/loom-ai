@@ -2,7 +2,7 @@ export type CapabilityKind = 'skill' | 'mcp' | 'rule' | 'hook'
 export type CapabilityOrigin = 'inherited' | 'explicit' | null
 
 /** Core-owned review scope. It carries ids, never a caller-supplied label or digest. */
-export type HookReviewScope = {
+export type RemoteHookReviewScope = {
   memberId: string
   missionId: string
   campId: string
@@ -12,6 +12,26 @@ export type HookReviewScope = {
   workspaceGeneration: number
   workspaceTokenDigest: string
   adapterKind: string
+}
+
+export type LocalHookReviewScope = {
+  scopeKind: 'local'
+  memberId: string
+  campId: string
+  executionHostId: string
+  workspaceRoot: string
+  workspaceAuthority:
+    | { kind: 'camp'; campId: string }
+    | { kind: 'mission'; missionId: string; workspaceId: string; workspaceGeneration: number; workspaceTokenDigest: string }
+  adapterKind: 'deepseek-harness'
+  permissionsDigest: string
+  permissions: { adapterKind: 'deepseek-harness'; schemaVersion: number; values: Record<string, unknown> }
+}
+
+export type HookReviewScope = RemoteHookReviewScope | LocalHookReviewScope
+
+export function isLocalHookScope(scope: HookReviewScope): scope is LocalHookReviewScope {
+  return 'scopeKind' in scope && scope.scopeKind === 'local'
 }
 
 export type HookDefinition = {
@@ -33,7 +53,7 @@ export type CapabilityItem = {
   origin: CapabilityOrigin
   toolNames: readonly string[]
   risk: 'high' | null
-  /** Present for hooks whose member has a remote run scope. Core owns both digests. */
+  /** Present only when Core supplies an authoritative local or remote run scope. */
   hookDefinition?: HookDefinition | null
   /** Read-model stamp failure. It only blocks a new check, never removing an existing one. */
   sourceError?: string | null
@@ -215,6 +235,14 @@ export function hookDefinitionMissing(item: Pick<CapabilityItem, 'kind' | 'hookD
   if (!definition.definitionDigest.trim() || !definition.scopeDigest.trim()) return true
   const scope = definition.reviewScope
   if (!scope) return true
+  if (isLocalHookScope(scope)) {
+    if ([scope.memberId, scope.campId, scope.executionHostId, scope.workspaceRoot, scope.permissionsDigest].some(value => !value?.trim())) return true
+    if (scope.adapterKind !== 'deepseek-harness' || !scope.workspaceAuthority || scope.permissions?.adapterKind !== 'deepseek-harness') return true
+    const authority = scope.workspaceAuthority
+    if (authority.kind === 'camp') return authority.campId !== scope.campId
+    return authority.kind !== 'mission' || !authority.missionId?.trim() || !authority.workspaceId?.trim()
+      || !Number.isSafeInteger(authority.workspaceGeneration) || authority.workspaceGeneration < 0 || !authority.workspaceTokenDigest?.trim()
+  }
   if (!Number.isFinite(scope.workspaceGeneration)) return true
   return HOOK_SCOPE_KEYS.some((key) => !String(scope[key] ?? '').trim())
 }

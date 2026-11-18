@@ -9,20 +9,20 @@
 
 mod hook_review;
 mod skill_source;
+#[cfg(test)]
+pub(crate) use hook_review::test_remote_scope;
+pub(crate) use hook_review::{
+    FrozenHookReview, HookDefinitionView, HookReviewApproval, SCHEMA_SQL as HOOK_REVIEW_SCHEMA_SQL,
+    frozen_review_digest, schema_matches as hook_review_schema_matches,
+    validate_frozen as validate_frozen_hook_reviews,
+    validate_frozen_local_scope as validate_frozen_local_hook_scope,
+    validate_frozen_scope as validate_frozen_hook_scope,
+};
 pub(crate) use skill_source::{
     ID_PREFIX as SKILL_SOURCE_ID_PREFIX, SCHEMA_SQL as SKILL_SOURCE_SCHEMA_SQL, SelectedSource,
     schema_matches as skill_source_schema_matches, selected_library_sources,
     verify_selected_source as verify_selected_skill_source,
 };
-pub(crate) use hook_review::{
-    FrozenHookReview, HookDefinitionView, HookReviewApproval,
-    SCHEMA_SQL as HOOK_REVIEW_SCHEMA_SQL,
-    schema_matches as hook_review_schema_matches,
-    validate_frozen as validate_frozen_hook_reviews,
-    frozen_review_digest, validate_frozen_scope as validate_frozen_hook_scope,
-};
-#[cfg(test)]
-pub(crate) use hook_review::test_remote_scope;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -195,7 +195,7 @@ pub(crate) struct MemberCapabilityCatalog {
     pub items: Vec<MemberCapabilityItem>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProjectedCapability {
     pub id: String,
@@ -208,6 +208,8 @@ pub(crate) struct ProjectedCapability {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct MemberCapabilityGetParams {
     pub agent_id: String,
+    #[serde(default)]
+    pub local_camp_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +224,8 @@ pub(crate) struct MemberCapabilitySelection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct MemberCapabilitySetParams {
     pub agent_id: String,
+    #[serde(default)]
+    pub local_camp_id: Option<String>,
     pub expected_revision: String,
     #[serde(default)]
     pub acknowledge_high_risk: bool,
@@ -286,7 +290,12 @@ struct CatalogPiece {
 fn library_stamps(database: &Database) -> Result<BTreeMap<String, skill_source::Stamp>> {
     Ok(skill_source::list(database)?
         .into_iter()
-        .map(|registered| (skill_source::item_id(&registered.skill_id), registered.stamp))
+        .map(|registered| {
+            (
+                skill_source::item_id(&registered.skill_id),
+                registered.stamp,
+            )
+        })
         .collect())
 }
 
@@ -295,8 +304,17 @@ pub(crate) fn get_member_capability_catalog(
     store: &McpConfigStore,
     agent_id: &str,
 ) -> Result<MemberCapabilityCatalog> {
+    get_member_capability_catalog_scoped(database, store, agent_id, None)
+}
+
+pub(crate) fn get_member_capability_catalog_scoped(
+    database: &Database,
+    store: &McpConfigStore,
+    agent_id: &str,
+    local_camp_id: Option<&str>,
+) -> Result<MemberCapabilityCatalog> {
     let profile = require_member(database, agent_id)?;
-    let pieces = catalog_pieces(database, store, &profile)?;
+    let pieces = catalog_pieces_scoped(database, store, &profile, local_camp_id)?;
     let stamps = library_stamps(database)?;
     Ok(catalog_from_pieces(&profile, pieces, &stamps)?)
 }
@@ -308,8 +326,10 @@ pub(crate) fn set_member_capability_catalog(
     params: &MemberCapabilitySetParams,
 ) -> Result<MemberCapabilityCatalog> {
     let profile = require_member(database, &params.agent_id)?;
-    let current_pieces = catalog_pieces(database, store, &profile)?;
-    let current = catalog_from_pieces(&profile, current_pieces.clone(), &library_stamps(database)?)?;
+    let current_pieces =
+        catalog_pieces_scoped(database, store, &profile, params.local_camp_id.as_deref())?;
+    let current =
+        catalog_from_pieces(&profile, current_pieces.clone(), &library_stamps(database)?)?;
     if current.revision != params.expected_revision {
         return Err(MemberCapabilityError::with_details(
             "capability.revision_conflict",
@@ -348,6 +368,47 @@ pub(crate) fn set_member_capability_catalog(
         }
     }
 
+    if params.local_camp_id.is_some()
+        && next
+            .iter()
+            .any(|p| p.kind == "hook" && p.selected && p.hook_scope.is_none())
+    {
+        return Err(MemberCapabilityError::new(
+            "capability.local_hook_unsupported",
+            "这位队员当前的运行环境还不能执行本地 Hook。",
+        ));
+    }
+    let local_hooks: Vec<_> = next
+        .iter()
+        .filter(|piece| {
+            piece.kind == "hook"
+                && piece.selected
+                && piece
+                    .hook_scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.is_local())
+        })
+        .map(|piece| ProjectedCapability {
+            id: piece.id.clone(),
+            name: piece.name.clone(),
+            body: piece.body.clone(),
+            origin: "explicit".into(),
+        })
+        .collect();
+    if local_hooks.len() > 1 {
+        return Err(MemberCapabilityError::new(
+            "capability.local_hook_one_required",
+            "本地 Hook 目前一次只能启用一个，请先关闭其他 Hook。",
+        ));
+    }
+    if !local_hooks.is_empty() {
+        crate::local_hook::settings(&local_hooks).map_err(|_| {
+            MemberCapabilityError::new(
+                "capability.local_hook_definition_unsupported",
+                "本地 Hook 需要使用 PostToolUse、填写一个具体工具名，并把超时设在 5 秒以内。",
+            )
+        })?;
+    }
     // Exact reviews are checked before the existing external Skill/MCP writes.
     let approved_hooks = hook_review::validate_request(&next, &params.reviewed_hooks)?;
     // The write loop below skips unchanged selections, so admission must cover every selected item here.
@@ -467,7 +528,11 @@ pub(crate) fn set_member_capability_catalog(
 
     let transaction = database.connection().unchecked_transaction()?;
     hook_review::revalidate_before_write(
-        &transaction, &profile.agent_id, &next, &params.reviewed_hooks,
+        &transaction,
+        &profile.agent_id,
+        &next,
+        &params.reviewed_hooks,
+        params.local_camp_id.as_deref(),
     )?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     for piece in &next {
@@ -480,16 +545,29 @@ pub(crate) fn set_member_capability_catalog(
             &piece.kind,
             &piece.id,
             piece.selected,
-            default_selected(&piece.kind, &piece.scope, &piece.id),
+            if piece.kind == "hook" && piece.hook_scope.as_ref().is_some_and(|s| s.is_local()) {
+                false
+            } else {
+                default_selected(&piece.kind, &piece.scope, &piece.id)
+            },
             &now,
         )?;
     }
     hook_review::persist(
-        &transaction, &profile.agent_id, &next, &approved_hooks,
-        &params.expected_revision, &now,
+        &transaction,
+        &profile.agent_id,
+        &next,
+        &approved_hooks,
+        &params.expected_revision,
+        &now,
     )?;
     transaction.commit()?;
-    get_member_capability_catalog(database, store, &profile.agent_id)
+    get_member_capability_catalog_scoped(
+        database,
+        store,
+        &profile.agent_id,
+        params.local_camp_id.as_deref(),
+    )
 }
 
 pub(crate) fn put_capability_item(
@@ -619,9 +697,14 @@ pub(crate) fn selected_rules(
 }
 
 pub(crate) fn frozen_hook_reviews(
-    database: &Database, store: &McpConfigStore, agent_id: &str,
+    database: &Database,
+    store: &McpConfigStore,
+    agent_id: &str,
 ) -> Result<Vec<FrozenHookReview>> {
-    anyhow::ensure!(!database.connection().is_autocommit(), "hook_review_transaction_required");
+    anyhow::ensure!(
+        !database.connection().is_autocommit(),
+        "hook_review_transaction_required"
+    );
     let profile = require_member(database, agent_id)?;
     hook_review::freeze(&catalog_pieces(database, store, &profile)?)
 }
@@ -631,12 +714,26 @@ fn catalog_pieces(
     store: &McpConfigStore,
     profile: &AgentProfileView,
 ) -> Result<Vec<CatalogPiece>> {
+    catalog_pieces_scoped(database, store, profile, None)
+}
+fn catalog_pieces_scoped(
+    database: &Database,
+    store: &McpConfigStore,
+    profile: &AgentProfileView,
+    local_camp_id: Option<&str>,
+) -> Result<Vec<CatalogPiece>> {
     let connection = database.connection();
     let choices = load_choices(connection, &profile.agent_id)?;
     let has_hooks: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM member_capability_item WHERE kind='hook')", [], |r| r.get(0),
+        "SELECT EXISTS(SELECT 1 FROM member_capability_item WHERE kind='hook')",
+        [],
+        |r| r.get(0),
     )?;
-    let hook_scope = if has_hooks { hook_review::current_scope(connection, &profile.agent_id)? } else { None };
+    let hook_scope = if has_hooks {
+        hook_review::current_scope_for_camp(connection, &profile.agent_id, local_camp_id)?
+    } else {
+        None
+    };
     let reviews = hook_review::load(connection, &profile.agent_id, hook_scope.as_ref())?;
     let claims = load_claims(connection)?;
     let known = AgentProfileService::default().all_profile_ids(database)?;
@@ -735,7 +832,19 @@ fn catalog_pieces(
         let selected = stored
             .as_ref()
             .map(|choice| choice.selected)
-            .unwrap_or_else(|| default_selected(&kind, &scope, &id));
+            .unwrap_or_else(|| {
+                if kind == "hook"
+                    && local_camp_id.is_some()
+                    && !matches!(
+                        hook_scope.as_ref(),
+                        Some(hook_review::HookReviewScope::Remote(_))
+                    )
+                {
+                    false
+                } else {
+                    default_selected(&kind, &scope, &id)
+                }
+            });
         let risk = ((kind == "hook" && hook_scope.is_some()) || hook_runs_shell(&kind, &body))
             .then_some("high".to_string());
         pieces.push(CatalogPiece {
@@ -743,8 +852,16 @@ fn catalog_pieces(
                 .get(&(kind.clone(), id.clone()))
                 .cloned()
                 .unwrap_or_default(),
-            hook_review: if kind == "hook" { reviews.get(&id).cloned() } else { None },
-            hook_scope: if kind == "hook" { hook_scope.clone() } else { None },
+            hook_review: if kind == "hook" {
+                reviews.get(&id).cloned()
+            } else {
+                None
+            },
+            hook_scope: if kind == "hook" {
+                hook_scope.clone()
+            } else {
+                None
+            },
             id,
             kind,
             name,
@@ -760,6 +877,66 @@ fn catalog_pieces(
     Ok(pieces)
 }
 
+/// Read only Hook definitions/choices/reviews inside the claim transaction.
+pub(crate) fn freeze_local_hooks(
+    connection: &Connection,
+    agent_id: &str,
+    scope: &crate::local_hook::LocalHookScope,
+) -> Result<(Vec<ProjectedCapability>, Vec<FrozenHookReview>)> {
+    let scoped = hook_review::HookReviewScope::Local(scope.clone());
+    let reviews = hook_review::load(connection, agent_id, Some(&scoped))?;
+    let claims = load_claims(connection)?;
+    let mut stmt = connection.prepare(
+        "SELECT i.item_id,i.name,i.note,i.source_label,i.scope,i.body
+         FROM member_capability_item i JOIN member_capability_choice c
+           ON c.kind='hook' AND c.item_key=i.item_id AND c.agent_id=?1 AND c.selected=1
+         WHERE i.kind='hook' ORDER BY i.item_id",
+    )?;
+    let rows = stmt.query_map([agent_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+        ))
+    })?;
+    let mut pieces = Vec::new();
+    for row in rows {
+        let (id, name, note, source, item_scope, body) = row?;
+        pieces.push(CatalogPiece {
+            tool_names: claims
+                .get(&("hook".to_owned(), id.clone()))
+                .cloned()
+                .unwrap_or_default(),
+            hook_review: reviews.get(&id).cloned(),
+            hook_scope: Some(scoped.clone()),
+            id,
+            kind: "hook".into(),
+            name,
+            note,
+            source,
+            scope: item_scope,
+            body,
+            risk: Some("high".into()),
+            selected: true,
+            stored_origin: Some("explicit".into()),
+        });
+    }
+    let frozen = hook_review::freeze(&pieces)?;
+    let hooks = pieces
+        .into_iter()
+        .map(|p| ProjectedCapability {
+            id: p.id,
+            name: p.name,
+            body: p.body,
+            origin: "explicit".into(),
+        })
+        .collect();
+    Ok((hooks, frozen))
+}
+
 fn catalog_from_pieces(
     profile: &AgentProfileView,
     mut pieces: Vec<CatalogPiece>,
@@ -773,23 +950,25 @@ fn catalog_from_pieces(
     });
     let items = pieces
         .iter()
-        .map(|piece| Ok(MemberCapabilityItem {
-            id: piece.id.clone(),
-            kind: piece.kind.clone(),
-            name: piece.name.clone(),
-            note: piece.note.clone(),
-            source: piece.source.clone(),
-            scope: piece.scope.clone(),
-            selected: piece.selected,
-            origin: display_origin(piece),
-            tool_names: piece.tool_names.clone(),
-            risk: piece.risk.clone(),
-            hook_definition: hook_review::view(piece)?,
-            source_error: stamps
-                .get(&piece.id)
-                .and_then(skill_source::stamp_source_error),
-            library: stamps.get(&piece.id).cloned(),
-        }))
+        .map(|piece| {
+            Ok(MemberCapabilityItem {
+                id: piece.id.clone(),
+                kind: piece.kind.clone(),
+                name: piece.name.clone(),
+                note: piece.note.clone(),
+                source: piece.source.clone(),
+                scope: piece.scope.clone(),
+                selected: piece.selected,
+                origin: display_origin(piece),
+                tool_names: piece.tool_names.clone(),
+                risk: piece.risk.clone(),
+                hook_definition: hook_review::view(piece)?,
+                source_error: stamps
+                    .get(&piece.id)
+                    .and_then(skill_source::stamp_source_error),
+                library: stamps.get(&piece.id).cloned(),
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     let revision = canonical_json_digest(&json!(
         items
@@ -1130,7 +1309,10 @@ fn newly_selected_high_risk<'a>(
     next: &'a [CatalogPiece],
 ) -> Option<&'a CatalogPiece> {
     next.iter().find(|piece| {
-        (piece.kind != "hook" || piece.hook_scope.is_none()) && piece.risk.as_deref() == Some("high") && piece.selected && !was_selected(current, piece)
+        (piece.kind != "hook" || piece.hook_scope.is_none())
+            && piece.risk.as_deref() == Some("high")
+            && piece.selected
+            && !was_selected(current, piece)
     })
 }
 
@@ -1242,7 +1424,6 @@ mod tests {
     };
     use std::fs;
 
-
     fn capability_code(error: anyhow::Error) -> &'static str {
         error
             .downcast_ref::<MemberCapabilityError>()
@@ -1251,9 +1432,20 @@ mod tests {
     }
 
     fn exact_review(catalog: &MemberCapabilityCatalog, id: &str) -> HookReviewApproval {
-        let item = catalog.items.iter().find(|item| item.kind == "hook" && item.id == id).unwrap();
-        let definition = item.hook_definition.as_ref().expect("full review definition");
-        HookReviewApproval { id: id.to_owned(), definition_digest: definition.definition_digest.clone(), scope_digest: definition.scope_digest.clone() }
+        let item = catalog
+            .items
+            .iter()
+            .find(|item| item.kind == "hook" && item.id == id)
+            .unwrap();
+        let definition = item
+            .hook_definition
+            .as_ref()
+            .expect("full review definition");
+        HookReviewApproval {
+            id: id.to_owned(),
+            definition_digest: definition.definition_digest.clone(),
+            scope_digest: definition.scope_digest.clone(),
+        }
     }
 
     fn applied_digest(result: McpMutationResult) -> (String, crate::mcp::McpConfigView) {
@@ -1309,7 +1501,10 @@ mod tests {
         // cloud rule stays off until the user selects it.
         let rules = selected_rules(database.connection(), &agent_id).unwrap();
         assert_eq!(
-            rules.iter().map(|rule| rule.id.as_str()).collect::<Vec<_>>(),
+            rules
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .collect::<Vec<_>>(),
             ["rule_project"]
         );
         assert_eq!(rules[0].origin, "inherited");
@@ -1473,6 +1668,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: catalog.revision.clone(),
@@ -1513,6 +1709,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: catalog.revision.clone(),
@@ -1533,6 +1730,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: saved.revision.clone(),
@@ -1617,6 +1815,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: selected_catalog.revision.clone(),
@@ -1635,7 +1834,11 @@ mod tests {
         .unwrap();
         let (_, deselected_rules, deselected_hooks) =
             projection_additions(&database, &store, &agent_id).unwrap();
-        assert!(deselected_rules.iter().all(|rule| !rule.body.contains(RULE_MARKER)));
+        assert!(
+            deselected_rules
+                .iter()
+                .all(|rule| !rule.body.contains(RULE_MARKER))
+        );
         assert!(
             deselected_hooks
                 .iter()
@@ -1660,6 +1863,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: deselected.revision.clone(),
@@ -1778,6 +1982,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: catalog_a.revision.clone(),
@@ -1829,6 +2034,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: selected_library.revision.clone(),
@@ -1837,10 +2043,17 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(capability_code(stale_library), "capability.revision_conflict");
+        assert_eq!(
+            capability_code(stale_library),
+            "capability.revision_conflict"
+        );
 
         // A disabled source refuses selection but still allows the member to drop it.
-        let version = library.get(&database, &imported.id).unwrap().unwrap().version;
+        let version = library
+            .get(&database, &imported.id)
+            .unwrap()
+            .unwrap()
+            .version;
         library
             .set_enabled(
                 &mut database,
@@ -1872,6 +2085,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: catalog_c.revision.clone(),
@@ -1889,6 +2103,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: catalog_c.revision.clone(),
@@ -1913,9 +2128,12 @@ mod tests {
         );
 
         // The catalog binds the admitted Library root; a moved root refuses the old expectation.
-        let registered_before_root = get_member_capability_catalog(&database, &store, &agent_id)
-            .unwrap();
-        let moved_root = directory.join("moved-library").to_string_lossy().to_string();
+        let registered_before_root =
+            get_member_capability_catalog(&database, &store, &agent_id).unwrap();
+        let moved_root = directory
+            .join("moved-library")
+            .to_string_lossy()
+            .to_string();
         database
             .connection()
             .execute(
@@ -1930,6 +2148,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: registered_before_root.revision.clone(),
@@ -1944,6 +2163,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: moved.revision.clone(),
@@ -1987,6 +2207,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: risky.revision.clone(),
@@ -2023,6 +2244,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: risky.revision,
@@ -2076,6 +2298,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id: agent_id.clone(),
                 expected_revision: with_hook.revision.clone(),
@@ -2104,6 +2327,7 @@ mod tests {
             &store,
             &library,
             &MemberCapabilitySetParams {
+                local_camp_id: None,
                 reviewed_hooks: Vec::new(),
                 agent_id,
                 expected_revision: current.revision,
@@ -2132,7 +2356,11 @@ mod tests {
         let mut database = Database::open(&directory).unwrap();
         let store = McpConfigStore::new(directory.join("mcp.json"));
         let library = SkillLibraryService::new(directory.join("skill-library")).unwrap();
-        let agent = AgentProfileService::default().list_profiles(&database).unwrap()[0].agent_id.clone();
+        let agent = AgentProfileService::default()
+            .list_profiles(&database)
+            .unwrap()[0]
+            .agent_id
+            .clone();
         let scope = test_remote_scope(&mut database, &agent, &directory);
         let mut definition = MemberCapabilityPutParams {
             item_id: Some("review_hook".into()), kind: "hook".into(), name: Some("Reviewed hook".into()),
@@ -2141,23 +2369,43 @@ mod tests {
             body: Some(r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"fixture-command","timeout":5}]}]}}"#.into()),
         };
         put_capability_item(&database, &store, &library, &definition).unwrap();
-        let request = |catalog: &MemberCapabilityCatalog, selected: bool, approvals: Vec<HookReviewApproval>| {
+        let request = |catalog: &MemberCapabilityCatalog,
+                       selected: bool,
+                       approvals: Vec<HookReviewApproval>| {
             MemberCapabilitySetParams {
-                agent_id: agent.clone(), expected_revision: catalog.revision.clone(),
-                acknowledge_high_risk: true, reviewed_hooks: approvals,
+                local_camp_id: None,
+                agent_id: agent.clone(),
+                expected_revision: catalog.revision.clone(),
+                acknowledge_high_risk: true,
+                reviewed_hooks: approvals,
                 selections: vec![MemberCapabilitySelection {
-                    kind: "hook".into(), id: "review_hook".into(), selected,
+                    kind: "hook".into(),
+                    id: "review_hook".into(),
+                    selected,
                 }],
             }
         };
         let catalog = get_member_capability_catalog(&database, &store, &agent).unwrap();
-        let initial = catalog.items.iter().find(|item| item.id == "review_hook").unwrap();
+        let initial = catalog
+            .items
+            .iter()
+            .find(|item| item.id == "review_hook")
+            .unwrap();
         assert!(initial.selected && initial.origin.as_deref() == Some("inherited"));
         assert!(!initial.hook_definition.as_ref().unwrap().reviewed);
         let before_changes = database.connection().total_changes();
-        assert_eq!(capability_code(set_member_capability_catalog(
-            &mut database, &store, &library, &request(&catalog, true, Vec::new())
-        ).unwrap_err()), "capability.hook_review_required");
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(
+                    &mut database,
+                    &store,
+                    &library,
+                    &request(&catalog, true, Vec::new())
+                )
+                .unwrap_err()
+            ),
+            "capability.hook_review_required"
+        );
         assert_eq!(database.connection().total_changes(), before_changes);
 
         // The generic acknowledgement and a simultaneous MCP edit cannot stand
@@ -2168,19 +2416,37 @@ mod tests {
         let mut missing = request(&catalog, true, Vec::new());
         missing.selections.push(MemberCapabilitySelection {
             kind: "mcp".into(),
-            id: catalog.items.iter().find(|item| item.kind == "mcp").unwrap().id.clone(),
+            id: catalog
+                .items
+                .iter()
+                .find(|item| item.kind == "mcp")
+                .unwrap()
+                .id
+                .clone(),
             selected: true,
         });
-        assert_eq!(capability_code(set_member_capability_catalog(
-            &mut database, &store, &library, &missing
-        ).unwrap_err()), "capability.hook_review_required");
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(&mut database, &store, &library, &missing)
+                    .unwrap_err()
+            ),
+            "capability.hook_review_required"
+        );
         assert_eq!(fs::read(store.path()).unwrap(), before_mcp);
         let approval = exact_review(&catalog, "review_hook");
         let reviewed = set_member_capability_catalog(
-            &mut database, &store, &library, &request(&catalog, true, vec![approval.clone()])
-        ).unwrap();
+            &mut database,
+            &store,
+            &library,
+            &request(&catalog, true, vec![approval.clone()]),
+        )
+        .unwrap();
         assert_ne!(reviewed.revision, catalog.revision);
-        let reviewed_item = reviewed.items.iter().find(|item| item.id == "review_hook").unwrap();
+        let reviewed_item = reviewed
+            .items
+            .iter()
+            .find(|item| item.id == "review_hook")
+            .unwrap();
         assert!(reviewed_item.hook_definition.as_ref().unwrap().reviewed);
         assert!(!format!("{:?}", reviewed_item.hook_definition).contains("fixture-command"));
         let stamp: (String, String) = database.connection().query_row(
@@ -2194,8 +2460,12 @@ mod tests {
             [&agent], |r|r.get::<_,i64>(0),
         ).unwrap(), 0);
         let idempotent = set_member_capability_catalog(
-            &mut database, &store, &library, &request(&reviewed, true, vec![approval.clone()])
-        ).unwrap();
+            &mut database,
+            &store,
+            &library,
+            &request(&reviewed, true, vec![approval.clone()]),
+        )
+        .unwrap();
         assert_eq!(idempotent.revision, reviewed.revision);
         assert_eq!(stamp, database.connection().query_row(
             "SELECT reviewed_revision,reviewed_at FROM member_hook_review WHERE agent_id=?1 AND item_id='review_hook'",
@@ -2204,106 +2474,460 @@ mod tests {
 
         // Same ID, changed body: both catalog revision and digest change, and
         // neither the stale catalog nor a later catalog with the old review can save.
-        definition.body = Some(definition.body.as_ref().unwrap().replace("fixture-command", "fixture-command-v2"));
+        definition.body = Some(
+            definition
+                .body
+                .as_ref()
+                .unwrap()
+                .replace("fixture-command", "fixture-command-v2"),
+        );
         put_capability_item(&database, &store, &library, &definition).unwrap();
         let changed = get_member_capability_catalog(&database, &store, &agent).unwrap();
         assert_ne!(changed.revision, reviewed.revision);
-        assert_eq!(capability_code(set_member_capability_catalog(
-            &mut database, &store, &library, &request(&reviewed, true, vec![approval.clone()])
-        ).unwrap_err()), "capability.revision_conflict");
-        assert_eq!(capability_code(set_member_capability_catalog(
-            &mut database, &store, &library, &request(&changed, true, vec![approval])
-        ).unwrap_err()), "capability.hook_review_conflict");
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(
+                    &mut database,
+                    &store,
+                    &library,
+                    &request(&reviewed, true, vec![approval.clone()])
+                )
+                .unwrap_err()
+            ),
+            "capability.revision_conflict"
+        );
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(
+                    &mut database,
+                    &store,
+                    &library,
+                    &request(&changed, true, vec![approval])
+                )
+                .unwrap_err()
+            ),
+            "capability.hook_review_conflict"
+        );
         let body_approval = exact_review(&changed, "review_hook");
         definition.note = Some("Changed execution explanation".into());
         put_capability_item(&database, &store, &library, &definition).unwrap();
         let note_changed = get_member_capability_catalog(&database, &store, &agent).unwrap();
         assert_ne!(note_changed.revision, changed.revision);
-        assert_ne!(exact_review(&note_changed,"review_hook").definition_digest, body_approval.definition_digest);
-        assert_eq!(capability_code(set_member_capability_catalog(
-            &mut database, &store, &library, &request(&note_changed, true, vec![body_approval])
-        ).unwrap_err()), "capability.hook_review_conflict");
+        assert_ne!(
+            exact_review(&note_changed, "review_hook").definition_digest,
+            body_approval.definition_digest
+        );
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(
+                    &mut database,
+                    &store,
+                    &library,
+                    &request(&note_changed, true, vec![body_approval])
+                )
+                .unwrap_err()
+            ),
+            "capability.hook_review_conflict"
+        );
         let fresh_approval = exact_review(&note_changed, "review_hook");
         let reviewed = set_member_capability_catalog(
-            &mut database, &store, &library, &request(&note_changed, true, vec![fresh_approval.clone()])
-        ).unwrap();
+            &mut database,
+            &store,
+            &library,
+            &request(&note_changed, true, vec![fresh_approval.clone()]),
+        )
+        .unwrap();
         let off = set_member_capability_catalog(
-            &mut database, &store, &library, &request(&reviewed, false, Vec::new())
-        ).unwrap();
-        assert_eq!(database.connection().query_row(
-            "SELECT COUNT(*) FROM member_hook_review WHERE agent_id=?1", [&agent], |r|r.get::<_,i64>(0),
-        ).unwrap(), 1);
+            &mut database,
+            &store,
+            &library,
+            &request(&reviewed, false, Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM member_hook_review WHERE agent_id=?1",
+                    [&agent],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
         let on_again = set_member_capability_catalog(
-            &mut database, &store, &library, &request(&off, true, Vec::new())
-        ).unwrap();
-        assert!(on_again.items.iter().find(|item|item.id=="review_hook").unwrap().hook_definition.as_ref().unwrap().reviewed);
+            &mut database,
+            &store,
+            &library,
+            &request(&off, true, Vec::new()),
+        )
+        .unwrap();
+        assert!(
+            on_again
+                .items
+                .iter()
+                .find(|item| item.id == "review_hook")
+                .unwrap()
+                .hook_definition
+                .as_ref()
+                .unwrap()
+                .reviewed
+        );
         set_member_capability_catalog(
-            &mut database, &store, &library, &request(&on_again, false, Vec::new())
-        ).unwrap();
+            &mut database,
+            &store,
+            &library,
+            &request(&on_again, false, Vec::new()),
+        )
+        .unwrap();
         // Stored consent is no longer usable after a definition change.
         definition.note = Some("Different execution explanation after deselection".into());
         put_capability_item(&database, &store, &library, &definition).unwrap();
         let off = get_member_capability_catalog(&database, &store, &agent).unwrap();
         let fresh_approval = exact_review(&off, "review_hook");
-        assert_eq!(capability_code(set_member_capability_catalog(
-            &mut database, &store, &library, &request(&off, true, Vec::new())
-        ).unwrap_err()), "capability.hook_review_required");
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(
+                    &mut database,
+                    &store,
+                    &library,
+                    &request(&off, true, Vec::new())
+                )
+                .unwrap_err()
+            ),
+            "capability.hook_review_required"
+        );
         // A failed new approval rolls the selection DELETE back in the same
         // transaction; retained but stale consent cannot authorize the changed body.
-        database.connection().execute_batch(
-            "CREATE TEMP TRIGGER fail_review BEFORE INSERT ON member_hook_review
-             BEGIN SELECT RAISE(ABORT,'fixture review failure'); END;"
-        ).unwrap();
-        assert!(set_member_capability_catalog(
-            &mut database, &store, &library, &request(&off, true, vec![fresh_approval.clone()])
-        ).is_err());
+        database
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_review BEFORE INSERT ON member_hook_review
+             BEGIN SELECT RAISE(ABORT,'fixture review failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            set_member_capability_catalog(
+                &mut database,
+                &store,
+                &library,
+                &request(&off, true, vec![fresh_approval.clone()])
+            )
+            .is_err()
+        );
         let after_failure = get_member_capability_catalog(&database, &store, &agent).unwrap();
         assert_eq!(after_failure.revision, off.revision);
-        assert!(!after_failure.items.iter().find(|item|item.id=="review_hook").unwrap().selected);
-        database.connection().execute_batch("DROP TRIGGER fail_review;").unwrap();
+        assert!(
+            !after_failure
+                .items
+                .iter()
+                .find(|item| item.id == "review_hook")
+                .unwrap()
+                .selected
+        );
+        database
+            .connection()
+            .execute_batch("DROP TRIGGER fail_review;")
+            .unwrap();
         for invalid in [
-            vec![fresh_approval.clone(),fresh_approval.clone()],
-            vec![HookReviewApproval{id:"unknown-hook".into(),definition_digest:fresh_approval.definition_digest.clone(),scope_digest:fresh_approval.scope_digest.clone()}],
+            vec![fresh_approval.clone(), fresh_approval.clone()],
+            vec![HookReviewApproval {
+                id: "unknown-hook".into(),
+                definition_digest: fresh_approval.definition_digest.clone(),
+                scope_digest: fresh_approval.scope_digest.clone(),
+            }],
         ] {
-            assert!(set_member_capability_catalog(
-                &mut database, &store, &library, &request(&off,true,invalid)
-            ).is_err());
+            assert!(
+                set_member_capability_catalog(
+                    &mut database,
+                    &store,
+                    &library,
+                    &request(&off, true, invalid)
+                )
+                .is_err()
+            );
         }
         let on = set_member_capability_catalog(
-            &mut database, &store, &library, &request(&off, true, vec![fresh_approval])
-        ).unwrap();
-        assert!(on.items.iter().find(|item|item.id=="review_hook").unwrap().hook_definition.as_ref().unwrap().reviewed);
+            &mut database,
+            &store,
+            &library,
+            &request(&off, true, vec![fresh_approval]),
+        )
+        .unwrap();
+        assert!(
+            on.items
+                .iter()
+                .find(|item| item.id == "review_hook")
+                .unwrap()
+                .hook_definition
+                .as_ref()
+                .unwrap()
+                .reviewed
+        );
 
         // Scope comes from real membership + ready workspace authority. A path
         // or project label alone cannot carry consent to a different workspace.
         let approval_a = exact_review(&on, "review_hook");
-        let selected_a: String = database.connection().query_row(
-            "SELECT selection_json FROM member_execution_target WHERE member_id=?1", [&agent], |r|r.get(0),
-        ).unwrap();
+        let selected_a: String = database
+            .connection()
+            .query_row(
+                "SELECT selection_json FROM member_execution_target WHERE member_id=?1",
+                [&agent],
+                |r| r.get(0),
+            )
+            .unwrap();
         let other = test_remote_scope(&mut database, &agent, &directory);
         assert_ne!(other.workspace_id, scope.workspace_id);
-        let changed_scope = get_member_capability_catalog(&database,&store,&agent).unwrap();
-        assert_ne!(changed_scope.revision,on.revision);
-        assert!(!changed_scope.items.iter().find(|i|i.id=="review_hook").unwrap().hook_definition.as_ref().unwrap().reviewed);
-        assert_eq!(capability_code(set_member_capability_catalog(
-            &mut database, &store, &library,&request(&changed_scope,true,vec![approval_a.clone()])
-        ).unwrap_err()), "capability.hook_review_conflict");
+        let changed_scope = get_member_capability_catalog(&database, &store, &agent).unwrap();
+        assert_ne!(changed_scope.revision, on.revision);
+        assert!(
+            !changed_scope
+                .items
+                .iter()
+                .find(|i| i.id == "review_hook")
+                .unwrap()
+                .hook_definition
+                .as_ref()
+                .unwrap()
+                .reviewed
+        );
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(
+                    &mut database,
+                    &store,
+                    &library,
+                    &request(&changed_scope, true, vec![approval_a.clone()])
+                )
+                .unwrap_err()
+            ),
+            "capability.hook_review_conflict"
+        );
         database.connection().execute(
             "UPDATE member_execution_target SET selection_json=?1,node_id=?2,revision=revision+1 WHERE member_id=?3",
             params![selected_a,scope.node_id,agent],
         ).unwrap();
-        let restored_scope = get_member_capability_catalog(&database,&store,&agent).unwrap();
-        assert!(restored_scope.items.iter().find(|i|i.id=="review_hook").unwrap().hook_definition.as_ref().unwrap().reviewed);
+        let restored_scope = get_member_capability_catalog(&database, &store, &agent).unwrap();
+        assert!(
+            restored_scope
+                .items
+                .iter()
+                .find(|i| i.id == "review_hook")
+                .unwrap()
+                .hook_definition
+                .as_ref()
+                .unwrap()
+                .reviewed
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE mission_workspace SET generation=generation+1 WHERE id=?1",
+                [&scope.workspace_id],
+            )
+            .unwrap();
+        let rebuilt = get_member_capability_catalog(&database, &store, &agent).unwrap();
+        assert_ne!(
+            exact_review(&rebuilt, "review_hook").scope_digest,
+            approval_a.scope_digest
+        );
+        assert!(
+            !rebuilt
+                .items
+                .iter()
+                .find(|i| i.id == "review_hook")
+                .unwrap()
+                .hook_definition
+                .as_ref()
+                .unwrap()
+                .reviewed
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE mission_workspace SET state='preparing' WHERE id=?1",
+                [&scope.workspace_id],
+            )
+            .unwrap();
+        assert!(get_member_capability_catalog(&database, &store, &agent).is_err());
+
+        // The local extension keeps the exact old Remote wire/digest and gets
+        // its own authority from a real local Camp, never a manufactured Node.
+        assert_eq!(
+            serde_json::to_value(hook_review::HookReviewScope::Remote(scope.clone())).unwrap(),
+            serde_json::to_value(&scope).unwrap()
+        );
+        database
+            .connection()
+            .execute(
+                "DELETE FROM member_execution_target WHERE member_id=?1",
+                [&agent],
+            )
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "DELETE FROM member_capability_choice WHERE agent_id=?1 AND kind='hook'",
+                [&agent],
+            )
+            .unwrap();
+        let permissions = json!({"adapterKind":"deepseek-harness","schemaVersion":1,
+            "values":{"sandbox_mode":"workspace-write","approval_policy":"ask"}});
         database.connection().execute(
-            "UPDATE mission_workspace SET generation=generation+1 WHERE id=?1", [&scope.workspace_id],
+            "INSERT INTO adapter_installation(id,adapter_kind,executable_path,command_name,
+             installation_class,source,auth_scope,enabled,version,created_at,updated_at)
+             VALUES('local-hook-fixture-dsh','deepseek-harness',?1,'dsh','managed_default','custom',
+             'test-user',1,1,'fixture','fixture')",
+            [std::env::current_exe().unwrap().to_string_lossy().to_string()],
         ).unwrap();
-        let rebuilt = get_member_capability_catalog(&database,&store,&agent).unwrap();
-        assert_ne!(exact_review(&rebuilt,"review_hook").scope_digest,approval_a.scope_digest);
-        assert!(!rebuilt.items.iter().find(|i|i.id=="review_hook").unwrap().hook_definition.as_ref().unwrap().reviewed);
         database.connection().execute(
-            "UPDATE mission_workspace SET state='preparing' WHERE id=?1", [&scope.workspace_id],
+            "UPDATE agent_profile SET selected_runtime_adapter_kind='deepseek-harness',
+             default_runtime_installation_id='local-hook-fixture-dsh',default_model_selection_json=?1,
+             default_permission_config_json=?2 WHERE id=?3",
+            params![json!({"mode":"explicit","modelId":"local-hook-fixture","options":{}}).to_string(),
+                permissions.to_string(),agent],
         ).unwrap();
-        assert!(get_member_capability_catalog(&database,&store,&agent).is_err());
+        let created = crate::collaboration::CollaborationService::default()
+            .create_camp(
+                &mut database,
+                &user_envelope(
+                    crate::collaboration::CreateThreadCommand::for_test_with_members(
+                        directory.to_string_lossy().into_owned(),
+                        &[agent.as_str()],
+                        &agent,
+                    ),
+                ),
+            )
+            .unwrap();
+        let camp = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        definition.body=Some(r#"{"hooks":{"PostToolUse":[{"matcher":"read","hooks":[{"type":"command","command":"printf hook-reviewed","timeout":1}]}]}}"#.into());
+        put_capability_item(&database, &store, &library, &definition).unwrap();
+        let absent =
+            get_member_capability_catalog_scoped(&database, &store, &agent, Some("not-this-camp"))
+                .unwrap();
+        let item = absent.items.iter().find(|i| i.id == "review_hook").unwrap();
+        assert!(!item.selected && item.hook_definition.is_none());
+        // A missing local context must not silently select an inherited Hook
+        // or make an unrelated unchanged capability save fail.
+        let mut unrelated = request(&absent, false, vec![]);
+        unrelated.local_camp_id = Some("not-this-camp".into());
+        unrelated.selections.clear();
+        set_member_capability_catalog(&mut database, &store, &library, &unrelated).unwrap();
+        let local =
+            get_member_capability_catalog_scoped(&database, &store, &agent, Some(&camp)).unwrap();
+        let item = local.items.iter().find(|i| i.id == "review_hook").unwrap();
+        assert!(!item.selected && !item.hook_definition.as_ref().unwrap().reviewed);
+        let authority =
+            crate::local_hook::current_scope(database.connection(), &agent, &camp).unwrap();
+        let wire = serde_json::to_value(&authority).unwrap();
+        assert_eq!(wire["scopeKind"], "local");
+        assert!(wire.get("nodeId").is_none());
+        assert_eq!(wire["permissions"], permissions);
+        let mut local_request = request(&local, true, vec![]);
+        local_request.local_camp_id = Some(camp.clone());
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(&mut database, &store, &library, &local_request,)
+                    .unwrap_err()
+            ),
+            "capability.hook_review_required"
+        );
+        local_request.reviewed_hooks = vec![exact_review(&local, "review_hook")];
+        let selected =
+            set_member_capability_catalog(&mut database, &store, &library, &local_request).unwrap();
+        let (hooks, reviews) =
+            freeze_local_hooks(database.connection(), &agent, &authority).unwrap();
+        let frozen = crate::local_hook::FrozenLocalHooks {
+            version: 1,
+            agent_run_id: "already-queued-local-run".into(),
+            scope: authority.clone(),
+            hooks,
+            reviews,
+        };
+        frozen.validate().unwrap();
+        crate::local_hook::assert_receipt_pairing_and_run_fence(&frozen);
+
+        // The first contract supports one selected Hook. Reject the entire
+        // second selection before any external MCP/Skill write or choice write.
+        let second = MemberCapabilityPutParams {
+            item_id: Some("second_local_hook".into()),
+            kind: "hook".into(),
+            name: Some("Second local hook".into()),
+            note: definition.note.clone(),
+            source_label: definition.source_label.clone(),
+            scope: definition.scope.clone(),
+            tool_names: vec![],
+            body: definition.body.clone(),
+        };
+        put_capability_item(&database, &store, &library, &second).unwrap();
+        let two =
+            get_member_capability_catalog_scoped(&database, &store, &agent, Some(&camp)).unwrap();
+        let mut second_request = request(&two, true, vec![exact_review(&two, "second_local_hook")]);
+        second_request.local_camp_id = Some(camp.clone());
+        second_request.selections.push(MemberCapabilitySelection {
+            kind: "hook".into(),
+            id: "second_local_hook".into(),
+            selected: true,
+        });
+        let before = database.connection().total_changes();
+        assert_eq!(
+            capability_code(
+                set_member_capability_catalog(&mut database, &store, &library, &second_request,)
+                    .unwrap_err()
+            ),
+            "capability.local_hook_one_required"
+        );
+        assert_eq!(before, database.connection().total_changes());
+
+        let mut off = request(&two, false, vec![]);
+        off.local_camp_id = Some(camp.clone());
+        set_member_capability_catalog(&mut database, &store, &library, &off).unwrap();
+        assert!(
+            freeze_local_hooks(database.connection(), &agent, &authority)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        // Deselection changes the next Run only; the reviewed earlier snapshot
+        // remains exact, independently of mutable catalog choices.
+        frozen.validate().unwrap();
+        assert_eq!(frozen.hooks.len(), 1);
+        let mut changed_permissions = permissions.clone();
+        changed_permissions["values"]["sandbox_mode"] = json!("read-only");
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET default_permission_config_json=?1 WHERE id=?2",
+                params![changed_permissions.to_string(), agent],
+            )
+            .unwrap();
+        let drift =
+            get_member_capability_catalog_scoped(&database, &store, &agent, Some(&camp)).unwrap();
+        assert_ne!(
+            exact_review(&selected, "review_hook").scope_digest,
+            exact_review(&drift, "review_hook").scope_digest
+        );
+        assert!(
+            !drift
+                .items
+                .iter()
+                .find(|i| i.id == "review_hook")
+                .unwrap()
+                .hook_definition
+                .as_ref()
+                .unwrap()
+                .reviewed
+        );
+        assert!(
+            crate::member_capability::validate_frozen_local_hook_scope(
+                &frozen.reviews,
+                &crate::local_hook::current_scope(database.connection(), &agent, &camp).unwrap(),
+            )
+            .is_err()
+        );
 
         drop(database);
         fs::remove_dir_all(directory).unwrap();

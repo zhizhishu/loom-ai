@@ -87,6 +87,7 @@ pub mod mcp_import;
 pub mod mcp_projection;
 pub mod member_avatar;
 mod member_capability;
+mod local_hook;
 pub mod member_execution_availability;
 pub mod member_environment;
 pub mod member_studio;

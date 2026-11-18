@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { BusinessEnvironment } from '../business-environment'
-import { itemKey, type CapabilityCatalog, type CapabilityKind } from '../member-catalog-model'
+import { itemKey, selectRefusal, type CapabilityCatalog, type CapabilityKind } from '../member-catalog-model'
 import { createCapabilityPort } from './capability-service'
 import { inspectNativeImport, commitNativeImport, type NativeImportReview } from './native-import-service'
 import { hostFeatureError, type NativeCapability, type NativeCatalog } from './host-services'
@@ -24,7 +24,7 @@ export function AssistantCapabilityPicker({ environment, catalogAgentId, runtime
   selectedKeys: string[]; onSelection(keys: string[]): void; theme?: 'day' | 'night'; disabled?: boolean; threadId?: string; draftAssistant?: boolean
   onBusyChange?(busy: boolean): void; onCatalogue?(catalog: CapabilityCatalog): void
 }) {
-  const port = useMemo(() => createCapabilityPort(environment.client),[environment.client])
+  const port = useMemo(() => createCapabilityPort(environment.client,threadId),[environment.client,threadId])
   const [catalog,setCatalog] = useState<CapabilityCatalog | null>(null)
   const [native,setNative] = useState<NativeCatalog | null>(null)
   const [kind,setKind] = useState<CapabilityKind>('skill')
@@ -101,8 +101,9 @@ export function AssistantCapabilityPicker({ environment, catalogAgentId, runtime
     {loading?<p className="ln-inspector-empty">正在读取能力库和本机客户端…</p>:<>
       {source!=='native'&&source!=='claude'&&<div className="ln-picker-group"><h4>可以直接选择 <span>{library.length}</span></h4>{library.map(item=>{
         const key=itemKey(item), isSelected=selected.has(key)
+        const missingScope=!draftAssistant&&selectRefusal({...item,selected:isSelected})==='hook-scope'
         const unsupported=!draftAssistant&&item.kind==='hook'&&runtime!==null&&!!item.hookDefinition&&item.hookDefinition.reviewScope.adapterKind!==runtime
-        return <label className={`ln-picker-row${isSelected?' is-selected':''}`} key={key}><input type="checkbox" checked={isSelected} disabled={disabled||busy||!isSelected&&((!!item.sourceError&&!(draftAssistant&&item.kind==='hook'))||unsupported)} onChange={()=>toggle(key)}/><span><strong>{item.name}{item.risk==='high'&&<i>需确认</i>}</strong><small>{draftAssistant&&item.kind==='hook'?'创建时会按新助手的实际运行端、正文和工作范围重新校验及确认；此处只作选择。':item.sourceError|| (unsupported?'此 Hook 的已知审阅范围属于另一运行端；需要为目标运行端适配':item.note||item.source||KINDS.find(row=>row.id===kind)?.hint)}</small></span><span className="ln-picker-state">{isSelected?'已选':'库内'}</span></label>
+        return <label className={`ln-picker-row${isSelected?' is-selected':''}`} key={key}><input type="checkbox" checked={isSelected} disabled={disabled||busy||!isSelected&&((!!item.sourceError&&!(draftAssistant&&item.kind==='hook'))||unsupported||missingScope)} onChange={()=>toggle(key)}/><span><strong>{item.name}{item.risk==='high'&&<i>需确认</i>}</strong><small>{draftAssistant&&item.kind==='hook'?'创建时会按新助手的实际运行端、正文和工作范围重新校验及确认；此处只作选择。':item.sourceError|| (missingScope?'请先打开这个助手的对话，确认工作目录后再启用。':unsupported?'此 Hook 属于另一运行方式，需要重新确认范围。':item.note||item.source||KINDS.find(row=>row.id===kind)?.hint)}</small></span><span className="ln-picker-state">{isSelected?'已选':'库内'}</span></label>
       })}{!library.length&&<p className="ln-picker-empty">{needle?'没有匹配的库内能力。':'还没有这一类可选能力，可从下方本机来源检查并导入。'}</p>}</div>}
       {source!=='library'&&<div className="ln-picker-group"><h4>{source==='runtime'&&runtime?`从 ${RUNTIME_NAMES[runtime]||runtime} 发现`:source==='claude'?'从 Claude 原生主来源发现':'从本机客户端发现'} <span>{found.length}</span></h4>{found.map(item=><article className="ln-picker-row is-native" key={item.sourceId}><Icon name={KINDS.find(row=>row.id===kind)!.icon} size={18}/><span><strong>{item.name}</strong><small>{RUNTIME_NAMES[item.runtime]||item.runtime}{item.aliasSource?' · 继承 Claude 来源':''} · {item.sourceScope==='project'?'当前项目':'用户配置'}</small><details><summary>来源与兼容</summary><p>{item.sourcePath}</p><p>{item.import?.reason||'保存到 LOOM 目录后，可独立选择给助手；原客户端配置不变。'}</p></details></span><button type="button" className="ln-action" disabled={busy||disabled||!item.importable} onClick={()=>{void inspect(item)}}>{item.importable?'检查并导入':'仅原生使用'}</button></article>)}{!found.length&&!scanError&&<p className="ln-picker-empty">{needle?'没有匹配的本机资源。':'这个来源尚未发现此类资源。查看扫描范围，或手动选择主机上的文件夹。'}</p>}</div>}
       {native && <p className="ln-native-help" aria-live="polite">扫描结果：Skills {native.items.filter(item=>item.kind==='skill').length} · MCP {native.items.filter(item=>item.kind==='mcp').length} · Rules {native.items.filter(item=>item.kind==='rule').length} · Hooks {native.items.filter(item=>item.kind==='hook').length}。各端可能引用同一原生来源，数字不代表互不重复。</p>}

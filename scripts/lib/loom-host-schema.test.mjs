@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { verifyRunningHostSchema } from './loom-host-schema.mjs'
 
-async function fixture (t, schema = 185, migration = 235, previousReceipts = []) {
+async function fixture (t, schema = 186, migration = 236, previousReceipts = migration >= 236 ? [235] : []) {
   const dir = await mkdtemp(join(tmpdir(), 'loom-host-schema-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const path = join(dir, 'rovai.sqlite')
@@ -28,35 +28,37 @@ test('the running Host actual schema is verified read-only, with no runtime or s
   const before = await readFile(f.path)
   const evidence = await verifyRunningHostSchema({ request: f.request, databasePath: f.path })
   assert.equal(evidence.verified, true)
-  assert.equal(evidence.projectionSchema, 185)
-  assert.equal(evidence.latestMigrationVersion, 235)
+  assert.equal(evidence.projectionSchema, 186)
+  assert.equal(evidence.latestMigrationVersion, 236)
+  assert.equal(evidence.localHookMigrationPresent, true)
   assert.equal(evidence.source, 'running-host-health-and-read-only-database')
   assert.deepEqual(f.methods, ['health.check'])
   assert.deepEqual(await readFile(f.path), before)
-  const hook = await fixture(t, 186, 236, [235])
+  const hook = await fixture(t, 185, 235)
   const hookBefore = await readFile(hook.path)
   const hookEvidence = await verifyRunningHostSchema({ request: hook.request, databasePath: hook.path,
-    expectedProjectionSchema: 186, expectedMigrationVersion: 236 })
+    expectedProjectionSchema: 185, expectedMigrationVersion: 235 })
   assert.equal(hookEvidence.verified, true)
-  assert.equal(hookEvidence.projectionSchema, 186)
-  assert.equal(hookEvidence.latestMigrationVersion, 236)
+  assert.equal(hookEvidence.projectionSchema, 185)
+  assert.equal(hookEvidence.latestMigrationVersion, 235)
+  assert.equal(hookEvidence.localHookMigrationPresent, false)
   assert.equal(hookEvidence.artifactVersionMigrationPresent, true)
   assert.deepEqual(await readFile(hook.path), hookBefore)
 })
 
 test('an old embedded Core fails even when standalone Core build metadata claims the new version', async t => {
-  const f = await fixture(t, 184, 234)
+  const f = await fixture(t, 185, 235)
   await assert.rejects(verifyRunningHostSchema({
-    request: f.request, databasePath: f.path, standaloneCoreProjectionSchema: 185
-  }), error => error.hostSchema.verified === false && error.hostSchema.projectionSchema === 184
-    && error.hostSchema.latestMigrationVersion === 234)
+    request: f.request, databasePath: f.path, standaloneCoreProjectionSchema: 186
+  }), error => error.hostSchema.verified === false && error.hostSchema.projectionSchema === 185
+    && error.hostSchema.latestMigrationVersion === 235)
 })
 
 test('a current schema marker without its immutable-version migration receipt is rejected', async t => {
   const f = await fixture(t, 185, 234)
   await assert.rejects(verifyRunningHostSchema({ request: f.request, databasePath: f.path }),
     error => error.hostSchema.projectionSchema === 185 && error.hostSchema.artifactVersionMigrationPresent === false)
-  const missingHistory = await fixture(t, 186, 236)
+  const missingHistory = await fixture(t, 186, 236, [])
   await assert.rejects(verifyRunningHostSchema({ request: missingHistory.request, databasePath: missingHistory.path,
     expectedProjectionSchema: 186, expectedMigrationVersion: 236 }),
     error => error.hostSchema.latestMigrationVersion === 236 && error.hostSchema.artifactVersionMigrationPresent === false)

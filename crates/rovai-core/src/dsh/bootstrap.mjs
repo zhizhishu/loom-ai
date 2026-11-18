@@ -133,5 +133,9 @@ export async function apply(ctx, config) {
   })
   ctx.systemPrompt.section({ name: 'rovai:bootstrap', order: 11000, text: '{{rovai_bootstrap}}' })
   await awaitNativeMcpReadiness(ctx)
+  if (config.localHook) {
+    const { installLocalHooks } = await import('./local-hooks.mjs')
+    await installLocalHooks(ctx, config)
+  }
   ctx.provide(readinessService, Object.freeze({ ready: true }))
 }

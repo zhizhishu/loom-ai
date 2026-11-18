@@ -1402,8 +1402,11 @@ impl LoomBundleBatchParams {
         let mut seen = std::collections::HashSet::new();
         for id in &self.mission_ids {
             anyhow::ensure!(
-                !id.is_empty() && id.len() <= 80
-                    && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')),
+                !id.is_empty()
+                    && id.len() <= 80
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')),
                 "Invalid LOOM batch mission id"
             );
             anyhow::ensure!(seen.insert(id), "Duplicate LOOM batch mission id");
@@ -1418,11 +1421,17 @@ fn loom_bundle_batch_admits_only_bounded_unique_identifiers() {
     let good: LoomBundleBatchParams =
         serde_json::from_value(json!({"missionIds":["m-1","m_2"]})).unwrap();
     assert!(good.validate().is_ok());
-    assert!(serde_json::from_value::<LoomBundleBatchParams>(
-        json!({"missionIds":["m-1"],"projectPath":"outside"})).is_err());
+    assert!(
+        serde_json::from_value::<LoomBundleBatchParams>(
+            json!({"missionIds":["m-1"],"projectPath":"outside"})
+        )
+        .is_err()
+    );
     for ids in [
-        json!([]), json!(["m","m"]), json!(["../escape"]),
-        json!(["x","x","x","x","x","x","x","x","x"])
+        json!([]),
+        json!(["m", "m"]),
+        json!(["../escape"]),
+        json!(["x", "x", "x", "x", "x", "x", "x", "x", "x"]),
     ] {
         let params: LoomBundleBatchParams =
             serde_json::from_value(json!({"missionIds":ids})).unwrap();
@@ -9799,8 +9808,7 @@ impl Core {
                 )?)?)
             }
             "loom.bundles.getMany" => {
-                let params: LoomBundleBatchParams =
-                    serde_json::from_value(request.params.clone())?;
+                let params: LoomBundleBatchParams = serde_json::from_value(request.params.clone())?;
                 params.validate()?;
                 let database = self.database.lock().await;
                 let mut rows = Vec::with_capacity(params.mission_ids.len());
@@ -10187,10 +10195,11 @@ impl Core {
                     serde_json::from_value(request.params.clone())?;
                 let database = self.database.lock().await;
                 Ok(serde_json::to_value(
-                    crate::member_capability::get_member_capability_catalog(
+                    crate::member_capability::get_member_capability_catalog_scoped(
                         &database,
                         self.mcp_config()?,
                         &params.agent_id,
+                        params.local_camp_id.as_deref(),
                     )?,
                 )?)
             }
@@ -10221,6 +10230,12 @@ impl Core {
                         &params,
                     )?,
                 )?)
+            }
+            "agentRuns.hooks.get" => {
+                let params: crate::local_hook::HookRunParams =
+                    serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                crate::local_hook::run_view(database.connection(), &params.agent_run_id)
             }
             "members.camps.list" => {
                 let params: AgentIdParams = serde_json::from_value(request.params.clone())?;
@@ -13260,6 +13275,10 @@ impl Core {
                     catalog_requested,
                 )
                 .await;
+                // The health layer already bounded and redacted this failure.
+                // A completed-but-unready probe must preserve it just like a
+                // failed construction; returning None here hid native errors.
+                let failure = probe.result.failure.clone();
                 (
                     registry.acp_capability_snapshot(AcpProbeObservation {
                         adapter_kind: kind,
@@ -13288,7 +13307,7 @@ impl Core {
                             probe.result.detail
                         },
                     })?,
-                    None,
+                    failure,
                 )
             }
             rovai_core::agent_profile::AdapterKind::ClaudeCodeCli => {
@@ -17572,7 +17591,9 @@ impl Core {
             Some(pi::PiMcpProjection { document, digest })
         };
         let runtime_compatibility_digest = pi::runtime_compatibility_digest_with_mcp(
-            &execution.runtime, &execution_root, attachment_authorization,
+            &execution.runtime,
+            &execution_root,
+            attachment_authorization,
             managed_mcp.as_ref().map(|mcp| &mcp.document),
         )?;
         self.persist_runtime_compatibility_digest(execution, &runtime_compatibility_digest)
@@ -19201,6 +19222,20 @@ impl Core {
         execution: &AgentRunExecution,
         digest: Option<String>,
     ) -> Result<(Option<String>, Option<String>)> {
+        if execution.runtime.adapter_kind == AdapterKind::DeepseekHarness {
+            let database = self.database.lock().await;
+            let launch = crate::local_hook::prepare_launch(
+                database.connection(),
+                &execution.agent_run_id,
+                execution.execution_epoch,
+                &execution.workspace,
+                &execution.runtime,
+            )?;
+            return Ok((
+                crate::local_hook::compatibility(digest, launch.as_ref())?,
+                None,
+            ));
+        }
         if !matches!(
             execution.runtime.adapter_kind,
             AdapterKind::ClineCli | AdapterKind::MinimaxCodeCli
@@ -19251,6 +19286,18 @@ impl Core {
                 execution_root.display()
             );
         }
+        let local_hooks = if execution.runtime.adapter_kind == AdapterKind::DeepseekHarness {
+            let database = self.database.lock().await;
+            crate::local_hook::prepare_launch(
+                database.connection(),
+                &execution.agent_run_id,
+                execution.execution_epoch,
+                &execution.workspace,
+                &execution.runtime,
+            )?
+        } else {
+            None
+        };
         let adapter = self
             .acp_adapter(execution.runtime.adapter_kind)
             .context("AgentRun selected an unsupported ACP Adapter")?;
@@ -19274,7 +19321,7 @@ impl Core {
                 .await?;
         }
         let runtime_result = adapter
-            .ensure_agent_run_runtime(
+            .ensure_agent_run_runtime_with_local_hooks(
                 &execution.agent_run_id,
                 execution.execution_epoch,
                 &execution.camp_id,
@@ -19289,6 +19336,7 @@ impl Core {
                 attachment_access_root,
                 &runtime_compatibility_digest,
                 startup_bootstrap.as_deref(),
+                local_hooks.clone(),
                 {
                     let core = self.clone();
                     let workspace = execution.workspace.clone();
@@ -19352,7 +19400,7 @@ impl Core {
                             .await?;
                     }
                     runtime = adapter
-                        .ensure_agent_run_runtime(
+                        .ensure_agent_run_runtime_with_local_hooks(
                             &execution.agent_run_id,
                             execution.execution_epoch,
                             &execution.camp_id,
@@ -19367,6 +19415,7 @@ impl Core {
                             attachment_access_root,
                             &runtime_compatibility_digest,
                             startup_bootstrap.as_deref(),
+                            local_hooks.clone(),
                             {
                                 let core = self.clone();
                                 let workspace = execution.workspace.clone();
@@ -19481,7 +19530,7 @@ impl Core {
                 }
                 launch_permit.check_cancelled()?;
                 runtime = adapter
-                    .ensure_agent_run_runtime(
+                    .ensure_agent_run_runtime_with_local_hooks(
                         &execution.agent_run_id,
                         execution.execution_epoch,
                         &execution.camp_id,
@@ -19496,6 +19545,7 @@ impl Core {
                         attachment_access_root,
                         &runtime_compatibility_digest,
                         startup_bootstrap.as_deref(),
+                        local_hooks.clone(),
                         {
                             let core = self.clone();
                             let workspace = execution.workspace.clone();
@@ -23732,6 +23782,21 @@ async fn process_agent_run_acp_message(
         return;
     }
 
+    if adapter_kind == AdapterKind::DeepseekHarness {
+        if let Some(observations) = params["update"]["_meta"].get("dshHooks") {
+            let database = core.database.lock().await;
+            if let Err(error) = crate::local_hook::record_observations(
+                database.connection(),
+                agent_run_id,
+                execution_epoch,
+                native_session_id,
+                observations,
+            ) {
+                eprintln!("local Hook receipt rejected for Run {agent_run_id}: {error:#}");
+                return;
+            }
+        }
+    }
     let mut usage =
         parse_acp_usage_message(adapter_kind, runtime.reported_version(), &method, &params);
     if usage.iter().any(|item| {
@@ -28003,9 +28068,11 @@ fn emit_missions_invalidated(
 fn mission_camp_id(database: &Database, mission_id: &str) -> Result<Option<String>> {
     Ok(database
         .connection()
-        .query_row("SELECT camp_id FROM mission WHERE id=?1", [mission_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT camp_id FROM mission WHERE id=?1",
+            [mission_id],
+            |row| row.get(0),
+        )
         .optional()?)
 }
 
