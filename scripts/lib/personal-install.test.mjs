@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:net'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, symlinkSync, copyFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, symlinkSync, copyFileSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -15,8 +15,11 @@ const required = ['rovai-server.exe', 'rovai-host.exe', 'rovai-core.exe', 'rovai
 const hash = value => createHash('sha256').update(value).digest('hex')
 
 function fixture(t, chosenRoot) {
-  const root = chosenRoot ? resolve(chosenRoot) : mkdtempSync(join(tmpdir(), 'loom-personal-install-'))
-  if (chosenRoot) mkdirSync(root)
+  const createdRoot = chosenRoot ? resolve(chosenRoot) : mkdtempSync(join(tmpdir(), 'loom-personal-install-'))
+  if (chosenRoot) mkdirSync(createdRoot)
+  // Windows CI can expose TEMP through an 8.3 alias (RUNNER~1). Match the
+  // installer's canonical parent before comparing the chosen data directory.
+  const root = realpathSync(createdRoot)
   t.after(() => rmSync(root, { recursive: true, force: true }))
   return { root, install: join(root, 'LOOM programs'), data: join(root, 'personal data') }
 }
