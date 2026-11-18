@@ -820,6 +820,7 @@ pub fn claim_waiting_delivery_batches_with_sources(
                 },
             };
             let local_hooks = if remote_selection.is_none()
+                && runtime.adapter_kind == crate::agent_profile::AdapterKind::DeepseekHarness
                 && selection.failure_code.is_none()
                 && crate::remote_execution::authority_table_available(
                     &transaction,
@@ -6464,6 +6465,53 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(delivery, ("claimed".to_string(), Some(run_id)));
+        }
+        // A saved Hook choice survives a Runtime switch, but the local DSH
+        // admission path must not take over another adapter's ordinary Run.
+        for adapter in [
+            crate::agent_profile::AdapterKind::CodexCli,
+            crate::agent_profile::AdapterKind::Pi,
+            crate::agent_profile::AdapterKind::ClaudeCodeCli,
+        ] {
+            let mut fixture = Fixture::new();
+            let defaults = crate::agent_profile::member_runtime_defaults(adapter);
+            fixture.database.connection().execute(
+                "UPDATE adapter_installation SET adapter_kind=?1
+                 WHERE id='adapter-test-codex'",
+                [adapter.as_str()],
+            ).unwrap();
+            fixture.database.connection().execute(
+                "UPDATE agent_profile SET selected_runtime_adapter_kind=?1,
+                 default_permission_config_json=?2 WHERE id='agent_1'",
+                params![adapter.as_str(), serde_json::to_string(&defaults.permissions).unwrap()],
+            ).unwrap();
+            fixture.database.connection().execute_batch(
+                r#"INSERT INTO member_capability_item(
+                    item_id,kind,name,note,source_label,scope,body,created_at)
+                 VALUES('retained-local-hook','hook','Retained local Hook','','test','project',
+                    '{"hooks":{"PostToolUse":[{"matcher":"read","hooks":[{"type":"command","command":"Write-Output reviewed","timeout":1}]}]}}',
+                    'fixture');
+                 INSERT INTO member_capability_choice(
+                    agent_id,kind,item_key,selected,origin,updated_at)
+                 VALUES('agent_1','hook','retained-local-hook',1,'explicit','fixture');"#,
+            ).unwrap();
+            fixture.enqueue("retained-hook", "ordinary adapter Run");
+            let run_id = claim_waiting_delivery_batches(&mut fixture.database, 1)
+                .unwrap().pop().unwrap();
+            let (status, frozen_adapter, failure): (String, String, Option<String>) =
+                fixture.database.connection().query_row(
+                    "SELECT status,runtime_adapter_kind,last_error_code FROM agent_run WHERE id=?1",
+                    [&run_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                ).unwrap();
+            assert_eq!((status.as_str(), frozen_adapter.as_str(), failure),
+                ("queued", adapter.as_str(), None), "retained Hook blocked {adapter:?}");
+            assert!(crate::local_hook::load(fixture.database.connection(), &run_id)
+                .unwrap().is_none());
+            assert!(fixture.database.connection().query_row(
+                "SELECT selected FROM member_capability_choice
+                 WHERE agent_id='agent_1' AND kind='hook' AND item_key='retained-local-hook'",
+                [], |row| row.get::<_, bool>(0),
+            ).unwrap(), "admission must not erase the user's saved choice");
         }
         let mut fixture = Fixture::new();
         fixture
