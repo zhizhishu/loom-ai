@@ -4701,5 +4701,19 @@
   "空闲": "Idle",
   "读取执行节点失败": "Unable to load execution nodes",
   "远程屏幕": "Remote screen",
-  "拖动调整 · 双击恢复 58/42 · 方向键调整 · Delete 关闭": "Drag to resize · Double-click to restore 58/42 · Arrow keys to adjust · Delete to close"
+  "拖动调整 · 双击恢复 58/42 · 方向键调整 · Delete 关闭": "Drag to resize · Double-click to restore 58/42 · Arrow keys to adjust · Delete to close",
+  "按服务提供的名称填写密钥、地址等设置。保存后从下次运行开始使用。": "Use the setting names from your provider for keys, addresses, and other connection details. Saved changes apply to the next run.",
+  "设置名称": "Setting name",
+  "设置名称 {0}": "Setting name {0}",
+  "设置值": "Value",
+  "设置值 {0}": "Value {0}",
+  "删除设置 {0}": "Remove setting {0}",
+  "尚未添加连接信息。": "No connection settings added yet.",
+  "添加设置": "Add setting",
+  "隐藏设置值 {0}": "Hide value {0}",
+  "显示设置值 {0}": "Show value {0}",
+  "返回输入框": "Back to fields",
+  "高级编辑（显示原文）": "Advanced editing (show raw values)",
+  "连接信息": "Connection settings",
+  "使用这个运行端的助手会共用这些连接设置。": "Assistants using this runtime share these connection settings."
 }

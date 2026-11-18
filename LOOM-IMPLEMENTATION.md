@@ -14,6 +14,17 @@
 
 ## 2026-11-17 续开发实测（未签收）
 
+### 最新结果：双任务返工已跑通，个人版收尾继续
+
+- **真实工作已从页面走完**：`resume-05/current-ui-versioned-03/report.json` 使用 `1a4fd53` 的同源 Host、生产 Web 与实际 schema 185 / receipt 235。页面创建工作、模型拆成两项任务、明确批准范围与独立审查，两项都经历首稿、要求修改、原路径返工，最后两份新稿都通过审查并可在页面打开。四份新旧归档均校验通过。另以只读 SQLite 核对 12 个 Run 全成功、4 Candidate、4 Artifact、2 REQUEST_CHANGES + 2 PASS、10 派发全部 SETTLED；Candidate 仍 PENDING，Owner Review 为 0。
+- **连接设置可直接填写**：`915ffa1` 把连接信息改成名称和值的输入框，值默认隐藏；需要时才展开原文编辑。重复名称、未填完的名称、放弃修改、离开提示与版本冲突均保留保护。实际 Electron 10 项通过，桌面/手机日夜四张截图已查看；助手服务 24 项、类型检查与生产 Web 构建通过。证据为 `resume-05/connection-fields-integration.json` 与 `runtime-settings-ui/run-iqGOSF/screenshots/report.json`。Pi 文件权限的界面文字简化，保存值及 Core 权限边界未改变。
+- **安装包里的电脑操作已实测**：此前 `1a4fd53` 的本机验证包 6956 个文件，经真正的 Start-Loom.cmd 启动、重启与数据库版本核对。专用自建 Windows 窗口上的手动授权、查看、点击、输入、归还、断开共 9 项通过；助手独立授权、包内 MCP stdio、真实截图/点击/输入、重复请求拒绝、撤销后旧连接拒绝和 Core 配置清理共 12 项通过。见 `resume-05/computer-personal-current-summary.json`。这两组工具链实际执行，但模型 Run 数为 0；模型自行选择截图仍另验。
+- **新的完整 Windows 包已构建、下载和安装**：`915ffa1` 的 E3 `44237548866` 已成功；下载后的 6955 个文件逐一核对，原 Install-Loom.cmd 已实际安装至 `%LOCALAPPDATA%\Programs\LOOM-Personal`，原 Start-Loom.cmd 首次启动的 HTTP 200 与实际数据库 schema 185 已确认。下载包在 `C:\Users\echo\Downloads\LOOM-Personal-Candidate-20261117`，证据 `resume-05/personal-final-package.json` 和 `personal-final-installation.json`。首次自动化会话退出后子进程被回收；已改为保持正常启动窗口和受管长会话，另一次独立检查确认服务仍在运行、HTTP 200、数据库 185。安装包可独立双击启动；本次自动打开的实例由该开发会话保活。该包不包含本节仍在修的 Pi/Hook。旧 E3 `44234714818`、`44235243723` 路径失败保留；真实 Win32 8.3 TEMP/TMP 路径回归 2 项通过、0 跳过。
+- **Pi 页面流程已定位到具体代码缺陷**：`pi-purge-ui-03` 已从真实界面保存 Append/Persona 和文件与任务权限，原生扩展激活与本次提示词应用均有匹配摘要的证据。真实模型写出文件后，任务、Claim、Artifact/Candidate 均未创建；原生工具未展示 Core 必填输入字段，且正常 return 的 `isError:true` 被 Pi 0.85.1 忽略。现修复既有八类操作的参数描述和错误传递，再做新的完整流程；该轮不通过，不能以文件已存在代替成果登记。
+- **仍在完成的明确项目**：助手模型截图与本地 DSH Hook。Hook 在独立工作树实现，真实对话/设备/工作目录/权限由 Core 确认，逐次运行冻结，界面不自动批准；前端范围与审批检查 45 项通过，不代替 Rust、沙箱及原生触发验收。本机改装 DSH 的 shell 包声称 full enforcement 却原样执行命令，正在验证独立固定版本执行链，未计为 Hook 通过。Codex 的真实 MCP 调用仍失败；隔离线缆探针证明 Core 已向原生 Codex 提供工具，出站请求包含 namespace 工具定义，尚不能据此宣称当前转接服务兼容。
+
+以下保留此前修复与失败记录；与上面重复的状态以上面最新证据为准。
+
 **2026-11-17 本轮个人版收尾（以下新证据优先）**：c399 的 Windows E3 `44158565571` 已通过；本节修复与该旧包分开记录，新源码候选须另行构建验证。
 
 - **真实返工卡点已修，整链复验继续**：`web-refresh-ui-04` 暴露同路径新内容被 Core 拒绝登记，Worker 改用新文件名又被审核要求原路径，A 任务耗尽返工次数。现按 Task/生产 Run/作者/SHA 保留同路径的不可变版本，旧 Candidate 继续指向旧归档；schema 185 / receipt 235 迁移不改历史记录。18 项针对性 Rust、68 项验收脚本与真实旧 SQLite 只读迁移核对通过，来源见 `resume-05/artifact-version-core-build.json`。整链要求两项任务最新稿都通过独立审查、原路径返工、旧归档仍可读，不能用一项任务成功代表整体通过。

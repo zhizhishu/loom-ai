@@ -276,7 +276,7 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
 
             <aside className="ln-artifact-context" aria-label="验收上下文">
               <h3 className="ln-artifact-context-title">验收</h3>
-              {facts.task?.description && <p className="ln-artifact-request">{facts.task.description}</p>}
+              {facts.task?.description && <details className="ln-artifact-criteria"><summary className="ln-artifact-criteria-head">任务要求</summary><p className="ln-artifact-fact-note">{facts.task.description}</p></details>}
 
               <div className="ln-artifact-fact" data-fact="task">
                 <span className="ln-artifact-fact-label">相关任务</span>
@@ -299,13 +299,13 @@ export function ArtifactView({ selection, onClose, onRefresh, fallbackFocus = nu
 
               {facts.candidate !== null && <>
                 <div className="ln-artifact-fact" data-fact="verification">
-                  <span className="ln-artifact-fact-label">技术核验</span>
+                  <span className="ln-artifact-fact-label">检查结果</span>
                   <span className="ln-artifact-badge" data-state={facts.candidate.verificationStatus}>
                     {verificationLabel(facts.candidate.verificationStatus)}
                   </span>
                 </div>
                 <div className="ln-artifact-fact" data-fact="acceptance">
-                  <span className="ln-artifact-fact-label">用户接受</span>
+                  <span className="ln-artifact-fact-label">你的验收</span>
                   <span className="ln-artifact-badge" data-state={facts.candidate.acceptanceStatus}>
                     {acceptanceLabel(facts.candidate.acceptanceStatus)}
                   </span>
