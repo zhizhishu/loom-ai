@@ -3,6 +3,57 @@
   "canonicalSource": "crates/rovai-core/src/loom_tool.rs::tool_definitions",
   "canonicalFixture": "scripts/fixtures/pi-workflow/core-input-contract.json",
   "fixtureOwnership": "Existing Rust owner compares this fixture with actual Core definitions; production uses Core definitions directly.",
+  "managedCliReceipt": {
+    "revision": 2,
+    "source": "crates/rovai-core/src/bin/rovai.rs::project_cli_envelope",
+    "marker": "ROVAI_BUILTIN_REQUEST_ID",
+    "markerFormat": "Hyphenated UUID; surrounding whitespace and case normalization retained. Braced, compact and URN forms are rejected, matching the existing malformed-value owner.",
+    "enabledOnlyFor": "The existing eight LOOM operations with a valid UUID request marker.",
+    "machineFieldsVisibleToModel": false,
+    "projectionOrder": [
+      "validate Core envelope",
+      "project and sanitize business result or error",
+      "validate projected schema",
+      "wrap the received correlation fields without replacing them"
+    ],
+    "syntheticExample": true,
+    "before": {
+      "missionId": "synthetic-mission",
+      "plan": null,
+      "tasks": [],
+      "dependencies": [],
+      "claims": [],
+      "evaluatedAt": "2026-11-18T00:00:00Z"
+    },
+    "after": {
+      "contractVersion": 2,
+      "ok": true,
+      "operation": "loom.status",
+      "requestId": "11111111-1111-4111-8111-111111111111",
+      "result": {
+        "missionId": "synthetic-mission",
+        "plan": null,
+        "tasks": [],
+        "dependencies": [],
+        "claims": [],
+        "evaluatedAt": "2026-11-18T00:00:00Z"
+      }
+    },
+    "afterRejected": {
+      "contractVersion": 2,
+      "ok": false,
+      "operation": "loom.plan",
+      "requestId": "11111111-1111-4111-8111-111111111111",
+      "error": {
+        "code": "loom.plan_exists",
+        "message": "A plan already exists",
+        "recovery": "stop"
+      }
+    },
+    "ordinaryCliOutputUnchanged": true,
+    "bridgeIdentityChecksUnchanged": true,
+    "oldCliRealProcessFailure": "builtin_tool.invalid_output after exit 0 with a valid projected business result"
+  },
   "before": {
     "toolName": "rovai_loom",
     "description": "Run one LOOM operation for the current Thread's Mission: status, plan, release, claim, evidence, submit, inspect, stage-review. `evidence` registers a file you produced (a path relative to the Mission workspace). `submit` sends your claimed task for User acceptance; it never accepts a delivery. The Run, Member and Mission come from Core authentication — you cannot and need not name them.",

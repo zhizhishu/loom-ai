@@ -178,6 +178,13 @@ async fn run() -> Result<u8> {
         }
         _ => bail!("invalid Rovai command; run `rovai --help`"),
     };
+    // Only the existing eight-operation managed bridge asks for a machine receipt. This marker
+    // carries request identity, not authority; authentication and input validation stay unchanged.
+    let managed_workflow_receipt = managed_workflow_request_id(
+        &operation,
+        env::var(ROVAI_BUILTIN_REQUEST_ID_ENV).ok().as_deref(),
+    )?
+    .is_some();
     let request_id = invocation_request_id(&operation, &input)?;
     let body = BuiltinToolIpcRequestBody::Invoke {
         request_id,
@@ -224,7 +231,7 @@ async fn run() -> Result<u8> {
         BuiltinToolIpcResponse::Envelope { envelope } => {
             let exit_code = envelope_exit_code(&envelope);
             let operation = envelope.operation.clone();
-            let projected = match project_envelope(envelope) {
+            let projected = match project_cli_envelope(envelope, managed_workflow_receipt) {
                 Ok(projected) => projected,
                 Err(error) => {
                     record_output_contract_mismatch(&operation, &error);
@@ -433,6 +440,34 @@ async fn send_compaction_hook(
         .await
         .map_err(|(_, error)| error)?;
     Ok(serde_json::from_str(&response)?)
+}
+
+/// Preserve the ordinary CLI projection. The managed bridge additionally needs the received
+/// correlation metadata, but may see only the same validated/projected business document.
+fn project_cli_envelope(
+    envelope: rovai_core::builtin_tool_transport::BuiltinToolInvocationEnvelope,
+    managed_workflow_receipt: bool,
+) -> Result<Value> {
+    let mut receipt = json!({
+        "contractVersion": envelope.contract_version,
+        "ok": envelope.ok,
+        "operation": envelope.operation,
+        "requestId": envelope.request_id,
+    });
+    let ok = envelope.ok;
+    let projected = project_envelope(envelope)?;
+    if !managed_workflow_receipt {
+        return Ok(projected);
+    }
+    if ok {
+        receipt["result"] = projected;
+    } else {
+        receipt["error"] = projected
+            .get("error")
+            .cloned()
+            .context("projected Built-in Tool error is missing")?;
+    }
+    Ok(receipt)
 }
 
 fn envelope_exit_code(
@@ -2194,7 +2229,12 @@ fn managed_workflow_request_id(operation: &str, raw: Option<&str>) -> Result<Opt
         return Ok(None);
     }
     let parsed = Uuid::parse_str(raw).context("managed workflow request id is not a UUID")?;
-    Ok(Some(parsed.to_string()))
+    let canonical = parsed.to_string();
+    anyhow::ensure!(
+        raw.eq_ignore_ascii_case(&canonical),
+        "managed workflow request id must use hyphenated UUID form"
+    );
+    Ok(Some(canonical))
 }
 
 fn operation_help_examples(operation: &str) -> &'static [&'static str] {
@@ -3590,6 +3630,35 @@ mod managed_workflow_request_id_tests {
         ] {
             assert_eq!(managed_workflow_request_id(operation, Some(ID)).unwrap(), None);
         }
+        let business = json!({
+            "missionId": "fixture-mission", "plan": null, "tasks": [],
+            "dependencies": [], "claims": [], "evaluatedAt": "2026-11-18T00:00:00Z"
+        });
+        let envelope = rovai_core::builtin_tool_transport::BuiltinToolInvocationEnvelope::success(
+            "loom.status", ID, business.clone(),
+        ).unwrap();
+        assert_eq!(project_cli_envelope(envelope.clone(), false).unwrap(), business);
+        let receipt = project_cli_envelope(envelope, true).unwrap();
+        assert_eq!(receipt["requestId"], ID);
+        assert_eq!(receipt["operation"], "loom.status");
+        assert_eq!(receipt["contractVersion"], 2);
+        assert_eq!(receipt["ok"], true);
+        assert_eq!(receipt["result"], business);
+        let malformed = rovai_core::builtin_tool_transport::BuiltinToolInvocationEnvelope::success(
+            "loom.status", ID, json!({}),
+        ).unwrap();
+        assert!(project_cli_envelope(malformed, true).is_err());
+        let rejection = rovai_core::builtin_tool_transport::BuiltinToolInvocationEnvelope::rejected(
+            "loom.status", ID, rovai_core::builtin_tool_transport::BuiltinToolError {
+                code: "builtin_tool.outcome_indeterminate".to_string(),
+                message: "private-fixture-diagnostic".to_string(),
+                recovery: rovai_core::builtin_tool_transport::BuiltinToolRecovery::ConfirmOutcome,
+                details: Some(json!({"requestId": "private-fixture-identity"})),
+            },
+        ).unwrap();
+        let rejected = project_cli_envelope(rejection, true).unwrap();
+        assert_eq!(rejected["error"]["code"], "builtin_tool.outcome_indeterminate");
+        assert!(!rejected.to_string().contains("private-fixture"));
     }
 
     #[test]
@@ -3601,6 +3670,8 @@ mod managed_workflow_request_id_tests {
             "6e71a1b4-6b19-4f86-8c18-988552586a3",
             "agent-run:run-1:builtin-cli:x",
             "{6e71a1b4-6b19-4f86-8c18-988552586a37}",
+            "6e71a1b46b194f868c18988552586a37",
+            "urn:uuid:6e71a1b4-6b19-4f86-8c18-988552586a37",
         ] {
             assert!(
                 managed_workflow_request_id("loom.submit", Some(value)).is_err(),
@@ -3610,6 +3681,10 @@ mod managed_workflow_request_id_tests {
         // A padded but otherwise valid value is accepted, so a formatting accident is not a rerun.
         assert_eq!(
             managed_workflow_request_id("loom.submit", Some(&format!(" {ID} "))).unwrap(),
+            Some(ID.to_string())
+        );
+        assert_eq!(
+            managed_workflow_request_id("loom.submit", Some(&ID.to_uppercase())).unwrap(),
             Some(ID.to_string())
         );
     }
