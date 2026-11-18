@@ -1,0 +1,629 @@
+{
+  "baseline": "915ffa1",
+  "canonicalSource": "crates/rovai-core/src/loom_tool.rs::tool_definitions",
+  "canonicalFixture": "scripts/fixtures/pi-workflow/core-input-contract.json",
+  "fixtureOwnership": "Existing Rust owner compares this fixture with actual Core definitions; production uses Core definitions directly.",
+  "before": {
+    "toolName": "rovai_loom",
+    "description": "Run one LOOM operation for the current Thread's Mission: status, plan, release, claim, evidence, submit, inspect, stage-review. `evidence` registers a file you produced (a path relative to the Mission workspace). `submit` sends your claimed task for User acceptance; it never accepts a delivery. The Run, Member and Mission come from Core authentication — you cannot and need not name them.",
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation"
+      ],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": [
+            "loom.status",
+            "loom.plan",
+            "loom.release",
+            "loom.claim",
+            "loom.evidence",
+            "loom.submit",
+            "loom.inspect",
+            "loom.stage-review"
+          ]
+        },
+        "input": {
+          "type": "object"
+        }
+      }
+    },
+    "failure": {
+      "protocol": "return fulfilled value containing isError:true",
+      "nativeSdkResult": "isError:false (Pi 0.85.1 ignores the returned flag)"
+    }
+  },
+  "after": {
+    "toolName": "rovai_loom",
+    "description": "Call one current-Mission operation as {operation, input}. Put the operation's JSON fields inside input. Run, Member and Mission identity come from Core authentication.\nRead status first. Only the Default Lead imports the one plan and releases tasks. Claim a released task before writing. Register each actual file with relativePath, then submit the returned artifactId values. Submit leaves the delivery awaiting User acceptance.\nFor stage-review, inspect first and copy that candidateId, policyRevision and manifestHash. Review only an authorized task assigned to you; do not review your own output or accept for the User.\nExamples show JSON shape. Replace example task, member, candidate and artifact identifiers with actual current values. relativePath is a file path relative to the Mission workspace.\nloom.status: required input fields: none; optional: none. Example: {\"operation\":\"loom.status\",\"input\":{}}\nloom.plan: required input fields: goal, criteria, tasks; optional: acceptanceCriteriaVersion, dependencies. Example: {\"operation\":\"loom.plan\",\"input\":{\"goal\":\"Deliver the requested file\",\"criteria\":[{\"criterionId\":\"file\",\"text\":\"File is registered and awaits User acceptance\"}],\"tasks\":[{\"taskId\":\"task-1\",\"title\":\"Write the requested file\"}]}}\nloom.release: required input fields: taskId; optional: none. Example: {\"operation\":\"loom.release\",\"input\":{\"taskId\":\"task-1\"}}\nloom.claim: required input fields: taskId; optional: leaseSeconds. Example: {\"operation\":\"loom.claim\",\"input\":{\"taskId\":\"task-1\"}}\nloom.evidence: required input fields: relativePath; optional: taskId, contentType. Example: {\"operation\":\"loom.evidence\",\"input\":{\"relativePath\":\"result.md\",\"taskId\":\"task-1\"}}\nloom.submit: required input fields: taskId, evidenceIds; optional: previousCandidateId. Example: {\"operation\":\"loom.submit\",\"input\":{\"taskId\":\"task-1\",\"evidenceIds\":[\"artifact-from-evidence\"]}}\nloom.inspect: required input fields: taskId; optional: none. Example: {\"operation\":\"loom.inspect\",\"input\":{\"taskId\":\"task-1\"}}\nloom.stage-review: required input fields: taskId, candidateId, policyRevision, manifestHash, verdict, reason, criteriaResults; optional: none. Example: {\"operation\":\"loom.stage-review\",\"input\":{\"taskId\":\"task-1\",\"candidateId\":\"candidate-from-inspect\",\"policyRevision\":1,\"manifestHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"verdict\":\"pass\",\"reason\":\"The inspected evidence meets the criteria\",\"criteriaResults\":[{\"criterionId\":\"file\",\"satisfied\":true}]}}",
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "input"
+      ],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": [
+            "loom.status",
+            "loom.plan",
+            "loom.release",
+            "loom.claim",
+            "loom.evidence",
+            "loom.submit",
+            "loom.inspect",
+            "loom.stage-review"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "goal": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            },
+            "acceptanceCriteriaVersion": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "criteria": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "criterionId",
+                  "text"
+                ],
+                "properties": {
+                  "criterionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000
+                  }
+                }
+              }
+            },
+            "tasks": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "taskId",
+                  "title"
+                ],
+                "properties": {
+                  "taskId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 12000
+                  },
+                  "assigneeAgentId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                }
+              }
+            },
+            "dependencies": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "upstreamTaskId",
+                  "downstreamTaskId"
+                ],
+                "properties": {
+                  "upstreamTaskId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "downstreamTaskId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "condition": {
+                    "type": "string",
+                    "enum": [
+                      "task_done",
+                      "artifact_accepted"
+                    ]
+                  }
+                }
+              }
+            },
+            "taskId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "leaseSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600
+            },
+            "relativePath": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000
+            },
+            "contentType": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "evidenceIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              }
+            },
+            "previousCandidateId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "candidateId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "policyRevision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "manifestHash": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "verdict": {
+              "type": "string",
+              "enum": [
+                "pass",
+                "request_changes",
+                "blocked"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4000
+            },
+            "criteriaResults": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "criterionId",
+                  "satisfied"
+                ],
+                "properties": {
+                  "criterionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "satisfied": {
+                    "type": "boolean"
+                  },
+                  "evidenceIds": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 200
+                    }
+                  },
+                  "note": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 4000
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "failure": {
+      "protocol": "throw Error for explicit rejection or indeterminate result",
+      "nativeSdkResult": "isError:true; code and unknown-outcome recovery text preserved; no retry"
+    }
+  },
+  "canonicalOperations": [
+    {
+      "operation": "loom.status",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      }
+    },
+    {
+      "operation": "loom.plan",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "goal",
+          "criteria",
+          "tasks"
+        ],
+        "properties": {
+          "goal": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "acceptanceCriteriaVersion": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "criteria": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "criterionId",
+                "text"
+              ],
+              "properties": {
+                "criterionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "text": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2000
+                }
+              }
+            }
+          },
+          "tasks": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "taskId",
+                "title"
+              ],
+              "properties": {
+                "taskId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "title": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "description": {
+                  "type": "string",
+                  "maxLength": 12000
+                },
+                "assigneeAgentId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                }
+              }
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "upstreamTaskId",
+                "downstreamTaskId"
+              ],
+              "properties": {
+                "upstreamTaskId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "downstreamTaskId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "condition": {
+                  "type": "string",
+                  "enum": [
+                    "task_done",
+                    "artifact_accepted"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "operation": "loom.release",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "taskId"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        }
+      }
+    },
+    {
+      "operation": "loom.claim",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "taskId"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "leaseSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600
+          }
+        }
+      }
+    },
+    {
+      "operation": "loom.evidence",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "relativePath"
+        ],
+        "properties": {
+          "relativePath": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "taskId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "contentType": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        }
+      }
+    },
+    {
+      "operation": "loom.submit",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "taskId",
+          "evidenceIds"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "evidenceIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          "previousCandidateId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        }
+      }
+    },
+    {
+      "operation": "loom.inspect",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "taskId"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        }
+      }
+    },
+    {
+      "operation": "loom.stage-review",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "taskId",
+          "candidateId",
+          "policyRevision",
+          "manifestHash",
+          "verdict",
+          "reason",
+          "criteriaResults"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "candidateId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "policyRevision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "manifestHash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "pass",
+              "request_changes",
+              "blocked"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          },
+          "criteriaResults": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "criterionId",
+                "satisfied"
+              ],
+              "properties": {
+                "criterionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "satisfied": {
+                  "type": "boolean"
+                },
+                "evidenceIds": {
+                  "type": "array",
+                  "maxItems": 100,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                },
+                "note": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "maxLength": 4000
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "unchanged": [
+    "Bootstrap content, SESSION_CHARTER, MEMBER_IDENTITY and Dynamic Context content/selection/budgets",
+    "Tool name, eight operations, Run/bot/Mission authentication, allowed operation keys, workspace guard, claim/acceptance authority",
+    "Fixed trusted CLI argv, per-call deterministic request ID, workflow stdin/output budgets, timeout and no-replay boundaries",
+    "Formatter/profile/manifest versions and database schema"
+  ],
+  "compatibility": {
+    "identity": "runtime_compatibility_digest_with_mcp",
+    "addition": "managedWorkflowContractDigest = canonical_json_digest(managed_workflow_contract())",
+    "effect": "Existing managed extension/source digests also change. A previous native Host/session compatibility identity does not match and must be recreated by the existing lifecycle.",
+    "migration": "No user data or database migration."
+  },
+  "validation": {
+    "workflow": "17/17 offline owners passed with the installed Pi 0.85.1 SDK; the existing Core-contract owner was subsequently extended to load the actual managed-host extension and passed 1/1.",
+    "mcp": "21 existing MCP owners passed. The new SDK owner passed its targeted rerun after correcting a test assumption about the maintained client structured-content precedence; production source did not change between these tests.",
+    "rust": "workflow_tool_sources_agree_on_one_tool_name_and_the_eight_operations passed in the coordinated parent build.",
+    "pageScripts": "All 29 generated Pi UI expressions parse using the actual page wrapper; one forwarding call is covered.",
+    "live": "Previous Pi UI 03 remained failed: no claim or candidate was created. The next isolated UI 04 Run is not started by this change record."
+  },
+  "revision": 1,
+  "purpose": "Review snapshot of existing Core schemas exposed through the Pi adapter; not a second runtime schema authority.",
+  "mcpProtocol": {
+    "before": {
+      "executeSource": "async execute(_toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal) {\n          const timeoutMs = options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;\n          const controller = new AbortController();\n          const timer = setTimeout(() => controller.abort(), timeoutMs);\n          const onAbort = (): void => controller.abort();\n          signal?.addEventListener(\"abort\", onAbort, { once: true });\n          try {\n            // No automatic replay: an unknown outcome is returned to the model.\n            const result = await client.callTool(tool.name, params ?? {}, {\n              signal: controller.signal,\n              timeoutMs\n            });\n            const content = boundContent(sdk.toLlmContent({ content: result.content ?? [], structuredContent: result.structuredContent }));\n            return { content, details: undefined, isError: result.isError === true };\n          } catch (error: unknown) {\n            return {\n              content: [{ type: \"text\", text: sanitizeFailure(server.name, error) }],\n              details: undefined,\n              isError: true\n            };\n          } finally {\n            clearTimeout(timer);\n            signal?.removeEventListener(\"abort\", onAbort);\n          }\n        }",
+      "nativeSdkOutcome": "A fulfilled handler is marked successful even if its result.isError is true."
+    },
+    "after": {
+      "executeSource": "async execute(_toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal) {\n          const timeoutMs = options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;\n          const controller = new AbortController();\n          const timer = setTimeout(() => controller.abort(), timeoutMs);\n          const onAbort = (): void => controller.abort();\n          signal?.addEventListener(\"abort\", onAbort, { once: true });\n          let content: unknown[];\n          let isError = false;\n          try {\n            // No automatic replay: an unknown outcome is returned to the model.\n            const result = await client.callTool(tool.name, params ?? {}, {\n              signal: controller.signal,\n              timeoutMs\n            });\n            content = boundContent(sdk.toLlmContent({ content: result.content ?? [], structuredContent: result.structuredContent }));\n            isError = result.isError === true;\n          } catch (error: unknown) {\n            // Pi 0.85 marks a fulfilled handler successful, regardless of a returned isError flag.\n            throw new Error(sanitizeFailure(server.name, error));\n          } finally {\n            clearTimeout(timer);\n            signal?.removeEventListener(\"abort\", onAbort);\n          }\n          if (isError) {\n            // The native error protocol carries text only. Keep the existing text budget and the\n            // client's structured-content rendering; never put image/base64 data into an error.\n            const text = content\n              .filter((block): block is { type: \"text\"; text: string } => isRecord(block) && block.type === \"text\" && typeof block.text === \"string\")\n              .map((block) => block.text)\n              .join(\"\\n\")\n              .slice(0, MAX_RESULT_TEXT_CHARS);\n            throw new Error(text || \"MCP tool reported an error\");\n          }\n          return { content, details: undefined, isError: false };\n        }",
+      "nativeSdkOutcome": "An explicit MCP rejection or sanitized transport failure throws and is marked isError:true.",
+      "successContent": "Unchanged bounded text/image blocks from the maintained client toLlmContent conversion. Existing content takes precedence over structuredContent in that client.",
+      "errorContent": "Already bounded text blocks joined with newline and capped to 65,536 characters; structuredContent uses the same client conversion. SDK emits one text error block. Failure images are omitted; image-only rejection says MCP tool reported an error.",
+      "transportFailureText": "server \"<serverName>\" failed (<kind>[:<code>])",
+      "retry": "None. One handler invocation calls the server at most once."
+    }
+  }
+}

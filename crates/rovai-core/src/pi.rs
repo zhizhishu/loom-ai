@@ -52,6 +52,19 @@ pub(crate) const PI_FILE_GUARD_EXTENSION_NAME: &str = "rovai-pi-file-guard.ts";
 /// closed operation table. Its digest is part of the Host compatibility identity.
 pub(crate) const MANAGED_WORKFLOW_TOOL_EXTENSION: &str = include_str!("pi/managed-workflow-tool.ts");
 pub(crate) const MANAGED_WORKFLOW_TOOL_EXTENSION_NAME: &str = "managed-workflow-tool.ts";
+pub(crate) const MANAGED_WORKFLOW_CONTRACT_NAME: &str = "loom-workflow-contract.json";
+
+/// The native tool consumes the existing Core input contracts, never a second schema registry.
+pub(crate) fn managed_workflow_contract() -> Value {
+    let operations: Vec<Value> = crate::loom_tool::tool_definitions()
+        .into_iter()
+        .filter(|definition| definition["name"].as_str().is_some_and(crate::loom_tool::is_loom_tool))
+        .map(|definition| json!({
+            "operation": definition["name"], "inputSchema": definition["inputSchema"]
+        }))
+        .collect();
+    json!({"schemaVersion": 1, "operations": operations})
+}
 /// The managed Pi MCP extension is a generated bundle: `scripts/build-pi-mcp.mjs`
 /// inlines the maintained MCP client so the Pi process needs no node_modules tree.
 pub(crate) const PI_MCP_EXTENSION_VERSION: &str = "rovai-pi-mcp-v1";
@@ -420,6 +433,7 @@ pub(crate) fn runtime_compatibility_digest_with_mcp(
         // The managed workflow bridge is part of the same compatibility identity: two Runs that would
         // load a different bridge implementation must never share a warm Host.
         "managedWorkflowToolDigest": format!("{:x}", Sha256::digest(MANAGED_WORKFLOW_TOOL_EXTENSION.as_bytes())),
+        "managedWorkflowContractDigest": canonical_json_digest(&managed_workflow_contract())?,
     });
     if let Some(document) = mcp_document {
         identity["managedMcpExtensionVersion"] = json!(PI_MCP_EXTENSION_VERSION);
@@ -1069,6 +1083,12 @@ mod managed_workflow_source_tests {
 
     #[test]
     fn workflow_tool_sources_agree_on_one_tool_name_and_the_eight_operations() {
+        // One fixture owns the Node seam; its contents must remain the actual Core schemas.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/pi-workflow/core-input-contract.json"
+        )).unwrap();
+        assert_eq!(managed_workflow_contract(), fixture);
+        assert_eq!(fixture["operations"].as_array().unwrap().len(), 8);
         // The name and the operation set live in three places that MUST agree: the Rust contract
         // (file_grant.rs / builtin_tool_transport.rs), the managed Host extension that registers the
         // tool, and the shared guard that re-checks every call. A drift here is a silent policy hole,

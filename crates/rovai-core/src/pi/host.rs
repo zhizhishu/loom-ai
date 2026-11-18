@@ -649,6 +649,11 @@ impl PiHost {
             &config_root.join(super::MANAGED_WORKFLOW_TOOL_EXTENSION_NAME),
             super::MANAGED_WORKFLOW_TOOL_EXTENSION.as_bytes(),
         )?;
+        // Public input shapes only; binding credentials never enter this document or model help.
+        write_private_json(
+            &config_root.join(super::MANAGED_WORKFLOW_CONTRACT_NAME),
+            &super::managed_workflow_contract(),
+        )?;
         let managed_mcp = match launch.mcp {
             Some(mcp) => {
                 anyhow::ensure!(super::managed_mcp_document_digest(&mcp.document)? == mcp.digest,

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import * as sdk from "@earendil-works/pi-mcp";
 import bundleDefault, {
@@ -129,6 +129,87 @@ function start(options, privateRoot, documentPath, documentDigest) {
   return { pi, extension };
 }
 
+test("Pi 0.85 SDK records MCP rejection as failure while retaining bounded successful content", {
+  skip: process.env.LOOM_PI_AGENT_LOOP_MODULE ? false : "explicit installed Pi SDK module path required"
+}, async () => {
+  const { runAgentLoop } = await import(pathToFileURL(process.env.LOOM_PI_AGENT_LOOP_MODULE).href);
+  const image = { type: "image", data: "c3ludGhldGljLWltYWdl", mimeType: "image/png" };
+  let response = { content: [{ type: "text", text: "The requested item is unavailable" }, image], structuredContent: { kind: "unavailable" }, isError: true };
+  let transportFailure = false;
+  let calls = 0;
+  const injected = {
+    McpClient: class {
+      async connect() {}
+      async listTools() { return [{ name: "lookup", inputSchema: { type: "object", properties: {} } }]; }
+      async callTool() {
+        calls += 1;
+        if (transportFailure) throw new Error("Authorization: Bearer synthetic-private");
+        return response;
+      }
+      async close() {}
+    },
+    StdioTransport: class {},
+    StreamableHttpTransport: class {},
+    toLlmContent: sdk.toLlmContent
+  };
+  const body = document([{ name: "protocol", transport: "stdio", command: "fixture-only" }]);
+  const current = privateRun({ "mcp.json": body });
+  const pi = fakePi();
+  createManagedMcpExtension(pi.api, {
+    documentPath: current.written["mcp.json"], documentDigest: digestOf(body),
+    privateRoot: current.privateRoot, workspaceRoot: current.root
+  }, injected, quietLogger);
+  await pi.fire("session_start");
+  const tool = pi.tools.get(namespacedToolName("protocol", "lookup"));
+  const native = async (definition) => {
+    const assistant = { role: "assistant", content: [{ type: "toolCall", id: "offline-mcp", name: tool.name, arguments: {} }], stopReason: "toolUse", timestamp: 1 };
+    const stream = { async *[Symbol.asyncIterator]() { yield { type: "done", message: assistant }; }, async result() { return assistant; } };
+    let providerCalls = 0;
+    const messages = await runAgentLoop([{ role: "user", content: "synthetic offline MCP protocol regression", timestamp: 0 }],
+      { systemPrompt: "", messages: [], tools: [definition] },
+      { model: { provider: "offline", id: "offline", api: "openai-completions" }, convertToLlm: messages => messages, shouldStopAfterTurn: () => true },
+      () => {}, undefined, () => { providerCalls += 1; return stream; });
+    assert.equal(providerCalls, 1);
+    return messages.find(message => message.role === "toolResult");
+  };
+  try {
+    const legacy = await native({ ...tool, async execute() { return { content: sdk.toLlmContent(response), details: undefined, isError: true }; } });
+    assert.equal(legacy.isError, false, "reproduce the former fulfilled-handler false success");
+    const rejected = await native(tool);
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.content[0].text, /requested item is unavailable/u);
+    assert.equal(rejected.content[0].text, sdk.toLlmContent(response).filter(block => block.type === "text").map(block => block.text).join("\n"));
+    assert.equal(rejected.content[0].text.includes(image.data), false);
+    assert.equal(calls, 1);
+    response = { ...response, isError: false };
+    const accepted = await native(tool);
+    assert.equal(accepted.isError, false);
+    assert.deepEqual(accepted.content, sdk.toLlmContent(response));
+    assert.equal(calls, 2);
+    response = { content: [], structuredContent: { kind: "unavailable" }, isError: true };
+    const structuredFailure = await native(tool);
+    assert.equal(structuredFailure.isError, true);
+    assert.match(structuredFailure.content[0].text, /"kind":\s*"unavailable"/u);
+    assert.equal(calls, 3);
+    response = { content: [{ type: "text", text: "x".repeat(70_000) }], isError: true };
+    await assert.rejects(() => tool.execute("bounded", {}), error => error.message.length === 64 * 1024);
+    assert.equal(calls, 4);
+    response = { content: [image], isError: true };
+    await assert.rejects(() => tool.execute("image-error", {}), /MCP tool reported an error/u);
+    assert.equal(calls, 5);
+    transportFailure = true;
+    const failed = await native(tool);
+    assert.equal(failed.isError, true);
+    assert.match(failed.content[0].text, /server "protocol" failed/u);
+    assert.equal(failed.content[0].text.includes("synthetic-private"), false);
+    assert.equal(failed.content[0].text.includes("Authorization"), false);
+    assert.equal(calls, 6, "no failure may replay a call");
+  } finally {
+    await pi.fire("session_shutdown");
+    await current.cleanup();
+  }
+});
+
 test("registers the real tools of a selected stdio server and calls one", { timeout: 30_000 }, async () => {
   const body = document([stdioServer("local")]);
   const run = privateRun({ "mcp.json": body });
@@ -215,12 +296,12 @@ test("a server failure stays a diagnostic and never leaks header or env text", {
     const { pi } = start({}, run.privateRoot, run.written["mcp.json"], digestOf(body));
     await pi.fire("session_start");
     const fail = pi.tools.get(namespacedToolName("local", "fail"));
-    const result = await fail.execute("call-2", {}, new AbortController().signal);
-    assert.equal(result.isError, true);
-    const text = result.content.map((block) => block.text ?? "").join("");
-    assert.equal(text.includes("synthetic-secret"), false, text);
-    assert.equal(text.includes("Authorization"), false, text);
-    assert.match(text, /server "local" failed/u);
+    await assert.rejects(() => fail.execute("call-2", {}, new AbortController().signal), error => {
+      assert.equal(error.message.includes("synthetic-secret"), false);
+      assert.equal(error.message.includes("Authorization"), false);
+      assert.match(error.message, /server "local" failed/u);
+      return true;
+    });
   } finally {
     run.cleanup();
   }
@@ -239,10 +320,11 @@ test("an aborted call is cancelled, not replayed", { timeout: 30_000 }, async ()
     // Let the request reach the server, then cancel it while it is in flight.
     await new Promise((resolve) => setTimeout(resolve, 150));
     controller.abort();
-    const result = await pending;
+    await assert.rejects(pending, error => {
+      assert.equal(error.message.includes("slow-done"), false);
+      return true;
+    });
     const elapsed = Date.now() - startedAt;
-    assert.equal(result.isError, true);
-    assert.equal(result.content[0].text.includes("slow-done"), false);
     // The fixture sleeps 5s; returning well before that proves cancellation, not completion.
     assert.ok(elapsed < 4000, `cancellation took ${elapsed}ms`);
   } finally {
@@ -298,9 +380,10 @@ test("session_shutdown closes every connection; later calls fail closed", { time
     await pi.fire("session_start");
     const echo = pi.tools.get(namespacedToolName("local", "echo"));
     await pi.fire("session_shutdown");
-    const after = await echo.execute("call-5", { text: "x" }, new AbortController().signal);
-    assert.equal(after.isError, true);
-    assert.equal(after.content[0].text.includes("echo:x"), false);
+    await assert.rejects(() => echo.execute("call-5", { text: "x" }, new AbortController().signal), error => {
+      assert.equal(error.message.includes("echo:x"), false);
+      return true;
+    });
   } finally {
     run.cleanup();
   }

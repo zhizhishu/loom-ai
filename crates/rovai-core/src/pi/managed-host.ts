@@ -8,8 +8,12 @@ import path from "node:path";
 import {
   CLI_ENV,
   LOOM_TOOL_NAME,
+  WORKFLOW_CONTRACT_FILE,
+  loomToolDescription,
   loomToolParameters,
+  piToolResult,
   planInvocation,
+  readWorkflowContracts,
   registrationFailureLine,
   resolveTrustedCli,
   runInvocation,
@@ -285,18 +289,17 @@ function loomRegistration(pi: any): void {
     return;
   }
   const cliPath = resolved.cliPath;
+  // This adjacent file contains only Core's public input schemas, not binding credentials.
+  const bindingFile = process.env.ROVAI_PI_HOST_BINDING_FILE;
+  if (!bindingFile || !path.isAbsolute(bindingFile)) throw new Error("loom_contract_path_invalid");
+  const contracts = readWorkflowContracts(path.join(path.dirname(bindingFile), WORKFLOW_CONTRACT_FILE));
 
   pi.registerTool({
     name: LOOM_TOOL_NAME,
     label: "LOOM workflow",
-    description:
-      "Run one LOOM operation for the current Thread's Mission: status, plan, release, claim, "
-      + "evidence, submit, inspect, stage-review. `evidence` registers a file you produced (a path "
-      + "relative to the Mission workspace). `submit` sends your claimed task for User acceptance; it "
-      + "never accepts a delivery. The Run, Member and Mission come from Core authentication — you "
-      + "cannot and need not name them.",
+    description: loomToolDescription(contracts),
     promptSnippet: "rovai_loom — record delivery evidence and submit a claimed task (8 LOOM operations only)",
-    parameters: loomToolParameters(),
+    parameters: loomToolParameters(contracts),
     async execute(toolCallId: string, params: any, signal?: AbortSignal) {
       let binding: any;
       let grantNow: any;
@@ -311,6 +314,7 @@ function loomRegistration(pi: any): void {
       const planned = planInvocation({
         toolCallId,
         params,
+        contracts,
         grant: grantNow,
         binding: { agentRunId: binding.agentRunId, executionEpoch: binding.executionEpoch },
         nowMs: Date.now(),
@@ -330,15 +334,15 @@ function loomRegistration(pi: any): void {
         plan: planned.plan,
         signal,
       });
-      // The bridge's own text already states an unknown outcome; nothing is appended here, so a retry
-      // decision can never be inferred from wording this extension invented.
-      return { content: [{ type: "text", text: result.text }], details: undefined, isError: result.isError };
+      // Pi marks a fulfilled handler successful. Preserve Core rejection/unknown state by throwing;
+      // this conversion never retries the child or changes its request identity.
+      return piToolResult(result);
     },
   });
 }
 
-function toolFailure(text: string) {
-  return { content: [{ type: "text", text }], details: undefined, isError: true };
+function toolFailure(text: string): never {
+  throw new Error(text);
 }
 
 function errorMessage(error: unknown): string {

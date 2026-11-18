@@ -398,24 +398,34 @@ export function createManagedMcpExtension(
           const timer = setTimeout(() => controller.abort(), timeoutMs);
           const onAbort = (): void => controller.abort();
           signal?.addEventListener("abort", onAbort, { once: true });
+          let content: unknown[];
+          let isError = false;
           try {
             // No automatic replay: an unknown outcome is returned to the model.
             const result = await client.callTool(tool.name, params ?? {}, {
               signal: controller.signal,
               timeoutMs
             });
-            const content = boundContent(sdk.toLlmContent({ content: result.content ?? [], structuredContent: result.structuredContent }));
-            return { content, details: undefined, isError: result.isError === true };
+            content = boundContent(sdk.toLlmContent({ content: result.content ?? [], structuredContent: result.structuredContent }));
+            isError = result.isError === true;
           } catch (error: unknown) {
-            return {
-              content: [{ type: "text", text: sanitizeFailure(server.name, error) }],
-              details: undefined,
-              isError: true
-            };
+            // Pi 0.85 marks a fulfilled handler successful, regardless of a returned isError flag.
+            throw new Error(sanitizeFailure(server.name, error));
           } finally {
             clearTimeout(timer);
             signal?.removeEventListener("abort", onAbort);
           }
+          if (isError) {
+            // The native error protocol carries text only. Keep the existing text budget and the
+            // client's structured-content rendering; never put image/base64 data into an error.
+            const text = content
+              .filter((block): block is { type: "text"; text: string } => isRecord(block) && block.type === "text" && typeof block.text === "string")
+              .map((block) => block.text)
+              .join("\n")
+              .slice(0, MAX_RESULT_TEXT_CHARS);
+            throw new Error(text || "MCP tool reported an error");
+          }
+          return { content, details: undefined, isError: false };
         }
       });
       added += 1;

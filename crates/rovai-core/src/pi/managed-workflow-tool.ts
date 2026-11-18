@@ -26,11 +26,12 @@
  */
 
 import { createHash } from "node:crypto"
-import { lstatSync, realpathSync } from "node:fs"
+import { lstatSync, readFileSync, realpathSync } from "node:fs"
 import { extname, isAbsolute, resolve } from "node:path"
 import { StringDecoder } from "node:string_decoder"
 
 export const LOOM_TOOL_NAME = "rovai_loom"
+export const WORKFLOW_CONTRACT_FILE = "loom-workflow-contract.json"
 export const WORKFLOW_POLICY = "workspace_workflow"
 export const FILE_GRANT_SCHEMA = "loom.runtime.file-guard.v1"
 /** Set by this bridge on the exact child it spawns; never on `process.env`. */
@@ -243,10 +244,44 @@ export function evidencePathProblem(raw: unknown): string | null {
 }
 
 export type LoomCall = { operation: string; input: Record<string, unknown> }
+export type WorkflowContracts = Readonly<Record<string, Record<string, unknown>>>
+
+/** Core materializes its existing schemas beside the private Host binding. */
+export function workflowContracts(value: unknown): WorkflowContracts {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.operations)
+    || value.operations.length !== LOOM_OPERATIONS.length) throw new Error("loom_contract_invalid")
+  const contracts: Record<string, Record<string, unknown>> = Object.create(null)
+  for (const row of value.operations) {
+    if (!isRecord(row) || typeof row.operation !== "string" || !LOOM_OPERATIONS.includes(row.operation)
+      || Object.hasOwn(contracts, row.operation) || !isRecord(row.inputSchema)) throw new Error("loom_contract_invalid")
+    const schema = row.inputSchema
+    if (schema.type !== "object" || schema.additionalProperties !== false || !isRecord(schema.properties)) {
+      throw new Error("loom_contract_invalid")
+    }
+    const expected = [...LOOM_INPUT_KEYS[row.operation]].sort()
+    if (JSON.stringify(Object.keys(schema.properties).sort()) !== JSON.stringify(expected)) {
+      throw new Error("loom_contract_keys_changed")
+    }
+    const required = schema.required ?? []
+    if (!Array.isArray(required) || required.some(key => typeof key !== "string" || !expected.includes(key))) {
+      throw new Error("loom_contract_invalid")
+    }
+    contracts[row.operation] = schema
+  }
+  return Object.freeze(contracts)
+}
+
+export function readWorkflowContracts(file: string): WorkflowContracts {
+  if (!isAbsolute(file)) throw new Error("loom_contract_path_invalid")
+  const info = lstatSync(file)
+  if (!info.isFile() || info.isSymbolicLink() || info.size > 65536) throw new Error("loom_contract_file_invalid")
+  return workflowContracts(JSON.parse(readFileSync(file, "utf8")))
+}
 
 /** Accept exactly `{ operation, input? }` for one of the eight operations with its closed key set. */
 export function validateLoomParams(
   params: unknown,
+  contracts: WorkflowContracts,
 ): { ok: true; call: LoomCall } | { ok: false; code: string } {
   if (!isRecord(params)) return { ok: false, code: "loom_params_not_object" }
   for (const key of Object.keys(params)) {
@@ -263,6 +298,10 @@ export function validateLoomParams(
     if (FORBIDDEN_INPUT_KEYS.includes(key)) return { ok: false, code: `loom_identity_not_allowed:${key}` }
     if (!allowed.includes(key)) return { ok: false, code: `loom_input_not_allowed:${key}` }
   }
+  const schema = contracts?.[operation]
+  if (!schema) return { ok: false, code: "loom_contract_missing" }
+  const missing = ((schema.required ?? []) as string[]).filter(key => !Object.hasOwn(rawInput, key))
+  if (missing.length) return { ok: false, code: `loom_input_required:${missing.join(",")}` }
   if (operation === "loom.evidence") {
     const problem = evidencePathProblem(rawInput.relativePath)
     if (problem) return { ok: false, code: `loom_evidence_${problem}` }
@@ -271,17 +310,28 @@ export function validateLoomParams(
 }
 
 /**
- * The tool's provider-facing parameter schema: one closed operation enum plus a free-form `input`
- * object. The per-operation key set is enforced by `validateLoomParams` and by Core's own schema.
+ * Preserve Core's field shapes for providers. Per-operation required keys are named in the
+ * description and checked before a child starts; Core still owns final validation.
  */
-export function loomToolParameters(): Record<string, unknown> {
+export function loomToolParameters(contracts: WorkflowContracts): Record<string, unknown> {
+  const properties: Record<string, unknown> = {}
+  for (const operation of LOOM_OPERATIONS) {
+    const fields = contracts[operation]?.properties
+    if (!isRecord(fields)) throw new Error("loom_contract_missing")
+    for (const [name, schema] of Object.entries(fields)) {
+      if (Object.hasOwn(properties, name) && JSON.stringify(properties[name]) !== JSON.stringify(schema)) {
+        throw new Error("loom_contract_property_conflict")
+      }
+      properties[name] = JSON.parse(JSON.stringify(schema))
+    }
+  }
   return {
     type: "object",
     additionalProperties: false,
-    required: ["operation"],
+    required: ["operation", "input"],
     properties: {
       operation: { type: "string", enum: [...LOOM_OPERATIONS] },
-      input: { type: "object" },
+      input: { type: "object", additionalProperties: false, properties },
     },
   }
 }
@@ -289,6 +339,33 @@ export function loomToolParameters(): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 // Invocation plan
 // ---------------------------------------------------------------------------
+
+export function loomToolDescription(contracts: WorkflowContracts): string {
+  const examples: Record<string, Record<string, unknown>> = {
+    "loom.status": {},
+    "loom.plan": { goal: "Deliver the requested file", criteria: [{ criterionId: "file", text: "File is registered and awaits User acceptance" }], tasks: [{ taskId: "task-1", title: "Write the requested file" }] },
+    "loom.release": { taskId: "task-1" },
+    "loom.claim": { taskId: "task-1" },
+    "loom.evidence": { relativePath: "result.md", taskId: "task-1" },
+    "loom.submit": { taskId: "task-1", evidenceIds: ["artifact-from-evidence"] },
+    "loom.inspect": { taskId: "task-1" },
+    "loom.stage-review": { taskId: "task-1", candidateId: "candidate-from-inspect", policyRevision: 1, manifestHash: "0".repeat(64), verdict: "pass", reason: "The inspected evidence meets the criteria", criteriaResults: [{ criterionId: "file", satisfied: true }] },
+  }
+  const lines = [
+    "Call one current-Mission operation as {operation, input}. Put the operation's JSON fields inside input. Run, Member and Mission identity come from Core authentication.",
+    "Read status first. Only the Default Lead imports the one plan and releases tasks. Claim a released task before writing. Register each actual file with relativePath, then submit the returned artifactId values. Submit leaves the delivery awaiting User acceptance.",
+    "For stage-review, inspect first and copy that candidateId, policyRevision and manifestHash. Review only an authorized task assigned to you; do not review your own output or accept for the User.",
+    "Examples show JSON shape. Replace example task, member, candidate and artifact identifiers with actual current values. relativePath is a file path relative to the Mission workspace.",
+  ]
+  for (const operation of LOOM_OPERATIONS) {
+    const schema = contracts[operation]
+    if (!schema || !isRecord(schema.properties)) throw new Error("loom_contract_missing")
+    const required = (schema.required ?? []) as string[]
+    const optional = Object.keys(schema.properties).filter(key => !required.includes(key))
+    lines.push(`${operation}: required input fields: ${required.join(", ") || "none"}; optional: ${optional.join(", ") || "none"}. Example: ${JSON.stringify({ operation, input: examples[operation] })}`)
+  }
+  return lines.join("\n")
+}
 
 export type Binding = { agentRunId: string; executionEpoch: number }
 
@@ -309,6 +386,7 @@ export type InvocationPlan = {
 export function planInvocation(options: {
   toolCallId: unknown
   params: unknown
+  contracts: WorkflowContracts
   grant: unknown
   binding: Binding
   nowMs: number
@@ -331,7 +409,7 @@ export function planInvocation(options: {
   if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || nowMs >= expiresAt) {
     return { ok: false, code: "loom_grant_expired" }
   }
-  const validated = validateLoomParams(options.params)
+  const validated = validateLoomParams(options.params, options.contracts)
   if (!validated.ok) return validated
   const resolved = resolveTrustedCli(options.cliPath)
   if (!resolved.ok) return resolved
@@ -447,6 +525,17 @@ export type RunResult = {
 
 function failure(code: string, text: string, indeterminate: boolean): RunResult {
   return { isError: true, code, text, indeterminate }
+}
+
+/** Pi 0.85 marks any fulfilled handler successful; a failed operation must throw. */
+export function piToolResult(result: RunResult): { content: { type: string; text: string }[] } {
+  if (result.isError) {
+    const recovery = result.indeterminate ? " Outcome unknown; do not replay this call. Read LOOM status before recovery." : ""
+    const error = new Error(`${result.code}: ${result.text}${recovery}`)
+    Object.assign(error, { code: result.code, indeterminate: result.indeterminate })
+    throw error
+  }
+  return { content: [{ type: "text", text: result.text }] }
 }
 
 function boundedText(value: unknown): string {

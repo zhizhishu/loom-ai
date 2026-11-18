@@ -21,10 +21,13 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import managedHost from '../crates/rovai-core/src/pi/managed-host.ts'
 
 import {
   CLI_ENV,
@@ -39,13 +42,160 @@ import {
   REQUEST_ID_ENV,
   deriveRequestId,
   evidencePathProblem,
-  loomToolParameters,
+  loomToolDescription,
+  loomToolParameters as nativeToolParameters,
   parseEnvelope,
   planInvocation,
+  piToolResult,
+  readWorkflowContracts,
   resolveTrustedCli,
   runInvocation,
-  validateLoomParams,
+  validateLoomParams as validateNativeParams,
+  workflowContracts,
 } from '../crates/rovai-core/src/pi/managed-workflow-tool.ts'
+
+const CORE_CONTRACT = JSON.parse(readFileSync(new URL('./fixtures/pi-workflow/core-input-contract.json', import.meta.url), 'utf8'))
+const CONTRACTS = workflowContracts(CORE_CONTRACT)
+const validateLoomParams = params => validateNativeParams(params, CONTRACTS)
+const loomToolParameters = () => nativeToolParameters(CONTRACTS)
+
+test('Core input contracts replace guessed fields and reject incomplete operations before dispatch', async () => {
+  const fields = loomToolParameters().properties.input
+  assert.equal(fields.additionalProperties, false)
+  assert.deepEqual(fields.properties.relativePath, CONTRACTS['loom.evidence'].properties.relativePath)
+  assert.deepEqual(fields.properties.tasks.items.required, ['taskId', 'title'])
+  for (const operation of EIGHT.filter(name => name !== 'loom.status')) {
+    assert.equal(validateLoomParams({ operation, input: {} }).ok, false, operation + ' empty input')
+  }
+  for (const key of ['path', 'files', 'filePath', 'paths', 'file']) {
+    assert.equal(fields.properties[key], undefined)
+    assert.equal(validateLoomParams({ operation: 'loom.evidence', input: { [key]: 'result.md' } }).code, 'loom_input_not_allowed:' + key)
+  }
+  const help = loomToolDescription(CONTRACTS)
+  for (const line of help.split('\n').filter(line => line.includes('. Example: '))) {
+    const example = JSON.parse(line.split('. Example: ')[1])
+    assert.equal(validateLoomParams(example).ok, true, example.operation)
+  }
+  assert.match(help, /loom.plan: required input fields: goal, criteria, tasks/u)
+  assert.match(help, /loom.evidence: required input fields: relativePath/u)
+  assert.match(help, /Claim a released task before writing/u)
+  const fixturePath = new URL('./fixtures/pi-workflow/core-input-contract.json', import.meta.url)
+  assert.deepEqual(readWorkflowContracts(fileURLToPath(fixturePath)), CONTRACTS)
+  const changed = structuredClone(CORE_CONTRACT)
+  changed.operations[0].inputSchema.properties.missionId = { type: 'string' }
+  assert.throws(() => workflowContracts(changed), /loom_contract_keys_changed/u)
+  assert.throws(() => workflowContracts({ schemaVersion: 1, operations: [] }), /loom_contract_invalid/u)
+  // Exercise the actual extension load path, including the adjacent Core schema file. No child
+  // can start: the only invocation deliberately lacks the required plan input.
+  const current = fixture()
+  const previous = Object.fromEntries(['ROVAI_PI_HOST_BINDING_FILE', 'ROVAI_PI_FILE_GRANT_FILE', CLI_ENV]
+    .map(key => [key, process.env[key]]))
+  const bootstrap = 'synthetic managed extension binding'
+  const bindingFile = join(current.root, 'binding.json')
+  const grantFile = join(current.root, 'grant.json')
+  writeFileSync(bindingFile, JSON.stringify({
+    schemaVersion: 3, extensionVersion: 'rovai-pi-host-v11', hostInstanceId: 'fixture-host',
+    hostBindingGeneration: 1, agentRunId: current.grant.runId, executionEpoch: current.grant.executionEpoch,
+    nativeBindingId: 'fixture-binding', nativeBindingGeneration: 1, expectedNativeSessionId: null,
+    bootstrap, bootstrapPayloadDigest: createHash('sha256').update(bootstrap).digest('hex')
+  }), { mode: 0o600 })
+  writeFileSync(grantFile, JSON.stringify(current.grant))
+  writeFileSync(join(current.root, 'loom-workflow-contract.json'), JSON.stringify(CORE_CONTRACT))
+  try {
+    process.env.ROVAI_PI_HOST_BINDING_FILE = bindingFile
+    process.env.ROVAI_PI_FILE_GRANT_FILE = grantFile
+    process.env[CLI_ENV] = current.cliPath
+    const registered = []
+    managedHost({ registerTool: definition => registered.push(definition), on() {} })
+    assert.equal(registered.length, 1)
+    assert.equal(registered[0].name, LOOM_TOOL_NAME)
+    assert.deepEqual(registered[0].parameters, loomToolParameters())
+    assert.equal(registered[0].description, help)
+    await assert.rejects(() => registered[0].execute('empty-plan', { operation: 'loom.plan', input: {} }), /loom_input_required:goal,criteria,tasks/u)
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    await rm(current.root, { recursive: true, force: true })
+  }
+})
+
+test('plan release claim write evidence submit retain exact JSON fields and native failure semantics', async () => {
+  const current = fixture()
+  const calls = [
+    { operation: 'loom.plan', input: { goal: 'Write one file', criteria: [{ criterionId: 'file', text: 'Real registered file' }], tasks: [{ taskId: 't1', title: 'Write file', assigneeAgentId: 'bot-workflow' }] } },
+    { operation: 'loom.release', input: { taskId: 't1' } },
+    { operation: 'loom.claim', input: { taskId: 't1' } },
+    { operation: 'loom.evidence', input: { relativePath: 'result.md', taskId: 't1' } },
+    { operation: 'loom.submit', input: { taskId: 't1', evidenceIds: ['artifact-1'] } },
+  ]
+  let claimed = false
+  try {
+    for (const [index, params] of calls.entries()) {
+      if (params.operation === 'loom.evidence') {
+        assert.equal(claimed, true)
+        writeFileSync(join(current.root, 'result.md'), '# Actual fixture file\n')
+      }
+      const planned = plan(current, params, { toolCallId: 'sequence-' + index })
+      assert.equal(planned.ok, true)
+      const fake = fakeSpawn()
+      fake.onEnd((record, emit) => {
+        assert.deepEqual(JSON.parse(record.stdin), params.input)
+        const result = params.operation === 'loom.evidence' ? { artifact: { artifactId: 'artifact-1' } }
+          : params.operation === 'loom.submit' ? { candidateId: 'candidate-1', acceptanceStatus: 'pending' } : { taskId: 't1' }
+        emit('stdout', JSON.stringify({ contractVersion: ENVELOPE_VERSION, ok: true, operation: params.operation, requestId: planned.plan.requestId, result }))
+        emit('close', 0)
+      })
+      const native = piToolResult(await runInvocation({ spawn: fake.spawn, plan: planned.plan, timeoutMs: 1000 }))
+      assert.equal(fake.calls.length, 1)
+      assert.ok(native.content[0].text)
+      if (params.operation === 'loom.claim') claimed = true
+      if (params.operation === 'loom.submit') assert.equal(JSON.parse(native.content[0].text).acceptanceStatus, 'pending')
+    }
+    for (const indeterminate of [false, true]) {
+      assert.throws(() => piToolResult({ isError: true, code: 'loom.claim_absent', text: 'No current claim', indeterminate }), error => {
+        assert.equal(error.code, 'loom.claim_absent'); assert.equal(error.indeterminate, indeterminate)
+        if (indeterminate) assert.match(error.message, /do not replay/u)
+        return true
+      })
+    }
+  } finally { await rm(current.root, { recursive: true, force: true }) }
+})
+
+test('Pi 0.85 SDK distinguishes a returned error flag from a thrown Core rejection', {
+  skip: process.env.LOOM_PI_AGENT_LOOP_MODULE ? false : 'explicit installed Pi SDK module path required'
+}, async () => {
+  const { runAgentLoop } = await import(pathToFileURL(process.env.LOOM_PI_AGENT_LOOP_MODULE).href)
+  const run = async (params, execute) => {
+    const assistant = { role: 'assistant', content: [{ type: 'toolCall', id: 'offline-call', name: LOOM_TOOL_NAME, arguments: params }], stopReason: 'toolUse', timestamp: 1 }
+    const response = { async *[Symbol.asyncIterator]() { yield { type: 'done', message: assistant } }, async result() { return assistant } }
+    let providerCalls = 0
+    const messages = await runAgentLoop([{ role: 'user', content: 'synthetic offline tool protocol regression', timestamp: 0 }],
+      { systemPrompt: '', messages: [], tools: [{ name: LOOM_TOOL_NAME, label: 'LOOM', description: loomToolDescription(CONTRACTS), parameters: loomToolParameters(), execute }] },
+      { model: { provider: 'offline', id: 'offline', api: 'openai-completions' }, convertToLlm: messages => messages, shouldStopAfterTurn: () => true },
+      () => {}, undefined, () => { providerCalls += 1; return response })
+    assert.equal(providerCalls, 1)
+    return messages.find(message => message.role === 'toolResult')
+  }
+  const rejection = { isError: true, code: 'loom.claim_absent', text: 'No current claim', indeterminate: false }
+  const valid = { operation: 'loom.status', input: {} }
+  const previous = await run(valid, async () => ({ content: [{ type: 'text', text: 'No current claim' }], isError: true }))
+  assert.equal(previous.isError, false, 'reproduce the old fulfilled-handler false success')
+  const fixed = await run(valid, async () => piToolResult(rejection))
+  assert.equal(fixed.isError, true)
+  assert.match(fixed.content[0].text, /loom.claim_absent/u)
+  let dispatched = 0
+  const badPath = await run({ operation: 'loom.evidence', input: { path: 'result.md' } }, async () => { dispatched += 1 })
+  assert.equal(badPath.isError, true); assert.equal(dispatched, 0)
+  const emptyPlan = await run({ operation: 'loom.plan', input: {} }, async (_id, params) => {
+    const checked = validateLoomParams(params)
+    if (!checked.ok) throw new Error(checked.code)
+    dispatched += 1
+  })
+  assert.equal(emptyPlan.isError, true); assert.equal(dispatched, 0)
+  assert.match(emptyPlan.content[0].text, /loom_input_required:goal,criteria,tasks/u)
+})
 
 const EIGHT = [
   'loom.status',
@@ -84,6 +234,7 @@ function plan(fixtureValue, params, overrides = {}) {
   return planInvocation({
     toolCallId: overrides.toolCallId ?? 'call-1',
     params,
+    contracts: CONTRACTS,
     grant: Object.hasOwn(overrides, 'grant') ? overrides.grant : fixtureValue.grant,
     binding: overrides.binding ?? fixtureValue.binding,
     nowMs: overrides.nowMs ?? Date.now(),
@@ -153,7 +304,7 @@ test('1 · the tool reaches exactly the eight LOOM operations through fixed argv
   // The provider-facing schema offers exactly the closed enum.
   const schema = loomToolParameters()
   assert.equal(schema.additionalProperties, false)
-  assert.deepEqual(schema.required, ['operation'])
+  assert.deepEqual(schema.required, ['operation', 'input'])
   assert.deepEqual([...schema.properties.operation.enum], EIGHT)
   assert.deepEqual(Object.keys(schema.properties).sort(), ['input', 'operation'])
 })
