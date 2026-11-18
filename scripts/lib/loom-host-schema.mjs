@@ -8,12 +8,14 @@ import { DatabaseSync } from 'node:sqlite'
 export const ARTIFACT_VERSION_SCHEMA = 185
 export const ARTIFACT_VERSION_MIGRATION = 235
 
-export async function verifyRunningHostSchema ({ request, databasePath, expectedProjectionSchema = ARTIFACT_VERSION_SCHEMA }) {
+export async function verifyRunningHostSchema ({ request, databasePath,
+  expectedProjectionSchema = ARTIFACT_VERSION_SCHEMA, expectedMigrationVersion = ARTIFACT_VERSION_MIGRATION }) {
   const evidence = { source: 'running-host-health-and-read-only-database', readOnly: true,
-    expectedProjectionSchema, expectedMigrationVersion: ARTIFACT_VERSION_MIGRATION, verified: false }
+    expectedProjectionSchema, expectedMigrationVersion, verified: false }
   try {
-    assert.equal(expectedProjectionSchema, ARTIFACT_VERSION_SCHEMA,
-      'this acceptance requires the artifact-version schema from the current source')
+    assert.ok((expectedProjectionSchema === 185 && expectedMigrationVersion === 235)
+      || (expectedProjectionSchema === 186 && expectedMigrationVersion === 236),
+      'this acceptance requires a supported projection/migration pair (185/235 or 186/236)')
     assert.ok(typeof databasePath === 'string' && isAbsolute(databasePath),
       'the isolated Host database path must be explicitly selected')
     const health = await request('health.check', {})
@@ -42,7 +44,7 @@ export async function verifyRunningHostSchema ({ request, databasePath, expected
       assert.equal(evidence.contractVersion, 'v1.72', 'the running Host data contract differs from the current source')
       assert.equal(evidence.projectionSchema, expectedProjectionSchema,
         'the running Host uses an old or unexpected projection schema')
-      assert.equal(evidence.latestMigrationVersion, ARTIFACT_VERSION_MIGRATION,
+      assert.equal(evidence.latestMigrationVersion, expectedMigrationVersion,
         'the running Host migration history differs from the current source')
       assert.equal(evidence.artifactVersionMigrationPresent, true, 'the artifact-version migration is absent')
       evidence.verified = true

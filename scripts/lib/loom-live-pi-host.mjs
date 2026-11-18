@@ -66,7 +66,8 @@ export async function prepareLivePiHost({ configPath, providerKey, readyBudgetMs
     const guarded = createHostRequestGuard((method, params) => host.request(method, params))
     progress('verify_running_host_schema')
     const hostSchema = await verifyRunningHostSchema({ request: guarded.request,
-      databasePath: join(dataDir, 'rovai.sqlite'), expectedProjectionSchema: config.expectedProjectionSchema })
+      databasePath: join(dataDir, 'rovai.sqlite'), expectedProjectionSchema: config.expectedProjectionSchema,
+      expectedMigrationVersion: config.expectedMigrationVersion })
     progress('runtime_product_check')
     await guarded.request('runtime.product.check', { runtimeKind: 'pi' })
     const installation = await waitForManagedPiInstallation(guarded, piBundle.launcher)
