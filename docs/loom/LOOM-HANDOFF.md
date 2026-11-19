@@ -61,10 +61,11 @@
 - 已建：DE-BERO 宿主 `/root/sandbox/projects/loom-dev/`，镜像 `loom-dev:base`（node:24-bookworm + Rust 1.97.1 + pnpm 11.20.0），容器 `loom-dev`（runc、无宿主密钥）。说明与脚本见 [`scripts/bero/README.md`](../../scripts/bero/README.md)。
 - 代码：`src/` 在 `b5c5d67`（GitHub 分支 `915ffa1` + 17 个未推送提交经 git bundle 传入，sha256 已核对）。
 - 基线（`logs/baseline.summary`）：pnpm install 5 s；`cargo check --workspace --all-targets` 冷 129 s、热 0 s；文档决策检查 37 s 通过；`cargo test -p rovai-core --lib` 484 s，**634 过 / 4 败 / 1 忽略**；cospan `doctor` 0.1.1 可用，但 codex、dsh 尚未安装。
-- Linux 下 4 个失败（Windows 上未见，先当环境/平台问题查，不改断言）：
-  - `database_admission` 3 个：`authority_ticket_blocked … IdentityChanged … stage: Revalidation`。把 `TMPDIR` 换到 ext4 卷仍失败，所以不是 tmpfs/overlay，疑为 Linux 下文件身份判定逻辑。
-  - `runtime_probe_process::tests::cancelling_the_owner_kills_the_spawned_process_group`：疑为容器 PID 1 是 `sleep`、没有 init 回收子进程；下一步用 `docker run --init` 重建容器复测。
-- 下一位接手顺序：① 重建容器加 `--init`，复测上面 4 个；② 查 `database_admission.rs` Revalidation 的身份比较在 Linux 的取值；③ 在容器里装 Pi 固定版本、DSH `0.2.0-rc.2`、Codex（密钥只进容器环境），`cospan doctor --check` 见到 codex、dsh；④ 进 P0。
+- Linux 下 4 个失败，**根因已在 Bero 复现确认（2026-11-18 22:55 PST，Pi 工兵只读定位 + Hark 复测）**：
+  - `runtime_probe_process` 进程组 ×1：容器缺 init。`docker run --init` 下 5/5 通过。
+  - `database_admission` ×3：unix 的 `artifact_state_key`（`database_admission.rs` 约 1096 行）把 ctime 算进身份；bundled SQLite 在 euid=0 时每次打开 `-wal`/`-journal` 都 `fchown`，Linux 会刷新 ctime，于是 `db.rs` 约 7871 行的严格复核判成 `IdentityChanged`。同一测试二进制：**root 9/12，uid 10001 12/12**。Windows 身份不含 ctime，所以没暴露。
+  - 修法待定（安全闸，需用户拍板）：①unix 身份去掉 ctime；②只在准入复核忽略 ctime；③不改代码，Core 一律非 root 运行（Dockerfile 已有此禁令）。终态上云时 root 运行必挂，不能只靠③。
+- 下一位接手顺序：① 重建 `loom-dev` 加 `--init` 并改非 root 用户跑测试；② 按用户选定修法改身份判等并补 root 场景测试；③ 在容器里装 Pi 固定版本、DSH `0.2.0-rc.2`、Codex（密钥只进容器环境），`cospan doctor --check` 见到 codex、dsh；④ 进 P0。
 
 **留给 GitHub 与用户电脑**
 - Windows：Bero 通过后，由 GitHub 镜像仓库 Actions（`windows-package.yml`、`loom-v2-e3-windows.yml`）多构建 Windows 包；用户电脑只做安装冒烟，不碰 64851/64852、日常 userData。
