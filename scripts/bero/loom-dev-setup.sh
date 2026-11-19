@@ -14,6 +14,7 @@ ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH \
     PNPM_HOME=/opt/pnpm COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config libssl-dev git curl ca-certificates jq ripgrep \
+      xvfb xauth xdotool xterm x11-utils python3-pil \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} \
     && rustup component add clippy rustfmt && chmod -R a+w /opt/cargo /opt/rustup
@@ -50,5 +51,14 @@ docker exec loom-dev sh -c 'command -v pi >/dev/null || npm i -g @earendil-works
   [ -d /root/.pi/pi-skill ] && ln -sfn /root/.pi/pi-skill /root/.codex/skills/pi-skill; \
   [ -d /root/.pi/claude-hooks ] && ln -sfn /root/.pi/claude-hooks /root/.claude/hooks; \
   pi --version'
+# Computer live-desktop acceptance fixture (resources/computer/test_host_desktop.py): Xvfb gives the
+# private display, xdpyinfo/xdotool observe the windows, xmessage/xterm are the dedicated target
+# windows, xauth satisfies xvfb-run, python3-pil is the helper's own PNG encoder. Idempotent, and
+# installed here so an existing container does not need to be recreated.
+docker exec loom-dev bash -lc 'dpkg -s xvfb xauth xdotool xterm x11-utils python3-pil >/dev/null 2>&1 || \
+  (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+     xvfb xauth xdotool xterm x11-utils python3-pil) && \
+  for tool in Xvfb xdpyinfo xdotool xmessage xterm xvfb-run; do command -v $tool || { echo "missing $tool"; exit 1; }; done' \
+  && echo "computer fixture tools ok"
 docker exec loom-dev bash -lc 'node -v; pnpm -v; rustc -V; cargo -V' 
 echo "=== setup done $(date -Is)"
