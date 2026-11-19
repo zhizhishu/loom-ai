@@ -1413,7 +1413,7 @@ fn control_facts_survive_a_database_reopen() {
 }
 
 /// The `blocked_reason` this module persists for one Task, or `None` when it carries none.
-fn task_blocked_reason(database: &OwnedTestDatabase, plan_id: &str, task_id: &str) -> Option<String> {
+fn task_blocked_reason(database: &Database, plan_id: &str, task_id: &str) -> Option<String> {
     database
         .connection()
         .query_row(
@@ -1451,7 +1451,7 @@ fn installation_of(database: &OwnedTestDatabase, agent_id: &str) -> String {
 }
 
 /// Deliveries the control plane created: the handoff lane and nothing else.
-fn loom_deliveries(database: &OwnedTestDatabase) -> i64 {
+fn loom_deliveries(database: &Database) -> i64 {
     count(
         database,
         "SELECT COUNT(*) FROM camp_message_delivery WHERE message_id IN
@@ -1726,7 +1726,7 @@ fn dispatch_and_run(database: &OwnedTestDatabase, task_id: &str) -> (String, Opt
         .unwrap()
 }
 
-fn run_status(database: &OwnedTestDatabase, run_id: &str) -> String {
+fn run_status(database: &Database, run_id: &str) -> String {
     database
         .connection()
         .query_row(
@@ -3319,5 +3319,153 @@ fn a_run_that_already_started_is_never_a_dispatch_failure() {
     assert_eq!(
         ledger_after_end, "DISPATCHED",
         "assertion an_unproved_outcome_is_never_read_as_a_settled_dispatch"
+    );
+}
+
+/// Production launch order, ported from the review's remaining blocker: `dispatch_agent_run_candidate`
+/// prepares the Runtime *before* the claim asks the control plane, and Core's preparation answers a
+/// disabled installation with a terminal dispatch rejection. The control plane only ever wants such
+/// a Run to wait, so the wait has to be decided before the Runtime is prepared. This drives the real
+/// scheduler step — not the claim helper — and proves the Run is never failed: it stays `queued`
+/// with its Delivery still `claimed`, and that very same Run starts once the device is back.
+#[tokio::test]
+async fn a_loom_dispatch_waits_for_the_device_before_the_runtime_is_prepared() {
+    let mut database = fixture();
+    let (mission_id, _plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch production order",
+        "command_approve_production_order",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    // Production validates the Mission project directory before it prepares anything, so the
+    // fixture states that precondition instead of relying on a path that only a Project would have.
+    let project_path: String = database
+        .connection()
+        .query_row(
+            "SELECT project_path FROM camp WHERE id=?1",
+            [&camp_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    std::fs::create_dir_all(&project_path).unwrap();
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_approved_work_is_reserved"
+    );
+    let claimed = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(
+        claimed.len(),
+        1,
+        "assertion the_reservation_materialises_one_run"
+    );
+    let run_id = claimed[0].clone();
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion the_materialised_run_waits_queued"
+    );
+
+    // The device disappears after the Run was materialised but before the scheduler prepared it.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET enabled=0 WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+
+    let directory = database.directory().to_path_buf();
+    database.close();
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    crate::application::dispatch_queued_run_for_test(&directory, database, &run_id)
+        .await
+        .expect("one scheduler step must be runnable");
+
+    // Nothing started and nothing failed: an unavailable device is a wait, never a terminal answer.
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        run_status(&database, &run_id),
+        "queued",
+        "assertion an_unavailable_device_leaves_the_run_queued"
+    );
+    let (delivery_status, delivery_run, dispatch_status): (String, Option<String>, String) =
+        database
+            .connection()
+            .query_row(
+                "SELECT delivery.status, delivery.claimed_agent_run_id, dispatch.status
+                 FROM loom_control_dispatch AS dispatch
+                 JOIN camp_message_delivery AS delivery ON delivery.id = dispatch.delivery_id
+                 WHERE dispatch.task_id='task_a'
+                 ORDER BY dispatch.created_at, dispatch.dispatch_id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (
+            delivery_status.as_str(),
+            delivery_run.as_deref(),
+            dispatch_status.as_str()
+        ),
+        ("claimed", Some(run_id.as_str()), "DISPATCHED"),
+        "assertion the_queued_run_keeps_its_claimed_delivery_and_pending_dispatch"
+    );
+    let terminal: i64 = database
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM event_log
+             WHERE entity_type='agent_run' AND entity_id=?1
+               AND event_type IN ('agent_run.failed','agent_run.dispatch_rejected')",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        terminal, 0,
+        "assertion preparation_never_rejects_a_waiting_loom_dispatch"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion waiting_starts_nothing_and_mints_nothing"
+    );
+
+    // The device comes back: the same scheduler step starts this very Run, once.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET enabled=1 WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    drop(database);
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    crate::application::dispatch_queued_run_for_test(&directory, database, &run_id)
+        .await
+        .expect("the recovered scheduler step must be runnable");
+
+    let database = Database::open(&directory).expect("the fixture database must reopen");
+    assert_eq!(
+        run_status(&database, &run_id),
+        "running",
+        "assertion the_same_run_starts_once_the_device_is_back"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion recovery_adds_no_second_ledger_row_delivery_or_run"
     );
 }
