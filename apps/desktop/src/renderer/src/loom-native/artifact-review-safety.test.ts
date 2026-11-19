@@ -705,6 +705,49 @@ describe('artifact status is derived from the real control and acceptance projec
     expect(artifactCandidateFacts(bundle([first], [artifact]), artifact, first).reviewKind).toBe('reviewing')
   })
 
+  it('reads a blocker Core wrote only onto the task, without a blocked task status', () => {
+    // 派发/返工预算耗尽、前置结果未知、审查者不可用都只写 blocked_reason：
+    // 任务状态可能还在 in_review/ready，但这份工作确实停了。
+    for (const reason of [
+      'loom.dispatch_budget_exhausted',
+      'loom.rework_budget_exhausted',
+      'loom.dispatch_previous_outcome_unknown',
+      'loom.dispatch_recipient_unavailable'
+    ] as const) {
+      expect(kindOf({ taskStatus: 'in_review', blockedReason: reason, control: observed() })).toBe('blocked')
+      expect(kindOf({ taskStatus: 'in_review', blockedReason: reason, control: undefined })).toBe('blocked')
+    }
+    // 空白原因不是阻塞：不要把没写原因当成受阻。
+    expect(kindOf({ taskStatus: 'in_review', blockedReason: '   ' })).toBe('review')
+    expect(kindOf({ taskStatus: 'in_review', blockedReason: null })).toBe('review')
+  })
+
+  it('a superseded version is archived, never a rework in progress', () => {
+    const askedForChanges = observed({ policy: policy(), stageReviews: [stageReview({ verdict: 'request_changes' })] })
+    // 链头上是真的在返工。
+    expect(kindOf({ control: askedForChanges })).toBe('fixing')
+    // 同一份「要求返工」不能跟着历史版本走：旧版本已归档，不归当前工作。
+    expect(kindOf({ latest: false, control: askedForChanges })).toBe('ready')
+    // 人工退回同样只属于链头。
+    expect(kindOf({ latest: false, reviews: [reviewOf()] })).toBe('ready')
+    // 接受是永久结论，历史版本仍显示已接受。
+    expect(kindOf({ latest: false, candidate: { ...first, acceptanceStatus: 'accepted' } })).toBe('accepted')
+  })
+
+  it('the facts of a real rework chain report the old artifact as archived', () => {
+    // 真实版本链：c2 取代 c1，阶段审查要求返工。旧归档仍可打开，但不再是「返工中」。
+    const chain: WorkBundle = {
+      ...bundle([first, rework], [artifact, reworkArtifact]),
+      control: observed({ policy: policy(), stageReviews: [stageReview({ candidateId: 'c2', verdict: 'request_changes' })] })
+    }
+    expect(artifactCandidateFacts(chain, artifact, null).reviewKind).toBe('ready')
+    const tip = artifactCandidateFacts(chain, reworkArtifact, null)
+    expect(tip.reviewKind).toBe('fixing')
+    // 链头仍可人工验收（写入口仍只给链头），历史版本保持关闭。
+    expect(tip.reviewable).toBe(true)
+    expect(artifactCandidateFacts(chain, artifact, null).reviewable).toBe(false)
+  })
+
   it('the latest human review of one candidate is picked by time, not array order', () => {
     const earlier = reviewOf({ reviewId: 'rev-a', verdict: 'rejected', reviewedAt: '2026-11-13T06:00:00Z' })
     const later = reviewOf({ reviewId: 'rev-b', verdict: 'accepted', reviewedAt: '2026-11-13T07:00:00Z' })

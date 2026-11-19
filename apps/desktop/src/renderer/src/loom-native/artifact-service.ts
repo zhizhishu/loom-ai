@@ -129,12 +129,13 @@ export function acceptanceLabel(state: LoomCandidate['acceptanceStatus']): strin
  *
  * - `none`：还没有成果侧结论（卡片沿用任务状态本身）。
  * - `preparing`：准备中——候选已登记，归档成果还没出现。
- * - `ready`：已归档——有这份成果，但没有可验收的候选（没有候选持有它，或它是历史版本）。
+ * - `ready`：已归档——有这份成果，但不是当前可验收的那一版（没有候选持有它，或它是历史版本）。
  * - `reviewing`：审查中——助手阶段审查还没交回结论，或控制事实还没读到。
- * - `fixing`：返工中——被要求返工/被人工退回，助手正在改。
+ * - `fixing`：返工中——链头候选被要求返工/被人工退回，助手正在改。
  * - `review`：等你——审查结论已交回，等你的验收。
  * - `accepted`：已接受。
- * - `blocked`：受阻——任务阻塞，或当前授权下的阶段审查结论就是阻塞。
+ * - `blocked`：受阻——任务阻塞（含 Core 只写在任务上的阻塞原因），
+ *   或当前授权下的阶段审查结论就是阻塞。
  */
 export type ArtifactReviewKind =
   | 'none'
@@ -208,6 +209,11 @@ export type ArtifactReviewInput = {
   hasArtifact: boolean
   taskId: string | null
   taskStatus: LoomTaskStatus | null
+  /**
+   * 任务上的阻塞原因。Core 的派发预算耗尽、前置结果未知、审查者不可用只写这里，
+   * 并不改任务状态——不读它就会把真的受阻说成在办。
+   */
+  blockedReason?: string | null
   /** 成果归属候选；没有候选引用这份证据时为 null */
   candidate: LoomCandidate | null
   /** 候选是否返工链链头；历史版本恒为 false */
@@ -235,22 +241,24 @@ export function artifactReviewKind(input: ArtifactReviewInput): ArtifactReviewKi
   // 旧授权下的阶段审查结论已被新授权取代：只作历史，不当现在的判定。
   const stale = stageReview !== null && loomStageReviewFreshness(stageReview, snapshot?.policy ?? null) === 'stale'
 
-  // 1. 任务阻塞是当下的真事实：卡片不因候选还在等验收就藏起来。
-  if (taskStatus === 'blocked') return 'blocked'
-  // 2. 人工终判已经成立。
+  // 1. 任务阻塞是当下的真事实：卡片不因候选还在等验收就藏起来。任务状态是阻塞，或 Core
+  //    只写了阻塞原因（派发/返工预算耗尽、前置结果未知、审查者不可用）都算受阻。
+  if (taskStatus === 'blocked' || (input.blockedReason ?? '').trim() !== '') return 'blocked'
+  // 2. 人工终判已经成立（接受是永久的，历史版本同样算已接受）。
   if (candidate !== null && (candidate.acceptanceStatus === 'accepted' || review?.verdict === 'accepted')) return 'accepted'
   // 3. 已取消的工作不再向人要验收。
   if (taskStatus === 'canceled') return 'none'
   // 4. 当前授权下的阶段审查判了阻塞：这也是受阻。
   if (stageReview !== null && !stale && stageReview.verdict === 'blocked') return 'blocked'
-  // 5. 返工中：人工退回、当前授权要求返工，或返工派发还在办。
+  // 5. 还没有归档成果：候选已登记就是「准备中」，否则沿用任务状态本身。
+  if (!input.hasArtifact) return candidate !== null ? 'preparing' : 'none'
+  // 6. 有成果但没有可验收的候选，或它是历史版本：已归档，不归当前工作。
+  //    返工与审查只属于链头；旧版本不能被接受，也不该冒充正在返工。
+  if (candidate === null || !latest) return 'ready'
+  // 7. 返工中：人工退回、当前授权要求返工，或返工派发还在办。
   if (candidate !== null && (candidate.acceptanceStatus === 'rejected' || review?.verdict === 'rejected')) return 'fixing'
   if (stageReview !== null && !stale && stageReview.verdict === 'request_changes') return 'fixing'
   if (dispatchInFlight(snapshot?.dispatches, input.taskId, 'rework', candidateId)) return 'fixing'
-  // 6. 还没有归档成果：候选已登记就是「准备中」，否则沿用任务状态本身。
-  if (!input.hasArtifact) return candidate !== null ? 'preparing' : 'none'
-  // 7. 有成果但没有可验收的候选：没有候选持有它，或它是历史版本（旧版本不能接受）。
-  if (candidate === null || !latest) return 'ready'
   // 8. 助手审查还在办：不归你处理，也绝不说「等你」。
   if (dispatchInFlight(snapshot?.dispatches, input.taskId, 'review', candidateId)) return 'reviewing'
   // 9. 控制事实还没读到：pending 不外推成「等你」。
@@ -314,6 +322,7 @@ export function artifactCandidateFacts(
     hasArtifact: true,
     taskId: ownedTaskId,
     taskStatus: task?.status ?? null,
+    blockedReason: task?.blockedReason ?? null,
     candidate: owner,
     latest,
     reviews: bundle.reviews,

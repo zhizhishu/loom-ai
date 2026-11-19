@@ -72,6 +72,7 @@ export function workStatus(item: WorkStatusInput): { label: string; group: strin
     hasArtifact: item.hasArtifact ?? item.candidate !== null,
     taskId: item.task.taskId,
     taskStatus: item.task.status,
+    blockedReason: item.task.blockedReason,
     candidate: item.candidate,
     latest: true,
     reviews: item.reviews ?? [],
@@ -160,7 +161,9 @@ export function Inspector({ agents, bundles, agent, mode, tab, onMode, onClose, 
     if (!rows.length) return null
     const list = <div className="ln-task-list">{rows.map(item => {
       const status = workStatus(item); const member = agents.find(person => person.agentId === item.task.assigneeAgentId)
-      return <button className="ln-task-card" type="button" key={item.task.taskId} onClick={() => setSelectedTaskId(item.task.taskId)}><Icon name={status.icon} size={21}/><span className="ln-task-content"><span className="ln-task-firstline"><strong>{item.task.title}</strong><time>{relativeDate(item.task.updatedAt)}</time></span><span className="ln-task-subtitle">{member && <Avatar agent={member} size={12}/>}<span>{member?.displayName || '未指派'} · {item.task.blockedReason || item.task.description || status.label}</span></span></span><Icon name="right" size={14}/></button>
+      // 状态总是写出来：描述/阻塞原因只做补充，不能把「审查中」「返工中」「受阻」藏掉。
+      const detail = item.task.blockedReason || item.task.description
+      return <button className="ln-task-card" type="button" key={item.task.taskId} onClick={() => setSelectedTaskId(item.task.taskId)}><Icon name={status.icon} size={21}/><span className="ln-task-content"><span className="ln-task-firstline"><strong>{item.task.title}</strong><time>{relativeDate(item.task.updatedAt)}</time></span><span className="ln-task-subtitle">{member && <Avatar agent={member} size={12}/>}<span>{member?.displayName || '未指派'} · <span data-state={status.group}>{status.label}</span>{detail ? ` · ${detail}` : ''}</span></span></span><Icon name="right" size={14}/></button>
     })}</div>
     return group === '已完成' ? <details key={group} className="ln-completed-group"><summary><span>{group}（{rows.length}）</span><i/><Icon name="right" size={13}/></summary>{list}</details>
       : <section key={group} className="ln-work-group"><h3>{group}（{rows.length}）<i/></h3>{list}</section>

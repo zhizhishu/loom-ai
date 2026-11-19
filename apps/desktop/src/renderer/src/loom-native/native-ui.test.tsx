@@ -121,6 +121,31 @@ describe('native reference frontend boundaries', () => {
   it('does not hide blocked work behind a pending candidate', () => {
     expect(workStatus({task:{...task,status:'blocked'},mission,candidate:first}).group).toBe('受阻')
   })
+  it('treats a Core blocker written only onto the task as blocked', () => {
+    // 预算耗尽/前置结果未知不改任务状态，只写 blocked_reason：仍必须说「受阻」。
+    for (const reason of ['loom.dispatch_budget_exhausted','loom.rework_budget_exhausted','loom.dispatch_previous_outcome_unknown'] as const) {
+      expect(workStatus({task:{...task,status:'in_review',blockedReason:reason},mission,candidate:first,control:observed()}))
+        .toMatchObject({label:'受阻',group:'受阻'})
+    }
+  })
+  it('prints the derived status on the card even when the task already has a description', () => {
+    const card = (control: WorkControlFacts, tasks: LoomTask[] = [task]) => {
+      const html = renderToStaticMarkup(createElement(Inspector, {
+        agents: [], bundles: [bundle([first], { control, tasks })],
+        agent: null, mode: 'work' as const, tab: 'work' as const,
+        onTab: () => {}, onMode: () => {}, onClose: () => {}, onExpand: () => {}, expanded: false,
+        onArtifact: () => {}, onOpenConversation: () => {}, loading: false
+      }))
+      return html.match(/<button class="ln-task-card"[\s\S]*?<\/button>/)?.[0] ?? ''
+    }
+    // 有描述的任务不能把状态顶掉：描述与状态同时可见。
+    const reviewing = card(observed({ dispatches: [dispatch()] }))
+    expect(reviewing).toContain('Actual description')
+    expect(reviewing).toContain('审查中')
+    expect(card(observed({ policy: policy(), stageReviews: [stageReview({ verdict: 'request_changes' })] }))).toContain('返工中')
+    const blocked: LoomTask = { ...task, blockedReason: 'loom.rework_budget_exhausted' }
+    expect(card(observed(), [blocked])).toContain('受阻')
+  })
 })
 
 describe('native immutable artifact and explicit acceptance', () => {
@@ -194,6 +219,22 @@ describe('artifact status never says you are being waited on while the machine r
   it('shows the rework and archived states in the same place', () => {
     expect(renderToStaticMarkup(createElement(ArtifactReviewStatus,{kind:'fixing'}))).toContain('返工中')
     expect(renderToStaticMarkup(createElement(ArtifactReviewStatus,{kind:'ready'}))).toContain('已归档')
+  })
+  it('keeps a superseded artifact archived instead of reporting a rework in progress', () => {
+    const second = {...first,candidateId:'c2',agentRunId:'r2',evidenceIds:['file2'],previousCandidateId:'c1',createdAt:'2026-11-13T00:05:00Z'}
+    const secondArtifact = {...artifact,artifactId:'file2',sha256:'b'.repeat(64),createdAt:'2026-11-13T00:05:00Z'}
+    // c1 已被 c2 取代，返工说的是链头 c2：旧归档只能显示「已归档」，不能声称助手在改它。
+    const facts = artifactCandidateFacts(bundle([first,second],{
+      artifacts:[artifact,secondArtifact],
+      control: observed({ policy: policy(), stageReviews: [stageReview({candidateId:'c2',verdict:'request_changes'})] })
+    }), artifact, null)
+    expect(facts.candidate?.candidateId).toBe('c1')
+    expect(facts.latest).toBe(false)
+    expect(facts.reviewKind).toBe('ready')
+    const html = renderToStaticMarkup(createElement(ArtifactReviewStatus,{kind:facts.reviewKind}))
+    expect(html).toContain('已归档')
+    expect(html).not.toContain('返工中')
+    expect(html).not.toContain('等你')
   })
   it('renders nothing when there is no artifact-side conclusion to show', () => {
     expect(renderToStaticMarkup(createElement(ArtifactReviewStatus,{kind:'none'}))).toBe('')
