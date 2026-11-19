@@ -517,7 +517,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 186;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 187;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -1028,6 +1028,7 @@ struct CurrentMigrationState {
     v234: bool,
     v235: bool,
     v236: bool,
+    v237: bool,
 }
 
 impl CurrentMigrationState {
@@ -1049,6 +1050,14 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v237 {
+            let mut previous = *self;
+            previous.v237 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 187
+                && self.v236
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 186, classifier);
+        }
         if self.v236 {
             let mut previous = *self;
             previous.v236 = false;
@@ -3955,6 +3964,7 @@ pub(crate) fn classify_database_contract(
                 | 184
                 | 185
                 | 186
+                | 187
         )
     {
         let expected_migration = marker.projection_schema_version + 50;
@@ -6321,7 +6331,8 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=233),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=234),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=235),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=236)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=236),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=237)
         "#,
         [],
         |row| {
@@ -6493,6 +6504,7 @@ fn load_current_migration_state(
                 v234: row.get(164)?,
                 v235: row.get(165)?,
                 v236: row.get(166)?,
+                v237: row.get(167)?,
             })
         },
     )
@@ -9869,6 +9881,9 @@ impl Database {
             if !self.schema_migration_applied(236)? {
                 migration_step!("migration_236", local_hook_migration::migrate(self));
             }
+            if !self.schema_migration_applied(237)? {
+                migration_step!("migration_237", loom::migrate_recovery_ledger(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10810,6 +10825,9 @@ impl Database {
         }
         if !self.schema_migration_applied(236)? {
             migration_step!("migration_236", local_hook_migration::migrate(self));
+        }
+        if !self.schema_migration_applied(237)? {
+            migration_step!("migration_237", loom::migrate_recovery_ledger(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -42642,6 +42660,7 @@ mod tests {
             v234: version >= 234,
             v235: version >= 235,
             v236: version >= 236,
+            v237: version >= 237,
         }
     }
 
@@ -42914,10 +42933,16 @@ mod tests {
                 235,
             ),
             (
+                "v1.72/schema 186 before the LOOM recovery ledger",
+                "v1.72",
+                186,
+                236,
+            ),
+            (
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                236,
+                237,
             ),
             (
                 "v1.72/schema 152 before compact operations",
@@ -43493,7 +43518,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(236);
+        let current = migration_state_through(237);
         assert!(current.admits(
             CURRENT_DATA_CONTRACT_VERSION,
             CURRENT_PROJECTION_SCHEMA_VERSION,
@@ -44269,7 +44294,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(236));
+        assert_eq!(state, migration_state_through(237));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
