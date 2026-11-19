@@ -30,7 +30,7 @@ fi
 t0=$(date +%s)
 docker build -t loom-dev:base $B/image && echo "image ok $(( $(date +%s)-t0 ))s"
 if ! docker ps -a --format '{{.Names}}' | grep -qx loom-dev; then
-  docker run -d --name loom-dev --restart unless-stopped \
+  docker run -d --init --name loom-dev --restart unless-stopped \
     -v $B/src:/src -v $B/cospan:/opt/cospan:ro \
     -v $B/cache/cargo-registry:/opt/cargo/registry -v $B/cache/cargo-git:/opt/cargo/git \
     -v $B/cache/target:/cache/target -v $B/cache/pnpm:/root/.local/share/pnpm \

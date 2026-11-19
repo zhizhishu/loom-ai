@@ -703,6 +703,41 @@ struct ArtifactIdentity {
     state_key: String,
 }
 
+impl ArtifactIdentity {
+    /// Admission revalidation compares every identity segment except the unix
+    /// ctime. The bundled SQLite `fchown`s `-wal`/`-journal` on open and Linux
+    /// refreshes their ctime under euid 0, so an untouched database would
+    /// otherwise look replaced. Object (dev:inode), byte length and the content
+    /// mtime must still match: a replacement, a rename onto the path or a content
+    /// write is still refused. Windows state keys carry no ctime, so its
+    /// comparison keeps exactly the strictness of `Self: PartialEq`.
+    fn unchanged_by_admission(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            self.object == other.object
+                && self.byte_length == other.byte_length
+                && state_key_mtime_matches(&self.state_key, &other.state_key)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+/// Compares only the content mtime segments (`mtime:mtime_nsec`) of two unix
+/// artifact state keys and rejects a malformed key. One parser serves both the
+/// legacy-rename exemption and admission revalidation.
+#[cfg(unix)]
+fn state_key_mtime_matches(left: &str, right: &str) -> bool {
+    let left = left.split(':').collect::<Vec<_>>();
+    let right = right.split(':').collect::<Vec<_>>();
+    left.len() == 4 && right.len() == 4 && left[..2] == right[..2]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AuthorityArtifactIdentityToken {
@@ -713,21 +748,20 @@ pub(crate) struct AuthorityArtifactIdentityToken {
 
 impl AuthorityArtifactIdentityToken {
     /// Only old manifest recovery may explain a rename's ctime change. Ordinary
-    /// admission still compares the entire token strictly. Object, size and
-    /// content mtime must all match; a replacement or content write is refused.
+    /// admission applies the same ctime-blind rule to freshly observed
+    /// identities (`ArtifactIdentity::unchanged_by_admission`); the token itself
+    /// still compares strictly, so a manifest written with a stale token is never
+    /// accepted as an exact match. Object, size and content mtime must all match;
+    /// a replacement or content write is refused.
     pub(crate) fn matches_legacy_rename(&self, before: &Self) -> bool {
         if self == before {
             return true;
         }
         #[cfg(unix)]
         {
-            let after_times = self.state_key.split(':').collect::<Vec<_>>();
-            let before_times = before.state_key.split(':').collect::<Vec<_>>();
             self.object_key == before.object_key
                 && self.byte_length == before.byte_length
-                && after_times.len() == 4
-                && before_times.len() == 4
-                && after_times[..2] == before_times[..2]
+                && state_key_mtime_matches(&self.state_key, &before.state_key)
         }
         #[cfg(not(unix))]
         {
@@ -775,6 +809,9 @@ pub(crate) struct NamespaceArtifactSet {
 }
 
 impl NamespaceArtifactSet {
+    /// Admission's own identity fence. A ctime-only difference is not evidence of
+    /// a replacement: see `ArtifactIdentity::unchanged_by_admission`. Sidecar
+    /// presence must still match exactly.
     fn authority_unchanged(&self, other: &Self) -> bool {
         [
             (&self.main, &other.main),
@@ -782,9 +819,9 @@ impl NamespaceArtifactSet {
             (&self.rollback_journal, &other.rollback_journal),
         ]
         .into_iter()
-        .all(|(before, after)| {
-            before.as_ref().map(|artifact| &artifact.identity)
-                == after.as_ref().map(|artifact| &artifact.identity)
+        .all(|(before, after)| match (before, after) {
+            (Some(before), Some(after)) => before.identity.unchanged_by_admission(&after.identity),
+            _ => before.is_some() == after.is_some(),
         })
     }
 
@@ -1469,6 +1506,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn admission_revalidation_ignores_only_a_ctime_change_on_unix() {
+        #[cfg(unix)]
+        fn replace_segment(state_key: &str, index: usize, value: &str) -> String {
+            let mut segments = state_key
+                .split(':')
+                .map(|segment| segment.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(segments.len(), 4, "unix state keys are mtime then ctime");
+            segments[index] = value.to_string();
+            segments.join(":")
+        }
+
+        let directory = TestDirectory::new("ctime-only-revalidation");
+        let lease = CoreDataDirLease::acquire(&directory.0).unwrap();
+        let main = directory.0.join("rovai.sqlite");
+        let wal = directory.0.join("rovai.sqlite-wal");
+        std::fs::write(&main, b"authority bytes").unwrap();
+        std::fs::write(&wal, b"frames").unwrap();
+        let before = observe_namespace(&lease, AuthorityNamespace::Rovai)
+            .ok()
+            .unwrap();
+        assert!(
+            before.wal.is_some(),
+            "the authority sidecar must be observed"
+        );
+
+        // The refresh the bundled SQLite causes under euid 0: ctime moves on the
+        // authority artifacts while object, byte length and content mtime stay.
+        #[cfg(unix)]
+        let refreshed = {
+            let mut refreshed = before.clone();
+            for artifact in [&mut refreshed.main, &mut refreshed.wal] {
+                let artifact = artifact.as_mut().unwrap();
+                let state_key = replace_segment(&artifact.identity.state_key, 2, "-1");
+                artifact.identity.state_key = replace_segment(&state_key, 3, "123456789");
+            }
+            refreshed
+        };
+        #[cfg(not(unix))]
+        let refreshed = {
+            // Windows identities carry no ctime: any state difference is a real one.
+            let mut refreshed = before.clone();
+            refreshed
+                .main
+                .as_mut()
+                .unwrap()
+                .identity
+                .state_key
+                .push_str(":changed");
+            refreshed
+        };
+
+        // The observation keeps the ctime in its identity: only the admission
+        // comparison below is ctime-blind.
+        assert!(
+            before.main.as_ref().unwrap().identity != refreshed.main.as_ref().unwrap().identity,
+            "the observation itself stays ctime-strict"
+        );
+        assert_eq!(
+            before.authority_unchanged(&refreshed),
+            cfg!(unix),
+            "only the unix ctime is exempt from admission revalidation"
+        );
+
+        let mut replaced = refreshed.clone();
+        replaced.main.as_mut().unwrap().identity.object = {
+            let other = directory.0.join("other-authority-object.sqlite");
+            std::fs::write(&other, b"authority bytes").unwrap();
+            FilesystemObjectIdentity::observe(&other).unwrap()
+        };
+        assert!(!before.authority_unchanged(&replaced), "object replacement");
+
+        let mut resized = refreshed.clone();
+        resized.main.as_mut().unwrap().identity.byte_length += 1;
+        assert!(!before.authority_unchanged(&resized), "byte length");
+
+        let mut missing_sidecar = before.clone();
+        missing_sidecar.wal = None;
+        assert!(
+            !before.authority_unchanged(&missing_sidecar),
+            "sidecar presence"
+        );
+
+        #[cfg(unix)]
+        {
+            let mut rewritten = before.clone();
+            let state_key = replace_segment(
+                &rewritten.main.as_ref().unwrap().identity.state_key,
+                0,
+                "-1",
+            );
+            rewritten.main.as_mut().unwrap().identity.state_key = state_key;
+            assert!(!before.authority_unchanged(&rewritten), "content mtime");
+
+            let mut malformed = before.clone();
+            malformed.main.as_mut().unwrap().identity.state_key = "1:2:3".to_string();
+            assert!(
+                !before.authority_unchanged(&malformed),
+                "malformed state key"
+            );
+        }
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -1791,7 +1932,10 @@ mod tests {
             let tagged = observe_namespace(&lease, AuthorityNamespace::Rovai)
                 .ok()
                 .unwrap();
-            assert!(!untagged_wal.authority_unchanged(&tagged));
+            assert!(untagged_wal.authority_unchanged(&tagged));
+            // Admission tolerates the ctime that attaching the xattr bumps, so the
+            // provenance refresh must be selected by the xattr transition itself,
+            // not by the identity comparison.
             assert!(untagged_wal.macos_provenance_only_change(&tagged));
             std::fs::write(&main, b"changed authority").unwrap();
             let changed = observe_namespace(&lease, AuthorityNamespace::Rovai)

@@ -64,8 +64,8 @@
 - Linux 下 4 个失败，**根因已在 Bero 复现确认（2026-11-18 22:55 PST，Pi 工兵只读定位 + Hark 复测）**：
   - `runtime_probe_process` 进程组 ×1：容器缺 init。`docker run --init` 下 5/5 通过。
   - `database_admission` ×3：unix 的 `artifact_state_key`（`database_admission.rs` 约 1096 行）把 ctime 算进身份；bundled SQLite 在 euid=0 时每次打开 `-wal`/`-journal` 都 `fchown`，Linux 会刷新 ctime，于是 `db.rs` 约 7871 行的严格复核判成 `IdentityChanged`。同一测试二进制：**root 9/12，uid 10001 12/12**。Windows 身份不含 ctime，所以没暴露。
-  - 修法待定（安全闸，需用户拍板）：①unix 身份去掉 ctime；②只在准入复核忽略 ctime；③不改代码，Core 一律非 root 运行（Dockerfile 已有此禁令）。终态上云时 root 运行必挂，不能只靠③。
-- 下一位接手顺序：① 重建 `loom-dev` 加 `--init` 并改非 root 用户跑测试；② 按用户选定修法改身份判等并补 root 场景测试；③ 在容器里装 Pi 固定版本、DSH `0.2.0-rc.2`、Codex（密钥只进容器环境），`cospan doctor --check` 见到 codex、dsh；④ 进 P0。
+  - **已修（2026-11-18 23:25 PST，方案②，Pi 工兵执笔、Hark 审+复测）**：`ArtifactIdentity::unchanged_by_admission` 只在 unix 准入复核忽略 ctime（dev:ino、长度、mtime 仍须一致；旁路文件有无须一致）；身份 token 与迁移 manifest 仍严格；Windows 不变。新增测试 `admission_revalidation_ignores_only_a_ctime_change_on_unix`；macOS xattr 断言同批翻转。Bero 容器 root + `--init`：**rovai-core lib 639 过 / 0 败 / 1 忽略**。Windows 上尚未跑此测试，macOS 未验证。
+- 下一位接手顺序：① ~~`--init`~~ 已重建；~~身份判等~~ 已修；② 用户电脑上跑一次 `cargo test -p rovai-core --lib database_admission::` 确认 Windows 不回退；③ 在容器里装 Pi 固定版本、DSH `0.2.0-rc.2`、Codex（密钥只进容器环境），`cospan doctor --check` 见到 codex、dsh；④ 进 P0。
 
 **留给 GitHub 与用户电脑**
 - Windows：Bero 通过后，由 GitHub 镜像仓库 Actions（`windows-package.yml`、`loom-v2-e3-windows.yml`）多构建 Windows 包；用户电脑只做安装冒烟，不碰 64851/64852、日常 userData。
