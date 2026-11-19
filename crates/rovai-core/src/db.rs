@@ -3489,32 +3489,14 @@ fn connection_has_admissible_data_contract(connection: &Connection) -> rusqlite:
         .ok()
         .and_then(Option::as_ref)
         .is_some_and(|(contract, schema, _)| {
+            // Every schema from the oldest supported contract through the current projection is
+            // decided by `classify_database_contract`, which validates each schema's own shape and
+            // requires only that schema's receipt. Spelling the handled range out as a literal
+            // list let it stop at the schema that happened to be current when it was written, so
+            // a current store missing one *historical* receipt was judged inadmissible and fell
+            // back to the legacy full-chain path that `Current` never needs.
             contract == CURRENT_DATA_CONTRACT_VERSION
-                && matches!(
-                    schema,
-                    145 | 146
-                        | 147
-                        | 148
-                        | 149
-                        | 150
-                        | 151
-                        | 152
-                        | 153
-                        | 154
-                        | 155
-                        | 156
-                        | 157
-                        | 158
-                        | 159
-                        | 160
-                        | 161
-                        | 162
-                        | 163
-                        | 164
-                        | 165
-                        | 166
-                        | 167
-                )
+                && (145..=CURRENT_PROJECTION_SCHEMA_VERSION).contains(schema)
         })
     {
         return Ok(matches!(
