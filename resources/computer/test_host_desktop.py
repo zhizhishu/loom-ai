@@ -502,6 +502,14 @@ LIVE_MARKER = "Mikka isolated CUA input"
 LIVE_TOOLS = ("Xvfb", "xdpyinfo", "xdotool", "xmessage", "xterm")
 # The bottom-left default button, as measured in the upstream fixture.
 BUTTON_INSET = (16, 14)
+# The isolated display handshake is POSIX-only: `os.pipe` + `select` and
+# `Popen(pass_fds=...)` do not exist on Windows, while the Windows CI runs this
+# whole file (`-p 'test_*.py'`). Those checks are skipped there; the real desktop
+# acceptance keeps running in full on Linux.
+POSIX_ONLY = unittest.skipIf(
+    sys.platform == "win32",
+    "the isolated X display handshake needs POSIX pipes, select and pass_fds",
+)
 
 
 def live_acceptance_enabled(value=None):
@@ -828,6 +836,7 @@ class LiveFixtureContract(unittest.TestCase):
         self.assertEqual(button_point((0, 0, 400, 140)), (16, 126))
         self.assertEqual(button_point((10, 20, 800, 300)), (26, 306))
 
+    @POSIX_ONLY
     def test_the_handshake_reads_only_a_display_number_xvfb_reported(self):
         for reported, expected in [(b"104\n", 104), (b":7\n", None),
                                    (b"", None), (b"banana\n", None)]:
@@ -884,6 +893,7 @@ class LiveFixtureContract(unittest.TestCase):
         self.assertIsNone(display.process)
         display.stop()  # idempotent teardown
 
+    @POSIX_ONLY
     def test_a_failing_xvfb_is_retried_and_reported(self):
         class CountingDisplay(IsolatedDisplay):
             attempts = 0
