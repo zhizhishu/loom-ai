@@ -889,15 +889,18 @@ pub fn stage_review_record(
     // Only the Run this Candidate's review was actually bound to may answer it, and it must be the
     // binding of *this* authorization. A dispatch the platform wrote under an authorization the
     // Owner has since replaced named a Run for an older grant: re-labeling that Run with the new
-    // revision does not make the standing grant ask it. With no dispatch at all the verdict is a
-    // human/Lead request, and the trusted Run above (assigned reviewer, not a producer) is its
-    // source.
+    // revision does not make the standing grant ask it. A Run the platform asked to review one
+    // delivery stays bound to that delivery, so it cannot re-aim itself at a rework nobody asked it
+    // about. Only a Run the control plane never asked anything at all is a human/Lead request, and
+    // there the trusted Run above (assigned reviewer, not a producer, outside the producing
+    // session) is the observer that was asked.
     match review_source(
         &transaction,
         &plan_id,
         &task_id,
         &candidate_id,
         policy_revision,
+        &trusted_run_id,
     )? {
         ReviewSource::NotDispatched => {}
         ReviewSource::DispatchedTo(dispatched_run_id) if dispatched_run_id == trusted_run_id => {}
@@ -922,6 +925,15 @@ pub fn stage_review_record(
                 LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
                 format!(
                     "the review of candidate {candidate_id} was dispatched under authorization revision {dispatched_revision}; the standing grant {policy_revision} has dispatched no review to agent run {trusted_run_id}"
+                ),
+            ));
+        }
+        ReviewSource::BoundElsewhere(binding) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
+                format!(
+                    "agent run {trusted_run_id} was dispatched to review candidate {} of task {} under authorization revision {}; it is not the observer this Candidate's review asked for",
+                    binding.candidate_id, binding.task_id, binding.policy_revision
                 ),
             ));
         }
@@ -1552,8 +1564,9 @@ fn agent_of_run(connection: &Connection, agent_run_id: &str) -> Result<Option<St
 /// The source a Candidate's review is bound to, derived from the persisted dispatch ledger.
 #[derive(Debug, PartialEq, Eq)]
 enum ReviewSource {
-    /// No review dispatch exists for this Candidate under any authorization, so this is a human or
-    /// Lead request: the trusted Run the Host resolved is the observer it asked.
+    /// No review dispatch of this Candidate exists under any authorization *and* the asking Run was
+    /// never dispatched to review anything else in this Plan, so this is a human or Lead request:
+    /// the trusted Run the Host resolved is the observer it asked.
     NotDispatched,
     /// The standing authorization dispatched the review and this Run claimed its Delivery: only it
     /// may answer.
@@ -1565,6 +1578,18 @@ enum ReviewSource {
     /// replaced, so the standing grant has not asked any Run. Its claimed Run — the one the old
     /// grant asked — cannot answer under the new revision.
     SupersededAuthorization(i64),
+    /// This Candidate's review was never dispatched, but the Run asking already holds a review
+    /// dispatch of another delivery: the platform asked that Run for something else, and pointing it
+    /// at a newer Candidate does not make the standing grant ask it for this one.
+    BoundElsewhere(ReviewBinding),
+}
+
+/// The review request one Run was dispatched to answer, as the ledger recorded it.
+#[derive(Debug, PartialEq, Eq)]
+struct ReviewBinding {
+    task_id: String,
+    candidate_id: String,
+    policy_revision: i64,
 }
 
 /// Which Run, under which authorization, the platform bound this Candidate's review to.
@@ -1572,12 +1597,20 @@ enum ReviewSource {
 /// The ledger is keyed by `(REVIEW, plan, task, candidate, authorization revision)`, so a Candidate
 /// carries at most one such dispatch per grant. Reading the newest dispatch of the Candidate is what
 /// makes a re-approved grant observable: a Run named by an older grant stays bound to that grant.
+///
+/// The Candidate-scoped read alone is not enough, because the Candidate is named by the payload: a
+/// rework that nobody has dispatched yet would look like "this Candidate was never dispatched" to
+/// every Run in the Plan, including the Run the platform asked to review the *previous* delivery.
+/// So when this Candidate carries no dispatch, the asking Run's own dispatch is what decides: a Run
+/// the platform asked to review something else cannot answer, and only a Run the control plane never
+/// asked at all is left to the human/Lead path.
 fn review_source(
     connection: &Connection,
     plan_id: &str,
     task_id: &str,
     candidate_id: &str,
     policy_revision: i64,
+    trusted_run_id: &str,
 ) -> Result<ReviewSource> {
     let newest: Option<(i64, Option<String>)> = connection
         .query_row(
@@ -1593,13 +1626,49 @@ fn review_source(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    Ok(match newest {
+    if let Some(newest) = newest {
+        return Ok(match newest {
+            (dispatched_revision, _) if dispatched_revision != policy_revision => {
+                ReviewSource::SupersededAuthorization(dispatched_revision)
+            }
+            (_, Some(run_id)) => ReviewSource::DispatchedTo(run_id),
+            (_, None) => ReviewSource::Unclaimed,
+        });
+    }
+    // This Candidate carries no review dispatch, so the Run asking has to prove it was never asked
+    // to review something else. A dispatch whose identity is not exactly this request is what the
+    // platform asked it for, and re-labelling the payload cannot turn that into this one.
+    let bound_elsewhere: Option<ReviewBinding> = connection
+        .query_row(
+            "SELECT dispatch.task_id, COALESCE(dispatch.candidate_id,''),
+                    dispatch.policy_revision
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.plan_id=?1 AND dispatch.kind='REVIEW'
+               AND delivery.claimed_agent_run_id=?2
+               AND NOT (dispatch.task_id=?3 AND COALESCE(dispatch.candidate_id,'')=?4
+                        AND dispatch.policy_revision=?5)
+             ORDER BY dispatch.created_at DESC, dispatch.dispatch_id DESC
+             LIMIT 1",
+            params![
+                plan_id,
+                trusted_run_id,
+                task_id,
+                candidate_id,
+                policy_revision
+            ],
+            |row| {
+                Ok(ReviewBinding {
+                    task_id: row.get(0)?,
+                    candidate_id: row.get(1)?,
+                    policy_revision: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(match bound_elsewhere {
+        Some(binding) => ReviewSource::BoundElsewhere(binding),
         None => ReviewSource::NotDispatched,
-        Some((dispatched_revision, _)) if dispatched_revision != policy_revision => {
-            ReviewSource::SupersededAuthorization(dispatched_revision)
-        }
-        Some((_, Some(run_id))) => ReviewSource::DispatchedTo(run_id),
-        Some((_, None)) => ReviewSource::Unclaimed,
     })
 }
 
