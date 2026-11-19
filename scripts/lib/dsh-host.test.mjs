@@ -351,3 +351,226 @@ test('DSH selected local Hook fences the root session, exact command, policy and
     assert.equal(observations().filter(row => row.kind === 'result' && row.aborted).length, 1)
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
+
+test('DSH concurrent local Hook callbacks preserve separate native handler receipts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rovai-dsh-hook-concurrent-'))
+  try {
+    const launch = { schemaVersion: 1, agentRunId: 'run-concurrent', executionEpoch: 4,
+      snapshotDigest: 'a'.repeat(64), hookId: 'reviewed-hook', workspaceRoot: root,
+      sandboxMode: 'workspace-write', model: 'model',
+      settings: { hooks: { PostToolUse: [{ matcher: '^read$', hooks: [
+        { type: 'command', command: 'reviewed command', timeout: 1 }
+      ] }] } } }
+    const config = { localHook: launch, bindingRoot: root, observationRoot: root,
+      localHookExecutor: { schemaVersion: 1, node: process.execPath, root,
+        launchPath: join(root, 'local-hook-launch.json'), manifestDigest: 'b'.repeat(64),
+        launchDigest: 'c'.repeat(64) } }
+    const bootstrap = 'Concurrent root binding'
+    writeFileSync(join(root, 'session-a.json'), JSON.stringify({ schemaVersion: 1,
+      sessionId: 'session-a', bootstrap,
+      sha256: createHash('sha256').update(bootstrap).digest('hex') }))
+    const events = new Map(), seen = []
+    const policy = { mode: 'workspace-write', workspaceRoot: root, additionalWritableRoots: [] }
+    let entered = 0, releaseEnsure, bothWaiting
+    const gate = new Promise(resolve => { releaseEnsure = resolve })
+    const waiting = new Promise(resolve => { bothWaiting = resolve })
+    const protocol = {
+      appendHookInvoked(session, record) { session.append('hook/invoked', record) },
+      appendHookResult(session, { output, ...record }) {
+        session.append('hook/result', { ...record, exitCode: output.exitCode,
+          stderrSummary: output.stderr, decision: 'pass' })
+      }
+    }
+    const local = {
+      loader: { import: async name => { assert(name.endsWith('hook-protocol')); return protocol } },
+      sandboxPolicy: { resolve: () => policy },
+      agents: { turnBoundaryOf: () => ({ lastTurn: 7 }) },
+      workingDirectory: { async ensure() {
+        if (++entered === 2) bothWaiting()
+        await gate
+        return root
+      } },
+      effect: () => {},
+      on: (name, listener) => events.set(name, listener)
+    }
+    const ctx = { plugin: definition => {
+      const task = definition.apply(local)
+      return { await: () => task }
+    } }
+    const calls = []
+    await installLocalHooks(ctx, config, async (executor, actualLaunch, mode, input) => {
+      if (mode === 'verify') return { manifestDigest: executor.manifestDigest }
+      assert.deepEqual(actualLaunch, launch)
+      calls.push(input)
+      return { output: { exitCode: 0, stderr: 'private error summary' }, durationMs: 1,
+        facts: { aborted: false, timedOut: false, sandboxEnforcement: 'partial', sandboxDenied: false } }
+    })
+    let seq = 1
+    const session = { id: 'session-a', header: {},
+      append(type, data) {
+        seen.push({ type, ...data })
+        events.get('session/event')(this, { type, data, seq: seq++ })
+      } }
+    const exec = { agent: { session }, name: 'read', arguments: {},
+      signal: new AbortController().signal }
+    const content = { content: [{ type: 'text', text: 'read output' }] }
+    const invoke = events.get('tools/post-execute')
+    const next = async () => ({ kind: 'pass' })
+    const first = invoke({ ...exec, callId: 'native-call-1' }, content, next)
+    const second = invoke({ ...exec, callId: 'native-call-2' }, content, next)
+    await waiting
+    releaseEnsure()
+    assert.deepEqual(await Promise.all([first, second]), [{ kind: 'pass' }, { kind: 'pass' }])
+    assert.deepEqual(calls.map(row => row.payload.tool_use_id), ['native-call-1', 'native-call-2'])
+    const handlerIds = calls.map(row => row.handlerId)
+    assert.equal(new Set(handlerIds).size, 2, 'overlapping callbacks must not share handlerId')
+    for (const id of handlerIds) {
+      assert.equal(seen.filter(row => row.type === 'hook/invoked' && row.handlerId === id).length, 1)
+      assert.equal(seen.filter(row => row.type === 'hook/result' && row.handlerId === id).length, 1)
+    }
+    const receipts = readdirSync(root).filter(name => name.includes('.hook-'))
+    assert.equal(receipts.length, 4)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+// DSH 0.2 removed `workingDirectory` and the `agents` turn-boundary helper. A
+// projection-era Host therefore has no way to supply a guessed cwd or turn, and
+// these cases pin the exact fields it must supply instead.
+const projectionFixture = root => {
+  const launch = { schemaVersion: 1, agentRunId: 'run-projection', executionEpoch: 5,
+    snapshotDigest: 'a'.repeat(64), hookId: 'reviewed-hook', workspaceRoot: root,
+    sandboxMode: 'workspace-write', model: 'reviewed-model',
+    settings: { hooks: { PostToolUse: [{ matcher: '^read$', hooks: [
+      { type: 'command', command: 'reviewed command', timeout: 1 }
+    ] }] } } }
+  const bootstrap = 'Projection root binding'
+  writeFileSync(join(root, 'session-a.json'), JSON.stringify({ schemaVersion: 1,
+    sessionId: 'session-a', bootstrap,
+    sha256: createHash('sha256').update(bootstrap).digest('hex') }))
+  return { launch, config: { localHook: launch, bindingRoot: root, observationRoot: root,
+    localHookExecutor: { schemaVersion: 1, node: process.execPath, root,
+      launchPath: join(root, 'local-hook-launch.json'), manifestDigest: 'b'.repeat(64),
+      launchDigest: 'c'.repeat(64) } } }
+}
+
+const projectionProtocol = () => ({
+  appendHookInvoked(session, record) { session.append('hook/invoked', record) },
+  appendHookResult(session, { output, ...record }) {
+    session.append('hook/result', { ...record, exitCode: output.exitCode,
+      stderrSummary: output.stderr, decision: 'pass' })
+  }
+})
+
+// One Host object: the projection registry is reachable only through
+// `reflect.get`, and the removed `workingDirectory` service throws on read.
+const projectionHost = ({ events, cleanups, resolve, projections, alsoAgentTurn }) => ({
+  reflect: { get: name => ({
+    sessionProjections: projections,
+    agents: alsoAgentTurn ? { turnBoundaryOf: () => ({ lastTurn: 99 }) } : undefined,
+    workingDirectory: undefined
+  })[name] },
+  loader: { import: async name => { assert(name.endsWith('hook-protocol')); return projectionProtocol() } },
+  get shell() { throw new Error('the native global shell must never execute a reviewed local Hook') },
+  get workingDirectory() { throw new Error('0.2 has no workingDirectory service') },
+  sandboxPolicy: { resolve },
+  effect: factory => cleanups.push(factory()),
+  on: (name, listener) => events.set(name, listener)
+})
+
+test('DSH 0.2 Session contract supplies the turn, the header cwd and the Session policy', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rovai-dsh-projection-'))
+  try {
+    const { launch, config } = projectionFixture(root)
+    const events = new Map(), cleanups = [], resolved = [], calls = []
+    const policy = { mode: 'workspace-write', workspaceRoot: root, additionalWritableRoots: [],
+      sessionId: 'session-a' }
+    let seq = 1
+    const session = { id: 'session-a', header: { cwd: root },
+      append(type, data) { events.get('session/event')(this, { type, data, seq: seq++ }) } }
+    const projections = { stateOf: (target, key) => {
+      assert.equal(target, session)
+      assert.equal(key, 'turnBoundary')
+      return { lastTurn: 7 }
+    } }
+    const local = projectionHost({ events, cleanups, projections, alsoAgentTurn: true,
+      resolve: request => {
+        resolved.push(request === undefined ? 'default' : request.session.id)
+        return policy
+      } })
+    const ctx = { plugin: definition => { const task = definition.apply(local); return { await: () => task } } }
+    await installLocalHooks(ctx, config, async (executor, exactLaunch, mode, input) => {
+      if (mode === 'verify') return { manifestDigest: executor.manifestDigest }
+      assert.deepEqual(exactLaunch, launch)
+      calls.push(input)
+      return { output: { exitCode: 0, stderr: '' }, durationMs: 1,
+        facts: { aborted: false, timedOut: false, sandboxEnforcement: 'partial', sandboxDenied: false } }
+    })
+    // Startup can only check the deployment default; every callback re-resolves
+    // for its own Session, which is how a 0.2 policy reports the effective mode.
+    assert.deepEqual(resolved, ['default'])
+    const exec = { agent: { session }, name: 'read', callId: 'native-call',
+      arguments: { path: 'proof.txt' }, signal: new AbortController().signal }
+    assert.deepEqual(await events.get('tools/post-execute')(exec,
+      { content: [{ type: 'text', text: 'owned output' }] }, async () => ({ kind: 'pass' })),
+    { kind: 'pass' })
+    assert.deepEqual(resolved, ['default', 'session-a'])
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].turn, 7, 'the native projection outranks the legacy turn helper')
+    assert.equal(calls[0].payload.cwd, root, 'the frozen Session header is the only directory source')
+    assert.equal(calls[0].payload.turn_id, '7')
+    assert.equal(calls[0].payload.tool_use_id, 'native-call')
+    const receipts = readdirSync(root).filter(name => name.includes('.hook-'))
+      .map(name => JSON.parse(readFileSync(join(root, name), 'utf8')))
+    assert.deepEqual(receipts.map(row => [row.kind, row.turn, row.handlerId]),
+      [['invoked', 7, calls[0].handlerId], ['result', 7, calls[0].handlerId]])
+    assert.equal(receipts.every(row => row.sessionId === 'session-a'), true)
+    assert.equal(receipts.every(row => row.agentRunId === 'run-projection'), true)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test('DSH 0.2 refuses a guessed turn, a guessed directory or a foreign Session policy', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rovai-dsh-projection-refuse-'))
+  try {
+    const { config } = projectionFixture(root)
+    const rejections = async ({ projections, header, resolve, alsoAgentTurn, error }) => {
+      const events = new Map(), cleanups = [], calls = []
+      const local = projectionHost({ events, cleanups, resolve, projections, alsoAgentTurn })
+      const ctx = { plugin: definition => { const task = definition.apply(local); return { await: () => task } } }
+      await installLocalHooks(ctx, config, async (executor, exactLaunch, mode, input) => {
+        if (mode === 'verify') return { manifestDigest: executor.manifestDigest }
+        calls.push(input)
+        return { output: { exitCode: 0, stderr: '' }, durationMs: 1,
+          facts: { aborted: false, timedOut: false, sandboxEnforcement: 'partial', sandboxDenied: false } }
+      })
+      const session = { id: 'session-a', header,
+        append() { throw new Error('a refused Hook must not record a receipt') } }
+      const exec = { agent: { session }, name: 'read', callId: 'native-call',
+        arguments: {}, signal: new AbortController().signal }
+      await assert.rejects(events.get('tools/post-execute')(exec, { content: [] },
+        async () => ({ kind: 'pass' })), error)
+      assert.equal(calls.length, 0, 'a refused Hook never starts the reviewed command')
+      assert.equal(readdirSync(root).filter(name => name.includes('.hook-')).length, 0)
+    }
+    const policy = { mode: 'workspace-write', workspaceRoot: root, additionalWritableRoots: [],
+      sessionId: 'session-a' }
+    const projection = lastTurn => ({ stateOf: () => ({ lastTurn }) })
+    // 0.2 keeps the open turn in the projection registry; a missing state is not turn 0.
+    await rejections({ projections: projection(undefined), header: { cwd: root }, resolve: () => policy,
+      error: /native_turn_invalid/ })
+    // The Session header is the boundary. Without it 0.2 supplies no directory at all.
+    await rejections({ projections: projection(7), header: {}, resolve: () => policy,
+      error: /workspace_missing/ })
+    // A policy resolved for another Session is the wrong fence.
+    await rejections({ projections: projection(7), header: { cwd: root },
+      resolve: () => ({ ...policy, sessionId: 'session-b' }), error: /sandbox_session_mismatch/ })
+    // A Session override outranks the deployment default, so the old no-argument
+    // resolve is not evidence of the mode this call actually runs under.
+    await rejections({ projections: projection(7), header: { cwd: root },
+      resolve: request => request === undefined ? policy : { ...policy, mode: 'read-only' },
+      error: /scope_mismatch/ })
+    // A Host exposing neither contract is refused even though `agents` exists.
+    await rejections({ projections: undefined, header: { cwd: root }, alsoAgentTurn: false,
+      resolve: () => policy, error: /session_contract_unavailable/ })
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+

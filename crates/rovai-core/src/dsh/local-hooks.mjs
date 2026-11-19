@@ -1,14 +1,63 @@
 import { readFileSync, writeFileSync, renameSync, realpathSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { runPrivateExecutor } from './local-hook-executor.mjs'
 
 const hash = value => createHash('sha256').update(value).digest('hex')
+const fail = code => { throw new Error(code) }
+// A relative path would be resolved against this Host's own process directory,
+// which is exactly the inference this adapter must never make. Missing or
+// non-absolute input is a refusal, not a fallback.
 const rootIdentity = value => {
-  const root = realpathSync.native(value)
+  if (typeof value !== 'string' || value === '' || !isAbsolute(value)) fail('local_hook_workspace_unavailable')
+  let root
+  try {
+    root = realpathSync.native(value)
+  } catch {
+    fail('local_hook_workspace_unavailable')
+  }
   return process.platform === 'win32' ? root.toLowerCase() : root
 }
-const fail = code => { throw new Error(code) }
+
+// Cordis resolves a service the plugin did not inject only through
+// `ctx.reflect.get`; a bare property read on an inactive context throws. Plain
+// fixture objects expose the same names directly.
+const service = (local, name) => typeof local?.reflect?.get === 'function'
+  ? local.reflect.get(name, false)
+  : local?.[name]
+
+// The main Host owns the Session schema. 0.2 dropped `workingDirectory` and the
+// `agents` turn-boundary helper: the Session projection registry now carries the
+// open turn and the frozen Session header carries the absolute boundary, while
+// `sandboxPolicy.resolve` only computes a Session's effective mode when the
+// Session is passed in. Both contracts are supported; neither fact is ever
+// inferred, and a Host exposing neither is refused.
+function sessionContract(local) {
+  const projections = service(local, 'sessionProjections')
+  if (typeof projections?.stateOf === 'function') return 'projection'
+  if (typeof service(local, 'agents')?.turnBoundaryOf === 'function') return 'legacy'
+  fail('local_hook_session_contract_unavailable')
+}
+
+const turnOf = (local, contract, session) => contract === 'projection'
+  ? service(local, 'sessionProjections').stateOf(session, 'turnBoundary')?.lastTurn
+  : service(local, 'agents').turnBoundaryOf(session).lastTurn
+
+const policyOf = (local, contract, session) => contract === 'projection'
+  ? local.sandboxPolicy.resolve({ session })
+  : local.sandboxPolicy.resolve()
+
+// 0.2 binds the writable boundary to the immutable Session header. The legacy
+// `workingDirectory` seam is only consulted for a Host that carries no header
+// cwd at all; a 0.2 Host without one is refused rather than guessed.
+async function workspaceOf(local, contract, exec, signal) {
+  const headerCwd = exec?.agent?.session?.header?.cwd
+  if (typeof headerCwd === 'string' && headerCwd !== '') return headerCwd
+  if (contract === 'projection') fail('local_hook_workspace_missing')
+  const ensure = service(local, 'workingDirectory')?.ensure
+  if (typeof ensure !== 'function') fail('local_hook_workspace_missing')
+  return await ensure(exec.agent, signal)
+}
 
 // This adapter uses DSH's official Hook runner and durable event helpers.
 // It adds the Core Run/epoch/root-session fence that a process-global bridge
@@ -34,9 +83,14 @@ export function validateLaunch(launch) {
   return { tool: group.matcher.slice(1, -1), command: hook.command, timeoutSec: hook.timeout }
 }
 
-export function validatePolicy(policy, launch, root = rootIdentity) {
+export function validatePolicy(policy, launch, root = rootIdentity, sessionId) {
   if (!policy || policy.mode !== launch.sandboxMode || root(policy.workspaceRoot) !== root(launch.workspaceRoot)
     || (policy.additionalWritableRoots?.length ?? 0) !== 0) fail('local_hook_sandbox_scope_mismatch')
+  // 0.2 reports the Session whose mode it resolved; a policy resolved for any
+  // other Session would be the wrong fence and is refused.
+  if (sessionId !== undefined && policy.sessionId !== undefined && policy.sessionId !== sessionId) {
+    fail('local_hook_sandbox_session_mismatch')
+  }
 }
 
 export function rootBinding(config, session, read = readFileSync) {
@@ -67,7 +121,10 @@ export async function installLocalHooks(ctx, config, execute = runPrivateExecuto
   const verified = await execute(config.localHookExecutor, launch, 'verify')
   const owner = ctx.plugin({
     name: 'loom-local-post-tool-hook',
-    inject: ['loader', 'agents', 'workingDirectory', 'sandboxPolicy'],
+    // Only services every supported Host provides are hard dependencies. A 0.2
+    // Host has no `workingDirectory`, and requiring it would leave this plugin
+    // permanently inactive instead of failing loudly on a missing fact.
+    inject: ['loader', 'agents', 'sandboxPolicy'],
     async apply(local) {
       // Native DSH owns the Session event schema. The command itself is run
       // only by the verified private child; local.shell is never invoked.
@@ -75,10 +132,11 @@ export async function installLocalHooks(ctx, config, execute = runPrivateExecuto
       if (!['appendHookInvoked', 'appendHookResult'].every(key => typeof protocol[key] === 'function')) {
         fail('local_hook_event_protocol_unavailable')
       }
+      // Startup can only check the deployment default: no Session exists yet.
       validatePolicy(local.sandboxPolicy.resolve(), launch)
       const ownedAbort = new AbortController()
       const inflight = new Set(), invocations = new Map()
-      let serial = 0, boundSessionId
+      let serial = 0, boundSessionId, contract
       local.effect(() => async () => {
         ownedAbort.abort()
         await Promise.allSettled([...inflight])
@@ -114,15 +172,21 @@ export async function installLocalHooks(ctx, config, execute = runPrivateExecuto
         if (!rootBinding(config, session)) return next()
         if (boundSessionId !== undefined && boundSessionId !== session.id) fail('local_hook_second_root_session')
         boundSessionId = session.id
-        if (++serial > 128) fail('local_hook_invocation_budget_exceeded')
-        const turn = local.agents.turnBoundaryOf(session).lastTurn
+        // One Host, one contract: a Host that changes shape mid-Run would give
+        // two different meanings to the same receipt.
+        const resolved = sessionContract(local)
+        if (contract !== undefined && contract !== resolved) fail('local_hook_session_contract_changed')
+        contract = resolved
+        const invocationSerial = ++serial
+        if (invocationSerial > 128) fail('local_hook_invocation_budget_exceeded')
+        const turn = turnOf(local, contract, session)
         if (!Number.isSafeInteger(turn) || turn < 0) fail('local_hook_native_turn_invalid')
         const signal = AbortSignal.any([exec.signal, ownedAbort.signal])
         signal.throwIfAborted()
-        const cwd = await local.workingDirectory.ensure(exec.agent, signal)
+        const cwd = await workspaceOf(local, contract, exec, signal)
         if (rootIdentity(cwd) !== rootIdentity(launch.workspaceRoot)) fail('local_hook_workspace_changed')
-        validatePolicy(local.sandboxPolicy.resolve(), launch)
-        const handlerId = 'loom:' + launch.snapshotDigest.slice(0, 16) + ':' + serial
+        validatePolicy(policyOf(local, contract, session), launch, rootIdentity, session.id)
+        const handlerId = 'loom:' + launch.snapshotDigest.slice(0, 16) + ':' + invocationSerial
         const invocation = { sessionId: session.id, turn }
         invocations.set(handlerId, invocation)
         const input = { sessionId: session.id, turn, handlerId, payload: {

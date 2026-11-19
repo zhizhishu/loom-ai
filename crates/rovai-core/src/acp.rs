@@ -1904,6 +1904,15 @@ impl AcpHost {
                 .map(BuiltinToolProcessConfig::run_tmp),
         )
         .context("failed to configure ACP Runtime command")?;
+        if frozen_runtime.adapter_kind == AdapterKind::DeepseekHarness {
+            // A Run's frozen Skill tree is its own copy. Resolve it into the
+            // native provider before the Host starts; a Run that selected no
+            // imported source pins an empty root list instead of inheriting one.
+            crate::dsh::configure_skill_roots(
+                private_config_root.context("DSH Host private directory is missing")?,
+                startup_bootstrap,
+            )?;
+        }
         if let Some(local_hooks) = local_hooks {
             anyhow::ensure!(
                 frozen_runtime.adapter_kind == AdapterKind::DeepseekHarness,

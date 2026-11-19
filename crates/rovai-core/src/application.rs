@@ -19231,10 +19231,20 @@ impl Core {
                 &execution.workspace,
                 &execution.runtime,
             )?;
-            return Ok((
-                crate::local_hook::compatibility(digest, launch.as_ref())?,
-                None,
-            ));
+            // The frozen Skill roots are a per-Run Host fact: a changed selection
+            // must acquire a new Host, and an empty selection must never inherit
+            // the previous Run's provider directory.
+            let skill_roots = crate::dsh::resolve_frozen_skill_roots(
+                &self.data_dir,
+                &execution.agent_run_id,
+                &execution.agent_id,
+            )?;
+            let digest = crate::local_hook::compatibility(digest, launch.as_ref())?
+                .map(|digest| {
+                    canonical_json_digest(&json!({"runtime": digest, "skillRoots": skill_roots}))
+                })
+                .transpose()?;
+            return Ok((digest, Some(skill_roots.encode()?)));
         }
         if !matches!(
             execution.runtime.adapter_kind,

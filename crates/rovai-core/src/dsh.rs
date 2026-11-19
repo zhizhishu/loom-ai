@@ -1,6 +1,7 @@
 //! DeepSeek Harness's official ACP profile plus a scoped system-prompt section.
 //! Transport, process ownership, approvals and LRU remain in the shared ACP host.
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
@@ -12,7 +13,7 @@ use crate::{
 };
 
 pub const MINIMUM_VERSION: &str = "0.1.5-rc.2";
-pub const BOOTSTRAP_REVISION: &str = "dsh-local-hook-private-executor-v8";
+pub const BOOTSTRAP_REVISION: &str = "dsh-local-hook-private-executor-v9";
 const BOOTSTRAP_PLUGIN: &str = include_str!("dsh/bootstrap.mjs");
 const MODEL_PLUGIN: &str = include_str!("dsh/models.mjs");
 const LOCAL_HOOK_PLUGIN: &str = include_str!("dsh/local-hooks.mjs");
@@ -24,6 +25,18 @@ const LOCAL_HOOK_LOCK: &str =
     include_str!("../../../resources/dsh-hook-executor/package-lock.json");
 
 const MAX_OBSERVED_FILE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
+
+/// The native `skill-filesystem` entry this Host patches. DSH discovers
+/// `customSkillDirs[]` roots, reading `<root>/<name>/SKILL.md`, and replaces a
+/// patched `config` wholesale, so the entry is addressed by its own id here.
+const SKILL_FILESYSTEM_ID: &str = "skill-filesystem";
+/// A Run's frozen Skill copy is published by the Context service as
+/// `<dataDir>/runtime/skills/<runId>` with this manifest written last.
+const SKILL_MATERIAL_ROOT: [&str; 2] = ["runtime", "skills"];
+const SKILL_MATERIAL_CONTENT_DIR: &str = "skills";
+const SKILL_MATERIAL_MANIFEST: &str = "manifest.json";
+const SKILL_MATERIAL_SCHEMA_VERSION: u32 = 1;
+const MAX_SKILL_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 pub fn supported_version(version: Option<&str>) -> bool {
     let Some(version) = version.map(str::trim) else {
@@ -281,6 +294,198 @@ pub fn preparation_diagnostic(result: &Value) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// One Run's frozen Skill tree as its native provider must read it.
+///
+/// The root and the identity digest both come from the manifest the Context
+/// service already verified and published for this Run. A Run that selected no
+/// imported source owns no directory, and that absence is carried explicitly as
+/// an empty root list rather than as an unspecified field: a Host is never left
+/// free to inherit a directory from an earlier Run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrozenSkillRoots {
+    schema_version: u32,
+    custom_skill_dirs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_digest: Option<String>,
+}
+
+impl FrozenSkillRoots {
+    /// The state of a Run that selected no imported Skill source.
+    fn unselected() -> Self {
+        Self {
+            schema_version: SKILL_MATERIAL_SCHEMA_VERSION,
+            custom_skill_dirs: Vec::new(),
+            identity_digest: None,
+        }
+    }
+
+    pub fn identity_digest(&self) -> Option<&str> {
+        self.identity_digest.as_deref()
+    }
+
+    /// The per-Run payload the Core hands its own Host spawn. It travels with the
+    /// compatibility digest, so a changed selection acquires a new Host instead
+    /// of silently reusing the previous Run's provider configuration.
+    pub fn encode(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn decode(payload: &str) -> Result<Self> {
+        let roots: Self = serde_json::from_str(payload)
+            .context("dsh_skill_roots_invalid")?;
+        roots.validate()?;
+        Ok(roots)
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == SKILL_MATERIAL_SCHEMA_VERSION,
+            "dsh_skill_roots_invalid"
+        );
+        anyhow::ensure!(self.custom_skill_dirs.len() <= 1, "dsh_skill_roots_invalid");
+        for root in &self.custom_skill_dirs {
+            anyhow::ensure!(
+                Path::new(root).is_absolute(),
+                "dsh_skill_roots_invalid"
+            );
+        }
+        match self.identity_digest.as_deref() {
+            None => anyhow::ensure!(
+                self.custom_skill_dirs.is_empty(),
+                "dsh_skill_roots_invalid"
+            ),
+            Some(digest) => anyhow::ensure!(
+                !self.custom_skill_dirs.is_empty()
+                    && digest.len() == 64
+                    && digest
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()),
+                "dsh_skill_roots_invalid"
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// Reads the manifest of one Run's published Skill material. The bytes are owned
+/// and re-verified by the Context service on every claim and replay; this reads
+/// that same manifest so the native provider points at exactly one Run's own
+/// tree, and refuses the Host when the tree does not describe this Run.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillMaterialManifest {
+    schema_version: u32,
+    run_id: String,
+    member_id: String,
+    imports: Vec<Value>,
+    files: Vec<Value>,
+    identity_digest: String,
+}
+
+pub fn resolve_frozen_skill_roots(
+    data_dir: &Path,
+    run_id: &str,
+    member_id: &str,
+) -> Result<FrozenSkillRoots> {
+    anyhow::ensure!(
+        !run_id.is_empty()
+            && run_id.len() <= 64
+            && run_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+        "dsh_skill_material_run_invalid"
+    );
+    let run_root = SKILL_MATERIAL_ROOT
+        .iter()
+        .fold(data_dir.to_path_buf(), |path, part| path.join(part))
+        .join(run_id);
+    let metadata = match fs::symlink_metadata(&run_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FrozenSkillRoots::unselected());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "dsh_skill_material_root_invalid"
+    );
+    let content = run_root.join(SKILL_MATERIAL_CONTENT_DIR);
+    let content_metadata = fs::symlink_metadata(&content)?;
+    anyhow::ensure!(
+        content_metadata.is_dir() && !content_metadata.file_type().is_symlink(),
+        "dsh_skill_material_content_invalid"
+    );
+    let manifest_path = run_root.join(SKILL_MATERIAL_MANIFEST);
+    let manifest_metadata = fs::symlink_metadata(&manifest_path)
+        .context("dsh_skill_material_manifest_missing")?;
+    anyhow::ensure!(
+        manifest_metadata.is_file()
+            && !manifest_metadata.file_type().is_symlink()
+            && manifest_metadata.len() <= MAX_SKILL_MANIFEST_BYTES,
+        "dsh_skill_material_manifest_invalid"
+    );
+    let manifest: SkillMaterialManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+        .context("dsh_skill_material_manifest_invalid")?;
+    anyhow::ensure!(
+        manifest.schema_version == SKILL_MATERIAL_SCHEMA_VERSION
+            && manifest.run_id == run_id
+            && manifest.member_id == member_id
+            && !manifest.imports.is_empty()
+            && !manifest.files.is_empty(),
+        "dsh_skill_material_manifest_invalid"
+    );
+    let roots = FrozenSkillRoots {
+        schema_version: SKILL_MATERIAL_SCHEMA_VERSION,
+        custom_skill_dirs: vec![
+            dunce::simplified(&content)
+                .to_str()
+                .context("dsh_skill_material_root_not_utf8")?
+                .to_string(),
+        ],
+        identity_digest: Some(manifest.identity_digest),
+    };
+    roots.validate()?;
+    Ok(roots)
+}
+
+/// Points the existing native `skill-filesystem` entry at this Run's verified
+/// frozen tree. DSH replaces a patched `config` wholesale, so the empty state is
+/// written out as an empty `customSkillDirs` instead of being left unmentioned.
+/// This only ever re-points the provider; it registers no Skill of its own.
+pub fn configure_skill_roots(root: &Path, bootstrap: Option<&str>) -> Result<()> {
+    let payload = bootstrap.context("dsh_skill_roots_missing")?;
+    let roots = FrozenSkillRoots::decode(payload)?;
+    let path = root.join("rovai.patch.json");
+    let mut patches: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let patches = patches
+        .as_array_mut()
+        .context("dsh_skill_patch_invalid")?;
+    anyhow::ensure!(
+        !patches
+            .iter()
+            .any(|patch| patch["id"] == SKILL_FILESYSTEM_ID),
+        "dsh_skill_duplicate_configuration"
+    );
+    let config = if roots.custom_skill_dirs.is_empty() {
+        json!({ "customSkillDirs": [] })
+    } else {
+        // A Run's frozen tree is the only directory this Host may discover: the
+        // native project, user and bundled roots would let the same model read a
+        // different copy of a Skill this Run never froze.
+        json!({
+            "customSkillDirs": roots.custom_skill_dirs,
+            "includeDefaultRoots": false,
+            "watch": false
+        })
+    };
+    patches.push(json!({ "id": SKILL_FILESYSTEM_ID, "config": config }));
+    fs::write(&path, serde_json::to_vec(&patches)?)?;
+    private_file(&path)?;
+    Ok(())
 }
 
 pub fn configure_host(
@@ -580,10 +785,17 @@ fn local_hook_executor_configuration(launch_path: &Path, launch_bytes: &[u8]) ->
             && manifest["entry"] == "executor.mjs",
         "local_hook_bundle_manifest_invalid"
     );
+    // Node cannot load a module through a verbatim (\\?\) path: it re-prefixes
+    // the argument and reports MODULE_NOT_FOUND with empty stdout, which reaches
+    // the Host as `local_hook_executor_result_missing`. Both handed-over paths
+    // are therefore the plain native form; the admitted identity above stays
+    // canonicalized.
+    let executor_root = dunce::simplified(&root).to_path_buf();
+    let executor_launch = dunce::simplified(&launch_path.canonicalize()?).to_path_buf();
     Ok(json!({
-        "schemaVersion":1, "node":pi.node, "root":root,
+        "schemaVersion":1, "node":pi.node, "root":executor_root,
         "manifestDigest":manifest_digest,
-        "launchPath":launch_path.canonicalize()?,
+        "launchPath":executor_launch,
         "launchDigest":format!("{:x}",Sha256::digest(launch_bytes))
     }))
 }
