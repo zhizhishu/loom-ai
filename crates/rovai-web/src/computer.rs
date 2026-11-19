@@ -24,8 +24,13 @@
 //!   admitted for the outgoing holder can never execute after the handback.
 //! * A device reached over a paired node keeps its epoch across reconnects even
 //!   though every lease, view and sequence is dropped with the replaced socket:
-//!   the epoch never runs backwards, so an epoch issued before a reconnect can
-//!   never be issued again after it.
+//!   the replaced instance is retired first, so a caller that still holds it
+//!   fails closed instead of reaching the new connection, and the epoch never
+//!   runs backwards, so an epoch issued before a reconnect can never be issued
+//!   again after it.
+//! * Reading the epoch and retiring a device never wait for the input gate: both
+//!   use the counter the gate publishes on every advance, so a reconnect cannot
+//!   stall on an input that is still running.
 //! * Nothing about a session, a frame or an input event is persisted or logged.
 
 use crate::auth::{Session, Sessions};
@@ -41,7 +46,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{
+        Arc, Mutex, MutexGuard, TryLockError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
@@ -635,6 +643,14 @@ pub(crate) struct Computer {
     provider: Arc<dyn Provider>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     gate: Mutex<Gate>,
+    /// Mirror of `Gate::generation`, published on every advance. The epoch is read
+    /// by the replacement of a node device, which must never wait for an input
+    /// that still holds the gate; it only ever moves forward.
+    epoch: AtomicU64,
+    /// Set when a replacement connection took over this physical device. Every
+    /// operation on a retired instance fails closed, so no request that still
+    /// holds it can reach the provider of a newer connection.
+    retired: AtomicBool,
     captures: Arc<Semaphore>,
     /// True when the device belongs to a paired node rather than this process.
     /// `supported()` is then a fact about the node's advertised capability, not
@@ -659,6 +675,8 @@ impl Computer {
             provider,
             clock: Arc::new(wall_clock),
             gate: Mutex::new(Gate::default()),
+            epoch: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
             captures: Arc::new(Semaphore::new(1)),
             remote: false,
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
@@ -685,30 +703,54 @@ impl Computer {
                 generation: epoch,
                 ..Gate::default()
             }),
+            epoch: AtomicU64::new(epoch),
+            retired: AtomicBool::new(false),
             captures: Arc::new(Semaphore::new(1)),
             remote: true,
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
         }
     }
 
-    /// The epoch this gate has reached, so a replacement device can continue the
-    /// sequence instead of restarting it. Only the counter is read: the lease,
-    /// view and sequence state of a replaced device is discarded, never adopted.
-    /// A poisoned gate still yields its counter — the number is not lease state,
-    /// and a reconnect is exactly when the rest of that state is thrown away.
-    pub(crate) fn epoch(&self) -> Result<u64, &'static str> {
-        let deadline = std::time::Instant::now() + Duration::from_millis(GATE_DEADLINE_MS);
-        loop {
-            match self.gate.try_lock() {
-                Ok(gate) => return Ok(gate.generation),
-                Err(TryLockError::Poisoned(guard)) => return Ok(guard.get_ref().generation),
-                Err(TryLockError::WouldBlock) => {}
+    /// The epoch this device has reached, so a replacement can continue the
+    /// sequence instead of restarting it. It is read from the counter the gate
+    /// publishes on every advance, never from the gate itself: a reconnect must
+    /// not wait for an input that is still holding it.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Retire this device because a newer connection now owns the same physical
+    /// machine, and return the epoch the replacement must continue from.
+    ///
+    /// Retirement is the fence, not the replacement: every later operation fails
+    /// closed through [`Computer::gate`], so a caller that still holds this `Arc`
+    /// can never reach the provider — and therefore never reach the socket of the
+    /// connection that replaced it. The lease, the views and the input sequence
+    /// are dropped with the old connection; only the counter is carried forward.
+    /// Nothing here waits for the gate: an input that already holds it finishes
+    /// against the device it was admitted for, which the retirement has already
+    /// fenced off from every new admission.
+    pub(crate) fn retire(&self) -> u64 {
+        self.retired.store(true, Ordering::SeqCst);
+        // Best effort, and deliberately `try_lock`: revoking the lease and
+        // publishing the advance are worth doing, but an input still running must
+        // not delay the replacement.
+        if let Ok(mut gate) = self.gate.try_lock() {
+            gate.views.clear();
+            if gate.control.take().is_some() {
+                gate.generation = gate.generation.wrapping_add(1);
+                self.publish(gate.generation);
             }
-            if std::time::Instant::now() >= deadline {
-                return Err("computer_busy");
-            }
-            std::thread::sleep(Duration::from_millis(2));
         }
+        self.epoch()
+    }
+
+    fn publish(&self, generation: u64) {
+        self.epoch.store(generation, Ordering::SeqCst);
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -734,6 +776,8 @@ impl Computer {
             provider,
             clock,
             gate: Mutex::new(Gate::default()),
+            epoch: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
             captures: Arc::new(Semaphore::new(1)),
             remote: false,
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
@@ -780,13 +824,25 @@ impl Computer {
     }
 
     fn gate(&self) -> Result<MutexGuard<'_, Gate>, &'static str> {
+        // A retired device is fenced before anyone waits for the gate, and again
+        // after the wait: a retirement that happened while this caller queued must
+        // still refuse the operation.
+        if self.is_retired() {
+            return Err("computer_unavailable");
+        }
         let deadline = std::time::Instant::now() + Duration::from_millis(GATE_DEADLINE_MS);
         loop {
             match self.gate.try_lock() {
-                Ok(guard) => return Ok(guard),
-            // A poisoned gate means the in-memory lease state is untrustworthy.
-            // Fail closed instead of adopting unknown state.
-            Err(TryLockError::Poisoned(_)) => return Err("computer_unavailable"),
+                Ok(guard) => {
+                    return if self.is_retired() {
+                        Err("computer_unavailable")
+                    } else {
+                        Ok(guard)
+                    };
+                }
+                // A poisoned gate means the in-memory lease state is untrustworthy.
+                // Fail closed instead of adopting unknown state.
+                Err(TryLockError::Poisoned(_)) => return Err("computer_unavailable"),
                 Err(TryLockError::WouldBlock) => {}
             }
             if std::time::Instant::now() >= deadline {
@@ -812,10 +868,13 @@ impl Computer {
     /// Drop the controller and invalidate its generation so any input still
     /// queued behind the gate is rejected. Every path that revokes a lease
     /// without granting a new one (handback, view stop, expiry, a failed input)
-    /// goes through here, so a revocation always advances the epoch.
-    fn expire_control(gate: &mut Gate) {
+    /// goes through here, so a revocation always advances the epoch — and the
+    /// advance is published while the gate is held, so the counter a replacement
+    /// reads can never lag the epoch that was issued.
+    fn expire_control(&self, gate: &mut Gate) {
         if gate.control.take().is_some() {
             gate.generation = gate.generation.wrapping_add(1);
+            self.publish(gate.generation);
         }
     }
 
@@ -1145,6 +1204,7 @@ impl Computer {
         let id = crate::new_token().map_err(|_| "computer_busy")?;
         let generation = gate.generation.wrapping_add(1);
         gate.generation = generation;
+        self.publish(generation);
         gate.control = Some(Control {
             id: id.clone(),
             client_id: session.client_id.clone(),
@@ -1201,7 +1261,7 @@ impl Computer {
         }
         let expired = !control_alive(&gate, control, now);
         if expired {
-            Self::expire_control(&mut gate);
+            self.expire_control(&mut gate);
             // A heartbeat never revives a dead lease; the client must acquire
             // again, which is a new explicit consent and a new generation.
             return Err("computer_lease_expired");
@@ -1253,7 +1313,7 @@ impl Computer {
         if control.generation != body.generation {
             return Err("computer_input_stale");
         }
-        Self::expire_control(&mut gate);
+        self.expire_control(&mut gate);
         let generation = gate.generation;
         // Releasing the lease is the barrier this call promises: any input still
         // queued behind the gate now sees a newer generation and is rejected.
@@ -1293,7 +1353,7 @@ impl Computer {
             .as_ref()
             .is_some_and(|control| control.view_id == body.view_id);
         if detached {
-            Self::expire_control(&mut gate);
+            self.expire_control(&mut gate);
             // The local generation is fenced either way, so no further input can
             // be admitted. Physical release is a separate claim: it is reported
             // only when the device proved it drained, never assumed.
@@ -1364,7 +1424,7 @@ impl Computer {
         }
         let expired = !control_alive(&gate, control, now);
         if expired {
-            Self::expire_control(&mut gate);
+            self.expire_control(&mut gate);
             return Err("computer_lease_expired");
         }
         let bounds = match gate.views.get(&body.view_id) {
@@ -1391,7 +1451,7 @@ impl Computer {
         // release/stop cannot return before this input has finished.
         if let Err(failure) = self.provider.input(&command) {
             // Unknown side effect: revoke the lease now. Never auto resend.
-            Self::expire_control(&mut gate);
+            self.expire_control(&mut gate);
             return Err(failure.input_code());
         }
         Ok(json!({
@@ -3204,6 +3264,8 @@ mod tests {
             provider: Arc::new(UnavailableProvider),
             clock: Arc::new(wall_clock),
             gate: Mutex::new(Gate::default()),
+            epoch: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
             captures: Arc::new(Semaphore::new(1)),
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
         };

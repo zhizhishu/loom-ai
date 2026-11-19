@@ -12,11 +12,12 @@
 //!   unparsable answer returns [`Failure::Unconfirmed`], so the Host never tells
 //!   a caller that a remote keyboard is released when it cannot see it.
 //! * A node's `Computer` is tied to the connection generation that advertised
-//!   it. A reconnect replaces the entry and drops the old gate with it, so a
-//!   lease or view held against a replaced socket can never be reused. The epoch
-//!   is the one thing carried over: leases are discarded, but the counter only
-//!   ever moves forward, so an epoch issued before the reconnect can never be
-//!   issued again after it.
+//!   it. A reconnect retires the entry and drops the old gate with it, so a
+//!   lease or view held against a replaced socket can never be reused — and a
+//!   caller that still holds the retired instance fails closed instead of
+//!   reaching the new connection. The epoch is the one thing carried over: leases
+//!   are discarded, but the counter only ever moves forward, so an epoch issued
+//!   before the reconnect can never be issued again after it.
 use super::{
     Bounds, Computer, DeviceInfo, Failure, Frame, InputCommand, KeyName, MAX_DIMENSION,
     MAX_FRAME_BYTES, PNG_SIGNATURE, PointerAction, PointerButton, Provider,
@@ -84,39 +85,44 @@ impl NodeComputers {
     /// Install the device for a connection generation, replacing whatever the
     /// previous generation left behind.
     ///
-    /// A replaced device's gate is dropped whole: its lease, its views and its
-    /// input sequence are gone, which is what fences a lease held against a
-    /// replaced socket. Its epoch is sampled first and seeded into the
-    /// replacement, so the counter never runs backwards across a reconnect. A
-    /// concurrent caller that already installed this generation wins, under the
-    /// same write lock, because replacing it would drop a live lease.
+    /// One critical section owns the whole transition, so it is a single boundary
+    /// rather than three steps that can interleave:
+    ///
+    /// * A late arrival from an already replaced generation is refused instead of
+    ///   installed. Overwriting a newer entry with an older one would move the
+    ///   epoch backwards and let a number be issued twice.
+    /// * The replaced device is retired before its epoch is inherited. Retirement
+    ///   is the fence: its lease, views and sequence are dropped with the socket,
+    ///   and every later operation on the instance — including one a caller still
+    ///   holds an `Arc` to — fails closed, so nothing can be sent on the new
+    ///   connection under an epoch issued for the old one.
+    /// * The epoch is read from the counter the device publishes, never from its
+    ///   gate, so an input that is still running cannot stall the reconnect.
+    ///
+    /// A concurrent caller that already installed this generation wins, under the
+    /// same lock, because replacing it would drop a live lease.
     fn install(
         &self,
         node_id: &str,
         generation: u64,
         provider: Arc<dyn Provider>,
     ) -> Result<Arc<Computer>, &'static str> {
-        // Sample the epoch of the device being replaced before taking the write
-        // lock: an input still inside that gate must not stall another node's
-        // transition, and a device whose epoch cannot be read is refused rather
-        // than silently restarted from zero.
-        let replaced = {
-            let entries = self.entries.lock().map_err(|_| "computer_busy")?;
-            entries.get(node_id).map(|cached| cached.computer.clone())
-        };
-        let epoch = match replaced {
-            Some(computer) => computer.epoch()?,
+        let mut entries = self.entries.lock().map_err(|_| "computer_busy")?;
+        if let Some(cached) = entries.get(node_id) {
+            if cached.generation == generation {
+                return Ok(cached.computer.clone());
+            }
+            if cached.generation > generation {
+                // A newer connection already owns this node; this call is a late
+                // arrival from the socket that connection replaced.
+                return Err("node_connection_changed");
+            }
+        }
+        let epoch = match entries.get(node_id) {
+            Some(cached) => cached.computer.retire(),
             None => 0,
         };
         let computer = Arc::new(Computer::with_provider(provider, epoch));
-        let mut entries = self.entries.lock().map_err(|_| "computer_busy")?;
-        // Re-check under the write lock: a concurrent caller may already have
-        // installed this generation, and replacing it would drop a live lease.
-        if let Some(cached) = entries.get(node_id)
-            && cached.generation == generation
-        {
-            return Ok(cached.computer.clone());
-        }
         entries.insert(
             node_id.to_owned(),
             Cached {
@@ -131,9 +137,9 @@ impl NodeComputers {
 struct NodeProvider {
     hub: Arc<Hub>,
     node_id: String,
-    /// The connection generation this provider was created against. A reply
-    /// from any other generation is discarded by the transport.
-    #[allow(dead_code)]
+    /// The connection generation this provider was created against. Every call
+    /// re-checks it before anything is sent: a reply from any other generation is
+    /// discarded by the transport, and a request must never be addressed to one.
     generation: u64,
 }
 
@@ -147,6 +153,16 @@ impl NodeProvider {
     }
 
     fn call(&self, op: ComputerOpV1) -> Result<ComputerOutcome, &'static str> {
+        // Send-boundary fence. This provider speaks for exactly one connection
+        // generation; if the node reconnected since it was built, the socket it
+        // was created for is gone and nothing is sent at all. The transport would
+        // otherwise address whichever connection is current now, which would hand
+        // a caller's operation to a session it never authenticated against.
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| "computer_busy")?;
+        let current = handle.block_on(self.hub.computer_generation(&self.node_id));
+        if current != Some(self.generation) {
+            return Err("node_connection_changed");
+        }
         let request = ComputerRequestV1 {
             version: COMPUTER_VERSION,
             request_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -338,8 +354,10 @@ fn wire_key(key: KeyName) -> ComputerKeyV1 {    match key {
 mod tests {
     use super::super::{ControlBody, EventBody, EventKind, InputBody, ReleaseBody, ViewBody};
     use super::*;
-    use crate::auth::Sessions;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::auth::{Session, Sessions};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     /// One physical desktop behind a paired node. It records every input that
     /// actually reached it, which is the only proof that a fenced lease never
@@ -406,49 +424,105 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_reconnect_drops_every_lease_and_never_reissues_an_epoch() {
+    fn open_view(
+        computer: &Arc<Computer>,
+        sessions: &Sessions,
+        session: &Arc<Session>,
+        device: &DeviceInfo,
+    ) -> String {
+        computer
+            .start_view(
+                sessions,
+                session,
+                ViewBody {
+                    consent: true,
+                    device_id: device.id.clone(),
+                },
+            )
+            .unwrap()["viewId"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// One takeover on `view`, returning the lease identity and its epoch.
+    fn take(
+        computer: &Arc<Computer>,
+        sessions: &Sessions,
+        session: &Arc<Session>,
+        device: &DeviceInfo,
+        view: &str,
+    ) -> (String, u64) {
+        let lease = computer
+            .acquire(
+                sessions,
+                session,
+                ControlBody {
+                    view_id: view.to_owned(),
+                    device_id: device.id.clone(),
+                    consent: true,
+                    ttl_seconds: 30,
+                },
+            )
+            .unwrap();
+        (
+            lease["controlId"].as_str().unwrap().to_owned(),
+            lease["generation"].as_u64().unwrap(),
+        )
+    }
+
+    fn fixture_parts() -> (Arc<Sessions>, Arc<Session>) {
         let token = crate::new_token().unwrap();
-        let sessions = Sessions::new(&token).unwrap();
+        let sessions = Arc::new(Sessions::new(&token).unwrap());
         let (_, session) = sessions
             .login(&token)
             .ok()
             .expect("browser session must be issued");
+        (sessions, session)
+    }
+
+    /// A desktop whose input only returns when the test lets it, so the gate can
+    /// be held open on purpose while a reconnect is attempted.
+    struct BlockingDevice {
+        device: DeviceInfo,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        inputs: AtomicU64,
+    }
+
+    impl Provider for BlockingDevice {
+        fn info(&self) -> Result<DeviceInfo, Failure> {
+            Ok(self.device.clone())
+        }
+        fn capture(&self, _max_width: u32, _max_height: u32) -> Result<Frame, Failure> {
+            Err(Failure::Failed)
+        }
+        fn input(&self, _command: &InputCommand) -> Result<(), Failure> {
+            // Announce that the gate is now held by this input, then wait for the
+            // test to let go. Nothing is counted until the input really completes.
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            self.inputs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn release(&self) -> Result<(), Failure> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_reconnect_retires_the_old_device_and_never_reissues_an_epoch() {
+        let (sessions, session) = fixture_parts();
         let device = Arc::new(FakeDevice::new());
         let provider: Arc<dyn Provider> = device.clone();
         let computers = NodeComputers::new();
 
         // The node advertises the transport on connection generation 7.
         let first = computers.install("node-1", 7, provider.clone()).unwrap();
-        let view = first
-            .start_view(
-                &sessions,
-                &session,
-                ViewBody {
-                    consent: true,
-                    device_id: device.device.id.clone(),
-                },
-            )
-            .unwrap()["viewId"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let lease = first
-            .acquire(
-                &sessions,
-                &session,
-                ControlBody {
-                    view_id: view.clone(),
-                    device_id: device.device.id.clone(),
-                    consent: true,
-                    ttl_seconds: 30,
-                },
-            )
-            .unwrap();
-        let control = lease["controlId"].as_str().unwrap().to_owned();
-        let epoch = lease["generation"].as_u64().unwrap();
+        let view = open_view(&first, &sessions, &session, &device.device);
+        let (control, epoch) = take(&first, &sessions, &session, &device.device, &view);
         assert_eq!(epoch, 1);
-        assert_eq!(first.epoch().unwrap(), epoch);
+        assert_eq!(first.epoch(), epoch);
 
         // The node reconnects: generation 8 replaces the device.
         let second = computers.install("node-1", 8, provider.clone()).unwrap();
@@ -456,20 +530,74 @@ mod tests {
             !Arc::ptr_eq(&first, &second),
             "a reconnect must replace the device, not reuse it"
         );
-        // The epoch is carried across the reconnect, so the number the old lease
-        // was issued under can never be handed out again on the new socket.
-        assert_eq!(second.epoch().unwrap(), epoch);
-        // Every lease, view and sequence of the replaced socket is gone: the old
-        // lease identity is refused and never reaches the device.
-        let body = InputBody {
+        // The fence is the retirement: a caller that still holds the replaced
+        // instance cannot reach the provider at all, so nothing it does can be
+        // addressed to the connection that replaced it.
+        let late = InputBody {
             view_id: view.clone(),
             ..click(&control, epoch, 1)
         };
         assert_eq!(
+            first.input(&sessions, &session, late).unwrap_err(),
+            "computer_unavailable",
+            "an input on the replaced instance must fail closed"
+        );
+        assert_eq!(
+            first
+                .release_control(
+                    &sessions,
+                    &session,
+                    ReleaseBody {
+                        view_id: view.clone(),
+                        control_id: control.clone(),
+                        generation: epoch,
+                    },
+                )
+                .unwrap_err(),
+            "computer_unavailable",
+            "the replaced instance must not hand back a lease either"
+        );
+        assert_eq!(
+            first
+                .start_view(
+                    &sessions,
+                    &session,
+                    ViewBody {
+                        consent: true,
+                        device_id: device.device.id.clone(),
+                    },
+                )
+                .unwrap_err(),
+            "computer_unavailable",
+            "the replaced instance must not open a view either"
+        );
+        assert_eq!(
+            device.inputs.load(Ordering::SeqCst),
+            0,
+            "the replaced instance reached the device after the reconnect"
+        );
+
+        // The lease was live, so retiring the replaced device revoked it and
+        // published that advance: the replacement starts strictly above the epoch
+        // the old socket had issued.
+        assert_eq!(
+            second.epoch(),
+            epoch + 1,
+            "the replacement must never restart below an epoch that was issued"
+        );
+        assert_eq!(first.epoch(), epoch + 1);
+
+        // The replacement holds no lease and no view: the operation the old
+        // connection admitted is refused instead of being replayed. Its epoch is
+        // below the inherited counter, so it is reported as stale rather than
+        // being mistaken for a missing lease on the new device.
+        let body = InputBody {
+            view_id: view.clone(),
+            ..click(&control, epoch, 2)
+        };
+        assert_eq!(
             second.input(&sessions, &session, body).unwrap_err(),
-            // The replacement has no lease at all: the epoch it inherited is the
-            // current one, so this is a missing lease rather than a stale one.
-            "computer_control_required"
+            "computer_input_stale"
         );
         assert_eq!(device.inputs.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -486,37 +614,15 @@ mod tests {
                 .unwrap_err(),
             "computer_control_required"
         );
+
         // A takeover on the reconnected device continues the epoch sequence.
-        let fresh = second
-            .start_view(
-                &sessions,
-                &session,
-                ViewBody {
-                    consent: true,
-                    device_id: device.device.id.clone(),
-                },
-            )
-            .unwrap()["viewId"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let taken = second
-            .acquire(
-                &sessions,
-                &session,
-                ControlBody {
-                    view_id: fresh.clone(),
-                    device_id: device.device.id.clone(),
-                    consent: true,
-                    ttl_seconds: 30,
-                },
-            )
-            .unwrap();
-        assert_eq!(taken["generation"].as_u64().unwrap(), epoch + 1);
+        let fresh = open_view(&second, &sessions, &session, &device.device);
+        let (fresh_control, taken) = take(&second, &sessions, &session, &device.device, &fresh);
+        assert_eq!(taken, epoch + 2, "the reconnect must not reuse an epoch");
         // And the lease from before the reconnect is stale, not merely unknown.
         let body = InputBody {
             view_id: view.clone(),
-            ..click(&control, epoch, 2)
+            ..click(&control, epoch, 3)
         };
         assert_eq!(
             second.input(&sessions, &session, body).unwrap_err(),
@@ -524,12 +630,211 @@ mod tests {
         );
         assert_eq!(device.inputs.load(Ordering::SeqCst), 0);
 
-        // The same connection generation resolves to the same device instance: a
-        // concurrent duplicate lookup must not drop a live lease.
+        // Positive control: exactly one input reaches the device, and only for the
+        // lease that was issued after the reconnect. Without this, the `0` above
+        // would also pass if the fixture simply never delivered anything.
+        let accepted = InputBody {
+            view_id: fresh.clone(),
+            ..click(&fresh_control, taken, 1)
+        };
+        assert!(second.input(&sessions, &session, accepted).is_ok());
+        assert_eq!(device.inputs.load(Ordering::SeqCst), 1);
+
+        // A late arrival from the replaced generation must be refused, not
+        // installed: taking it would move the epoch backwards.
+        let third = computers.install("node-1", 9, provider.clone()).unwrap();
+        assert_eq!(third.epoch(), taken + 1);
+        assert_eq!(
+            computers.install("node-1", 8, provider.clone()).err(),
+            Some("node_connection_changed"),
+            "a late install from a replaced generation must be refused"
+        );
+        assert!(computers.current("node-1", 8).unwrap().is_none());
         assert!(Arc::ptr_eq(
-            &second,
-            &computers.install("node-1", 8, provider).unwrap()
+            &third,
+            &computers.install("node-1", 9, provider).unwrap()
         ));
+        // The refused late install left the newest device in place and usable.
+        assert_eq!(third.epoch(), taken + 1);
+    }
+
+    /// A reconnect must never wait on a gate that an input is holding: the epoch
+    /// it inherits is a published counter, and retirement is a non-blocking fence.
+    /// The budget below is far above any correct cost (both reads are a load and a
+    /// `try_lock`), so a regression to the old "poll the gate for up to 7 s" path
+    /// fails here instead of stalling a runtime thread in production.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reconnect_never_waits_on_a_gate_an_input_is_holding() {
+        let (sessions, session) = fixture_parts();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let device = Arc::new(BlockingDevice {
+            device: FakeDevice::new().device,
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            inputs: AtomicU64::new(0),
+        });
+        let provider: Arc<dyn Provider> = device.clone();
+        let computers = NodeComputers::new();
+        let first = computers.install("node-1", 7, provider.clone()).unwrap();
+        let view = open_view(&first, &sessions, &session, &device.device);
+        let (control, epoch) = take(&first, &sessions, &session, &device.device, &view);
+
+        // An input admitted on generation 7 now holds the gate while its backend
+        // blocks, exactly like a real desktop that is slow to inject.
+        let held = {
+            let computer = first.clone();
+            let sessions = sessions.clone();
+            let session = session.clone();
+            let body = InputBody {
+                view_id: view.clone(),
+                ..click(&control, epoch, 1)
+            };
+            std::thread::spawn(move || computer.input(&sessions, &session, body))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the input never reached the device, so the gate is not held");
+
+        // Reading the epoch is a counter load.
+        assert_eq!(first.epoch(), epoch);
+
+        // The whole transition runs inline on this single-threaded runtime, exactly
+        // as `for_node` runs it, and must not wait: it is a counter load plus a
+        // `try_lock`, while the old "poll the gate" read would burn the gate's own
+        // 7 s deadline here. The budget is orders of magnitude above the correct
+        // cost and well below that deadline, so a regression fails instead of
+        // stalling an executor thread in production.
+        let progressed = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::spawn({
+            let progressed = progressed.clone();
+            async move { progressed.store(true, Ordering::SeqCst) }
+        });
+        let started = std::time::Instant::now();
+        let installed = computers
+            .install("node-1", 8, provider)
+            .expect("a reconnect must install while an input holds the replaced gate");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the reconnect waited on the gate an input was holding"
+        );
+        // An unrelated task on the same runtime still got to run around it.
+        tokio::task::yield_now().await;
+        watcher.await.unwrap();
+        assert!(progressed.load(Ordering::SeqCst));
+        // A revocation it could not perform under the busy gate is not invented:
+        // the replacement starts at the epoch the old socket published, and its
+        // first takeover moves past it.
+        assert_eq!(installed.epoch(), epoch);
+        let fresh = open_view(&installed, &sessions, &session, &device.device);
+        let (_, taken) = take(&installed, &sessions, &session, &device.device, &fresh);
+        assert_eq!(taken, epoch + 1);
+
+        // The pre-admitted input finished against the device it was admitted for;
+        // the replaced instance is fenced from then on.
+        release_tx.send(()).unwrap();
+        assert!(
+            held.join().unwrap().is_ok(),
+            "an input admitted before the reconnect must still finish"
+        );
+        assert_eq!(device.inputs.load(Ordering::SeqCst), 1);
+        let late = InputBody {
+            view_id: view.clone(),
+            ..click(&control, epoch, 2)
+        };
+        assert_eq!(
+            first.input(&sessions, &session, late).unwrap_err(),
+            "computer_unavailable"
+        );
+        assert_eq!(
+            device.inputs.load(Ordering::SeqCst),
+            1,
+            "the retired device delivered an input after the reconnect"
+        );
+    }
+
+    /// Two reconnects installing different generations of the same node race on
+    /// purpose. Whatever the interleaving, the newest generation must end up
+    /// installed, the epoch must never move backwards, and the device that lost
+    /// must be fenced rather than left able to send on the surviving connection.
+    /// The rounds are what expose the second interleaving; each round is otherwise
+    /// a plain install against a shared cache.
+    #[test]
+    fn racing_reconnects_never_move_the_epoch_backwards() {
+        let (sessions, session) = fixture_parts();
+        let device = Arc::new(FakeDevice::new());
+        let provider: Arc<dyn Provider> = device.clone();
+        let computers = Arc::new(NodeComputers::new());
+        for round in 0..32 {
+            let node = format!("node-{round}");
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let older = {
+                let (computers, provider, barrier, node) = (
+                    computers.clone(),
+                    provider.clone(),
+                    barrier.clone(),
+                    node.clone(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    computers.install(&node, 8, provider)
+                })
+            };
+            let newer = {
+                let (computers, provider, barrier, node) = (
+                    computers.clone(),
+                    provider.clone(),
+                    barrier.clone(),
+                    node.clone(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    computers.install(&node, 9, provider)
+                })
+            };
+            let older = older.join().unwrap();
+            let newer = newer
+                .join()
+                .unwrap()
+                .expect("the newer connection must always end up installed");
+            // The newest generation owns the node and the replaced one owns nothing;
+            // a late install of 8 never displaces 9 (it is refused), and an install
+            // of 9 after 8 replaces and retires 8.
+            assert!(
+                Arc::ptr_eq(&newer, &computers.current(&node, 9).unwrap().unwrap()),
+                "the newest connection lost the cache"
+            );
+            assert!(
+                computers.current(&node, 8).unwrap().is_none(),
+                "a replaced generation stayed installed"
+            );
+            if let Ok(older) = older {
+                assert!(
+                    newer.epoch() >= older.epoch(),
+                    "the epoch moved backwards across a racing reconnect"
+                );
+                // The device that lost the race is fenced: it can neither open a
+                // view nor execute anything against the surviving connection.
+                assert_eq!(
+                    older
+                        .start_view(
+                            &sessions,
+                            &session,
+                            ViewBody {
+                                consent: true,
+                                device_id: device.device.id.clone(),
+                            },
+                        )
+                        .unwrap_err(),
+                    "computer_unavailable"
+                );
+                assert_eq!(
+                    device.inputs.load(Ordering::SeqCst),
+                    0,
+                    "a replaced device reached the backend"
+                );
+            }
+        }
     }
 
     #[test]
