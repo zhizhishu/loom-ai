@@ -1175,7 +1175,8 @@ fn lease_expired(lease_expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> 
 /// 时钟，避免在这里偷偷读第二个时钟。
 ///
 /// 消费方：`application::launch_pi_agent_run` 在发写授权（`pi::PiFileGrant`）前读它，
-/// 让 grant 携带的就是本 Run 当下真正持有的 claim/fence/租约。
+/// `application::handle_builtin_operation` 在 `loom.claim` / `loom.claim_heartbeat` 成功后重签同一份
+/// 授权时读它，让 grant 携带的就是本 Run 当下真正持有的 claim/fence/租约。
 pub(crate) fn live_claim_for_run(
     connection: &rusqlite::Connection,
     agent_run_id: &str,
@@ -1660,6 +1661,12 @@ pub(crate) fn claim_acquire_in(
 /// The read of the claim and the write that extends it happen under one lock and therefore cannot
 /// interleave with another writer; the `UPDATE` still names every guard again, so a row that no
 /// longer matches can never be renewed by a stale decision made earlier in this transaction.
+///
+/// Consumer (P0 step 6): `application::handle_builtin_operation` re-issues this Run's Pi write
+/// authorisation from [`live_claim_for_run`] after a successful heartbeat, exactly as it does after
+/// `loom.claim`. The lease this function writes is what the shared guard compares, so a heartbeat
+/// that moved only the ledger would turn a Run that is still beating into `claim_expired` once its
+/// previous lease ran out.
 pub fn claim_heartbeat(
     database: &mut Database,
     input: LoomClaimHeartbeatInput,
@@ -8322,6 +8329,266 @@ mod tests {
         );
         assert_ne!(reissued.claim_id, after_claim.claim_id);
         assert!(reissued.requires_claim);
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// P0 步骤 6：`loom.claim_heartbeat` 续租成功后，写授权必须和 `loom.claim` 一样重签——guard
+    /// 比的是 grant 文档里那条 lease。只改库不重签，一个还在心跳的 Run 会在旧租约到点的那一刻被
+    /// 判成 `claim_expired`。这里把「续租 → 读回活 claim → 重签」整条链钉死。
+    #[test]
+    fn a_heartbeat_reissues_the_write_authorisation_it_extends() {
+        use crate::pi::{PiFileAccessMode, PiFileGrant, now_epoch_ms};
+
+        let lease_epoch_ms = |lease: &str| {
+            chrono::DateTime::parse_from_rfc3339(lease)
+                .unwrap()
+                .timestamp_millis()
+        };
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM pi grant heartbeat");
+        let workspace = std::env::temp_dir().join(format!(
+            "rovai-loom-pi-grant-heartbeat-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log = workspace.join("guard.jsonl");
+
+        // r9 形状：Run 先启动、写授权先签发（空三元组 + requiresClaim），随后才 claim。
+        let launched = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run_one",
+            "bot_one",
+            1,
+            &workspace,
+            &log,
+            now_epoch_ms(),
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("the claiming Run holds the live claim");
+        let after_claim = launched
+            .reissued_for_claim(Some(&live), true, now_epoch_ms())
+            .unwrap();
+        let claimed_lease_ms = lease_epoch_ms(&claim.lease_expires_at);
+        assert_eq!(
+            after_claim.lease_expires_at_epoch_ms, claimed_lease_ms,
+            "assertion the grant re-issued after loom.claim carries the lease the claim wrote"
+        );
+
+        // 心跳：库里的 lease 前移，fence 不动。
+        let renewed = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap();
+        let renewed_lease_ms = lease_epoch_ms(&renewed.lease_expires_at);
+        assert!(
+            renewed_lease_ms > claimed_lease_ms,
+            "assertion a heartbeat moves the lease the claim holds forward"
+        );
+        assert_eq!(
+            renewed.fence_generation, claim.fence_generation,
+            "assertion a heartbeat never advances the fence"
+        );
+
+        // 不重签的样子：guard 只会在旧租约到点那一刻把仍在心跳的 Run 判成 `claim_expired`，
+        // 而这正是缺口——grant 必须跟着续过的租约走。
+        assert!(
+            claimed_lease_ms >= after_claim.lease_expires_at_epoch_ms,
+            "assertion a grant that was not re-issued is expired from the instant the old lease ends"
+        );
+
+        // 重签（`application::handle_builtin_operation` 在心跳成功后做的正是这一步）：文档带的是
+        // 续过的租约，在同一个时刻照旧放行。
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("a renewed lease still reads as live");
+        assert_eq!(
+            lease_epoch_ms(&live.lease_expires_at),
+            renewed_lease_ms,
+            "assertion the live claim read after a heartbeat is the renewed lease"
+        );
+        let reissued = after_claim
+            .reissued_for_claim(Some(&live), true, now_epoch_ms())
+            .unwrap();
+        assert_eq!(
+            reissued.lease_expires_at_epoch_ms, renewed_lease_ms,
+            "assertion re-issuing after loom.claim_heartbeat carries the renewed lease"
+        );
+        assert!(
+            claimed_lease_ms < reissued.lease_expires_at_epoch_ms,
+            "assertion the re-issued authorisation is live at the instant the old one expired"
+        );
+        assert_ne!(
+            reissued.lease_expires_at_epoch_ms, after_claim.lease_expires_at_epoch_ms,
+            "assertion a heartbeat re-issue is a real rewrite, not a no-op"
+        );
+        // 重签只动 claim 三元组：Run/bot/epoch/workspace/工具/日志/过期时刻一字节不变。
+        assert_eq!(reissued.claim_id, after_claim.claim_id);
+        assert_eq!(reissued.fence_generation, after_claim.fence_generation);
+        assert!(reissued.requires_claim);
+        assert_eq!(reissued.schema, after_claim.schema);
+        assert_eq!(reissued.run_id, after_claim.run_id);
+        assert_eq!(reissued.bot_id, after_claim.bot_id);
+        assert_eq!(reissued.execution_epoch, after_claim.execution_epoch);
+        assert_eq!(reissued.workspace_real, after_claim.workspace_real);
+        assert_eq!(reissued.allowed_tools, after_claim.allowed_tools);
+        assert_eq!(reissued.log_path, after_claim.log_path);
+        assert_eq!(
+            reissued.expires_at_epoch_ms, after_claim.expires_at_epoch_ms,
+            "assertion a heartbeat re-issue never extends the grant expiry"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// P0 步骤 6：被接管的旧 Run 再也拿不到活的写授权。接管只在旧租约过期后发生，旧 Run 手里那份
+    /// 文档因此从它自己的租约终点起就是 `claim_expired`；而且没有任何路径能把它救回来——
+    /// `live_claim_for_run` 读不到活 claim（接管已释放），心跳对已释放的 claim 直接
+    /// `LOOM_CLAIM_ABSENT`，所以 Core 也永远不会为它重签出更晚的 lease。fence 更旧的提交与证据
+    /// 登记由 `candidate_record` / `artifact_register` 自己拒
+    /// （`artifact_register_from_a_superseded_claim_is_refused`）。
+    #[test]
+    fn a_takeover_leaves_only_the_new_fence_with_a_live_write_authorisation() {
+        use crate::pi::{PiFileAccessMode, PiFileGrant, now_epoch_ms};
+
+        let lease_epoch_ms = |lease: &str| {
+            chrono::DateTime::parse_from_rfc3339(lease)
+                .unwrap()
+                .timestamp_millis()
+        };
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM pi grant takeover");
+        let workspace = std::env::temp_dir().join(format!(
+            "rovai-loom-pi-grant-takeover-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log = workspace.join("guard.jsonl");
+
+        let stale = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("the claiming Run holds the live claim");
+        let stale_grant = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run_one",
+            "bot_one",
+            1,
+            &workspace,
+            &log,
+            now_epoch_ms(),
+            Some(&live),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let stale_lease_ms = lease_epoch_ms(&stale.lease_expires_at);
+        assert_eq!(
+            stale_grant.lease_expires_at_epoch_ms, stale_lease_ms,
+            "assertion the superseded Run's document carries the lease it holds"
+        );
+
+        // 租约到期后另一个 Run 接管：旧 claim 被释放，fence 前进一代。
+        expire_lease(&database, &stale.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation,
+            stale.fence_generation + 1,
+            "assertion a takeover advances the fence generation"
+        );
+
+        // 旧 Run 没有任何活 claim，也没有任何路径能把它救回来。
+        assert!(
+            live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released claim is never live for its superseded Run"
+        );
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &stale.claim_id,
+                stale.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion a superseded Run cannot heartbeat a released claim into a new lease"
+        );
+        // 它手里那份文档从自己的租约终点起就是过期的：guard 的 `at >= leaseExpiresAtEpochMs`
+        // 在那一刻就把写拿掉，不需要任何额外机制。
+        assert!(
+            stale_lease_ms >= stale_grant.lease_expires_at_epoch_ms,
+            "assertion the superseded Run's grant expires with the lease the takeover ended"
+        );
+        // 就算 Core 以后以「没有活 claim」重签，要求开关也只能保持开着（guard 此时报
+        // `claim_missing`，而不是回到先领后写之前的放行）。
+        let emptied = stale_grant
+            .reissued_for_claim(None, true, now_epoch_ms())
+            .unwrap();
+        assert!(emptied.claim().is_none());
+        assert!(
+            emptied.requires_claim,
+            "assertion losing the claim never switches the write gate off"
+        );
+
+        // 只有接管者的 fence 是活的，而它拿的正是新一代。
+        let live = live_claim_for_run(database.connection(), "run_two", chrono::Utc::now())
+            .unwrap()
+            .expect("the takeover's Run holds the only live claim");
+        assert_eq!(live.claim_id, takeover.claim_id);
+        assert_eq!(live.fence_generation, takeover.fence_generation);
+        assert_ne!(
+            live.claim_id, stale.claim_id,
+            "assertion the takeover binds a new claim row, never the released one"
+        );
+        let takeover_grant = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run_two",
+            "bot_two",
+            1,
+            &workspace,
+            &log,
+            now_epoch_ms(),
+            Some(&live),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            takeover_grant.fence_generation, takeover.fence_generation,
+            "assertion the new fence is the only write authority on the Task"
+        );
         std::fs::remove_dir_all(&workspace).ok();
     }
 

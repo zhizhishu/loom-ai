@@ -7635,13 +7635,18 @@ impl Core {
                         let output = rovai_core::loom_tool::invoke(
                             &mut database,&caller,&tool_name,request.input,
                         ).map_err(map_loom_tool_error)?;
-                        // P0 step 3 (c): `loom.claim` is the moment this Run earns the right to write,
-                        // and the shared guard reads this Run's grant document before every decision —
-                        // so the authorisation is re-issued HERE, from the claim the command just
-                        // created. Without this, a Run launched before it claimed (r9) would keep
-                        // writing under the empty pre-claim grant. A Run with no guarded Host (native
-                        // policy, already stopped) is a no-op, which keeps ordinary chat untouched.
-                        if tool_name == rovai_core::loom_tool::LOOM_CLAIM_TOOL_NAME {
+                        // P0 step 3 (c) + step 6: `loom.claim` is the moment this Run earns the
+                        // right to write, and `loom.claim_heartbeat` is the moment it extends the
+                        // lease that right is bound to. The shared guard re-reads this Run's grant
+                        // document before every decision and compares the lease it carries, so an
+                        // authorisation is re-issued HERE, from the claim the command just wrote.
+                        // Without the claim re-issue, a Run launched before it claimed (r9) would
+                        // keep writing under the empty pre-claim grant; without the heartbeat
+                        // re-issue, a Run that is still beating would be refused with
+                        // `claim_expired` from the instant its previous lease ran out. A Run with no
+                        // guarded Host (native policy, already stopped) is a no-op, which keeps
+                        // ordinary chat untouched.
+                        if rovai_core::loom_tool::reissues_write_authorisation(&tool_name) {
                             let claim = crate::loom::live_claim_for_run(
                                 database.connection(),
                                 &authenticated_run.agent_run_id,
@@ -7654,9 +7659,11 @@ impl Core {
                             self.pi
                                 .reissue_file_grant(&run_id, execution_epoch, claim.as_ref(), true)
                                 .await
-                                .context(
-                                    "failed to re-issue the Pi write authorisation after loom.claim",
-                                )?;
+                                .with_context(|| {
+                                    format!(
+                                        "failed to re-issue the Pi write authorisation after {tool_name}"
+                                    )
+                                })?;
                         }
                         output
                     };

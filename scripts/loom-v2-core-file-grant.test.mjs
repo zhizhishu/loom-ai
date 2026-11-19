@@ -684,6 +684,45 @@ test('claim gate: a LOOM-bound Run writes only under a complete, live claim', { 
       assert.match(String(outcome.reason), /claim_expired/, `${toolName}: ${outcome?.reason}`)
     }
     assert.ok(decisions('claim_expired').length >= 2, 'a lapsed lease is recorded as claim_expired')
+    const expiredBeforeHeartbeat = decisions('claim_expired').length
+
+    // 3b · P0 step 6: the Run heartbeats and Core re-issues the SAME document with the lease the
+    // heartbeat wrote. A Run that is still beating must not be turned into `claim_expired` by the
+    // lease it already replaced — the refusal has to follow the document, not the run's history.
+    const renewedLease = Date.now() + 300_000
+    writeFileSync(pendingFile, JSON.stringify(grantDocument({
+      workspaceReal, logPath, tools: WORKFLOW, requiresClaim: true, expiresAtEpochMs: grantExpiry,
+      claimId: 'claim-live-1', fenceGeneration: 2, leaseExpiresAtEpochMs: renewedLease
+    })), 'utf8')
+    assert.equal(pending(toolEvent('write', 'heartbeat_new', { path: NEW_FILE }), ctx), undefined,
+      'the write of a Run whose heartbeat Core re-issued must be allowed again')
+    assert.equal(pending(toolEvent('edit', 'heartbeat_edit', { path: 'notes.md' }), ctx), undefined,
+      'an edit under the renewed lease is allowed too')
+    assert.equal(decisions('claim_expired').length, expiredBeforeHeartbeat,
+      'a renewed lease records no new claim_expired decision')
+
+    // 3c · P0 step 6: a takeover ends the old Run's lease. No re-issue can produce a live lease for
+    // it (Core refuses a heartbeat of a released claim), so the document it still holds is refused
+    // from the instant that lease ended...
+    writeFileSync(pendingFile, JSON.stringify(grantDocument({
+      workspaceReal, logPath, tools: WORKFLOW, requiresClaim: true, expiresAtEpochMs: grantExpiry,
+      claimId: 'claim-live-1', fenceGeneration: 2, leaseExpiresAtEpochMs: Date.now() - 1
+    })), 'utf8')
+    const superseded = pending(toolEvent('write', 'superseded_new', { path: NEW_FILE }), ctx)
+    assert.equal(superseded?.block, true,
+      'a superseded Run cannot write under the lease its takeover ended')
+    assert.match(String(superseded.reason), /claim_expired/, String(superseded?.reason))
+    // ... and a document Core re-issues for a Run that holds no claim any more keeps the requirement:
+    // the triple empties, so the refusal is `claim_missing` — never a fall back to pre-claim writing.
+    writeFileSync(pendingFile, JSON.stringify(grantDocument({
+      workspaceReal, logPath, tools: WORKFLOW, requiresClaim: true, expiresAtEpochMs: grantExpiry,
+      claimId: '', fenceGeneration: 0, leaseExpiresAtEpochMs: 0
+    })), 'utf8')
+    for (const [toolName, path, id] of [['write', NEW_FILE, 'taken_over_new'], ['edit', 'notes.md', 'taken_over_edit']]) {
+      const outcome = pending(toolEvent(toolName, id, { path }), ctx)
+      assert.equal(outcome?.block, true, `${toolName} must be refused once the Run holds no claim`)
+      assert.match(String(outcome.reason), /claim_missing/, `${toolName}: ${outcome?.reason}`)
+    }
 
     // 4 · a rewrite may only move the claim: another Run in the same file is refused.
     writeFileSync(pendingFile, JSON.stringify(grantDocument({

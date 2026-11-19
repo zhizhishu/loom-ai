@@ -51,6 +51,22 @@ pub fn is_read_only(name: &str) -> bool {
     matches!(name, LOOM_STATUS_TOOL_NAME | LOOM_INSPECT_TOOL_NAME)
 }
 
+/// P0 step 6: the operations that establish or extend *this Run's* claim, and therefore move the
+/// Run's write authorisation onto the claim the command just wrote.
+///
+/// `loom.claim` earns the right to write (P0 step 3) and `loom.claim_heartbeat` extends the very
+/// lease that right is bound to (P0 step 5). The shared guard compares the lease the Run's grant
+/// document carries, so a heartbeat that moved the lease in the ledger but not in the document
+/// leaves a Run that is still beating being refused with `claim_expired` once the pre-renewal lease
+/// runs out. Both operations therefore share one re-issue trigger rather than one of them silently
+/// keeping the authorisation it had. Every other `loom.*` operation leaves the authorisation alone:
+/// `loom.evidence`, `loom.submit` and the reviews are checked against the claim by the domain
+/// itself (`fence_generation` / `claim_id` comparisons in `loom::artifact_register` and
+/// `loom::candidate_record`), never by a grant rewrite.
+pub fn reissues_write_authorisation(name: &str) -> bool {
+    matches!(name, LOOM_CLAIM_TOOL_NAME | LOOM_CLAIM_HEARTBEAT_TOOL_NAME)
+}
+
 /// A rejection with a stable `loom.*` code the CLI maps to `error.recovery`.
 #[derive(Debug)]
 pub struct LoomToolError {
@@ -1373,6 +1389,41 @@ mod tests {
     fn domain_codes_become_agent_codes() {
         assert_eq!(agent_error_code("LOOM_PLAN_EXISTS"), "loom.plan_exists");
         assert_eq!(agent_error_code("LOOM_CLAIM_ABSENT"), "loom.claim_absent");
+    }
+
+    /// P0 step 6: `loom.claim_heartbeat` must move the Run's write authorisation exactly like
+    /// `loom.claim` does, or the guard keeps comparing the pre-renewal lease. Every other operation
+    /// is enumerated here, so a new `loom.*` tool cannot join the LOOM vocabulary while silently
+    /// keeping a stale grant (or, worse, rewriting an authorisation it never moved).
+    #[test]
+    fn only_the_claim_operations_reissue_the_write_authorisation() {
+        for name in [LOOM_CLAIM_TOOL_NAME, LOOM_CLAIM_HEARTBEAT_TOOL_NAME] {
+            assert!(
+                reissues_write_authorisation(name),
+                "assertion {name} moves the write authorisation it just re-bound"
+            );
+        }
+        let untouched: Vec<&str> = LOOM_TOOL_NAMES
+            .into_iter()
+            .filter(|name| !reissues_write_authorisation(*name))
+            .collect();
+        assert_eq!(
+            untouched,
+            vec![
+                LOOM_STATUS_TOOL_NAME,
+                LOOM_PLAN_TOOL_NAME,
+                LOOM_RELEASE_TOOL_NAME,
+                LOOM_EVIDENCE_TOOL_NAME,
+                LOOM_SUBMIT_TOOL_NAME,
+                LOOM_INSPECT_TOOL_NAME,
+                LOOM_STAGE_REVIEW_TOOL_NAME,
+            ],
+            "assertion every other loom.* operation leaves the grant where it is"
+        );
+        assert!(
+            !reissues_write_authorisation("loom.claim_heartbeats"),
+            "assertion the trigger matches the exact operation name, never a prefix"
+        );
     }
 
     #[test]
