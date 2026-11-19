@@ -2351,6 +2351,10 @@ fn mission_workspace(
 /// Registering the same path, Task, producer and bytes replays that immutable version (and gives
 /// a historical artifact its missing snapshot). Changed bytes or a new producer Run create a new
 /// artifact id at the same logical path. Older candidates continue to read their own archives.
+///
+/// Local evidence is fenced exactly like remote evidence: a registration that names both a producer
+/// Run and a Task is only written while that Run holds the Task's live claim, so an unclaimed or
+/// taken-over Run can never deposit evidence under somebody else's Task.
 pub fn artifact_register(
     database: &mut Database,
     creator_id: &str,
@@ -2387,6 +2391,13 @@ pub fn artifact_register(
         let workspace = mission_workspace(connection, &mission_id)?;
         let plan_id = artifact_plan(connection, &mission_id)?;
         ensure_artifact_task(connection, &plan_id, &mission_id, task_id.as_deref())?;
+        ensure_artifact_claim(
+            connection,
+            agent_run_id.as_deref(),
+            &plan_id,
+            task_id.as_deref(),
+            chrono::Utc::now(),
+        )?;
         (workspace, plan_id)
     };
     let data_dir = snapshot::data_directory(database)?;
@@ -2437,6 +2448,16 @@ pub fn artifact_register(
         ));
     }
     ensure_artifact_task(&transaction, &plan_id, &mission_id, task_id.as_deref())?;
+    // The fence is judged again under the write lock, against a clock read inside it: a lease that
+    // lapsed while this command waited for the lock is expired, not still live, so the archived
+    // bytes can never be recorded under a claim the producer has already lost.
+    ensure_artifact_claim(
+        &transaction,
+        agent_run_id.as_deref(),
+        &plan_id,
+        task_id.as_deref(),
+        chrono::Utc::now(),
+    )?;
     let workspace_now = mission_workspace(&transaction, &mission_id)?;
     let resolved_now = resolve_artifact_path(&workspace_now, &relative_path).map_err(|error| {
         LoomCommandError::rejection(
@@ -2585,6 +2606,80 @@ fn ensure_artifact_task(
         return Err(LoomCommandError::rejection(
             LOOM_TASK_NOT_FOUND,
             format!("task {task_id} does not belong to the plan of mission {mission_id}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The local evidence fence, with the same rules as the remote one: a registration that names both a
+/// producer Run and a Task may only be written by the Run that still holds that Task's claim.
+///
+/// The claim identity and its fence generation are read from the Task's open claim, never supplied by
+/// the caller, so a local registration cannot present a fence it does not hold; only the Run's
+/// identity is authenticated, exactly like `loom.submit`. Liveness is the same rule the submit-side
+/// fence uses: a released claim, a lapsed lease and an unparsable lease are not a fence for new
+/// evidence. `now` is the caller's clock because the artifact path re-judges the fence inside its
+/// write transaction.
+///
+/// A registration that names no Run (a human or the main assistant) or no Task binds itself to no
+/// Task, so it has no claim to hold and keeps the unfenced behaviour. Only a Run that names a Task is
+/// gated here.
+fn ensure_artifact_claim(
+    connection: &rusqlite::Connection,
+    agent_run_id: Option<&str>,
+    plan_id: &str,
+    task_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let (Some(agent_run_id), Some(task_id)) = (agent_run_id, task_id) else {
+        return Ok(());
+    };
+    // `loom_claim_open_task_idx` keeps this at most one row per Task, so the fence this registration
+    // is written under is never ambiguous.
+    let holding: Option<(String, String, i64, String)> = connection
+        .query_row(
+            "SELECT claim_id, agent_run_id, fence_generation, lease_expires_at FROM loom_claim
+             WHERE plan_id=?1 AND task_id=?2 AND released_at IS NULL",
+            params![plan_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((claim_id, holder_run_id, fence_generation, lease_expires_at)) = holding else {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!("task {task_id} carries no unreleased claim to register evidence under"),
+        ));
+    };
+    // Same reading as the remote evidence path: a claim on the Task that does not name this Run is
+    // not this Run's claim. A takeover releases the previous holder first, so a superseded producer
+    // lands here too. (The local submit fence splits this case out as
+    // `LOOM_CLAIM_AGENT_RUN_MISMATCH`; evidence registration keeps the remote path's code so both
+    // evidence routes answer a lost Task identically.)
+    if holder_run_id != agent_run_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!(
+                "task {task_id} is held at fence generation {fence_generation} by claim {claim_id} for agentRun {holder_run_id}, not {agent_run_id}"
+            ),
+        ));
+    }
+    if lease_expired(&lease_expires_at, now) {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_EXPIRED,
+            format!(
+                "claim {claim_id} on task {task_id} expired at {lease_expires_at}; register evidence under a live claim"
+            ),
+        ));
+    }
+    // The Run's own live claim, read through the one reader the write authorisation also uses. A Run
+    // whose newest generation already lapsed has no live fence left to present, even while a row of
+    // its own is still open.
+    if live_claim_for_run(connection, agent_run_id, now)?.is_none() {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_EXPIRED,
+            format!(
+                "agentRun {agent_run_id} holds no live claim on task {task_id} to register evidence under"
+            ),
         ));
     }
     Ok(())
@@ -8118,6 +8213,14 @@ mod tests {
             relative_path: "report.md".into(),
             content_type: None,
         };
+        // A producer Run may only register evidence for the Task it holds, so the delivery's claim
+        // is taken first and the rework below is a real takeover of it.
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run-first", "command_one"),
+        )
+        .unwrap();
         let produced = artifact_register(
             &mut database, "agent_1", producer_input("run-first"),
         ).unwrap();
@@ -8126,6 +8229,19 @@ mod tests {
         ).unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.artifact.artifact_id, produced.artifact.artifact_id);
+        // The rework is a new Run under a new claim: the first lease lapsed and the second Run took
+        // the Task over, which released the old claim and advanced the fence generation.
+        expire_lease(&database, &claim.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run-rework", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation,
+            claim.fence_generation + 1,
+            "assertion the rework advances the fence generation"
+        );
         let next_run = artifact_register(
             &mut database, "agent_1", producer_input("run-rework"),
         ).unwrap();
@@ -8135,6 +8251,227 @@ mod tests {
         assert_eq!(next_run.artifact.agent_run_id.as_deref(), Some("run-rework"));
         assert_eq!(next_run.artifact.task_id.as_deref(), Some("task_a"));
         assert_eq!(next_run.artifact.creator_id, "agent_1");
+    }
+
+    fn artifact_rows(database: &Database) -> i64 {
+        database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// The producer registration the tool boundary builds: the Run is authenticated, the Task is what
+    /// the evidence claims to belong to, and the creator is who the Run acts for.
+    fn producer_evidence_input(
+        mission_id: &str,
+        task_id: &str,
+        agent_run_id: &str,
+    ) -> LoomArtifactRegisterInput {
+        LoomArtifactRegisterInput {
+            mission_id: mission_id.into(),
+            task_id: Some(task_id.into()),
+            agent_run_id: Some(agent_run_id.into()),
+            relative_path: "report.md".into(),
+            content_type: Some("text/markdown".into()),
+        }
+    }
+
+    #[test]
+    fn artifact_register_from_a_live_claim_is_recorded() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact live claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "delivered bytes");
+
+        let registered = artifact_register(
+            &mut database,
+            "agent_1",
+            producer_evidence_input(&mission_id, "task_a", "run_one"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            registered.artifact.agent_run_id.as_deref(),
+            Some(claim.agent_run_id.as_str()),
+            "assertion a fenced registration records the Run that holds the claim"
+        );
+        assert_eq!(
+            registered.artifact.task_id.as_deref(),
+            Some("task_a"),
+            "assertion a fenced registration records the claimed Task"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            1,
+            "assertion a live claim registers exactly one artifact"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion registering evidence leaves the holder's claim open"
+        );
+    }
+
+    #[test]
+    fn artifact_register_by_a_run_without_a_live_claim_is_refused() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact unclaimed");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        // RELEASED is not CLAIMED: only a live claim authorises a Run's evidence.
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "unclaimed bytes");
+
+        let error = artifact_register(
+            &mut database,
+            "agent_1",
+            producer_evidence_input(&mission_id, "task_a", "run_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion artifact_register_by_a_run_without_a_live_claim_is_refused"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            0,
+            "assertion an unclaimed registration writes no artifact"
+        );
+
+        // A registration that names no Task binds itself to nothing, so the unfenced path that the
+        // User and the main assistant use keeps working.
+        let taskless = artifact_register(
+            &mut database,
+            "agent_1",
+            LoomArtifactRegisterInput {
+                mission_id: mission_id.clone(),
+                task_id: None,
+                agent_run_id: Some("run_one".into()),
+                relative_path: "report.md".into(),
+                content_type: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            taskless.artifact.task_id, None,
+            "assertion a taskless registration binds no Task and needs no claim"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            1,
+            "assertion the taskless path records its artifact"
+        );
+    }
+
+    #[test]
+    fn artifact_register_from_an_expired_claim_is_refused() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact expired claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "late bytes");
+        expire_lease(&database, &claim.claim_id);
+
+        let error = artifact_register(
+            &mut database,
+            "agent_1",
+            producer_evidence_input(&mission_id, "task_a", "run_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_EXPIRED,
+            "assertion artifact_register_from_an_expired_claim_is_refused"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            0,
+            "assertion an expired claim writes no artifact"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion a refused registration does not release the lapsed claim"
+        );
+    }
+
+    #[test]
+    fn artifact_register_from_a_superseded_claim_is_refused() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact superseded claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let stale = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "handed over bytes");
+        // The lease lapses and another Run takes the Task over: the old claim is released and the
+        // fence generation advances, so the takeover is the only live fence on the Task.
+        expire_lease(&database, &stale.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_ne!(
+            takeover.claim_id, stale.claim_id,
+            "assertion the_takeover_writes_a_new_claim"
+        );
+        assert_eq!(
+            takeover.fence_generation,
+            stale.fence_generation + 1,
+            "assertion the_takeover_advances_the_fence_generation"
+        );
+
+        // The superseded Run's own claim was released by the takeover, so its registration arrives as
+        // a Run that no longer holds the Task and is refused before a byte is archived.
+        let late = artifact_register(
+            &mut database,
+            "agent_1",
+            producer_evidence_input(&mission_id, "task_a", "run_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&late),
+            LOOM_CLAIM_ABSENT,
+            "assertion artifact_register_from_a_superseded_claim_is_refused"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            0,
+            "assertion a superseded producer writes no artifact"
+        );
+
+        // Only the live fence's Run registers the evidence.
+        let accepted = artifact_register(
+            &mut database,
+            "agent_2",
+            producer_evidence_input(&mission_id, "task_a", "run_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.artifact.agent_run_id.as_deref(),
+            Some("run_two"),
+            "assertion the takeover's Run registers the evidence it holds the Task for"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            1,
+            "assertion only the live fence records an artifact"
+        );
     }
 
     #[test]
