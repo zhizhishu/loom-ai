@@ -233,11 +233,23 @@ export function unknownWorkControl(
  * 回执 → 事实：只有属于本 Mission 且阶段审查回执完整的快照才算 `observed`。
  * 判定复用 `control-service` 的 `classifyControlSnapshot`（错 Mission 与缺字段都在那里），
  * 这里只把结果翻译成右栏用的三态事实，不另立第二套规则。
+ *
+ * 畸形回执只让控制事实变成 `unknown/invalid`：六源数据照常保留，绝不因一份坏投影
+ * 丢掉整份 bundle，也绝不让分类器异常穿透到调用方。
  */
 export function classifyWorkControl(raw: unknown, missionId: string): WorkControlFacts {
-  const read = classifyControlSnapshot(raw, missionId)
-  if (read.status === 'observed') return { status: 'observed', snapshot: read.snapshot }
-  return unknownWorkControl('invalid', read.message)
+  const invalid = (message: string): WorkControlFacts => unknownWorkControl('invalid', message)
+  // 缺 `policy` 字段的快照会让完整性检查读到 undefined：先按缺失字段收成 invalid。
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && !('policy' in raw)) {
+    return invalid(uiAttribute('控制快照缺少必需字段：policy，阶段审查事实尚未确认。'))
+  }
+  try {
+    const read = classifyControlSnapshot(raw, missionId)
+    if (read.status === 'observed') return { status: 'observed', snapshot: read.snapshot }
+    return invalid(read.message)
+  } catch {
+    return invalid(uiAttribute('控制回执无法识别，阶段审查事实尚未确认。'))
+  }
 }
 
 /**
@@ -260,10 +272,17 @@ async function readWorkControl(client: Reader, mission: MissionRecord): Promise<
   return classifyWorkControl(raw, missionId)
 }
 
-/** 批量投影没有随批次带回的控制事实：未知，且明确说明是批量口径。 */
-function batchWorkControl(mission: MissionRecord): WorkControlFacts {
-  return unknownWorkControl('batch_projection',
-    uiAttribute('「{0}」的阶段审查事实不在批量投影里，尚未确认。', mission.title))
+/** 有界并发：批量读取补齐控制事实时，逐 Mission 的请求数不超过 `LOOM_BUNDLE_CONCURRENCY`。 */
+async function mapBounded<T, R>(
+  items: readonly T[], limit: number, run: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (let index = cursor++; index < items.length; index = cursor++) results[index] = await run(items[index])
+  })
+  await Promise.all(workers)
+  return results
 }
 
 /** Bundle 上的控制事实；缺省字段同样是「尚未读取」，不是「没有批准」。 */
@@ -356,9 +375,9 @@ export async function readWorkBundles(
 /** One bounded read-only Core operation per 8 Missions. Older Hosts and
  * partially unavailable Missions use the existing six-source reconciliation,
  * so an unknown contract or broken projection never pretends to be empty.
- * The batch row carries the control projection only when the Host includes it;
- * otherwise the facts stay unknown instead of being re-read as a second, per-Mission
- * storm (which is exactly what this batch exists to avoid). */
+ * The batch row carries the control projection when the Host includes it; when it does
+ * not, the same `loom.control.get` read the ordinary path uses fills it in with bounded
+ * concurrency, so both paths answer with the same facts instead of one guessing. */
 export async function readWorkBundlesFast(
   client: Reader, missions: readonly MissionRecord[]
 ): Promise<{ bundles: WorkBundle[]; errors: string[] }> {
@@ -381,7 +400,13 @@ export async function readWorkBundlesFast(
         verified.push({mission,plan:row.plan??null,tasks:requireArray(row.tasks,error),
           candidates:requireArray(row.candidates,error),reviews:requireArray(row.reviews,error),
           verifications:requireArray(row.verifications,error),artifacts:requireArray(row.artifacts?.artifacts,error),
-          control:row.control===undefined?batchWorkControl(mission):classifyWorkControl(row.control,mission.missionId)})
+          ...(row.control===undefined?{}:{control:classifyWorkControl(row.control,mission.missionId)})})
+      }
+      // 旧 Host 的批次行不带控制投影：用与普通读取同一个读取器补齐，且不放开并发。
+      const withoutControl=verified.filter(bundle=>bundle.control===undefined)
+      if(withoutControl.length>0){
+        const facts=await mapBounded(withoutControl,LOOM_BUNDLE_CONCURRENCY,bundle=>readWorkControl(client,bundle.mission))
+        withoutControl.forEach((bundle,index)=>{bundle.control=facts[index]})
       }
       bundles.push(...verified)
     }catch{

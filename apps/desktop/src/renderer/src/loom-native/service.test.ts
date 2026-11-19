@@ -117,20 +117,86 @@ describe('native work bundle review facts',()=>{
     expect(workControl(bare)).toMatchObject({status:'unknown',reason:'not_read'})
     expect(stageReviewFacts(bare)).toMatchObject({status:'unknown',reason:'not_read'})
   })
-  it('never turns an absent batch control projection into a conclusion',async()=>{
-    const many={bundles:[{missionId:'m',plan:null,tasks:[],candidates:[],reviews:[],verifications:[],artifacts:{artifacts:[]}}]}
-    const batched=await readWorkBundlesFast(host({many}),[mission])
+  const row=(over:Record<string,unknown>={})=>({missionId:'m',plan:null,tasks:[{taskId:'task-1',title:'T'}],candidates:[candidate],
+    reviews:[],verifications:[],artifacts:{artifacts:[]},...over})
+  it('fills an absent batch control projection with the same facts the ordinary read returns',async()=>{
+    const batched=await readWorkBundlesFast(host({many:{bundles:[row()]}}),[mission])
+    const ordinary=await readWorkBundle(host(),mission)
+    expect(batched.errors).toHaveLength(0)
     expect(batched.bundles).toHaveLength(1)
-    expect(workControl(batched.bundles[0])).toMatchObject({status:'unknown',reason:'batch_projection'})
-    expect(stageReviewFacts(batched.bundles[0]).status).toBe('unknown')
+    expect(workControl(batched.bundles[0])).toEqual(workControl(ordinary))
+    expect(stageReviewFacts(batched.bundles[0])).toEqual(stageReviewFacts(ordinary))
+    expect(stageReviewFacts(batched.bundles[0])).toMatchObject({status:'observed'})
+    const facts=stageReviewFacts(batched.bundles[0])
+    if(facts.status!=='observed') throw Error('unreachable')
+    expect(latestStageReview(facts.stageReviews,'cand-1')).toEqual(stageReview)
   })
   it('applies the same control classification to a batch row that carries it',async()=>{
-    const many={bundles:[{missionId:'m',plan:null,tasks:[],candidates:[],reviews:[],verifications:[],artifacts:{artifacts:[]},control:snapshot()}]}
+    const many={bundles:[row({control:snapshot()})]}
     const batched=await readWorkBundlesFast(host({many}),[mission])
-    expect(workControl(batched.bundles[0]).status).toBe('observed')
-    const wrong={bundles:[{missionId:'m',plan:null,tasks:[],candidates:[],reviews:[],verifications:[],artifacts:{artifacts:[]},control:snapshot({missionId:'other'})}]}
+    expect(workControl(batched.bundles[0])).toEqual(workControl(await readWorkBundle(host(),mission)))
+    const wrong={bundles:[row({control:snapshot({missionId:'other'})})]}
     const other=await readWorkBundlesFast(host({many:wrong}),[mission])
     expect(workControl(other.bundles[0])).toMatchObject({status:'unknown',reason:'invalid'})
+    // 批次行自带错 Mission 投影时也不会再被逐 Mission 覆写成“读到了”。
+    expect(other.bundles[0].control).toMatchObject({status:'unknown',reason:'invalid'})
+  })
+  it('reads batch control facts with bounded concurrency instead of an unbounded storm',async()=>{
+    const missions=Array.from({length:9},(_,index)=>({...mission,
+      missionId:`m${index}`,threadId:`t${index}`,title:`M${index}`}) as MissionRecord)
+    let inFlight=0,peak=0
+    const request=vi.fn(async(method:string,params?:{missionId?:string}):Promise<unknown>=>{
+      if(method==='loom.bundles.getMany') return {bundles:missions.map(item=>row({missionId:item.missionId}))}
+      if(method==='loom.control.get'){
+        inFlight+=1;peak=Math.max(peak,inFlight)
+        await new Promise(resolve=>setTimeout(resolve,0))
+        inFlight-=1
+        return snapshot({missionId:String(params?.missionId??'m')})
+      }
+      if(method==='loom.plan.get') return null
+      if(method==='loom.artifacts.list') return {artifacts:[]}
+      return []
+    })
+    const batched=await readWorkBundlesFast(mockClient(request),missions)
+    expect(batched.bundles).toHaveLength(9)
+    expect(peak).toBeGreaterThan(0)
+    expect(peak).toBeLessThanOrEqual(4)
+    for(const bundle of batched.bundles) expect(workControl(bundle).status).toBe('observed')
+  })
+  it('keeps the bundle unknown when the batch and the control read both fail',async()=>{
+    const client=host({many:Promise.reject(new Error('batch unavailable')),controlError:new Error('offline')})
+    const recovered=await readWorkBundlesFast(client,[mission])
+    expect(recovered.errors).toHaveLength(0)
+    expect(recovered.bundles).toHaveLength(1)
+    expect(recovered.bundles[0].tasks).toHaveLength(1)
+    expect(workControl(recovered.bundles[0])).toMatchObject({status:'unknown',reason:'read_failed'})
+    expect(stageReviewFacts(recovered.bundles[0]).status).toBe('unknown')
+  })
+  it('keeps the six sources when a control receipt is malformed instead of dropping the bundle',async()=>{
+    const malformed=snapshot() as unknown as Record<string,unknown>
+    delete malformed.policy
+    const ordinary=await readWorkBundle(host({control:malformed}),mission)
+    expect(ordinary.tasks).toHaveLength(1)
+    expect(ordinary.candidates).toHaveLength(1)
+    expect(workControl(ordinary)).toMatchObject({status:'unknown',reason:'invalid'})
+    const batched=await readWorkBundlesFast(host({many:{bundles:[row({control:malformed})]}}),[mission])
+    expect(batched.bundles).toHaveLength(1)
+    expect(batched.bundles[0].tasks).toHaveLength(1)
+    expect(workControl(batched.bundles[0])).toMatchObject({status:'unknown',reason:'invalid'})
+  })
+  it('selects the newest stage review across an unordered ledger and keeps ledger order on ties',()=>{
+    const older={...stageReview,stageReviewId:'older',reviewedAt:'2026-11-12T00:00:00Z'}
+    const newest={...stageReview,stageReviewId:'newest',reviewedAt:'2026-11-14T00:00:00Z'}
+    const middle={...stageReview,stageReviewId:'middle',reviewedAt:'2026-11-13T00:00:00Z'}
+    expect(latestStageReview([older,newest,middle],'cand-1')?.stageReviewId).toBe('newest')
+    expect(latestStageReview([newest,older,middle],'cand-1')?.stageReviewId).toBe('newest')
+    const first={...stageReview,stageReviewId:'first'}
+    const last={...stageReview,stageReviewId:'last'}
+    expect(latestStageReview([first,last],'cand-1')?.stageReviewId).toBe('last')
+    expect(latestStageReview([last,first],'cand-1')?.stageReviewId).toBe('first')
+    expect(latestStageReview([older,newest,{...newest,stageReviewId:'other-candidate',candidateId:'cand-2'}],'cand-1')?.stageReviewId)
+      .toBe('newest')
+    expect(latestStageReview([],'cand-1')).toBeNull()
   })
   it('recovers a failed batch through ordinary reads with the same facts',async()=>{
     const client=host({many:Promise.reject(new Error('batch unavailable'))})
@@ -142,7 +208,8 @@ describe('native work bundle review facts',()=>{
     expect(recovered.bundles[0].tasks).toEqual(ordinary.tasks)
     expect(recovered.bundles[0].candidates).toEqual(ordinary.candidates)
     expect(recovered.bundles[0].reviews).toEqual(ordinary.reviews)
-    expect(recovered.bundles[0].control?.status).toBe('observed')
+    expect(workControl(recovered.bundles[0])).toEqual(workControl(ordinary))
+    expect(stageReviewFacts(recovered.bundles[0])).toEqual(stageReviewFacts(ordinary))
   })
 })
 

@@ -32,11 +32,10 @@ export type WorkItem = { task: LoomTask; mission: MissionRecord; candidate: Loom
  * 不是「没有批准」，不是「没有审查回执」，更不是「在等你」。
  *
  * - `not_read`：这份 Bundle 没读过控制投影（缺省字段，不是空结论）。
- * - `batch_projection`：批量投影不含 control，逐 Mission 的事实没有随批次回来。
  * - `read_failed`：请求本身失败（传输层或 Host 错误）。
  * - `invalid`：回执不是本 Mission 的完整快照（错 Mission、缺阶段审查回执等）。
  */
-export type WorkControlUnknownReason = 'not_read' | 'batch_projection' | 'read_failed' | 'invalid'
+export type WorkControlUnknownReason = 'not_read' | 'read_failed' | 'invalid'
 
 /** 「还没读到」的唯一形状；控制与阶段审查两种事实共用它。 */
 export type WorkControlUnknown = { status: 'unknown'; reason: WorkControlUnknownReason; message: string }
