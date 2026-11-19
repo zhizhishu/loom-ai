@@ -57,6 +57,15 @@
 3. 分层测试：`cargo check -p <crate>` → 改动 crate 单测 → 相关 Node 测试 → 该阶段 E 门禁；跨设备用“Core 容器 + 独立 Node 容器”。
 4. 回执写 `_artifacts/<批次>/`，结论只进 `LOOM-IMPLEMENTATION.md`。
 
+**当前状态（2026-11-18 22:05 PST，Hark 起头，下一位接手）**
+- 已建：DE-BERO 宿主 `/root/sandbox/projects/loom-dev/`，镜像 `loom-dev:base`（node:24-bookworm + Rust 1.97.1 + pnpm 11.20.0），容器 `loom-dev`（runc、无宿主密钥）。说明与脚本见 [`scripts/bero/README.md`](../../scripts/bero/README.md)。
+- 代码：`src/` 在 `b5c5d67`（GitHub 分支 `915ffa1` + 17 个未推送提交经 git bundle 传入，sha256 已核对）。
+- 基线（`logs/baseline.summary`）：pnpm install 5 s；`cargo check --workspace --all-targets` 冷 129 s、热 0 s；文档决策检查 37 s 通过；`cargo test -p rovai-core --lib` 484 s，**634 过 / 4 败 / 1 忽略**；cospan `doctor` 0.1.1 可用，但 codex、dsh 尚未安装。
+- Linux 下 4 个失败（Windows 上未见，先当环境/平台问题查，不改断言）：
+  - `database_admission` 3 个：`authority_ticket_blocked … IdentityChanged … stage: Revalidation`。把 `TMPDIR` 换到 ext4 卷仍失败，所以不是 tmpfs/overlay，疑为 Linux 下文件身份判定逻辑。
+  - `runtime_probe_process::tests::cancelling_the_owner_kills_the_spawned_process_group`：疑为容器 PID 1 是 `sleep`、没有 init 回收子进程；下一步用 `docker run --init` 重建容器复测。
+- 下一位接手顺序：① 重建容器加 `--init`，复测上面 4 个；② 查 `database_admission.rs` Revalidation 的身份比较在 Linux 的取值；③ 在容器里装 Pi 固定版本、DSH `0.2.0-rc.2`、Codex（密钥只进容器环境），`cospan doctor --check` 见到 codex、dsh；④ 进 P0。
+
 **留给 GitHub 与用户电脑**
 - Windows：Bero 通过后，由 GitHub 镜像仓库 Actions（`windows-package.yml`、`loom-v2-e3-windows.yml`）多构建 Windows 包；用户电脑只做安装冒烟，不碰 64851/64852、日常 userData。
 - 云端：DE-BERO 上的部署按云端形态做（Linux Core + Web 登录 + Node 连入）。
@@ -79,7 +88,7 @@
 ## 5. 施工顺序
 
 ### P-1 Bero 开发容器（先做）
-按 §3.1 建 `loom-dev`，跑通一次 `cargo check` 与现有 Node 测试，cospan `doctor --check` 通过（codex、dsh），记录基线耗时。
+按 §3.1 建 `loom-dev`，跑通一次 `cargo check` 与现有 Node 测试，cospan `doctor --check` 通过（codex、dsh），记录基线耗时。**进行中**：容器与基线已完成（见 §3.1 当前状态），剩 4 个 Linux 失败与运行端安装。
 
 ### P0 先领后写（附带：Claude 禁用对齐）
 0. 把 `agent_runtime_adapter.rs` 中 Claude Code 的准入改为禁用（只识别），UI 显示“已禁用”；加负例测试：选 Claude 派工被拒。
