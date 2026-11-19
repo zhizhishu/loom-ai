@@ -269,6 +269,426 @@ pub fn has_waiting_delivery_batch_work(database: &Database) -> Result<bool> {
     )?)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Commit wake and due-timer recovery (T21)
+//
+// Ported from Mikka (MIT), commit d59c85cb321b2b466616960db49dea8f038c2384. The Delivery row is
+// the durable outbox; it is what notices pending work instead of a blind minute sweep, and a due
+// timer repairs whatever a lost wake cannot ("The independent sweep still repairs the
+// commit-to-start gap and workflow infrastructure failures." — lib/coordinator/wake.ts).
+//
+// Nothing here adds a table or a second scheduler: every fact is read from the existing delivery,
+// Run and claim columns, and every action is an existing function of this module.
+// ---------------------------------------------------------------------------------------------
+
+/// Threshold for interpreting persisted wake attempts.
+/// upstream: Mikka d59c85cb lib/coordinator/wake-recovery.ts:MAX_WAKE_ATTEMPTS
+pub const MAX_WAKE_ATTEMPTS: i64 = 8;
+
+/// How often the old minute sweep re-checked state only an outside owner knows
+/// (upstream: `RECHECK` in lib/run-recovery-due.ts). Here the outside owner is the Run that still
+/// holds the lane: its own ACK wakes the scheduler directly, so this is only a re-check.
+const DELIVERY_RECOVERY_RECHECK_MS: i64 = 60_000;
+
+/// The default bound of one reconciliation sweep.
+/// upstream: Mikka d59c85cb lib/coordinator/wake.ts:retryCoordinatorWakes (`deadline = Date.now()+45_000`)
+const DELIVERY_WAKE_SWEEP_BUDGET_MS: i64 = 45_000;
+
+/// The sweeps of the Delivery recovery timer, as the due query labels each due time.
+/// upstream: Mikka d59c85cb lib/run-recovery-due.ts:RUN_RECOVERY_SWEEPS
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeliveryRecoverySweep {
+    /// A waiting Delivery lane no live Run holds: the ordinary claim is due now.
+    Claims,
+    /// A claimed steer input its Run has not consumed yet: re-checked, never re-sent.
+    Inputs,
+    /// A queued batch Run whose input is already frozen: its dispatch is re-checked at the minute
+    /// cadence, because only its own preparation can advance it.
+    QueuedRuns,
+    /// A LOOM dispatch the standing approval already admitted: re-checked at the same cadence.
+    Dispatches,
+    /// An execution or LOOM claim lease that expires by itself: recovered then, not before.
+    Leases,
+}
+
+impl DeliveryRecoverySweep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claims => "claims",
+            Self::Inputs => "inputs",
+            Self::QueuedRuns => "queuedRuns",
+            Self::Dispatches => "dispatches",
+            Self::Leases => "leases",
+        }
+    }
+}
+
+/// Correlated on a `camp_message_delivery AS d` row: every membership fact still stands, so the
+/// only thing that can keep the lane waiting is a live Run.
+const DELIVERY_LANE_ADMISSIBLE_SQL: &str = r#"
+    d.status = 'waiting'
+    AND EXISTS (SELECT 1 FROM camp WHERE camp.id = d.camp_id AND camp.deletion_operation_id IS NULL)
+    AND EXISTS (
+        SELECT 1 FROM camp_member AS member
+        WHERE member.camp_id = d.camp_id AND member.agent_id = d.recipient_agent_id
+          AND member.status = 'active' AND member.leave_requested_at IS NULL
+    )
+    AND EXISTS (
+        SELECT 1 FROM agent_profile AS profile
+        WHERE profile.id = d.recipient_agent_id AND profile.profile_status = 'present'
+    )
+"#;
+
+/// Correlated on a `camp_message_delivery AS d` row: a fact the lane needed is gone, so no wake can
+/// ever start it. The claim sweep settles such a lane visibly instead.
+const DELIVERY_LANE_INVALID_SQL: &str = r#"
+    NOT EXISTS (SELECT 1 FROM camp WHERE camp.id = d.camp_id AND camp.deletion_operation_id IS NULL)
+    OR NOT EXISTS (
+        SELECT 1 FROM camp_member AS member
+        WHERE member.camp_id = d.camp_id AND member.agent_id = d.recipient_agent_id
+          AND member.status = 'active' AND member.leave_requested_at IS NULL
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM agent_profile AS profile
+        WHERE profile.id = d.recipient_agent_id AND profile.profile_status = 'present'
+    )
+"#;
+
+/// Correlated on an admissible lane: no queued, running or waiting Run owns that conversation, so
+/// the claim can start it right now ("one Delivery lane, one live Run" — lib/coordinator/wake.ts).
+const DELIVERY_LANE_FREE_SQL: &str = r#"
+    NOT EXISTS (
+        SELECT 1 FROM agent_run AS active
+        JOIN conversation ON conversation.id = active.conversation_id
+        WHERE conversation.camp_id = d.camp_id
+          AND conversation.agent_id = d.recipient_agent_id
+          AND conversation.kind = 'camp_member'
+          AND active.status IN ('queued', 'running', 'waiting')
+    )
+"#;
+
+/// Counts of one reconciliation sweep.
+/// upstream: Mikka d59c85cb lib/coordinator/wake.ts:retryCoordinatorWakes(`counts`)
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryWakeCounts {
+    /// Tickets still in the durable outbox this sweep looked at.
+    pub due: usize,
+    /// Tickets whose lane is free, so the claim sweep of the same pass starts them.
+    pub started: usize,
+    /// Tickets held by a live Run (or cut off by the sweep budget): re-checked, not retried harder.
+    pub deferred: usize,
+    /// Tickets that can never start: the Camp, membership or profile fact is gone.
+    pub failed: usize,
+    /// Tickets deferred `MAX_WAKE_ATTEMPTS` times already: reported, never spun on.
+    pub exhausted: usize,
+}
+
+/// What one due-timer pass did, and when the next one is due.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecoveryPass {
+    /// `None` means nothing can come due without a new write: the Core then arms no timer at all.
+    pub next_due_at_ms: Option<i64>,
+    /// The sweeps whose work had come.
+    pub due: std::collections::BTreeSet<DeliveryRecoverySweep>,
+    /// The Runs the `Claims` sweep started, in claim order.
+    pub claimed_agent_run_ids: Vec<String>,
+    /// What the reconciliation sweep made of the remaining tickets.
+    pub wakes: DeliveryWakeCounts,
+}
+
+fn delivery_recovery_now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Timestamps here are written both by `chrono` (`+00:00`) and by SQLite (`YYYY-MM-DD HH:MM:SS`),
+/// so both spellings are read, exactly as `thread_runs::parse_timestamp` does.
+fn parse_delivery_timestamp(value: &str) -> Option<i64> {
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(value.timestamp_millis());
+    }
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|value| value.and_utc().timestamp_millis())
+}
+
+/// How many times a minute-cadence sweep has already looked at this ticket.
+/// upstream: Mikka d59c85cb lib/coordinator/wake-recovery.ts:WakeDeadlineTicket(`attempt`)
+fn delivery_wake_attempts(created_at: &str, now_ms: i64) -> i64 {
+    parse_delivery_timestamp(created_at)
+        .map(|created| ((now_ms - created) / DELIVERY_RECOVERY_RECHECK_MS).max(0))
+        // An unreadable deadline never claims exhaustion.
+        .unwrap_or(0)
+}
+
+/// Each sweep's due time, epoch ms, exactly as large as its own condition allows.
+/// upstream: Mikka d59c85cb lib/run-recovery-due.ts:RUN_RECOVERY_DUE_SQL
+fn delivery_recovery_due_rows(
+    database: &Database,
+) -> Result<std::collections::BTreeMap<DeliveryRecoverySweep, i64>> {
+    use std::collections::BTreeMap;
+    let connection = database.connection();
+    let now = delivery_recovery_now_ms();
+    let mut rows = BTreeMap::new();
+    let exists = |sql: String| -> Result<bool> {
+        Ok(connection.query_row(&format!("SELECT EXISTS({sql})"), [], |row| {
+            row.get::<_, i64>(0)
+        })? == 1)
+    };
+    // A waiting lane nobody holds is due now; a lane a live Run holds is re-checked at the minute
+    // cadence, because only that Run's own settlement can free it.
+    if exists(format!(
+        "SELECT 1 FROM camp_message_delivery AS d WHERE {DELIVERY_LANE_ADMISSIBLE_SQL} AND {DELIVERY_LANE_FREE_SQL}"
+    ))? {
+        // Work that is already claimable is due at `now`, not a millisecond later: upstream's
+        // `+ interval '1 millisecond'` belongs to stored deadlines, never to a `now()` term.
+        rows.insert(DeliveryRecoverySweep::Claims, now);
+    } else if exists(
+        "SELECT 1 FROM camp_message_delivery AS d WHERE d.status = 'waiting' AND EXISTS (SELECT 1 FROM camp WHERE camp.id = d.camp_id AND camp.deletion_operation_id IS NULL)".to_string(),
+    )? {
+        rows.insert(
+            DeliveryRecoverySweep::Claims,
+            now + DELIVERY_RECOVERY_RECHECK_MS,
+        );
+    }
+    if exists(
+        "SELECT 1 FROM camp_message_delivery AS d JOIN camp ON camp.id = d.camp_id WHERE d.requested_mode = 'steer' AND d.status = 'claimed' AND camp.deletion_operation_id IS NULL".to_string(),
+    )? {
+        rows.insert(
+            DeliveryRecoverySweep::Inputs,
+            now + DELIVERY_RECOVERY_RECHECK_MS,
+        );
+    }
+    if exists(
+        "SELECT 1 FROM agent_run JOIN camp ON camp.id = agent_run.camp_id WHERE agent_run.invocation_kind = 'batch' AND agent_run.status = 'queued' AND agent_run.input_ready_at IS NOT NULL AND agent_run.cancel_requested_at IS NULL AND camp.deletion_operation_id IS NULL".to_string(),
+    )? {
+        // A queued Run advances only through its own dispatch preparation, so it is the same kind
+        // of outside owner as a lane a live Run holds: re-checked, never spun on. (Upstream:
+        // `least("createdAt" + interval '60 seconds', now() + interval '60 seconds')`.)
+        rows.insert(
+            DeliveryRecoverySweep::QueuedRuns,
+            now + DELIVERY_RECOVERY_RECHECK_MS,
+        );
+    }
+    if exists(
+        "SELECT 1 FROM loom_control_dispatch WHERE status IN ('WAITING','DISPATCHED')".to_string(),
+    )? {
+        // Admission is re-run by every scan, so a dispatch row that persists is waiting on a fact
+        // the timer cannot see: the same recheck cadence.
+        rows.insert(
+            DeliveryRecoverySweep::Dispatches,
+            now + DELIVERY_RECOVERY_RECHECK_MS,
+        );
+    }
+    // A lease is lost once it expires: that instant, not a minute later, is when the recovery is
+    // due. Nothing else can be recovered before it without a new write.
+    let lease_due: Option<String> = connection.query_row(
+        r#"
+        SELECT min(at) FROM (
+            SELECT execution_lease_expires_at AS at FROM agent_run
+            WHERE status IN ('running','waiting') AND execution_lease_expires_at IS NOT NULL
+            UNION ALL
+            SELECT lease_expires_at AS at FROM loom_claim
+            WHERE released_at IS NULL AND lease_expires_at IS NOT NULL
+        )
+        "#,
+        [],
+        |row| row.get(0),
+    )?;
+    if let Some(lease_due) = lease_due.and_then(|value| parse_delivery_timestamp(&value)) {
+        rows.insert(DeliveryRecoverySweep::Leases, lease_due + 1);
+    }
+    Ok(rows)
+}
+
+/// The earliest time any Delivery recovery work is due (epoch ms, rounded up), or `None` when none
+/// can come due without a new write.
+/// upstream: Mikka d59c85cb lib/run-recovery-due.ts:nextRunRecoveryDue
+pub fn next_delivery_recovery_due(database: &Database) -> Result<Option<i64>> {
+    Ok(delivery_recovery_due_rows(database)?
+        .values()
+        .copied()
+        .min())
+}
+
+/// The next due time and which sweeps are due now, from the same read, so a pass runs only the
+/// sweeps whose work has come.
+/// upstream: Mikka d59c85cb lib/run-recovery-due.ts:runRecoveryDueSweeps
+pub fn delivery_recovery_due_sweeps(
+    database: &Database,
+) -> Result<(Option<i64>, std::collections::BTreeSet<DeliveryRecoverySweep>)> {
+    let now = delivery_recovery_now_ms();
+    let rows = delivery_recovery_due_rows(database)?;
+    let next = rows.values().copied().min();
+    let due = rows
+        .into_iter()
+        .filter(|(_, at)| *at <= now)
+        .map(|(sweep, _)| sweep)
+        .collect();
+    Ok((next, due))
+}
+
+/// One due-timer pass: runs only the sweeps due now and returns when the next one is due.
+/// A pass with nothing due starts nothing.
+/// upstream: Mikka d59c85cb lib/run-recovery-due.ts:runRecoveryPass
+pub fn run_delivery_recovery_pass(
+    database: &mut Database,
+    limit: i64,
+    prepared_workspaces: &BatchWorkspaces,
+    remote_sources: Option<&RemoteBundleCaptureContext<'_>>,
+) -> Result<DeliveryRecoveryPass> {
+    let (next, due) = delivery_recovery_due_sweeps(database)?;
+    if due.is_empty() {
+        // A pass with nothing due (a wake that found no work) starts nothing: upstream returns the
+        // next due time without running any sweep.
+        return Ok(DeliveryRecoveryPass {
+            next_due_at_ms: next,
+            due,
+            claimed_agent_run_ids: Vec::new(),
+            wakes: DeliveryWakeCounts::default(),
+        });
+    }
+    // Only the sweep that starts work acts here; every other one is the caller's signal that its
+    // own lane (input, dispatch, lease) owes a pass.
+    let claimed_agent_run_ids = if due.contains(&DeliveryRecoverySweep::Claims) {
+        claim_waiting_delivery_batches_with_sources(
+            database,
+            limit,
+            prepared_workspaces,
+            remote_sources,
+        )?
+    } else {
+        Vec::new()
+    };
+    let wakes = reconcile_pending_delivery_wakes(
+        database,
+        delivery_recovery_now_ms() + DELIVERY_WAKE_SWEEP_BUDGET_MS,
+    )?;
+    // The sweeps changed what is due, so the next due time is read again, exactly as upstream
+    // re-reads `nextRunRecoveryDue` after `recoverRuns`.
+    let mut rows = delivery_recovery_due_rows(database)?;
+    // A Claims sweep that started nothing must not be re-armed at "now": the lane it saw needs
+    // something this pass cannot do (a Mission workspace prepared outside the claim), so the next
+    // look is a recheck interval away — exactly like a lane a live Run holds.
+    if rows.contains_key(&DeliveryRecoverySweep::Claims) && claimed_agent_run_ids.is_empty() {
+        rows.insert(
+            DeliveryRecoverySweep::Claims,
+            delivery_recovery_now_ms() + DELIVERY_RECOVERY_RECHECK_MS,
+        );
+    }
+    Ok(DeliveryRecoveryPass {
+        next_due_at_ms: rows.values().copied().min(),
+        due,
+        claimed_agent_run_ids,
+        wakes,
+    })
+}
+
+/// The slow reconciliation sweep. It never starts work of its own — the claim sweep of the same
+/// pass does — it walks every ticket still in the durable outbox and reports what became of it, so
+/// a lost wake or a lane no Run may take is visible instead of silent. A ticket held by a live Run
+/// is re-checked at the minute cadence for at most `MAX_WAKE_ATTEMPTS`, then reported exhausted
+/// instead of being spun on.
+/// upstream: Mikka d59c85cb lib/coordinator/wake.ts:retryCoordinatorWakes
+pub fn reconcile_pending_delivery_wakes(
+    database: &Database,
+    deadline_ms: i64,
+) -> Result<DeliveryWakeCounts> {
+    let now = delivery_recovery_now_ms();
+    let tickets = {
+        let mut statement = database.connection().prepare(&format!(
+            r#"
+            SELECT d.id, d.created_at,
+                   CASE
+                       WHEN {DELIVERY_LANE_INVALID_SQL} THEN 'invalid'
+                       WHEN {DELIVERY_LANE_ADMISSIBLE_SQL} AND {DELIVERY_LANE_FREE_SQL} THEN 'claimable'
+                       ELSE 'blocked'
+                   END AS lane
+            FROM camp_message_delivery AS d
+            WHERE d.status = 'waiting'
+            ORDER BY d.created_at, d.queue_sequence, d.id
+            LIMIT ?1
+            "#
+        ))?;
+        statement
+            .query_map([MAX_DELIVERY_WAKE_TICKETS], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut counts = DeliveryWakeCounts::default();
+    for (created_at, lane) in tickets {
+        counts.due += 1;
+        match lane.as_str() {
+            "invalid" => counts.failed += 1,
+            "claimable" => counts.started += 1,
+            _ => {
+                if now >= deadline_ms
+                    || delivery_wake_attempts(&created_at, now) < MAX_WAKE_ATTEMPTS
+                {
+                    counts.deferred += 1;
+                } else {
+                    counts.exhausted += 1;
+                }
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// One reconciliation sweep is bounded like `MAX_DISPATCHES_PER_TICK`: a Ticket storm cannot turn
+/// into an unbounded pass.
+const MAX_DELIVERY_WAKE_TICKETS: i64 = 200;
+
+/// Whether this Delivery row still owes the scheduler a wake.
+/// upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.ts:pending
+///
+/// Mikka gates on `!event.deliveredAt && event.tier !== 'background'`. Both facts live in the
+/// Delivery row here: `waiting` is "not delivered yet", and no LOOM lane is ever admitted as
+/// background — a row that must not start a turn never becomes a Delivery.
+fn delivery_wake_pending(status: &str) -> bool {
+    status == "waiting"
+}
+
+/// Starts the scheduler's wake for the pending Delivery rows this transaction just wrote.
+/// upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.ts:wakeCoordinatorAfterCommit
+///
+/// The caller passes the Delivery rows its own transaction created, and calls this only after that
+/// transaction committed. One wake per commit, whatever the number of rows; nothing wakes before
+/// the commit and nothing wakes on rollback, because then no `waiting` row is left to notice; and
+/// a broken gate never fails the write.
+pub(crate) fn wake_delivery_scheduler_after_commit(
+    database: &Database,
+    delivery_ids: &[String],
+) -> bool {
+    let pending = delivery_ids.iter().any(|delivery_id| {
+        database
+            .connection()
+            .query_row(
+                "SELECT status FROM camp_message_delivery WHERE id=?1",
+                [delivery_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|status| delivery_wake_pending(&status))
+            // An executor without a durable row: the slow reconciliation sweep recovers it.
+            .unwrap_or(false)
+    });
+    if !pending {
+        return false;
+    }
+    database.execution_wake.delivery.notify_one();
+    true
+}
+
+/// The same wake for a write that has already committed and no longer holds its rows.
+/// upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.ts:wakeCoordinatorSoon
+pub(crate) fn wake_delivery_scheduler_now(database: &Database) -> bool {
+    if !has_waiting_delivery_batch_work(database).unwrap_or(false) {
+        return false;
+    }
+    database.execution_wake.delivery.notify_one();
+    true
+}
+
 /// Converts waiting Delivery lanes into immutable, ordered multi-input AgentRuns.
 /// Waiting rows carry message responsibility or explicit continuation authorization. Runtime, model and permissions are
 /// resolved here. Mission lanes wait for their exact workspace facts, prepared
@@ -8929,5 +9349,268 @@ mod tests {
                 > serialized_batch_run_input_len(&without_mentions).unwrap()
         );
         transaction.rollback().unwrap();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Commit wake and due-timer recovery. Ported from Mikka (MIT) d59c85cb:
+    // lib/coordinator/wake-after-commit.test.ts, wake-event-driven.db.test.ts,
+    // owner-event-wakes.db.test.ts, lib/run-recovery-due.ts.
+    // -----------------------------------------------------------------------------------------
+
+    /// upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.test.ts
+    /// ("a producer's pending row starts the owner's wake after COMMIT ... never on rollback").
+    #[tokio::test]
+    async fn a_committed_delivery_write_wakes_once_and_a_rolled_back_write_wakes_nothing() {
+        let mut fixture = Fixture::new();
+        let wake = fixture.database.execution_wake.delivery.clone();
+        // Setup may already have left one hint behind; the wake under test is the next one.
+        while tokio::time::timeout(std::time::Duration::from_millis(1), wake.notified())
+            .await
+            .is_ok()
+        {}
+        let camp_id = fixture.camp_id.clone();
+        let now = chrono::Utc::now().to_rfc3339();
+        let rolled_back = {
+            let transaction = fixture.database.connection_mut().transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE camp SET last_message_sequence = last_message_sequence + 1, version = version + 1, updated_at = ?2 WHERE id = ?1",
+                    params![camp_id, now],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO camp_message(
+                        id, camp_id, sequence, author_type, author_id, body,
+                        structured_content_json, content_digest,
+                        address_mode, addressed_agent_ids_json,
+                        effective_recipient_ids_json, recipient_presentation_json,
+                        origin_kind, recall_state, version, created_at, updated_at
+                    ) VALUES (
+                        'rolled-back-message', ?1, 1, 'user', 'local_user', 'rolled back',
+                        '[{"kind":"text","text":"rolled back"}]', 'sha256:rolled-back-message',
+                        'explicit', '["agent_1"]', '["agent_1"]', '{}', 'local_composer',
+                        'recallable', 1, ?2, ?2
+                    )
+                    "#,
+                    params![camp_id, now],
+                )
+                .unwrap();
+            let deliveries = enqueue_message_deliveries(
+                &transaction,
+                &camp_id,
+                "rolled-back-message",
+                &["agent_1".to_string()],
+                &now,
+            )
+            .unwrap();
+            deliveries
+                .into_iter()
+                .map(|delivery| delivery.delivery_id)
+                .collect::<Vec<_>>()
+        };
+        // The transaction is rolled back here: no `waiting` row is left to notice.
+        assert!(!wake_delivery_scheduler_after_commit(
+            &fixture.database,
+            &rolled_back
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), wake.notified())
+                .await
+                .is_err(),
+            "nothing wakes before the write commits"
+        );
+
+        let committed = fixture.enqueue("committed-message", "同意");
+        assert!(
+            wake_delivery_scheduler_after_commit(&fixture.database, &[committed.clone()]),
+            "a committed pending row owes the wake"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), wake.notified())
+                .await
+                .is_ok(),
+            "the committed write wakes the scheduler"
+        );
+
+        // Once the claim took the row, it is delivered: a replay of the same commit wakes nothing.
+        assert_eq!(
+            claim_waiting_delivery_batches(&mut fixture.database, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!wake_delivery_scheduler_after_commit(
+            &fixture.database,
+            &[committed]
+        ));
+    }
+
+    /// upstream: Mikka d59c85cb lib/run-recovery-due.ts:nextRunRecoveryDue
+    /// ("a queued retry whose device stopped being seen is re-checked each minute while it exists").
+    #[test]
+    fn a_waiting_delivery_held_by_a_live_run_is_rechecked_at_the_minute_cadence() {
+        let mut fixture = Fixture::new();
+        let claimed = fixture.enqueue("held-message", "第一封");
+        let runs = claim_waiting_delivery_batches(&mut fixture.database, 1).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(!claimed.is_empty());
+        // A second message written while that Run owns the conversation waits behind it.
+        fixture.enqueue("held-message-2", "第二封");
+        let now = chrono::Utc::now().timestamp_millis();
+        let claims = delivery_recovery_due_rows(&fixture.database).unwrap()
+            [&DeliveryRecoverySweep::Claims];
+        assert!(
+            (now + 59_000..=now + 61_000).contains(&claims),
+            "a lane a live Run holds re-checks at the minute cadence, got {claims} against {now}"
+        );
+
+        // The Run ends: the very same lane is due at once, with no new write needed.
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'succeeded', ended_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1",
+                [&runs[0]],
+            )
+            .unwrap();
+        let claims = delivery_recovery_due_rows(&fixture.database).unwrap()
+            [&DeliveryRecoverySweep::Claims];
+        assert!(
+            claims <= chrono::Utc::now().timestamp_millis() + 5,
+            "a freed lane is due immediately, got {claims}"
+        );
+    }
+
+    /// upstream: Mikka d59c85cb lib/run-recovery-due.ts:RUN_RECOVERY_DUE_SQL
+    /// ("a lease is lost once leaseExpiresAt < now": the expiry itself is the due time) and the
+    /// idle rule ("at idle every term is empty").
+    #[test]
+    fn an_expiring_lease_arms_the_recovery_timer_and_an_idle_core_arms_no_timer() {
+        let mut fixture = Fixture::new();
+        // Nothing is waiting and nobody holds a lease: no timer is armed at all.
+        assert_eq!(next_delivery_recovery_due(&fixture.database).unwrap(), None);
+
+        fixture.enqueue("lease-message", "租约");
+        let runs = claim_waiting_delivery_batches(&mut fixture.database, 1).unwrap();
+        let expires_at = "2026-11-19T06:00:00+00:00";
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', started_at = datetime('now'), updated_at = datetime('now'), execution_lease_owner = 'runtime', execution_lease_expires_at = ?2 WHERE id = ?1",
+                params![runs[0], expires_at],
+            )
+            .unwrap();
+        let leases = delivery_recovery_due_rows(&fixture.database).unwrap()
+            [&DeliveryRecoverySweep::Leases];
+        assert_eq!(
+            leases,
+            parse_delivery_timestamp(expires_at).unwrap() + 1,
+            "the lease expiry, not a minute later, is when recovery is due"
+        );
+    }
+
+    /// upstream: Mikka d59c85cb lib/coordinator/wake.ts:retryCoordinatorWakes
+    #[test]
+    fn the_reconciliation_sweep_counts_deferred_and_exhausted_tickets_instead_of_spinning() {
+        let mut fixture = Fixture::new();
+        fixture.enqueue("sweep-ready", "甲");
+        let budget = chrono::Utc::now().timestamp_millis() + DELIVERY_WAKE_SWEEP_BUDGET_MS;
+        let counts = reconcile_pending_delivery_wakes(&fixture.database, budget).unwrap();
+        assert_eq!(
+            (counts.due, counts.started, counts.deferred),
+            (1, 1, 0),
+            "a free lane is started, not deferred"
+        );
+
+        // Hold the lane with a live Run, then write behind it.
+        claim_waiting_delivery_batches(&mut fixture.database, 1).unwrap();
+        fixture.enqueue("sweep-blocked", "乙");
+        let counts = reconcile_pending_delivery_wakes(&fixture.database, budget).unwrap();
+        assert_eq!(
+            (counts.due, counts.started, counts.deferred, counts.exhausted, counts.failed),
+            (1, 0, 1, 0, 0),
+            "a lane a live Run holds is deferred, not started twice"
+        );
+
+        // Eight minute-cadence attempts later the ticket is reported, never spun on.
+        let aged = (chrono::Utc::now()
+            - chrono::Duration::seconds(MAX_WAKE_ATTEMPTS * 60 + 1))
+        .to_rfc3339();
+        fixture.set_delivery_created_at("sweep-blocked", &aged);
+        let counts = reconcile_pending_delivery_wakes(&fixture.database, budget).unwrap();
+        assert_eq!(
+            (counts.due, counts.deferred, counts.exhausted),
+            (1, 0, 1),
+            "an exhausted ticket is reported, not retried a ninth time"
+        );
+
+        // The sweep budget bounds one pass before anything else does.
+        let counts = reconcile_pending_delivery_wakes(
+            &fixture.database,
+            chrono::Utc::now().timestamp_millis() - 1,
+        )
+        .unwrap();
+        assert_eq!((counts.due, counts.deferred, counts.exhausted), (1, 1, 0));
+
+        // A lane whose membership is gone can never start: that is a failure, not a retry.
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE camp_member SET status = 'left', left_at = datetime('now') WHERE camp_id = ?1 AND agent_id = 'agent_1'",
+                [&fixture.camp_id],
+            )
+            .unwrap();
+        let counts = reconcile_pending_delivery_wakes(&fixture.database, budget).unwrap();
+        assert_eq!(
+            (counts.due, counts.started, counts.failed),
+            (1, 0, 1),
+            "an inadmissible lane is settled visibly instead of woken forever"
+        );
+    }
+
+    /// upstream: Mikka d59c85cb lib/run-recovery-due.ts:runRecoveryPass
+    /// ("A pass with nothing due ... costs this one statement").
+    #[test]
+    fn a_recovery_pass_repairs_the_commit_to_start_gap_and_an_idle_pass_starts_nothing() {
+        let mut fixture = Fixture::new();
+        let idle = run_delivery_recovery_pass(
+            &mut fixture.database,
+            16,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            idle.due.is_empty()
+                && idle.claimed_agent_run_ids.is_empty()
+                && idle.next_due_at_ms.is_none(),
+            "an idle pass starts nothing and arms no timer: {idle:?}"
+        );
+
+        fixture.enqueue("gap-message", "提交后没醒过来");
+        let pass = run_delivery_recovery_pass(
+            &mut fixture.database,
+            16,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        assert!(pass.due.contains(&DeliveryRecoverySweep::Claims));
+        assert_eq!(
+            pass.claimed_agent_run_ids.len(),
+            1,
+            "the independent pass repairs the commit-to-start gap"
+        );
+        assert_eq!(pass.wakes.started, 0, "the ticket is no longer waiting");
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            pass.next_due_at_ms
+                .is_some_and(|next| (now..=now + 61_000).contains(&next)),
+            "the queued Run it just started is the next due work, at the recheck cadence: {pass:?}"
+        );
     }
 }

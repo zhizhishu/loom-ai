@@ -339,7 +339,9 @@ const RUNTIME_EVIDENCE_DELTA_BATCH_MAX_ITEMS: usize = 32;
 const CAMP_ATTACHMENT_VIEW_MUTATION_DEADLINE: Duration = Duration::from_secs(55);
 const CAMP_ATTACHMENT_VIEW_QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DELIVERY_BATCH_SCHEDULER_PAGE_LIMIT: i64 = 16;
-const DELIVERY_BATCH_FALLBACK_INTERVAL: Duration = Duration::from_secs(30);
+/// A due-timer pass that failed is retried after this; an idle Core arms no timer at all.
+/// upstream: Mikka d59c85cb lib/run-recovery-due.ts:RECHECK
+const DELIVERY_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const NON_BATCH_AGENT_RUN_DISPATCH_LIMIT: i64 = 16;
 const ORDERED_REQUEST_QUEUE_CAPACITY: usize = 128;
 const INDEPENDENT_READ_QUEUE_CAPACITY: usize = 16;
@@ -10427,8 +10429,16 @@ impl Core {
                 drop(database);
                 emit_member_roster_if_applied(&self.output, &request.method, &execution);
                 if wake_delivery_scheduler {
-                    self.delivery_batch_scheduler_notify.notify_one();
-                    self.execution_wake.runs.notify_one();
+                    // The command already committed, so this is the soon-wake: it is owed only while
+                    // the durable outbox still holds a waiting Delivery.
+                    // upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.ts:wakeCoordinatorSoon
+                    let woke = {
+                        let database = self.database.lock().await;
+                        rovai_core::delivery_queue::wake_delivery_scheduler_now(&database)
+                    };
+                    if woke {
+                        self.execution_wake.runs.notify_one();
+                    }
                 }
                 Ok(serde_json::to_value(execution.result)?)
             }
@@ -12997,6 +13007,26 @@ impl Core {
         }
     }
 
+    /// One wake per committed Delivery write, and nothing at all when that commit left no waiting
+    /// row — a replayed or withdrawn write that changed nothing wakes nothing.
+    /// upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.ts:wakeCoordinatorAfterCommit
+    async fn wake_delivery_scheduler_after_commit(&self, command_result: &Value) {
+        let delivery_ids = command_result_delivery_ids(command_result);
+        if delivery_ids.is_empty() {
+            return;
+        }
+        let woke = {
+            let database = self.database.lock().await;
+            rovai_core::delivery_queue::wake_delivery_scheduler_after_commit(
+                &database,
+                &delivery_ids,
+            )
+        };
+        if woke {
+            self.execution_wake.runs.notify_one();
+        }
+    }
+
     async fn send_test_camp_message_request(
         &self,
         params: SendThreadMessageParams,
@@ -13006,10 +13036,10 @@ impl Core {
             let database = self.database.lock().await;
             DomainCommandGateway.replay_if_recorded(&database, &envelope)?
         } {
-            if command_result_has_delivery_work(&replay.result.payload) {
-                self.delivery_batch_scheduler_notify.notify_one();
-                self.execution_wake.runs.notify_one();
-            }
+            // The replay names the rows its original commit wrote: those still waiting are woken,
+            // the ones already claimed are not ("already-committed writes notify").
+            self.wake_delivery_scheduler_after_commit(&replay.result.payload)
+                .await;
             return Ok(json!({
                 "commandResult": replay.result,
                 "replayed": true,
@@ -13033,10 +13063,8 @@ impl Core {
                 Some(params.camp_id.as_str()),
             );
         }
-        if command_result_has_delivery_work(&execution.result.payload) {
-            self.delivery_batch_scheduler_notify.notify_one();
-            self.execution_wake.runs.notify_one();
-        }
+        self.wake_delivery_scheduler_after_commit(&execution.result.payload)
+            .await;
         Ok(json!({
             "commandResult": execution.result,
             "replayed": execution.replayed,
@@ -13073,10 +13101,8 @@ impl Core {
         if execution.result.status != CommandResultStatus::Rejected {
             self.request_camp_attachment_projection(&camp_id);
         }
-        if command_result_has_delivery_work(&execution.result.payload) {
-            self.delivery_batch_scheduler_notify.notify_one();
-            self.execution_wake.runs.notify_one();
-        }
+        self.wake_delivery_scheduler_after_commit(&execution.result.payload)
+            .await;
         Ok(json!({
             "commandResult": execution.result,
             "replayed": execution.replayed,
@@ -14049,6 +14075,63 @@ impl Core {
             self.execution_wake.runs.notify_one();
         }
         Ok(admitted)
+    }
+
+    /// One due-timer pass of the Message Delivery recovery loop: it runs only the sweeps whose work
+    /// has come, and answers when the next one is due plus whether it started anything the scan
+    /// still owes a dispatch. `None` means nothing can come due without a new write, so the
+    /// scheduler then arms no timer at all.
+    /// upstream: Mikka d59c85cb lib/run-recovery-due.ts:runRecoveryPass
+    async fn run_delivery_recovery_pass(self: &Arc<Self>) -> (Option<tokio::time::Instant>, bool) {
+        let outcome = {
+            let mut database = self.database.lock().await;
+            rovai_core::delivery_queue::run_delivery_recovery_pass(
+                &mut database,
+                DELIVERY_BATCH_SCHEDULER_PAGE_LIMIT,
+                &Default::default(),
+                None,
+            )
+        };
+        match outcome {
+            Ok(pass) => {
+                let wakes = pass.wakes;
+                let claimed = !pass.claimed_agent_run_ids.is_empty();
+                if !pass.due.is_empty() || wakes.due > 0 {
+                    eprintln!(
+                        "delivery recovery pass due={:?} claimed={} tickets={} started={} deferred={} exhausted={} failed={}",
+                        pass.due
+                            .iter()
+                            .map(|sweep| sweep.as_str())
+                            .collect::<Vec<_>>(),
+                        pass.claimed_agent_run_ids.len(),
+                        wakes.due,
+                        wakes.started,
+                        wakes.deferred,
+                        wakes.exhausted,
+                        wakes.failed,
+                    );
+                }
+                // A due lease or a frozen queued input is the Run lane's own work, never this
+                // loop's: the answer is to wake that lane, not to duplicate its recovery here.
+                if pass.due.iter().any(|sweep| {
+                    matches!(
+                        sweep,
+                        rovai_core::delivery_queue::DeliveryRecoverySweep::Leases
+                            | rovai_core::delivery_queue::DeliveryRecoverySweep::QueuedRuns
+                    )
+                }) {
+                    self.execution_wake.runs.notify_one();
+                }
+                (pass.next_due_at_ms.map(delivery_recovery_instant), claimed)
+            }
+            Err(error) => {
+                eprintln!("Delivery recovery pass failed: {error:#}");
+                (
+                    Some(tokio::time::Instant::now() + DELIVERY_RECOVERY_RETRY_INTERVAL),
+                    false,
+                )
+            }
+        }
     }
 
     async fn dispatch_agent_runs_by_id(
@@ -20901,6 +20984,21 @@ async fn run_core(
         ExecutionRuntimeService::default().cancel_interrupted_single_chat_runs(&mut database)?;
         database.prepare_v2_recovery()?;
         mark_unstarted_deliveries_interrupted_before_dispatch(&mut database)?;
+        // The scheduler arms its due timer from the durable outbox the moment it starts; this boot
+        // pass is what makes a lost wake, or a lane no Run may take, visible at startup instead of
+        // silent. It never fails the boot: the timer is the thing that recovers the work.
+        // upstream: Mikka d59c85cb lib/coordinator/wake.ts:retryCoordinatorWakes
+        match rovai_core::delivery_queue::reconcile_pending_delivery_wakes(
+            &database,
+            chrono::Utc::now().timestamp_millis() + 45_000,
+        ) {
+            Ok(counts) if counts.due > 0 => eprintln!(
+                "[startup] stage=delivery_wake_reconciliation due={} started={} deferred={} exhausted={} failed={}",
+                counts.due, counts.started, counts.deferred, counts.exhausted, counts.failed,
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!("Delivery wake reconciliation unavailable: {error:#}"),
+        }
         rovai_core::runtime::settle_legacy_retry_waits(&mut database)?;
         Ok(controlled)
     })();
@@ -27356,16 +27454,26 @@ async fn process_agent_run_scheduler(
     output: mpsc::UnboundedSender<String>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    let mut delivery_batch_fallback = tokio::time::interval_at(
-        tokio::time::Instant::now() + DELIVERY_BATCH_FALLBACK_INTERVAL,
-        DELIVERY_BATCH_FALLBACK_INTERVAL,
-    );
-    delivery_batch_fallback.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut delivery_batch_dispatches = tokio::task::JoinSet::new();
     let mut delivery_batch_workers = HashMap::new();
     let mut delivery_batch_inflight = HashSet::new();
     let mut scan_delivery_batches = true;
+    // The scheduler sleeps until the first Delivery recovery work is due and arms no timer at all
+    // while nothing can come due without a new write; a committed Delivery write still wakes it
+    // directly. The blind fallback tick is gone with this timer.
+    // upstream: Mikka d59c85cb lib/run-recovery-due.ts:nextRunRecoveryDue
+    let mut delivery_recovery_deadline: Option<tokio::time::Instant> = None;
+    let mut delivery_recovery_pass_due = true;
     'scheduler: loop {
+        if delivery_recovery_pass_due {
+            delivery_recovery_pass_due = false;
+            let (deadline, claimed) = core.run_delivery_recovery_pass().await;
+            // A wake that arrives while work is already armed must not push that work further away.
+            delivery_recovery_deadline =
+                earliest_delivery_recovery_deadline(delivery_recovery_deadline, deadline);
+            // A run the pass just claimed is dispatched by the scan that follows it.
+            scan_delivery_batches |= claimed;
+        }
         if scan_delivery_batches {
             scan_delivery_batches = false;
             let inputs = {
@@ -27413,22 +27521,24 @@ async fn process_agent_run_scheduler(
                 }
             }
         }
+        let recovery_deadline = delivery_recovery_deadline;
+        let recovery_timer = async move {
+            match recovery_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                // Nothing can come due without a new write: no timer exists at all.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(recovery_timer);
         tokio::select! {
             _ = core.delivery_batch_scheduler_notify.notified() => {
                 scan_delivery_batches = true;
+                delivery_recovery_pass_due = true;
             },
-            _ = delivery_batch_fallback.tick() => {
-                let pending = {
-                    let database = core.database.lock().await;
-                    has_pending_delivery_batch_work(&database)
-                };
-                match pending {
-                    Ok(true) => scan_delivery_batches = true,
-                    Ok(false) => {}
-                    Err(error) => {
-                        eprintln!("failed to inspect pending Message Delivery batch work: {error:#}");
-                    }
-                }
+            _ = &mut recovery_timer => {
+                // A due sweep starts work of its own (Claims), and the scan then dispatches it.
+                scan_delivery_batches = true;
+                delivery_recovery_pass_due = true;
             },
             result = delivery_batch_dispatches.join_next_with_id(), if !delivery_batch_dispatches.is_empty() => {
                 match result {
@@ -27452,6 +27562,27 @@ async fn process_agent_run_scheduler(
     }
     delivery_batch_dispatches.abort_all();
     while delivery_batch_dispatches.join_next().await.is_some() {}
+}
+
+/// The earlier of two still-valid recovery deadlines; a deadline that already fired is replaced.
+fn earliest_delivery_recovery_deadline(
+    current: Option<tokio::time::Instant>,
+    next: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    let now = tokio::time::Instant::now();
+    match (current, next) {
+        (Some(current), Some(next)) if current > now => Some(current.min(next)),
+        (_, next) => next,
+    }
+}
+
+/// An epoch-ms deadline as a timer instant; a deadline already past is due at once.
+fn delivery_recovery_instant(at_ms: i64) -> tokio::time::Instant {
+    let target = std::time::UNIX_EPOCH + std::time::Duration::from_millis(at_ms.max(0) as u64);
+    tokio::time::Instant::now()
+        + target
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default()
 }
 
 async fn process_network_recovery(
@@ -28478,10 +28609,23 @@ fn command_execution_payload(execution: CommandExecution) -> Result<Value> {
 }
 
 fn command_result_has_delivery_work(payload: &Value) -> bool {
+    // upstream: Mikka d59c85cb lib/coordinator/wake-after-commit.ts:pending — the committed write
+    // names the Delivery rows it created; that list is the whole wake decision.
+    !command_result_delivery_ids(payload).is_empty()
+}
+
+fn command_result_delivery_ids(payload: &Value) -> Vec<String> {
     payload
         .get("deliveryIds")
         .and_then(Value::as_array)
-        .is_some_and(|delivery_ids| !delivery_ids.is_empty())
+        .map(|delivery_ids| {
+            delivery_ids
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn command_rejection_details(code: &str, payload: &Value) -> Option<Value> {
