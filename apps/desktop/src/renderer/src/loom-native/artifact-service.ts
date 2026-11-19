@@ -241,11 +241,14 @@ export function artifactReviewKind(input: ArtifactReviewInput): ArtifactReviewKi
   // 旧授权下的阶段审查结论已被新授权取代：只作历史，不当现在的判定。
   const stale = stageReview !== null && loomStageReviewFreshness(stageReview, snapshot?.policy ?? null) === 'stale'
 
-  // 1. 任务阻塞是当下的真事实：卡片不因候选还在等验收就藏起来。任务状态是阻塞，或 Core
+  // 1. 人工终判已经成立（接受是永久的，历史版本同样算已接受）。它排在最前，因为 Core 的
+  //    接受只把任务改成 DONE（loom.rs review_record），并**不清**任务上残留的 dispatch
+  //    阻塞原因；反过来 dispatch 只写原因、不改任务状态，也从不碰 DONE 任务。
+  //    两者同时出现时，真实的终局是「已接受」——照上游的顺序，完成优先于受阻。
+  if (candidate !== null && (candidate.acceptanceStatus === 'accepted' || review?.verdict === 'accepted')) return 'accepted'
+  // 2. 任务阻塞是当下的真事实：卡片不因候选还在等验收就藏起来。任务状态是阻塞，或 Core
   //    只写了阻塞原因（派发/返工预算耗尽、前置结果未知、审查者不可用）都算受阻。
   if (taskStatus === 'blocked' || (input.blockedReason ?? '').trim() !== '') return 'blocked'
-  // 2. 人工终判已经成立（接受是永久的，历史版本同样算已接受）。
-  if (candidate !== null && (candidate.acceptanceStatus === 'accepted' || review?.verdict === 'accepted')) return 'accepted'
   // 3. 已取消的工作不再向人要验收。
   if (taskStatus === 'canceled') return 'none'
   // 4. 当前授权下的阶段审查判了阻塞：这也是受阻。

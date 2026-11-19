@@ -678,6 +678,25 @@ describe('artifact status is derived from the real control and acceptance projec
     expect(kindOf({ latest: false })).toBe('ready')
   })
 
+  it('an accepted result outranks a dispatch blocker Core left on the task', () => {
+    // 真实链：机器审查 pass → handoff 派发写阻塞原因 → 用户接受。Core 的 review_record 只把
+    // 任务改成 DONE，不清 blocked_reason；dispatch 只写原因、不改状态。终局仍是「已接受」。
+    const accepted = { ...first, acceptanceStatus: 'accepted' as const }
+    const acceptedReview = reviewOf({ verdict: 'accepted', reviewedAt: '2026-11-13T09:00:00Z' })
+    for (const reason of ['loom.dispatch_budget_exhausted', 'loom.dispatch_recipient_unavailable'] as const) {
+      expect(kindOf({ taskStatus: 'done', blockedReason: reason, candidate: accepted, reviews: [acceptedReview] }))
+        .toBe('accepted')
+      // 控制事实读不到时也不改终局。
+      expect(kindOf({ taskStatus: 'done', blockedReason: reason, candidate: accepted, reviews: [acceptedReview], control: undefined }))
+        .toBe('accepted')
+      // 反过来：同一原因配上仍待验收的候选，还是「受阻」——不为了修终局把在办说成没停。
+      expect(kindOf({ taskStatus: 'in_review', blockedReason: reason })).toBe('blocked')
+    }
+    // 历史版本接受同样是终局，残留原因不改写它。
+    expect(kindOf({ latest: false, taskStatus: 'done', blockedReason: 'loom.dispatch_budget_exhausted', candidate: accepted }))
+      .toBe('accepted')
+  })
+
   it('unknown control facts never turn a pending candidate into waiting for you', () => {
     for (const reason of ['not_read', 'read_failed', 'invalid'] as const) {
       expect(kindOf({ control: unknownControl(reason) })).toBe('reviewing')

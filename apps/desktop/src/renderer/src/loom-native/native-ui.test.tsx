@@ -128,16 +128,41 @@ describe('native reference frontend boundaries', () => {
         .toMatchObject({label:'受阻',group:'受阻'})
     }
   })
-  it('prints the derived status on the card even when the task already has a description', () => {
-    const card = (control: WorkControlFacts, tasks: LoomTask[] = [task]) => {
-      const html = renderToStaticMarkup(createElement(Inspector, {
-        agents: [], bundles: [bundle([first], { control, tasks })],
-        agent: null, mode: 'work' as const, tab: 'work' as const,
-        onTab: () => {}, onMode: () => {}, onClose: () => {}, onExpand: () => {}, expanded: false,
-        onArtifact: () => {}, onOpenConversation: () => {}, loading: false
-      }))
-      return html.match(/<button class="ln-task-card"[\s\S]*?<\/button>/)?.[0] ?? ''
+  // 卡片渲染夹具：直接挂真实 Inspector，再截出一张 ln-task-card 的 HTML。
+  const card = (control: WorkControlFacts, tasks: LoomTask[] = [task], candidates: LoomCandidate[] = [first],
+    extra: Partial<WorkBundle> = {}) => {
+    const html = renderToStaticMarkup(createElement(Inspector, {
+      agents: [], bundles: [bundle(candidates, { control, tasks, ...extra })],
+      agent: null, mode: 'work' as const, tab: 'work' as const,
+      onTab: () => {}, onMode: () => {}, onClose: () => {}, onExpand: () => {}, expanded: false,
+      onArtifact: () => {}, onOpenConversation: () => {}, loading: false
+    }))
+    return html.match(/<button class="ln-task-card"[\s\S]*?<\/button>/)?.[0] ?? ''
+  }
+  it('keeps an accepted card out of 受阻 when Core left a dispatch blocker on the task', () => {
+    // 真实链：机器审查 pass → handoff 派发写阻塞原因 → 用户接受。Core 只把任务改成 DONE，
+    // 不清 blocked_reason；卡片必须停在「已完成 · 已接受」，不能永久挂在「受阻」。
+    const accepted = { ...first, acceptanceStatus: 'accepted' as const }
+    for (const reason of ['loom.dispatch_budget_exhausted', 'loom.dispatch_recipient_unavailable'] as const) {
+      const done: LoomTask = { ...task, status: 'done', blockedReason: reason }
+      const control = observed()
+      expect(workStatus({ task: done, mission, candidate: accepted, control, reviews: [review({ verdict: 'accepted' })] }))
+        .toMatchObject({ label: '已接受', group: '已完成' })
+      expect(workStatus({ task: done, mission, candidate: accepted, control: undefined }))
+        .toMatchObject({ label: '已接受', group: '已完成' })
+      const html = card(control, [done], [accepted], { reviews: [review({ verdict: 'accepted' })] })
+      expect(html).toContain('已接受')
+      expect(html).not.toContain('受阻')
+      // 浮层与资产行同一条规则：同一份归档报「已接受」，不报「受阻」。
+      const facts = artifactCandidateFacts(
+        bundle([accepted], { control, tasks: [done], reviews: [review({ verdict: 'accepted' })] }), artifact, null)
+      expect(facts.reviewKind).toBe('accepted')
+      // 同一原因配上仍待验收的候选：仍是「受阻」，不能为了终局把在办说成没停。
+      expect(workStatus({ task: { ...task, status: 'in_review', blockedReason: reason }, mission, candidate: first, control }))
+        .toMatchObject({ label: '受阻', group: '受阻' })
     }
+  })
+  it('prints the derived status on the card even when the task already has a description', () => {
     // 有描述的任务不能把状态顶掉：描述与状态同时可见。
     const reviewing = card(observed({ dispatches: [dispatch()] }))
     expect(reviewing).toContain('Actual description')
