@@ -15,6 +15,17 @@
 //!   call all happen while one gate mutex is held. `release`/`view/stop` take the
 //!   same gate, so their return is a barrier: after it, no queued input belonging
 //!   to an older lease generation can still execute.
+//! * The boundary between a person and the agent is one exclusive lease per
+//!   physical device. Taking it is a takeover: it is refused while another
+//!   client holds a live lease, it advances the epoch (the generation every
+//!   input is fenced against) exactly once, and it stays bounded by the same
+//!   five-minute control ceiling that no refresh can extend. Handing the device
+//!   back clears the holder and advances the epoch exactly once too, so an input
+//!   admitted for the outgoing holder can never execute after the handback.
+//! * A device reached over a paired node keeps its epoch across reconnects even
+//!   though every lease, view and sequence is dropped with the replaced socket:
+//!   the epoch never runs backwards, so an epoch issued before a reconnect can
+//!   never be issued again after it.
 //! * Nothing about a session, a frame or an input event is persisted or logged.
 
 use crate::auth::{Session, Sessions};
@@ -47,6 +58,13 @@ pub(crate) const CONTROL_TTL_DEFAULT_MS: u64 = 30_000;
 /// Longest single control TTL a client may request.
 pub(crate) const CONTROL_TTL_MAX_MS: u64 = 60_000;
 /// Absolute control ceiling. Heartbeats refresh the TTL, never this deadline.
+///
+/// This is the five-minute lease a takeover is bounded by: the upstream takeover
+/// branch grants five minutes and lets a refresh reset it to another five, while
+/// this Host grants at most `CONTROL_TTL_MAX_MS` per request and refuses to pass
+/// `CONTROL_TOTAL_MAX_MS` from the takeover itself. The takeover lease is
+/// therefore never longer than upstream's and can be shorter, which is the
+/// deliberate, stricter half of that branch.
 pub(crate) const CONTROL_TOTAL_MAX_MS: u64 = 300_000;
 /// A controller that neither heartbeats nor inputs for this long loses control.
 pub(crate) const INPUT_IDLE_DEADMAN_MS: u64 = 15_000;
@@ -651,15 +669,45 @@ impl Computer {
     /// local helper, so `config` stays `None` and `supported()` rests on the
     /// node's advertised capability alone. The caller only reaches this after
     /// the node proved it with a successful metadata probe.
-    pub(crate) fn with_provider(provider: Arc<dyn Provider>) -> Self {
+    ///
+    /// `epoch` seeds the gate. A first install starts at zero; a replacement for
+    /// a node that reconnected on a new connection generation inherits the epoch
+    /// of the device it replaces. No lease, view or input sequence is inherited —
+    /// a lease held against a replaced socket must be refused, not remembered —
+    /// but the counter never runs backwards, so an epoch the previous device
+    /// already issued is never issued again.
+    pub(crate) fn with_provider(provider: Arc<dyn Provider>, epoch: u64) -> Self {
         Self {
             config: None,
             provider,
             clock: Arc::new(wall_clock),
-            gate: Mutex::new(Gate::default()),
+            gate: Mutex::new(Gate {
+                generation: epoch,
+                ..Gate::default()
+            }),
             captures: Arc::new(Semaphore::new(1)),
             remote: true,
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
+        }
+    }
+
+    /// The epoch this gate has reached, so a replacement device can continue the
+    /// sequence instead of restarting it. Only the counter is read: the lease,
+    /// view and sequence state of a replaced device is discarded, never adopted.
+    /// A poisoned gate still yields its counter — the number is not lease state,
+    /// and a reconnect is exactly when the rest of that state is thrown away.
+    pub(crate) fn epoch(&self) -> Result<u64, &'static str> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(GATE_DEADLINE_MS);
+        loop {
+            match self.gate.try_lock() {
+                Ok(gate) => return Ok(gate.generation),
+                Err(TryLockError::Poisoned(guard)) => return Ok(guard.get_ref().generation),
+                Err(TryLockError::WouldBlock) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("computer_busy");
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -762,7 +810,9 @@ impl Computer {
     }
 
     /// Drop the controller and invalidate its generation so any input still
-    /// queued behind the gate is rejected.
+    /// queued behind the gate is rejected. Every path that revokes a lease
+    /// without granting a new one (handback, view stop, expiry, a failed input)
+    /// goes through here, so a revocation always advances the epoch.
     fn expire_control(gate: &mut Gate) {
         if gate.control.take().is_some() {
             gate.generation = gate.generation.wrapping_add(1);
@@ -1026,6 +1076,18 @@ impl Computer {
         Ok(captured)
     }
 
+    /// Take control of the physical device: the takeover boundary.
+    ///
+    /// * Exclusive. A live lease held by any other client is refused with
+    ///   `computer_control_held`; a second session never displaces the holder.
+    ///   Taking over again while holding is a fresh takeover by the same holder
+    ///   and replaces the lease, exactly as the upstream takeover branch does.
+    /// * Epoch-bearing. The grant advances the epoch once, whether the previous
+    ///   lease had lapsed, been handed back or never existed. Every input is
+    ///   fenced against that value, so an input admitted for an earlier holder
+    ///   can never execute after this one.
+    /// * Bounded by the five-minute ceiling (`CONTROL_TOTAL_MAX_MS`), which a
+    ///   heartbeat or input can refresh the TTL toward but never extend.
     pub(crate) fn acquire(
         &self,
         sessions: &Sessions,
@@ -1055,7 +1117,11 @@ impl Computer {
             .as_ref()
             .is_some_and(|control| !control_alive(&gate, control, now));
         if dead {
-            Self::expire_control(&mut gate);
+            // Not `expire_control`: the grant below is the one and only epoch
+            // advance this transition performs, so a takeover of a lapsed lease
+            // moves the epoch by exactly one and the value the client reads is
+            // the value that fences it.
+            gate.control = None;
         }
         if let Some(control) = &gate.control {
             if control.client_id != session.client_id {
@@ -1155,6 +1221,14 @@ impl Computer {
         }))
     }
 
+    /// Hand the device back: the handback boundary.
+    ///
+    /// Only the holder can hand back, and only with the lease identity it was
+    /// given. The handback clears the holder and advances the epoch once, so the
+    /// barrier it returns from rejects every input that was admitted for the
+    /// outgoing holder. Releasing the lease is not the same claim as releasing
+    /// the physical device: that second claim is reported only when the device
+    /// confirmed it drained (see the body below).
     pub(crate) fn release_control(
         &self,
         sessions: &Sessions,
@@ -1278,11 +1352,15 @@ impl Computer {
                 "computer_control_required"
             });
         };
+        if control.generation != body.generation {
+            // The epoch is decided before the lease identity: an input admitted for
+            // a superseded epoch is stale whoever holds the device now, so a holder
+            // that took over after a handback never inherits the old client's
+            // queued input as if it were its own missing lease.
+            return Err("computer_input_stale");
+        }
         if control.client_id != session.client_id || control.id != body.control_id {
             return Err("computer_control_required");
-        }
-        if control.generation != body.generation {
-            return Err("computer_input_stale");
         }
         let expired = !control_alive(&gate, control, now);
         if expired {
@@ -2034,9 +2112,11 @@ mod tests {
         failure: Mutex<Option<Failure>>,
         capture_failure: Mutex<Option<Failure>>,
         input_failure: Mutex<Option<Failure>>,
+        release_failure: Mutex<Option<Failure>>,
         inputs: Mutex<Vec<InputCommand>>,
         infos: AtomicU64,
         captures: AtomicU64,
+        releases: AtomicU64,
         gate_entered: Option<Mutex<mpsc::Sender<()>>>,
         gate_proceed: Option<Mutex<mpsc::Receiver<()>>>,
     }
@@ -2058,9 +2138,11 @@ mod tests {
                 failure: Mutex::new(None),
                 capture_failure: Mutex::new(None),
                 input_failure: Mutex::new(None),
+                release_failure: Mutex::new(None),
                 inputs: Mutex::new(Vec::new()),
                 infos: AtomicU64::new(0),
                 captures: AtomicU64::new(0),
+                releases: AtomicU64::new(0),
                 gate_entered: None,
                 gate_proceed: None,
             }
@@ -2114,8 +2196,14 @@ mod tests {
             Ok(())
         }
         fn release(&self) -> Result<(), Failure> {
-            // The mock is an in-process device: a completed release is real here.
-            Ok(())
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            // A device that cannot prove it drained reports exactly that; the
+            // mock never invents a confirmation it was not told to give.
+            self.release_failure
+                .lock()
+                .unwrap()
+                .clone()
+                .map_or(Ok(()), Err)
         }
     }
 
@@ -2159,10 +2247,13 @@ mod tests {
             self.now.fetch_add(milliseconds, Ordering::SeqCst);
         }
         fn view(&self) -> String {
+            self.view_as(&self.session)
+        }
+        fn view_as(&self, session: &Arc<Session>) -> String {
             self.computer
                 .start_view(
                     &self.sessions,
-                    &self.session,
+                    session,
                     ViewBody {
                         consent: true,
                         device_id: self.mock.device.id.clone(),
@@ -2174,23 +2265,48 @@ mod tests {
                 .to_owned()
         }
         fn control(&self, view: &str) -> (String, u64) {
-            let value = self
-                .computer
-                .acquire(
-                    &self.sessions,
-                    &self.session,
-                    ControlBody {
-                        view_id: view.to_owned(),
-                        device_id: self.mock.device.id.clone(),
-                        consent: true,
-                        ttl_seconds: 30,
-                    },
-                )
-                .unwrap();
+            let value = self.acquire_as(&self.session, view, 30).unwrap();
             (
                 value["controlId"].as_str().unwrap().to_owned(),
                 value["generation"].as_u64().unwrap(),
             )
+        }
+        /// One takeover attempt by a named session, so exclusivity and the epoch
+        /// are observable without a second fixture.
+        fn acquire_as(
+            &self,
+            session: &Arc<Session>,
+            view: &str,
+            ttl_seconds: u32,
+        ) -> Result<Value, &'static str> {
+            self.computer.acquire(
+                &self.sessions,
+                session,
+                ControlBody {
+                    view_id: view.to_owned(),
+                    device_id: self.mock.device.id.clone(),
+                    consent: true,
+                    ttl_seconds,
+                },
+            )
+        }
+        fn handback(&self, session: &Arc<Session>, view: &str, control: &str, epoch: u64) -> Result<Value, &'static str> {
+            self.computer.release_control(
+                &self.sessions,
+                session,
+                ReleaseBody {
+                    view_id: view.to_owned(),
+                    control_id: control.to_owned(),
+                    generation: epoch,
+                },
+            )
+        }
+        fn second_session(&self) -> Arc<Session> {
+            self.sessions
+                .login(&self.token)
+                .ok()
+                .expect("second browser session must be issued")
+                .1
         }
         fn click(&self, view: &str, control: &str, generation: u64, seq: u64) -> InputBody {
             InputBody {
@@ -2522,6 +2638,199 @@ mod tests {
                 .unwrap_err(),
             "computer_view_unknown"
         );
+    }
+
+    #[test]
+    fn a_takeover_is_exclusive_and_advances_the_epoch_exactly_once() {
+        let fixture = fixture();
+        let view = fixture.view();
+        // A takeover of a free device is the first transition: epoch 1.
+        let (holder, epoch) = fixture.control(&view);
+        assert_eq!(epoch, 1, "a takeover of a free device advances the epoch once");
+        let other = fixture.second_session();
+        let other_view = fixture.view_as(&other);
+        // Exclusivity: a live lease is never displaced, and the loser gains
+        // nothing by holding a view of the same physical device.
+        assert_eq!(
+            fixture.acquire_as(&other, &other_view, 30).unwrap_err(),
+            "computer_control_held"
+        );
+        assert_eq!(
+            fixture
+                .computer
+                .input(&fixture.sessions, &other, fixture.click(&other_view, &holder, epoch, 1))
+                .unwrap_err(),
+            "computer_control_required"
+        );
+        // A heartbeat is the renewal that does *not* open a new epoch: the lease
+        // and its generation are kept.
+        let renewed = fixture
+            .computer
+            .heartbeat(
+                &fixture.sessions,
+                &fixture.session,
+                HeartbeatBody {
+                    view_id: view.clone(),
+                    control_id: holder.clone(),
+                    generation: epoch,
+                    consent: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(renewed["generation"].as_u64().unwrap(), epoch);
+        assert_eq!(renewed["controlId"].as_str().unwrap(), holder);
+        // The lease lapses at the idle deadman. The takeover that follows is one
+        // transition, so it advances the epoch by exactly one, not two.
+        fixture.tick(INPUT_IDLE_DEADMAN_MS + 1);
+        let taken = fixture.acquire_as(&other, &other_view, 30).unwrap();
+        let next_epoch = taken["generation"].as_u64().unwrap();
+        assert_eq!(
+            next_epoch,
+            epoch + 1,
+            "a takeover of a lapsed lease advances the epoch exactly once"
+        );
+        let next_holder = taken["controlId"].as_str().unwrap().to_owned();
+        // The lapsed holder can no longer execute, and cannot hand back a lease
+        // it no longer holds.
+        assert_eq!(
+            fixture
+                .computer
+                .input(&fixture.sessions, &fixture.session, fixture.click(&view, &holder, epoch, 2))
+                .unwrap_err(),
+            "computer_input_stale"
+        );
+        assert_eq!(
+            fixture.handback(&fixture.session, &view, &holder, epoch).unwrap_err(),
+            "computer_control_required"
+        );
+        assert_eq!(fixture.mock.inputs.lock().unwrap().len(), 0);
+        // Handback advances the epoch once and fences the outgoing holder.
+        let handed = fixture
+            .handback(&other, &other_view, &next_holder, next_epoch)
+            .unwrap();
+        assert_eq!(handed["released"], json!(true));
+        let after_handback = handed["generation"].as_u64().unwrap();
+        assert_eq!(after_handback, next_epoch + 1);
+        assert_eq!(
+            fixture
+                .computer
+                .input(&fixture.sessions, &other, fixture.click(&other_view, &next_holder, next_epoch, 1))
+                .unwrap_err(),
+            "computer_input_stale"
+        );
+        // Only after the handback may the original session take the device again,
+        // and that takeover continues the same epoch sequence.
+        let retaken = fixture.acquire_as(&fixture.session, &view, 600).unwrap();
+        assert_eq!(retaken["generation"].as_u64().unwrap(), after_handback + 1);
+        // The takeover lease is bounded by the five-minute ceiling: a longer
+        // request is clamped per call and the total deadline never moves.
+        let server_time = retaken["serverTime"].as_u64().unwrap();
+        assert_eq!(
+            retaken["expiresAt"].as_u64().unwrap() - server_time,
+            CONTROL_TTL_MAX_MS
+        );
+        assert_eq!(
+            retaken["totalDeadline"].as_u64().unwrap() - server_time,
+            CONTROL_TOTAL_MAX_MS
+        );
+        assert_eq!(CONTROL_TOTAL_MAX_MS, 5 * 60_000);
+        // Even repeated heartbeats cannot pass the ceiling that lease promises:
+        // each is clamped per call and, near the deadline, clamped to it.
+        let mut value = retaken.clone();
+        for _ in 0..21 {
+            fixture.tick(INPUT_IDLE_DEADMAN_MS - 1_000);
+            value = fixture
+                .computer
+                .heartbeat(
+                    &fixture.sessions,
+                    &fixture.session,
+                    HeartbeatBody {
+                        view_id: view.clone(),
+                        control_id: retaken["controlId"].as_str().unwrap().to_owned(),
+                        generation: retaken["generation"].as_u64().unwrap(),
+                        consent: true,
+                    },
+                )
+                .unwrap();
+            assert!(
+                value["expiresAt"].as_u64().unwrap() <= value["totalDeadline"].as_u64().unwrap()
+            );
+            // The five-minute deadline is a property of the takeover and never
+            // moves with a refresh.
+            assert_eq!(
+                value["totalDeadline"].as_u64().unwrap(),
+                retaken["totalDeadline"].as_u64().unwrap()
+            );
+        }
+        assert_eq!(
+            value["expiresAt"].as_u64().unwrap(),
+            value["totalDeadline"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_release_the_device_does_not_confirm_is_never_reported_as_a_release() {
+        let fixture = fixture();
+        let view = fixture.view();
+        let (control, epoch) = fixture.control(&view);
+        *fixture.mock.release_failure.lock().unwrap() = Some(Failure::Unconfirmed);
+        let value = fixture
+            .handback(&fixture.session, &view, &control, epoch)
+            .unwrap();
+        // The two claims stay separate: the lease is gone, the physical release
+        // is not claimed.
+        assert_eq!(value["released"], json!(false));
+        assert_eq!(value["confirmed"], json!(false));
+        assert_eq!(value["reason"], json!("computer_release_unconfirmed"));
+        assert_eq!(fixture.mock.releases.load(Ordering::SeqCst), 1);
+        // The fence is still the barrier: the handback consumed the epoch, so the
+        // outgoing holder cannot execute anything while the device's real state
+        // is unknown.
+        assert_eq!(value["generation"].as_u64().unwrap(), epoch + 1);
+        assert_eq!(
+            fixture
+                .computer
+                .input(&fixture.sessions, &fixture.session, fixture.click(&view, &control, epoch, 1))
+                .unwrap_err(),
+            "computer_input_stale"
+        );
+        assert_eq!(fixture.mock.inputs.lock().unwrap().len(), 0);
+        // A takeover may follow, but it is a new epoch and never a retroactive
+        // confirmation of the release that was not observed.
+        let taken = fixture.acquire_as(&fixture.session, &view, 30).unwrap();
+        assert_eq!(taken["generation"].as_u64().unwrap(), epoch + 2);
+        // Stopping the view reports the same unconfirmed release instead of
+        // folding it into a clean stop.
+        let (control, epoch) = (
+            taken["controlId"].as_str().unwrap().to_owned(),
+            taken["generation"].as_u64().unwrap(),
+        );
+        let stopped = fixture
+            .computer
+            .stop_view(
+                &fixture.sessions,
+                &fixture.session,
+                StopBody {
+                    view_id: view.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped["controlRevoked"], json!(true));
+        assert_eq!(stopped["confirmed"], json!(false));
+        assert_eq!(stopped["reason"], json!("computer_release_unconfirmed"));
+        assert_eq!(stopped["generation"].as_u64().unwrap(), epoch + 1);
+        assert_eq!(fixture.mock.releases.load(Ordering::SeqCst), 2);
+        assert_ne!(control, String::new());
+        // A device that is simply unavailable says so: the reason is its own code.
+        *fixture.mock.release_failure.lock().unwrap() = Some(Failure::Unavailable);
+        let view = fixture.view();
+        let (control, epoch) = fixture.control(&view);
+        let value = fixture
+            .handback(&fixture.session, &view, &control, epoch)
+            .unwrap();
+        assert_eq!(value["released"], json!(false));
+        assert_eq!(value["confirmed"], json!(false));
+        assert_eq!(value["reason"], json!("computer_unsupported"));
     }
 
     #[test]
