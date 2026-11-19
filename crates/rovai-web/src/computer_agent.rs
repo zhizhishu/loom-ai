@@ -20,6 +20,32 @@
 //! * A created-but-not-yet-assigned server id is remembered immediately, so a later
 //!   failure can clean up the exact server. An ambiguous create is reported as unknown
 //!   and never replayed.
+//!
+//! Authority identity and the finite tool map are ported from Mikka
+//! (`lib/computer/local-authority.ts` and `packages/daemon/src/computer/driver.mjs`
+//! at `d59c85cb`):
+//! * Identity is [`Authority`], derived once from reviewed Host state — the browser
+//!   session that consented, the member the reviewed MCP server is assigned to, its
+//!   runtime, the one local device, the granted scope and the reviewed configuration
+//!   revision. A request body can never supply any of it (`GrantBody` denies unknown
+//!   fields), and every tool call re-reads the live Core state instead of trusting the
+//!   stored stamp.
+//! * The tool surface is the same closed five Mikka's driver exposes, mapped one to one:
+//!   `get_desktop_state`→[`Tool::Screenshot`], `click`→[`Tool::MouseClick`],
+//!   `type_text`→[`Tool::Text`], `press_key`→[`Tool::Key`], `scroll`→[`Tool::Wheel`].
+//!   Mikka's recording-only tools (`capture_screenshot`, `start_screen_recording`,
+//!   `stop_screen_recording`, `mark_recording_step`) and its `step` description have no
+//!   LOOM counterpart and are deliberately not exposed.
+//! * Captures and synthetic input keep **independent** authorization: [`Scope::View`]
+//!   authorizes a frame and nothing else, [`Scope::Control`] additionally authorizes the
+//!   four input tools. Mikka's single workspace policy (`permission: "allow"`, no
+//!   per-step review) is *not* copied: every grant here is per-grant, consented, TTL
+//!   bounded and revocable, and a tool call is re-authorized while the physical gate is
+//!   held.
+//! * Runtimes are the Pi toolchain family only ([`runtime_supported`]). `pi` stays closed
+//!   until the instance opts in through `LOOM_COMPUTER_AGENT_PI_MCP=1`;
+//!   `claude-code-cli` is refused by product policy and the Claude runtime opt-in
+//!   (`LOOM_CLAUDE_RUNTIME_ENABLED`) never opens a desktop grant.
 
 use crate::auth::{Session, Sessions};
 use crate::computer::{
@@ -69,11 +95,22 @@ const RPC_PATH: &str = "/api/v1/computer-agent/rpc";
 
 /// The only adapter kinds this bridge will wire. These are the *wire* values of
 /// `rovai_core::agent_profile::AdapterKind`, which is `#[serde(rename_all = "kebab-case")]`
-/// (`agent_profile.rs:35-37`): `ClaudeCodeCli`, `CodexCli`, `DeepseekHarness`, `Pi`.
-/// `pi` stays closed until the instance opts in through `LOOM_COMPUTER_AGENT_PI_MCP=1`.
-const RUNTIMES: [&str; 4] = ["claude-code-cli", "codex-cli", "deepseek-harness", "pi"];
+/// (`agent_profile.rs:35-37`): `CodexCli`, `DeepseekHarness`, `Pi`.
+/// `pi` stays closed until the instance opts in through [`PI_COMPUTER_MCP_ENV`].
+/// `claude-code-cli` is absent on purpose: it is refused by product policy, not only
+/// gated, so the reported allowlist can never offer a Claude computer grant.
+const RUNTIMES: [&str; 3] = ["codex-cli", "deepseek-harness", "pi"];
 /// Tool names are a closed set. No generic HTTP, shell, file or URL tool exists.
+///
+/// The same five tools Mikka's driver exposes, in LOOM's wire spelling:
+/// `get_desktop_state`→`screenshot`, `click`→`mouse_click`, `press_key`→`key`,
+/// `type_text`→`text`, `scroll`→`wheel`.
 const TOOLS: [&str; 5] = ["screenshot", "mouse_click", "key", "text", "wheel"];
+
+/// The existing explicit-enable path for the Pi toolchain. Only `1` (surrounding
+/// whitespace tolerated) counts, the same shape `runtime_platform_admission` uses for the
+/// Claude switch, so a stray value can never widen the surface.
+pub(crate) const PI_COMPUTER_MCP_ENV: &str = "LOOM_COMPUTER_AGENT_PI_MCP";
 
 fn wall_clock() -> u64 {
     SystemTime::now()
@@ -149,6 +186,15 @@ impl Scope {
             Self::Control => "control",
         }
     }
+
+    /// Independent authorization. A view grant authorizes a capture and nothing else; the
+    /// control scope is the only one that can reach a synthetic input.
+    fn allows(self, required: Scope) -> bool {
+        match required {
+            Self::View => matches!(self, Self::View | Self::Control),
+            Self::Control => self == Self::Control,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,17 +218,78 @@ impl Tool {
         }
     }
 
-    fn needs_control(self) -> bool {
-        !matches!(self, Self::Screenshot)
+    /// The narrowest scope that can use this tool. A capture needs the view scope and
+    /// nothing more; every synthetic input needs the control scope.
+    fn required_scope(self) -> Scope {
+        match self {
+            Self::Screenshot => Scope::View,
+            Self::MouseClick | Self::Key | Self::Text | Self::Wheel => Scope::Control,
+        }
+    }
+}
+
+/// The authority a computer grant carries, derived once from reviewed Host state.
+///
+/// Ported from Mikka's `localComputerAuthority` (`lib/computer/local-authority.ts`):
+/// authority is read from persisted ownership, never from a task, a model field or the
+/// tool call. Mikka carries `{botId, ownerId, workspaceId, permission, policyVersion}`;
+/// LOOM keeps two independent permissions instead of one `allow` and uses the reviewed
+/// Core MCP configuration digest as the policy version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Authority {
+    /// The browser session that consented (`ownerId`).
+    owner_id: String,
+    /// The member the reviewed MCP server is assigned to (`botId`).
+    bot_id: String,
+    /// The member's own runtime wire value. Reported and recorded, so the definition a
+    /// grant minted can be told apart from one minted for another runtime.
+    runtime: String,
+    /// The one local device this grant covers (`workspaceId`/`deviceId`).
+    device_id: String,
+    /// What the user allowed: captures only, or captures plus synthetic input.
+    permission: Scope,
+    /// The reviewed Core configuration revision (`policyVersion`). A newer revision never
+    /// silently inherits an older grant.
+    policy_version: String,
+}
+
+impl Authority {
+    /// The single authorization decision for one tool call.
+    fn authorizes(&self, tool: Tool) -> Result<(), &'static str> {
+        if self.permission.allows(tool.required_scope()) {
+            Ok(())
+        } else {
+            Err("computer_agent_scope_denied")
+        }
     }
 }
 
 /// Runtime kinds accepted by [`runtime_supported`], read from the member's own runtime
 /// configuration (never inferred from a model name).
 fn runtime_supported(adapter: &str) -> bool {
+    runtime_supported_with(
+        adapter,
+        pi_mcp_opt_in(std::env::var(PI_COMPUTER_MCP_ENV).ok().as_deref()),
+    )
+}
+
+/// Pure form of the Pi opt-in, so a test can assert both sides without mutating this
+/// process's environment (which parallel tests would observe).
+fn pi_mcp_opt_in(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+/// The accepted runtimes, with the Pi opt-in passed in.
+///
+/// `claude-code-cli` is refused unconditionally. LOOM disabled the Claude runtime by
+/// product policy (`rovai_core::runtime_platform_admission::CLAUDE_RUNTIME_ENABLED_ENV`),
+/// and that switch only re-enables channel-endpoint Claude runs for manual testing. It is
+/// deliberately not accepted here: a desktop grant must never be a way around it, so this
+/// function takes no Claude opt-in at all.
+fn runtime_supported_with(adapter: &str, pi_opt_in: bool) -> bool {
     match adapter {
-        "claude-code-cli" | "codex-cli" | "deepseek-harness" => true,
-        "pi" => std::env::var("LOOM_COMPUTER_AGENT_PI_MCP").is_ok_and(|value| value == "1"),
+        "pi" => pi_opt_in,
+        "codex-cli" | "deepseek-harness" => true,
         _ => false,
     }
 }
@@ -340,9 +447,10 @@ struct EmptyArgs {}
 pub(crate) fn public_grant(grant: &Grant, now: u64) -> Value {
     json!({
         "grantId": grant.id,
-        "assistantId": grant.assistant_id,
-        "deviceId": grant.device_id,
-        "scope": grant.scope.label(),
+        "assistantId": grant.authority.bot_id,
+        "deviceId": grant.authority.device_id,
+        "runtime": grant.authority.runtime,
+        "scope": grant.authority.permission.label(),
         "serverId": grant.server_id(),
         "expiresAt": grant.expires_at,
         "validForSeconds": grant.expires_at.saturating_sub(now) / 1000,
@@ -378,14 +486,11 @@ impl Default for RunState {
 
 pub(crate) struct Grant {
     id: String,
-    owner_client_id: String,
     owner: Arc<Session>,
     owner_sessions: Arc<Sessions>,
-    assistant_id: String,
-    device_id: String,
-    /// The digest the user reviewed when granting. Every tool call must match it.
-    expected_config_digest: String,
-    scope: Scope,
+    /// The identity this grant was minted for. Every tool call is re-authorized against
+    /// it, and nothing in a request body can supply or widen it.
+    authority: Authority,
     /// Empty until `create` confirms a server id; set immediately when it does, so a
     /// later failure can clean up the exact server instead of leaking it.
     created_server_id: Mutex<String>,
@@ -420,6 +525,12 @@ pub(crate) struct Grant {
 }
 
 impl Grant {
+    /// The browser session that consented. Kept as a named accessor because the registry,
+    /// the cleanup path and the private transport all filter on exactly this identity.
+    fn owner_id(&self) -> &str {
+        &self.authority.owner_id
+    }
+
     fn server_id(&self) -> String {
         self.created_server_id
             .lock()
@@ -515,7 +626,7 @@ fn server_authorizes(current: &ServerState, grant: &Grant) -> Result<(), &'stati
         return Err("computer_agent_grant_revoked");
     }
     // Exactly the one assistant the grant was created for, and no other.
-    if current.assigned.len() != 1 || current.assigned[0] != grant.assistant_id {
+    if current.assigned.len() != 1 || current.assigned[0] != grant.authority.bot_id {
         return Err("computer_agent_grant_revoked");
     }
     if !definition_matches(&current.definition, grant) {
@@ -1143,9 +1254,9 @@ impl AgentGrants {
             // reservation is created with `revoked` already set (it has no browser token
             // yet), so keying on `revoked` would let two concurrent creations for the same
             // assistant+device+scope both pass and publish duplicate servers.
-            let same = existing.assistant_id == grant.assistant_id
-                && existing.device_id == grant.device_id
-                && existing.scope == grant.scope
+            let same = existing.authority.bot_id == grant.authority.bot_id
+                && existing.authority.device_id == grant.authority.device_id
+                && existing.authority.permission == grant.authority.permission
                 && !existing.closed.load(Ordering::Acquire)
                 && wall_clock() < existing.expires_at;
             if same {
@@ -1183,7 +1294,7 @@ impl AgentGrants {
         };
         grants
             .values()
-            .filter(|grant| grant.owner_client_id == client_id)
+            .filter(|grant| grant.owner_id() == client_id)
             .filter(|grant| !grant.pending.load(Ordering::Acquire))
             .cloned()
             .collect()
@@ -1236,8 +1347,8 @@ fn definition_json(
     config: &Config,
     grant_id: &str,
     token_path: &Path,
-    authority: &str,
-    digest: &str,
+    bridge_authority: &str,
+    authority: &Authority,
 ) -> String {
     let mut servers = serde_json::Map::new();
     servers.insert(
@@ -1250,11 +1361,20 @@ fn definition_json(
             "args": [config.bridge.display().to_string()],
             "env": {
                 "LOOM_COMPUTER_AGENT_GRANT": grant_id,
-                "LOOM_COMPUTER_AGENT_ENDPOINT": format!("http://{authority}{RPC_PATH}"),
+                "LOOM_COMPUTER_AGENT_ENDPOINT": format!("http://{bridge_authority}{RPC_PATH}"),
                 "LOOM_COMPUTER_AGENT_ORIGIN": config.origin,
-                // Non-secret: the reviewed configuration digest the bridge echoes on
-                // every tool call.
-                "LOOM_COMPUTER_AGENT_DIGEST": digest,
+                // Non-secret identity, in the shape Mikka's lease guard checks
+                // (`driver.mjs`): who the reviewed member is, which runtime it runs and
+                // which permission the user granted. The bridge refuses to start when the
+                // runtime is not the Pi family or the identity is malformed, so a
+                // definition minted for another runtime can never serve tool calls. The
+                // Host still re-derives all of this from its own state on every call.
+                "LOOM_COMPUTER_AGENT_RUNTIME": authority.runtime,
+                "LOOM_COMPUTER_AGENT_SUBJECT": authority.bot_id,
+                "LOOM_COMPUTER_AGENT_SCOPE": authority.permission.label(),
+                // Non-secret: the reviewed configuration revision (the authority's
+                // `policyVersion`), which the bridge echoes on every tool call.
+                "LOOM_COMPUTER_AGENT_DIGEST": authority.policy_version,
                 // Path only. The secret never enters a Core-stored configuration.
                 "LOOM_COMPUTER_AGENT_TOKEN_FILE": token_path.display().to_string(),
             },
@@ -1331,7 +1451,7 @@ async fn cleanup_mcp(mcp: &Arc<dyn McpOps>, grant: &Grant) -> Result<(), &'stati
         // Nothing was ever provisioned (the creation failed before `create` returned).
         return Ok(());
     }
-    let owner = grant.owner_client_id.clone();
+    let owner = grant.owner_id().to_owned();
     // Read first: a server deleted by another path must not turn a retry into an error.
     let Some(current) = mcp.server(owner.clone(), server_id.clone()).await? else {
         return Ok(());
@@ -1562,12 +1682,23 @@ pub(crate) async fn grant(
     hasher.update(b"rovai-computer-agent-v1\0");
     hasher.update(token.as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
+    // The authority identity is fixed here, once, from reviewed Host state: the browser
+    // session that consented, the admitted member, its own runtime and device, the granted
+    // scope and the reviewed configuration revision. Nothing later can supply or widen it.
+    let authority = Authority {
+        owner_id: owner.clone(),
+        bot_id: body.assistant_id.clone(),
+        runtime: assistant.adapter.clone(),
+        device_id: device_id.to_owned(),
+        permission: scope,
+        policy_version: body.expected_config_digest.clone(),
+    };
     let definition = definition_json(
         &config,
         &grant_id,
         &token_path,
         &bridge_authority,
-        &body.expected_config_digest,
+        &authority,
     );
     // Recorded before the registry write, so the value that authorizes later tool calls is
     // the one this Host minted, not whatever Core happens to hold afterwards.
@@ -1578,13 +1709,9 @@ pub(crate) async fn grant(
 
     let pending = Arc::new(Grant {
         id: grant_id.clone(),
-        owner_client_id: owner.clone(),
         owner: session.clone(),
         owner_sessions: state.sessions.clone(),
-        assistant_id: body.assistant_id.clone(),
-        device_id: device_id.to_owned(),
-        expected_config_digest: body.expected_config_digest.clone(),
-        scope,
+        authority,
         created_server_id: Mutex::new(String::new()),
         transport_origin,
         bridge_origin: config.origin.clone(),
@@ -1628,13 +1755,9 @@ pub(crate) async fn grant(
             }
             let live = Arc::new(Grant {
                 id: pending.id.clone(),
-                owner_client_id: pending.owner_client_id.clone(),
                 owner: pending.owner.clone(),
                 owner_sessions: pending.owner_sessions.clone(),
-                assistant_id: pending.assistant_id.clone(),
-                device_id: pending.device_id.clone(),
-                expected_config_digest: pending.expected_config_digest.clone(),
-                scope: pending.scope,
+                authority: pending.authority.clone(),
                 created_server_id: Mutex::new(server_id),
                 transport_origin: pending.transport_origin.clone(),
                 bridge_origin: pending.bridge_origin.clone(),
@@ -1697,7 +1820,7 @@ async fn run_creation(
             owner.to_owned(),
             digest,
             server_id.clone(),
-            pending.assistant_id.clone(),
+            pending.authority.bot_id.clone(),
         )
         .await?;
     admit_pending(pending, sessions)?;
@@ -1812,13 +1935,13 @@ pub(crate) async fn rpc(
     if origin != Some(grant.bridge_origin.as_str()) {
         return rpc_error(&body.request_id, "computer_agent_origin_denied");
     }
-    if body.expected_config_digest != grant.expected_config_digest {
+    if body.expected_config_digest != grant.authority.policy_version {
         // The bridge must echo the configuration the user reviewed. A newer Core
         // configuration never silently inherits an older grant.
         return rpc_error(&body.request_id, "computer_agent_digest_mismatch");
     }
-    if tool.needs_control() && grant.scope != Scope::Control {
-        return rpc_error(&body.request_id, "computer_agent_scope_denied");
+    if let Err(code) = grant.authority.authorizes(tool) {
+        return rpc_error(&body.request_id, code);
     }
     // Housekeeping is cheap because it only walks already-due grants.
     state.agents.retire_due(&state.computer, now).await;
@@ -1828,7 +1951,7 @@ pub(crate) async fn rpc(
     match state
         .agents
         .mcp
-        .server(grant.owner_client_id.clone(), grant.server_id())
+        .server(grant.owner_id().to_owned(), grant.server_id())
         .await
     {
         Ok(Some(current)) => {
@@ -1954,6 +2077,9 @@ fn run_tool(
     request_id: &str,
     arguments: Value,
 ) -> Result<Value, Failure> {
+    // Independent authorization first: a view grant reaches no synthetic input even when
+    // the rest of the grant is healthy.
+    grant.authority.authorizes(tool).map_err(Failure::code)?;
     // First check: refuse early instead of taking the grant gate for nothing.
     admit(grant, browser).map_err(Failure::code)?;
     let mut run = grant.gate().map_err(Failure::code)?;
@@ -2015,7 +2141,7 @@ fn ensure_view(
             &grant.session,
             ViewBody {
                 consent: true,
-                device_id: grant.device_id.clone(),
+                device_id: grant.authority.device_id.clone(),
             },
         )
         .map_err(map_computer)?;
@@ -2084,7 +2210,7 @@ fn ensure_control(
             &grant.session,
             ControlBody {
                 view_id: view_id.to_owned(),
-                device_id: grant.device_id.clone(),
+                device_id: grant.authority.device_id.clone(),
                 consent: true,
                 ttl_seconds: TOOL_CONTROL_TTL_SECONDS,
             },
@@ -2429,6 +2555,19 @@ mod tests {
         }
     }
 
+    /// The authority every fixture grant is minted for: the Pi runtime, the one local
+    /// device and the reviewed configuration digest.
+    fn fixture_authority(owner: &Arc<Session>, permission: Scope) -> Authority {
+        Authority {
+            owner_id: owner.client_id.clone(),
+            bot_id: "assistant-1".to_owned(),
+            runtime: "pi".to_owned(),
+            device_id: "sha256:blocking".to_owned(),
+            permission,
+            policy_version: "a".repeat(64),
+        }
+    }
+
     fn grant_for(
         browser: &Arc<Sessions>,
         owner: &Arc<Session>,
@@ -2448,13 +2587,9 @@ mod tests {
             .expect("session must be issued");
         Arc::new(Grant {
             id: "g".repeat(64),
-            owner_client_id: owner.client_id.clone(),
             owner: owner.clone(),
             owner_sessions: browser.clone(),
-            assistant_id: "assistant-1".to_owned(),
-            device_id: "sha256:blocking".to_owned(),
-            expected_config_digest: "a".repeat(64),
-            scope: Scope::Control,
+            authority: fixture_authority(owner, Scope::Control),
             created_server_id: Mutex::new("server-abc12345".to_owned()),
             transport_origin: "http://127.0.0.1:8443".to_owned(),
             bridge_origin: "http://127.0.0.1:8443".to_owned(),
@@ -2567,8 +2702,9 @@ mod tests {
             removed: false,
             target_local: true,
         };
-        // The real `AdapterKind` wire values (kebab-case).
-        for adapter in ["claude-code-cli", "codex-cli", "deepseek-harness"] {
+        // The real `AdapterKind` wire values (kebab-case). The Pi family is accepted;
+        // `claude-code-cli` is refused by product policy (see the next test).
+        for adapter in ["codex-cli", "deepseek-harness"] {
             assert!(assistant_admissible(&local(adapter)).is_ok(), "{adapter}");
             assert!(runtime_supported(adapter), "{adapter}");
         }
@@ -2579,6 +2715,7 @@ mod tests {
         );
         // Snake_case spellings are *not* wire values and must not be accepted.
         for adapter in [
+            "claude-code-cli",
             "claude_code_cli",
             "codex_cli",
             "deepseek_harness",
@@ -2620,6 +2757,44 @@ mod tests {
         );
     }
 
+    /// The Pi toolchain is opened only by the existing explicit opt-in, and Claude computer
+    /// use stays refused: the Claude runtime switch re-enables channel-endpoint Claude runs
+    /// for manual testing, never a desktop grant.
+    #[test]
+    fn pi_needs_the_explicit_opt_in_and_claude_computer_use_stays_refused() {
+        // Only `1`, surrounding whitespace tolerated, is an opt-in.
+        for (raw, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("true"), false),
+            (Some("yes"), false),
+            (Some("2"), false),
+            (Some("1"), true),
+            (Some(" 1 "), true),
+            (Some("\t1\n"), true),
+        ] {
+            assert_eq!(pi_mcp_opt_in(raw), expected, "{raw:?}");
+            assert_eq!(
+                runtime_supported_with("pi", expected),
+                expected,
+                "the Pi runtime follows the opt-in exactly"
+            );
+        }
+        // Claude is refused with and without every other switch we know of.
+        assert!(!runtime_supported_with("claude-code-cli", false));
+        assert!(!runtime_supported_with("claude-code-cli", true));
+        assert!(!RUNTIMES.contains(&"claude-code-cli"));
+        // The Pi family is exactly the codex/deepseek runtimes plus the gated Pi one.
+        assert_eq!(RUNTIMES, ["codex-cli", "deepseek-harness", "pi"]);
+        for adapter in RUNTIMES {
+            assert!(
+                runtime_supported_with(adapter, true),
+                "{adapter} must be supported once Pi opts in"
+            );
+        }
+    }
+
     #[test]
     fn wire_shapes_match_the_core_contracts() {
         // `members.get` -> `AgentProfileView` (camelCase, `agent_profile.rs:855-876`).
@@ -2651,7 +2826,18 @@ mod tests {
         let info = assistant_from_member(&member, local_target.clone());
         assert_eq!(info.adapter, "claude-code-cli");
         assert!(info.target_local);
-        assert!(assistant_admissible(&info).is_ok());
+        // The member shape is parsed faithfully, but Claude computer use is refused by
+        // product policy even when the member is local and ready.
+        assert_eq!(
+            assistant_admissible(&info).unwrap_err(),
+            "computer_agent_runtime_unsupported"
+        );
+        // The same member on an accepted runtime is admissible.
+        let mut accepted = member.clone();
+        accepted["runtimeConfiguration"]["adapterKind"] = json!("codex-cli");
+        assert!(
+            assistant_admissible(&assistant_from_member(&accepted, local_target.clone())).is_ok()
+        );
 
         // A persisted selection names a remote node: that route does not exist here.
         let remote_target = Ok(json!({
@@ -2662,7 +2848,8 @@ mod tests {
                 "model": {"mode": "runtime_default"},
                 "permissions": {"schemaVersion": 1, "values": {}}}
         }));
-        let remote = assistant_from_member(&member, remote_target);
+        // The runtime must be admitted first, so this uses an accepted one.
+        let remote = assistant_from_member(&accepted, remote_target);
         assert!(!remote.target_local);
         assert_eq!(
             assistant_admissible(&remote).unwrap_err(),
@@ -2920,16 +3107,67 @@ mod tests {
         assert!(!public.contains(&grant.session.client_id));
     }
 
+    /// The identity on a grant is the reviewed one, and a request body has no field that
+    /// could supply, replace or widen it (Mikka: never a task or model field).
+    #[test]
+    fn a_grant_request_cannot_supply_its_own_authority() {
+        let valid = json!({
+            "consent": true,
+            "assistantId": "assistant-1",
+            "scope": "view",
+            "deviceId": "sha256:blocking",
+            "expectedConfigDigest": "a".repeat(64),
+            "ttlSeconds": 60,
+        });
+        let body: GrantBody = serde_json::from_value(valid.clone()).expect("the real shape parses");
+        assert_eq!(body.assistant_id, "assistant-1");
+        assert_eq!(body.scope, "view");
+        // Every identity/authority field is refused as an unknown field instead of being
+        // silently ignored, so a caller cannot claim to be another member or runtime.
+        for field in [
+            "ownerId",
+            "ownerClientId",
+            "clientId",
+            "botId",
+            "runtime",
+            "adapter",
+            "adapterKind",
+            "permission",
+            "policyVersion",
+            "token",
+            "tokenFile",
+            "serverId",
+            "grantId",
+        ] {
+            let mut claimed = valid.clone();
+            claimed[field] = json!("attacker");
+            assert!(
+                serde_json::from_value::<GrantBody>(claimed).is_err(),
+                "{field} must never come from a request body"
+            );
+        }
+
+        // The public payload reports the granted identity it was minted for.
+        let (sessions, owner, _token) = browser();
+        let grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
+        let public = public_grant(&grant, wall_clock());
+        assert_eq!(public["assistantId"], json!("assistant-1"));
+        assert_eq!(public["deviceId"], json!("sha256:blocking"));
+        assert_eq!(public["runtime"], json!("pi"));
+        assert_eq!(public["scope"], json!("control"));
+    }
+
     #[test]
     fn definition_carries_a_token_path_but_never_a_token() {
         let grants = AgentGrants::for_test(FakeMcp::new());
         let config = grants.supported().unwrap().clone();
+        let (_sessions, owner, _token) = browser();
         let definition = definition_json(
             &config,
             "0123456789abcdef",
             Path::new("/tmp/grant-x"),
             "127.0.0.1:8443",
-            &"b".repeat(64),
+            &fixture_authority(&owner, Scope::View),
         );
         let parsed: Value = serde_json::from_str(&definition).unwrap();
         let server = parsed["mcpServers"]
@@ -2945,6 +3183,37 @@ mod tests {
             .unwrap()
             .ends_with("grant-x"));
         assert_eq!(env["LOOM_COMPUTER_AGENT_GRANT"], json!("0123456789abcdef"));
+        // The non-secret authority identity reaches the Pi toolchain; the token never does.
+        assert_eq!(env["LOOM_COMPUTER_AGENT_RUNTIME"], json!("pi"));
+        assert_eq!(env["LOOM_COMPUTER_AGENT_SUBJECT"], json!("assistant-1"));
+        assert_eq!(env["LOOM_COMPUTER_AGENT_SCOPE"], json!("view"));
+        // The digest the bridge echoes is the authority's reviewed revision, not a
+        // separately supplied value.
+        assert_eq!(
+            env["LOOM_COMPUTER_AGENT_DIGEST"],
+            json!(fixture_authority(&owner, Scope::View).policy_version)
+        );
+        let mut keys: Vec<&str> = env
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "LOOM_COMPUTER_AGENT_DIGEST",
+                "LOOM_COMPUTER_AGENT_ENDPOINT",
+                "LOOM_COMPUTER_AGENT_GRANT",
+                "LOOM_COMPUTER_AGENT_ORIGIN",
+                "LOOM_COMPUTER_AGENT_RUNTIME",
+                "LOOM_COMPUTER_AGENT_SCOPE",
+                "LOOM_COMPUTER_AGENT_SUBJECT",
+                "LOOM_COMPUTER_AGENT_TOKEN_FILE",
+            ],
+            "the toolchain environment is a closed set"
+        );
         assert!(!definition.contains(&"ab".repeat(32)));
     }
 
@@ -3064,7 +3333,7 @@ mod tests {
                 &grant.session,
                 ViewBody {
                     consent: true,
-                    device_id: grant.device_id.clone(),
+                    device_id: grant.authority.device_id.clone(),
                 },
             )
             .unwrap()["viewId"]
@@ -3077,7 +3346,7 @@ mod tests {
                 &grant.session,
                 ControlBody {
                     view_id: view.clone(),
-                    device_id: grant.device_id.clone(),
+                    device_id: grant.authority.device_id.clone(),
                     consent: true,
                     ttl_seconds: 30,
                 },
@@ -3181,7 +3450,7 @@ mod tests {
                 &grant.session,
                 ViewBody {
                     consent: true,
-                    device_id: grant.device_id.clone(),
+                    device_id: grant.authority.device_id.clone(),
                 },
             )
             .unwrap()["viewId"]
@@ -3224,7 +3493,7 @@ mod tests {
                 &grant.session,
                 ViewBody {
                     consent: true,
-                    device_id: grant.device_id.clone(),
+                    device_id: grant.authority.device_id.clone(),
                 },
             )
             .unwrap()["viewId"]
@@ -3237,7 +3506,7 @@ mod tests {
                 &grant.session,
                 ControlBody {
                     view_id: view.clone(),
-                    device_id: grant.device_id.clone(),
+                    device_id: grant.authority.device_id.clone(),
                     consent: true,
                     ttl_seconds: 30,
                 },
@@ -3307,6 +3576,120 @@ mod tests {
         .expect("replay must fail");
         assert_eq!(replay.code, "computer_agent_request_replayed");
         assert_eq!(provider.inputs.load(Ordering::SeqCst), 1);
+    }
+
+    /// The Pi toolchain's authorization lifecycle at the one boundary that can reach an
+    /// operating system: the capture scope alone may not type, a request id is burnt before
+    /// the OS call, and a revoked or expired grant is refused without a further OS call.
+    #[test]
+    fn pi_toolchain_covers_scope_replay_revocation_and_expiry() {
+        // Every phase gets its own device, so a control lease from an earlier grant can
+        // never be mistaken for this one.
+        fn fresh() -> (Arc<Computer>, Arc<BlockingProvider>) {
+            let (entered_tx, _entered_rx) = mpsc::channel();
+            let (_proceed_tx, proceed) = mpsc::channel::<()>();
+            let provider = BlockingProvider::new(entered_tx, proceed);
+            let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
+            let computer = Arc::new(Computer::with_test_provider(provider.clone(), {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            }));
+            (computer, provider)
+        }
+
+        let (sessions, owner, _token) = browser();
+
+        // 1. Independent authorization: a view grant captures, and cannot type.
+        let (computer, provider) = fresh();
+        let mut view_grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
+        Arc::get_mut(&mut view_grant).unwrap().authority.permission = Scope::View;
+        let shot = run_tool(
+            &computer,
+            &sessions,
+            &view_grant,
+            Tool::Screenshot,
+            "pi-shot-1",
+            json!({}),
+        )
+        .ok()
+        .expect("a view grant must capture");
+        assert!(shot["pngBase64"].as_str().is_some_and(|png| !png.is_empty()));
+        let refused = run_tool(
+            &computer,
+            &sessions,
+            &view_grant,
+            Tool::Key,
+            "pi-key-view",
+            json!({"key": "enter"}),
+        )
+        .err()
+        .expect("a view grant must not type");
+        assert_eq!(refused.code, "computer_agent_scope_denied");
+        assert!(!refused.revoke, "a scope refusal is not a revocation");
+        assert_eq!(
+            provider.inputs.load(Ordering::SeqCst),
+            0,
+            "no synthetic input may reach the device"
+        );
+
+        // 2. Replay: the same request id is refused before the second OS call.
+        let (computer, provider) = fresh();
+        let grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
+        let first = run_tool(
+            &computer,
+            &sessions,
+            &grant,
+            Tool::Key,
+            "pi-key-1",
+            json!({"key": "enter"}),
+        )
+        .ok()
+        .expect("the first input must be admitted");
+        assert_eq!(first["seq"], json!(1));
+        assert_eq!(provider.inputs.load(Ordering::SeqCst), 1);
+        let replay = run_tool(
+            &computer,
+            &sessions,
+            &grant,
+            Tool::Key,
+            "pi-key-1",
+            json!({"key": "enter"}),
+        )
+        .err()
+        .expect("a replay must be refused");
+        assert_eq!(replay.code, "computer_agent_request_replayed");
+        assert_eq!(provider.inputs.load(Ordering::SeqCst), 1);
+
+        // 3. Revocation: refused before the OS call, even with a fresh request id.
+        grant.revoked.store(true, Ordering::Release);
+        let revoked = run_tool(
+            &computer,
+            &sessions,
+            &grant,
+            Tool::Key,
+            "pi-key-2",
+            json!({"key": "enter"}),
+        )
+        .err()
+        .expect("a revoked grant must not type");
+        assert_eq!(revoked.code, "computer_agent_grant_revoked");
+        assert_eq!(provider.inputs.load(Ordering::SeqCst), 1);
+
+        // 4. Expiry: the same refusal, with its own code, and again no OS call.
+        let (computer, provider) = fresh();
+        let expired = grant_for(&sessions, &owner, 1, false);
+        let late = run_tool(
+            &computer,
+            &sessions,
+            &expired,
+            Tool::Key,
+            "pi-key-3",
+            json!({"key": "enter"}),
+        )
+        .err()
+        .expect("an expired grant must not type");
+        assert_eq!(late.code, "computer_agent_grant_expired");
+        assert_eq!(provider.inputs.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3440,7 +3823,7 @@ mod tests {
                 &grants,
                 &sessions,
                 &pending,
-                &pending.owner_client_id,
+                &pending.authority.owner_id,
                 "{\"mcpServers\":{\"loom-computer-agent-1\":{}}}".to_owned(),
             )
             .await
@@ -3467,7 +3850,7 @@ mod tests {
             .build()
             .unwrap();
         let outcome = runtime.block_on(async {
-            run_creation(&grants, &sessions, &pending, &pending.owner_client_id, "{}".to_owned()).await
+            run_creation(&grants, &sessions, &pending, &pending.authority.owner_id, "{}".to_owned()).await
         });
         assert_eq!(outcome.err(), Some("computer_agent_grant_revoked"));
         assert!(fake.names().is_empty(), "no Core write may happen");
@@ -3510,6 +3893,9 @@ mod tests {
                     "LOOM_COMPUTER_AGENT_GRANT": grant_id,
                     "LOOM_COMPUTER_AGENT_ENDPOINT": "http://127.0.0.1:8443/api/v1/computer-agent/rpc",
                     "LOOM_COMPUTER_AGENT_ORIGIN": "http://127.0.0.1:8443",
+                    "LOOM_COMPUTER_AGENT_RUNTIME": "pi",
+                    "LOOM_COMPUTER_AGENT_SUBJECT": "assistant-1",
+                    "LOOM_COMPUTER_AGENT_SCOPE": "control",
                     "LOOM_COMPUTER_AGENT_DIGEST": digest_text,
                     "LOOM_COMPUTER_AGENT_TOKEN_FILE": "/tmp/grants/token-abc",
                 },
@@ -3524,7 +3910,7 @@ mod tests {
         // No token file, so this test isolates the enabled/assignment checks.
         let grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
         assert!(grant.token_path.is_none());
-        let assistant = grant.assistant_id.clone();
+        let assistant = grant.authority.bot_id.clone();
         let definition = fixture_definition(&grant.id).to_string();
         let state = |enabled: bool, assigned: Vec<String>| ServerState {
             enabled,
@@ -3556,7 +3942,7 @@ mod tests {
         let (sessions, owner, _token) = browser();
         let grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
         let id = grant.id.clone();
-        let assistant = grant.assistant_id.clone();
+        let assistant = grant.authority.bot_id.clone();
         let expected = fixture_definition(&id);
         let name = format!("loom-computer-agent-{}", &id[..id.len().min(8)]);
         let digest_text = "a".repeat(64);
@@ -3572,6 +3958,9 @@ mod tests {
         let reordered = format!(
             concat!(
                 r#"{{"mcpServers":{{"{name}":{{"env":{{"LOOM_COMPUTER_AGENT_TOKEN_FILE":"/tmp/grants/token-abc","#,
+                r#""LOOM_COMPUTER_AGENT_SCOPE":"control","#,
+                r#""LOOM_COMPUTER_AGENT_SUBJECT":"assistant-1","#,
+                r#""LOOM_COMPUTER_AGENT_RUNTIME":"pi","#,
                 r#""LOOM_COMPUTER_AGENT_DIGEST":"{digest}","#,
                 r#""LOOM_COMPUTER_AGENT_ORIGIN":"http://127.0.0.1:8443","#,
                 r#""LOOM_COMPUTER_AGENT_ENDPOINT":"http://127.0.0.1:8443/api/v1/computer-agent/rpc","#,
@@ -3611,6 +4000,17 @@ mod tests {
         });
         let mut extra_env = expected.clone();
         extra_env["mcpServers"][name.as_str()]["env"]["LOOM_COMPUTER_AGENT_TIMEOUT_SECONDS"] = json!("60");
+        // The authority is inside the definition, so a definition re-pointed at another
+        // runtime, member or scope is not this grant either.
+        let mut runtime_changed = expected.clone();
+        runtime_changed["mcpServers"][name.as_str()]["env"]["LOOM_COMPUTER_AGENT_RUNTIME"] =
+            json!("claude-code-cli");
+        let mut subject_changed = expected.clone();
+        subject_changed["mcpServers"][name.as_str()]["env"]["LOOM_COMPUTER_AGENT_SUBJECT"] =
+            json!("assistant-2");
+        let mut scope_changed = expected.clone();
+        scope_changed["mcpServers"][name.as_str()]["env"]["LOOM_COMPUTER_AGENT_SCOPE"] =
+            json!("view");
 
         for (case, foreign) in [
             ("command", command_changed),
@@ -3621,6 +4021,9 @@ mod tests {
             ("token-path", token_path_changed),
             ("extra-server", extra_server),
             ("extra-env", extra_env),
+            ("runtime", runtime_changed),
+            ("subject", subject_changed),
+            ("scope", scope_changed),
         ] {
             assert_eq!(
                 server_authorizes(&state(foreign.to_string()), &grant).err(),
@@ -3680,7 +4083,7 @@ mod tests {
         };
         let (sessions, owner, _token) = browser();
         let grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
-        let assistant = grant.assistant_id.clone();
+        let assistant = grant.authority.bot_id.clone();
         let known: std::collections::BTreeSet<String> = [assistant.clone()].into_iter().collect();
         let root = std::env::temp_dir().join(format!("loom-mcp-{}", crate::new_token().unwrap()));
         let store = McpConfigStore::new(root.join(".rovai/mcp.json"));
