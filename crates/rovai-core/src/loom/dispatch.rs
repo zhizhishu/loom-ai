@@ -33,9 +33,19 @@
 //!   same `IMMEDIATE` transaction as the decision, so a recipient that comes back while the pass
 //!   waits for the write lock is dispatched instead of being reported as absent. Presence is the
 //!   device that will actually run the work: the local installation the Agent is bound to, or the
-//!   remote Node the member explicitly selected, judged by the same launch eligibility Core already
+//!   remote Node the member explicitly selected — first the Node's own presence (paired, unrevoked,
+//!   heartbeating), then the harness it reports — judged by the same launch intent Core already
 //!   applies (`light_ready`, `installed_unverified` and a missing snapshot are startable; a stored
-//!   probe result is not a dispatch condition).
+//!   probe result is not a dispatch condition, and a live Command Host is admitted by its
+//!   installation identity even when the disk entry moved). Once a Run exists, the device is that
+//!   Run's frozen target, never a member setting that changed afterwards.
+//! * **Unavailable work is still reserved.** A device that is merely gone does not cancel work the
+//!   Owner approved: the Dispatch and its Delivery are reserved, the failure is recorded, and the
+//!   pre-execution recheck keeps the lane from starting until the device is back. That reservation
+//!   is what the Delivery scheduler and the recovery timer can find, so the same queued Run
+//!   continues by itself — no pass has to be triggered by hand. A Recipient the Camp cannot address
+//!   at all (no profile, not a member, switched off, away) has no lane to reserve, so only its
+//!   failure fact is written.
 //! * **A failure is a durable fact.** Each `(event identity, reason)` is recorded once as a
 //!   `loom.dispatch_failed` domain event — a repeated tick stores nothing, an
 //!   offline → disabled → offline round trip keeps one row per reason, and recovery never deletes
@@ -54,7 +64,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use super::super::blocking_dependencies;
 use super::{LoomControlPolicy, active_member, read_policy};
-use crate::agent_profile::{RuntimeReadiness, RuntimeReadinessStatus};
+use crate::agent_profile::{AdapterKind, RuntimeReadiness, RuntimeReadinessStatus};
 use crate::collaboration::{LoomDispatchAdmission, LoomDispatchAdmissionOutcome};
 use crate::db::Database;
 
@@ -231,6 +241,9 @@ pub(crate) fn dispatch_block_reason(
         return Ok(Some("loom.control_policy_mission_mismatch".to_string()));
     }
 
+    // The device judged here is the one this queued work was frozen to: once a Run exists, a member
+    // setting that changed afterwards cannot reroute or block it.
+    let frozen = frozen_execution_of_dispatch(connection, dispatch_id)?;
     let problem = event_problem(
         connection,
         &policy,
@@ -242,6 +255,7 @@ pub(crate) fn dispatch_block_reason(
         &recipient,
         policy_revision,
         Some(dispatch_id),
+        frozen.as_ref(),
     )?;
     Ok(problem.map(str::to_string))
 }
@@ -312,9 +326,17 @@ fn admit_plan(
             continue;
         }
 
+        // A device that cannot take the work right now is not a reason to forget the work: the
+        // Dispatch and its Delivery are reserved anyway, exactly as upstream keeps the Run row
+        // queued, so the scheduler owns a durable pending item it can find again and the
+        // pre-execution recheck keeps the Delivery from starting until the device is back. Only the
+        // identity and budget rejections below leave nothing behind, because those are not a
+        // "wait for the device" fact: a Recipient the Camp cannot address at all (no profile, not a
+        // member, switched off, away) has no Delivery lane to reserve, so its failure is recorded
+        // as a fact and the Task stays closed for this pass.
+        let mut recipient_failure: Option<&'static str> = None;
         // Membership, ownership, assignment, producer identity and Candidate freshness are
-        // re-proved here, under the write lock, before the Delivery lane is entered: a rejected
-        // admission must leave neither a ledger row nor a Camp message behind.
+        // re-proved here, under the write lock, before the Delivery lane is entered.
         if let Some(problem) = event_problem(
             transaction,
             &policy,
@@ -326,44 +348,58 @@ fn admit_plan(
             &event.recipient_agent_id,
             policy.authorization_revision,
             None,
+            None,
         )? {
-            match problem {
-                RECIPIENT_UNAVAILABLE_REASON
-                | RECIPIENT_DISABLED_REASON
-                | RECIPIENT_OFFLINE_REASON
-                | HARNESS_UNAVAILABLE_REASON
-                | "loom.dispatch_recipient_not_reviewer"
-                | "loom.dispatch_recipient_not_assignee"
-                | "loom.dispatch_recipient_is_assignee"
-                | "loom.dispatch_recipient_is_producer"
-                | "loom.dispatch_recipient_not_lead" => {
-                    // The recorded reason is the specific code, not a generic "cannot reach".
-                    // `blocked_reason` is only the current-state mirror of it; the fact itself is
-                    // the durable `(event identity, reason)` row written below, so no tick can
-                    // turn one unavailable recipient into a second copy of the same event.
-                    set_control_blocked_reason(transaction, plan_id, &event.task_id, problem, now)?;
-                    if is_recipient_availability_reason(problem) {
-                        record_dispatch_failure(
+            let reservable = match camp_id.as_deref() {
+                Some(camp_id) => {
+                    reserves_while_unavailable(problem)
+                        && recipient_is_addressable(
                             transaction,
-                            camp_id.as_deref(),
-                            &event,
+                            camp_id,
+                            &event.recipient_agent_id,
+                        )?
+                }
+                None => false,
+            };
+            if reservable {
+                // The Recipient is an addressable Member whose device is gone: reserve the work
+                // below and record the reason once it exists.
+                recipient_failure = Some(problem);
+            } else {
+                match problem {
+                    RECIPIENT_UNAVAILABLE_REASON
+                    | RECIPIENT_DISABLED_REASON
+                    | RECIPIENT_OFFLINE_REASON
+                    | HARNESS_UNAVAILABLE_REASON
+                    | PREVIOUS_OUTCOME_REASON
+                    | "loom.dispatch_recipient_not_reviewer"
+                    | "loom.dispatch_recipient_not_assignee"
+                    | "loom.dispatch_recipient_is_assignee"
+                    | "loom.dispatch_recipient_is_producer"
+                    | "loom.dispatch_recipient_not_lead" => {
+                        // The recorded reason is the specific code, not a generic "cannot reach".
+                        // `blocked_reason` is only the current-state mirror of the durable fact.
+                        set_control_blocked_reason(
+                            transaction,
+                            plan_id,
+                            &event.task_id,
                             problem,
                             now,
                         )?;
+                        if is_recipient_availability_reason(problem) {
+                            record_dispatch_failure(
+                                transaction,
+                                camp_id.as_deref(),
+                                &event,
+                                problem,
+                                now,
+                            )?;
+                        }
                     }
+                    _ => {}
                 }
-                PREVIOUS_OUTCOME_REASON => {
-                    set_control_blocked_reason(
-                        transaction,
-                        plan_id,
-                        &event.task_id,
-                        PREVIOUS_OUTCOME_REASON,
-                        now,
-                    )?;
-                }
-                _ => {}
+                continue;
             }
-            continue;
         }
 
         // The budget is judged against the whole ledger, so it is re-read for every event: an
@@ -427,8 +463,31 @@ fn admit_plan(
                         params![now, plan_id, &event.task_id],
                     )?;
                 }
-                record_dispatch_recovery(transaction, camp_id.as_deref(), &event, now)?;
-                clear_control_blocked_reason(transaction, plan_id, &event.task_id, now)?;
+                match recipient_failure {
+                    // Reserved, but the device still cannot start it: the queued work is now the
+                    // durable pending item the scheduler and the recovery timer find, and the
+                    // failure is recorded exactly once per event and reason.
+                    Some(reason) => {
+                        set_control_blocked_reason(
+                            transaction,
+                            plan_id,
+                            &event.task_id,
+                            reason,
+                            now,
+                        )?;
+                        record_dispatch_failure(
+                            transaction,
+                            camp_id.as_deref(),
+                            &event,
+                            reason,
+                            now,
+                        )?;
+                    }
+                    None => {
+                        record_dispatch_recovery(transaction, camp_id.as_deref(), &event, now)?;
+                        clear_control_blocked_reason(transaction, plan_id, &event.task_id, now)?;
+                    }
+                }
                 admitted += 1;
             }
             LoomDispatchAdmissionOutcome::Skipped => {}
@@ -615,7 +674,21 @@ fn due_events(
         // keeps the class closed. A plain wait (nothing handed to a Run yet) is not an unknown
         // outcome and writes no reason: only a started-but-unproved or failed attempt does.
         match prior_outcome_of_class(transaction, plan_id, &event.task_id, event.kind, None)? {
-            PriorOutcome::Pending => continue,
+            PriorOutcome::Pending => {
+                // A Run that is still going proves nothing, so this class must not be handed out
+                // again. But the work that Run queued can itself become unreachable: the reservation
+                // is judged below (its dedupe key is already in the ledger, so no second Delivery
+                // can exist) and its failure and recovery are recorded as facts. Without this the
+                // queued Run's outage would be silent.
+                let reserved: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM loom_control_dispatch WHERE dedupe_key=?1)",
+                    [&event.dedupe_key],
+                    |row| row.get(0),
+                )?;
+                if !reserved {
+                    continue;
+                }
+            }
             PriorOutcome::Failed => {
                 set_control_blocked_reason(
                     transaction,
@@ -647,6 +720,7 @@ fn event_problem(
     recipient: &str,
     authorization_revision: i64,
     excluding_dispatch_id: Option<&str>,
+    frozen: Option<&FrozenExecution>,
 ) -> Result<Option<&'static str>> {
     // Mission, Plan and Task have to belong together.
     let owning: Option<String> = transaction
@@ -675,9 +749,9 @@ fn event_problem(
     // The recipient's own availability, in the upstream order disabled → offline → harness. It is
     // read from the transaction that is about to decide, never from an earlier reading: an
     // availability change that commits while this pass waits for the write lock is observed here.
-    // The device judged is the one execution will use: the selected remote Node when there is one,
-    // otherwise the local installation.
-    if let Some(reason) = recipient_failure_reason(transaction, &camp_id, recipient)? {
+    // The device judged is the one execution will use: the Run's frozen target when this work was
+    // already handed out, otherwise the selected remote Node, otherwise the local installation.
+    if let Some(reason) = recipient_failure_reason(transaction, &camp_id, recipient, frozen)? {
         return Ok(Some(reason));
     }
 
@@ -1063,10 +1137,9 @@ fn latest_stage_review_id(
         .optional()?)
 }
 
-/// The persisted presence of one recipient: the switch (profile and Camp membership) and the
-/// runtime the Agent is bound to locally. Read from the connection that is about to decide, so the
-/// facts are the ones the write lock ordered.
-struct RecipientPresence {
+/// The persisted switch of one recipient: the Agent profile and its Camp membership. Read from the
+/// connection that is about to decide, so the facts are the ones the write lock ordered.
+struct RecipientSwitch {
     profile_status: String,
     profile_removed: bool,
     profile_archived: bool,
@@ -1074,31 +1147,183 @@ struct RecipientPresence {
     leave_requested: bool,
     /// The Adapter kind the Agent is configured to run, when one is configured at all.
     selected_adapter_kind: Option<String>,
-    /// `(enabled, adapter_kind, path_state)` of the local installation bound to the Agent.
-    installation: Option<(i64, String, String)>,
+    /// The local installation the Agent is bound to right now.
+    installation_id: Option<String>,
 }
 
-/// Why this recipient cannot take a Delivery right now, or `None` when it can.
+/// The device that will actually run one dispatch, as the execution path will see it.
 ///
-/// The order is the upstream one — `disabled`, then `offline`, then `harness` — so the reason
-/// names the *first* fact that makes the recipient unusable instead of whichever fact was cheapest
-/// to read. Each step is asked only when the step above it passed, and an unreadable fact fails
-/// closed into the step it belongs to: nothing here answers "maybe".
+/// A local installation is a launch intent (`enabled`, the Adapter it offers, and — for every
+/// Adapter whose launch reads the disk — a resolvable `path_state`), which is the same fact
+/// `agent_profile::runtime_readiness` and `runtime_dispatch_blocker` read. A remote Node is
+/// presence (paired, unrevoked, heartbeating now) plus the catalog entry it reported for the
+/// selected harness. A stored probe result is *not* part of either: Core starts a Runtime in
+/// `light_ready`, `installed_unverified` or without any snapshot, so a probe would be stricter here
+/// than the launch it feeds.
+enum Device {
+    Local {
+        installation_id: Option<String>,
+        /// The Adapter the work must run, when the Agent named one. `None` asks for no particular
+        /// harness, exactly as upstream's device with no harness requirement.
+        expected_adapter_kind: Option<String>,
+    },
+    Remote {
+        node_id: String,
+        adapter_kind: String,
+    },
+}
+
+/// Why this device cannot take the work right now, in the upstream order: presence first, then the
+/// harness. `None` means it can.
 ///
-/// Presence is the device that will actually run the work, never a probe: a local installation
-/// record carries launch intent (`enabled`, a resolvable `path_state`, the Adapter it offers), which
-/// is the same fact `agent_profile::runtime_readiness` reads, and Core's own admission starts a
-/// Runtime in `light_ready`, `installed_unverified` or without any snapshot. A stored `ready` probe
-/// would be a stricter condition here than the execution path itself, so it is not asked. When the
-/// member selected a remote Node, that Node — not the disabled local placeholder installation — is
-/// the device, and its heartbeat, catalog and harness are judged by
-/// `member_execution_availability::evaluate`.
+/// The order matters: a Node that is also missing its harness is reported as unreachable, never as
+/// a harness problem, because presence is judged before anything the Node reported.
+fn device_failure_reason(connection: &Connection, device: &Device) -> Result<Option<&'static str>> {
+    match device {
+        Device::Local {
+            installation_id,
+            expected_adapter_kind,
+        } => {
+            let Some(installation_id) = installation_id.as_deref() else {
+                return Ok(Some(RECIPIENT_OFFLINE_REASON));
+            };
+            let installation: Option<(i64, String, String)> = connection
+                .query_row(
+                    "SELECT enabled, adapter_kind, path_state FROM adapter_installation
+                     WHERE id=?1",
+                    [installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((enabled, adapter_kind, path_state)) = installation else {
+                return Ok(Some(RECIPIENT_OFFLINE_REASON));
+            };
+            if enabled != 1 {
+                return Ok(Some(RECIPIENT_OFFLINE_REASON));
+            }
+            // A live Command Host is admitted by its installation identity: only the cold branch
+            // resolves the disk entry, exactly as `runtime_dispatch_blocker` splits it.
+            let command_host = adapter_kind == AdapterKind::CommandCodeCli.as_str();
+            if !command_host && path_state != "valid" {
+                return Ok(Some(RECIPIENT_OFFLINE_REASON));
+            }
+            if let Some(expected) = expected_adapter_kind
+                .as_deref()
+                .filter(|kind| !kind.is_empty())
+                && expected != adapter_kind
+            {
+                return Ok(Some(HARNESS_UNAVAILABLE_REASON));
+            }
+            Ok(None)
+        }
+        Device::Remote {
+            node_id,
+            adapter_kind,
+        } => {
+            // Presence: the Node is paired, still trusted, and heartbeating inside the window Core
+            // uses for every other remote decision.
+            let node: Option<(String, Option<String>, Option<String>)> = connection
+                .query_row(
+                    "SELECT role,last_heartbeat,revoked_at FROM execution_node WHERE node_id=?1",
+                    [node_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((role, last_heartbeat, revoked_at)) = node else {
+                return Ok(Some(RECIPIENT_OFFLINE_REASON));
+            };
+            if role != "remote"
+                || revoked_at.is_some()
+                || !crate::execution_node::fresh_heartbeat(
+                    last_heartbeat.as_deref(),
+                    chrono::Utc::now(),
+                )
+            {
+                return Ok(Some(RECIPIENT_OFFLINE_REASON));
+            }
+            // Harness: the Node reports one usable installation of the harness the work needs.
+            match crate::remote_catalog::load_remote_catalog(connection, node_id, adapter_kind) {
+                Ok(_) => Ok(None),
+                Err(error) => Ok(Some(if remote_harness_is_missing(error.code()) {
+                    HARNESS_UNAVAILABLE_REASON
+                } else {
+                    RECIPIENT_OFFLINE_REASON
+                })),
+            }
+        }
+    }
+}
+
+/// The execution target a queued dispatch is already frozen to, when one exists.
+///
+/// A reservation that produced a Delivery and a Run is judged by the device that Run was frozen to,
+/// never by a member setting that changed afterwards: the Run's own target is what the claim and the
+/// Host will honor, so a later switch to another (or offline) device cannot block or reroute it.
+enum FrozenExecution {
+    /// A remote Run frozen to one Node and harness (`agent_run_execution_target`).
+    Remote {
+        agent_run_id: String,
+        node_id: String,
+        adapter_kind: String,
+    },
+    /// A local Run frozen to one installation (`agent_run.runtime_installation_id`).
+    Local {
+        installation_id: String,
+        adapter_kind: Option<String>,
+    },
+}
+
+/// The frozen target of the Run this dispatch already started, or `None` while no Run exists yet.
+fn frozen_execution_of_dispatch(
+    connection: &Connection,
+    dispatch_id: &str,
+) -> Result<Option<FrozenExecution>> {
+    let claimed: Option<(String, Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT run.id, run.runtime_installation_id, run.runtime_adapter_kind
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             JOIN agent_run run ON run.id = delivery.claimed_agent_run_id
+             WHERE dispatch.dispatch_id=?1",
+            [dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((agent_run_id, installation_id, adapter_kind)) = claimed else {
+        return Ok(None);
+    };
+    if crate::remote_execution::authority_table_available(connection, "agent_run_execution_target")?
+        && let Some(frozen) = crate::remote_execution::load_run_target(connection, &agent_run_id)?
+    {
+        return Ok(Some(FrozenExecution::Remote {
+            agent_run_id,
+            node_id: frozen.target.node_id,
+            adapter_kind: frozen.target.adapter_kind,
+        }));
+    }
+    Ok(Some(FrozenExecution::Local {
+        installation_id: installation_id.unwrap_or_default(),
+        adapter_kind,
+    }))
+}
+
+/// Why this recipient cannot take the Delivery right now, or `None` when it can.
+///
+/// The order is the upstream one — `disabled`, then `offline`, then `harness` — so the reason names
+/// the *first* fact that makes the recipient unusable instead of whichever fact was cheapest to
+/// read. Each step is asked only when the step above it passed, and an unreadable fact fails closed
+/// into the step it belongs to: nothing here answers "maybe".
+///
+/// The device judged is the one execution will use: the Run's frozen target when the work was
+/// already handed out (`frozen`), otherwise the member's explicit remote Node or the local
+/// installation the Agent is bound to now.
 fn recipient_failure_reason(
     connection: &Connection,
     camp_id: &str,
     agent_id: &str,
+    frozen: Option<&FrozenExecution>,
 ) -> Result<Option<&'static str>> {
-    let presence: Option<RecipientPresence> = connection
+    let switch: Option<RecipientSwitch> = connection
         .query_row(
             "SELECT profile.profile_status,
                     profile.removed_at IS NOT NULL,
@@ -1106,106 +1331,125 @@ fn recipient_failure_reason(
                     member.status,
                     member.leave_requested_at IS NOT NULL,
                     profile.selected_runtime_adapter_kind,
-                    installation.enabled,
-                    installation.adapter_kind,
-                    installation.path_state
+                    profile.default_runtime_installation_id
              FROM agent_profile profile
              LEFT JOIN camp_member member
                     ON member.camp_id=?1 AND member.agent_id=profile.id
-             LEFT JOIN adapter_installation installation
-                    ON installation.id=profile.default_runtime_installation_id
              WHERE profile.id=?2",
             params![camp_id, agent_id],
             |row| {
-                let enabled: Option<i64> = row.get(6)?;
-                let adapter_kind: Option<String> = row.get(7)?;
-                let path_state: Option<String> = row.get(8)?;
-                let installation = match (enabled, adapter_kind, path_state) {
-                    (Some(enabled), Some(adapter_kind), Some(path_state)) => {
-                        Some((enabled, adapter_kind, path_state))
-                    }
-                    // A half-bound installation is not a reachable runtime.
-                    _ => None,
-                };
-                Ok(RecipientPresence {
+                Ok(RecipientSwitch {
                     profile_status: row.get(0)?,
                     profile_removed: row.get(1)?,
                     profile_archived: row.get(2)?,
                     member_status: row.get(3)?,
                     leave_requested: row.get(4)?,
                     selected_adapter_kind: row.get(5)?,
-                    installation,
+                    installation_id: row.get(6)?,
                 })
             },
         )
         .optional()?;
-    let Some(presence) = presence else {
+    let Some(switch) = switch else {
         // An Agent with no profile at all cannot be asked: that is the switch, not a transient
         // absence, so it is never reported as merely offline.
         return Ok(Some(RECIPIENT_DISABLED_REASON));
     };
 
     // 1. disabled — the recipient is switched off, so nothing below can make it usable.
-    if presence.profile_removed
-        || presence.profile_archived
-        || !matches!(presence.profile_status.as_str(), "present" | "away")
-        || presence.member_status.as_deref() != Some("active")
-        || presence.leave_requested
+    if switch.profile_removed
+        || switch.profile_archived
+        || !matches!(switch.profile_status.as_str(), "present" | "away")
+        || switch.member_status.as_deref() != Some("active")
+        || switch.leave_requested
     {
         return Ok(Some(RECIPIENT_DISABLED_REASON));
     }
 
     // 2. offline — the member stands, but it is not present now, or the device it is bound to
     //    cannot be reached.
-    if presence.profile_status != "present" {
+    if switch.profile_status != "present" {
         return Ok(Some(RECIPIENT_OFFLINE_REASON));
     }
-    if remote_execution_selected(connection, agent_id)? {
-        // The explicit remote choice owns execution: the local installation is only a disabled
-        // placeholder for the Run's foreign key and says nothing about the Node that will run.
-        // `evaluate` is the owner of that eligibility (node role/revocation, prepared workspace,
-        // native catalog, fresh heartbeat), so the same facts decide here.
-        let availability = crate::member_execution_availability::evaluate(
-            connection,
-            agent_id,
-            // Only the local branch reads these, and it is not the branch being judged.
-            None,
-            &RuntimeReadiness {
-                status: RuntimeReadinessStatus::RuntimeNotConfigured,
-                blockers: Vec::new(),
-            },
-        )?;
-        if !availability.can_launch {
-            let code = availability
-                .readiness
-                .blockers
-                .first()
-                .map(|blocker| blocker.code.as_str())
-                .unwrap_or_default();
-            return Ok(Some(if remote_harness_is_missing(code) {
-                HARNESS_UNAVAILABLE_REASON
-            } else {
-                RECIPIENT_OFFLINE_REASON
-            }));
+    match frozen {
+        Some(FrozenExecution::Local {
+            installation_id,
+            adapter_kind,
+        }) => {
+            if let Some(reason) = device_failure_reason(
+                connection,
+                &Device::Local {
+                    installation_id: Some(installation_id.clone()),
+                    expected_adapter_kind: adapter_kind.clone(),
+                },
+            )? {
+                return Ok(Some(reason));
+            }
         }
-    } else {
-        let Some((enabled, adapter_kind, path_state)) = presence.installation else {
-            return Ok(Some(RECIPIENT_OFFLINE_REASON));
-        };
-        if enabled != 1 || path_state != "valid" {
-            return Ok(Some(RECIPIENT_OFFLINE_REASON));
+        Some(FrozenExecution::Remote {
+            agent_run_id,
+            node_id,
+            adapter_kind,
+        }) => {
+            if let Some(reason) = device_failure_reason(
+                connection,
+                &Device::Remote {
+                    node_id: node_id.clone(),
+                    adapter_kind: adapter_kind.clone(),
+                },
+            )? {
+                return Ok(Some(reason));
+            }
+            // The Node is there and offers the harness. The rest of the frozen Run's own admission
+            // (prepared workspace, frozen bundle source, Run/member scope) is the owner's judgement:
+            // an unprovable frozen target is an unusable device, never a harness answer.
+            if crate::remote_execution::revalidate_run_claim(connection, agent_run_id).is_err() {
+                return Ok(Some(RECIPIENT_OFFLINE_REASON));
+            }
         }
-
-        // 3. harness — reachable, but the harness the Agent must run is not the one installed there.
-        //    An Agent with no configured Adapter asks for no particular harness, exactly as an
-        //    upstream device with no harness requirement.
-        if let Some(selected) = presence
-            .selected_adapter_kind
-            .as_deref()
-            .filter(|kind| !kind.is_empty())
-        {
-            if selected != adapter_kind {
-                return Ok(Some(HARNESS_UNAVAILABLE_REASON));
+        None => {
+            let selection = current_remote_selection(connection, agent_id)?;
+            match selection {
+                Some(selection) => {
+                    // The explicit remote choice owns execution: the local installation is only a
+                    // disabled placeholder for the Run's foreign key and says nothing about the
+                    // Node that will run. Presence and harness are judged in the upstream order
+                    // above; what remains (prepared workspace, catalog-backed selection) is the
+                    // remote owner's own eligibility.
+                    if let Some(reason) = device_failure_reason(
+                        connection,
+                        &Device::Remote {
+                            node_id: selection.node_id.clone(),
+                            adapter_kind: selection.adapter_kind.as_str().to_string(),
+                        },
+                    )? {
+                        return Ok(Some(reason));
+                    }
+                    let availability = crate::member_execution_availability::evaluate(
+                        connection,
+                        agent_id,
+                        // Only the local branch reads these, and it is not the branch being judged.
+                        None,
+                        &RuntimeReadiness {
+                            status: RuntimeReadinessStatus::RuntimeNotConfigured,
+                            blockers: Vec::new(),
+                        },
+                    )?;
+                    if !availability.can_launch {
+                        return Ok(Some(RECIPIENT_OFFLINE_REASON));
+                    }
+                }
+                None => {
+                    if let Some(reason) = device_failure_reason(
+                        connection,
+                        &Device::Local {
+                            installation_id: switch.installation_id.clone(),
+                            expected_adapter_kind: switch.selected_adapter_kind.clone(),
+                        },
+                    )? {
+                        return Ok(Some(reason));
+                    }
+                }
             }
         }
     }
@@ -1218,17 +1462,15 @@ fn recipient_failure_reason(
     Ok(None)
 }
 
-/// True when the member's explicit execution choice points at another Node, so the local
-/// installation is not the device that will run the work.
-fn remote_execution_selected(connection: &Connection, agent_id: &str) -> Result<bool> {
+/// The member's explicit remote execution choice, when one is saved.
+fn current_remote_selection(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Option<crate::remote_execution::RemoteMemberSelection>> {
     if !crate::remote_execution::authority_table_available(connection, "member_execution_target")? {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(
-        crate::remote_execution::load_member_target(connection, agent_id)?
-            .selection
-            .is_some(),
-    )
+    Ok(crate::remote_execution::load_member_target(connection, agent_id)?.selection)
 }
 
 /// The catalog codes that mean "this Node has no usable installation of the selected harness"
@@ -1242,6 +1484,7 @@ fn remote_harness_is_missing(code: &str) -> bool {
             | "remote_catalog_identity_malformed"
             | "remote_catalog_generation_out_of_range"
             | "remote_catalog_adapter_ambiguous"
+            | "remote_catalog_target_changed"
     )
 }
 
@@ -1268,6 +1511,43 @@ fn is_recipient_availability_reason(reason: &str) -> bool {
             | RECIPIENT_OFFLINE_REASON
             | HARNESS_UNAVAILABLE_REASON
     )
+}
+
+/// True for the two reasons whose winner is the device rather than the switch: the Member still
+/// stands, so the work can be reserved and wait for the device. Whether the Camp can actually
+/// address that Member is a separate fact (`recipient_is_addressable`), because a Recipient that is
+/// present but away wins the presence step and still has no Delivery lane.
+fn reserves_while_unavailable(reason: &str) -> bool {
+    matches!(
+        reason,
+        RECIPIENT_OFFLINE_REASON | HARNESS_UNAVAILABLE_REASON
+    )
+}
+
+/// Whether the Camp's own addressing contract would accept this Recipient right now.
+///
+/// The exact facts `collaboration::active_address_target` reads: an active Member who has not asked
+/// to leave, with a present profile, in a Camp that still exists. A Delivery can only be created for
+/// such a Member, so this is what makes a reservation possible at all.
+fn recipient_is_addressable(
+    connection: &Connection,
+    camp_id: &str,
+    agent_id: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM camp_member member
+             JOIN camp ON camp.id = member.camp_id
+             JOIN agent_profile profile ON profile.id = member.agent_id
+             WHERE member.camp_id=?1 AND member.agent_id=?2
+               AND member.status='active' AND member.leave_requested_at IS NULL
+               AND profile.profile_status='present'
+               AND camp.deletion_operation_id IS NULL
+         )",
+        params![camp_id, agent_id],
+        |row| row.get(0),
+    )?)
 }
 
 /// The stable identity of one recorded failure, keyed exactly like upstream's
