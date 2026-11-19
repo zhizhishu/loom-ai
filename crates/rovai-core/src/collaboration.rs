@@ -3203,6 +3203,11 @@ impl CollaborationService {
                         "threadMessageId": camp_message_id,
                         "sequence": queued.camp_sequence,
                         "deliveryIds": queued.delivery_ids,
+                        // The same routing explanation the send fact carries, so the
+                        // caller can say who was called and why.
+                        "addressSource": resolution.source(),
+                        "addressRoute": resolution.route_label(),
+                        "addressedAgentIds": resolution.agent_ids(),
                     });
                     let entity = Some(EntityReference {
                         entity_type: "camp_message".to_string(),
@@ -4229,11 +4234,17 @@ struct ThreadMessageSubmission {
     generated_camp_name: String,
 }
 
-#[derive(Debug, Clone)]
-enum ThreadMessageAddress {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThreadMessageAddress {
+    /// No member was named, so the Default Lead answers.
     Default,
+    /// Named members, in mention order.
     Explicit { agent_ids: Vec<String> },
+    /// The all-members alias: every active member except the sender.
     Broadcast,
+    /// Nobody is called. An Agent-authored send that addresses no Agent is
+    /// public context only, which is Mikka's `observe` with no responders.
+    PublicOnly,
 }
 
 impl ThreadMessageAddress {
@@ -4242,6 +4253,7 @@ impl ThreadMessageAddress {
             Self::Default => "default",
             Self::Explicit { .. } => "explicit",
             Self::Broadcast => "broadcast",
+            Self::PublicOnly => "public_only",
         }
     }
 }
@@ -4763,7 +4775,8 @@ fn queue_camp_message_and_runs(
         input.execution_epoch,
         &json!({
             "sequence": camp_sequence,
-            "addressSource": input.resolution.source,
+            "addressSource": input.resolution.source(),
+            "addressRoute": input.resolution.route_label(),
             "addressedAgentIds": addressed_agent_ids,
             "deliveryIds": delivery_ids,
         }),
@@ -4832,10 +4845,134 @@ fn ensure_resolution_conversations(
     Ok(created)
 }
 
+/// Why a message wakes the members it wakes.
+///
+/// This is the product's whole routing vocabulary, copied from Mikka, which
+/// decides who answers a group message once, before any Agent wakes, so no
+/// Agent has to judge for itself whether to speak.
+///
+/// - `Mention`: an `@` mention restricts eligible responders (mention order).
+/// - `Lead`: without a mention the Lead answers.
+/// - `Broadcast`: the message calls for every active member.
+/// - `Observe`: nobody is woken; the message is group context only.
+///
+/// upstream: Mikka d59c85cb lib/coordinator/group-routing.ts:GroupRoute
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressRoute {
+    Mention,
+    Lead,
+    Broadcast,
+    Observe,
+}
+
+impl AddressRoute {
+    /// Mikka's `GroupRoute.by`, recorded as `addressRoute` on the send fact.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Lead => "lead",
+            Self::Broadcast => "broadcast",
+            Self::Observe => "observe",
+        }
+    }
+
+    /// The `addressSource` literal this route has always published.
+    fn source(self) -> &'static str {
+        match self {
+            Self::Mention => "explicit",
+            Self::Lead => "default_lead",
+            Self::Broadcast => "broadcast",
+            Self::Observe => "public_only",
+        }
+    }
+}
+
 #[derive(Debug)]
-struct AddressResolution {
-    source: &'static str,
+pub(crate) struct AddressResolution {
+    route: AddressRoute,
     targets: Vec<AddressTarget>,
+}
+
+impl AddressResolution {
+    /// Mikka's `GroupRoute.by`, recorded as `addressRoute` on the send fact.
+    pub(crate) fn route_label(&self) -> &'static str {
+        self.route.as_str()
+    }
+
+    /// The `addressSource` literal this route has always published.
+    pub(crate) fn source(&self) -> &'static str {
+        self.route.source()
+    }
+
+    pub(crate) fn agent_ids(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .map(|target| target.agent_id.clone())
+            .collect()
+    }
+}
+
+/// Why one candidate target was refused. Both send lanes map these onto their
+/// own receipts, so there is one rule and two presentations.
+///
+/// upstream: Mikka d59c85cb lib/coordinator/group-routing.ts:UnknownMentionError
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressRejectionReason {
+    EmptyMention,
+    SelfTarget,
+    NotActiveMember,
+    DefaultLeadUnavailable,
+}
+
+impl AddressRejectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyMention => "empty_mention",
+            Self::SelfTarget => "self_target",
+            Self::NotActiveMember => "not_active_member",
+            Self::DefaultLeadUnavailable => "default_lead_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AddressOffender {
+    agent_id: String,
+    reason: AddressRejectionReason,
+}
+
+impl AddressOffender {
+    pub(crate) fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub(crate) fn reason(&self) -> AddressRejectionReason {
+        self.reason
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AddressRejection {
+    reason: AddressRejectionReason,
+    offenders: Vec<AddressOffender>,
+}
+
+impl AddressRejection {
+    pub(crate) fn offenders(&self) -> &[AddressOffender] {
+        &self.offenders
+    }
+
+    fn details(&self) -> Vec<serde_json::Value> {
+        self.offenders
+            .iter()
+            .map(|offender| {
+                json!({
+                    "agentId": offender.agent_id,
+                    "reason": offender.reason.as_str(),
+                })
+            })
+            .collect()
+    }
 }
 
 enum AddressingOutcome {
@@ -4843,14 +4980,32 @@ enum AddressingOutcome {
     Rejected(CommandHandlerResult),
 }
 
-// upstream: Mikka d59c85cb lib/coordinator/group-routing.ts:mentionRoute, lib/coordinator/route-group.ts:routeGroupMessage
-fn resolve_address(
+/// The single group-chat router: which members one Thread message wakes, in
+/// what order, and why.
+///
+/// The frame is fixed here (who may be picked, and the answer's shape); the
+/// pick itself is never re-derived by a second code path. Mentioning a member
+/// who is not in the group is an error, not something to ignore, and a member
+/// never addresses itself.
+///
+/// upstream: Mikka d59c85cb lib/coordinator/group-routing.ts:mentionRoute
+/// upstream: Mikka d59c85cb lib/coordinator/route-group.ts:routeGroupMessage
+pub(crate) fn resolve_group_address(
     transaction: &Connection,
     camp_id: &str,
     address: &ThreadMessageAddress,
     actor: &ActorRef,
-) -> Result<AddressingOutcome> {
+) -> Result<std::result::Result<AddressResolution, AddressRejection>> {
+    let sender_agent_id = match actor {
+        ActorRef::Agent { agent_id, .. } => Some(agent_id.as_str()),
+        _ => None,
+    };
     match address {
+        // Mikka's `observe`: the message is group context and no Agent wakes.
+        ThreadMessageAddress::PublicOnly => Ok(Ok(AddressResolution {
+            route: AddressRoute::Observe,
+            targets: Vec::new(),
+        })),
         ThreadMessageAddress::Default => {
             let default_lead = transaction.query_row(
                 "SELECT default_lead_agent_id FROM camp WHERE id = ?1",
@@ -4860,58 +5015,72 @@ fn resolve_address(
             let active_count = active_member_count(transaction, camp_id)?;
             let Some(default_lead) = default_lead else {
                 if active_count == 0 {
-                    return Ok(AddressingOutcome::Resolved(AddressResolution {
-                        source: "default_lead",
+                    return Ok(Ok(AddressResolution {
+                        route: AddressRoute::Lead,
                         targets: Vec::new(),
                     }));
                 }
-                return Ok(AddressingOutcome::Rejected(rejected(
-                    "camp.default_lead_invariant",
-                    "Thread has active members but no valid Default Lead",
-                )));
+                return Ok(Err(AddressRejection {
+                    reason: AddressRejectionReason::DefaultLeadUnavailable,
+                    offenders: Vec::new(),
+                }));
             };
             let Some(target) = active_address_target(transaction, camp_id, &default_lead)? else {
-                return Ok(AddressingOutcome::Rejected(rejected(
-                    "camp.default_lead_invariant",
-                    "Default Lead is not an active addressable member",
-                )));
+                return Ok(Err(AddressRejection {
+                    reason: AddressRejectionReason::DefaultLeadUnavailable,
+                    offenders: vec![AddressOffender {
+                        agent_id: default_lead,
+                        reason: AddressRejectionReason::DefaultLeadUnavailable,
+                    }],
+                }));
             };
-            Ok(AddressingOutcome::Resolved(AddressResolution {
-                source: "default_lead",
+            Ok(Ok(AddressResolution {
+                route: AddressRoute::Lead,
                 targets: vec![target],
             }))
         }
         ThreadMessageAddress::Explicit { agent_ids } => {
             if agent_ids.is_empty() {
-                return Ok(AddressingOutcome::Rejected(rejected(
-                    "camp_message.empty_explicit_address",
-                    "Explicit address requires at least one Agent",
-                )));
+                return Ok(Err(AddressRejection {
+                    reason: AddressRejectionReason::EmptyMention,
+                    offenders: Vec::new(),
+                }));
             }
             let mut seen = HashSet::new();
             let mut targets = Vec::new();
+            let mut offenders = Vec::new();
             for agent_id in agent_ids {
                 if !seen.insert(agent_id) {
                     continue;
                 }
+                if sender_agent_id == Some(agent_id.as_str()) {
+                    offenders.push(AddressOffender {
+                        agent_id: agent_id.clone(),
+                        reason: AddressRejectionReason::SelfTarget,
+                    });
+                    continue;
+                }
                 let Some(target) = active_address_target(transaction, camp_id, agent_id)? else {
-                    return Ok(AddressingOutcome::Rejected(rejected(
-                        "camp_message.invalid_explicit_target",
-                        "Every explicit target must be an active Thread member",
-                    )));
+                    offenders.push(AddressOffender {
+                        agent_id: agent_id.clone(),
+                        reason: AddressRejectionReason::NotActiveMember,
+                    });
+                    continue;
                 };
                 targets.push(target);
             }
-            Ok(AddressingOutcome::Resolved(AddressResolution {
-                source: "explicit",
+            if !offenders.is_empty() {
+                return Ok(Err(AddressRejection {
+                    reason: offenders[0].reason,
+                    offenders,
+                }));
+            }
+            Ok(Ok(AddressResolution {
+                route: AddressRoute::Mention,
                 targets,
             }))
         }
         ThreadMessageAddress::Broadcast => {
-            let sender_agent_id = match actor {
-                ActorRef::Agent { agent_id, .. } => Some(agent_id.as_str()),
-                _ => None,
-            };
             let mut statement = transaction.prepare(
                 r#"
                 SELECT camp_member.agent_id, conversation.id
@@ -4942,14 +5111,56 @@ fn resolve_address(
                 }
                 targets.push(target);
             }
-            Ok(AddressingOutcome::Resolved(AddressResolution {
-                source: "broadcast",
+            Ok(Ok(AddressResolution {
+                route: AddressRoute::Broadcast,
                 targets,
             }))
         }
     }
 }
 
+/// The command-receipt presentation of the one router above.
+fn resolve_address(
+    transaction: &Connection,
+    camp_id: &str,
+    address: &ThreadMessageAddress,
+    actor: &ActorRef,
+) -> Result<AddressingOutcome> {
+    Ok(
+        match resolve_group_address(transaction, camp_id, address, actor)? {
+            Ok(resolution) => AddressingOutcome::Resolved(resolution),
+            Err(rejection) => {
+                let (code, message) = match rejection.reason {
+                    AddressRejectionReason::EmptyMention => (
+                        "camp_message.empty_explicit_address",
+                        "Explicit address requires at least one Agent",
+                    ),
+                    AddressRejectionReason::DefaultLeadUnavailable => (
+                        "camp.default_lead_invariant",
+                        "Thread has active members but no valid Default Lead",
+                    ),
+                    AddressRejectionReason::SelfTarget
+                    | AddressRejectionReason::NotActiveMember => (
+                        "camp_message.invalid_explicit_target",
+                        "Every explicit target must be an active Thread member",
+                    ),
+                };
+                AddressingOutcome::Rejected(CommandHandlerResult::rejected(
+                    code,
+                    json!({
+                        "message": message,
+                        "addressRejections": rejection.details(),
+                    }),
+                ))
+            }
+        },
+    )
+}
+
+/// The members a route may pick from: the group's own roster, not the owner's
+/// private Agents.
+///
+/// upstream: Mikka d59c85cb lib/coordinator/group-turns.ts:currentMembers
 fn active_member_count(transaction: &Connection, camp_id: &str) -> Result<i64> {
     transaction
         .query_row(
@@ -4968,6 +5179,10 @@ fn active_member_count(transaction: &Connection, camp_id: &str) -> Result<i64> {
         .context("failed to count active Thread members")
 }
 
+/// One addressable member, or nothing when it is absent, not present in the
+/// roster, or on its way out.
+///
+/// upstream: Mikka d59c85cb lib/coordinator/group-turns.ts:currentMembers
 fn active_address_target(
     transaction: &Connection,
     camp_id: &str,
@@ -7135,6 +7350,322 @@ mod task_description_tests {
             synthesize_task_description("已有范围", &["第一项".to_string(), "第二项".to_string()]),
             "已有范围\n\n补充要求：\n- 第一项\n- 第二项"
         );
+    }
+}
+
+/// The group-chat router rules, as the upstream suite states them.
+///
+/// upstream: Mikka d59c85cb lib/coordinator/group-routing.test.ts
+/// upstream: Mikka d59c85cb lib/coordinator/group-turns.test.ts
+///
+/// Cases with no counterpart here are deliberately absent: this build has no
+/// decision model (so `routingInput`/correction examples have no reader) and no
+/// corrections table, which T19 routing corrections would need.
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    struct Fixture {
+        connection: Connection,
+    }
+
+    impl Fixture {
+        fn new(default_lead: Option<&str>) -> Self {
+            let connection = Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE camp(id TEXT PRIMARY KEY, default_lead_agent_id TEXT);
+                    CREATE TABLE camp_member(
+                        camp_id TEXT, agent_id TEXT, status TEXT,
+                        leave_requested_at TEXT, joined_at TEXT
+                    );
+                    CREATE TABLE agent_profile(
+                        id TEXT PRIMARY KEY, profile_status TEXT, display_name TEXT
+                    );
+                    CREATE TABLE conversation(id TEXT PRIMARY KEY, camp_id TEXT, agent_id TEXT);
+                    "#,
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO camp(id, default_lead_agent_id) VALUES ('camp', ?1)",
+                    [default_lead],
+                )
+                .unwrap();
+            for (index, (agent_id, joined_at)) in [
+                ("lead", "2026-01-01"),
+                ("ui", "2026-01-02"),
+                ("infra", "2026-01-03"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                connection
+                    .execute(
+                        "INSERT INTO camp_member VALUES ('camp', ?1, 'active', NULL, ?2)",
+                        params![agent_id, joined_at],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO agent_profile VALUES (?1, 'present', ?1)",
+                        [agent_id],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO conversation VALUES (?1, 'camp', ?2)",
+                        params![format!("conversation_{index}"), agent_id],
+                    )
+                    .unwrap();
+            }
+            Self { connection }
+        }
+
+        fn member(&self, agent_id: &str, status: &str, profile_status: &str) {
+            self.connection
+                .execute(
+                    "INSERT INTO camp_member VALUES ('camp', ?1, ?2, NULL, '2026-01-04')",
+                    params![agent_id, status],
+                )
+                .unwrap();
+            self.connection
+                .execute(
+                    "INSERT INTO agent_profile VALUES (?1, ?2, ?1)",
+                    params![agent_id, profile_status],
+                )
+                .unwrap();
+        }
+
+        fn resolve(
+            &self,
+            address: ThreadMessageAddress,
+            actor: &ActorRef,
+        ) -> std::result::Result<AddressResolution, AddressRejection> {
+            resolve_group_address(&self.connection, "camp", &address, actor).unwrap()
+        }
+
+        fn user(&self) -> ActorRef {
+            ActorRef::User {
+                user_id: "user_1".to_string(),
+            }
+        }
+
+        fn agent(&self, agent_id: &str) -> ActorRef {
+            ActorRef::Agent {
+                agent_id: agent_id.to_string(),
+                source_agent_run_id: "run_1".to_string(),
+            }
+        }
+    }
+
+    fn agent_ids(resolution: &AddressResolution) -> Vec<&str> {
+        resolution
+            .targets
+            .iter()
+            .map(|target| target.agent_id.as_str())
+            .collect()
+    }
+
+    // "an @mention goes straight to that agent, in mention order"
+    #[test]
+    fn mention_route_wakes_mentioned_members_in_mention_order() {
+        let fixture = Fixture::new(Some("lead"));
+        let resolution = fixture
+            .resolve(
+                ThreadMessageAddress::Explicit {
+                    agent_ids: vec!["ui".to_string(), "infra".to_string(), "ui".to_string()],
+                },
+                &fixture.user(),
+            )
+            .unwrap();
+        assert_eq!(agent_ids(&resolution), vec!["ui", "infra"]);
+        assert_eq!(resolution.route_label(), "mention");
+        assert_eq!(resolution.source(), "explicit");
+    }
+
+    // "mentioning a non-member is an error"
+    #[test]
+    fn mentioning_a_non_member_is_an_error() {
+        let fixture = Fixture::new(Some("lead"));
+        fixture.member("departed", "left", "present");
+        let rejection = fixture
+            .resolve(
+                ThreadMessageAddress::Explicit {
+                    agent_ids: vec!["ui".to_string(), "departed".to_string()],
+                },
+                &fixture.user(),
+            )
+            .err()
+            .expect("a departed member cannot be addressed");
+        assert_eq!(
+            rejection
+                .offenders()
+                .iter()
+                .map(|offender| (offender.agent_id(), offender.reason()))
+                .collect::<Vec<_>>(),
+            vec![("departed", AddressRejectionReason::NotActiveMember)]
+        );
+        // The command receipt names the reason, so a wrong route is explainable.
+        let AddressingOutcome::Rejected(receipt) = resolve_address(
+            &fixture.connection,
+            "camp",
+            &ThreadMessageAddress::Explicit {
+                agent_ids: vec!["departed".to_string()],
+            },
+            &fixture.user(),
+        )
+        .unwrap() else {
+            panic!("a departed member must be rejected");
+        };
+        assert_eq!(receipt.code, "camp_message.invalid_explicit_target");
+        assert_eq!(
+            receipt.payload["addressRejections"],
+            json!([{ "agentId": "departed", "reason": "not_active_member" }])
+        );
+    }
+
+    #[test]
+    fn a_present_member_without_a_profile_is_not_addressable() {
+        let fixture = Fixture::new(Some("lead"));
+        fixture.member("hidden", "active", "hidden");
+        let rejection = fixture
+            .resolve(
+                ThreadMessageAddress::Explicit {
+                    agent_ids: vec!["hidden".to_string()],
+                },
+                &fixture.user(),
+            )
+            .err()
+            .expect("an absent profile is not addressable");
+        assert_eq!(
+            rejection.offenders()[0].reason(),
+            AddressRejectionReason::NotActiveMember
+        );
+    }
+
+    // Mikka's `by: 'lead'`: without a mention the Lead answers.
+    #[test]
+    fn no_mention_wakes_the_default_lead() {
+        let fixture = Fixture::new(Some("infra"));
+        let resolution = fixture
+            .resolve(ThreadMessageAddress::Default, &fixture.user())
+            .unwrap();
+        assert_eq!(agent_ids(&resolution), vec!["infra"]);
+        assert_eq!(resolution.route_label(), "lead");
+        assert_eq!(resolution.source(), "default_lead");
+    }
+
+    // Mikka throws while resolving when the Lead is gone; LOOM refuses the send.
+    #[test]
+    fn active_members_without_a_lead_are_refused() {
+        let fixture = Fixture::new(None);
+        let rejection = fixture
+            .resolve(ThreadMessageAddress::Default, &fixture.user())
+            .err()
+            .expect("no Lead means no route");
+        assert_eq!(
+            rejection.reason,
+            AddressRejectionReason::DefaultLeadUnavailable
+        );
+        let AddressingOutcome::Rejected(receipt) = resolve_address(
+            &fixture.connection,
+            "camp",
+            &ThreadMessageAddress::Default,
+            &fixture.user(),
+        )
+        .unwrap() else {
+            panic!("a Thread with members and no Lead must be rejected");
+        };
+        assert_eq!(receipt.code, "camp.default_lead_invariant");
+    }
+
+    #[test]
+    fn a_thread_without_members_has_nothing_to_wake() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE camp(id TEXT PRIMARY KEY, default_lead_agent_id TEXT);
+                CREATE TABLE camp_member(
+                    camp_id TEXT, agent_id TEXT, status TEXT,
+                    leave_requested_at TEXT, joined_at TEXT
+                );
+                CREATE TABLE agent_profile(
+                    id TEXT PRIMARY KEY, profile_status TEXT, display_name TEXT
+                );
+                CREATE TABLE conversation(id TEXT PRIMARY KEY, camp_id TEXT, agent_id TEXT);
+                INSERT INTO camp VALUES ('camp', NULL);
+                "#,
+            )
+            .unwrap();
+        let resolution = resolve_group_address(
+            &connection,
+            "camp",
+            &ThreadMessageAddress::Default,
+            &ActorRef::User {
+                user_id: "user_1".to_string(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(resolution.targets.is_empty());
+        assert_eq!(resolution.route_label(), "lead");
+    }
+
+    // Mikka's `audience: 'everyone'`: the message calls for every active member.
+    #[test]
+    fn broadcast_wakes_every_active_member_except_the_sender() {
+        let fixture = Fixture::new(Some("lead"));
+        fixture.member("departed", "left", "present");
+        let resolution = fixture
+            .resolve(ThreadMessageAddress::Broadcast, &fixture.agent("ui"))
+            .unwrap();
+        assert_eq!(agent_ids(&resolution), vec!["lead", "infra"]);
+        assert_eq!(resolution.route_label(), "broadcast");
+    }
+
+    // A member never wakes itself: the sender is refused, not silently dropped.
+    #[test]
+    fn a_member_never_addresses_itself() {
+        let fixture = Fixture::new(Some("lead"));
+        let rejection = fixture
+            .resolve(
+                ThreadMessageAddress::Explicit {
+                    agent_ids: vec!["ui".to_string(), "infra".to_string()],
+                },
+                &fixture.agent("ui"),
+            )
+            .err()
+            .expect("self addressing is refused");
+        assert_eq!(rejection.reason, AddressRejectionReason::SelfTarget);
+        assert_eq!(rejection.offenders()[0].agent_id(), "ui");
+    }
+
+    // Mikka's `observe` with no responders: the message is context only.
+    #[test]
+    fn public_only_wakes_nobody() {
+        let fixture = Fixture::new(Some("lead"));
+        let resolution = fixture
+            .resolve(ThreadMessageAddress::PublicOnly, &fixture.agent("ui"))
+            .unwrap();
+        assert!(resolution.targets.is_empty());
+        assert_eq!(resolution.route_label(), "observe");
+        assert_eq!(resolution.source(), "public_only");
+    }
+
+    #[test]
+    fn empty_explicit_address_is_refused_instead_of_falling_back() {
+        let fixture = Fixture::new(Some("lead"));
+        let rejection = fixture
+            .resolve(
+                ThreadMessageAddress::Explicit { agent_ids: vec![] },
+                &fixture.user(),
+            )
+            .err()
+            .expect("an empty mention list is not a Lead route");
+        assert_eq!(rejection.reason, AddressRejectionReason::EmptyMention);
     }
 }
 
