@@ -24,8 +24,10 @@ on:
       - scripts/fixtures/loom-*/**
       - scripts/package-embedded-pi.mjs
       - scripts/package-dsh-hook-executor.mjs
+      - scripts/package-dsh-runtime.mjs
       - scripts/accept-local-hook-executor.mjs
       - resources/dsh-hook-executor/**
+      - resources/dsh-runtime/**
       - scripts/runtime/pi-source/**
       - scripts/start-loom-personal.cmd
       - scripts/install-loom-personal.cmd
@@ -304,6 +306,20 @@ jobs:
             throw 'Bundled Hook executor checks did not all execute'
           }
 
+      - name: Stage clean official DSH 0.2.0-rc.2 from the committed lock
+        shell: pwsh
+        run: |
+          node scripts/package-dsh-runtime.mjs --destination resources/runtime/dsh
+          if ($LASTEXITCODE -ne 0) { throw 'Official DSH 0.2 complete package failed to stage' }
+          node scripts/package-dsh-runtime.mjs --verify --destination resources/runtime/dsh
+          if ($LASTEXITCODE -ne 0) { throw 'Official DSH runtime manifest verification failed' }
+          $dsh = Get-Content resources/runtime/dsh/dsh-runtime-bundle.json -Raw | ConvertFrom-Json
+          if ($dsh.rootVersion -ne '0.2.0-rc.2' -or !$dsh.closureComplete -or
+              $dsh.files.Count -lt 100 -or $dsh.packages.Count -lt 1 -or
+              $dsh.installScripts -ne $false) {
+            throw 'DSH official runtime did not prove its complete exact-version closure'
+          }
+
       - name: Test real guarded Pi + official Host + production Web Electron (E3 only)
         shell: pwsh
         run: |
@@ -393,6 +409,12 @@ jobs:
           Copy-Item skills (Join-Path $kit 'skills') -Recurse
           New-Item -ItemType Directory -Path (Join-Path $kit 'runtime') | Out-Null
           Copy-Item resources/runtime/pi (Join-Path $kit 'runtime/pi') -Recurse
+          Copy-Item resources/runtime/dsh (Join-Path $kit 'runtime/dsh') -Recurse
+          node scripts/package-dsh-runtime.mjs --verify --destination (Join-Path $kit 'runtime/dsh')
+          if ($LASTEXITCODE -ne 0) { throw 'Copied official DSH 0.2 runtime verification failed' }
+          $dshManifestPath = Join-Path $kit 'runtime/dsh/dsh-runtime-bundle.json'
+          $dshBundle = Get-Content -LiteralPath $dshManifestPath -Raw | ConvertFrom-Json
+          $dshManifestSha = (Get-FileHash -LiteralPath $dshManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
           Copy-Item resources/runtime/dsh-hook-executor (Join-Path $kit 'runtime/dsh-hook-executor') -Recurse
           node scripts/package-dsh-hook-executor.mjs --verify --destination (Join-Path $kit 'runtime/dsh-hook-executor')
           if ($LASTEXITCODE -ne 0) { throw 'Copied candidate DSH Hook executor failed verification' }
@@ -445,6 +467,7 @@ jobs:
             dailyDataIncluded = $false
             computerRuntime = [ordered]@{ python = $computerBundle.pythonVersion; pillow = $computerBundle.pillowVersion }
             dshHookExecutor = [ordered]@{ dshVersion = $hookBundle.dshVersion; manifestSha256 = $hookManifestSha; treeSha256 = $hookBundle.treeSha256; lockSha256 = $hookBundle.lockSha256; packageCount = $hookBundle.packages.Count }
+            dshRuntime = [ordered]@{ rootVersion = $dshBundle.rootVersion; manifestSha256 = $dshManifestSha; treeSha256 = $dshBundle.treeSha256; lockSha256 = $dshBundle.lockSha256; packageCount = $dshBundle.packages.Count }
             embeddedPiVersion = '0.85.1'
             optionalPiPurgeVersion = '0.3.0'
             piPurgeDefaultEnabled = $false

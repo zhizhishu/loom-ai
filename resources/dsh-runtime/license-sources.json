@@ -1,0 +1,279 @@
+{
+  "schemaVersion": 1,
+  "entries": [
+    {
+      "package": "@earendil-works/pi-ai",
+      "version": "0.85.1",
+      "license": "MIT",
+      "file": "licenses/earendil-works-pi-d981de1229ef.txt",
+      "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/earendil-works/pi/d981de1229ef899957bbe968bc8dcda02a21f477/LICENSE",
+        "commit": "d981de1229ef899957bbe968bc8dcda02a21f477",
+        "packageIntegrity": "sha512-+VgVIJDkDO2efYJKEEqvPTH4zmnIaXdAppGbO+vKFA9qy5PdhFiAenuFAkU+oiCSfOC4dMHDyrjdQeL4ZoC5CQ=="
+      }
+    },
+    {
+      "package": "@earendil-works/pi-telemetry",
+      "version": "0.85.1",
+      "license": "MIT",
+      "file": "licenses/earendil-works-pi-d981de1229ef.txt",
+      "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/earendil-works/pi/d981de1229ef899957bbe968bc8dcda02a21f477/LICENSE",
+        "commit": "d981de1229ef899957bbe968bc8dcda02a21f477",
+        "packageIntegrity": "sha512-Bg/YN6kA7Swja/NQxka8xFdecb4E/auIEGF2G5A25EaQXhRnPj300/7/KpgsDDMYUzHTDAv4RyUxaQPJKW81Rw=="
+      }
+    },
+    {
+      "package": "@xterm/headless",
+      "version": "6.0.0",
+      "license": "MIT",
+      "file": "licenses/xtermjs-xterm.js-f447274f430f.txt",
+      "sha256": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/xtermjs/xterm.js/f447274f430fd22513f6adbf9862d19524471c04/LICENSE",
+        "commit": "f447274f430fd22513f6adbf9862d19524471c04",
+        "packageIntegrity": "sha512-5Yj1QINYCyzrZtf8OFIHi47iQtI+0qYFPHmouEfG8dHNxbZ9Tb9YGSuLcsEwj9Z+OL75GJqPyJbyoFer80a2Hw=="
+      }
+    },
+    {
+      "package": "data-uri-to-buffer",
+      "version": "4.0.1",
+      "license": "MIT",
+      "file": "licenses/data-uri-to-buffer-4.0.1.txt",
+      "sha256": "3072ef4a004c4f92b37eae61cdc3e27225c0a7d2f5e144700e40b9c5a5a7a9b9",
+      "source": {
+        "kind": "published-package-readme",
+        "package": "data-uri-to-buffer",
+        "version": "4.0.1",
+        "integrity": "sha512-0R9ikRb668HB7QDxT1vkpuUBtqc53YyAwMwGeUFKRojY/NWKvdZ+9UYtRfGmhqNbRkTSVpMbmyhXipFFv2cb/A==",
+        "path": "node_modules/data-uri-to-buffer/README.md"
+      }
+    },
+    {
+      "package": "standardwebhooks",
+      "version": "1.3.0",
+      "license": "MIT",
+      "file": "licenses/standard-webhooks-standard-webhooks-daee8284cfe9.txt",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/standard-webhooks/standard-webhooks/daee8284cfe9d4e435ec16e3e68a8f30084d6aaf/LICENSE",
+        "commit": "daee8284cfe9d4e435ec16e3e68a8f30084d6aaf",
+        "packageIntegrity": "sha512-5W9skHjqAm2dlA9wWvglTP+oX47JX4lFXVk1aJV7+TG1snvTR4QXaVgPscEzvOw9GRreeavMwbqEeL+MGhZHCg==",
+        "sourceLicense": "Apache-2.0",
+        "note": "Published package metadata declares MIT; the same published source revision supplies Apache-2.0. Both declarations are preserved."
+      }
+    },
+    {
+      "package": "@aws-sdk/credential-provider-http",
+      "version": "3.972.86",
+      "license": "Apache-2.0",
+      "file": "licenses/aws-sdk-js-v3-3.981.0.txt",
+      "sha256": "edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d",
+      "source": {
+        "kind": "same-project-published-license",
+        "package": "@aws-sdk/core",
+        "version": "3.981.0",
+        "integrity": "sha512-Mnu7gaDrC5UCdyH8uLxLfB2eWbjE/HbjKX1U1J2VQxG3TTATUDObW2wU3I8iH3e9YH5NN2CY6w1mlAIe2XJ3jg==",
+        "path": "node_modules/@aws-sdk/core/LICENSE",
+        "repository": "https://github.com/aws/aws-sdk-js-v3"
+      }
+    },
+    {
+      "package": "@aws-sdk/credential-provider-login",
+      "version": "3.972.92",
+      "license": "Apache-2.0",
+      "file": "licenses/aws-sdk-js-v3-3.981.0.txt",
+      "sha256": "edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d",
+      "source": {
+        "kind": "same-project-published-license",
+        "package": "@aws-sdk/core",
+        "version": "3.981.0",
+        "integrity": "sha512-Mnu7gaDrC5UCdyH8uLxLfB2eWbjE/HbjKX1U1J2VQxG3TTATUDObW2wU3I8iH3e9YH5NN2CY6w1mlAIe2XJ3jg==",
+        "path": "node_modules/@aws-sdk/core/LICENSE",
+        "repository": "https://github.com/aws/aws-sdk-js-v3"
+      }
+    },
+    {
+      "package": "@aws-sdk/nested-clients",
+      "version": "3.998.3",
+      "license": "Apache-2.0",
+      "file": "licenses/aws-sdk-js-v3-3.981.0.txt",
+      "sha256": "edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d",
+      "source": {
+        "kind": "same-project-published-license",
+        "package": "@aws-sdk/core",
+        "version": "3.981.0",
+        "integrity": "sha512-Mnu7gaDrC5UCdyH8uLxLfB2eWbjE/HbjKX1U1J2VQxG3TTATUDObW2wU3I8iH3e9YH5NN2CY6w1mlAIe2XJ3jg==",
+        "path": "node_modules/@aws-sdk/core/LICENSE",
+        "repository": "https://github.com/aws/aws-sdk-js-v3"
+      }
+    },
+    {
+      "package": "@earendil-works/pi-ai",
+      "version": "0.87.1",
+      "license": "MIT",
+      "file": "licenses/earendil-works-pi-f07218c4.txt",
+      "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/earendil-works/pi/f07218c4d4bbc12bef056a7058c3dd49dfe41abe/LICENSE",
+        "commit": "f07218c4d4bbc12bef056a7058c3dd49dfe41abe",
+        "registryIntegrity": "sha512-X/3PfQBnnoeVdO9Cv8zHghUMglzlgNZYGNzoPnbRoGnHl3Rw3TlA2UKSUB7BRHUOxMryHXYa8dnjWZlbRheDZA=="
+      }
+    },
+    {
+      "package": "@earendil-works/pi-telemetry",
+      "version": "0.87.1",
+      "license": "MIT",
+      "file": "licenses/earendil-works-pi-f07218c4.txt",
+      "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/earendil-works/pi/f07218c4d4bbc12bef056a7058c3dd49dfe41abe/LICENSE",
+        "commit": "f07218c4d4bbc12bef056a7058c3dd49dfe41abe",
+        "registryIntegrity": "sha512-MC6TRQH5lgMXpcN+Vku2WMI2T8BsiUPzMQHGo81uqFZD3/9O79WWJAysEDGuzduP6R4tvtgwMLwmqIxynM10JQ=="
+      }
+    },
+    {
+      "package": "@xterm/addon-serialize",
+      "version": "0.14.0",
+      "license": "MIT",
+      "file": "licenses/xtermjs-xterm-f447274f.txt",
+      "sha256": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/xtermjs/xterm.js/f447274f430fd22513f6adbf9862d19524471c04/LICENSE",
+        "commit": "f447274f430fd22513f6adbf9862d19524471c04",
+        "registryIntegrity": "sha512-uteyTU1EkrQa2Ux6P/uFl2fzmXI46jy5uoQMKEOM0fKTyiW7cSn0WrFenHm5vO5uEXX/GpwW/FgILvv3r0WbkA=="
+      }
+    },
+    {
+      "package": "saxes",
+      "version": "6.0.0",
+      "license": "ISC",
+      "file": "licenses/saxes-211fa0eb.txt",
+      "sha256": "0fac2374380621b22e6b50451057721a9c52935b02d16d106a9f04897f061d0e",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/lddubeau/saxes/211fa0ebec9b628affc09219199639887174bfc3/LICENSE",
+        "commit": "211fa0ebec9b628affc09219199639887174bfc3",
+        "registryIntegrity": "sha512-xAg7SOnEhrm5zI3puOOKyy1OMcMlIJZYNJY7xLBwSze0UjhPLnWfj2GF2EpT0jmzaJKIWKHLsaSSajf35bcYnA=="
+      }
+    },
+    {
+      "package": "sherpa-onnx-node",
+      "version": "1.13.8",
+      "license": "Apache-2.0",
+      "file": "licenses/sherpa-onnx-11afbd00.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/csukuangfj/sherpa-onnx/11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf/LICENSE",
+        "commit": "11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf",
+        "registryIntegrity": "sha512-MsDMBdhLFTZ1GwvcGSSQhnS7g/EA8OMH6IYysCVUOM7j8Icty9KRc0E6YT1A5fWBsZwRfKOeh88QC95aRvS8ag=="
+      }
+    },
+    {
+      "package": "sherpa-onnx-win-x64",
+      "version": "1.13.8",
+      "license": "Apache-2.0",
+      "file": "licenses/sherpa-onnx-11afbd00.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source": {
+        "kind": "published-git-revision",
+        "url": "https://raw.githubusercontent.com/csukuangfj/sherpa-onnx/11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf/LICENSE",
+        "commit": "11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf",
+        "registryIntegrity": "sha512-oZF1c9VPOKtMwn83Bboc5XSWL+76BRoyB3eUuVnCknBKxwSULZU2Foia9VHWzU+n4I12rPsP6z6H9Rp1hD9o8g=="
+      }
+    },
+    {
+      "package": "fontkit",
+      "version": "2.0.4",
+      "license": "MIT",
+      "file": "licenses/fontkit-upstream-6a36e349.txt",
+      "sha256": "cf22b8198f0886a8d4626121579114f23141070e1fceab02ab3c1c361e163440",
+      "source": {
+        "kind": "official-repository-license-pinned-current-revision",
+        "url": "https://raw.githubusercontent.com/foliojs/fontkit/6a36e349490e451ab0da98f08114b4169544c488/LICENSE",
+        "commit": "6a36e349490e451ab0da98f08114b4169544c488",
+        "registryIntegrity": "sha512-syetQadaUEDNdxdugga9CpEYVaQIxOwk7GlwZWWZ19//qW4zE5bknOKeMBDYAASwnpaSHKJITRLMF9m1fp3s6g=="
+      }
+    },
+    {
+      "package": "proxy-agent-negotiate",
+      "version": "1.1.0",
+      "license": "MIT",
+      "file": "licenses/proxy-agents-published-http-agent.txt",
+      "sha256": "71368fd0f5b4129191e9afcd1e1ef2dc89a9090d3e4d80bbab92dafd032b3bef",
+      "source": {
+        "kind": "same-repository-published-license",
+        "path": "node_modules/http-proxy-agent/LICENSE",
+        "note": "Same TooTallNate/proxy-agents repository, declared MIT, same author; original negotiate package omits its own license file.",
+        "registryIntegrity": "sha512-N8IBcM3UgCVzz2L2Lqv8DVntDnnC8/hiV4nEDUPkqq72TPUgYWjQc+bdZlBPZK9LzPAvOY//gAt0S0DApoOXWQ=="
+      }
+    },
+    {
+      "package": "brotli",
+      "version": "1.3.3",
+      "license": "MIT",
+      "file": "licenses/devongovett-mit-reference-6a36e349.txt",
+      "sha256": "cf22b8198f0886a8d4626121579114f23141070e1fceab02ab3c1c361e163440",
+      "source": {
+        "kind": "published-readme-plus-mit-terms-from-same-author",
+        "url": "https://raw.githubusercontent.com/foliojs/fontkit/6a36e349490e451ab0da98f08114b4169544c488/LICENSE",
+        "note": "Each published npm README declares MIT but omits a license file; reference terms from Devon Govett fontkit. Exact package-specific copyright notice is not established; retain this distinction.",
+        "registryIntegrity": "sha512-oTKjJdShmDuGW94SyyaoQvAjf30dZaHnjJ8uAF+u2/vGJkJbJPJAT1gDiOJP5v1Zb6f9KEyW/1HpuaWIXtGHPg=="
+      }
+    },
+    {
+      "package": "dfa",
+      "version": "1.2.0",
+      "license": "MIT",
+      "file": "licenses/devongovett-mit-reference-6a36e349.txt",
+      "sha256": "cf22b8198f0886a8d4626121579114f23141070e1fceab02ab3c1c361e163440",
+      "source": {
+        "kind": "published-readme-plus-mit-terms-from-same-author",
+        "url": "https://raw.githubusercontent.com/foliojs/fontkit/6a36e349490e451ab0da98f08114b4169544c488/LICENSE",
+        "note": "Each published npm README declares MIT but omits a license file; reference terms from Devon Govett fontkit. Exact package-specific copyright notice is not established; retain this distinction.",
+        "registryIntegrity": "sha512-ED3jP8saaweFTjeGX8HQPjeC1YYyZs98jGNZx6IiBvxW7JG5v492kamAQB3m2wop07CvU/RQmzcKr6bgcC5D/Q=="
+      }
+    },
+    {
+      "package": "type-fest",
+      "version": "4.41.0",
+      "license": "(MIT OR CC0-1.0)",
+      "file": "licenses/type-fest-published-dual-license.txt",
+      "sha256": "72483bf2d5333b804d99f5f5e39cc4bc7ca6e0918a6ff544510bceea06b03c64",
+      "source": {
+        "kind": "published-package-license-files",
+        "files": [
+          "node_modules/type-fest/license-mit",
+          "node_modules/type-fest/license-cc0"
+        ],
+        "registryIntegrity": "sha512-TeTSQ6H5YHvpqVwBRcnLDCBnDOHWYu7IvGbHT6N8AOymcr9PJGjc1GTtiWZTYg0NCgYwvnYWEkVChQAr9bjfwA=="
+      }
+    },
+    {
+      "package": "@deepseek-ai/libreoffice-kit-win32-x64",
+      "version": "0.1.5",
+      "license": "MPL-2.0",
+      "file": "licenses/libreoffice-kit-published-licenses.txt",
+      "sha256": "6959fc1e460c5ca92d94cfcf5e2c8fecb0cc05fe96d53301b910686f760b3ce3",
+      "source": {
+        "kind": "published-package-license-files",
+        "files": [
+          "licenses/LibreOffice-MPL-2.0.txt",
+          "licenses/DeepSeek-Harness-MIT.txt",
+          "licenses/LibreOffice-third-party.html"
+        ],
+        "registryIntegrity": "sha512-uKuDGZdofxuW4iRmUh8b3+XWU28JeOCYMTAONzo7tEHIq00DV2cARcgUYiTP7gUH49tH4A/RyPMOVEBzK7qjjw=="
+      }
+    }
+  ]
+}

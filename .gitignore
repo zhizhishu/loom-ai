@@ -61,3 +61,5 @@ __pycache__/
 /.stitch/
 # Generated, verified private Hook dependency closure.
 /resources/runtime/dsh-hook-executor/
+# Generated, verified complete official DSH ACP runtime.
+/resources/runtime/dsh/
