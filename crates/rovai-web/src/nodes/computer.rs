@@ -1,11 +1,14 @@
 //! Computer transport over the authenticated node WebSocket.
 //!
 //! This is routing only: it never captures, never injects and never decides
-//! consent. Every request is fenced to the node's *current* connection
-//! generation, both when it is sent and when its reply is accepted, so a frame
-//! produced by a replaced socket can never be handed to a caller that asked the
-//! new one. There is no second scheduler: the work happens on the node, and this
-//! module only correlates bounded request/response pairs.
+//! consent. Every request is fenced to the connection generation its caller
+//! authenticated against — checked in the same critical section that registers
+//! the waiter, and the same generation is sent under — and every reply is
+//! fenced to the generation of the socket it arrived on. A frame produced by a
+//! replaced socket can never be handed to a caller that asked the new one, and a
+//! request admitted for a replaced socket is refused instead of being delivered
+//! to its replacement. There is no second scheduler: the work happens on the
+//! node, and this module only correlates bounded request/response pairs.
 use super::{Hub, Inner};
 use loom_protocol::ServerMessage;
 use loom_protocol::computer::{
@@ -53,18 +56,28 @@ impl ComputerWait {
 pub(crate) fn request_blocking(
     hub: &Arc<Hub>,
     node_id: &str,
+    expected_generation: u64,
     request: ComputerRequestV1,
     budget: Duration,
 ) -> Result<ComputerOutcome, &'static str> {
     let handle = tokio::runtime::Handle::try_current().map_err(|_| "computer_busy")?;
-    handle.block_on(hub.computer_request(node_id, request, budget))
+    handle.block_on(hub.computer_request(node_id, expected_generation, request, budget))
 }
 
 impl Hub {
     /// Send one closed operation to a node and wait for its bounded reply.
+    ///
+    /// `expected_generation` is the connection the caller authenticated against,
+    /// not merely the connection that happens to be current now. It is checked
+    /// in the same critical section that reads the node and registers the waiter,
+    /// and that same generation is the one the frame is sent under, so a request
+    /// built for a socket that has since been replaced can never be registered
+    /// and sent on its replacement — not even when the reconnect lands between a
+    /// caller's own pre-check and this call.
     pub(crate) async fn computer_request(
         &self,
         node_id: &str,
+        expected_generation: u64,
         request: ComputerRequestV1,
         budget: Duration,
     ) -> Result<ComputerOutcome, &'static str> {
@@ -95,10 +108,20 @@ impl Hub {
             if node.outbound.is_none() {
                 return Err("node_offline");
             }
+            // The fence: this node is live, but it is not the connection this
+            // request was built for. A replaced socket must refuse rather than
+            // be handed the operation, and the check has to happen here — under
+            // the same lock that registers the waiter — because a caller's own
+            // pre-check cannot be atomic with this registration.
+            if node.generation != expected_generation {
+                return Err("node_connection_changed");
+            }
             if !node.computer_versions.contains(&COMPUTER_VERSION) {
                 return Err("computer_version_unsupported");
             }
-            let generation = node.generation;
+            // The registered and sent generation is the caller's, never a value
+            // re-read here: both are the same connection by the check above.
+            let generation = expected_generation;
             let (tx, rx) = oneshot::channel();
             inner.computer_waits.insert(
                 request_id.clone(),
@@ -116,7 +139,9 @@ impl Hub {
             (generation, rx)
         };
         // The send is fenced again inside `send_node_message_generation`, which
-        // re-checks the connection generation and the advertised capability.
+        // re-checks the connection generation and the advertised capability. It
+        // is handed the generation the fence above accepted, so a reconnect that
+        // lands between registration and delivery is refused there as well.
         if let Err(code) = self
             .send_node_message_generation(
                 node_id,

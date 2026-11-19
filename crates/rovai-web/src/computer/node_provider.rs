@@ -142,9 +142,11 @@ impl NodeComputers {
 struct NodeProvider {
     hub: Arc<Hub>,
     node_id: String,
-    /// The connection generation this provider was created against. Every call
-    /// re-checks it before anything is sent: a reply from any other generation is
-    /// discarded by the transport, and a request must never be addressed to one.
+    /// The connection generation this provider was built against, and the one
+    /// every operation it sends is fenced to. A reply from any other generation
+    /// is discarded by the transport, and a request is refused when the node has
+    /// reconnected since — checked inside the registration critical section, not
+    /// merely before it.
     generation: u64,
 }
 
@@ -158,11 +160,13 @@ impl NodeProvider {
     }
 
     fn call(&self, op: ComputerOpV1) -> Result<ComputerOutcome, &'static str> {
-        // Send-boundary fence. This provider speaks for exactly one connection
-        // generation; if the node reconnected since it was built, the socket it
-        // was created for is gone and nothing is sent at all. The transport would
-        // otherwise address whichever connection is current now, which would hand
-        // a caller's operation to a session it never authenticated against.
+        // Cheap early refusal: the socket this provider was built for is already
+        // gone, so nothing is attempted at all. This check is *not* the fence —
+        // a reconnect can land right after it — which is why the binding
+        // generation is also handed to the transport, where it is compared in the
+        // same critical section that registers the waiter and is then used to
+        // send. Together those two checks mean an operation built for a replaced
+        // connection is never registered, never sent and never answered.
         let handle = tokio::runtime::Handle::try_current().map_err(|_| "computer_busy")?;
         let current = handle.block_on(self.hub.computer_generation(&self.node_id));
         if current != Some(self.generation) {
@@ -173,7 +177,13 @@ impl NodeProvider {
             request_id: uuid::Uuid::new_v4().simple().to_string(),
             op,
         };
-        request_blocking(&self.hub, &self.node_id, request, COMPUTER_DEADLINE)
+        request_blocking(
+            &self.hub,
+            &self.node_id,
+            self.generation,
+            request,
+            COMPUTER_DEADLINE,
+        )
     }
 }
 

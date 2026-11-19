@@ -3616,7 +3616,7 @@ mod tests {
         // Not advertised: refused before a single byte reaches the socket.
         assert_eq!(hub.computer_generation(&node_id).await, None);
         assert_eq!(
-            hub.computer_request(&node_id, info("req_1"), Duration::from_millis(50))
+            hub.computer_request(&node_id, generation, info("req_1"), Duration::from_millis(50))
                 .await
                 .err(),
             Some("computer_version_unsupported")
@@ -3648,7 +3648,7 @@ mod tests {
             let hub = Arc::clone(&hub);
             let node_id = node_id.clone();
             async move {
-                hub.computer_request(&node_id, info("req_3"), Duration::from_secs(5))
+                hub.computer_request(&node_id, generation, info("req_3"), Duration::from_secs(5))
                     .await
             }
         });
@@ -3683,6 +3683,128 @@ mod tests {
         assert!(hub.inner.lock().await.computer_waits.is_empty());
     }
 
+    /// The rework's exact interleaving: a caller's connection pre-check passes on
+    /// generation `g`, the node then reconnects (and re-advertises computer on the
+    /// replacement socket) *before* the request is registered, and the request
+    /// still names `g`.
+    ///
+    /// Registration is the fence. Because the expected generation is compared in
+    /// the same critical section that inserts the waiter — and that same value is
+    /// what the frame is sent under — the stale request is refused instead of being
+    /// re-read as "whatever is current now" and delivered on the replacement
+    /// socket. The positive control then proves that same socket still carries a
+    /// fresh input, so the zero below cannot pass by delivering nothing at all.
+    #[tokio::test]
+    async fn an_input_admitted_before_a_reconnect_never_reaches_the_new_socket() {
+        use loom_protocol::computer::{
+            ComputerCodeV1, ComputerInputV1, ComputerOpV1, ComputerReplyV1, ComputerRequestV1,
+        };
+        let hub = Arc::new(test_hub());
+        let (node_id, mut first_frames) = attach_reports(&hub, Vec::new()).await;
+        let first_generation = hub.inner.lock().await.nodes[&node_id].generation;
+        hub.set_computer_versions(&node_id, first_generation, vec![COMPUTER_VERSION])
+            .await;
+        // Step 1 of the race: the provider's own pre-check passes, because the
+        // connection it was built for is still the current one right now.
+        assert_eq!(
+            hub.computer_generation(&node_id).await,
+            Some(first_generation)
+        );
+        // Step 2: the same node reconnects and re-advertises computer on the
+        // replacement socket. The request below was admitted for the old one.
+        let (tx, mut second_frames) = mpsc::channel(4);
+        let (cancel, _cancel_rx) = oneshot::channel();
+        let second_generation = hub
+            .attach(
+                &node_id,
+                Outbox {
+                    tx,
+                    urgent: None,
+                    acks: Arc::new(StdMutex::new(HashMap::new())),
+                },
+                cancel,
+                "linux",
+                "x86_64",
+                Vec::new(),
+            )
+            .await
+            .expect("reconnect");
+        assert!(second_generation > first_generation);
+        hub.set_computer_versions(&node_id, second_generation, vec![COMPUTER_VERSION])
+            .await;
+        let input = |id: &str| ComputerRequestV1 {
+            version: COMPUTER_VERSION,
+            request_id: id.to_owned(),
+            op: ComputerOpV1::Input {
+                input: ComputerInputV1::Text {
+                    text: "a".to_owned(),
+                },
+            },
+        };
+        // Step 3: registered under the old generation, after the reconnect.
+        assert_eq!(
+            hub.computer_request(
+                &node_id,
+                first_generation,
+                input("req_stale"),
+                Duration::from_millis(500)
+            )
+            .await
+            .err(),
+            Some("node_connection_changed"),
+            "an input admitted for the replaced socket was registered instead of refused"
+        );
+        // The refusal is total: the replacement receives nothing, the dead socket
+        // receives nothing, and no waiter survives to be completed by a later reply.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), second_frames.recv())
+                .await
+                .is_err(),
+            "the replaced connection's input reached the new socket"
+        );
+        assert!(first_frames.try_recv().is_err());
+        assert!(
+            hub.inner.lock().await.computer_waits.is_empty(),
+            "a refused request left a waiter behind"
+        );
+        // Positive control: the replacement socket does carry a fresh input, and
+        // its own reply completes the call.
+        let call = tokio::spawn({
+            let hub = Arc::clone(&hub);
+            let node_id = node_id.clone();
+            async move {
+                hub.computer_request(
+                    &node_id,
+                    second_generation,
+                    input("req_fresh"),
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        });
+        let Some(Outbound::Text(text)) = second_frames.recv().await else {
+            panic!("the fresh input was not sent on the new connection")
+        };
+        let Ok(ServerMessage::Computer { request: sent }) =
+            serde_json::from_str::<ServerMessage>(&text)
+        else {
+            panic!("the frame was not a computer request")
+        };
+        assert_eq!(sent.request_id, "req_fresh");
+        assert!(matches!(sent.op, ComputerOpV1::Input { .. }));
+        hub.handle_computer_reply(
+            &node_id,
+            second_generation,
+            ComputerReplyV1::refusal("req_fresh", ComputerCodeV1::Ok),
+        )
+        .await;
+        assert!(
+            call.await.expect("join").is_ok(),
+            "a fresh input on the current connection must still be delivered"
+        );
+        assert!(hub.inner.lock().await.computer_waits.is_empty());
+    }
+
     /// A disconnect retires pending computer calls instead of leaving a caller
     /// to wait out a deadline for a socket that is already gone.
     #[tokio::test]
@@ -3699,6 +3821,7 @@ mod tests {
             async move {
                 hub.computer_request(
                     &node_id,
+                    generation,
                     ComputerRequestV1 {
                         version: COMPUTER_VERSION,
                         request_id: "req_pending".to_owned(),
