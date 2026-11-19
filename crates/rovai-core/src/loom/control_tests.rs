@@ -3065,3 +3065,259 @@ fn a_live_command_host_is_a_device_even_when_its_entry_moved() {
         "assertion a_disabled_installation_is_unreachable_even_for_a_command_host"
     );
 }
+
+/// Admission-order boundary: "the device is gone" is an answer about an event that is otherwise
+/// admissible, never a licence to skip the identity rules. A Candidate whose producer Run cannot be
+/// resolved can never be reviewed, so a REVIEW that is also unreachable must not reserve a Delivery
+/// for it: that Delivery would consume the budget, block the lane and never start, even after the
+/// reviewer's device comes back. The device state must make no difference to the outcome.
+#[test]
+fn an_unreachable_device_cannot_reserve_work_the_identity_rules_refuse() {
+    let mut database = fixture();
+    let mission_id = create_mission(&mut database, "dispatch identity before device");
+    plan_import(&mut database, plan_input(&mission_id)).unwrap();
+    let plan_id: String = database
+        .connection()
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let camp_id = camp_of(&database, &mission_id);
+    seed_run(&database, &camp_id, PRODUCER_AGENT, PRODUCER_RUN);
+    seed_run(&database, &camp_id, REVIEWER_AGENT, REVIEWER_RUN);
+    control::configure(
+        &mut database,
+        OWNER,
+        policy_input(
+            &mission_id,
+            "command_approve_identity_first",
+            REVIEWER_AGENT,
+        ),
+    )
+    .unwrap();
+    // The delivery names a producing Run that no longer exists, so the self-review guard can never
+    // be discharged for this Candidate.
+    let (candidate_id, _manifest) =
+        submitted_candidate(&mut database, &mission_id, "run_producer_gone");
+    assert_eq!(
+        task_state(&database, &mission_id, "task_a"),
+        "IN_REVIEW",
+        "assertion the_candidate_is_waiting_for_its_review"
+    );
+    assert_eq!(
+        count(
+            &database,
+            "SELECT COUNT(*) FROM loom_candidate
+             WHERE candidate_id='run_producer_gone' OR candidate_id<>'run_producer_gone'"
+        ),
+        1,
+        "assertion exactly_one_candidate_is_under_review"
+    );
+    let reviewer_installation = installation_of(&database, REVIEWER_AGENT);
+
+    // The reviewer's device is gone at the same time as the producer identity is broken.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&reviewer_installation],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_gone_device_cannot_admit_an_event_the_identity_rules_refuse"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (0, 0),
+        "assertion the_refused_event_reserves_no_ledger_row_and_no_delivery"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion an_identity_refusal_is_not_a_device_failure_fact"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion an_identity_refusal_writes_no_availability_mirror"
+    );
+
+    // The device comes back. The identity judgement is what refuses the event, so the outcome is
+    // the same — the earlier refusal was never a device verdict that could be forgotten.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
+            [&reviewer_installation],
+        )
+        .unwrap();
+    for tick in 0..2 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_reachable_device_still_cannot_reserve_an_unreviewable_event (tick {tick})"
+        );
+    }
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (0, 0),
+        "assertion recovery_does_not_reserve_what_the_identity_rules_never_admitted"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion no_failure_or_recovery_fact_is_invented_for_a_refused_event"
+    );
+    assert!(
+        !candidate_id.is_empty(),
+        "assertion the_refused_review_names_the_candidate_it_could_not_hand_out"
+    );
+}
+
+/// Started-Run boundary, ported from upstream `recordFactoryDispatchFailure`, which returns `null`
+/// for anything that is not still `queued`, and from
+/// `dispatch-recovery.db.test.ts`'s "a claimed run is not a dispatch failure". Once a Run has
+/// started, a device that disappears is an execution problem, not a dispatch problem: the LOOM
+/// layer must not write `loom.dispatch_failed` or `loom.dispatch_recovered` for it, must not park
+/// the Task with an availability reason, and must leave the claimed Delivery alone.
+#[test]
+fn a_run_that_already_started_is_never_a_dispatch_failure() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch started run",
+        "command_approve_started_run",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let installation_id = installation_of(&database, PRODUCER_AGENT);
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion the_reachable_plan_reserves_its_delivery"
+    );
+    let claimed = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(claimed.len(), 1, "assertion the_delivery_produces_one_run");
+    let run_id = claimed[0].clone();
+    let (dispatch_id, run_of_dispatch) = dispatch_and_run(&database, "task_a");
+    assert_eq!(
+        run_of_dispatch.as_deref(),
+        Some(run_id.as_str()),
+        "assertion the_run_belongs_to_this_dispatch"
+    );
+    let started = claim_the_run(&mut database, &camp_id, &run_id);
+    assert_eq!(
+        started.result.status,
+        crate::command::CommandResultStatus::Accepted,
+        "assertion the_queued_run_starts_while_its_device_is_present: {:?}",
+        started.result
+    );
+    assert_eq!(
+        run_status(&database, &run_id),
+        "running",
+        "assertion the_run_is_running_before_the_device_disappears"
+    );
+
+    // The device disappears after the Run started.
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
+            [&installation_id],
+        )
+        .unwrap();
+    for tick in 0..3 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion a_started_run_is_never_dispatched_again (tick {tick})"
+        );
+    }
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion a_running_run_records_no_dispatch_failure_and_no_dispatch_recovery"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion a_running_run_is_not_parked_with_an_availability_reason"
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let reason = control::dispatch_block_reason(database.connection(), &dispatch_id, &now).unwrap();
+    assert!(
+        !matches!(
+            reason.as_deref(),
+            Some("loom.dispatch_recipient_disabled")
+                | Some("loom.dispatch_recipient_offline")
+                | Some("loom.dispatch_harness_unavailable")
+        ),
+        "assertion a_running_run_is_no_longer_judged_by_its_device: {reason:?}"
+    );
+    let (delivery_status, ledger_status): (String, String) = database
+        .connection()
+        .query_row(
+            "SELECT delivery.status, dispatch.status
+             FROM loom_control_dispatch dispatch
+             JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.dispatch_id=?1",
+            [&dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (delivery_status.as_str(), ledger_status.as_str()),
+        ("claimed", "DISPATCHED"),
+        "assertion the_started_work_keeps_its_claimed_delivery"
+    );
+
+    // A Run that already ended without writing its successor fact proves nothing either: the
+    // ledger stays pending, and the ended Run is still not a dispatch failure.
+    database
+        .connection()
+        .execute(
+            "UPDATE agent_run SET status='succeeded', ended_at=?2 WHERE id=?1",
+            params![&run_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    for tick in 0..3 {
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            0,
+            "assertion an_unproved_finished_run_is_never_dispatched_again (tick {tick})"
+        );
+    }
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion an_ended_run_that_proved_nothing_is_not_a_dispatch_failure"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion an_ended_run_is_not_parked_with_an_availability_reason"
+    );
+    let ledger_after_end: String = database
+        .connection()
+        .query_row(
+            "SELECT status FROM loom_control_dispatch WHERE dispatch_id=?1",
+            [&dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        ledger_after_end, "DISPATCHED",
+        "assertion an_unproved_outcome_is_never_read_as_a_settled_dispatch"
+    );
+}

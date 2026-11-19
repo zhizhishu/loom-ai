@@ -38,14 +38,20 @@
 //!   applies (`light_ready`, `installed_unverified` and a missing snapshot are startable; a stored
 //!   probe result is not a dispatch condition, and a live Command Host is admitted by its
 //!   installation identity even when the disk entry moved). Once a Run exists, the device is that
-//!   Run's frozen target, never a member setting that changed afterwards.
+//!   Run's frozen target, never a member setting that changed afterwards — and only while that Run
+//!   is still `queued` is a device a *dispatch* question at all: upstream records
+//!   `run_dispatch_failed` only for a queued Run, so work that already started neither writes a
+//!   failure fact nor a recovery fact, and is never parked with an availability reason.
 //! * **Unavailable work is still reserved.** A device that is merely gone does not cancel work the
 //!   Owner approved: the Dispatch and its Delivery are reserved, the failure is recorded, and the
 //!   pre-execution recheck keeps the lane from starting until the device is back. That reservation
 //!   is what the Delivery scheduler and the recovery timer can find, so the same queued Run
-//!   continues by itself — no pass has to be triggered by hand. A Recipient the Camp cannot address
-//!   at all (no profile, not a member, switched off, away) has no lane to reserve, so only its
-//!   failure fact is written.
+//!   continues by itself — no pass has to be triggered by hand. The device is judged *after* every
+//!   identity rule: a Reservation exists only for an event the Task state, the assignment, the
+//!   Candidate, the producer identity and the earlier outcome all allow, because a lane must never
+//!   be reserved for work no later pass can start. A Recipient the Camp cannot address at all (no
+//!   profile, not a member, switched off, away) has no lane to reserve, so only its failure fact is
+//!   written.
 //! * **A failure is a durable fact.** Each `(event identity, reason)` is recorded once as a
 //!   `loom.dispatch_failed` domain event — a repeated tick stores nothing, an
 //!   offline → disabled → offline round trip keeps one row per reason, and recovery never deletes
@@ -242,8 +248,9 @@ pub(crate) fn dispatch_block_reason(
     }
 
     // The device judged here is the one this queued work was frozen to: once a Run exists, a member
-    // setting that changed afterwards cannot reroute or block it.
-    let frozen = frozen_execution_of_dispatch(connection, dispatch_id)?;
+    // setting that changed afterwards cannot reroute or block it. A Run that already started is not
+    // a dispatch question at all, so its device is not judged here either.
+    let reserved = reserved_execution_of_dispatch(connection, dispatch_id)?;
     let problem = event_problem(
         connection,
         &policy,
@@ -255,7 +262,8 @@ pub(crate) fn dispatch_block_reason(
         &recipient,
         policy_revision,
         Some(dispatch_id),
-        frozen.as_ref(),
+        reserved.frozen.as_ref(),
+        reserved.device_is_judged(),
     )?;
     Ok(problem.map(str::to_string))
 }
@@ -312,6 +320,20 @@ fn admit_plan(
             )
             .optional()?;
         if let Some(recorded_dispatch_id) = already_recorded {
+            // The failure and recovery facts are judgements of a *dispatch*, so they exist only
+            // while the work they describe is still waiting to start: the queued Run that has not
+            // been handed to a Runtime yet, or the reservation no Run exists for. A Run that is
+            // already running, waiting or finished proves nothing about a device and must not be
+            // reported as a dispatch failure or a dispatch recovery.
+            if !reserved_execution_of_dispatch(transaction, &recorded_dispatch_id)?
+                .device_is_judged()
+            {
+                // `blocked_reason` is only the current-state mirror of those facts, so a reason
+                // that said "not started yet" is dropped once the work started; no event is
+                // written, and nothing about the running work is re-judged here.
+                clear_control_blocked_reason(transaction, plan_id, &event.task_id, now)?;
+                continue;
+            }
             match dispatch_block_reason(transaction, &recorded_dispatch_id, now)? {
                 Some(reason) if is_recipient_availability_reason(&reason) => {
                     set_control_blocked_reason(transaction, plan_id, &event.task_id, &reason, now)?;
@@ -349,6 +371,7 @@ fn admit_plan(
             policy.authorization_revision,
             None,
             None,
+            true,
         )? {
             let reservable = match camp_id.as_deref() {
                 Some(camp_id) => {
@@ -721,6 +744,7 @@ fn event_problem(
     authorization_revision: i64,
     excluding_dispatch_id: Option<&str>,
     frozen: Option<&FrozenExecution>,
+    judge_device: bool,
 ) -> Result<Option<&'static str>> {
     // Mission, Plan and Task have to belong together.
     let owning: Option<String> = transaction
@@ -751,9 +775,19 @@ fn event_problem(
     // availability change that commits while this pass waits for the write lock is observed here.
     // The device judged is the one execution will use: the Run's frozen target when this work was
     // already handed out, otherwise the selected remote Node, otherwise the local installation.
-    if let Some(reason) = recipient_failure_reason(transaction, &camp_id, recipient, frozen)? {
-        return Ok(Some(reason));
-    }
+    //
+    // The answer is held, not returned: a device that is merely gone says nothing about whether this
+    // event is allowed to exist. Every identity fact below — the Task state, the assignment, the
+    // Candidate's freshness, the producer's identity, the earlier outcome of this class — is judged
+    // first, and only an event that passes all of them can be admitted as "waiting for its device"
+    // (or reported as unreachable). Otherwise an unavailable device would short-circuit admission
+    // and reserve a Delivery that no later pass can ever start. A Run that already started is not a
+    // dispatch question at all, so its device is not judged here.
+    let recipient_problem = if judge_device {
+        recipient_failure_reason(transaction, &camp_id, recipient, frozen)?
+    } else {
+        None
+    };
 
     let task_state: Option<(String, Option<String>)> = transaction
         .query_row(
@@ -907,7 +941,7 @@ fn event_problem(
         kind,
         excluding_dispatch_id,
     )? {
-        PriorOutcome::Completed | PriorOutcome::NotExecuted => Ok(None),
+        PriorOutcome::Completed | PriorOutcome::NotExecuted => Ok(recipient_problem),
         PriorOutcome::Pending | PriorOutcome::Failed => Ok(Some(PREVIOUS_OUTCOME_REASON)),
     }
 }
@@ -1273,38 +1307,71 @@ enum FrozenExecution {
     },
 }
 
-/// The frozen target of the Run this dispatch already started, or `None` while no Run exists yet.
-fn frozen_execution_of_dispatch(
+/// What one recorded dispatch already handed out: the device it was frozen to, and whether that
+/// device is still a *dispatch* question.
+struct ReservedExecution {
+    /// The frozen device of the Run this dispatch materialised, or `None` while no Run exists yet.
+    frozen: Option<FrozenExecution>,
+    /// The Run's own status, when a Run exists.
+    run_status: Option<String>,
+}
+
+impl ReservedExecution {
+    /// True while the device can still decide whether this dispatch may start.
+    ///
+    /// Upstream `recordFactoryDispatchFailure` writes a `run_dispatch_failed` event only for a Run
+    /// that is still `queued` and returns `null` for any other status, and
+    /// `dispatch-recovery.db.test.ts` asserts that a claimed Run records no dispatch failure. Here
+    /// the same rule covers the Run the Delivery claim materialised: only a `queued` Run (or the
+    /// reservation no Run exists for yet) is a dispatch waiting on its device. A Run that is
+    /// `running`/`waiting`, or that already ended, proves nothing about a device.
+    fn device_is_judged(&self) -> bool {
+        matches!(self.run_status.as_deref(), None | Some("queued"))
+    }
+}
+
+/// The frozen target of the Run this dispatch already started, and that Run's own status.
+fn reserved_execution_of_dispatch(
     connection: &Connection,
     dispatch_id: &str,
-) -> Result<Option<FrozenExecution>> {
-    let claimed: Option<(String, Option<String>, Option<String>)> = connection
+) -> Result<ReservedExecution> {
+    let claimed: Option<(String, Option<String>, Option<String>, String)> = connection
         .query_row(
-            "SELECT run.id, run.runtime_installation_id, run.runtime_adapter_kind
+            "SELECT run.id, run.runtime_installation_id, run.runtime_adapter_kind, run.status
              FROM loom_control_dispatch dispatch
              JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
              JOIN agent_run run ON run.id = delivery.claimed_agent_run_id
              WHERE dispatch.dispatch_id=?1",
             [dispatch_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((agent_run_id, installation_id, adapter_kind)) = claimed else {
-        return Ok(None);
+    let Some((agent_run_id, installation_id, adapter_kind, run_status)) = claimed else {
+        return Ok(ReservedExecution {
+            frozen: None,
+            run_status: None,
+        });
+    };
+    let reserved = ReservedExecution {
+        frozen: Some(FrozenExecution::Local {
+            installation_id: installation_id.clone().unwrap_or_default(),
+            adapter_kind: adapter_kind.clone(),
+        }),
+        run_status: Some(run_status),
     };
     if crate::remote_execution::authority_table_available(connection, "agent_run_execution_target")?
         && let Some(frozen) = crate::remote_execution::load_run_target(connection, &agent_run_id)?
     {
-        return Ok(Some(FrozenExecution::Remote {
-            agent_run_id,
-            node_id: frozen.target.node_id,
-            adapter_kind: frozen.target.adapter_kind,
-        }));
+        return Ok(ReservedExecution {
+            frozen: Some(FrozenExecution::Remote {
+                agent_run_id,
+                node_id: frozen.target.node_id,
+                adapter_kind: frozen.target.adapter_kind,
+            }),
+            ..reserved
+        });
     }
-    Ok(Some(FrozenExecution::Local {
-        installation_id: installation_id.unwrap_or_default(),
-        adapter_kind,
-    }))
+    Ok(reserved)
 }
 
 /// Why this recipient cannot take the Delivery right now, or `None` when it can.
