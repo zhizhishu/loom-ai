@@ -37,7 +37,7 @@
 - 电脑控制：`L5-computer/run-07/run.json` 模型自主截图识码，`synthetic_frame=true`。
 - 能力矩阵：`L9` 16 格真实表，7 格正向回执。
 
-**未完成**：写入早于认领（r9 实证 claim 晚 6.031 秒）；E6-B 恢复对账缺故障注入；记忆只按 Bot 不按 Workspace；Claude 已定禁用但代码仍判可用；Codex MCP 外部 relay 卡点；Owner 接受 = 0。
+**未完成**：~~写入早于认领~~（P0 已修，2026-11-19）；E6-B 恢复对账缺故障注入；记忆只按 Bot 不按 Workspace；Claude 已定禁用但代码仍判可用；Codex MCP 外部 relay 卡点；Owner 接受 = 0。
 
 **Git**：分支 `rovai/loom-v2-personal-20261116`，本地提交未推送。
 
@@ -73,6 +73,12 @@
 - **Pi 工兵已搬进 `loom-dev`**：Pi `1.5.0` + pi-skill + 守卫，模型走 Octopus 公网 `https://oct.agent-ai.vip/v1`（内网 `10.10.0.101` 从 Bero 不可达），密钥只在容器环境。容器内只读冒烟 94 s 通过。用法见 [`scripts/bero/README.md`](../../scripts/bero/README.md)。
 - 仍未做：容器里装 DSH `0.2.0-rc.2`、Codex（P1b 前）；macOS 未验证；20+ 本地提交未推送（等用户同意）。
 - 下一步：**P0 先领后写**，Pi 在容器里先只读出计划，Root 审后授权落地，测试在 Bero 跑。
+
+**2026-11-19 04:30 PST 更新（Hark，P0 阶段交接）**
+- **P0 先领后写（T34）完成**，HEAD `37e35ca`：guard 对绑定 LOOM Task 的 Run 要求完整未过期 claim（`claim_missing` / `claim_expired`），`loom.claim` 与 `loom.claim_heartbeat` 成功后 Core 重签写授权，本地 `artifact_register` 查 fence，接管后旧 Run 报 `LOOM_CLAIM_ABSENT`；普通聊天不变。Claude 运行端默认禁用，`LOOM_CLAUDE_RUNTIME_ENABLED=1` 才放行。
+- Bero 回执：rovai-core lib 667/0/1；`pi::host` 扩展 18/0/1；Node 34/0；r9 重跑 10 次写入早于认领 = 0（`_artifacts/delivery-20261118/L12-r9-*`，脚本 `scripts/loom-r9-write-before-claim-rerun.mjs`，守卫+授权文档回放，非真模型在环）。
+- 缺口：E-5 `loom.evidence` 不带 `taskId` 仍绕过 fence（需 Run↔Task 绑定，产品决定）；UI TS 测试、Claude 启用路径生命周期测试、Claude/Codex 经 oct 冒烟、DSH 与 `cospan doctor` 未做。
+- 下一步：重读 MASTER-PLAN §B / ARCHITECTURE / 本文件后进 P1 / P1b。
 
 **留给 GitHub 与用户电脑**
 - Windows：Bero 通过后，由 GitHub 镜像仓库 Actions（`windows-package.yml`、`loom-v2-e3-windows.yml`）多构建 Windows 包；用户电脑只做安装冒烟，不碰 64851/64852、日常 userData。
