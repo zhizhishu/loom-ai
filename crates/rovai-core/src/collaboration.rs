@@ -4843,6 +4843,7 @@ enum AddressingOutcome {
     Rejected(CommandHandlerResult),
 }
 
+// upstream: Mikka d59c85cb lib/coordinator/group-routing.ts:mentionRoute, lib/coordinator/route-group.ts:routeGroupMessage
 fn resolve_address(
     transaction: &Connection,
     camp_id: &str,

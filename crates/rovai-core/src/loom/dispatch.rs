@@ -1,3 +1,4 @@
+// upstream: Mikka d59c85cb lib/factory/automatic-dispatch.ts:automaticFactoryDispatch, lib/factory/dispatch.ts:createFactoryDispatch
 //! LOOM dispatch scheduling: the Core decides, per Plan, which Task event may carry a Delivery
 //! right now, and records that decision in the permanent dispatch ledger.
 //!

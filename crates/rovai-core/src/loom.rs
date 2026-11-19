@@ -6,8 +6,6 @@ pub(crate) mod remote_artifact;
 /// The bytes of a registered local artifact, archived so a later verification re-reads what was
 /// registered instead of whatever the workspace file holds now.
 pub(crate) mod snapshot;
-// V2 additive coordinator ledger remains dormant until its Core migration is approved.
-pub(crate) mod v2_coordinator_adapter;
 /// The persistent automation authority of one Plan: the approved policy, the assistant stage
 /// verdicts, and the dispatch/budget ledger. Split out of this module because nothing in it may
 /// set the Owner's own `ACCEPTED` verdict — that stays in [`review_record`].
@@ -1391,6 +1389,7 @@ pub(crate) enum SameRunClaim {
     RevokeOwnLease,
 }
 
+// upstream: Mikka d59c85cb lib/factory/claim.ts:createFactoryClaim; ACCP 77f05778 internal/controlplane/tasks_execution.go:claimRun
 /// LOOM claim path: one Task, one Run, one lease. Everything the claim depends on
 /// (Mission, Plan ownership, Task state, dependency release, the previous lease) is
 /// checked and written in one immediate transaction, so a rejected or failed claim leaves
@@ -10124,6 +10123,183 @@ mod tests {
             error.downcast_ref::<LoomCommandError>().unwrap().code(),
             LOOM_EVIDENCE_NOT_FOUND,
             "assertion a passing verification needs something to re-read: {error}"
+        );
+    }
+
+    /// Guard: LOOM keeps exactly one scheduling authority. A Task is bound to a Run only by the
+    /// `loom_claim` row [`claim_acquire`] writes, and every dispatch decision is recorded in the
+    /// permanent `loom_control_dispatch` ledger. The dormant V2 coordinator modules
+    /// (`loom-protocol/src/v2_coordinator.rs`, its replay and `loom/v2_coordinator_adapter.rs`) were
+    /// a third scheduler with their own event ledger and their own replay clock; they are deleted,
+    /// so this test fails if a second ledger comes back or if a dispatch stops hanging off the Task
+    /// table the claim already owns.
+    #[test]
+    fn coordinator_contract_is_owned_by_loom_claim_and_dispatch_ledger() {
+        fn count(database: &Database, sql: &str) -> i64 {
+            database
+                .connection()
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap()
+        }
+
+        /// The parent tables of one foreign key, once per constraint: a composite key reports one
+        /// row per column, so the names are deduplicated.
+        fn parent_tables(database: &Database, table: &str) -> Vec<String> {
+            let connection = database.connection();
+            let mut statement = connection
+                .prepare(&format!("PRAGMA foreign_key_list({table})"))
+                .unwrap();
+            let mut parents = statement
+                .query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap();
+            parents.sort();
+            parents.dedup();
+            parents
+        }
+
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM single scheduling authority");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        // No second scheduler left a ledger behind: nothing else may carry the coordinator shape,
+        // so reintroducing one makes this test name it instead of quietly accepting it.
+        let foreign_objects = {
+            let connection = database.connection();
+            let mut statement = connection
+                .prepare(
+                    "SELECT type || ':' || name FROM sqlite_master
+                     WHERE type IN ('table','view','trigger')
+                       AND (instr(name,'coordinator') > 0 OR instr(name,'v2_') > 0)
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap()
+        };
+        assert!(
+            foreign_objects.is_empty(),
+            "assertion no_second_scheduler_ledger: {foreign_objects:?}"
+        );
+
+        // Both authorities hang off the same Task table, so a dispatch cannot be tracked in a
+        // private copy of the plan.
+        assert_eq!(
+            parent_tables(&database, "loom_claim"),
+            vec!["loom_task".to_string()],
+            "assertion the_claim_hangs_off_loom_task"
+        );
+        assert_eq!(
+            parent_tables(&database, "loom_control_dispatch"),
+            vec!["loom_task".to_string()],
+            "assertion the_dispatch_ledger_hangs_off_loom_task"
+        );
+
+        // Scheduling starts at the claim: a released Task holds no claim and dispatches nothing.
+        assert_eq!(
+            count(
+                &database,
+                "SELECT COUNT(*) FROM loom_claim WHERE task_id='task_a'"
+            ),
+            0,
+            "assertion a_released_task_holds_no_claim"
+        );
+        assert_eq!(
+            count(
+                &database,
+                "SELECT COUNT(*) FROM loom_control_dispatch"
+            ),
+            0,
+            "assertion a_plan_without_a_claim_dispatches_nothing"
+        );
+
+        // The claim write is the Run binding and the fence source, and it never writes a dispatch
+        // row itself: the dispatch ledger belongs to the scheduling line, which needs the claim.
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        assert_eq!(
+            claim.fence_generation, 1,
+            "assertion the_claim_hands_out_the_first_fence_generation"
+        );
+        assert_eq!(
+            count(
+                &database,
+                "SELECT COUNT(*) FROM loom_claim WHERE task_id='task_a' AND released_at IS NULL"
+            ),
+            1,
+            "assertion the_claim_path_writes_loom_claim"
+        );
+        assert_eq!(
+            count(
+                &database,
+                "SELECT COUNT(*) FROM loom_control_dispatch"
+            ),
+            0,
+            "assertion a_claim_alone_writes_no_dispatch"
+        );
+
+        // The ledger is permanent and identity-stable, so no second scheduler can re-purpose a row
+        // it did not write. One synthetic row is inserted to meet the same guards the real dispatch
+        // lane meets: the delete guard needs a parent Task, and a row's identity never moves.
+        let plan_id: String = database
+            .connection()
+            .query_row(
+                "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+                [mission_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let connection = database.connection();
+        connection
+            .execute(
+                "INSERT INTO loom_control_dispatch(dispatch_id,plan_id,task_id,kind,candidate_id,
+                     policy_revision,recipient_agent_id,delivery_id,status,reason,dedupe_key,
+                     created_at,updated_at)
+                 VALUES('dispatch_guard',?1,'task_a','EXECUTE',NULL,1,'agent_1',NULL,'WAITING',
+                        NULL,'dedupe_guard','2026-11-19T00:00:00Z','2026-11-19T00:00:00Z')",
+                [plan_id.as_str()],
+            )
+            .unwrap();
+        let deleted = connection.execute(
+            "DELETE FROM loom_control_dispatch WHERE dispatch_id='dispatch_guard'",
+            [],
+        );
+        assert!(
+            deleted.is_err(),
+            "assertion a_dispatch_row_is_a_permanent_ledger_record: {deleted:?}"
+        );
+        let rewritten = connection.execute(
+            "UPDATE loom_control_dispatch SET dedupe_key='dedupe_other'
+             WHERE dispatch_id='dispatch_guard'",
+            [],
+        );
+        assert!(
+            rewritten.is_err(),
+            "assertion a_dispatch_identity_cannot_be_rewritten: {rewritten:?}"
+        );
+        // Only the lifecycle columns move, which is exactly how the scheduling line walks a row.
+        connection
+            .execute(
+                "UPDATE loom_control_dispatch SET status='DISPATCHED',
+                        updated_at='2026-11-19T00:01:00Z' WHERE dispatch_id='dispatch_guard'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            count(
+                &database,
+                "SELECT COUNT(*) FROM loom_control_dispatch WHERE status='DISPATCHED'"
+            ),
+            1,
+            "assertion only_the_dispatch_lifecycle_columns_move"
         );
     }
 }

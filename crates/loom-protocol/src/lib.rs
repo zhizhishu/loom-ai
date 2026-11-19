@@ -6,8 +6,6 @@
 
 pub mod run_bundle;
 pub mod v2_domain;
-pub mod v2_coordinator;
-pub mod v2_coordinator_replay;
 pub mod v2_capability;
 pub mod command_hooks;
 pub mod computer;
