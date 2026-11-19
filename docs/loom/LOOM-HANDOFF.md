@@ -41,14 +41,25 @@
 
 **Git**：分支 `rovai/loom-v2-personal-20261116`，本地提交未推送。
 
-### 3.1 开发环境：DE-BERO 沙箱（用户 2026-11-18 决定）
+### 3.1 Bero 极速开发与测试（用户 2026-11-18 决定）
 
-- 主机 DE-BERO（Linux，4 核、19 GB 内存；2026-11-18 实测根盘 196 GB、可用 150 GB）。经 `komari-ssh` 执行，按 `berobox` 建**独立容器**，不动已有 23 个容器、不清理未知资源。
-- 容器里模拟用户环境：同分支代码、固定 Node/Rust、Pi 固定版本、DSH `0.2.0-rc.2`、Codex；**不装、不调用 Claude CLI**；模型走用户已授权的现有服务。
-- 在沙箱开发**并验收**：Rust Core、Web、loom-node（Linux）、Node 测试、P0–P5 单测/集成/E2E；跨设备先用“Core 容器 + 另一个 Node 容器”验证。
-- Windows：Bero 走通后，由 GitHub 镜像仓库的 Actions（`windows-package.yml`、`loom-v2-e3-windows.yml`）多构建 Windows 包；用户电脑只做最后的安装冒烟，不碰 64851/64852、日常 userData。
-- 终态上云：DE-BERO 上的部署按云端形态做（Linux Core + Web 登录 + Node 连入）。
-- 代码同步：沙箱只拉本地已提交的版本；推送远端仍需用户同意。
+目标：在 DE-BERO 上把“改 → 编译 → 测 → 回执”压到分钟级，Bero 走通再出 Windows 包，终态上云。
+
+**一次性准备（只做一次）**
+1. 用 `komari-ssh` + `berobox` 在 DE-BERO 建独立容器 `loom-dev`（Linux，4 核 / 19 GB，2026-11-18 实测可用 150 GB）；不动已有 23 个容器。
+2. 镜像固定：Node 22、Rust stable + `sccache`、pnpm、Pi 固定版本、DSH `0.2.0-rc.2`、Codex、cospan（`45ab14d`）。**不装 Claude CLI**。
+3. 卷：`/src`（代码）、`/cache/cargo`、`/cache/target`、`/cache/pnpm` 持久化，编译只做增量。
+4. 模型只用用户已授权的现有服务（Octopus / DeepSeek），密钥只进容器环境，不进仓库与回执。
+
+**每轮循环**
+1. 用户电脑只提交到本地分支；容器从固定提交拉取（经 Bero 中转的 git bundle 或私有镜像仓库，推送远端须用户同意）。
+2. Root 拆 2–4 分钟工单，用 **cospan** 在容器里派 Codex / DSH 工兵并行跑（`send` 后台、`observe` 看进度、`result` 收），每个工单自带上游对照表。
+3. 分层测试：`cargo check -p <crate>` → 改动 crate 单测 → 相关 Node 测试 → 该阶段 E 门禁；跨设备用“Core 容器 + 独立 Node 容器”。
+4. 回执写 `_artifacts/<批次>/`，结论只进 `LOOM-IMPLEMENTATION.md`。
+
+**留给 GitHub 与用户电脑**
+- Windows：Bero 通过后，由 GitHub 镜像仓库 Actions（`windows-package.yml`、`loom-v2-e3-windows.yml`）多构建 Windows 包；用户电脑只做安装冒烟，不碰 64851/64852、日常 userData。
+- 云端：DE-BERO 上的部署按云端形态做（Linux Core + Web 登录 + Node 连入）。
 
 ## 4. 造轮子清单（按“主体 Mikka + PiBot”重新定性）
 
@@ -67,6 +78,9 @@
 
 ## 5. 施工顺序
 
+### P-1 Bero 开发容器（先做）
+按 §3.1 建 `loom-dev`，跑通一次 `cargo check` 与现有 Node 测试，cospan `doctor --check` 通过（codex、dsh），记录基线耗时。
+
 ### P0 先领后写（附带：Claude 禁用对齐）
 0. 把 `agent_runtime_adapter.rs` 中 Claude Code 的准入改为禁用（只识别），UI 显示“已禁用”；加负例测试：选 Claude 派工被拒。
 1. Core 在 claim 事务里原子生成 Run + 快照 + 租约，并发放单调递增的 fence（对照 Mikka `claim.ts` / `worker-lease.ts` 的租约写法与 ACCP 不变量）。
@@ -77,6 +91,9 @@
 
 ### P1 Hook 回归 DSH 原生
 LOOM 只负责：选择并冻结进 Run → 写入 DSH Profile → 读 `hook/invoked` / `hook/result` 作回执。依赖对齐 `0.2.0-rc.2`，退役私有执行器；L3 判据保留为回归。
+
+### P1b 运行端派活接 cospan
+Codex、DSH 的 Run 改为交给设备上的 cospan worker（`send`/`observe`/`result`/`continue`/`cancel`）；Rust Adapter 只负责把 Run 快照交过去、把 job 状态和 git 差异写回 Core。删掉与 cospan 重复的自写进程管理与输出解析。上游：cospan `src/drivers/{codex,dsh}.mjs`、`job-worker.mjs`、`envelope.mjs`。
 
 ### P2 群聊与 Coordinator 对齐 Mikka
 逐个对照 `group-routing.ts`、`group-turns.ts`、`wake-after-commit.ts`、`wake-recovery.ts`、`automatic-dispatch.ts` 与现有 `v2_coordinator*.rs`：已等价的保留并在注释写上游出处；缺的直接移植（TS → Rust 只改语言不改算法）。验收用 T19/T20。

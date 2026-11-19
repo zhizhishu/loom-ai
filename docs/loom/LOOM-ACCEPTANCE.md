@@ -47,6 +47,7 @@
 | T20 | Assignment DAG | 一个 Goal 两个工兵、冻结上下文、依赖与租约；一个崩溃时另一个不被错误接管 | Mikka factory + ACCP 规则 |
 | T21 | 迟到回复 | 过期租约、旧配置、旧 Grant 的结果不影响现行 Goal | Mikka lease / ACCP fence |
 | T22 | 能力跨运行端 | 同一组四能力在 Pi/DSH/Codex 分别显示 native/adapted/unsupported，有正反例加载与调用证据；Claude Code 显示“已禁用” | PiBot capabilities |
+| T22c | 派活走 cospan | Codex、DSH 各一次 Run 经 cospan worker：observe ≤8 KiB 有进度，result 回收，continue 续同一会话，cancel 能停；改动文件差异写进 Core 证据，Core 记录与设备一致 | cospan job 协议 |
 | T22b | Claude 禁用 | 选 Claude Code 派工被拒且不启动任何 Claude 进程；全部测试回执中 Claude CLI 调用次数为 0 | — |
 | T23–T25 | 人格导入、提示词模式、记忆隔离 | 来源/版本可查；Off/Append/Replace 的实际 hash 可审计；W1/W2 记忆不串 | PiBot soul/learning + agent-purge 解析 |
 | T26–T27 | 守卫与安全实验 | 恶意插件、提示注入、换人格后审批/Grant/沙箱仍拒绝；实验室假凭据到期清理 | — |

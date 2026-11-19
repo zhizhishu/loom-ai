@@ -22,6 +22,7 @@
 | **PiBot** | ../_references/pibot | 8b9f3d7ab62e407ce635bb1150bc96c58dc36dc4 | 长期 Bot、每 Bot 能力配置/技能来源、中心服务、多客户端连续性 |
 | **ACCP** | ../_references/accp | 77f05778e194b3dca04cc14851c2b8e1aafdce65 | Task DAG、context snapshot、claim/lease/fencing、交接/审查/候选结果 |
 | **ROVAI** | ../_references/rovai-ai | f5f4cb26feaba2d09ee5a6e0d73ac53371a2e246 | 当前项目 UI / Team/Thread/Mission/Artifact 的实用体验与数据迁移素材 |
+| **cospan**（2026-11-18 加入，运行端派活主来源） | ../_references/cospan | 45ab14d1e44687cecbfa3272029cdd4c176e040b | MIT；job 协议 send/wait/observe/continue/result/cancel、codex/dsh 原生 CLI 驱动、独立 worker、git 差异证据、零 token 契约检查；claude/agy 驱动不启用 |
 | **agent-purge（跨端参考）** | _artifacts/reference-repos/agent-purge-current | **5881e309c5d2bca3eb0cc4125d75f8b573ae5aa0** | Persona Markdown、按四 Runtime 适配、Off/Append/Replace/Strict 观察、可逆备份；**DSH Approval/Sandbox Hook 逻辑不得直接进入生产** |
 | **Pi Purge（本轮选定 Pi 扩展）** | _artifacts/reference-repos/pi-purge-current | **d0196ccfd773b0ed342bd2f25372aff65f1a4a53** | 版本 **0.3.0**、MIT、Pi before_agent_start、Off/Append/Replace/Fallback/Strict；只作为可选受管 Pi Extension，不是第五 Runtime/能力；当前实现/验证只看根实施表 |
 

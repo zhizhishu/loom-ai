@@ -8,7 +8,7 @@
 >
 > 本文只定方案。不改 Rust、不改界面、不改数据库。行号对着写本文时的 `main`（`5b44585`）。函数名比行号稳，行号会随别人的提交漂移。
 >
-> 事实底稿：[`plan-remote-2026-10-31.md`](../legacy-plans-2026-11-15/plan-remote-2026-10-31.md) §1、[`handoff-remote-2026-11-01.md`](../legacy-plans-2026-11-15/handoff-remote-2026-11-01.md)、[`architecture-round4-2026-10-29.md`](../legacy-plans-2026-11-15/architecture-round4-2026-10-29.md)、仓库根的 [`LOOM.md`](../../../../LOOM.md)。克隆哪些参考仓库见 [`references-plan-b.md`](../legacy-plans-2026-11-15/references-plan-b.md)。
+> 事实底稿：[`plan-remote-2026-10-31.md`](../legacy-plans-2026-11-15/plan-remote-2026-10-31.md) §1、[`handoff-remote-2026-11-01.md`](../legacy-plans-2026-11-15/handoff-remote-2026-11-01.md)、[`architecture-round4-2026-10-29.md`](../legacy-plans-2026-11-15/architecture-round4-2026-10-29.md)、仓库根的 [`LOOM.md`](LOOM-overview-legacy.md)。克隆哪些参考仓库见 [`references-plan-b.md`](../legacy-plans-2026-11-15/references-plan-b.md)。
 
 ## 0. 结论
 

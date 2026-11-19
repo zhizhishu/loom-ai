@@ -25,6 +25,7 @@
 | 9 | **人格不扩权** | 换人格、换大脑都不改变 Bot 身份与授权；Pi Purge Strict 只在隔离实验用。 |
 | 10 | **开源直接用，可以整段照抄** | 参考快照许可已统一为 MIT。Mikka、PiBot 等上游代码可以整段照抄/移植/原样运行，保留版权与出处即可；LOOM 只写最薄适配层（规则见交接书 §2）。 |
 | 11 | **开发与验收都在 DE-BERO** | 在 DE-BERO 独立容器里模拟用户环境开发、跑测试、做验收，不碰用户电脑上的服务、数据和全局配置。Windows 包由 GitHub 镜像仓库的 Actions 多构建一份（`windows-package.yml`），Bero 走通后再出 Windows 版。 |
+| 13 | **运行端派活直接用 cospan** | 主助手/Factory 把活交给 Codex、DSH 时，设备上的执行层直接用 cospan（MIT）的 job 协议与驱动：send / wait / observe（≤8 KiB）/ continue / result / cancel，后台独立 worker，原生 CLI 无头调用，运行前后 git 差异作为改动证据。事实仍只记在 Core；cospan 自己的 `~/.cospan` 状态只是设备本地缓存。它的 claude、agy 驱动不启用。开发 LOOM 时也用它在 Bero 上派 Codex/DSH 工兵。 |
 | 12 | **最终跑在云上** | 终态是云端：Linux Core + Web 登录 + 各设备 LOOM Node 连上来。DE-BERO 上的部署就是云端形态的第一版，所以 Core 不得依赖 Windows 本机路径或桌面进程。 |
 
 ## 2. 架构图
@@ -108,7 +109,7 @@ flowchart TB
 | **每 Bot 能力（四能力）** | PiBot `host-core/plugins/manager.js`（内容指纹与授权指纹分开）、`capabilities/skill.js`、`capabilities/mcp.js`、`turn-sync.js`（prepare/confirm/restore）、`third-party/pi-skills.js` | DSH 原生 Hook / Profile；Mikka `packages/daemon/src/agents/run-context.ts`（冻结 Skill 快照） | `member_capability.rs`、`skill_projection.rs`、`mcp*.rs`、`local_hook.rs`、`resources/dsh-hook-executor` | 保存选择 / 设备准备 / 实际生效 / 明确失败四态分开显示；Hook 回归 DSH 原生 |
 | **人格 / 记忆 / 学习** | PiBot `host-core/bot-soul.js`、`bot-prompt.js`、`bot-learning.js`、`hindsight-*.js`、`plugins/hindsight`；Mikka `lib/profile/memory.ts`、`facts.ts`、`provenance.ts` | agent-purge 的 Persona 解析（**不含**其 DSH 审批/沙箱 Hook） | `memory.rs`、`memory_retrieval.rs` | 记忆按 Workspace 隔离 + 账号级画像；Persona 绑定写进 Run 快照 |
 | **主助手（Pi + Pi Purge）** | Pi 原生 JSONL RPC 与受管包；Pi Purge 上游 `extensions/pi-purge.ts` 原样加载；PiBot `host-core/runtime.js`（Pi 会话运行方式） | Pi `pi-mcp`、`pi-durable`（仅 Pi 内部评估） | `embedded_pi.rs`、`pi.rs`、`crates/loom-pi-launcher`、`pi/host.rs` | Bot 默认绑定、每 Run 激活回执；删掉模拟上游的桥接层 |
-| **其余三个运行端** | DSH 官方 Host / Cordis / ACP；Codex app-server | ACP Rust SDK | `dsh.rs`、`codex.rs`、`claude.rs`、`agent_runtime_adapter.rs` | 只做 Adapter；Claude Code 只做发现、标为禁用 |
+| **其余三个运行端** | DSH 官方 Host / Cordis / ACP；Codex app-server；**cospan** `src/drivers/{codex,dsh}.mjs`、`job-worker.mjs`、`job-store.mjs`、`observation.mjs`、`envelope.mjs`（改动差异）、`contract-check.mjs`（零 token 校验 CLI 契约）、`mcp/tools.mjs` | ACP Rust SDK | `dsh.rs`、`codex.rs`、`claude.rs`、`agent_runtime_adapter.rs` | 只做 Adapter：Rust 侧把 Run 交给设备上的 cospan worker 并把 job 状态/差异写回 Core；Claude Code 只做发现、标为禁用 |
 | **设备 / 电脑** | PiBot `host-core/device-link.js`、`relay-*.js`、`shower-*.js`（虚拟屏）、`cua-*.js`；Mikka `packages/daemon/src/device-gateway.ts`、`outbox.ts`、`lib/computer/store.ts`（接管/交还租约） | DeskFleet 终端/桌面通道、MindFS 文件/Relay、UFO³ 设备画像、AgentDock 手感 | `crates/loom-node`（配对、主动连接、代次、心跳、Workspace/Computer RPC）、`rovai-web/src/computer/node_provider.rs` | **loom-node 保留不重做**；按 PiBot/Mikka 补缺的能力（虚拟屏、接管租约），不移植 WebRTC 整套 |
 | **模型** | 现有 Octopus 等服务 | — | `runtime_custom_api.rs` | 不另建模型代理 |
 | **企业（以后）** | AgenTeam、MOVO | — | — | 个人版不做 |
@@ -180,6 +181,7 @@ flowchart TB
 | **DeskFleet** | 设备零件 | 终端 PTY、文件、桌面通道里能直接接进 loom-node 的组件 | daemon/ACP Agent 分层、人类接管手感 | 整套 WebRTC 替换 loom-node |
 | **MindFS** | 设备零件 | 文件/终端/Relay 组件可直接接 | 设备工具与 Agent Runtime 区分 | 替换设备层 |
 | **UFO³ Galaxy** | 规划零件 | 设备画像（Registry/Manager）模块 | Constellation DAG 拆解与调度解耦 | 第二套调度 |
+| **cospan** | 运行端派活 | job 协议（send/wait/observe/continue/result/cancel）、codex/dsh 驱动、独立 worker、进程树追踪、git 差异证据、零 token CLI 契约检查、stdio MCP 工具形态，原样用 | DSH 侧边栏看板的展示方式 | claude、agy 驱动；把 `~/.cospan` 当事实源；它的 SSH 跨机路线（LOOM 用 Node 连接） |
 | **AgentDock** | 电脑操作 | — | 本机电脑操作的工具形态与手感 | — |
 | **ROVAI** | 迁移素材 | 原有核心与页面、Team/Thread/Mission/Artifact 数据迁移 | 实用交互 | 改动已定的 loom-native UI |
 | **AgenTeam · MOVO** | 企业版 | 组织/岗位/配额/审计、MOVO 的 DSH 受管组合（企业版时直接用） | — | 个人版先做企业控制面 |

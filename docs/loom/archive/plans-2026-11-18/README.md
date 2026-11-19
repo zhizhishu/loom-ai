@@ -12,3 +12,5 @@
 | `mindkit-handoff-2026-11-13.md`、`mindkit-handoff-2026-11-18.md`、`MASTER-HANDOFF-2026-10-28.md` | 各次交接书 |
 | `plan-b-a-controls-b-2026-11-01.md`、`ultimate-workspace-plan.md`、`control-plane.md` | 更早的拓扑方案与控制面看板 |
 | `research/` | 架构讨论稿、Ports 提案、Runtime/能力提案、Persona/Memory 安全实验、Rules 笔记 |
+
+- `LOOM-overview-legacy.md`：原仓库根 `LOOM.md`（以 ACCP 为中心的早期总览），2026-11-18 由 `docs/loom/LOOM-ARCHITECTURE.md` 取代。
