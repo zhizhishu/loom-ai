@@ -29,7 +29,9 @@
 //!   runtime, the one local device, the granted scope and the reviewed configuration
 //!   revision. A request body can never supply any of it (`GrantBody` denies unknown
 //!   fields), and every tool call re-reads the live Core state instead of trusting the
-//!   stored stamp.
+//!   stored stamp. That re-read includes the member itself, so the grant stops serving as
+//!   soon as the reviewed member is removed, moved off this Host, or switched to another
+//!   runtime — including `pi` before its explicit opt-in.
 //! * The tool surface is the same closed five Mikka's driver exposes, mapped one to one:
 //!   `get_desktop_state`→[`Tool::Screenshot`], `click`→[`Tool::MouseClick`],
 //!   `type_text`→[`Tool::Text`], `press_key`→[`Tool::Key`], `scroll`→[`Tool::Wheel`].
@@ -304,10 +306,19 @@ pub(crate) struct AssistantInfo {
 }
 
 fn assistant_admissible(info: &AssistantInfo) -> Result<(), &'static str> {
+    assistant_admissible_with(
+        info,
+        pi_mcp_opt_in(std::env::var(PI_COMPUTER_MCP_ENV).ok().as_deref()),
+    )
+}
+
+/// Admission with the Pi opt-in passed in, so a test can assert both sides without
+/// mutating this process's environment.
+fn assistant_admissible_with(info: &AssistantInfo, pi_opt_in: bool) -> Result<(), &'static str> {
     if info.removed {
         return Err("computer_agent_assistant_removed");
     }
-    if !runtime_supported(&info.adapter) {
+    if !runtime_supported_with(&info.adapter, pi_opt_in) {
         return Err("computer_agent_runtime_unsupported");
     }
     if !info.target_local {
@@ -316,6 +327,53 @@ fn assistant_admissible(info: &AssistantInfo) -> Result<(), &'static str> {
         return Err("computer_agent_target_unsupported");
     }
     Ok(())
+}
+
+/// Is the grant still backed by the member it was minted for?
+///
+/// Mikka reads the current authority from persisted ownership before every driver
+/// invocation (`lib/computer/local-authority.ts`); nothing in a run or a tool call may
+/// stand in for that read. LOOM therefore re-reads the member on every call and requires
+/// the same decision the grant was minted under: still admitted, and still the exact
+/// runtime recorded in the authority. A member switched to another runtime — in
+/// particular to `pi` while the instance has not opted in through
+/// [`PI_COMPUTER_MCP_ENV`] — is refused with the live admission code, so a grant created
+/// before the switch can never outlive it.
+fn authority_holds(recorded: &Authority, current: &AssistantInfo) -> Result<(), &'static str> {
+    authority_holds_with(
+        recorded,
+        current,
+        pi_mcp_opt_in(std::env::var(PI_COMPUTER_MCP_ENV).ok().as_deref()),
+    )
+}
+
+/// The same decision with the Pi opt-in passed in, so the switch to `pi` can be asserted
+/// from both sides without touching this process's environment.
+fn authority_holds_with(
+    recorded: &Authority,
+    current: &AssistantInfo,
+    pi_opt_in: bool,
+) -> Result<(), &'static str> {
+    assistant_admissible_with(current, pi_opt_in)?;
+    if current.adapter != recorded.runtime {
+        // The identity moved: this grant's definition, scope and consent were reviewed for
+        // the old runtime, so it is not this grant any more — even when the new runtime is
+        // admitted (for example `deepseek-harness`), and even when Pi has opted in.
+        return Err("computer_agent_runtime_unsupported");
+    }
+    Ok(())
+}
+
+/// The live member gate `rpc` runs before anything else touches Core or the device.
+///
+/// The read itself may fail (`computer_agent_assistant_unknown` and friends); that is a
+/// fail-closed refusal, not proof the grant is gone, so the caller distinguishes it from an
+/// actual [`authority_holds`] refusal before deciding to retire the grant.
+async fn admit_live_authority(mcp: &dyn McpOps, grant: &Grant) -> Result<(), &'static str> {
+    let current = mcp
+        .assistant(grant.owner_id().to_owned(), grant.authority.bot_id.clone())
+        .await?;
+    authority_holds(&grant.authority, &current)
 }
 
 /// Host-owned configuration. Both paths are absolute and come from the Host process
@@ -1946,6 +2004,22 @@ pub(crate) async fn rpc(
     // Housekeeping is cheap because it only walks already-due grants.
     state.agents.retire_due(&state.computer, now).await;
 
+    // Current member state, not the stamp recorded at grant time: a runtime switch, a
+    // removed member or a new execution target revokes this grant before any OS call. This
+    // is the gate that keeps a grant minted for Codex/DSH from serving after the member is
+    // switched to Pi without the explicit opt-in.
+    match admit_live_authority(state.agents.mcp.as_ref(), &grant).await {
+        Ok(()) => {}
+        // The member could not be read at all: fail closed without claiming a revocation.
+        Err(code) if code == "computer_agent_assistant_unknown" => {
+            return rpc_error(&body.request_id, code);
+        }
+        Err(code) => {
+            let _ = try_retire(&state, &grant).await;
+            return rpc_error(&body.request_id, code);
+        }
+    }
+
     // Current Core state, not the stored stamp: a Core-side disable, unassign or definition
     // replacement revokes an active grant before any OS call is admitted.
     match state
@@ -2345,7 +2419,8 @@ mod tests {
     struct FakeMcp {
         digests: Mutex<Vec<String>>,
         calls: Mutex<Vec<(&'static str, Value)>>,
-        assistant: AssistantInfo,
+        /// What `assistant()` reports, i.e. the member as Core currently holds it.
+        assistant: Mutex<AssistantInfo>,
         fail_enable: AtomicBool,
         fail_delete: AtomicBool,
         /// What `server()` reports. `None` means "absent from the configuration".
@@ -2357,12 +2432,12 @@ mod tests {
             Arc::new(Self {
                 digests: Mutex::new((1..=16).map(|n| format!("{:064x}", n)).collect()),
                 calls: Mutex::new(Vec::new()),
-                assistant: AssistantInfo {
+                assistant: Mutex::new(AssistantInfo {
                     // The real wire value of `AdapterKind::ClaudeCodeCli`.
                     adapter: "claude-code-cli".to_owned(),
                     removed: false,
                     target_local: true,
-                },
+                }),
                 fail_enable: AtomicBool::new(false),
                 fail_delete: AtomicBool::new(false),
                 current: Mutex::new(None),
@@ -2375,6 +2450,15 @@ mod tests {
                 assigned: assigned.iter().map(|id| (*id).to_owned()).collect(),
                 definition: definition.to_owned(),
             });
+        }
+        /// Publish what a later `assistant()` read sees: the reviewed member after the user
+        /// changed its runtime, its execution target, or removed it.
+        fn see_member(&self, adapter: &str, target_local: bool, removed: bool) {
+            *self.assistant.lock().unwrap() = AssistantInfo {
+                adapter: adapter.to_owned(),
+                removed,
+                target_local,
+            };
         }
         fn next_digest(&self) -> String {
             let mut digests = self.digests.lock().unwrap();
@@ -2406,7 +2490,7 @@ mod tests {
             _agent_id: String,
         ) -> BoxFuture<'static, Result<AssistantInfo, &'static str>> {
             self.record("assistant", json!({}));
-            let info = self.assistant.clone();
+            let info = self.assistant.lock().unwrap().clone();
             Box::pin(async move { Ok(info) })
         }
         fn create(
@@ -2502,6 +2586,7 @@ mod tests {
         entered: Mutex<mpsc::Sender<()>>,
         proceed: Mutex<mpsc::Receiver<()>>,
         inputs: AtomicU64,
+        captures: AtomicU64,
     }
 
     impl BlockingProvider {
@@ -2520,6 +2605,7 @@ mod tests {
                 entered: Mutex::new(entered),
                 proceed: Mutex::new(proceed),
                 inputs: AtomicU64::new(0),
+                captures: AtomicU64::new(0),
             })
         }
     }
@@ -2529,6 +2615,7 @@ mod tests {
             Ok(self.device.clone())
         }
         fn capture(&self, _max_width: u32, _max_height: u32) -> Result<Frame, computer::Failure> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
             Ok(Frame {
                 png: {
                     let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -3690,6 +3777,116 @@ mod tests {
         .expect("an expired grant must not type");
         assert_eq!(late.code, "computer_agent_grant_expired");
         assert_eq!(provider.inputs.load(Ordering::SeqCst), 0);
+    }
+
+    /// The grant's authority is re-read from the live member on every call (upstream reads
+    /// current ownership before each driver invocation). A grant minted for Codex/DSH
+    /// therefore cannot keep serving after the member is switched to Pi without
+    /// `LOOM_COMPUTER_AGENT_PI_MCP=1`: the call is refused and neither a capture nor a
+    /// synthetic input reaches the device.
+    #[test]
+    fn a_runtime_switch_after_the_grant_is_refused_before_any_os_call() {
+        fn fresh() -> (Arc<Computer>, Arc<BlockingProvider>) {
+            let (entered, _entered_rx) = mpsc::channel();
+            let (_proceed_tx, proceed) = mpsc::channel::<()>();
+            let provider = BlockingProvider::new(entered, proceed);
+            let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
+            let computer = Arc::new(Computer::with_test_provider(provider.clone(), {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            }));
+            (computer, provider)
+        }
+
+        let (sessions, owner, _token) = browser();
+        let mut grant = grant_for(&sessions, &owner, wall_clock() + 60_000, false);
+        // Minted for the runtime the member actually ran; both are admitted without the Pi
+        // opt-in, so this fixture never depends on the process environment.
+        Arc::get_mut(&mut grant).unwrap().authority.runtime = "codex-cli".to_owned();
+        let (computer, provider) = fresh();
+        let fake = FakeMcp::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let counters = || {
+            (
+                provider.captures.load(Ordering::SeqCst),
+                provider.inputs.load(Ordering::SeqCst),
+            )
+        };
+        // The same order `rpc` uses: the live member gate first, then `run_tool`.
+        let attempt = |tool: Tool, request_id: &str| -> Result<Value, &'static str> {
+            runtime.block_on(admit_live_authority(fake.as_ref(), &grant))?;
+            let arguments = match tool {
+                Tool::Screenshot => json!({}),
+                _ => json!({"key": "enter"}),
+            };
+            run_tool(&computer, &sessions, &grant, tool, request_id, arguments)
+                .map_err(|failure| failure.code)
+        };
+
+        // 1. The member is unchanged, so the grant still captures and types.
+        fake.see_member("codex-cli", true, false);
+        assert!(attempt(Tool::Screenshot, "live-shot-1").is_ok());
+        assert!(attempt(Tool::Key, "live-key-1").is_ok());
+        assert_eq!(
+            counters(),
+            (1, 1),
+            "a healthy grant really reaches the device"
+        );
+        let healthy = counters();
+
+        // 2. Switched to Pi: refused on the real read-then-decide path, whether or not the
+        //    instance opted Pi in, and nothing reaches the device.
+        fake.see_member("pi", true, false);
+        for (tool, request_id) in [(Tool::Screenshot, "live-shot-2"), (Tool::Key, "live-key-2")] {
+            assert_eq!(
+                attempt(tool, request_id).err(),
+                Some("computer_agent_runtime_unsupported"),
+                "{tool:?}"
+            );
+        }
+        assert_eq!(
+            counters(),
+            healthy,
+            "a refused grant must not reach the device"
+        );
+
+        // 3. With the opt-in passed in explicitly, both sides are still refused: the
+        //    identity moved, so this definition/scope/consent is not this grant any more.
+        let pi_member = AssistantInfo {
+            adapter: "pi".to_owned(),
+            removed: false,
+            target_local: true,
+        };
+        for pi_opt_in in [false, true] {
+            assert_eq!(
+                authority_holds_with(&grant.authority, &pi_member, pi_opt_in).err(),
+                Some("computer_agent_runtime_unsupported"),
+                "pi_opt_in={pi_opt_in}"
+            );
+        }
+        // Another admitted runtime is not this grant either.
+        fake.see_member("deepseek-harness", true, false);
+        assert_eq!(
+            attempt(Tool::Key, "live-key-3").err(),
+            Some("computer_agent_runtime_unsupported")
+        );
+
+        // 4. A removed member and one moved off this Host are refused the same way.
+        fake.see_member("codex-cli", true, true);
+        assert_eq!(
+            attempt(Tool::Key, "live-key-4").err(),
+            Some("computer_agent_assistant_removed")
+        );
+        fake.see_member("codex-cli", false, false);
+        assert_eq!(
+            attempt(Tool::Key, "live-key-5").err(),
+            Some("computer_agent_target_unsupported")
+        );
+        // 5. Every refusal happened before the device.
+        assert_eq!(counters(), healthy, "no refused call may reach the device");
     }
 
     #[test]
