@@ -2,7 +2,7 @@
 //! SQLite ledger for [`loom_protocol::v2_coordinator_replay::EventEnvelope`]
 //! streams, one Mission per stream.
 //!
-//! Scope (P1-C, `docs/loom/LOOM-V2-P1B-ACCEPTANCE-HANDOFF-2026-11-15.md` 交接):
+//! Scope (P1-C, `docs/loom/archive/plans-2026-11-18/LOOM-V2-P1B-ACCEPTANCE-HANDOFF-2026-11-15.md` 交接):
 //! - **One table in the existing single Core SQLite database**: this module only
 //!   defines the [`MIGRATION_SQL`] constant and the read/append functions over
 //!   it. It does not touch any existing table, does not run the migration

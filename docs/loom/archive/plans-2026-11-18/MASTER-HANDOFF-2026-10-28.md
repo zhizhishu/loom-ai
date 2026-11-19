@@ -1,6 +1,6 @@
 # LOOM 主交接书（2026-10-28，给下一位接手 Agent）
 
-> **历史归档 / HISTORICAL_HANDOFF_NOT_UNIQUE_ENTRY / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](archive/legacy-plans-2026-11-15/README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
+> **历史归档 / HISTORICAL_HANDOFF_NOT_UNIQUE_ENTRY / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](../legacy-plans-2026-11-15/README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
 
 > **这份是唯一入口。** 其余 `docs/loom/*.md` 是历史与原始计划，冲突时以本文为准。
 > 本文所有数字都是主管在 bero / 本机亲跑出来的，不是工兵自报。跑不出来的不要信。

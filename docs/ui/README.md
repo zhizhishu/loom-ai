@@ -11,7 +11,7 @@ last_updated: 2026-10-25
 
 **当前默认界面**是 `apps/desktop/src/renderer/src/loom-native/` 独立组件树。Mikka/PiBot 方向已由用户选择；`native.css` + `product.css` 拥有新界面样式，根 `DESIGN.md` 拥有视觉原则。不得把以下历史 Rovai 页面/样式重新包进新工作台。
 
-当前用户级资料与能力、群聊、工作位置、权限及事实图接口见 [产品接口](../loom/productization-interfaces-2026-11-13.md)，阶段验收见 [实施与交接](../../LOOM-IMPLEMENTATION.md)。底层数据、审批、冻结与原生运行语义仍遵循 Core 合同；旧 UI 文档保留其数据/交互参考，不代表新界面已覆盖所有旧页面。
+当前用户级资料与能力、群聊、工作位置、权限及事实图接口见 [产品接口](../loom/archive/plans-2026-11-18/productization-interfaces-2026-11-13.md)，阶段验收见 [实施与交接](../../LOOM-IMPLEMENTATION.md)。底层数据、审批、冻结与原生运行语义仍遵循 Core 合同；旧 UI 文档保留其数据/交互参考，不代表新界面已覆盖所有旧页面。
 
 ## 历史 Rovai 组件规范
 

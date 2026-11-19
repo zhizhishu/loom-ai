@@ -2,7 +2,7 @@
 
 > **ARCHIVED / READ-ONLY。** 本目录存放从 `docs/loom/` 顶层实际移入的过时计划、交接、静态看板和旧研究证据。旧文本中的「当前」「唯一入口」「已授权开工」只代表其历史时点，不能指导现阶段开发。
 > 2026-11-15 曾另保存 16 份原字节 SHA256 快照于 `_artifacts/loom-v2-planning-archive-20261115/`；原始 [manifest.json](manifest.json) 的当时路径/哈希不重写。2026-11-16 本机归档另保存所有整理前字节、链接变更和迁移记录于 `_artifacts/loom-doc-consolidation-20261116/`。少量含未提交 WIP、源码引用的旧文件仍在原路径，带退役含义，但并非当前权威。
-> **权威位置**：[文档入口](../../README.md) → [当前实施 E0–E7](../../../../LOOM-IMPLEMENTATION.md)。原 [LOOM V2 蓝图](../../LOOM-V2-MASTER-PLAN.md) 现在只作设计基线。
+> **权威位置**：[文档入口](../../README.md) → [当前实施 E0–E7](../../../../LOOM-IMPLEMENTATION.md)。原 [LOOM V2 蓝图](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md) 现在只作设计基线。
 
 ## A. 旧执行线路 —— 已从「未来施工权威」退役
 
@@ -17,18 +17,18 @@
 | [loom-mikka-first-plain-language-2026-11-15.md](loom-mikka-first-plain-language-2026-11-15.md) | 旧用户说明 | SUPERSEDED：UI 愿景保留，实施说明非现行 |
 | [loom-mikka-first-device-invocation-seam-2026-11-15.md](loom-mikka-first-device-invocation-seam-2026-11-15.md) | W12 证明旧 Run/CLI 与证据运输耦合 | KEEP_AS_FINDING：架构问题仍有价值，旧两文件补丁路线失效 |
 | [pi-work-orders-architecture-proposal-2026-11-15.md](pi-work-orders-architecture-proposal-2026-11-15.md) | 旧 Pi 工兵研究/待授权任务集 | SUPERSEDED：不沿用旧写 owner |
-| [ultimate-workspace-plan.md](../../ultimate-workspace-plan.md) | 更早的四运行端完整工作空间目标 | HISTORICAL_PLAN：当前实现事实以 v1.72 为准，未来路线用 MASTER |
-| [MASTER-HANDOFF-2026-10-28.md](../../MASTER-HANDOFF-2026-10-28.md) | 2026-10-28 曾声称唯一交接入口 | SUPERSEDED：仅当时历史恢复路径 |
-| [plan-b-a-controls-b-2026-11-01.md](../../plan-b-a-controls-b-2026-11-01.md) | 旧单脑 A→B 远程计划 | SUPERSEDED：Hybrid 模式不再强制 A 单脑/B 纯手 |
+| [ultimate-workspace-plan.md](../plans-2026-11-18/ultimate-workspace-plan.md) | 更早的四运行端完整工作空间目标 | HISTORICAL_PLAN：当前实现事实以 v1.72 为准，未来路线用 MASTER |
+| [MASTER-HANDOFF-2026-10-28.md](../plans-2026-11-18/MASTER-HANDOFF-2026-10-28.md) | 2026-10-28 曾声称唯一交接入口 | SUPERSEDED：仅当时历史恢复路径 |
+| [plan-b-a-controls-b-2026-11-01.md](../plans-2026-11-18/plan-b-a-controls-b-2026-11-01.md) | 旧单脑 A→B 远程计划 | SUPERSEDED：Hybrid 模式不再强制 A 单脑/B 纯手 |
 | [single-brain-device-implementation-handoff-2026-11-15.md](single-brain-device-implementation-handoff-2026-11-15.md) | 旧纯 Device WIP 和测试 | EVIDENCE_ONLY：源文件/单测/回执可复用，设计不再是不可违背原则 |
 
 ## B. 研究、已有实现事实——不是当前 V2 待办，但不应丢失
 
 | 快照 | 说明 |
 |---|---|
-| [architecture-discussion-master-plan-2026-11-15.md](../../research/architecture-discussion-master-plan-2026-11-15.md) | 旧 50KB 深度源码调查，RuntimePort、Capability Registry、设备事实源等仍有研究价值，不从这里复制含过时授权的施工结论 |
+| [architecture-discussion-master-plan-2026-11-15.md](../plans-2026-11-18/research/architecture-discussion-master-plan-2026-11-15.md) | 旧 50KB 深度源码调查，RuntimePort、Capability Registry、设备事实源等仍有研究价值，不从这里复制含过时授权的施工结论 |
 | [ultimate-interface-contracts.md](ultimate-interface-contracts.md) | 描述 v1 受管 Pi/四端和四能力的实际或候选接口边界；V2 可重新设计但迁移必须读取 |
-| [productization-interfaces-2026-11-13.md](../../productization-interfaces-2026-11-13.md) | 已完成的 loom-native UI service 与旧 Core 命令形状，**仍是理解当前安装版本的事实参考**，不能在 V2 尚未发布时把 v1.72 当前运行能力判为失效 |
+| [productization-interfaces-2026-11-13.md](../plans-2026-11-18/productization-interfaces-2026-11-13.md) | 已完成的 loom-native UI service 与旧 Core 命令形状，**仍是理解当前安装版本的事实参考**，不能在 V2 尚未发布时把 v1.72 当前运行能力判为失效 |
 
 ## C. 归档和留存原则
 

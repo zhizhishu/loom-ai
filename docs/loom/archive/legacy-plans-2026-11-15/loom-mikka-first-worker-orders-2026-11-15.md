@@ -1,6 +1,6 @@
 # LOOM Mikka-first 开工工单（Pi Skill 可派发版）
 
-> **历史归档 / RETIRED_WORK_ORDERS / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../../LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
+> **历史归档 / RETIRED_WORK_ORDERS / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
 
 > **最新用户授权：允许实施。** 旧 `pi-work-orders-architecture-proposal-2026-11-15.md` 的 NOT AUTHORIZED 属历史讨论状态。工兵仍遵守本文件安全与 owner 范围：Windows 本机不运行 Claude Code，不动原 64851/原生产 DB，不读/回显 key，不全仓 reset/clean。
 

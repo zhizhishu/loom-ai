@@ -1,6 +1,6 @@
 # LOOM Mikka-first 实时执行看板（Mindkit / AgentDock）
 
-> **历史归档 / OLD_STATIC_PROGRESS / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../../LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
+> **历史归档 / OLD_STATIC_PROGRESS / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
 
 > 可视化：直接用浏览器打开 [离线 HTML 进度看板](loom-mikka-first-progress-2026-11-15.html)。该板是**阶段性人工更新的项目进度快照**，不是实时 WebSockets。每次交接同步 `TASK.md`；实时 Pi 进度通过受管 AgentDock session/本地 Pi Skill `status` 查。运行端口、PID、临时进程状态不可当永久稳定事实。
 
@@ -70,4 +70,4 @@ Next owner=...
 - [工兵任务卡](loom-mikka-first-worker-orders-2026-11-15.md)
 - [验收矩阵](loom-mikka-first-acceptance-2026-11-15.md)
 - [用户通俗版](loom-mikka-first-plain-language-2026-11-15.md)
-- [旧研究计划（历史）](../../research/architecture-discussion-master-plan-2026-11-15.md)
+- [旧研究计划（历史）](../plans-2026-11-18/research/architecture-discussion-master-plan-2026-11-15.md)

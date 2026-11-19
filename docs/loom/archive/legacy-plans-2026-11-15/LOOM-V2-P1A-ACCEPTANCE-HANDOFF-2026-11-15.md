@@ -2,7 +2,7 @@
 
 > **STATUS: P1_A_E2_ACCEPTED / NON_PRODUCTION**。用户在本轮明确授权正式开工；项目工作根 `C:/Users/echo/Downloads/claude/skill-cli`，产品子目录 `loom/`。本次验收只证明新增四个独立合同/模拟桥的**代码、单元测试和原有 Pi Bundle 离线自检**；**不是**整个 PDF P0–P14 已完成，也不是 E4 真 Pi Purge/跨设备/多 Agent 生产闭环。Root 仅负责合同、测试、Review/验收与 Mindkit，四路代码由真实 Pi Skill 编写和按测试反馈修正。
 
-入口：[唯一总计划](../../LOOM-V2-MASTER-PLAN.md) · [独占文件合同](../../LOOM-V2-P1-FOUR-LANE-SLICE-2026-11-15.md) · [Pi Purge 参考与接入](../../LOOM-V2-PI-PURGE-EXTENSION-PLAN.md) · [当前 LOOM 视觉看板](LOOM-V2-PLANNING-BOARD.html)。真实 Pi Skill 本机 Board：`http://127.0.0.1:8767`。
+入口：[唯一总计划](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md) · [独占文件合同](../plans-2026-11-18/LOOM-V2-P1-FOUR-LANE-SLICE-2026-11-15.md) · [Pi Purge 参考与接入](../plans-2026-11-18/LOOM-V2-PI-PURGE-EXTENSION-PLAN.md) · [当前 LOOM 视觉看板](LOOM-V2-PLANNING-BOARD.html)。真实 Pi Skill 本机 Board：`http://127.0.0.1:8767`。
 
 ## 1. 四路真实 Pi Worker 和 Root 独立审核
 

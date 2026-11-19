@@ -60,7 +60,7 @@ Mikka/PiBot 式安静桌面工作台；轻微半透明材料、明确阅读层�
 
 ## Evidence and State
 
-可验证实现与未完成项统一记录在根 `LOOM-IMPLEMENTATION.md`，用户纠偏区置顶。接口归 `docs/loom/productization-interfaces-2026-11-13.md`。测试夹具、只读截图、真实写入和模型运行分别记账，不混称“端到端全通过”。
+可验证实现与未完成项统一记录在根 `LOOM-IMPLEMENTATION.md`，用户纠偏区置顶。架构与接口归 `docs/loom/LOOM-ARCHITECTURE.md`，验收标准归 `docs/loom/LOOM-ACCEPTANCE.md`。测试夹具、只读截图、真实写入和模型运行分别记账，不混称“端到端全通过”。
 
 ## Accessibility
 

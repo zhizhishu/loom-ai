@@ -4,7 +4,7 @@
 
 > **状态：DISCUSSION_PROPOSAL / v0.1，待用户与工程合同评审。不是当前 Rovai v1.72 Contract、不是实现完成声明。**
 > 依据：用户认可的《LOOM 深度架构研究与正式开工计划》27 页 PDF（尤其第 1–17、18–23 页）；本地源码快照 Mikka `d59c85cb...`、ROVAI `f5f4cb26...`、ACCP `77f05778...`、PiBot `8b9f3d7a...`、Pi `ddaa0a03...`、DSH `39163dd3...`、AgenTeam `d12b5076...`、MOVO `e16174ac...`、DeskFleet `098485a4...`、UFO `eae3c0a8...`。固定 HEAD **不是**远端最新声明。
-> 与已有 [完整工作空间接口](../archive/legacy-plans-2026-11-15/ultimate-interface-contracts.md)、[产品化接口](../productization-interfaces-2026-11-13.md)并存：旧文描述已有产品/旧适配；**V2 允许替换领域模型和旧接口，不以兼容旧 API 为最高目标**。保留用户数据、迁移/回滚和当前 64851 服务，UI 视觉/配色/使用习惯不重做。新接口只有评审采纳并更新 canonical docs/architecture、docs/contracts、版本决策后才成为权威。
+> 与已有 [完整工作空间接口](../../legacy-plans-2026-11-15/ultimate-interface-contracts.md)、[产品化接口](../productization-interfaces-2026-11-13.md)并存：旧文描述已有产品/旧适配；**V2 允许替换领域模型和旧接口，不以兼容旧 API 为最高目标**。保留用户数据、迁移/回滚和当前 64851 服务，UI 视觉/配色/使用习惯不重做。新接口只有评审采纳并更新 canonical docs/architecture、docs/contracts、版本决策后才成为权威。
 
 ## 一、各项目只学习擅长的那一层
 

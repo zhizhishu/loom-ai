@@ -1,6 +1,6 @@
 # LOOM V2 本轮续建：授权、UI 责任与可恢复证据
 
-> **Latest independently verified increment (2026-11-16):** [Real upstream execution and delivery acceptance](../../LOOM-LIVE-ACCEPTANCE-2026-11-16.md). This supersedes older claims that E4 is entirely fake-provider-only or that no candidate was pushed; it does not sign off full E4-E7. User has explicitly re-authorized current implementation.
+> **Latest independently verified increment (2026-11-16):** [Real upstream execution and delivery acceptance](../plans-2026-11-18/LOOM-LIVE-ACCEPTANCE-2026-11-16.md). This supersedes older claims that E4 is entirely fake-provider-only or that no candidate was pushed; it does not sign off full E4-E7. User has explicitly re-authorized current implementation.
 
 
 ## 【2026-11-16 · 用户最终品牌决定｜原上传图锁定｜本机 Base/Pi 优先】
@@ -10,7 +10,7 @@
 - **用户明确最终拍板**：**上图就是 LOOM 品牌**，不是“临时图”、不是“待讨论方案”；任何开发者或工兵**不得再质疑、换成自创 Logo 或把旧机器人当默认品牌**。用户认可整体 Mikka/LOOM 三栏 UI，不要求重做布局。上一轮助手错误声称“无法写入本地”、还否定过用户图片；事实是 AgentDock 有本地写文件权限，必须直接落盘、尊重用户决定。
 - **素材已实际放入 Windows 本地仓库**：`docs/loom/assets/loom-brand-user-approved-256.webp`，真实校验为 WebP、256 × 256、5,026 字节、SHA256 `9bd461c1f5a44ebb0452297de50f5d713026bc7c417a7eba7ec0d67f14558d7a`。它是本轮用户原图的**缩放/压缩工作副本，非逐字节原图**。原上传的 `DA3A8DC1-579B-44C7-8C1B-A9082072277A.png` 规格 1254 × 1254 / 1,797,701 字节 / SHA256 `eff1aa63e7bdb3ebc5b1a58c3048bfa051553078a159f337c45cbe67f8a71d04`；不准把小图混称原 PNG 或悄悄换其它视觉素材。当前插图有实际文件可以打开。
 - **后续最小品牌替换工单（尚未改 UI）**：① Web `apps/web/public/loom-favicon.svg` + `apps/web/index.html` 的 tab 图标；② Desktop `apps/desktop/src/renderer/public/loom-favicon.svg` + `apps/desktop/src/renderer/index.html` 的 tab 图标；③ `apps/desktop/src/renderer/src/loom-native/Avatar.tsx` 的 `LoomMark` 左侧品牌机器人（`apps/web/src/WebLogin.tsx` 也复用此标识）。全部用**用户这张同图**，不引入另一卡通脸；保持现有尺寸、三栏布局、深浅色、点击与键盘交互。用户自行设置的个人助手头像 `MemberAvatar.avatarRef` 不得无差别覆盖。根仓库源码**尚未替换以上图标**，实时 64851 预览也没有热改；不能拿“已交接”冒充“已上线”。
-- **开发方式用户要求生效**：先调 AgentDock `agentdock_context`/`workspace_context`，按任务从 `C:/Users/echo/.claude/skills/base/SKILL.md` 读路由并用 `python C:/Users/echo/.claude/tools/base_skill_cli.py route`，再实际用已有的 `agent-browser-cli` / `computer-control` / `fast-context` / `ast-grep` 等匹配工具。小且可验的任务交 `pi-skill 0.5.7` 托管 `run`（在 AgentDock 中 `exec_command(async)`），不再造临时浏览器工具、不用失效的 `start` 伪后台；每轮最多2–3个互斥短工单，Scout/Reviewer只读，Worker先出方案再由 Root 批准文件白名单、最后 Root 独立实测并 `approve`。完整执行约束见 [唯一总计划 K 章](../../LOOM-V2-MASTER-PLAN.md#k-用户品牌标识与本机-basepi-技能开发合同2026-11-16)。
+- **开发方式用户要求生效**：先调 AgentDock `agentdock_context`/`workspace_context`，按任务从 `C:/Users/echo/.claude/skills/base/SKILL.md` 读路由并用 `python C:/Users/echo/.claude/tools/base_skill_cli.py route`，再实际用已有的 `agent-browser-cli` / `computer-control` / `fast-context` / `ast-grep` 等匹配工具。小且可验的任务交 `pi-skill 0.5.7` 托管 `run`（在 AgentDock 中 `exec_command(async)`），不再造临时浏览器工具、不用失效的 `start` 伪后台；每轮最多2–3个互斥短工单，Scout/Reviewer只读，Worker先出方案再由 Root 批准文件白名单、最后 Root 独立实测并 `approve`。完整执行约束见 [唯一总计划 K 章](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md#k-用户品牌标识与本机-basepi-技能开发合同2026-11-16)。
 - **本轮实际动作**：Base Skill 真读/真路由，Pi Scout `a85580b2b5194ad5a98f7ca3b667e762` 完成只读源码定位（Web/Desktop 两套 favicon + `LoomMark`），Root 核对源码路径；原上传角色图的轻量品牌副本确已转入 Windows 项目。没有新品牌设计、没有改 UI 代码、没有中止现用 64851、没有推送 GitHub/Bero、没有触碰日常 DB/旧五处 WIP/全局凭据。下一次实现品牌视觉时以此图和这里的验收标准为唯一准绳，不重新征求风格意见。
 
 ## 【2026-11-16 03:28 UTC · CI-A 本机候选门禁落盘｜未推送、未在 GitHub 跑过】
@@ -24,7 +24,7 @@
 
 ## 【2026-11-16 UTC · 用户确认：GitHub/Bero 云端优先，停止无效重复编译】
 
-- **已纳入唯一总计划**：[LOOM-V2-MASTER-PLAN.md §J](../../LOOM-V2-MASTER-PLAN.md#j-githubbero-优先的施工及验收路线2026-11-16)。后续不是默认全在用户 Win11 编译：GitHub Actions Windows Runner 做固定 commit 的 Host/Web+受管双 Pi+生产 Mikka Electron **隔离 E3** 清洁构建/自动回归；Bero（资源/源代码传输核查后）做 Linux Core、重型回归和云端设备协议；用户 Windows 只保留短增量、Windows DACL/Device、本机 UI 实际可用性与最终真实用户验收。此为**执行策略已写入**，非“现有 GitHub workflow 已接 V2 E3”或“已经推送/部署”。
+- **已纳入唯一总计划**：[LOOM-V2-MASTER-PLAN.md §J](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md#j-githubbero-优先的施工及验收路线2026-11-16)。后续不是默认全在用户 Win11 编译：GitHub Actions Windows Runner 做固定 commit 的 Host/Web+受管双 Pi+生产 Mikka Electron **隔离 E3** 清洁构建/自动回归；Bero（资源/源代码传输核查后）做 Linux Core、重型回归和云端设备协议；用户 Windows 只保留短增量、Windows DACL/Device、本机 UI 实际可用性与最终真实用户验收。此为**执行策略已写入**，非“现有 GitHub workflow 已接 V2 E3”或“已经推送/部署”。
 - **下一项可执行任务 CI-A**：先从本机大量未提交变更审出严格白名单与独立 V2 分支，不得 `git add -A`、不得 main/Release；为 GitHub Windows 2022 新建 V2-only 的 PR/手动测试流程，固定受管 Pi 0.85.1 与 Windows 编译工具链，调用 `scripts/lib/loom-v2-official-host-electron-review.test.mjs`，保存 commit+Host/Pi SHA、完整测试日志、E3真值（scripted Provider，fixture UI 自动点击非真人）与清理情况；不触碰当前 v1.72。接着 CI-B 验证 Bero 实时可用空间/容器/权限，用固定 SHA 在隔离目录进行 Linux Rust 回归；Bero 无准入即用 GitHub Linux Runner，不绕过以前的拒绝。
 - **Pi 派工变更**：Root 每次只开最多 **2–3 条短、互斥、可验收** 工单（2–4分钟目标），Base Skill 路由、Pi Skill 受管执行，单个 Worker 不改总计划/共享 UI；遇超时、跑错方向或重复构建直接收缩范围。Root 亲自监督 Mikka UI/Owner Review，不要求用户中途决定阶段或普通故障。严格记录当前与旧测试差异，不造阶段百分比。
 - **当前真实基线和权限**：本轮此前已由Root在本机签过 E3 1/1正式Host+双真Pi+生产Web/Mikka Electron CDP 审核、fresh Host 和 fresh Web 构建；`E4` 真模型/四运行端四能力、`E5` 实体跨机、`E6` 故障、`E7` 发布**仍未签**。本轮**仅更改计划**，没有执行 GitHub push/Bero 同步、没有触碰用户 DB、64851、旧五处 WIP、全局秘密配置或远端服务。下次操作必须先重新取得独占 Root 租约，再按总计划 J4 检查外传/发布权限。

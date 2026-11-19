@@ -2,7 +2,10 @@
 
 > **REFERENCE_INDEX / 固定源码身份与借鉴边界。** 镜像原位只读，不自动更新。此页不维护实施状态；用户后来批准的受管 Pi Purge 适配/隔离封包与真实验证看 [当前实施](../../LOOM-IMPLEMENTATION.md)，不能用旧研究时点的“未运行”覆盖实测。
 > 所有 40 位 SHA 是通过本机 git rev-parse HEAD 验证的**本地快照**，不是宣称远端 main 最新。未来每次工兵参考必须用下面 pinned commit；URL 只用于溯源，不替代本地源码证据。
-> 总入口 [LOOM V2 MASTER](LOOM-V2-MASTER-PLAN.md)，原始 27 页 PDF《LOOM 深度架构研究与正式开工计划》是用户认可的架构主蓝图；其原文件在当前 ChatGPT 对话附件中，**本地未发现同名 PDF 路径，不能假称已复制到 Windows**。本地 [原 2026-11-15 深度讨论](research/architecture-discussion-master-plan-2026-11-15.md) 作为带源码依据的研究补充而非施工主计划。
+> **2026-11-18 分级（用户决定）**：**Mikka、PiBot 是主体，源码直接复用**；其余条目是参考零件。每层具体用哪个文件见 [LOOM-ARCHITECTURE.md](LOOM-ARCHITECTURE.md) §3。
+> **PiBot 本机镜像注意**：`../_references/pibot` 的当前 checkout 已是 `6741737b8c0f0bfc45b92f1dcb0bb4d074f28666`（2026-11-18 更新），下表锁定的 `8b9f3d7…` 仍在其历史中；工兵引用以下表 pinned commit 为准，要改锁先报 Root。
+>
+> 原总入口 [LOOM V2 MASTER](archive/plans-2026-11-18/LOOM-V2-MASTER-PLAN.md)（已归档），原始 27 页 PDF《LOOM 深度架构研究与正式开工计划》是用户认可的架构主蓝图；其原文件在当前 ChatGPT 对话附件中，**本地未发现同名 PDF 路径，不能假称已复制到 Windows**。本地 [原 2026-11-15 深度讨论](archive/plans-2026-11-18/research/architecture-discussion-master-plan-2026-11-15.md) 作为带源码依据的研究补充而非施工主计划。
 
 ## 一、参考镜像锁定清单与本地目录
 
@@ -31,8 +34,8 @@
 | 优先复用目标 | 上游可直接使用的具体入口 | LOOM 只负责 |
 |---|---|---|
 | **本轮立即优先：Pi / DSH / Pi Purge** | Pi 原生受管包与 JSONL RPC、DSH 官方 Host / Cordis / ACP / Profile / Hook、Pi Purge 原生 `extensions/pi-purge.ts` | 固定包版本、隔离启动、Bot/Run 选择与权限冻结、原生加载/调用回执；不要自写 Agent Loop 或仿制 Purge |
-| **直接试用：DeskFleet / MindFS** | DeskFleet daemon、ACP Agent 与文件/PTY/桌面通道；MindFS 文件/终端/Relay 组件 | 与已有 DevicePort 对接、独立设备配对、Grant/Lease、人类接管、撤销和 OS 边界；先跑受限集成验收，再决定是否需补充代码 |
-| **复用现成机制：Mikka / PiBot / ACCP** | Mikka 的群聊路由、事件唤醒；PiBot 每 Bot 会话与能力管理；ACCP 的 DAG/claim/lease/fencing/review 实现 | 对照既有 Rust Core，优先移植兼容的算法或可独立组件；不得同时运行第二套业务调度/数据库，不能把 UI 私有 overlay 当已公开 |
+| **参考零件：DeskFleet / MindFS**（设备主体是 loom-node，对标 PiBot Host / Mikka daemon） | DeskFleet daemon、ACP Agent 与文件/PTY/桌面通道；MindFS 文件/终端/Relay 组件 | 与已有 DevicePort 对接、独立设备配对、Grant/Lease、人类接管、撤销和 OS 边界；先跑受限集成验收，再决定是否需补充代码 |
+| **主体：Mikka / PiBot**（ACCP 只取防抢不变量） | Mikka 的群聊路由、事件唤醒；PiBot 每 Bot 会话与能力管理；ACCP 的 DAG/claim/lease/fencing/review 实现 | 对照既有 Rust Core，优先移植兼容的算法或可独立组件；不得同时运行第二套业务调度/数据库，不能把 UI 私有 overlay 当已公开 |
 | **按需直接集成：ROVAI / UFO³ / agent-purge** | 原有 Rovai 核心与页面、UFO³ 任务/设备模块、agent-purge 人格解析/恢复模块 | 保持已选 loom-native、Core 唯一授权和本机用户数据；不引入 agent-purge 中绕过审批/沙箱的 Hook |
 | **企业版再用：AgenTeam / MOVO** | 组织/岗位/配额模块及 MOVO 的 DSH 组合服务 | 个人版不先造企业控制面；MOVO 代码许可已统一为 MIT，可直接复用 |
 
@@ -70,13 +73,13 @@ Pi：packages/coding-agent/docs/rpc.md、mcp.md、extensions.md、skills.md；DS
 - URL: https://github.com/ZiChuanLan/agent-purge ，MIT，已固定本机 HEAD **5881e309c5d2bca3eb0cc4125d75f8b573ae5aa0**。本轮只 git clone 研究，**没执行 package、npm、CLI、install、Hook、shim 或 slash**。
 - 源码锚点：lib/personas.mjs（Markdown+frontmatter、选择/版本），lib/activation.mjs（按宿主作用范围），lib/extension.mjs（Pi before_agent_start），lib/dsh.mjs（Cordis Profile/Patch），backends/index.mjs（Codex/Claude 启动参数），lib/restore.mjs（可逆恢复），matrix.json、docs/reference/compatibility.md（作者在特定版本隔离请求体的观察）。
 - **借鉴**：一份人设跨执行端、Off/Append/受控 Replace、每 Bot 不同人格、运行内可观测、配置变更可恢复；转为 **PersonaRegistry + PromptComposer + MemoryScope + 安全实验室**，与 Skill/MCP/Rule/Hook 统一选择页面并列；不劫持全局 CLI Home/PATH/项目 AGENTS.md。
-- **严重风险（已经从本地源码核对）**：当前 lib/dsh.mjs 会剔除 approval:policy / sandbox:policy contexts，并通过 approval/request 触发器自动允许某些工具审批；**不照搬插件，实现窄范围人格适配器且 Core Grant 一律不可被人格改变**。strict 可能让项目 AGENTS/Skills/其他扩展说明消失；不保证 Provider 安全限制消失。详情与未来 T23–T28：[人格/记忆/安全实验方案](research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md)，Schema [六对象](loom-v2-persona-memory-contract.schema.json)。
+- **严重风险（已经从本地源码核对）**：当前 lib/dsh.mjs 会剔除 approval:policy / sandbox:policy contexts，并通过 approval/request 触发器自动允许某些工具审批；**不照搬插件，实现窄范围人格适配器且 Core Grant 一律不可被人格改变**。strict 可能让项目 AGENTS/Skills/其他扩展说明消失；不保证 Provider 安全限制消失。详情与未来 T23–T28：[人格/记忆/安全实验方案](archive/plans-2026-11-18/research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md)，Schema [六对象](loom-v2-persona-memory-contract.schema.json)。
 
 ### ZiChuanLan/pi-purge → Pi 受管系统提示词扩展（已选为产品候选 Extension）
 - 固定源码 https://github.com/ZiChuanLan/pi-purge ，commit **d0196ccfd773b0ed342bd2f25372aff65f1a4a53**，v0.3.0，LICENSE MIT；README 的附加用途/署名说明须在分发时单独审查。Node>=22.19.0，Pi peer>=0.80.0<2；本地 Pi 固定 1.0.4 理论版本匹配，但**未运行兼容性测试**。
 - 实证源码：extensions/pi-purge.ts（session_start 关闭、before_agent_start 替换、registerCommand purge）；README.zh-CN.md、package.json 与 LICENSE。默认 disabled + mode strict；PI_PURGE_SOURCE 仅控制文件来源，不自动开启；Fallback 是第四种开启模式，别丢掉。
 - **LOOM 要借**：原版 Pi 内核完整保留、Pi Purge 可选封包、每 Bot Persona Binding、下一 Run 显式激活、真实 Prompt/RunReceipt；Normal Off/Append，Strict 仅建议隔离 Lab；旧项目 Rules/Skills 不能被静默清除。没有自带长期记忆、多 Agent Coordinator、Core 权限。
-- 详细合同：[LOOM V2 Pi Purge Extension Plan](LOOM-V2-PI-PURGE-EXTENSION-PLAN.md)。本轮只读研究仓库，不执行 pi install/npm/plugin，不把其内部示例 Persona 自动传播到其它 Bot。
+- 详细合同：[LOOM V2 Pi Purge Extension Plan](archive/plans-2026-11-18/LOOM-V2-PI-PURGE-EXTENSION-PLAN.md)。本轮只读研究仓库，不执行 pi install/npm/plugin，不把其内部示例 Persona 自动传播到其它 Bot。
 
 ## 三、研究输出与引用规范
 

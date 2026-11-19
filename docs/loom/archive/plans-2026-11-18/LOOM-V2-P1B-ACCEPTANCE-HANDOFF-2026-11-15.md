@@ -1,6 +1,6 @@
 # LOOM V2 P1-B · 四路工兵 + 真 Pi RPC 首次签收（2026-11-15）
 
-> **P1-B ACCEPTED · E2 PASS、E3 受限 PASS；E4 真 Provider PromptSeen / Bot→Artifact NOT_RUN。** 工作总管根 `C:/Users/echo/Downloads/claude/skill-cli`；子仓 `loom/`。此阶段 Root 验收四路真实 Pi Skill 工兵和两个独立 Pi 0.85.1 Runtime；不是 P0–P14 全产品完成。上一阶段 [P1-A 验收](archive/legacy-plans-2026-11-15/LOOM-V2-P1A-ACCEPTANCE-HANDOFF-2026-11-15.md)，本阶段 [合同](LOOM-V2-P1B-PI-RUNTIME-INTEGRATION-2026-11-15.md)，下一阶段 AgentDock `tsk_a21d75f405171f22` 正持续进入 Core/Runner/UI 真接线。
+> **P1-B ACCEPTED · E2 PASS、E3 受限 PASS；E4 真 Provider PromptSeen / Bot→Artifact NOT_RUN。** 工作总管根 `C:/Users/echo/Downloads/claude/skill-cli`；子仓 `loom/`。此阶段 Root 验收四路真实 Pi Skill 工兵和两个独立 Pi 0.85.1 Runtime；不是 P0–P14 全产品完成。上一阶段 [P1-A 验收](../legacy-plans-2026-11-15/LOOM-V2-P1A-ACCEPTANCE-HANDOFF-2026-11-15.md)，本阶段 [合同](LOOM-V2-P1B-PI-RUNTIME-INTEGRATION-2026-11-15.md)，下一阶段 AgentDock `tsk_a21d75f405171f22` 正持续进入 Core/Runner/UI 真接线。
 
 ## 真实完成的可复验功能
 

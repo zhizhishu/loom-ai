@@ -89,4 +89,4 @@ Loading / Empty / Error / Unsupported / Unsaved / Submitting / Conflict / Unknow
 
 ## 文档分工
 
-产品定义归 `PRODUCT.md`；实施状态和用户纠偏归 `LOOM-IMPLEMENTATION.md`；接口/Runtime兼容归 `docs/loom/productization-interfaces-2026-11-13.md`；Core权限、数据、冻结和恢复归对应 Contracts。历史Rovai UI文档仅供尚未迁移表面的参考，不得推翻当前已选视觉世界。
+产品定义归 `PRODUCT.md`；实施状态和用户纠偏归 `LOOM-IMPLEMENTATION.md`；架构、接口与 Runtime 边界归 `docs/loom/LOOM-ARCHITECTURE.md`；Core权限、数据、冻结和恢复归对应 Contracts。历史Rovai UI文档仅供尚未迁移表面的参考，不得推翻当前已选视觉世界。

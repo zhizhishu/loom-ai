@@ -2,7 +2,7 @@
 
 > **CURRENT IMPLEMENTATION STATUS · 2026-11-17 续开发，未签收。** 本页是 LOOM V2 **实现进度、失败和真实验收唯一汇总**，不是架构规范、第二开发书、发布声明或用户审批。最新状态看下面续开发实测；原固定 SHA 的历史证据保留，不冒充本次全量回归。
 
-产品要做什么看 [PRODUCT.md](PRODUCT.md)，已选 Mikka/PiBot 三栏 UI 与用户指定猫耳品牌看 [DESIGN.md](DESIGN.md)，具体 Runtime/能力/设备接口看 [productization-interfaces](docs/loom/productization-interfaces-2026-11-13.md)，13 个参考项目看 [参考锁](docs/loom/LOOM-V2-REFERENCE-LOCK.md)。P0–P14 原设计保留于 [冻结蓝图](docs/loom/LOOM-V2-MASTER-PLAN.md)，不在本页重复叙述。
+产品要做什么看 [PRODUCT.md](PRODUCT.md)，已选 Mikka/PiBot 三栏 UI 与用户指定猫耳品牌看 [DESIGN.md](DESIGN.md)，架构与每层复用来源看 [LOOM-ARCHITECTURE](docs/loom/LOOM-ARCHITECTURE.md)，交接与施工规则看 [LOOM-HANDOFF](docs/loom/LOOM-HANDOFF.md)，验收标准看 [LOOM-ACCEPTANCE](docs/loom/LOOM-ACCEPTANCE.md)，参考项目看 [参考锁](docs/loom/LOOM-V2-REFERENCE-LOCK.md)。旧计划（含 P0–P14 原设计）已归档于 [plans-2026-11-18](docs/loom/archive/plans-2026-11-18/README.md)，不在本页重复叙述。
 
 ## 给云上施工 Agent 的用户建议（2026-11-17，非规范）
 
@@ -106,7 +106,7 @@ L5 电脑模型自主截图、L6 新候选真装、L7 relay 取证、L8 恢复�
 
 ## 2026-11-18 交接收口补记
 
-用户要求此聊天停止施工并本机交接，完整入口是 `docs/loom/mindkit-handoff-2026-11-13.md` 顶部新节。实际新版隔离安装测试第一次240秒在全包核验阶段超时；延长真包测试预算至子流程600秒/全程900秒后，第二轮 AgentDock session `session-1c06f5d45a931f857a5f95d8` 及只读 DB 观察 `session-ae06c2e730a0d333743b505d` 在交接时均返回 `SESSION_NOT_FOUND`。无新隔离安装目录、无 SQLite、无 `resume-06/local-personal-186-install-proof.json`，**未验收安装或启动**。本地33844文件候选已组装但尚未交付，旧915ffa1/64852仍运行。下次以重新确认实时状态和实际安装、登录、重启、DB186/236为第一步；Pi Purge 模型/成果与 DSH 原生Hook等未通过项不变。
+用户要求此聊天停止施工并本机交接，完整入口是 `docs/loom/archive/plans-2026-11-18/mindkit-handoff-2026-11-13.md` 顶部新节。实际新版隔离安装测试第一次240秒在全包核验阶段超时；延长真包测试预算至子流程600秒/全程900秒后，第二轮 AgentDock session `session-1c06f5d45a931f857a5f95d8` 及只读 DB 观察 `session-ae06c2e730a0d333743b505d` 在交接时均返回 `SESSION_NOT_FOUND`。无新隔离安装目录、无 SQLite、无 `resume-06/local-personal-186-install-proof.json`，**未验收安装或启动**。本地33844文件候选已组装但尚未交付，旧915ffa1/64852仍运行。下次以重新确认实时状态和实际安装、登录、重启、DB186/236为第一步；Pi Purge 模型/成果与 DSH 原生Hook等未通过项不变。
 
 ## 2026-11-18 本机真实续建（个人版仍未签收）
 
@@ -260,6 +260,6 @@ LOOM V2 已有 Windows 隔离预览、双真实 Core→Pi Worker、Codex 原生�
 
 ## 证据、历史与更新规则
 
-- 真实模型及恢复原始记录：[LOOM-LIVE-ACCEPTANCE-2026-11-16.md](docs/loom/LOOM-LIVE-ACCEPTANCE-2026-11-16.md)；本机隔离证据位于 `_artifacts/loom-live-resume-20261116/`，包括 `real-pi-file-artifact-summary.json`、`real-artifact-recovery.json`、`codex-native-summary.json`、`fixed-package-local-verification.json`、`bero-tls-admission.json`；含私有数据的文件不可随 PR 上传。
+- 真实模型及恢复原始记录：[LOOM-LIVE-ACCEPTANCE-2026-11-16.md](docs/loom/archive/plans-2026-11-18/LOOM-LIVE-ACCEPTANCE-2026-11-16.md)；本机隔离证据位于 `_artifacts/loom-live-resume-20261116/`，包括 `real-pi-file-artifact-summary.json`、`real-artifact-recovery.json`、`codex-native-summary.json`、`fixed-package-local-verification.json`、`bero-tls-admission.json`；含私有数据的文件不可随 PR 上传。
 - 早期 P0–P7 产品化阶段、旧施工/交接和实验纪录已 [归档](docs/loom/archive/legacy-plans-2026-11-15/README.md)，其中 [旧版实施全文](docs/loom/archive/legacy-plans-2026-11-15/LOOM-IMPLEMENTATION-history-2026-11-13.md) 只用于来源追溯。
 - 后续**只更新本页当前状态及证据链接**；产品边界归 PRODUCT、UI 归 DESIGN、接口归 productization-interfaces、参考 SHA 归 REFERENCE-LOCK。不要再开新的“总交接”“最新计划”“进度看板”抢占权威。

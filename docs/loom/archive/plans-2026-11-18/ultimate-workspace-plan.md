@@ -1,6 +1,6 @@
 # LOOM 完整工作空间：已批准目标与实施合同
 
-> **历史归档 / SUPERSEDED_FUTURE_PLAN / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](archive/legacy-plans-2026-11-15/README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
+> **历史归档 / SUPERSEDED_FUTURE_PLAN / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](../legacy-plans-2026-11-15/README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
 
 > **用户纠偏入口 / 最新授权**：用户明确批准并要求落实：
 > **一个以 Mikka 体验为中心、内置 Pi Agent、连接本机与云端执行环境的多 Agent 工作空间。用户只需要创建助手、选择能力、组建群聊并提出目标；系统负责协作、执行、电脑控制、成果追踪和人工验收。**
@@ -8,7 +8,7 @@
 
 ## 最新阶段交接：内置 Pi + 原生发现 + 人工电脑控制
 
-主目标仍为 P0–P4 完整工作空间，本次按用户允许的小阶段交接。已取得的运行结果、失败与下一步集中记录在 [P1.1 / P3.1 交接](archive/legacy-plans-2026-11-15/p1-bundle-and-computer-handoff.md)，接口边界见 [统一接口](archive/legacy-plans-2026-11-15/ultimate-interface-contracts.md)。本页后续旧进展行仅保留历史，不能覆盖最新证据。
+主目标仍为 P0–P4 完整工作空间，本次按用户允许的小阶段交接。已取得的运行结果、失败与下一步集中记录在 [P1.1 / P3.1 交接](../legacy-plans-2026-11-15/p1-bundle-and-computer-handoff.md)，接口边界见 [统一接口](../legacy-plans-2026-11-15/ultimate-interface-contracts.md)。本页后续旧进展行仅保留历史，不能覆盖最新证据。
 
 | 产品阶段 | 当前可证实范围 | 尚未签署 |
 |---|---|---|

@@ -2,7 +2,7 @@
 
 > **DISCUSSION_PROPOSAL v0.1 / 2026-11-15，PLANNING_ONLY。** 用户要求在原 LOOM UI 与四 Runtime（Claude Code、Codex、DSH、Pi）不变的前提下，研究 ZiChuanLan/agent-purge 的人格库/覆盖方式，并解决切换人格、长期记忆和偶尔授权安全测试的问题。**本轮只读研究+文档；没有安装或运行 agent-purge，没有更改任何宿主系统提示词、模型 Provider、审批 Hook 或真实设备授权。**
 > **新产品决定（2026-11-15）**：**[pi-purge v0.3.0](../LOOM-V2-PI-PURGE-EXTENSION-PLAN.md) 选为 Pi-only 受管可选 Extension**，不能混淆为 agent-purge 的跨四内核插件；具体 Off/Append/Replace/**Fallback**/Strict、会话默认关闭/Strict 模式默认值与启动桥接边界见专篇。当前全部**未运行、未封包**。
-> [唯一总计划](../LOOM-V2-MASTER-PLAN.md) · [运行端与四能力方案](loom-v2-runtime-bundles-and-capability-selection-proposal-2026-11-15.md) · [通用 Ports](loom-v2-universal-architecture-and-ports-proposal-2026-11-15.md) · [参考 Git Lock](../LOOM-V2-REFERENCE-LOCK.md) · [Persona/Memory JSON Schema](../loom-v2-persona-memory-contract.schema.json)
+> [唯一总计划](../LOOM-V2-MASTER-PLAN.md) · [运行端与四能力方案](loom-v2-runtime-bundles-and-capability-selection-proposal-2026-11-15.md) · [通用 Ports](loom-v2-universal-architecture-and-ports-proposal-2026-11-15.md) · [参考 Git Lock](../../../LOOM-V2-REFERENCE-LOCK.md) · [Persona/Memory JSON Schema](../../../loom-v2-persona-memory-contract.schema.json)
 
 ## 一、先讲清五种不同东西，不再把“人格”误当 Rules、Skills、记忆或权限
 
@@ -151,5 +151,5 @@ Security Lab 有三种模板：
 
 - 本轮仅 git clone 指定开源仓库到只读研究目录并检查代码；**没有安装 npm 包、执行其源码、修改任何全局 CLI 配置或 Prompt、调用模型或启动工兵**。
 - 11 份原本的参考仓库与历史五处 WIP 原状保留；本次新增第 12 份参考，不授权其他 Runtime 入口。
-- 当前已在用户已有 Chrome 会话打开 [LOOM V2 规划板](../archive/legacy-plans-2026-11-15/LOOM-V2-PLANNING-BOARD.html)，静态页面不是实时产品完成率。
+- 当前已在用户已有 Chrome 会话打开 [LOOM V2 规划板](../../legacy-plans-2026-11-15/LOOM-V2-PLANNING-BOARD.html)，静态页面不是实时产品完成率。
 - Persona/Memory/Lab 的 Schema 只是草案，尚未正式写入当前 v1.72 Contract，不能标任何 T23–T28 PASS。

@@ -1,6 +1,6 @@
 # LOOM：A 单一 Brain，B/C 纯设备手脚——研究与实施交接（2026-11-15）
 
-> **历史候选方案，非当前冻结架构。** 用户随后明确纠正：这是 AI 给出的参考拓扑，仍在讨论；不能以“违反/不违反”排斥 B/C 本地 Runner，也不能在最终方案获认可前继续写产品代码。当前讨论入口为 [架构选项与工兵计划](../../research/architecture-discussion-master-plan-2026-11-15.md) 和 [用户易读版](architecture-discussion-plain-language-2026-11-15.md)。下文原始技术研究/阶段证据保留作历史，不应当成用户最终签署的合同。
+> **历史候选方案，非当前冻结架构。** 用户随后明确纠正：这是 AI 给出的参考拓扑，仍在讨论；不能以“违反/不违反”排斥 B/C 本地 Runner，也不能在最终方案获认可前继续写产品代码。当前讨论入口为 [架构选项与工兵计划](../plans-2026-11-18/research/architecture-discussion-master-plan-2026-11-15.md) 和 [用户易读版](architecture-discussion-plain-language-2026-11-15.md)。下文原始技术研究/阶段证据保留作历史，不应当成用户最终签署的合同。
 
 > 状态：**用户本轮明确要求先深研，再用 pi-skill 工兵实施，阶段性交接只汇报真实结果。** 本文不是已发布合同/云生产验收。所有代码与验收依旧受仓库 `AGENTS.md`、`DESIGN.md`、Core/Node/Computer/Workspace RPC 当前合同约束。**请勿将下文拟实施项目提前写成完成。**
 

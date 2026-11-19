@@ -1,8 +1,8 @@
 # LOOM V2：Pi Purge 受管扩展接入方案（架构交接）
 
 > **用户确认：Pi Purge 是 Pi Runtime 的可选扩展，不是第五个 Agent 内核。**
-> **2026-11-16 用户已批准纳入 4–6 周个人可用开发范围。** 本页保留五模式的原始设计；当前受管适配的已实现范围为 Off/Append，原生三协议实测、闭包与待补 Core/UI 接线统一看 [当前实施](../../LOOM-IMPLEMENTATION.md)。不再从下文历史“本轮未执行”推断现在仍未开工；详细结果不复制成另一份开发书。
-> 入口：[V2 总计划](LOOM-V2-MASTER-PLAN.md) · [Pi Purge 机器 Schema（2 对象草案）](loom-v2-pi-purge-extension.contract.schema.json) · [Persona/Memory](research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md) · [Runtime/四能力](research/loom-v2-runtime-bundles-and-capability-selection-proposal-2026-11-15.md) · [参考锁](LOOM-V2-REFERENCE-LOCK.md) · [未来 180 分钟计划](archive/legacy-plans-2026-11-15/LOOM-V2-3H-FAST-TRACK.md)。
+> **2026-11-16 用户已批准纳入 4–6 周个人可用开发范围。** 本页保留五模式的原始设计；当前受管适配的已实现范围为 Off/Append，原生三协议实测、闭包与待补 Core/UI 接线统一看 [当前实施](../../../../LOOM-IMPLEMENTATION.md)。不再从下文历史“本轮未执行”推断现在仍未开工；详细结果不复制成另一份开发书。
+> 入口：[V2 总计划](LOOM-V2-MASTER-PLAN.md) · [Pi Purge 机器 Schema（2 对象草案）](../../loom-v2-pi-purge-extension.contract.schema.json) · [Persona/Memory](research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md) · [Runtime/四能力](research/loom-v2-runtime-bundles-and-capability-selection-proposal-2026-11-15.md) · [参考锁](../../LOOM-V2-REFERENCE-LOCK.md) · [未来 180 分钟计划](../legacy-plans-2026-11-15/LOOM-V2-3H-FAST-TRACK.md)。
 
 ## 1. 真实上游来源与兼容事实
 

@@ -123,12 +123,12 @@ WorkMap 当前是**真实数据的只读关系视图**：依赖来自 `loom.depe
 - Hook/规则创建与启用分开，保存选择与实际生效分开。
 - 数据错版本/读不到显示错误，不伪造空状态。
 - 生产 UI、隔离 Core 写入测试、fixture tests 和真实模型运行分别标记。
-- 计划内不等于交付。完整验收结果与当前缺口只汇总在根 [LOOM-IMPLEMENTATION.md](../../LOOM-IMPLEMENTATION.md)，本文件不维护第二份进度表。
+- 计划内不等于交付。完整验收结果与当前缺口只汇总在根 [LOOM-IMPLEMENTATION.md](../../../../LOOM-IMPLEMENTATION.md)，本文件不维护第二份进度表。
 
 ## 9. 云端执行位置、企业扩展与能力真相
 
 - **同一个 Bot / Core，三个部署模式**：T = Cloud Brain + 纯工具 Node（设备可无本地 CLI），R = 可选本地 Runner（明确四 Runtime 的实际适配与就绪），H = Hybrid（按任务选云端、设备工具或本地 Runner）。BotIdentity、Goal/Run、Artifact/Review、Grant 的事实归同一个 Core；设备只是执行地点或工具来源，UI 不持有第二真源。
 - **Node 与授权不同层**：Node 在线、TLS 通、真实配对、工作区 Grant、工具可执行和远程屏幕控制分别要有回执。File/PTY/Browser/Computer 是独立 DevicePort 能力，屏幕 Provider/人工接管需要单独许可；断线后的未知副作用不换 requestId 无条件重试。
 - **ACCP 借协作机制，不加新运行端**：Goal/Step → Claim/Lease/Fence → Run/Artifact → Independent Review → Owner Acceptance 分别持久记录；ACP 是协议，与 ACCP 不是同一事物。
-- **未来企业化隔离（未实现，不得宣传为已交付）**：Tenant/Organization/User/Role/Resource/Permission/Quota/Audit，前提是实际的租户边界、权限拒绝、数据和凭据隔离，以及可测审计。参考 [AgenTeam/MOVO](LOOM-V2-REFERENCE-LOCK.md) 的思路；MOVO Community 代码不提供完整企业 ACL。
-- 借鉴 [DeskFleet、MindFS、UFO³ Galaxy](LOOM-V2-REFERENCE-LOCK.md) 的设备目录、daemon、工具分离和多设备调度；不等于已经接入它们的线协议或可以直接操控任意用户电脑。规划历史保留在 [V2 设计基线](LOOM-V2-MASTER-PLAN.md)，未冻结细节在 [研究](research/loom-v2-universal-architecture-and-ports-proposal-2026-11-15.md)。
+- **未来企业化隔离（未实现，不得宣传为已交付）**：Tenant/Organization/User/Role/Resource/Permission/Quota/Audit，前提是实际的租户边界、权限拒绝、数据和凭据隔离，以及可测审计。参考 [AgenTeam/MOVO](../../LOOM-V2-REFERENCE-LOCK.md) 的思路；MOVO Community 代码不提供完整企业 ACL。
+- 借鉴 [DeskFleet、MindFS、UFO³ Galaxy](../../LOOM-V2-REFERENCE-LOCK.md) 的设备目录、daemon、工具分离和多设备调度；不等于已经接入它们的线协议或可以直接操控任意用户电脑。规划历史保留在 [V2 设计基线](LOOM-V2-MASTER-PLAN.md)，未冻结细节在 [研究](research/loom-v2-universal-architecture-and-ports-proposal-2026-11-15.md)。

@@ -1,7 +1,7 @@
 //! LOOM V2 coordinator contract (Lane B): a pure, in-memory reducer for the
 //! ACCP-style Assignment DAG / Claim / Lease / Fence / Review lifecycle.
 //!
-//! Scope (P1-A four-lane slice, `docs/loom/LOOM-V2-P1-FOUR-LANE-SLICE-2026-11-15.md` G1 Lane B):
+//! Scope (P1-A four-lane slice, `docs/loom/archive/plans-2026-11-18/LOOM-V2-P1-FOUR-LANE-SLICE-2026-11-15.md` G1 Lane B):
 //! - **No I/O of any kind**: no clock, no DB, no network, no process. Every
 //!   decision is driven by the `now_ms` argument passed into
 //!   [`CoordinatorState::apply`]. This module is not registered in

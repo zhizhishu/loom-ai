@@ -1,6 +1,6 @@
 # W12 实施修订：DeviceInvocation 独立身份 × 复用 R2 Node 传输（2026-11-15）
 
-> **历史归档 / KEEP_AS_RESEARCH_FINDING / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../../LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
+> **历史归档 / KEEP_AS_RESEARCH_FINDING / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
 
 > **状态：源码已证实的架构缺口 + 下一阶段 implementation contract proposal；并未完成 E4，更未上线。** 用户已授权在隔离工作区实施，**不需要再把历史讨论稿的“不准开工”当阻塞**；但任何改动仍需具名所有权、真实授权/回执、向下兼容和隔离验收。此文是最新 W12 工单路由，不是已有 Current Architecture/Contract 的规范真源；正式实施需依据 `AGENTS.md` / `docs/decisions/README.md` 同步权威文档和门禁。
 

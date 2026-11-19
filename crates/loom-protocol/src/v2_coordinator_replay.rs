@@ -3,7 +3,7 @@
 //! [`crate::v2_coordinator`], plus a deterministic replay that rebuilds a
 //! [`CoordinatorState`] from envelopes alone.
 //!
-//! Scope (P1-B Lane B, `docs/loom/LOOM-V2-P1B-PI-RUNTIME-INTEGRATION-2026-11-15.md`):
+//! Scope (P1-B Lane B, `docs/loom/archive/plans-2026-11-18/LOOM-V2-P1B-PI-RUNTIME-INTEGRATION-2026-11-15.md`):
 //! - **No fork of the reducer**: every transition goes through the public
 //!   [`CoordinatorState::apply`] (`v2_coordinator.rs`). This module holds no
 //!   duplicate lifecycle logic and no private mirror of coordinator state.

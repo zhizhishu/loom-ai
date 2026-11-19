@@ -1,8 +1,8 @@
 # LOOM 未来 Pi Skill 多路工兵工单（待批准执行的设计稿）
 
-> **历史归档 / RETIRED_SCOUT_CARDS / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../../LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
+> **历史归档 / RETIRED_SCOUT_CARDS / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
 
-> **NOT AUTHORIZED FOR IMPLEMENTATION**：用户当前要求“讨论架构→形成完整计划→再决定动手”。以下是**未来**可直接分发的工单规格，不是此刻运行指令。现在仅可启动 `agent=scout` / `tools=file` 只读调研；所有 `worker` 写入需 P1 合同通过和用户新一轮明确允许。主文：[architecture-discussion-master-plan-2026-11-15.md](../../research/architecture-discussion-master-plan-2026-11-15.md)。
+> **NOT AUTHORIZED FOR IMPLEMENTATION**：用户当前要求“讨论架构→形成完整计划→再决定动手”。以下是**未来**可直接分发的工单规格，不是此刻运行指令。现在仅可启动 `agent=scout` / `tools=file` 只读调研；所有 `worker` 写入需 P1 合同通过和用户新一轮明确允许。主文：[architecture-discussion-master-plan-2026-11-15.md](../plans-2026-11-18/research/architecture-discussion-master-plan-2026-11-15.md)。
 
 ## 0. 工兵协作总合同
 

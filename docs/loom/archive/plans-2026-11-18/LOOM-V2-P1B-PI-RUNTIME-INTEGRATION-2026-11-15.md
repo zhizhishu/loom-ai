@@ -1,6 +1,6 @@
 # LOOM Core V2 · P1-B 第二轮 4 路 Pi Skill 子合同（Pi Purge 真 Hook + 多 Agent/能力桥）
 
-> **ACTIVE_P1B / 工兵须先微计划再 Root 授权写入。** 上一阶段 [P1-A 实际验收](archive/legacy-plans-2026-11-15/LOOM-V2-P1A-ACCEPTANCE-HANDOFF-2026-11-15.md) 已经完成 Rust62/62+Node16/16、旧 Pi Bundle verify PASS；本阶段继续建立**运行插件/工具物化的真实证据**。仍遵循用户 PDF P0–P14 总架构和 [唯一总计划](LOOM-V2-MASTER-PLAN.md)。  
+> **ACTIVE_P1B / 工兵须先微计划再 Root 授权写入。** 上一阶段 [P1-A 实际验收](../legacy-plans-2026-11-15/LOOM-V2-P1A-ACCEPTANCE-HANDOFF-2026-11-15.md) 已经完成 Rust62/62+Node16/16、旧 Pi Bundle verify PASS；本阶段继续建立**运行插件/工具物化的真实证据**。仍遵循用户 PDF P0–P14 总架构和 [唯一总计划](LOOM-V2-MASTER-PLAN.md)。  
 > Parent Root `C:/Users/echo/Downloads/claude/skill-cli`，child 产品 `loom/`。AgentDock 本阶段任务 **`tsk_2f9eed3cec934bf8`**；Pi Skill 实时本机看板 `http://127.0.0.1:8767`。
 
 ## 安全与前置事实（G0）

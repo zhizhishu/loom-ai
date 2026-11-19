@@ -1,6 +1,6 @@
 # LOOM Mikka-first 实施阶段交接 — 2026-11-15
 
-> **历史归档 / EVIDENCE_ONLY / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../../LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
+> **历史归档 / EVIDENCE_ONLY / 不再作为 Core V2 施工指令。** 用户最新要求「本轮只整理架构、不开工」，后续唯一入口：[LOOM V2 总计划](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md)。此文件原始正文与当时测试结论仅作历史证据；原字节 SHA256 快照在 [历史归档](README.md)。**不得依据下文旧“已授权开工/唯一入口”重新派工**。
 
 > **当前状态：IN_PROGRESS · 实施获用户最新授权 · P0/P1/P2 三阶段完成，P3 最小真实链路局部 E3 PASS。** 请勿把此文档当作全部产品完成/已部署。项目 root：`C:\Users\echo\Downloads\claude\skill-cli\loom`。主任务：AgentDock `tsk_407c504cc8494d6d`；进度可视化 HTML：`docs/loom/loom-mikka-first-progress-2026-11-15.html`。用户明确优先可用、可多 Pi 工兵、可重构与隔离编译；Windows 11 不运行 Claude Code；原 64851 服务和既有 WIP 须保留。
 

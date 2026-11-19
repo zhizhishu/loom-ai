@@ -1,6 +1,6 @@
 # LOOM V2 · P1-C 阶段进度与接手交接（2026-11-15）
 
-> **Latest independently verified increment (2026-11-16):** [Real upstream execution and delivery acceptance](../../LOOM-LIVE-ACCEPTANCE-2026-11-16.md). This supersedes older claims that E4 is entirely fake-provider-only or that no candidate was pushed; it does not sign off full E4-E7. User has explicitly re-authorized current implementation.
+> **Latest independently verified increment (2026-11-16):** [Real upstream execution and delivery acceptance](../plans-2026-11-18/LOOM-LIVE-ACCEPTANCE-2026-11-16.md). This supersedes older claims that E4 is entirely fake-provider-only or that no candidate was pushed; it does not sign off full E4-E7. User has explicitly re-authorized current implementation.
 
 
 ## 【最高优先级续建指令｜2026-11-16｜只在 4–6 周单用户可用版完成后向用户做常规汇报】
@@ -11,7 +11,7 @@
 
 ### 何为“4–6 周版本完成”（唯一常规回报触发门）
 
-以 [LOOM V2 总蓝图 P0–P14](../../LOOM-V2-MASTER-PLAN.md) 及原 27 页 PDF 的**单用户可用版**定义为准；不能靠局部 E3、假 Provider、测试覆盖数、截图或 Worker 自报代替。至少提供以下**用户可以亲手操作并有真实证据的闭环**：
+以 [LOOM V2 总蓝图 P0–P14](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md) 及原 27 页 PDF 的**单用户可用版**定义为准；不能靠局部 E3、假 Provider、测试覆盖数、截图或 Worker 自报代替。至少提供以下**用户可以亲手操作并有真实证据的闭环**：
 
 1. **Mikka 原生三栏工作台**：用户在 UI 创建/编辑长期 Bot，安排主助手和副助手，拉入群聊；能指定默认工作目录并按显式授权访问其他目录，不要求用户研究命令行。
 2. **四运行端和四能力的诚实产品入口**：Pi、DSH、Codex、Claude 有对应可发现/选择/说明与实际支持矩阵（包括 Win11 Claude 当前禁执行的明确状态）；Skill / MCP / Rule / Hook 可配置、冻结、加载及调用，并用真实回执区分“选中/加载/真正调用/不支持”，不能靠同一套 Claude 全局配置冒充四端全部生效。
@@ -133,12 +133,12 @@
 - **保留的不变量**：原五 WIP SHA256 重核5/5 unchanged；64851 listener PID12944；`git diff --check` 及 `mindfile_guard.py verify .` exit0；无全局 Pi/Claude/Codex/DSH 配置变化，无用户DB变更，无 Bero/GH push。`MIGRATION_SQL` 仍只在隔离测试使用，未进 Core 真实 migration。Node 旧 Core Wire E2E 0/2 暂无新绿灯；真实外部模型、E4全链、E5/E6/E7 仍 NOT_RUN。
 
 
-> **状态：P1-A / P1-B Root ACCEPTED；P1-C 四路源码已落盘，三路独立签收，Core 编译通过但 Rust 目标测试未签收；产品全闭环尚未完成。** 此文是可恢复现场快照，不是新总蓝图，也不是暂停指令。目标仍是用户要求的 4–6 周可用 LOOM。既有 27 页研究对应的 [P0–P14 总计划](../../LOOM-V2-MASTER-PLAN.md) 权威不变，禁止以本交接偷换为八步或宣布整阶段 100%。
+> **状态：P1-A / P1-B Root ACCEPTED；P1-C 四路源码已落盘，三路独立签收，Core 编译通过但 Rust 目标测试未签收；产品全闭环尚未完成。** 此文是可恢复现场快照，不是新总蓝图，也不是暂停指令。目标仍是用户要求的 4–6 周可用 LOOM。既有 27 页研究对应的 [P0–P14 总计划](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md) 权威不变，禁止以本交接偷换为八步或宣布整阶段 100%。
 
 ## 工作现场与边界
 
 - Windows 本机总管根：`C:/Users/echo/Downloads/claude/skill-cli`；LOOM 产品 Git 根：`C:/Users/echo/Downloads/claude/skill-cli/loom`；AgentDock 主任务：`tsk_a21d75f405171f22`（ACTIVE）；Pi Skill 实时板：`http://127.0.0.1:8767`（仅本机）。四路 Pi Skill 数据根：父项目 `_artifacts/loom-v2-20261115/worker-data`。
-- 历史批次入口：[P1-A Root 验收](LOOM-V2-P1A-ACCEPTANCE-HANDOFF-2026-11-15.md)、[P1-B Root 验收](../../LOOM-V2-P1B-ACCEPTANCE-HANDOFF-2026-11-15.md)；当前产品 UI 仍用用户认可的 `loom-native` Mikka 三栏/可拖动大小与群聊交互，不回滚旧 Shell。
+- 历史批次入口：[P1-A Root 验收](LOOM-V2-P1A-ACCEPTANCE-HANDOFF-2026-11-15.md)、[P1-B Root 验收](../plans-2026-11-18/LOOM-V2-P1B-ACCEPTANCE-HANDOFF-2026-11-15.md)；当前产品 UI 仍用用户认可的 `loom-native` Mikka 三栏/可拖动大小与群聊交互，不回滚旧 Shell。
 - 用户原五处未提交 WIP（`Inspector.tsx`、`product.css`、`crates/loom-node/src/lib.rs`、`process_wire.rs`、`session.rs`）**2026-11-15 本次复核 SHA256 5/5 未变**，基线见父项目 `_artifacts/loom-v2-20261115/evidence/original-five-wip-sha256.json`。64851 原监听仍在（PID 12944）。不得把这五处更改一并格式化、重置、提交、或覆盖。未修改日常用户 DB、全局 Pi/DSH/Claude/Codex 模型配置、远程 Bero/GitHub/生产镜像。
 - 当前 Git 工作树存在历史多人 WIP/历史文档更改与本轮大量新文件；**没有发起 commit/PR/push、没有执行产品发布，也没有触发用户 DB 迁移**。原 v1.72 发布规范仍有效。
 

@@ -1,8 +1,8 @@
 # LOOM V2 架构设计基线（P0–P14）
 
 > **DESIGN BASELINE / 非当前进度表。** 本文保留原 27 页研究蓝图映射、已选定的 UI 与架构取舍、P0–P14 设计依据。正文出现的「最新」「当前施工」「ACTIVE_P1」「未完成」和旧时段测试数字，均按其写作时点保留为历史，不可替代现在的验收、任务授权或版本状态。
-> **当前唯一事实分工**：[产品](../../PRODUCT.md) · [UI/品牌](../../DESIGN.md) · [实际 E0–E7 状态](../../LOOM-IMPLEMENTATION.md) · [Runtime/四能力/设备接口](productization-interfaces-2026-11-13.md) · [13 个固定参考项目](LOOM-V2-REFERENCE-LOCK.md) · [LOOM 导航](README.md)。
-> **仍需保护**：现有用户数据与活动服务、既有 WIP 和全局 Agent 凭据。LOOM V2 施工并不自动改变 [v1.72 当前发布版本](../versions/README.md)。ACCP 是设计参考，ACP 是通信协议；四 Runtime、四能力和原已选 `loom-native` 产品界面不因整理而变更。
+> **当前唯一事实分工**：[产品](../../../../PRODUCT.md) · [UI/品牌](../../../../DESIGN.md) · [实际 E0–E7 状态](../../../../LOOM-IMPLEMENTATION.md) · [Runtime/四能力/设备接口](productization-interfaces-2026-11-13.md) · [13 个固定参考项目](../../LOOM-V2-REFERENCE-LOCK.md) · [LOOM 导航](../../README.md)。
+> **仍需保护**：现有用户数据与活动服务、既有 WIP 和全局 Agent 凭据。LOOM V2 施工并不自动改变 [v1.72 当前发布版本](../../../versions/README.md)。ACCP 是设计参考，ACP 是通信协议；四 Runtime、四能力和原已选 `loom-native` 产品界面不因整理而变更。
 
 ## A. 一页总则：用户已经确定与尚待研究的区别
 
@@ -26,7 +26,7 @@
 
 ## B. 唯一架构图与职责
 
-> **用户确认的最终目标架构（含 Pi Purge）**。图表示组件归属和目标数据流，不把尚未验收的多设备、四端能力或企业隔离标为已交付；实际进度只看 [LOOM-IMPLEMENTATION.md](../../LOOM-IMPLEMENTATION.md)。
+> **用户确认的最终目标架构（含 Pi Purge）**。图表示组件归属和目标数据流，不把尚未验收的多设备、四端能力或企业隔离标为已交付；实际进度只看 [LOOM-IMPLEMENTATION.md](../../../../LOOM-IMPLEMENTATION.md)。
 
 ```mermaid
 flowchart TB
@@ -99,7 +99,7 @@ flowchart TB
 - PersonaRegistry / PromptComposer / SecurityLab / MemoryScopePolicy
 - Artifact / Identity / ExtensionHost
 
-**Persona 扩展合同**： [专门设计](research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md) + [6 对象 Schema 草案](loom-v2-persona-memory-contract.schema.json)。人格 Prompt 合成属于 Core 受管行为，不伪装成第五 Runtime、第五个四能力开关，也不能在生产设备权限链里加载未审核的 DSH purge Hook。
+**Persona 扩展合同**： [专门设计](research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md) + [6 对象 Schema 草案](../../loom-v2-persona-memory-contract.schema.json)。人格 Prompt 合成属于 Core 受管行为，不伪装成第五 Runtime、第五个四能力开关，也不能在生产设备权限链里加载未审核的 DSH purge Hook。
 
 **下一轮 P1 冻结必须交付**：一份不可歧义的状态图（Step/RunAttempt/Invocation/Review）、每个跨层请求的 ID 及 idempotency/trace/auth 绑定、版本和权限约束、各 Runtime feature matrix（包括 unsupported），至少四种能力 Manifest/Binding/EffectiveSnapshot/真实 Receipt 的结构、协议升级策略；机器 Schema 需扩展至正式 IDL/负例，不能把当前五对象草案当全部 Contract 已定案。
 
@@ -165,7 +165,7 @@ PDF T0–T18 原验收全部保留；增加多 Agent 定向 T19–T22：
 
 下一轮只有在 Root 将 P1 合同和 Worker Write Allowlist 冻结后才能实际启动工兵。每个 Worker 的卡必须有 TASK-ID、Owner、阶段、依赖、参考 SHA、可写文件/目录、测试和必需回执、失败条件、回滚、终态交接。Root 指挥/审查/合并，Worker 不自行改变产品架构、不向其他 Worker 扩权，不并发写同一文件，QA 独立。
 
-**3 小时是冲刺时间盒，不是“4–6 周产品已完成”的替代证据**。Pi Purge 是 [可选受管 Extension](LOOM-V2-PI-PURGE-EXTENSION-PLAN.md) 而非第五 Runtime；Persona/Memory/SecurityLab 与 Pi Purge 已列进 P0/P1/P3/P4/P8/P9/P12 和 T23–T33。三小时仅争取 Pi Purge Off/Append 的一条可信端到端记录，不能用打包成功冒充激活成功；三小时优先建立可测 Persona Binding/PromptSnapshot 的窄切片，不以赶工为理由接入能自动放行工具审批的 DSH 插件，完整长记忆/跨 Runtime 人格 A/B/隔离安全测试按后续 Gate。目标为尽量形成一个可核验的最小功能链，同时记录真实未完成；按 [3 小时实战计划](archive/legacy-plans-2026-11-15/LOOM-V2-3H-FAST-TRACK.md) 严格切片。4–6 周单用户基础版的估计不会因为工兵并行而自动归零；跨机、断电恢复、四端插件兼容、企业隔离依旧需要实际验证。
+**3 小时是冲刺时间盒，不是“4–6 周产品已完成”的替代证据**。Pi Purge 是 [可选受管 Extension](LOOM-V2-PI-PURGE-EXTENSION-PLAN.md) 而非第五 Runtime；Persona/Memory/SecurityLab 与 Pi Purge 已列进 P0/P1/P3/P4/P8/P9/P12 和 T23–T33。三小时仅争取 Pi Purge Off/Append 的一条可信端到端记录，不能用打包成功冒充激活成功；三小时优先建立可测 Persona Binding/PromptSnapshot 的窄切片，不以赶工为理由接入能自动放行工具审批的 DSH 插件，完整长记忆/跨 Runtime 人格 A/B/隔离安全测试按后续 Gate。目标为尽量形成一个可核验的最小功能链，同时记录真实未完成；按 [3 小时实战计划](../legacy-plans-2026-11-15/LOOM-V2-3H-FAST-TRACK.md) 严格切片。4–6 周单用户基础版的估计不会因为工兵并行而自动归零；跨机、断电恢复、四端插件兼容、企业隔离依旧需要实际验证。
 
 ## I. 当前讨论交接
 
@@ -173,7 +173,7 @@ PDF T0–T18 原验收全部保留；增加多 Agent 定向 T19–T22：
 
 ## J. GitHub/Bero 优先的施工及验收路线（2026-11-16）
 
-> **执行决策，优先于旧的“每轮本机编译”习惯；不是发布授权。** 优先减少开发等待、重复构建和污染用户电脑，按固定源码 SHA 获得可复现回执；不以工兵数、测试数量或 CI 绿灯代替产品交付。完整 E4–E7 与原定 4–6 周**单用户可用版**验收标准不变。最新实证在 [本机续建交接](archive/legacy-plans-2026-11-15/LOOM-V2-CONTINUATION-2026-11-15.md)。
+> **执行决策，优先于旧的“每轮本机编译”习惯；不是发布授权。** 优先减少开发等待、重复构建和污染用户电脑，按固定源码 SHA 获得可复现回执；不以工兵数、测试数量或 CI 绿灯代替产品交付。完整 E4–E7 与原定 4–6 周**单用户可用版**验收标准不变。最新实证在 [本机续建交接](../legacy-plans-2026-11-15/LOOM-V2-CONTINUATION-2026-11-15.md)。
 
 ### J1. 三处环境的唯一职责
 
@@ -194,7 +194,7 @@ PDF T0–T18 原验收全部保留；增加多 Agent 定向 T19–T22：
 - Root 每轮从**一条实际关键路径阻塞**拆为最多 **2–3 个互斥短工单**；先用 Base Skill 路由，再通过 Pi Skill 托管运行。每条有任务 ID、唯一写白名单、依赖与明确停工条件；未冻结接口时只读 Scout，不让数十个工兵并发改同一 Core/UI。上一批4路实测只有2路交付、2路420秒超时，不能拿“派了4个”冒充4倍速度。
 - 工兵交付的是可检查的代码 diff/单个测试/失败定位，不是无边界长时间研究；优先 **2–4 分钟有界任务**，一旦超时或无增量就收窄任务、切模型/工具，不持续重复相同提示。Root 独立审阅合并、跑聚焦检查、亲自监督 Mikka 信息层级、键盘焦点、390/1440px、未知回执和 Review 误触；视觉不推倒重做。
 - **本机快速反馈→CI 清洁门禁→下个增量**：日常仅改动相关类型/单测/短 Host 编译；只有接口/安全/版本变化才触发对应 E3/E4 清洁构建。相同 commit+相同环境的绿灯用 SHA 复用，不重跑只为凑测试数；CI 红灯只重跑失败范围并保留原始报错。受控 cache 设上限，不随意 `cargo clean`。
-- 每个完成/失败在唯一 [LOOM 当前实施与验收](../../LOOM-IMPLEMENTATION.md) 更新并链接原始证据，记录**commit/源文件 SHA、Runner/Bero/Win 位置、命令、退出码、原始证据位置、模型真伪、E门禁、下一阻塞**。只有签过的阶段才能宣称完成；`ACTIVE`、Pi 会话数、CI job 创建或启动不等于连续后台开发。日常普通错误由 Root 自行处理，不因一组测试通过中断找用户。
+- 每个完成/失败在唯一 [LOOM 当前实施与验收](../../../../LOOM-IMPLEMENTATION.md) 更新并链接原始证据，记录**commit/源文件 SHA、Runner/Bero/Win 位置、命令、退出码、原始证据位置、模型真伪、E门禁、下一阻塞**。只有签过的阶段才能宣称完成；`ACTIVE`、Pi 会话数、CI job 创建或启动不等于连续后台开发。日常普通错误由 Root 自行处理，不因一组测试通过中断找用户。
 
 ### J4. 外传/发布安全边界
 
@@ -205,7 +205,7 @@ PDF T0–T18 原验收全部保留；增加多 Agent 定向 T19–T22：
 
 **用户明确决策，已冻结，非建议或待讨论：**本轮用户上传的下方粉发绿眼、黑色猫耳与蝴蝶结的角色形象**就是 LOOM 品牌 Logo**，不得贬为临时占位、替换为另外绘制的机器人、擅自换风格或再次征求是否喜欢此品牌。整体 Mikka/LOOM UI 的左中右三栏、配色与交互继续保留，不因换标识而重做。
 
-![用户指定的 LOOM 品牌图片工作副本](assets/loom-brand-user-approved-256.webp)
+![用户指定的 LOOM 品牌图片工作副本](../../assets/loom-brand-user-approved-256.webp)
 
 - **上传原件证据**：本会话用户上传 `DA3A8DC1-579B-44C7-8C1B-A9082072277A.png`（1254 × 1254，RGBA，1,797,701 字节，SHA256 `eff1aa63e7bdb3ebc5b1a58c3048bfa051553078a159f337c45cbe67f8a71d04`）。本机现已存可直接用于小图标和侧栏的**同图缩放、WebP 压缩工作副本** `docs/loom/assets/loom-brand-user-approved-256.webp`（256 × 256，5,026 字节，SHA256 `9bd461c1f5a44ebb0452297de50f5d713026bc7c417a7eba7ec0d67f14558d7a`）；**不是原件逐字节拷贝**，不可把这个缩略版的 SHA 称作上传 PNG 的 SHA。原图应作为日后高清源，缩略图作为 UI 资源基线。禁止工兵再用自动生成的替代形象。
 - **必须实施的视觉范围**：Web 标签页 `apps/web/index.html` 引用的 `apps/web/public/loom-favicon.svg`、Desktop renderer 标签页 `apps/desktop/src/renderer/index.html` 引用的 `apps/desktop/src/renderer/public/loom-favicon.svg`，以及左侧品牌机器人 `apps/desktop/src/renderer/src/loom-native/Avatar.tsx` 的 `LoomMark`（同组件也出现在 Web 登录页）。三者一律改为**上述同一张用户批准图片**；涉及默认品牌/无头像 fallback 时同源对齐，但**不得覆盖用户自定义 MemberAvatar/avatarRef**。保留原布局、点击/键盘区域、亮暗模式和可访问名称；16/32px 识别、1440/390 宽度、浏览器 favicon 缓存/新标签与 Desktop UI 要由 Root 实测。当前本条只完成**决策锁定、素材本地落地及定位**，**代码替换尚未完成**，别把记录冒充发布。

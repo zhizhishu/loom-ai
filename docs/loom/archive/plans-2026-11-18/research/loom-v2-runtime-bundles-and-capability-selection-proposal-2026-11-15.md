@@ -1,7 +1,7 @@
 # LOOM V2：Pi / DSH 封包与 Skills/MCP/Rules/Hooks 能力勾选合同
 
 > **最新边界（2026-11-15）**：产品 Runtime 选择器**只允许 Claude Code / Codex / DSH / Pi**，Pi 优先受管封包，DSH 可插拔并单独封包；Claude/Codex 保留原生外部 Adapter，Win11 不实际执行 Claude Code。ACP 是通信协议不是第五内核。以 [LOOM V2 MASTER](../LOOM-V2-MASTER-PLAN.md) 为今后施工主计划；本文件为**讨论合同，不是已安装插件或已跑通四能力的事实**。
-> **Pi 扩展已选定、尚未安装**：[Pi Purge Extension 受管封包/实际激活/证据合同](../LOOM-V2-PI-PURGE-EXTENSION-PLAN.md)，固定源码 d0196ccfd773b0ed342bd2f25372aff65f1a4a53、v0.3.0；仅 Pi Runtime 有此 Extension，默认关闭，源码 session_start 会再次关掉，所以必须用可靠 Bridge/本次 RunReceipt 激活；其他三个 Runtime 不装 Pi Purge。专项 Schema：[Pi Purge Binding/Receipt](../loom-v2-pi-purge-extension.contract.schema.json)。
+> **Pi 扩展已选定、尚未安装**：[Pi Purge Extension 受管封包/实际激活/证据合同](../LOOM-V2-PI-PURGE-EXTENSION-PLAN.md)，固定源码 d0196ccfd773b0ed342bd2f25372aff65f1a4a53、v0.3.0；仅 Pi Runtime 有此 Extension，默认关闭，源码 session_start 会再次关掉，所以必须用可靠 Bridge/本次 RunReceipt 激活；其他三个 Runtime 不装 Pi Purge。专项 Schema：[Pi Purge Binding/Receipt](../../../loom-v2-pi-purge-extension.contract.schema.json)。
 > **Persona 与长期记忆补充**：[agent-purge 源码研究 + PersonaRegistry / PromptComposer / MemoryScope / SecurityLab](LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md)。Persona 是独立资产，不是 Skill/MCP/Rule/Hook 中的第五勾选项；其 Off/Append/受控 Replace 不得修改 Core 安全 Grant。特别禁止把第三方 DSH purge 的自动审批或沙箱上下文移除 Hook 直接封包进生产。
 
 > DISCUSSION_PROPOSAL v0.1，2026-11-15；不是已经实施、测试通过或当前 v1.72 权威合同。与 [V2 架构与 Ports](loom-v2-universal-architecture-and-ports-proposal-2026-11-15.md) 配套。依据为用户认可的 27 页 PDF 第 12–17 页及本机锁定的 Pi、DSH、ROVAI、PiBot、MOVO 源码。

@@ -1,6 +1,6 @@
 # LOOM V2：「3 小时冲刺」未来派工书（不是本轮开工）
 
-> **ACTIVE_P1_A_SLICE / 2026-11-15**：用户最新指令已批准执行，Root 正按 [P1-A 四路独立合同](../../LOOM-V2-P1-FOUR-LANE-SLICE-2026-11-15.md) 组织实际 Pi 工兵；**这只激活首批独立可测模块，不代表下文全部 G2–G6、生产部署或 130 例验收已授权/已跑**。用户希望将原 4–6 周单用户基础版尽量压缩到 3 小时，需尽可能复用代码，但**不承诺三小时得到同等产品质量**；未验必须标 NOT_RUN。
+> **ACTIVE_P1_A_SLICE / 2026-11-15**：用户最新指令已批准执行，Root 正按 [P1-A 四路独立合同](../plans-2026-11-18/LOOM-V2-P1-FOUR-LANE-SLICE-2026-11-15.md) 组织实际 Pi 工兵；**这只激活首批独立可测模块，不代表下文全部 G2–G6、生产部署或 130 例验收已授权/已跑**。用户希望将原 4–6 周单用户基础版尽量压缩到 3 小时，需尽可能复用代码，但**不承诺三小时得到同等产品质量**；未验必须标 NOT_RUN。
 
 ## 0. 时间盒的正确目标（建议）
 
@@ -10,10 +10,10 @@
 
 ## 1. 开工前根任务的必要条件（本轮只记录，不执行）
 
-> **Pi Purge 扩展已纳入正式候选工单（非已完成）**：先读 [Pi Purge 固定 SHA、Extension Bridge 与 T29–T33](../../LOOM-V2-PI-PURGE-EXTENSION-PLAN.md)，Pi 受管封包时只增加可选 Extension，不 Fork 原 Pi Agent Loop、不依赖全局 pi install；三小时只有主闭环完成后才尝试 Off/Append 的真实 Loaded/PromptApplied 证据，不能因此承诺五模式/恢复/Strict/Lab 全通过。
-> **人格与安全测试新边界**：新增 [LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md](../../research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md)。agent-purge 固定源码可作为文档参考，不能把剔除 DSH Approval/Sandbox Context、自动允许工具审批的原插件加入核心 Runtime。Persona/Memory/Lab 允许并行只读 Scout；三小时只争取 **1 份可信 Persona Manifest + 1 次受管 Pi Append Loaded/PromptReceipt**（在 Domain/Runtime 核心闭环通过后）；完整跨四内核人格/长期记忆/安全实验自动化是独立后续 Gate。
+> **Pi Purge 扩展已纳入正式候选工单（非已完成）**：先读 [Pi Purge 固定 SHA、Extension Bridge 与 T29–T33](../plans-2026-11-18/LOOM-V2-PI-PURGE-EXTENSION-PLAN.md)，Pi 受管封包时只增加可选 Extension，不 Fork 原 Pi Agent Loop、不依赖全局 pi install；三小时只有主闭环完成后才尝试 Off/Append 的真实 Loaded/PromptApplied 证据，不能因此承诺五模式/恢复/Strict/Lab 全通过。
+> **人格与安全测试新边界**：新增 [LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md](../plans-2026-11-18/research/LOOM-V2-PERSONA-MEMORY-AND-SECURITY-LAB.md)。agent-purge 固定源码可作为文档参考，不能把剔除 DSH Approval/Sandbox Context、自动允许工具审批的原插件加入核心 Runtime。Persona/Memory/Lab 允许并行只读 Scout；三小时只争取 **1 份可信 Persona Manifest + 1 次受管 Pi Append Loaded/PromptReceipt**（在 Domain/Runtime 核心闭环通过后）；完整跨四内核人格/长期记忆/安全实验自动化是独立后续 Gate。
 
-- Root 阅读 PROJECT_ID.md、AGENTS.md、docs/README.md、docs/versions/README.md、[V2 MASTER](../../LOOM-V2-MASTER-PLAN.md)、两份 V2 Port/Capability 提案、JSON Schema、原 PDF 与参考源码索引；
+- Root 阅读 PROJECT_ID.md、AGENTS.md、docs/README.md、docs/versions/README.md、[V2 MASTER](../plans-2026-11-18/LOOM-V2-MASTER-PLAN.md)、两份 V2 Port/Capability 提案、JSON Schema、原 PDF 与参考源码索引；
 - 用户同意具体范围：不重做 UI，四 Runtime 只选 Claude/Codex/DSH/Pi、Pi 首先封包、DSH 保留 Adapter；Windows 11 Claude Code 执行禁用；
 - 根任务明确标记从 PLANNED_ONLY → ACTIVE，建立独立 Git 分支/worktree、文件 Allowlist、原五处 WIP 备份 SHA、隔离 DB/端口/沙箱/凭据通道；
 - 每条设计变更先由 Root 冻结 Spec，确认旧数据迁移/回滚；Pi 工兵不得自行扩大全局权限或推送发布；

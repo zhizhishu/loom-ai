@@ -1,6 +1,6 @@
 # LOOM A 单脑 / B-C 纯手脚：分阶段实施交接（2026-11-15）
 
-> **历史实施实验，不是本轮继续实施的授权。** 用户最新明确要求先讨论 Mikka 式 Bot、多设备模式、Pi/DSH 选型和详细计划。此处 Rust/UI WIP、测试失败与双节点脚本仍是可恢复的真实证据，但“B/C 必须纯 daemon”未获最终确定。新讨论主文：[architecture-discussion-master-plan-2026-11-15.md](../../research/architecture-discussion-master-plan-2026-11-15.md)。
+> **历史实施实验，不是本轮继续实施的授权。** 用户最新明确要求先讨论 Mikka 式 Bot、多设备模式、Pi/DSH 选型和详细计划。此处 Rust/UI WIP、测试失败与双节点脚本仍是可恢复的真实证据，但“B/C 必须纯 daemon”未获最终确定。新讨论主文：[architecture-discussion-master-plan-2026-11-15.md](../plans-2026-11-18/research/architecture-discussion-master-plan-2026-11-15.md)。
 
 > **范围：单用户 / 多设备开发实例，非已发布云端服务。** 用户新轮已授权在本地项目内实施，要求研究后经 Pi Skill 多路工兵完成、主管负责安全/UX 验收、每一小阶段落盘。此前同日“仅讨论、未授权实施”的记录只适用于上一轮消息；此处为后续新阶段事实。严禁把开发预览、静态源码和真实 B/C 物理机器验收混为一谈。
 

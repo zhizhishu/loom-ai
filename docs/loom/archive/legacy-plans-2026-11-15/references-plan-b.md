@@ -1,6 +1,6 @@
 # 方案 B 的本地参考仓库
 
-给 [`plan-b-a-controls-b-2026-11-01.md`](../../plan-b-a-controls-b-2026-11-01.md) 用。核对日期 2026-11-01。
+给 [`plan-b-a-controls-b-2026-11-01.md`](../plans-2026-11-18/plan-b-a-controls-b-2026-11-01.md) 用。核对日期 2026-11-01。
 
 这些目录放在 `~/loom-refs/` 或直接 vendor 进本仓库皆可；参考仓库许可已统一为 MIT，不再有克隆或复用限制。
 

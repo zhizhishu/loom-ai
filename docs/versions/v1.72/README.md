@@ -13,7 +13,7 @@ last_updated: 2026-10-27
 
 ## LOOM 用户级工作台产品化（2026-11-13）
 
-本地 LOOM 独立产品线在用户确认的 `loom-native` 前端中增加助手资料、四类能力、主副助手群聊、工作区域、权限配置与真实工作/资产关系图。界面与接口边界见 [产品接口](../../loom/productization-interfaces-2026-11-13.md)，实际发布与验收见 [阶段交接](../../../LOOM-IMPLEMENTATION.md)。新 Run 的短引导和新助手种子文字见 [精确模型上下文变更](model-context-change-loom-productization.md)。
+本地 LOOM 独立产品线在用户确认的 `loom-native` 前端中增加助手资料、四类能力、主副助手群聊、工作区域、权限配置与真实工作/资产关系图。界面与接口边界见 [产品接口](../../loom/archive/plans-2026-11-18/productization-interfaces-2026-11-13.md)，实际发布与验收见 [阶段交接](../../../LOOM-IMPLEMENTATION.md)。新 Run 的短引导和新助手种子文字见 [精确模型上下文变更](model-context-change-loom-productization.md)。
 
 原生权限、Core 数据权威、候选/审查/人工接受与发布仍分开。本轮没有内置 Pi 分发产物，也没有图形屏幕提供者；接口存在不代表这两项已交付。不切换上游版本指针、不修改旧 Migration 或用户全局 Runtime/凭据。
 
