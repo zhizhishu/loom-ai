@@ -6,6 +6,9 @@ pub(crate) mod remote_artifact;
 /// The bytes of a registered local artifact, archived so a later verification re-reads what was
 /// registered instead of whatever the workspace file holds now.
 pub(crate) mod snapshot;
+/// The pure watchdog decision table ported from Mikka `lib/factory/watchdog.ts`: what a sweep
+/// should do for one observed Task, judged against an explicit `now` and no I/O of its own.
+pub(crate) mod watchdog;
 /// The persistent automation authority of one Plan: the approved policy, the assistant stage
 /// verdicts, and the dispatch/budget ledger. Split out of this module because nothing in it may
 /// set the Owner's own `ACCEPTED` verdict — that stays in [`review_record`].
@@ -1815,6 +1818,201 @@ fn claim_heartbeat_in(
         lease_expires_at,
         heartbeat_at,
         extended_seconds: DEFAULT_CLAIM_LEASE_SECONDS,
+    })
+}
+
+/// The `blockedReason` a reclaimed Task carries: its Run stopped proving it was still alive, so
+/// execution authority is gone until somebody restores the executor and explicitly resumes.
+/// The literal is the LOOM-facing name of ACCP's `EXECUTION_AUTHORITY_LOST` `error_code`.
+const LOOM_EXECUTION_AUTHORITY_LOST: &str = "loom.execution_authority_lost";
+
+/// One claim the sweep reclaimed: the lease that ran out, the Run that stopped proving it was
+/// alive, and whether the Task was moved to `BLOCKED` for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomReclaimedClaim {
+    pub claim_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    /// The fence the lost Run was holding. Reclaiming never advances it; the next takeover does.
+    pub fence_generation: i64,
+    /// The lease that was already in the past when the sweep judged it.
+    pub lease_expires_at: String,
+    /// The instant the sweep released the claim.
+    pub released_at: String,
+    /// True when this reclaim also moved the Task to `BLOCKED`. A Task that already reached a
+    /// concluded state keeps it (see [`reclaim_lost_claims`]).
+    pub task_blocked: bool,
+}
+
+/// Reclaim receipt: what one Mission's sweep found and closed, judged against one clock instant.
+/// The list is empty when there was nothing to reclaim, which is also what a replay returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomReclaimLostClaimsResult {
+    pub mission_id: String,
+    pub evaluated_at: String,
+    pub reclaimed: Vec<LoomReclaimedClaim>,
+}
+
+/// LOOM reclaim path: close the claims whose holder lost execution authority.
+///
+/// Ported from ACCP `internal/controlplane/reconcile.go` (`Reconcile` / `reconcileProject`,
+/// `77f05778e194b3dca04cc14851c2b8e1aafdce65`): a Run whose lease ran out while it still held the
+/// Task is `LOST`; the Task it was executing becomes `BLOCKED` and an event records the lost
+/// authority. Like ACCP's pass this never authorizes a retry — that is a later decision.
+///
+/// The rules:
+///
+/// * only claims of this Mission that are unreleased *and* whose lease is already in the past are
+///   touched, using the same [`lease_expired`] rule the claim, heartbeat and submit paths use, so
+///   an unreadable lease is lost authority rather than proof of life;
+/// * the claim is released by writing `released_at` — the fence generation is never advanced here,
+///   because a released claim is a conclusion and the next takeover advances the fence itself;
+/// * a Task that is still `READY` (it was claimed and never delivered) becomes `BLOCKED` with
+///   `blockedReason = 'loom.execution_authority_lost'` and one domain event. A Task that already
+///   reached a concluded state (`DONE`, `CANCELED`) or was delivered for review (`IN_REVIEW`) is
+///   not rolled back: an accepted verdict and a delivered candidate are not a lost Run, exactly as
+///   ACCP's reconcile only closes Runs that were still `RUNNING`. An already `BLOCKED` Task keeps
+///   the reason that blocked it;
+/// * the pass is idempotent: a released claim is never selected again, so a replay returns an empty
+///   list and writes nothing.
+///
+/// The caller owns one Mission; the sweep is written to be repeated by a later scheduler (M5)
+/// without any per-Task bookkeeping of its own.
+pub fn reclaim_lost_claims(
+    database: &mut Database,
+    mission_id: &str,
+) -> Result<LoomReclaimLostClaimsResult> {
+    let mission_id = required_field("claim reclaim", "missionId", mission_id)?;
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Like every other LOOM write, the clock is read only after the write lock is held: a lease
+    // that lapses while this sweep waits for the lock is expired, not live.
+    let now = chrono::Utc::now();
+    let reclaimed_at = now.to_rfc3339();
+    let camp_id: Option<String> = transaction
+        .query_row(
+            "SELECT camp_id FROM mission WHERE id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(camp_id) = camp_id else {
+        return Err(LoomCommandError::rejection(
+            LOOM_MISSION_NOT_FOUND,
+            format!("mission {mission_id} does not exist"),
+        ));
+    };
+    let plan_id: Option<String> = transaction
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [&mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(plan_id) = plan_id else {
+        // No plan means no claim: a Mission that never imported one has nothing to reclaim.
+        transaction.commit()?;
+        return Ok(LoomReclaimLostClaimsResult {
+            mission_id,
+            evaluated_at: reclaimed_at,
+            reclaimed: Vec::new(),
+        });
+    };
+    let open_claims: Vec<(String, String, String, i64, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT claim_id, task_id, agent_run_id, fence_generation, lease_expires_at
+             FROM loom_claim
+             WHERE plan_id=?1 AND released_at IS NULL
+             ORDER BY task_id, fence_generation",
+        )?;
+        statement
+            .query_map([&plan_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut reclaimed = Vec::new();
+    for (claim_id, task_id, agent_run_id, fence_generation, lease_expires_at) in open_claims {
+        // A live lease belongs to its holder and is never reclaimed by a sweep.
+        if !lease_expired(&lease_expires_at, now) {
+            continue;
+        }
+        let task_status: String = transaction.query_row(
+            "SELECT status FROM loom_task WHERE plan_id=?1 AND task_id=?2",
+            params![&plan_id, &task_id],
+            |row| row.get(0),
+        )?;
+        let released = transaction.execute(
+            "UPDATE loom_claim SET released_at=?1 WHERE claim_id=?2 AND released_at IS NULL",
+            params![&reclaimed_at, &claim_id],
+        )?;
+        if released != 1 {
+            continue;
+        }
+        // Only work that was still expected is blocked. `READY` means "claimed and not yet
+        // delivered": its executor lost authority mid-flight, which is the ACCP `LOST` case.
+        // `DONE`/`CANCELED` are concluded and `IN_REVIEW` has a delivered Candidate waiting for a
+        // verdict; none of those is a Run that reconcile may close.
+        let task_blocked = if task_status == "READY" {
+            let updated = transaction.execute(
+                "UPDATE loom_task SET status='BLOCKED', blocked_reason=?1, updated_at=?2,
+                                     revision=revision+1
+                 WHERE plan_id=?3 AND task_id=?4 AND status='READY'",
+                params![
+                    LOOM_EXECUTION_AUTHORITY_LOST,
+                    &reclaimed_at,
+                    &plan_id,
+                    &task_id
+                ],
+            )?;
+            updated == 1
+        } else {
+            false
+        };
+        crate::collaboration::append_domain_event(
+            &transaction,
+            LOOM_EXECUTION_AUTHORITY_LOST,
+            Some(&camp_id),
+            Some(("loom_task", &task_id)),
+            &crate::command::ActorRef::System {
+                component_id: "loom.watchdog".into(),
+            },
+            None,
+            &serde_json::json!({
+                "taskId": task_id,
+                "claimId": claim_id,
+                "agentRunId": agent_run_id,
+                "fenceGeneration": fence_generation,
+                "leaseExpiresAt": lease_expires_at,
+                "releasedAt": reclaimed_at,
+                "taskStatus": if task_blocked { "BLOCKED" } else { task_status.as_str() },
+                "blockedReason": if task_blocked { Some(LOOM_EXECUTION_AUTHORITY_LOST) } else { None },
+            }),
+        )?;
+        reclaimed.push(LoomReclaimedClaim {
+            claim_id,
+            task_id,
+            agent_run_id,
+            fence_generation,
+            lease_expires_at,
+            released_at: reclaimed_at.clone(),
+            task_blocked,
+        });
+    }
+    transaction.commit()?;
+    Ok(LoomReclaimLostClaimsResult {
+        mission_id,
+        evaluated_at: reclaimed_at,
+        reclaimed,
     })
 }
 
@@ -5096,6 +5294,30 @@ mod tests {
             .query_row(
                 "SELECT released_at FROM loom_claim WHERE claim_id=?1",
                 [claim_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn blocked_reason(database: &Database, task_id: &str) -> Option<String> {
+        database
+            .connection()
+            .query_row(
+                "SELECT blocked_reason FROM loom_task WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Domain events of one type written for one entity, so a replay that writes nothing is
+    /// proven by the ledger rather than by a return value alone.
+    fn domain_events(database: &Database, event_type: &str, entity_id: &str) -> i64 {
+        database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE event_type=?1 AND entity_id=?2",
+                params![event_type, entity_id],
                 |row| row.get(0),
             )
             .unwrap()
@@ -10301,5 +10523,304 @@ mod tests {
             1,
             "assertion only_the_dispatch_lifecycle_columns_move"
         );
+    }
+
+    /// S2-1（ACCP `reconcileProject`）：未释放且租约已过期的 claim → 写 released_at（fence 不动）、
+    /// 仍未投递的 Task 置 BLOCKED 并写 blocked_reason，同时落一条领域事件。
+    #[test]
+    fn reclaim_releases_an_expired_claim_and_blocks_its_task() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM reclaim lost claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        expire_lease(&database, &claim.claim_id);
+
+        let receipt = reclaim_lost_claims(&mut database, &mission_id).unwrap();
+
+        assert_eq!(
+            receipt.mission_id, mission_id,
+            "assertion reclaim_receipt_echoes_the_mission_it_swept"
+        );
+        assert_eq!(
+            receipt.reclaimed.len(),
+            1,
+            "assertion one expired open claim is the one thing a sweep reclaims"
+        );
+        let reclaimed = &receipt.reclaimed[0];
+        assert_eq!(reclaimed.claim_id, claim.claim_id);
+        assert_eq!(reclaimed.task_id, "task_a");
+        assert_eq!(reclaimed.agent_run_id, "run_one");
+        assert_eq!(
+            reclaimed.fence_generation, claim.fence_generation,
+            "assertion reclaiming never advances the fence; the next takeover does"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            "2000-01-01T00:00:00+00:00",
+            "assertion reclaiming never rewrites the lease it already judged as lost"
+        );
+        assert_eq!(
+            released_at(&database, &claim.claim_id),
+            Some(receipt.evaluated_at.clone()),
+            "assertion the lost claim is released at the sweep instant"
+        );
+        assert!(reclaimed.task_blocked);
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "BLOCKED",
+            "assertion a Task whose executor lost authority stops being claimable work"
+        );
+        assert_eq!(
+            blocked_reason(&database, "task_a").as_deref(),
+            Some(LOOM_EXECUTION_AUTHORITY_LOST),
+            "assertion the Task records why it is blocked"
+        );
+        assert_eq!(
+            task_revision(&database, "task_a"),
+            3,
+            "assertion the block advances the Task revision exactly once"
+        );
+        assert_eq!(
+            domain_events(&database, LOOM_EXECUTION_AUTHORITY_LOST, "task_a"),
+            1,
+            "assertion the release is one domain event, not a silent ledger write"
+        );
+    }
+
+    /// S2-2：幂等——同一 Mission 再扫一次不产生任何新写入。
+    #[test]
+    fn reclaim_is_idempotent_and_replays_as_an_empty_sweep() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM reclaim replay");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        expire_lease(&database, &claim.claim_id);
+
+        let first = reclaim_lost_claims(&mut database, &mission_id).unwrap();
+        let second = reclaim_lost_claims(&mut database, &mission_id).unwrap();
+
+        assert_eq!(first.reclaimed.len(), 1);
+        assert_eq!(
+            second.reclaimed,
+            Vec::new(),
+            "assertion a released claim is never reclaimed a second time"
+        );
+        assert_eq!(
+            released_at(&database, &claim.claim_id),
+            Some(first.evaluated_at),
+            "assertion the replay leaves the original release instant untouched"
+        );
+        assert_eq!(
+            task_revision(&database, "task_a"),
+            3,
+            "assertion the replay does not advance the Task revision again"
+        );
+        assert_eq!(
+            blocked_reason(&database, "task_a").as_deref(),
+            Some(LOOM_EXECUTION_AUTHORITY_LOST)
+        );
+        assert_eq!(
+            domain_events(&database, LOOM_EXECUTION_AUTHORITY_LOST, "task_a"),
+            1,
+            "assertion the replay writes no second domain event"
+        );
+    }
+
+    /// S2-3：活租约属于持有者，扫描不得回收。
+    #[test]
+    fn reclaim_leaves_a_live_lease_to_its_holder() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM reclaim live lease");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+
+        let receipt = reclaim_lost_claims(&mut database, &mission_id).unwrap();
+
+        assert_eq!(receipt.reclaimed, Vec::new());
+        assert_eq!(
+            released_at(&database, &claim.claim_id),
+            None,
+            "assertion a live lease is never released under its holder"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion a Task with a live claim stays claimable"
+        );
+        assert_eq!(
+            domain_events(&database, LOOM_EXECUTION_AUTHORITY_LOST, "task_a"),
+            0
+        );
+    }
+
+    /// S2-4：已释放的 claim 不再算失权，释放时刻保留原值。
+    #[test]
+    fn reclaim_never_rewrites_a_released_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM reclaim released");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at='2026-01-01T00:00:00+00:00' WHERE claim_id=?1",
+                [&claim.claim_id],
+            )
+            .unwrap();
+        expire_lease(&database, &claim.claim_id);
+
+        let receipt = reclaim_lost_claims(&mut database, &mission_id).unwrap();
+
+        assert_eq!(receipt.reclaimed, Vec::new());
+        assert_eq!(
+            released_at(&database, &claim.claim_id).as_deref(),
+            Some("2026-01-01T00:00:00+00:00"),
+            "assertion a conclusion already recorded is never restamped"
+        );
+        assert_eq!(task_status(&database, "task_a"), "READY");
+    }
+
+    /// S2-5：只碰本 Mission；没有计划的 Mission 是空扫描而不是报错。
+    #[test]
+    fn reclaim_stays_inside_the_mission() {
+        let mut database = fixture();
+        let first = create_mission(&mut database, "LOOM reclaim scope one");
+        let second = create_mission(&mut database, "LOOM reclaim scope two");
+        plan_import(&mut database, plan_input(&first)).unwrap();
+        task_release(&mut database, release_input(&first, "task_a")).unwrap();
+        // Task ids are global in `loom_task`, so the second Mission's plan carries its own id.
+        let mut other_plan = plan_input(&second);
+        other_plan.tasks = vec![task("task_c", "Task C")];
+        other_plan.dependencies = Vec::new();
+        plan_import(&mut database, other_plan).unwrap();
+        task_release(&mut database, release_input(&second, "task_c")).unwrap();
+        let first_claim = claim_acquire(
+            &mut database,
+            claim_input(&first, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let second_claim = claim_acquire(
+            &mut database,
+            claim_input(&second, "task_c", "run_two", "command_two"),
+        )
+        .unwrap();
+        expire_lease(&database, &first_claim.claim_id);
+        expire_lease(&database, &second_claim.claim_id);
+
+        let receipt = reclaim_lost_claims(&mut database, &first).unwrap();
+
+        assert_eq!(receipt.reclaimed.len(), 1);
+        assert_eq!(receipt.reclaimed[0].claim_id, first_claim.claim_id);
+        assert_eq!(
+            released_at(&database, &first_claim.claim_id).is_some(),
+            true,
+            "assertion the swept Mission's lost claim is released"
+        );
+        assert_eq!(
+            released_at(&database, &second_claim.claim_id),
+            None,
+            "assertion another Mission's lost claim is not this sweep's business"
+        );
+        let mission_task_status =
+            |database: &Database, mission_id: &str, task_id: &str| -> String {
+                database
+                    .connection()
+                    .query_row(
+                        "SELECT task.status FROM loom_task AS task
+                     JOIN loom_plan AS plan ON plan.plan_id=task.plan_id
+                     WHERE plan.mission_id=?1 AND task.task_id=?2",
+                        params![mission_id, task_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            };
+        assert_eq!(
+            mission_task_status(&database, &first, "task_a"),
+            "BLOCKED",
+            "assertion the swept Mission's Task is blocked for the lost authority"
+        );
+        assert_eq!(
+            mission_task_status(&database, &second, "task_c"),
+            "READY",
+            "assertion the other Mission's Task is left exactly as it was"
+        );
+
+        let unplanned = create_mission(&mut database, "LOOM reclaim unplanned");
+        assert_eq!(
+            reclaim_lost_claims(&mut database, &unplanned)
+                .unwrap()
+                .reclaimed,
+            Vec::new(),
+            "assertion a Mission without a Plan sweeps to nothing instead of failing"
+        );
+    }
+
+    /// ACCP `reconcileProject` 只关闭仍 `RUNNING` 的 Run：已交付待审（IN_REVIEW）、已验收（DONE）
+    /// 或已取消（CANCELED）的 Task 不是丢失的 Run，回收 claim 不得回退它的状态与判定。
+    #[test]
+    fn reclaim_never_blocks_a_task_that_already_reached_a_conclusion() {
+        for status in ["IN_REVIEW", "DONE", "CANCELED"] {
+            let mut database = fixture();
+            let mission_id = create_mission(&mut database, "LOOM reclaim concluded");
+            plan_import(&mut database, plan_input(&mission_id)).unwrap();
+            task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+            let claim = claim_acquire(
+                &mut database,
+                claim_input(&mission_id, "task_a", "run_one", "command_one"),
+            )
+            .unwrap();
+            database
+                .connection()
+                .execute(
+                    "UPDATE loom_task SET status=?1, blocked_reason='stage review: kept'
+                     WHERE task_id='task_a'",
+                    [status],
+                )
+                .unwrap();
+            expire_lease(&database, &claim.claim_id);
+
+            let receipt = reclaim_lost_claims(&mut database, &mission_id).unwrap();
+
+            assert_eq!(receipt.reclaimed.len(), 1);
+            assert!(
+                !receipt.reclaimed[0].task_blocked,
+                "assertion a concluded {status} Task is not reported as blocked by reclaim"
+            );
+            assert_eq!(
+                task_status(&database, "task_a"),
+                status,
+                "assertion reclaim never rolls a concluded Task back to BLOCKED"
+            );
+            assert_eq!(
+                blocked_reason(&database, "task_a").as_deref(),
+                Some("stage review: kept"),
+                "assertion reclaim does not overwrite an existing blocked reason"
+            );
+            assert_eq!(
+                released_at(&database, &claim.claim_id).is_some(),
+                true,
+                "assertion the expired claim itself is still released"
+            );
+        }
     }
 }
