@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AgentProfile, LoomControlSnapshot, LoomStageReview, MissionRecord, NavigationSnapshot, ThreadOpenProjection } from '@contracts'
 import type { ThreadClient } from '../camp-client'
 import { emptyLocalThreadComposerDraft, loadLocalThreadComposerDraft, saveLocalThreadComposerDraft } from '../camp-composer-local-store'
-import { bootstrapSelection, conversationItems, createThreadForAgent, latestStageReview, prepareSendDraft, readThreadSnapshot, readWorkBundle, readWorkBundles, readWorkBundlesFast, sendThreadMessage, stageDraftAttachments, stageReviewFacts, threadMessageSendParams, workControl } from './service'
+import { bootstrapSelection, conversationItems, createThreadForAgent, latestStageReview, LOOM_BUNDLE_CONCURRENCY, prepareSendDraft, readThreadSnapshot, readWorkBundle, readWorkBundles, readWorkBundlesFast, sendThreadMessage, stageDraftAttachments, stageReviewFacts, threadMessageSendParams, workControl } from './service'
 import type { WorkBundle } from './types'
 
 let store: Map<string,string>
@@ -145,22 +145,28 @@ describe('native work bundle review facts',()=>{
     const missions=Array.from({length:9},(_,index)=>({...mission,
       missionId:`m${index}`,threadId:`t${index}`,title:`M${index}`}) as MissionRecord)
     let inFlight=0,peak=0
-    const request=vi.fn(async(method:string,params?:{missionId?:string}):Promise<unknown>=>{
-      if(method==='loom.bundles.getMany') return {bundles:missions.map(item=>row({missionId:item.missionId}))}
+    const request=vi.fn(async(method:string,params?:{missionId?:string;missionIds?:string[]}):Promise<unknown>=>{
+      // 严格按请求的 missionIds 回行：多回或漏回都会让批量投影形状校验失败、退化为六源回退，
+      // 那样这条用例就测不到“批量行缺 control 时按 Mission 补读”的路径。
+      if(method==='loom.bundles.getMany') return {bundles:(params?.missionIds??[]).map(id=>row({missionId:id}))}
       if(method==='loom.control.get'){
         inFlight+=1;peak=Math.max(peak,inFlight)
         await new Promise(resolve=>setTimeout(resolve,0))
         inFlight-=1
         return snapshot({missionId:String(params?.missionId??'m')})
       }
-      if(method==='loom.plan.get') return null
-      if(method==='loom.artifacts.list') return {artifacts:[]}
-      return []
+      // 批次成功时不该再发六源单读：发出来就说明走的是回退路径，不是被测路径。
+      throw Error(`batch control read must not issue ${method}`)
     })
     const batched=await readWorkBundlesFast(mockClient(request),missions)
+    const calls=(name:string)=>request.mock.calls.filter(([method])=>method===name)
+    expect(batched.errors).toHaveLength(0)
     expect(batched.bundles).toHaveLength(9)
-    expect(peak).toBeGreaterThan(0)
-    expect(peak).toBeLessThanOrEqual(4)
+    // 9 个 Mission 被 8+1 分两批：既有批量请求，也有逐 Mission 的 control 补读，没有六源单读。
+    expect(calls('loom.bundles.getMany').map(([,params])=>params?.missionIds)).toEqual([
+      missions.slice(0,8).map(item=>item.missionId),[missions[8].missionId]])
+    expect(calls('loom.control.get')).toHaveLength(9)
+    expect(peak).toBe(LOOM_BUNDLE_CONCURRENCY)
     for(const bundle of batched.bundles) expect(workControl(bundle).status).toBe('observed')
   })
   it('keeps the bundle unknown when the batch and the control read both fail',async()=>{
