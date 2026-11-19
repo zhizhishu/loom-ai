@@ -9,11 +9,13 @@
 - “Mikka 和 PiBot 为主，其它是参考。”
 - “UI 就是我们现在这个，很满意了。”
 - “Pi 和 Pi Purge 是内置的，可以理解为主助手，也可以操控 B，四个端口。”
-- “之前老是说开源，不舍得用。”参考快照许可已统一为 MIT，**许可不确定不再是自己写的理由**。
+- “之前老是说开源，不舍得用。”参考快照许可已统一为 MIT，**Mikka、PiBot 等上游代码可以整段照抄**，许可不确定不再是自己写的理由。
+- “Claude 依然禁用，Claude CLI 容易封号。”开发、测试、验收都不调用 Claude CLI。
+- “直接在 DE-BERO 沙箱那边模拟我环境实现。”
 
 ## 2. 复用硬规则（每个施工 Agent 的 READ FIRST）
 
-1. **先找上游，再动手。** 任何新模块、新函数文件、新协议字段之前，先查 [架构](LOOM-ARCHITECTURE.md) §3 对应行。主体来源（Mikka / PiBot）有现成实现的，**直接复制/移植/运行**，不是“参考思路”。
+1. **先找上游，再动手。** 任何新模块、新函数文件、新协议字段之前，先查 [架构](LOOM-ARCHITECTURE.md) §3 对应行。主体来源（Mikka / PiBot）有现成实现的，**直接复制/移植/运行，可以整段照抄**，不是“参考思路”。
 2. **上游对照表是交付物的一部分。** 每份报告写：参考项目 + 40 位 SHA + 上游文件路径 + 复用方式（直接依赖 / 复制改写 / 原样运行）+ 若不能直接用，具体不兼容点（某个 API、某张表、某个平台）。给不出对照表就不许写新代码。
 3. **只写最薄适配层。** 允许写的只有架构 §3 “LOOM 只写”一列。单次新增超过 300 行，必须说明为什么不是适配层。
 4. **抄写上游再模拟 = 造轮子。** 要么导入/运行上游，要么写明不兼容点。读完上游后自己“重新实现一个简化版”同样算造轮子。
@@ -21,7 +23,9 @@
 6. **数据只进一个 Core。** 移植 Mikka/PiBot 逻辑时，存储落到 Rust Core + SQLite；不另跑 Postgres、不另起 PiBot Center、不建第二套调度。
 7. **依赖版本跟随用户实际安装版本**（DSH `0.2.0-rc.2`、固定 Pi 版本），仓内不另锁旧版。注意系统 PATH 上的 `dsh --version` 仍报 `0.1.5-rc.2`，不要误判。
 8. **既有纪律不变**：只认原始回执；失败记录不改写；不碰 64851 / 64852、日常 userData 和正式数据；DE-BERO 根盘余量很小，不投大编译；不 `reset`、不清理用户 WIP；未经用户同意不推送远端。
-9. 阶段结果只更新根 `TASK.md` / `LOG.md` / `LOOM-IMPLEMENTATION.md`，**不再新建计划书或交接书**；需要改计划就改本页三件套。
+9. **不调用 Claude CLI**：Claude Code 运行端禁用，开发与测试也不拿它当工兵或验收对象。
+10. **在 DE-BERO 沙箱开发**（见 §3.1）；用户电脑只做 Windows 专属的隔离验收。
+11. 阶段结果只更新根 `TASK.md` / `LOG.md` / `LOOM-IMPLEMENTATION.md`，**不再新建计划书或交接书**；需要改计划就改本页三件套。
 
 ## 3. 当前状态（2026-11-18 晚，细节以 LOOM-IMPLEMENTATION 为准）
 
@@ -33,9 +37,17 @@
 - 电脑控制：`L5-computer/run-07/run.json` 模型自主截图识码，`synthetic_frame=true`。
 - 能力矩阵：`L9` 16 格真实表，7 格正向回执。
 
-**未完成**：写入早于认领（r9 实证 claim 晚 6.031 秒）；E6-B 恢复对账缺故障注入；记忆只按 Bot 不按 Workspace；Claude Win11 准入口径冲突；Codex MCP 外部 relay 卡点；Owner 接受 = 0。
+**未完成**：写入早于认领（r9 实证 claim 晚 6.031 秒）；E6-B 恢复对账缺故障注入；记忆只按 Bot 不按 Workspace；Claude 已定禁用但代码仍判可用；Codex MCP 外部 relay 卡点；Owner 接受 = 0。
 
 **Git**：分支 `rovai/loom-v2-personal-20261116`，本地提交未推送。
+
+### 3.1 开发环境：DE-BERO 沙箱（用户 2026-11-18 决定）
+
+- 主机 DE-BERO（Linux，4 核、19 GB 内存；2026-11-18 实测根盘 196 GB、可用 150 GB）。经 `komari-ssh` 执行，按 `berobox` 建**独立容器**，不动已有 23 个容器、不清理未知资源。
+- 容器里模拟用户环境：同分支代码、固定 Node/Rust、Pi 固定版本、DSH `0.2.0-rc.2`、Codex；**不装、不调用 Claude CLI**；模型走用户已授权的现有服务。
+- 在沙箱跑：Rust Core、Web、loom-node（Linux）、Node 测试、P0–P5 的单测与集成测试。
+- 留在用户电脑隔离验收：Windows 安装包、Electron 桌面、Windows 电脑控制、真跨设备（E5）。不碰 64851/64852、日常 userData。
+- 代码同步：沙箱只拉本地已提交的版本；推送远端仍需用户同意。
 
 ## 4. 造轮子清单（按“主体 Mikka + PiBot”重新定性）
 
@@ -54,7 +66,8 @@
 
 ## 5. 施工顺序
 
-### P0 先领后写
+### P0 先领后写（附带：Claude 禁用对齐）
+0. 把 `agent_runtime_adapter.rs` 中 Claude Code 的准入改为禁用（只识别），UI 显示“已禁用”；加负例测试：选 Claude 派工被拒。
 1. Core 在 claim 事务里原子生成 Run + 快照 + 租约，并发放单调递增的 fence（对照 Mikka `claim.ts` / `worker-lease.ts` 的租约写法与 ACCP 不变量）。
 2. 写授权只在 claim 成功后由 Core 签发并携带 fence；guard 对每次写入（含首次新建）校验，缺失或过期即拒绝。
 3. heartbeat / report / artifact 全部校验 fence；过期租约不能被旧心跳复活。
