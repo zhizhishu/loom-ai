@@ -23,6 +23,12 @@ coordinates never reach an OS process list, shell history or argv log.
     {"op":"text","text":"..."}          (<= 2048 codepoints, no control chars)
     {"op":"release"}                    (best effort: release every button)
 
+Typed text keeps its case on every backend: the Windows path sends UTF-16 units,
+and the X11 path resolves each character against the display's own keyboard
+mapping, holding shift exactly where the mapping puts the character on level 1.
+A character that mapping cannot reach without AltGr is refused
+(`unsupported_input`) instead of being typed as its unshifted neighbour.
+
 A refusal is `{"ok":false,"error":"<code>"}` on stdout with exit status 1:
 `invalid_request`, `unsupported_backend`, `no_display`, `session_locked`,
 `encoder_unavailable`, `unsupported_input`, `capture_failed`.
@@ -91,18 +97,6 @@ WINDOWS_VK = {
     "shift": 0x10, "ctrl": 0x11, "alt": 0x12, "meta": 0x5B,
     "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74, "f6": 0x75,
     "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
-}
-
-# Characters that live on the shift level of another X11 keysym, for the baseline
-# US layout the helper targets. `XKeysymToKeycode` maps both levels of a key to the
-# same keycode, so the tap alone types the *unshifted* character: a capital letter
-# or `!` needs shift held around it, otherwise typed text silently loses its case.
-X11_SHIFTED = {
-    **{chr(code): chr(code + 32) for code in range(ord("A"), ord("Z") + 1)},
-    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
-    "&": "7", "*": "8", "(": "9", ")": "0", "_": "-", "+": "=",
-    "{": "[", "}": "]", "|": "\\", ":": ";", "\"": "'", "<": ",",
-    ">": ".", "?": "/", "~": "`",
 }
 
 X11_KEYSYM = {
@@ -240,28 +234,69 @@ def plan_input(request, bounds, unicode_text):
         for character in text:
             if ord(character) > 0xFF:
                 raise Failure("unsupported_input", "text encoding")
-        return x11_text_steps(text)
+        # Layout-independent: which key and which shift level a character needs is
+        # a property of the display's keyboard mapping, resolved at apply time.
+        return [("keysym", ord(character)) for character in text]
     raise Failure("invalid_request", "op")
 
 
-def x11_text_steps(text):
-    """Keysym taps for the X11 text path, with the shift taps case needs.
+def keyboard_levels(rows):
+    """Inverse keyboard map: keysym -> (keycode, needs_shift).
 
-    Every character is one tap of its keysym, except the characters in
-    `X11_SHIFTED`: those are pressed as shift-down, base keysym tap, shift-up, so
-    the delivered text keeps the case the caller asked for. The shift taps stay
-    inside the same plan as the tap they wrap, so a plan can never end with shift
-    (or any other modifier) held.
+    `rows` is an iterable of `(keycode, [level0, level1, ...])` in ascending
+    keycode order, the shape the X server reports. Only the first two levels are
+    used, because shift is the only modifier this helper can hold: a character a
+    layout only reaches through AltGr (its third level) is not reachable here and
+    must be refused instead of typed as a neighbouring character.
+    """
+    levels = {}
+    for keycode, keysyms in rows:
+        for level, value in enumerate(keysyms[:2]):
+            if not value:
+                continue  # NoSymbol: this level types nothing
+            known = levels.get(value)
+            if known is not None and (not known[1] or level == 1):
+                # A character reachable without shift always wins, and a shifted
+                # duplicate keeps the first keycode it was found on.
+                continue
+            levels[value] = (keycode, level == 1)
+    return levels
+
+
+def plan_text_steps(values, levels):
+    """Taps for keysym `values` against one display's own keyboard mapping.
+
+    A character the mapping puts on level 1 needs shift held around its tap; one
+    it puts on level 0 must never take shift, because shift would turn it into a
+    different character there (`+` is a bare key on `de` and shift+`=` on `us`).
+    A character the mapping cannot reach with shift alone is refused: typing a
+    neighbour instead of what was asked would be silent text corruption.
     """
     steps = []
-    for character in text:
-        base = X11_SHIFTED.get(character)
-        if base is None:
-            steps.append(("keysym", ord(character)))
+    for value in values:
+        entry = levels.get(value)
+        if not entry:
+            raise Failure("unsupported_input", "keysym")
+        keycode, shifted = entry
+        if not keycode:
+            raise Failure("unsupported_input", "keycode")
+        if not shifted:
+            steps.append(("keycode", keycode))
             continue
         steps.append(("key", "shift", "down"))
-        steps.append(("keysym", ord(base)))
+        steps.append(("keycode", keycode))
         steps.append(("key", "shift", "up"))
+    return steps
+
+
+def expand_keysym_taps(plan, levels):
+    """Resolve the layout-independent keysym taps of `plan` for this display."""
+    steps = []
+    for step in plan:
+        if step[0] == "keysym":
+            steps.extend(plan_text_steps([step[1]], levels))
+        else:
+            steps.append(step)
     return steps
 
 
@@ -675,9 +710,44 @@ def _xtst():
     return xtst
 
 
+def read_keyboard_levels(ctypes, x11, display):
+    """The keyboard mapping this X server actually serves, in `keyboard_levels`."""
+    first, last = ctypes.c_int(), ctypes.c_int()
+    x11.XDisplayKeycodes.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                     ctypes.POINTER(ctypes.c_int)]
+    x11.XDisplayKeycodes.restype = ctypes.c_int
+    if not x11.XDisplayKeycodes(display, ctypes.byref(first), ctypes.byref(last)):
+        raise Failure("unsupported_input", "keymap")
+    count = int(last.value) - int(first.value) + 1
+    if count <= 0:
+        raise Failure("unsupported_input", "keymap")
+    per_keycode = ctypes.c_int()
+    x11.XGetKeyboardMapping.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_int,
+                                       ctypes.POINTER(ctypes.c_int)]
+    x11.XGetKeyboardMapping.restype = ctypes.POINTER(ctypes.c_ulong)
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XFree.restype = ctypes.c_int
+    table = x11.XGetKeyboardMapping(display, int(first.value), count,
+                                  ctypes.byref(per_keycode))
+    if not table:
+        raise Failure("unsupported_input", "keymap")
+    try:
+        per = int(per_keycode.value)
+        rows = [(int(first.value) + index,
+                 [int(table[index * per + level]) for level in range(min(per, 2))])
+                for index in range(count)]
+    finally:
+        x11.XFree(table)
+    return keyboard_levels(rows)
+
+
 def linux_apply(plan, bounds):
     ctypes, x11, display, screen, bounds = linux_display()
     xtst = _xtst()
+    if any(step[0] == "keysym" for step in plan):
+        # The layout belongs to the display, not to the request: resolve every
+        # character against the mapping this X server serves before touching it.
+        plan = expand_keysym_taps(plan, read_keyboard_levels(ctypes, x11, display))
     # Anything this plan presses and has not released yet. A plan that fails
     # halfway (an unmapped keysym, a dropped display) must not leave a modifier
     # or a button held on the user's desktop.
@@ -710,12 +780,11 @@ def linux_apply(plan, bounds):
                     held.append(("key", code))
                 elif ("key", code) in held:
                     held.remove(("key", code))
-            elif kind == "keysym":
-                code = x11.XKeysymToKeycode(display, step[1])
-                if not code:
-                    raise Failure("unsupported_input", "keysym")
-                xtst.XTestFakeKeyEvent(display, code, 1, 0)
-                xtst.XTestFakeKeyEvent(display, code, 0, 0)
+            elif kind == "keycode":
+                # A resolved character tap: keycode and shift already decided by
+                # the display's own mapping, so no level is guessed here.
+                xtst.XTestFakeKeyEvent(display, step[1], 1, 0)
+                xtst.XTestFakeKeyEvent(display, step[1], 0, 0)
             else:
                 raise Failure("unsupported_input", kind)
             x11.XFlush(display)

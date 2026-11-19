@@ -7,8 +7,11 @@ Windows INPUT plan, device identity and the stdin-only request framing.
 
 The real desktop acceptance (`LiveDesktopAcceptance`) is opt-in through
 `LOOM_COMPUTER_LIVE_ACCEPTANCE=1` and needs a private Xvfb display plus
-`xdotool`, `xmessage` and `xterm` (installed by `scripts/bero/loom-dev-setup.sh`).
-It drives the shipped one-shot helper over stdin, one process per operation.
+`xdotool`, `xmessage`, `xterm` and `setxkbmap` (installed by
+`scripts/bero/loom-dev-setup.sh`). It drives the shipped one-shot helper over
+stdin, one process per operation, and one of its cases switches that display's
+keyboard layout, so typed text is proven against a layout the helper does not
+hard-code.
 
 Run pure only:
     python3 -m unittest discover -s resources/computer -p test_host_desktop.py -v
@@ -166,16 +169,103 @@ class KeyWhitelist(unittest.TestCase):
         plan = helper.plan_input({"op": "text", "text": "Ok"}, BOUNDS, unicode_text=True)
         self.assertEqual(plan, [("unicode", ord("O")), ("unicode", ord("k"))])
         ansi = helper.plan_input({"op": "text", "text": "Ok"}, BOUNDS, unicode_text=False)
-        # The X11 path taps the shift level of the same keycode for `O`.
-        self.assertEqual(
-            ansi,
-            [("key", "shift", "down"), ("keysym", ord("o")),
-             ("key", "shift", "up"), ("keysym", ord("k"))],
-        )
+        # The X11 plan stays layout-independent: keycode and shift level are decided
+        # at apply time from the display's own mapping (`X11TextLevels` below), so
+        # one hard-coded layout can never be assumed here.
+        self.assertEqual(ansi, [("keysym", ord("O")), ("keysym", ord("k"))])
         # X11 keysyms only map Latin-1 without an input-method round trip.
         with self.assertRaises(helper.Failure) as raised:
             helper.plan_input({"op": "text", "text": "中文"}, BOUNDS, unicode_text=False)
         self.assertEqual(raised.exception.code, "unsupported_input")
+
+
+# Keyboard mappings in the shape the X server reports them: per keycode, the
+# keysyms of the levels shift can reach. Letters and the space bar are the same on
+# both fixtures; `+` is not, which is exactly the difference that must never be
+# baked into the helper.
+LIVE_LOWER = "abcdefghijklmnopqrstuvwxyz"
+LETTER_KEYCODE = 38
+
+
+def letter_keycode(letter):
+    return LETTER_KEYCODE + LIVE_LOWER.index(letter)
+
+
+COMMON_KEYMAP = (
+    [(letter_keycode(letter), [ord(letter), ord(letter.upper())])
+     for letter in LIVE_LOWER]
+    + [(57, [ord(" "), ord(" ")]), (10, [ord("1"), ord("!")])]
+)
+
+
+def keymap(rows):
+    """Rows in the order a real X server reports them."""
+    return sorted(rows, key=lambda row: row[0])
+
+
+# The two layouts differ in exactly one row: the key that carries `+` (shift level
+# of `=` on us, a bare key on de).
+US_KEYMAP = keymap(COMMON_KEYMAP + [(21, [ord("="), ord("+")])])
+DE_KEYMAP = keymap(COMMON_KEYMAP + [(21, [ord("+"), ord("*")])])
+
+
+class X11TextLevels(unittest.TestCase):
+    """Typed text follows the display's keyboard mapping, not one layout.
+
+    Pure: the mappings below are fixture rows, no X server is contacted.
+    """
+
+    def test_shift_is_pressed_only_where_the_layout_needs_it(self):
+        us = helper.keyboard_levels(US_KEYMAP)
+        de = helper.keyboard_levels(DE_KEYMAP)
+        # The same request, two layouts: us needs shift for `+`, de must not.
+        self.assertEqual(
+            helper.plan_text_steps([ord("+")], us),
+            [("key", "shift", "down"), ("keycode", 21), ("key", "shift", "up")],
+        )
+        self.assertEqual(helper.plan_text_steps([ord("+")], de), [("keycode", 21)])
+        self.assertEqual(helper.plan_text_steps([ord("=")], us), [("keycode", 21)])
+        for name, levels in (("us", us), ("de", de)):
+            # A capital is the shift level of its letter on either layout.
+            self.assertEqual(
+                helper.plan_text_steps([ord("O")], levels),
+                [("key", "shift", "down"), ("keycode", letter_keycode("o")),
+                 ("key", "shift", "up")],
+                name,
+            )
+            self.assertEqual(helper.plan_text_steps([ord("o")], levels),
+                             [("keycode", letter_keycode("o"))], name)
+
+    def test_a_character_on_no_shift_level_is_refused_not_mistyped(self):
+        levels = helper.keyboard_levels(DE_KEYMAP)
+        # On de `@` only exists on the AltGr level, which this helper cannot hold.
+        with self.assertRaises(helper.Failure) as raised:
+            helper.plan_text_steps([ord("@")], levels)
+        self.assertEqual(raised.exception.code, "unsupported_input")
+        with self.assertRaises(helper.Failure):
+            helper.plan_text_steps([0], levels)
+
+    def test_an_unshifted_duplicate_wins_over_a_shifted_one(self):
+        # Ascending keycodes: `+` first appears shifted, then on a bare key.
+        levels = helper.keyboard_levels([(21, [ord("="), ord("+")]),
+                                        (35, [ord("+"), ord("*")])])
+        self.assertEqual(levels[ord("+")], (35, False))
+        self.assertEqual(helper.plan_text_steps([ord("+")], levels), [("keycode", 35)])
+        # A shifted duplicate keeps the first keycode it was found on.
+        self.assertEqual(levels[ord("*")], (35, True))
+
+    def test_expansion_resolves_only_the_text_taps(self):
+        levels = helper.keyboard_levels(US_KEYMAP)
+        plan = helper.plan_input({"op": "text", "text": "o+"}, BOUNDS,
+                                unicode_text=False)
+        self.assertEqual(
+            helper.expand_keysym_taps(plan, levels),
+            [("keycode", letter_keycode("o")), ("key", "shift", "down"),
+             ("keycode", 21), ("key", "shift", "up")],
+        )
+        pointer = helper.plan_input({"op": "pointer", "x": 1, "y": 2, "action": "move"},
+                                    BOUNDS, unicode_text=True)
+        self.assertEqual(helper.expand_keysym_taps(pointer, levels), pointer)
 
 
 class WindowsInputPlan(unittest.TestCase):
@@ -499,7 +589,9 @@ LIVE_SCREEN = (1024, 768)
 # must hold shift for the shift-level characters instead of delivering their
 # lowercase form.
 LIVE_MARKER = "Mikka isolated CUA input"
-LIVE_TOOLS = ("Xvfb", "xdpyinfo", "xdotool", "xmessage", "xterm")
+# `setxkbmap` switches the fixture display's own layout: typed text must follow
+# the mapping the display serves, never one layout baked into the helper.
+LIVE_TOOLS = ("Xvfb", "xdpyinfo", "xdotool", "xmessage", "xterm", "setxkbmap")
 # The bottom-left default button, as measured in the upstream fixture.
 BUTTON_INSET = (16, 14)
 # The isolated display handshake is POSIX-only: `os.pipe` + `select` and
@@ -549,6 +641,27 @@ def find_window(environment, name, only_visible=False):
     for window in completed.stdout.split():
         return window
     return ""
+
+
+def set_keyboard_layout(environment, layout):
+    """Switch one fixture display's keyboard layout, then prove the server took it.
+
+    `setxkbmap` changes the mapping the X server serves, which is what typed text
+    must follow. The query is read back because a silent failure here would make a
+    layout regression test assert nothing at all.
+    """
+    completed = subprocess.run(["setxkbmap", layout], env=environment,
+                               capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise AssertionError("could not switch the fixture keyboard to %s: %s"
+                             % (layout, completed.stderr.strip()))
+    query = subprocess.run(["setxkbmap", "-query"], env=environment,
+                           capture_output=True, text=True, check=True).stdout
+    reported = [line.partition(":")[2].strip() for line in query.splitlines()
+                if line.partition(":")[0].strip() == "layout"]
+    if reported != [layout]:
+        raise AssertionError("the fixture keyboard reports %s, not %r"
+                             % (reported, layout))
 
 
 def socket_owner_inodes(number, socket_dir="/tmp/.X11-unix"):
@@ -810,26 +923,25 @@ class LiveFixtureContract(unittest.TestCase):
 
     def test_the_marker_keeps_its_case_on_the_x11_text_path(self):
         # The upstream sample, capitals included: a capital is the shift level of
-        # the same keycode, so a bare tap would silently type the lowercase form.
+        # its letter, so the plan must hold shift around it on every layout.
         self.assertEqual(LIVE_MARKER, "Mikka isolated CUA input")
         self.assertTrue(any(character.isupper() for character in LIVE_MARKER))
         self.assertTrue(all(ord(character) < 0x100 for character in LIVE_MARKER))
-        self.assertEqual(
-            helper.plan_input({"op": "text", "text": "Mi"}, BOUNDS,
-                              unicode_text=False),
-            [("key", "shift", "down"), ("keysym", ord("m")),
-             ("key", "shift", "up"), ("keysym", ord("i"))],
-        )
+        capitals = sum(1 for character in LIVE_MARKER if character.isupper())
         plan = helper.plan_input({"op": "text", "text": LIVE_MARKER}, BOUNDS,
                                  unicode_text=False)
-        shifts = [step for step in plan if step[0] == "key"]
-        capitals = [character for character in LIVE_MARKER if character.isupper()]
-        self.assertEqual(len([step for step in shifts if step[2] == "down"]), len(capitals))
-        self.assertEqual(len([step for step in shifts if step[2] == "up"]), len(capitals))
-        keysyms = [step[1] for step in plan if step[0] == "keysym"]
-        # No uppercase keysym may be tapped: that is the shape that loses case.
-        self.assertTrue(all(chr(keysym).islower() or not chr(keysym).isalpha()
-                            for keysym in keysyms), [chr(k) for k in keysyms])
+        self.assertEqual([step[1] for step in plan],
+                         [ord(character) for character in LIVE_MARKER])
+        for name, rows in (("us", US_KEYMAP), ("de", DE_KEYMAP)):
+            steps = helper.expand_keysym_taps(plan, helper.keyboard_levels(rows))
+            # Every marker character is reachable, and shift wraps exactly the
+            # capitals: one down and one up per capital, no other modifier.
+            self.assertTrue(all(step[0] in ("key", "keycode") for step in steps), name)
+            downs = [step for step in steps if step == ("key", "shift", "down")]
+            ups = [step for step in steps if step == ("key", "shift", "up")]
+            self.assertEqual((len(downs), len(ups)), (capitals, capitals), name)
+            self.assertEqual(sum(1 for step in steps if step[0] == "keycode"),
+                             len(LIVE_MARKER), name)
 
     def test_button_point_reproduces_the_ported_upstream_click(self):
         self.assertEqual(button_point((200, 200, 400, 140)), (216, 326))
@@ -970,12 +1082,13 @@ class LiveDesktopAcceptance(unittest.TestCase):
         self.addCleanup(self.reap, process)
         return process
 
-    def focus(self, window):
+    def focus(self, environment, window):
+        """Focus a window on the display that owns it, not on the class display."""
         completed = None
         for _ in range(20):
             completed = subprocess.run(
                 ["xdotool", "windowfocus", "--sync", window],
-                env=self.environment, capture_output=True, text=True,
+                env=environment, capture_output=True, text=True,
             )
             if completed.returncode == 0:
                 return
@@ -1129,6 +1242,35 @@ class LiveDesktopAcceptance(unittest.TestCase):
                            "the dialog rectangle must be repainted after the click")
 
     def test_typed_text_reaches_the_dedicated_window(self):
+        received = self.typed_line(self.environment, "input", LIVE_MARKER)
+        # Case is part of the text: the shift taps, not just the taps, must arrive.
+        self.assertTrue(any(character.isupper() for character in received),
+                        "typed text must keep the capital letters of the marker")
+
+    def test_typed_text_follows_the_display_keyboard_layout(self):
+        """On a non-US layout `+` must still arrive as `+`.
+
+        `de` has a `+` key of its own while `=` needs shift, so a hard-coded US
+        table types `=` and still reports success. The layout is switched on this
+        case's own display, so no other case can inherit it.
+        """
+        display = IsolatedDisplay(*LIVE_SCREEN)
+        self.addCleanup(display.stop)
+        display.start()
+        environment = display.environment()
+        set_keyboard_layout(environment, "us")
+        set_keyboard_layout(environment, "de")
+        received = self.typed_line(environment, "layout", "Mikka + CUA")
+        self.assertIn("+", received, "the de `+` key must not arrive as another character")
+        self.assertNotIn("=", received)
+
+    def typed_line(self, environment, label, text):
+        """Type `text` then Enter into a dedicated xterm; return what it received.
+
+        The received text is read from the application's own file, which must not
+        exist before the injection, so a helper receipt can never stand in for the
+        characters that actually arrived.
+        """
         workspace = pathlib.Path(tempfile.mkdtemp(prefix="loom-live-input-"))
         self.addCleanup(shutil.rmtree, workspace, True)
         typed = workspace / "typed.txt"
@@ -1139,20 +1281,20 @@ class LiveDesktopAcceptance(unittest.TestCase):
             "pathlib.Path(sys.argv[1]).write_text(line.rstrip('\\n'), encoding='utf-8')\n",
             encoding="utf-8",
         )
-        title = dedicated_title("input")
+        title = dedicated_title(label)
         terminal = subprocess.Popen(
             ["xterm", "-title", title, "-geometry", "60x5+200+200", "-e",
              sys.executable, str(reader), str(typed)],
-            env=self.environment,
+            env=environment,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         self.addCleanup(self.reap, terminal)
-        window = await_window(self.environment, title, terminal, only_visible=True)
-        self.focus(window)
-        self.assertFalse(typed.exists(), "the application must not have the marker yet")
-        for request in ({"op": "text", "text": LIVE_MARKER}, {"op": "key", "key": "enter"}):
-            status, header, _ = call_helper(request, environment=self.environment)
+        window = await_window(environment, title, terminal, only_visible=True)
+        self.focus(environment, window)
+        self.assertFalse(typed.exists(), "the application must not have the text yet")
+        for request in ({"op": "text", "text": text}, {"op": "key", "key": "enter"}):
+            status, header, _ = call_helper(request, environment=environment)
             self.assertEqual(status, 0, header)
             self.assertTrue(header.get("ok"), header)
         for _ in range(50):
@@ -1162,11 +1304,9 @@ class LiveDesktopAcceptance(unittest.TestCase):
         self.assertEqual(terminal.returncode, 0,
                          "the fixture application exits only after a complete line")
         received = typed.read_text(encoding="utf-8")
-        self.assertEqual(received, LIVE_MARKER,
-                         "observed application text must match the typed marker")
-        # Case is part of the text: the shift taps, not just the taps, must arrive.
-        self.assertTrue(any(character.isupper() for character in received),
-                        "typed text must keep the capital letters of the marker")
+        self.assertEqual(received, text,
+                         "observed application text must match the typed text")
+        return received
 
 
 if __name__ == "__main__":
