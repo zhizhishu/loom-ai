@@ -21,11 +21,12 @@ import {
 
 const SCHEMA_VERSION = 3;
 // P0 step 2 / Core's plan decision E2: the guard acknowledgement (`rovai-managed-guard-state`)
-// carries the LOOM claim the grant was issued under, so THAT receipt moves to v4 while the binding
-// and session-state documents keep v3 (they did not change). Core's matching constant is
-// `PI_MANAGED_GUARD_SCHEMA_VERSION` in `pi.rs`; the two must move together or every guarded Run is
-// refused by `await_guard_ready`.
-const GRANT_SCHEMA_VERSION = 4;
+// carries the LOOM claim the grant was issued under.
+// P0 step 3: it also carries `requiresClaim`, the boolean that makes every `write`/`edit` require a
+// live claim, so THAT receipt is v5 while the binding and session-state documents keep v3 (they did
+// not change). Core's matching constant is `PI_MANAGED_GUARD_SCHEMA_VERSION` in `pi.rs`; the two must
+// move together or every guarded Run is refused by `await_guard_ready`.
+const GRANT_SCHEMA_VERSION = 5;
 const EXTENSION_VERSION = "rovai-pi-host-v11";
 // Optional per-Run file-access policy. Absent => the unchanged legacy native policy (no guard).
 // Core writes the grant to a private file and points this env var at it; the same file is what the
@@ -55,11 +56,13 @@ const FILE_GRANT_KEYS = [
   "expiresAtEpochMs",
   "logPath",
 ];
-// The claim triple Core adds to every grant it issues (P0 step 2). A Run that holds no LOOM Task
+// The claim identity Core adds to every grant it issues (P0 step 2). A Run that holds no LOOM Task
 // presents the empty triple (`""`/`0`/`0`) — the keys are still present, so "missing" can never be
-// mistaken for "unbound". Carrying them is all this step does; refusing a write without a claim is
-// the shared guard's decision.
-const FILE_GRANT_CLAIM_KEYS = ["claimId", "fenceGeneration", "leaseExpiresAtEpochMs"];
+// mistaken for "unbound".
+// P0 step 3 adds `requiresClaim` beside them: it is the REQUIREMENT, not the identity, and it is
+// `true` for a Run bound to a LOOM Task even before the claim row exists (the r9 window). The shared
+// guard refuses `write`/`edit` without a live claim exactly when it is `true`.
+const FILE_GRANT_CLAIM_KEYS = ["claimId", "fenceGeneration", "leaseExpiresAtEpochMs", "requiresClaim"];
 const FILE_GRANT_ALL_KEYS = [...FILE_GRANT_KEYS, ...FILE_GRANT_CLAIM_KEYS];
 
 /**
@@ -199,6 +202,15 @@ function validateFileAccess(binding: any): void {
   } else if (grant.fenceGeneration !== 0 || grant.leaseExpiresAtEpochMs !== 0) {
     throw new Error("runGrant claim is inconsistent");
   }
+  // P0 step 3: the requirement is a boolean, and a claim always implies it. `requiresClaim:true`
+  // beside an empty triple is the legal pre-claim window (r9); a claim beside `requiresClaim:false`
+  // would let the shared guard skip the gate while carrying an identity, so it is refused outright.
+  if (typeof grant.requiresClaim !== "boolean") {
+    throw new Error("runGrant requiresClaim is invalid");
+  }
+  if (nonEmpty(grant.claimId) && grant.requiresClaim !== true) {
+    throw new Error("runGrant claim is inconsistent with requiresClaim");
+  }
 }
 
 /**
@@ -226,6 +238,7 @@ function publishGuardState(ctx: any, binding: any): void {
       claimId: grant.claimId,
       fenceGeneration: grant.fenceGeneration,
       leaseExpiresAtEpochMs: grant.leaseExpiresAtEpochMs,
+      requiresClaim: grant.requiresClaim,
     }),
   );
 }

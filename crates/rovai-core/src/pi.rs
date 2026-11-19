@@ -34,13 +34,16 @@ pub(crate) const PI_PROTOCOL_VERSION: &str = "pi-jsonl-rpc-v1";
 pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v11";
 /// The schema version of the `rovai-managed-guard-state` acknowledgement (the grant receipt).
 ///
-/// P0 step 2 / plan decision E2: the grant now carries the LOOM claim triple
-/// (`claimId`/`fenceGeneration`/`leaseExpiresAtEpochMs`), so the receipt moves from v3 to v4 and
-/// every older receipt is refused instead of being field-compared against a wider document. It is a
-/// SEPARATE constant from the binding/session-state `SCHEMA_VERSION` in `managed-host.ts` because
-/// those two documents did not change; the TypeScript side mirrors this with `GRANT_SCHEMA_VERSION`.
-/// Both ends must move together — drift here makes `await_guard_ready` refuse every guarded Run.
-pub(crate) const PI_MANAGED_GUARD_SCHEMA_VERSION: i64 = 4;
+/// P0 step 2 / plan decision E2: the grant carries the LOOM claim triple
+/// (`claimId`/`fenceGeneration`/`leaseExpiresAtEpochMs`), so the receipt moved from v3 to v4 and
+/// every older receipt is refused instead of being field-compared against a wider document.
+/// P0 step 3: the grant now also carries `requiresClaim` (the boolean that makes every `write`/`edit`
+/// require a live claim), so the receipt moves again to v5 and a v4 acknowledgement is refused.
+/// It is a SEPARATE constant from the binding/session-state `SCHEMA_VERSION` in `managed-host.ts`
+/// because those two documents did not change; the TypeScript side mirrors this with
+/// `GRANT_SCHEMA_VERSION`. Both ends must move together — drift here makes `await_guard_ready` refuse
+/// every guarded Run.
+pub(crate) const PI_MANAGED_GUARD_SCHEMA_VERSION: i64 = 5;
 // The managed Host extension validates the OPTIONAL per-Run file grant (`ROVAI_PI_FILE_GRANT_FILE`)
 // and publishes `rovai-managed-guard-state`. v10 widened the accepted grant to the two exact frozen
 // tool sets (`read` or `read`/`write`/`edit`); v11 adds the third, explicitly chosen
@@ -1172,9 +1175,153 @@ mod managed_workflow_source_tests {
         // The empty (unbound) triple is a legal shape; an incoherent one is not.
         assert!(source.contains("runGrant claim is incomplete"));
         assert!(source.contains("runGrant claim is inconsistent"));
+        // P0 step 3: the requirement flag travels on both ends of the same document, exactly once.
+        assert!(source.contains("\"requiresClaim\""));
+        assert!(source.contains("runGrant requiresClaim is invalid"));
         // The binding and session-state documents did NOT change shape, so they keep the older
         // version: one shared bump would have invalidated evidence this step never widened.
         assert!(source.contains("const SCHEMA_VERSION = 3;"));
+    }
+
+    /// P0 step 3: the two managed sources agree on the claim gate vocabulary. A drift in a reason
+    /// code would silently turn a refusal into an allow, so it is asserted rather than trusted.
+    #[test]
+    fn the_guard_and_the_managed_host_agree_on_the_claim_gate() {
+        for token in [
+            "requiresClaim",
+            "claimId",
+            "fenceGeneration",
+            "leaseExpiresAtEpochMs",
+        ] {
+            assert!(
+                PI_FILE_GUARD_EXTENSION_SOURCE.contains(token),
+                "the shared guard lost {token}"
+            );
+            assert!(
+                include_str!("pi/managed-host.ts").contains(token),
+                "managed-host.ts lost {token}"
+            );
+        }
+        for token in [
+            "claim_missing",
+            "claim_expired",
+            "guard_requires_claim_missing",
+            "guard_claim_incomplete",
+            "guard_claim_inconsistent",
+        ] {
+            assert!(
+                PI_FILE_GUARD_EXTENSION_SOURCE.contains(token),
+                "the shared guard lost the {token} decision"
+            );
+        }
+        // The gate is on the writing tools only: a `read` is never blocked by a missing claim.
+        assert!(PI_FILE_GUARD_EXTENSION_SOURCE.contains("CLAIM_GATE_TOOLS"));
+        // Re-issuing the grant is what moves the authorisation after a `loom.claim`, so the guard
+        // must consume the file rather than a launch-time snapshot.
+        assert!(PI_FILE_GUARD_EXTENSION_SOURCE.contains("loadGrantFromFile(grantPath)"));
+    }
+
+    /// P0 step 3: the document the shared guard reads is re-issued for the claim the Run holds now,
+    /// and ONLY the claim moves. The guard re-reads this file before every decision, so this is the
+    /// whole mechanism that lets a `loom.claim` issued after the Host started take effect — including
+    /// on the warm-Host re-use path, which calls exactly this function with `request.live_claim`.
+    #[test]
+    fn reissuing_the_guard_grant_moves_only_the_claim_fence() {
+        use crate::loom::LiveClaim;
+
+        let root = std::env::temp_dir().join(format!(
+            "rovai-pi-guard-grant-reissue-{}",
+            std::process::id()
+        ));
+        let config_root = root.join("host-config").join("instance");
+        std::fs::create_dir_all(&config_root).unwrap();
+        let now = now_epoch_ms();
+        // The r9 shape: a LOOM-bound Run launched BEFORE it claims, so the first document requires a
+        // claim it does not have yet.
+        let launched = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run-1",
+            "bot-1",
+            3,
+            &root,
+            &root.join("guard.jsonl"),
+            now,
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let path = config_root.join("guard-grant.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&launched.to_document().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let published = || -> Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        assert_eq!(published()["requiresClaim"], json!(true));
+        assert_eq!(published()["claimId"], json!(""));
+
+        let claim = LiveClaim {
+            claim_id: "claim-1".to_string(),
+            agent_run_id: "run-1".to_string(),
+            fence_generation: 2,
+            lease_expires_at: chrono::DateTime::from_timestamp_millis(now + 90_000)
+                .unwrap()
+                .to_rfc3339(),
+        };
+        let reissued = super::host::reissue_guard_grant_file(
+            &config_root,
+            &launched,
+            Some(&claim),
+            true,
+            now,
+        )
+        .unwrap()
+        .expect("a loom.claim must publish a new guard grant");
+        assert_eq!(reissued.fence_generation, 2);
+        let document = published();
+        assert_eq!(document["claimId"], json!("claim-1"));
+        assert_eq!(document["fenceGeneration"], json!(2));
+        assert_eq!(document["requiresClaim"], json!(true));
+        assert_eq!(
+            document["leaseExpiresAtEpochMs"],
+            json!(now + 90_000),
+            "the published document carries the lease the guard compares"
+        );
+        // Everything the guard binds to stays byte-identical: a re-issue can never re-point it.
+        for key in [
+            "schema",
+            "runId",
+            "botId",
+            "executionEpoch",
+            "workspaceReal",
+            "allowedTools",
+            "expiresAtEpochMs",
+            "logPath",
+        ] {
+            assert_eq!(
+                document[key],
+                launched.to_document().unwrap()[key],
+                "assertion a re-issue never moves the guard identity field {key}"
+            );
+        }
+        // The warm-Host re-use path must be idempotent: the same claim is not published twice.
+        assert!(
+            super::host::reissue_guard_grant_file(&config_root, &reissued, Some(&claim), true, now)
+                .unwrap()
+                .is_none(),
+            "assertion re-issuing the same claim writes nothing"
+        );
+        // A Run that holds no claim yet and is not bound to a LOOM Task never gets a document that
+        // demands one: ordinary chat behaviour is unchanged.
+        assert!(
+            super::host::reissue_guard_grant_file(&config_root, &launched, None, true, now)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
 

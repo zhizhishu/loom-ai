@@ -68,7 +68,19 @@ function toolEvent(toolName, toolCallId, input = {}) {
   return { type: 'tool_call', toolCallId, toolName, input }
 }
 
-function grantDocument({ workspaceReal, logPath, runId = 'run-core-1', botId = 'bot-core', epoch = 3, expiresAtEpochMs = Date.now() + 600_000, tools = ['read'] }) {
+function grantDocument({
+  workspaceReal,
+  logPath,
+  runId = 'run-core-1',
+  botId = 'bot-core',
+  epoch = 3,
+  expiresAtEpochMs = Date.now() + 600_000,
+  tools = ['read'],
+  requiresClaim = false,
+  claimId = '',
+  fenceGeneration = 0,
+  leaseExpiresAtEpochMs = 0
+}) {
   return {
     schema: GUARD_SCHEMA,
     runId,
@@ -77,7 +89,14 @@ function grantDocument({ workspaceReal, logPath, runId = 'run-core-1', botId = '
     workspaceReal,
     allowedTools: tools,
     expiresAtEpochMs,
-    logPath
+    logPath,
+    // P0 step 2 + 3: the claim identity Core always writes, and the requirement flag that turns both
+    // `write` and `edit` into "not without a live claim". A plain chat Run keeps `requiresClaim:false`
+    // and the empty triple, which is the unchanged behaviour.
+    claimId,
+    fenceGeneration,
+    leaseExpiresAtEpochMs,
+    requiresClaim
   }
 }
 
@@ -587,6 +606,121 @@ test('core grant file: payload fields cannot turn a write-only or reordered gran
         assert.match(String(outcome.reason), /guard_tools_not_permitted/, `${label}: ${outcome?.reason}`)
       }
     }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 7 · P0 step 3: a LOOM-bound Run writes only under a live claim
+// ---------------------------------------------------------------------------
+
+// The r9 failure was a `write` of a brand-new file ~6s before `loom.claim`. The gated shape is: the
+// grant says `requiresClaim:true`, so EVERY write/edit — including the first creation of a file that
+// does not exist yet — needs a complete, unexpired claim. A plain chat Run keeps `requiresClaim:false`
+// and the unchanged behaviour, and `read` never needs a claim.
+test('claim gate: a LOOM-bound Run writes only under a complete, live claim', { timeout: 60_000, concurrency: false }, async () => {
+  const root = freshDir('loom-claim-gate-')
+  const workspace = join(root, 'ws')
+  mkdirSync(workspace)
+  writeFileSync(join(workspace, 'notes.md'), 'in scope\n', 'utf8')
+  const workspaceReal = realpathSync(workspace)
+  const ctx = { cwd: workspaceReal }
+  const logPath = join(root, 'guard.jsonl')
+  const WORKFLOW = ['read', 'write', 'edit', 'rovai_loom']
+  const readLogLines = () => readLog(logPath).split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line))
+  const decisions = (reasonCode) => readLogLines()
+    .filter((record) => record?.t === 'decision' && record?.reasonCode === reasonCode)
+
+  // A brand-new path: the path policy alone would say `in_workspace_new_file`.
+  const NEW_FILE = 'brand-new.md'
+  // One expiry for every rewrite of the pending document: a re-issue may move the claim, never the
+  // guard identity (the guard refuses a document whose expiry or Run changed under it).
+  const grantExpiry = Date.now() + 600_000
+
+  try {
+    // 1 · bound Run, no claim yet (the r9 window): refuse the FIRST creation, allow reads.
+    const pendingFile = join(root, 'grant-pending.json')
+    writeFileSync(pendingFile, JSON.stringify(grantDocument({
+      workspaceReal, logPath, tools: WORKFLOW, requiresClaim: true, expiresAtEpochMs: grantExpiry
+    })), 'utf8')
+    const pending = await loadGuard({ grantFile: pendingFile })
+    assert.equal(pending(toolEvent('read', 'pending_read', { path: 'notes.md' }), ctx), undefined,
+      'a read never needs a claim')
+    for (const [toolName, path, id] of [['write', NEW_FILE, 'pending_new'], ['write', 'notes.md', 'pending_overwrite'], ['edit', 'notes.md', 'pending_edit']]) {
+      const outcome = pending(toolEvent(toolName, id, { path }), ctx)
+      assert.equal(outcome?.block, true, `${toolName} ${path} must be refused before loom.claim`)
+      assert.match(String(outcome.reason), /claim_missing/, `${toolName} ${path}: ${outcome?.reason}`)
+    }
+    const missing = decisions('claim_missing')
+    assert.ok(missing.length >= 3, 'every refused write must be recorded as claim_missing')
+    assert.equal(missing[0].requiresClaim, true, 'the refusal records the requirement it enforced')
+    assert.ok(readLogLines().some((record) => record?.t === 'guard_ready' && record?.requiresClaim === true),
+      'guard_ready must record the claim requirement')
+
+    // 2 · Core re-issues the SAME document after `loom.claim`: the running guard must see it.
+    writeFileSync(pendingFile, JSON.stringify(grantDocument({
+      workspaceReal, logPath, tools: WORKFLOW, requiresClaim: true, expiresAtEpochMs: grantExpiry,
+      claimId: 'claim-live-1', fenceGeneration: 2, leaseExpiresAtEpochMs: Date.now() + 120_000
+    })), 'utf8')
+    assert.equal(pending(toolEvent('write', 'claimed_new', { path: NEW_FILE }), ctx), undefined,
+      'the first creation is allowed once the claim the grant carries is live')
+    assert.equal(pending(toolEvent('edit', 'claimed_edit', { path: 'notes.md' }), ctx), undefined,
+      'an edit under the live claim is allowed')
+    // The business tool never needs a claim of its own: `loom.claim` is how the claim is earned.
+    assert.equal(pending(toolEvent('rovai_loom', 'claimed_loom', { operation: 'loom.claim', input: {} }), ctx), undefined,
+      'loom.claim must never be gated on a claim it is about to create')
+
+    // 3 · a lease that lapsed is `claim_expired`, for writes and edits alike.
+    writeFileSync(pendingFile, JSON.stringify(grantDocument({
+      workspaceReal, logPath, tools: WORKFLOW, requiresClaim: true, expiresAtEpochMs: grantExpiry,
+      claimId: 'claim-live-1', fenceGeneration: 2, leaseExpiresAtEpochMs: Date.now() - 1_000
+    })), 'utf8')
+    for (const [toolName, path, id] of [['write', NEW_FILE, 'expired_new'], ['edit', 'notes.md', 'expired_edit']]) {
+      const outcome = pending(toolEvent(toolName, id, { path }), ctx)
+      assert.equal(outcome?.block, true, `${toolName} must be refused after the claim lease lapsed`)
+      assert.match(String(outcome.reason), /claim_expired/, `${toolName}: ${outcome?.reason}`)
+    }
+    assert.ok(decisions('claim_expired').length >= 2, 'a lapsed lease is recorded as claim_expired')
+
+    // 4 · a rewrite may only move the claim: another Run in the same file is refused.
+    writeFileSync(pendingFile, JSON.stringify(grantDocument({
+      workspaceReal, logPath, tools: WORKFLOW, runId: 'run-other', requiresClaim: true,
+      expiresAtEpochMs: grantExpiry,
+      claimId: 'claim-other', fenceGeneration: 3, leaseExpiresAtEpochMs: Date.now() + 120_000
+    })), 'utf8')
+    const swapped = pending(toolEvent('write', 'swapped_new', { path: NEW_FILE }), ctx)
+    assert.equal(swapped?.block, true, 'a re-issued document may not swap the Run it authorizes')
+    assert.match(String(swapped.reason), /guard_grant_identity_changed/, String(swapped?.reason))
+
+    // 5 · requiresClaim:false keeps the unchanged behaviour: no claim, writes still allowed.
+    const chatFile = join(root, 'grant-chat.json')
+    writeFileSync(chatFile, JSON.stringify(grantDocument({
+      workspaceReal, logPath, tools: ['read', 'write', 'edit'], requiresClaim: false
+    })), 'utf8')
+    const chat = await loadGuard({ grantFile: chatFile })
+    assert.equal(chat(toolEvent('write', 'chat_new', { path: NEW_FILE }), ctx), undefined,
+      'an ordinary chat Run is not gated on a claim')
+    assert.equal(chat(toolEvent('edit', 'chat_edit', { path: 'notes.md' }), ctx), undefined)
+
+    // 6 · the flag is part of the Core contract: a file grant without it fails closed, while the
+    // isolated Runner payload (which never describes a claim) keeps working with the default.
+    const missingFile = join(root, 'grant-no-flag.json')
+    const withoutFlag = grantDocument({ workspaceReal, logPath, tools: WORKFLOW })
+    delete withoutFlag.requiresClaim
+    writeFileSync(missingFile, JSON.stringify(withoutFlag), 'utf8')
+    const refused = await loadGuard({ grantFile: missingFile })
+    const missingFlag = refused(toolEvent('read', 'no_flag_read', { path: 'notes.md' }), ctx)
+    assert.equal(missingFlag?.block, true, 'a Core file grant without requiresClaim must fail closed')
+    assert.match(String(missingFlag.reason), /guard_requires_claim_missing/, String(missingFlag?.reason))
+
+    const envWithoutFlag = grantDocument({ workspaceReal, logPath: join(root, 'env.jsonl'), tools: ['read', 'write'] })
+    delete envWithoutFlag.requiresClaim
+    const runner = await loadGuard({ envGrant: JSON.stringify(envWithoutFlag) })
+    assert.equal(runner(toolEvent('write', 'runner_new', { path: NEW_FILE }), ctx), undefined,
+      'the isolated Runner payload keeps the pre-P0 behaviour when the flag is absent')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -1157,6 +1157,57 @@ pub(crate) fn live_claim_for_run(
     Ok(claim.filter(|claim| !lease_expired(&claim.lease_expires_at, now)))
 }
 
+/// 「这个 Run 是不是绑定了一个 LOOM 任务」+「它现在拿着哪个活 claim」（P0 步骤 3）。
+///
+/// 「先领后写」需要一个不依赖 claim 行是否存在的判据：r9 场景里 Run 先启动、6 秒后才
+/// `loom.claim`，签发写授权时根本没有 claim 行，但「这个 Run 承担的是 LOOM 任务」这件事在它
+/// 启动那一刻就已经是账本里的事实——它就是投递上的 `loom_control_dispatch`。因此：
+///
+/// - `requires_claim` = 这个 Run 关联的投递里有任意一条 dispatch，或者它已经持有活 claim；
+/// - `claim` = [`live_claim_for_run`] 的结果（没有就是 `None`，过期/不可解析也不算活）。
+///
+/// 只读，不写库、不加锁；调用方自己持有连接与时钟。消费方：`application::launch_pi_agent_run`
+/// 与 `application::handle_builtin_operation`（`loom.claim` 之后重签 grant）在发/改写授权前读它。
+pub(crate) struct RunLoomBinding {
+    /// 这个 Run 的写操作是否必须带一个活 claim。
+    pub requires_claim: bool,
+    /// 它此刻真正持有的 claim（open 且未过期）。
+    pub claim: Option<LiveClaim>,
+}
+
+pub(crate) fn loom_binding_for_run(
+    connection: &rusqlite::Connection,
+    agent_run_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RunLoomBinding> {
+    let claim = live_claim_for_run(connection, agent_run_id, now)?;
+    // 老库（还没有控制平面表）里不可能有 dispatch：读不到表就是「没有绑定」，不是偷偷放行也不
+    // 是报错——与 `runtime::preclaim_loom_dispatch_tasks` 的表可用性判定同一个口径。
+    let dispatched = if crate::remote_execution::authority_table_available(
+        connection,
+        "loom_control_dispatch",
+    )? && crate::remote_execution::authority_table_available(
+        connection,
+        "camp_message_delivery",
+    )? {
+        connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM camp_message_delivery AS delivery
+                 JOIN loom_control_dispatch AS dispatch ON dispatch.delivery_id = delivery.id
+                 WHERE delivery.claimed_agent_run_id = ?1)",
+            [agent_run_id],
+            |row| row.get::<_, bool>(0),
+        )?
+    } else {
+        false
+    };
+    Ok(RunLoomBinding {
+        // 已持有 claim 的 Run 无论如何都是绑定的：不让「账本里查不到 dispatch」变成关掉门禁的理由。
+        requires_claim: dispatched || claim.is_some(),
+        claim,
+    })
+}
+
 /// The edges that still block a claim, using the same rule as the contract's
 /// `loomEvaluateDependency`: a frozen release wins, otherwise a `TASK_DONE` edge needs its
 /// upstream Task `DONE`. The `ARTIFACT_ACCEPTED` branch needs a candidate and an accepted
@@ -7303,6 +7354,7 @@ mod tests {
                 &workspace.join("guard.jsonl"),
                 now_epoch_ms(),
                 claim,
+                true,
             )
             .unwrap()
             .unwrap()
@@ -7331,7 +7383,6 @@ mod tests {
         assert_eq!(unbound.claim_id, "");
         assert_eq!(unbound.fence_generation, 0);
         assert_eq!(unbound.lease_expires_at_epoch_ms, 0);
-
         // 过期租约既不算活 claim，也不会被塞进写授权冒充活 fence。
         expire_lease(&database, &claim.claim_id);
         let expired =
@@ -7345,6 +7396,148 @@ mod tests {
         assert_eq!(grant.fence_generation, 0);
         assert_eq!(grant.lease_expires_at_epoch_ms, 0);
         assert!(grant.claim().is_none());
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// P0 步骤 3：绑定判据来自 LOOM 任务（dispatch），不来自 claim 行是否存在。
+    /// r9 里 Run 先启动、6 秒后才 claim，那一刻根本没有 `loom_claim` 行，但「这一段工作绑了
+    /// LOOM 任务」已经是账本里的事实。这里用一个只含三张表的最小关系 fixture 把这条 SQL 钉住。
+    #[test]
+    fn loom_binding_for_run_requires_a_claim_for_a_dispatched_run() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE loom_claim(claim_id TEXT, plan_id TEXT, task_id TEXT,
+                         agent_run_id TEXT, claimant_agent_id TEXT, command_id TEXT,
+                         lease_expires_at TEXT, fence_generation INTEGER, claimed_at TEXT,
+                         released_at TEXT);
+                 CREATE TABLE camp_message_delivery(id TEXT PRIMARY KEY, claimed_agent_run_id TEXT);
+                 CREATE TABLE loom_control_dispatch(dispatch_id TEXT PRIMARY KEY, delivery_id TEXT);
+                 INSERT INTO camp_message_delivery VALUES('delivery_one','run_bound');
+                 INSERT INTO loom_control_dispatch VALUES('dispatch_one','delivery_one');",
+            )
+            .unwrap();
+
+        // r9 形状：已绑定 LOOM 任务、但还没有 claim 行。
+        let bound = loom_binding_for_run(&connection, "run_bound", chrono::Utc::now()).unwrap();
+        assert!(
+            bound.requires_claim,
+            "assertion a Run carrying a LOOM dispatch requires a claim before it holds one"
+        );
+        assert!(bound.claim.is_none());
+
+        // 普通聊天 Run：没有 dispatch，也没有 claim。
+        let chat = loom_binding_for_run(&connection, "run_chat", chrono::Utc::now()).unwrap();
+        assert!(
+            !chat.requires_claim,
+            "assertion an ordinary chat Run is never gated on a claim"
+        );
+        assert!(chat.claim.is_none());
+
+        // 活 claim 自己就是绑定：账本里查不到 dispatch 也不能把门禁关掉。
+        connection
+            .execute(
+                "INSERT INTO loom_claim VALUES('claim_one','plan_one','task_a','run_claimed',
+                     'agent_one','command_one',?1,1,'2026-08-31T00:00:00+00:00',NULL)",
+                [(chrono::Utc::now() + chrono::Duration::seconds(90)).to_rfc3339()],
+            )
+            .unwrap();
+        let claimed = loom_binding_for_run(&connection, "run_claimed", chrono::Utc::now()).unwrap();
+        assert!(claimed.requires_claim);
+        assert_eq!(claimed.claim.unwrap().claim_id, "claim_one");
+
+        // 旧库没有控制平面表：读不到表就是「没有绑定」，既不是报错也不是偷偷放行。
+        let bare = rusqlite::Connection::open_in_memory().unwrap();
+        bare.execute_batch(
+            "CREATE TABLE loom_claim(claim_id TEXT, plan_id TEXT, task_id TEXT,
+                     agent_run_id TEXT, claimant_agent_id TEXT, command_id TEXT,
+                     lease_expires_at TEXT, fence_generation INTEGER, claimed_at TEXT,
+                     released_at TEXT);",
+        )
+        .unwrap();
+        assert!(
+            !loom_binding_for_run(&bare, "run_chat", chrono::Utc::now())
+                .unwrap()
+                .requires_claim
+        );
+    }
+
+    /// P0 步骤 3：`loom.claim` 成功（含同一 Run 的换代）之后重签的写授权，携带的就是这一代
+    /// claim 与 fence；而且重签只动 claim，不动 Run/epoch/workspace/过期时刻。
+    #[test]
+    fn a_reissued_grant_carries_the_fence_loom_claim_just_created() {
+        use crate::pi::{PiFileAccessMode, PiFileGrant, now_epoch_ms};
+
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM pi grant reissue");
+        let workspace = std::env::temp_dir()
+            .join(format!("rovai-loom-pi-grant-reissue-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log = workspace.join("guard.jsonl");
+        let now = now_epoch_ms();
+
+        // r9：Run 先启动，写授权先签发，此刻还没有 claim 行。
+        let launched = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run_one",
+            "bot_one",
+            1,
+            &workspace,
+            &log,
+            now,
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(launched.requires_claim);
+        assert!(launched.claim().is_none());
+
+        // loom.claim 成功：Core 把同一份 grant 文档重签成新一代。
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("an open, unexpired lease must read as live");
+        let after_claim = launched
+            .reissued_for_claim(Some(&live), true, now_epoch_ms())
+            .unwrap();
+        assert_eq!(after_claim.claim_id, claim.claim_id.as_str());
+        assert_eq!(after_claim.fence_generation, 1);
+        assert_eq!(
+            after_claim.expires_at_epoch_ms, launched.expires_at_epoch_ms,
+            "assertion re-issuing after loom.claim never extends the grant expiry"
+        );
+
+        // 同一 Run 的换代（过期后被自己重新领回）：fence 前进，重签的是新一代。
+        expire_lease(&database, &claim.claim_id);
+        let second = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            second.fence_generation, 2,
+            "assertion the takeover advances the fence generation"
+        );
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("the re-claim Run holds the live claim");
+        let reissued = after_claim
+            .reissued_for_claim(Some(&live), true, now_epoch_ms())
+            .unwrap();
+        assert_eq!(reissued.claim_id, second.claim_id.as_str());
+        assert_eq!(
+            reissued.fence_generation, 2,
+            "assertion the re-issued write grant carries the fence loom.claim just created"
+        );
+        assert_ne!(reissued.claim_id, after_claim.claim_id);
+        assert!(reissued.requires_claim);
         std::fs::remove_dir_all(&workspace).ok();
     }
 

@@ -231,6 +231,9 @@ function fixture(options = {}) {
     claimId: options.claimId ?? 'claim-workflow-1',
     fenceGeneration: options.fenceGeneration ?? 1,
     leaseExpiresAtEpochMs: options.leaseExpiresAtEpochMs ?? Date.now() + 600_000,
+    // P0 step 3: the same document also states the claim is REQUIRED, which is what makes every
+    // `write`/`edit` of a LOOM-bound Run depend on that claim staying live.
+    requiresClaim: options.requiresClaim ?? true,
   }
   return { root, cliPath, grant, binding: { agentRunId: grant.runId, executionEpoch: grant.executionEpoch } }
 }

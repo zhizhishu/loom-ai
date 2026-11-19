@@ -7632,9 +7632,33 @@ impl Core {
                         ).await.map_err(rovai_core::loom_tool::map_domain_error)
                         .map_err(map_loom_tool_error)?
                     } else {
-                        rovai_core::loom_tool::invoke(
+                        let output = rovai_core::loom_tool::invoke(
                             &mut database,&caller,&tool_name,request.input,
-                        ).map_err(map_loom_tool_error)?
+                        ).map_err(map_loom_tool_error)?;
+                        // P0 step 3 (c): `loom.claim` is the moment this Run earns the right to write,
+                        // and the shared guard reads this Run's grant document before every decision —
+                        // so the authorisation is re-issued HERE, from the claim the command just
+                        // created. Without this, a Run launched before it claimed (r9) would keep
+                        // writing under the empty pre-claim grant. A Run with no guarded Host (native
+                        // policy, already stopped) is a no-op, which keeps ordinary chat untouched.
+                        if tool_name == rovai_core::loom_tool::LOOM_CLAIM_TOOL_NAME {
+                            let claim = crate::loom::live_claim_for_run(
+                                database.connection(),
+                                &authenticated_run.agent_run_id,
+                                chrono::Utc::now(),
+                            )?;
+                            let run_id = authenticated_run.agent_run_id.clone();
+                            let execution_epoch = authenticated_run.execution_epoch;
+                            // The grant rewrite touches the filesystem, never the database.
+                            drop(database);
+                            self.pi
+                                .reissue_file_grant(&run_id, execution_epoch, claim.as_ref(), true)
+                                .await
+                                .context(
+                                    "failed to re-issue the Pi write authorisation after loom.claim",
+                                )?;
+                        }
+                        output
                     };
                     if !read_only {
                         evidence_replayed = output
@@ -17611,14 +17635,16 @@ impl Core {
         self.persist_runtime_compatibility_digest(execution, &runtime_compatibility_digest)
             .await?;
         let builtin_tool_factory = self.builtin_tool_process_config_factory()?;
-        // P0 step 2: the write authorisation Core is about to issue must carry the LOOM claim this Run
-        // actually holds right now. The claim is read here, under the database lock its owner already
-        // holds, and only carried into the grant; a Run bound to no LOOM Task reads as `None` and keeps
-        // the empty claim triple, so ordinary chat is unchanged. One read serves both the first spawn and
-        // the exact-resume replacement below, so they can never be built from two different fences.
-        let live_claim = {
+        // P0 step 2 + 3: the write authorisation Core is about to issue must carry the LOOM claim this
+        // Run actually holds right now, AND whether this Run is bound to a LOOM Task at all — the two
+        // are different questions in the r9 shape, where the Run starts first and claims seconds later.
+        // Both are read here, under the database lock its owner already holds. A Run bound to no LOOM
+        // Task reads as `requires_claim:false` with an empty triple, so ordinary chat is unchanged. One
+        // read serves both the first spawn and the exact-resume replacement below, so they can never be
+        // built from two different fences.
+        let loom_binding = {
             let database = self.database.lock().await;
-            crate::loom::live_claim_for_run(
+            crate::loom::loom_binding_for_run(
                 database.connection(),
                 &execution.agent_run_id,
                 chrono::Utc::now(),
@@ -17643,7 +17669,8 @@ impl Core {
                 bootstrap: &session_bootstrap,
                 builtin_tool_factory: &builtin_tool_factory,
                 mcp: managed_mcp.as_ref(),
-                live_claim: live_claim.as_ref(),
+                live_claim: loom_binding.claim.as_ref(),
+                requires_claim: loom_binding.requires_claim,
             })
             .await;
         let runtime = match runtime_result {
@@ -17715,7 +17742,8 @@ impl Core {
                         bootstrap: &replacement_bootstrap,
                         builtin_tool_factory: &builtin_tool_factory,
                 mcp: managed_mcp.as_ref(),
-                        live_claim: live_claim.as_ref(),
+                        live_claim: loom_binding.claim.as_ref(),
+                        requires_claim: loom_binding.requires_claim,
                     })
                     .await
                     .with_context(|| {

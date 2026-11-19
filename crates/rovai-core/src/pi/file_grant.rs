@@ -34,6 +34,15 @@
 // work) keeps exactly today's behaviour; a claim that already lapsed is never presented as live.
 // This module only CARRIES that identity: the guard-side refusal of an unclaimable write is a
 // separate decision and is not taken here.
+//
+// Claim requirement (P0 step 3): carrying a claim is not the same as needing one. `requiresClaim`
+// states whether this Run must present a LIVE claim before every `write`/`edit`, and it is decided by
+// the Run's LOOM *binding*, not by the claim row: in the r9 shape the Run starts first and claims
+// seconds later, so the grant Core issues at launch has `requiresClaim:true` and an empty triple and
+// the shared guard refuses every write until the claim exists. An ordinary chat Run carries
+// `requiresClaim:false` and keeps the unchanged pre-P0 behaviour. A non-empty triple always implies
+// the requirement (the flag is derived as an OR), so no caller can switch the gate off while
+// presenting a claim.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -161,6 +170,13 @@ pub(crate) struct PiFileGrant {
     pub fence_generation: i64,
     /// The claim lease expiry in epoch milliseconds. `0` exactly when `claim_id` is empty.
     pub lease_expires_at_epoch_ms: i64,
+    /// Whether this Run must present a live claim before every `write`/`edit`.
+    ///
+    /// `true` for a Run bound to a LOOM Task, including the window between the Run starting and its
+    /// `loom.claim` (the claim triple above is still empty there); `false` for ordinary chat, which
+    /// keeps exactly today's behaviour. `false` with a non-empty triple is not representable: a claim
+    /// always implies the requirement.
+    pub requires_claim: bool,
 }
 
 impl PiFileGrant {
@@ -171,6 +187,9 @@ impl PiFileGrant {
     /// `claim` is the live claim `loom::live_claim_for_run` reported for exactly this Run, or `None`
     /// when the Run holds none. It is read by the caller that owns the database connection: this
     /// module never opens one, so the grant can never disagree with the claim it was built from.
+    /// `requires_claim` is that same read's LOOM-binding answer (`loom::loom_binding_for_run`): it is
+    /// `true` before the claim exists, which is what makes a pre-claim write impossible instead of
+    /// merely unlikely. A claim handed in without the flag still yields `requires_claim: true`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_run(
         mode: PiFileAccessMode,
@@ -181,6 +200,7 @@ impl PiFileGrant {
         log_path: &Path,
         now_ms: i64,
         claim: Option<&LiveClaim>,
+        requires_claim: bool,
     ) -> Result<Option<Self>> {
         if !mode.guarded() {
             return Ok(None);
@@ -222,7 +242,34 @@ impl PiFileGrant {
             claim_id: claim.map_or_else(String::new, |(claim_id, _, _)| claim_id.to_string()),
             fence_generation: claim.map_or(0, |(_, fence_generation, _)| fence_generation),
             lease_expires_at_epoch_ms: claim.map_or(0, |(_, _, lease)| lease),
+            requires_claim: requires_claim || claim.is_some(),
         }))
+    }
+
+    /// Re-issue this grant for the claim the Run holds *now* (P0 step 3).
+    ///
+    /// The shared guard re-reads the grant document before every decision, so this is the whole of
+    /// "Core re-issues the authorisation after `loom.claim`": only the claim triple and
+    /// `requiresClaim` move. The Run/bot/epoch/workspace/tool/log/expiry identity is copied
+    /// verbatim, so a re-issue can never re-point the guard at another Run or another workspace.
+    ///
+    /// A lease that already lapsed is never carried (the triple empties) but the requirement stays
+    /// `true` — the fail-closed direction: the guard then refuses a write with `claim_missing`
+    /// instead of silently falling back to pre-claim behaviour. `requires_claim` is monotone: it can
+    /// be switched on by a binding or by the claim itself, never off.
+    pub(crate) fn reissued_for_claim(
+        &self,
+        claim: Option<&LiveClaim>,
+        requires_claim: bool,
+        now_ms: i64,
+    ) -> Result<Self> {
+        let fields = grant_claim_fields(claim, &self.run_id, now_ms)?;
+        let mut reissued = self.clone();
+        reissued.requires_claim = self.requires_claim || requires_claim || fields.is_some();
+        reissued.claim_id = fields.map_or_else(String::new, |(claim_id, _, _)| claim_id.to_string());
+        reissued.fence_generation = fields.map_or(0, |(_, fence_generation, _)| fence_generation);
+        reissued.lease_expires_at_epoch_ms = fields.map_or(0, |(_, _, lease)| lease);
+        Ok(reissued)
     }
 
     /// Expired grants must never be presented to a Host.
@@ -424,6 +471,7 @@ mod tests {
             &workspace.join("guard.jsonl"),
             now_epoch_ms(),
             None,
+            false,
         )
         .unwrap();
         assert!(grant.is_none());
@@ -461,6 +509,7 @@ mod tests {
                 &workspace.join("guard.jsonl"),
                 now,
                 None,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -489,7 +538,8 @@ mod tests {
                 assert!(!grant.allowed_tools.iter().any(|tool| tool == PI_LOOM_TOOL_NAME));
             }
             // The document keys are exactly what the shared guard validates: eight identity/policy
-            // keys plus the three claim fields, never more and never fewer.
+            // keys plus the three claim fields and the one requirement flag, never more and never
+            // fewer.
             let document = grant.to_document().unwrap();
             for key in [
                 "schema",
@@ -503,18 +553,21 @@ mod tests {
                 "claimId",
                 "fenceGeneration",
                 "leaseExpiresAtEpochMs",
+                "requiresClaim",
             ] {
                 assert!(document.get(key).is_some(), "grant document is missing {key}");
             }
             assert_eq!(
                 document.as_object().unwrap().len(),
-                11,
-                "the grant schema is eight identity keys plus the three claim fields"
+                12,
+                "the grant schema is eight identity keys plus the claim triple and the claim requirement"
             );
-            // An unbound Run carries the empty claim triple and nothing else.
+            // An unbound Run carries the empty claim triple and no claim requirement.
             assert_eq!(document["claimId"], json!(""));
             assert_eq!(document["fenceGeneration"], json!(0));
             assert_eq!(document["leaseExpiresAtEpochMs"], json!(0));
+            assert_eq!(document["requiresClaim"], json!(false));
+            assert!(!grant.requires_claim);
             assert!(grant.claim().is_none());
             assert_eq!(document["schema"], json!(PI_FILE_GRANT_SCHEMA));
             assert_eq!(document["allowedTools"], json!(expected_tools));
@@ -536,6 +589,7 @@ mod tests {
                 &log,
                 now_epoch_ms(),
                 None,
+                false,
             )
         };
         assert!(build("", "bot-1", 1).is_err());
@@ -558,6 +612,7 @@ mod tests {
             &missing.join("guard.jsonl"),
             now_epoch_ms(),
             None,
+            false,
         )
         .unwrap_err()
         .to_string();
@@ -581,6 +636,7 @@ mod tests {
             &workspace.join("guard.jsonl"),
             now,
             Some(&claim),
+            true,
         )
         .unwrap()
         .unwrap();
@@ -588,11 +644,16 @@ mod tests {
         assert_eq!(grant.fence_generation, 3);
         assert_eq!(grant.lease_expires_at_epoch_ms, lease);
         assert_eq!(grant.claim(), Some(("claim-1", 3, lease)));
+        assert!(
+            grant.requires_claim,
+            "assertion a grant carrying a claim always requires one"
+        );
         let document = grant.to_document().unwrap();
-        assert_eq!(document.as_object().unwrap().len(), 11);
+        assert_eq!(document.as_object().unwrap().len(), 12);
         assert_eq!(document["claimId"], json!("claim-1"));
         assert_eq!(document["fenceGeneration"], json!(3));
         assert_eq!(document["leaseExpiresAtEpochMs"], json!(lease));
+        assert_eq!(document["requiresClaim"], json!(true));
         // The claim never loosens the Run/bot/epoch binding it was issued under.
         assert!(grant.binds("run-1", "bot-1", 7));
         assert!(!grant.binds("run-2", "bot-1", 7));
@@ -611,6 +672,7 @@ mod tests {
             &workspace.join("guard.jsonl"),
             now,
             Some(&foreign),
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -626,6 +688,7 @@ mod tests {
                 &workspace.join("guard.jsonl"),
                 now,
                 Some(&invalid),
+                true,
             )
             .unwrap_err()
             .to_string();
@@ -652,17 +715,24 @@ mod tests {
             &workspace.join("guard.jsonl"),
             now,
             None,
+            false,
         )
         .unwrap()
         .unwrap();
         assert_eq!(grant.claim_id, "");
         assert_eq!(grant.fence_generation, 0);
         assert_eq!(grant.lease_expires_at_epoch_ms, 0);
+        assert!(
+            !grant.requires_claim,
+            "assertion an unbound Run (ordinary chat) is never gated on a claim"
+        );
         assert!(grant.claim().is_none());
         let document = grant.to_document().unwrap();
         assert_eq!(document["claimId"], json!(""));
         assert_eq!(document["fenceGeneration"], json!(0));
         assert_eq!(document["leaseExpiresAtEpochMs"], json!(0));
+        assert_eq!(document["requiresClaim"], json!(false));
+        assert_eq!(document.as_object().unwrap().len(), 12);
         std::fs::remove_dir_all(workspace).ok();
     }
 
@@ -685,6 +755,7 @@ mod tests {
                 &workspace.join("guard.jsonl"),
                 now,
                 Some(&claim),
+                true,
             )
             .unwrap()
             .unwrap();
@@ -695,6 +766,10 @@ mod tests {
             assert_eq!(grant.fence_generation, 0);
             assert_eq!(grant.lease_expires_at_epoch_ms, 0);
             assert!(grant.claim().is_none());
+            assert!(
+                grant.requires_claim,
+                "assertion clearing a lapsed claim never clears the requirement"
+            );
         }
         // An unparsable lease is dead too: LOOM's own `lease_expired` says so.
         let unreadable = LiveClaim {
@@ -712,6 +787,7 @@ mod tests {
             &workspace.join("guard.jsonl"),
             now,
             Some(&unreadable),
+            true,
         )
         .unwrap()
         .unwrap();
@@ -719,6 +795,151 @@ mod tests {
             grant.claim().is_none(),
             "assertion an unreadable claim lease is never reported as live"
         );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// P0 step 3, the r9 shape: the Run is launched first and claims seconds later, so the grant Core
+    /// issues carries `requiresClaim:true` with an EMPTY triple. That is what lets the shared guard
+    /// refuse the first write instead of trusting a launch-time snapshot.
+    #[test]
+    fn a_bound_grant_requires_a_claim_before_the_run_claims() {
+        let workspace = temp_workspace("pre-claim");
+        let now = 1_700_000_000_000;
+        let grant = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run-1",
+            "bot-1",
+            1,
+            &workspace,
+            &workspace.join("guard.jsonl"),
+            now,
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            grant.requires_claim,
+            "assertion a Run bound to a LOOM Task requires a claim before it holds one"
+        );
+        assert!(grant.claim().is_none());
+        assert_eq!(grant.claim_id, "");
+        let document = grant.to_document().unwrap();
+        assert_eq!(document["requiresClaim"], json!(true));
+        assert_eq!(document["claimId"], json!(""));
+        assert_eq!(
+            document.as_object().unwrap().len(),
+            12,
+            "an unmet requirement still uses the one 12-key document"
+        );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// P0 step 3: the requirement is derived as an OR, so a caller can never present a claim while
+    /// telling the shared guard that no claim is needed.
+    #[test]
+    fn a_claim_alone_switches_the_requirement_on() {
+        let workspace = temp_workspace("claim-forces-requirement");
+        let now = 1_700_000_000_000;
+        let claim = live_claim("run-1", "claim-1", 1, now + 90_000);
+        let grant = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run-1",
+            "bot-1",
+            1,
+            &workspace,
+            &workspace.join("guard.jsonl"),
+            now,
+            Some(&claim),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            grant.requires_claim,
+            "assertion presenting a claim always requires one"
+        );
+        assert_eq!(grant.to_document().unwrap()["requiresClaim"], json!(true));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// P0 step 3: re-issuing the grant for the claim the Run holds now moves ONLY the claim triple
+    /// and the requirement flag — never the Run/bot/epoch/workspace/tool/log/expiry identity the
+    /// shared guard binds to. A lapsed lease empties the triple and keeps the requirement.
+    #[test]
+    fn reissuing_a_grant_moves_only_the_claim_it_was_bound_to() {
+        let workspace = temp_workspace("reissue");
+        let now = 1_700_000_000_000;
+        let launched = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run-1",
+            "bot-1",
+            4,
+            &workspace,
+            &workspace.join("guard.jsonl"),
+            now,
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        let claim = live_claim("run-1", "claim-1", 3, now + 90_000);
+        let reissued = launched.reissued_for_claim(Some(&claim), true, now).unwrap();
+        assert_eq!(reissued.claim(), Some(("claim-1", 3, now + 90_000)));
+        assert!(reissued.requires_claim);
+        // The identity the guard validates is byte-identical: a re-issue can never re-point it.
+        assert_eq!(reissued.schema, launched.schema);
+        assert_eq!(reissued.run_id, launched.run_id);
+        assert_eq!(reissued.bot_id, launched.bot_id);
+        assert_eq!(reissued.execution_epoch, launched.execution_epoch);
+        assert_eq!(reissued.workspace_real, launched.workspace_real);
+        assert_eq!(reissued.allowed_tools, launched.allowed_tools);
+        assert_eq!(reissued.log_path, launched.log_path);
+        assert_eq!(
+            reissued.expires_at_epoch_ms, launched.expires_at_epoch_ms,
+            "assertion a claim re-issue never extends the grant expiry"
+        );
+        assert!(reissued.binds("run-1", "bot-1", 4));
+
+        // A takeover hands the same Run a NEW fence: the re-issued document carries it, not the old one.
+        let takeover = live_claim("run-1", "claim-2", 4, now + 120_000);
+        let advanced = reissued.reissued_for_claim(Some(&takeover), true, now).unwrap();
+        assert_eq!(advanced.claim(), Some(("claim-2", 4, now + 120_000)));
+        assert_ne!(advanced.claim_id, reissued.claim_id);
+
+        // A lease that already lapsed is dropped from the document, but the requirement stays: the
+        // guard must refuse that write with `claim_missing`, never fall back to pre-claim behaviour.
+        let lapsed = advanced
+            .reissued_for_claim(Some(&live_claim("run-1", "claim-2", 4, now - 1)), true, now)
+            .unwrap();
+        assert!(lapsed.claim().is_none());
+        assert!(
+            lapsed.requires_claim,
+            "assertion a lapsed claim never switches the requirement off"
+        );
+
+        // An unbound Run stays unbound: re-issuing with no claim and no binding changes nothing.
+        let plain = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceReadWrite,
+            "run-2",
+            "bot-1",
+            1,
+            &workspace,
+            &workspace.join("guard.jsonl"),
+            now,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plain.reissued_for_claim(None, false, now).unwrap(), plain);
+        // A claim that belongs to another Run is still a wiring bug, not a re-issue.
+        let error = plain
+            .reissued_for_claim(Some(&claim), true, now)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("another AgentRun"), "{error}");
         std::fs::remove_dir_all(workspace).ok();
     }
 }

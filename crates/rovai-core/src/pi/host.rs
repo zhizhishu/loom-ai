@@ -216,6 +216,9 @@ struct PiManagedGuardState {
     claim_id: String,
     fence_generation: i64,
     lease_expires_at_epoch_ms: i64,
+    /// P0 step 3: whether the grant refuses `write`/`edit` without a live claim. Echoed for the same
+    /// reason as the triple: a Host that acknowledges a different requirement is not this Run's guard.
+    requires_claim: bool,
 }
 
 #[derive(Deserialize)]
@@ -684,7 +687,7 @@ impl PiHost {
             Some(grant) => {
                 let guard_path = config_root.join(super::PI_FILE_GUARD_EXTENSION_NAME);
                 write_private_file(&guard_path, super::PI_FILE_GUARD_EXTENSION_SOURCE.as_bytes())?;
-                let grant_path = config_root.join("guard-grant.json");
+                let grant_path = config_root.join(GUARD_GRANT_FILE_NAME);
                 write_private_json(&grant_path, &grant.to_document()?)?;
                 Some((guard_path, grant.allowed_tools.join(","), grant_path))
             }
@@ -1639,11 +1642,60 @@ impl PiHost {
         Ok(())
     }
 
+    /// Re-issue this Host's guard grant document for the claim the Run holds now (P0 step 3).
+    ///
+    /// A Run earns its write authorisation when its LOOM claim exists, and that claim can appear or
+    /// advance *after* the Host started (r9: the Run starts, then claims six seconds later; a takeover
+    /// hands out a new fence). The shared guard re-reads the document before every decision, so
+    /// rewriting it here is what moves the authorisation — nothing in the launch path is re-run and the
+    /// Host binding (and its acknowledgement) stays exactly as issued.
+    ///
+    /// `Ok(false)`: this Host has no guarded grant (legacy native policy), or the document already
+    /// carries exactly this claim.
+    pub(crate) fn reissue_guard_grant(
+        &self,
+        claim: Option<&LiveClaim>,
+        requires_claim: bool,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let Some(grant) = self.file_grant.as_ref() else {
+            return Ok(false);
+        };
+        Ok(reissue_guard_grant_file(&self.config_root, grant, claim, requires_claim, now_ms)?.is_some())
+    }
+
+    /// Whether an acknowledgement echoes a claim this Host could legitimately be holding.
+    ///
+    /// The ack is published on every `session_start`, and P0 step 3 re-issues the grant document after
+    /// `loom.claim` (and again on a takeover with a new fence). So the ack may echo either the claim
+    /// this Host was LAUNCHED with or the one currently on disk — both are this Run's guard, and nothing
+    /// else is accepted. The live decision is never taken from the ack anyway: the shared guard
+    /// re-reads the document before every tool call.
+    fn acknowledges_claim_of(&self, state: &PiManagedGuardState, grant: &PiFileGrant) -> bool {
+        let matches = |candidate: &PiFileGrant| {
+            state.claim_id == candidate.claim_id
+                && state.fence_generation == candidate.fence_generation
+                && state.lease_expires_at_epoch_ms == candidate.lease_expires_at_epoch_ms
+                && state.requires_claim == candidate.requires_claim
+        };
+        if matches(grant) {
+            return true;
+        }
+        std::fs::read(self.config_root.join(GUARD_GRANT_FILE_NAME))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PiFileGrant>(&bytes).ok())
+            .is_some_and(|current| matches(&current))
+    }
+
     /// Prove this Run is actually guarded before any prompt is sent.
     ///
     /// Two independent receipts are required: the managed extension's binding-side acknowledgement
     /// (generation/Run/tools/workspace/expiry), and the executed guard's OWN `guard_ready` +
     /// `guard_selftest(failures=0)` lines in its log file. A file merely existing is not evidence.
+    ///
+    /// The acknowledgement is the ack of the grant this Host is running under, and after P0 step 3
+    /// that grant can legitimately move (Core re-issues it when `loom.claim` succeeds). See
+    /// [`Self::acknowledges_claim_of`].
     async fn await_guard_ready(&self, grant: &PiFileGrant) -> Result<()> {
         let binding = self
             .binding_document
@@ -1668,10 +1720,10 @@ impl PiHost {
                     || state.workspace_real != grant.workspace_real
                     || state.expires_at_epoch_ms != grant.expires_at_epoch_ms
                     || state.guard_log_path != grant.log_path
-                    || state.claim_id != grant.claim_id
-                    || state.fence_generation != grant.fence_generation
-                    || state.lease_expires_at_epoch_ms != grant.lease_expires_at_epoch_ms
                 {
+                    bail!("Pi managed guard state is not bound to this Run's file grant");
+                }
+                if !self.acknowledges_claim_of(&state, grant) {
                     bail!("Pi managed guard state is not bound to this Run's file grant");
                 }
                 if grant.is_expired(super::now_epoch_ms()) {
@@ -2063,6 +2115,19 @@ impl PiRuntime {
         self.host.builtin_tool_process_config()
     }
 
+    /// Re-issue the grant document the shared guard reads for this Run (P0 step 3).
+    ///
+    /// See [`PiHost::reissue_guard_grant`]. `Ok(false)` means nothing moved (no guarded grant, or the
+    /// document already carries this claim), which is the common case for an ordinary chat Run.
+    pub(crate) fn reissue_file_grant(
+        &self,
+        claim: Option<&LiveClaim>,
+        requires_claim: bool,
+        now_ms: i64,
+    ) -> Result<bool> {
+        self.host.reissue_guard_grant(claim, requires_claim, now_ms)
+    }
+
     fn belongs_to_camp(&self, camp_id: &str) -> bool {
         self.camp_id == camp_id
     }
@@ -2083,15 +2148,48 @@ impl PiRuntime {
     }
 }
 
+/// The grant document the shared guard reads, inside the Host's private config root.
+///
+/// One file, one writer (`write_private_json` publishes atomically), and the guard re-reads it before
+/// every tool decision — which is what makes a re-issue after `loom.claim` take effect in a Host that
+/// is already running.
+const GUARD_GRANT_FILE_NAME: &str = "guard-grant.json";
+
+/// Re-issue the guard grant document for the claim the Run holds now (P0 step 3, producer side).
+///
+/// Only the claim triple and `requiresClaim` may move (see `PiFileGrant::reissued_for_claim`): the
+/// Run/bot/epoch/workspace/tool/log/expiry identity is copied verbatim, so a re-issue can never
+/// re-point the guard at another Run or another workspace. `Ok(None)` means there was nothing to
+/// write — either the Run holds no guarded grant, or the document already says this.
+pub(crate) fn reissue_guard_grant_file(
+    config_root: &Path,
+    grant: &PiFileGrant,
+    claim: Option<&LiveClaim>,
+    requires_claim: bool,
+    now_ms: i64,
+) -> Result<Option<PiFileGrant>> {
+    let reissued = grant.reissued_for_claim(claim, requires_claim, now_ms)?;
+    if reissued == *grant {
+        return Ok(None);
+    }
+    write_private_json(
+        &config_root.join(GUARD_GRANT_FILE_NAME),
+        &reissued.to_document()?,
+    )?;
+    Ok(Some(reissued))
+}
+
 type PiRuntimeCreationKey = (String, i64);
 type PiRuntimeCreationGate = Weak<Mutex<()>>;
 
 /// The warm-Host reuse key of one guarded Run.
 ///
 /// The frozen compatibility digest alone says nothing about the write authorisation: two launches of
-/// the SAME Run under different claim fences hold different grants, so they must never reuse one warm
-/// Host (the older claim's grant is still materialized there). An unbound Run keys on `claim=none`,
-/// which keeps single-Run warm reuse working exactly as before.
+/// the SAME Run under different claim fences hold different grants, so they must never share one
+/// materialized grant document. The live Runtime map (`PiRpcRuntimeAdapter::active`) re-issues the
+/// document instead of reusing a stale one (P0 step 3, see `reissue_guard_grant_file`); this key is
+/// what keeps the fleet from treating two different fences as one compatible Host. An unbound Run keys
+/// on `claim=none`, which keeps single-Run warm reuse working exactly as before.
 fn guarded_compatibility_digest(base: &str, mode: PiFileAccessMode, grant: &PiFileGrant) -> String {
     let claim = grant.claim().map_or_else(
         || "none".to_string(),
@@ -2139,10 +2237,14 @@ pub struct PiAgentRunRuntimeRequest<'a> {
     pub builtin_tool_factory: &'a BuiltinToolProcessConfigFactory,
     pub mcp: Option<&'a PiMcpProjection>,
     /// The live LOOM claim the calling Core already read for exactly this Run (see
-    /// `loom::live_claim_for_run`). `None` means the Run is bound to no LOOM Task, which is what keeps
-    /// ordinary chat grants unchanged. This module owns no database connection, so the claim is read
-    /// by its owner and only carried here.
+    /// `loom::live_claim_for_run`). `None` means the Run holds none right now, which is not the same as
+    /// "no claim needed": in the r9 shape the Run starts before it claims. This module owns no
+    /// database connection, so the claim is read by its owner and only carried here.
     pub live_claim: Option<&'a LiveClaim>,
+    /// Whether this Run is bound to a LOOM Task (see `loom::loom_binding_for_run`), i.e. whether the
+    /// grant must refuse `write`/`edit` until a live claim is presented (P0 step 3). `false` keeps
+    /// ordinary chat Grants byte-identical to the pre-P0 behaviour.
+    pub requires_claim: bool,
 }
 
 impl PiRpcRuntimeAdapter {
@@ -2198,6 +2300,16 @@ impl PiRpcRuntimeAdapter {
                     );
                 }
                 PiEpochDisposition::ReuseOrRetireSame if existing.host.is_alive() => {
+                    // P0 step 3: a warm Host is only reusable if its write authorisation still says
+                    // what THIS launch was asked to run under. The grant document is re-issued from
+                    // the claim just read, so a Run that claimed after its first launch never keeps
+                    // writing under the pre-claim grant — and the check is fail-closed: a re-issue
+                    // that cannot be written refuses the launch instead of reusing a stale grant.
+                    existing.reissue_file_grant(
+                        request.live_claim,
+                        request.requires_claim,
+                        now_epoch_ms(),
+                    )?;
                     return Ok(existing);
                 }
                 PiEpochDisposition::ReuseOrRetireSame | PiEpochDisposition::ReplaceOlder => {}
@@ -2267,6 +2379,7 @@ impl PiRpcRuntimeAdapter {
             &guard_log_dir.join("guard.jsonl"),
             now_epoch_ms(),
             request.live_claim,
+            request.requires_claim,
         )?;
         // A guarded Run must never share a warm Host with another Run or with the native policy, so the
         // reuse key carries the access mode, the Run identity and the claim fence the grant was issued
@@ -2414,6 +2527,24 @@ impl PiRpcRuntimeAdapter {
             .get(agent_run_id)
             .filter(|runtime| runtime.agent_run_epoch() == execution_epoch)
             .cloned()
+    }
+
+    /// P0 step 3 (consumer side): move a live guarded Run's write authorisation onto the claim it
+    /// holds now, e.g. right after `loom.claim` succeeded.
+    ///
+    /// `Ok(false)` means this Run has no guarded Host to re-issue for (the legacy native policy, or a
+    /// Host that is already gone). That is not an error: there is no grant document anybody reads.
+    pub(crate) async fn reissue_file_grant(
+        &self,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        claim: Option<&LiveClaim>,
+        requires_claim: bool,
+    ) -> Result<bool> {
+        let Some(runtime) = self.get_agent_run(agent_run_id, execution_epoch).await else {
+            return Ok(false);
+        };
+        runtime.reissue_file_grant(claim, requires_claim, now_epoch_ms())
     }
 
     pub async fn get_agent_run_on_host(
@@ -4324,6 +4455,7 @@ done
                 &workspace.join("guard.jsonl"),
                 now,
                 claim,
+                claim.is_some(),
             )
             .unwrap()
             .unwrap()

@@ -21,6 +21,20 @@
 // Boundaries: no network, no child processes, no global config, no writes outside the log file and
 // the paths Pi itself would have written (which this guard only permits inside the workspace).
 // OS-level sandboxing is explicitly NOT claimed: this is a tool-call path policy, not an OS jail.
+//
+// P0 step 3 — "claim first, then write": when the grant says `requiresClaim`, every `write`/`edit`
+// additionally needs a COMPLETE, unexpired LOOM claim (`claim_missing` / `claim_expired`), and that is
+// checked before any filesystem probe, so the first creation of a brand-new file is refused too (the
+// r9 failure: a write ~6s before `loom.claim`). `read` never needs a claim, and the managed
+// `rovai_loom` tool never does either — `loom.claim` is how a Run EARNS the authorisation.
+// `requiresClaim:false` (ordinary chat) keeps the pre-P0 behaviour byte for byte.
+//
+// The claim a Run holds moves after this process starts (`loom.claim`, then a takeover with a new
+// fence) and Core re-issues the very file this guard reads. So the grant is NOT snapshotted at load:
+// for the Core-written file source it is read again before every decision, and a rewrite may only
+// move the claim triple and `requiresClaim` — everything the guard binds to (Run, bot, epoch,
+// workspace, tool set, log path, expiry) must stay byte-identical, or the call is refused with
+// `guard_grant_identity_changed`.
 
 import { appendFileSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { createHash } from 'node:crypto'
@@ -39,6 +53,12 @@ const LOOM_OPERATIONS = Object.freeze([
   'loom.status', 'loom.plan', 'loom.release', 'loom.claim',
   'loom.evidence', 'loom.submit', 'loom.inspect', 'loom.stage-review',
 ])
+// P0 step 3: the tools that MUTATE the workspace. When the grant says `requiresClaim`, every one of
+// them must present a live LOOM claim first — including the creation of a brand-new file, which is
+// exactly the r9 shape (a first `write` six seconds before `loom.claim`). `read` never needs a claim,
+// and the business tool does not either: `loom.claim` is how a Run EARNS the authorisation, so
+// requiring a claim to call it would deadlock the gate it opens.
+const CLAIM_GATE_TOOLS = Object.freeze(['write', 'edit'])
 // Tools this guard knows at all. Anything outside it is blocked before any policy is consulted.
 const GRANT_TOOL_UNIVERSE = Object.freeze([...GUARD_TOOLS, LOOM_TOOL_NAME])
 // The exact tool sets a Core-written grant may carry, compared in order. The business tool is never
@@ -314,7 +334,39 @@ function validateGrantObject(parsed, isolatedRunner = false) {
     return { ok: false, reason: 'guard_tools_not_permitted' }
   }
   if (!Number.isInteger(parsed.expiresAtEpochMs) || parsed.expiresAtEpochMs <= 0) return { ok: false, reason: 'guard_expiry_missing' }
-  return { ok: true, grant: parsed }
+  // P0 step 3: `requiresClaim` decides whether every `write`/`edit` must also present a live LOOM
+  // claim. Core always writes it into a grant it issued; the isolated Runner's own grant never
+  // describes a claim, so an absent value THERE means "no claim gate" rather than a guess. A
+  // Core-written grant that silently lost the flag fails the load instead of degrading.
+  if (parsed.requiresClaim === undefined && !isolatedRunner) return { ok: false, reason: 'guard_requires_claim_missing' }
+  const requiresClaim = parsed.requiresClaim === undefined ? false : parsed.requiresClaim
+  if (typeof requiresClaim !== 'boolean') return { ok: false, reason: 'guard_requires_claim_invalid' }
+  // The claim identity beside it. Absent (Runner) means the empty triple; present must be coherent.
+  // Liveness is decided per call, never at load: the document is read again before every decision, so
+  // a lease that lapsed has to produce `claim_expired` rather than a load failure.
+  const claimId = parsed.claimId === undefined ? '' : parsed.claimId
+  const fenceGeneration = parsed.fenceGeneration === undefined ? 0 : parsed.fenceGeneration
+  const leaseExpiresAtEpochMs = parsed.leaseExpiresAtEpochMs === undefined ? 0 : parsed.leaseExpiresAtEpochMs
+  if (typeof claimId !== 'string') return { ok: false, reason: 'guard_claim_id_invalid' }
+  if (!Number.isInteger(fenceGeneration) || fenceGeneration < 0) return { ok: false, reason: 'guard_claim_fence_invalid' }
+  if (!Number.isInteger(leaseExpiresAtEpochMs) || leaseExpiresAtEpochMs < 0) {
+    return { ok: false, reason: 'guard_claim_lease_invalid' }
+  }
+  const claimed = claimId.trim().length > 0
+  if (claimed && (fenceGeneration < 1 || leaseExpiresAtEpochMs < 1)) {
+    return { ok: false, reason: 'guard_claim_incomplete' }
+  }
+  if (!claimed && (fenceGeneration !== 0 || leaseExpiresAtEpochMs !== 0)) {
+    return { ok: false, reason: 'guard_claim_inconsistent' }
+  }
+  // A claim always implies the requirement: otherwise a document could carry an identity while
+  // telling the guard that no claim is needed.
+  if (claimed && requiresClaim !== true) return { ok: false, reason: 'guard_claim_not_required' }
+  // Normalised once so every decision below reads one shape, whatever the source omitted.
+  return {
+    ok: true,
+    grant: { ...parsed, requiresClaim, claimId, fenceGeneration, leaseExpiresAtEpochMs }
+  }
 }
 
 /** Read the Core-written grant file. Refuses symlinks, non-files and oversized content. */
@@ -341,7 +393,11 @@ function loadGrant() {
   const raw = process.env[CONFIG_ENV]
   if (typeof raw !== 'string' || raw.trim().length === 0) {
     const fromFile = process.env[GRANT_FILE_ENV]
-    if (typeof fromFile === 'string' && fromFile.trim().length > 0) return loadGrantFromFile(fromFile)
+    if (typeof fromFile === 'string' && fromFile.trim().length > 0) {
+      // `path` is what makes the document re-readable: the claim a Run holds moves after the Host
+      // starts, and Core re-issues this exact file when it does.
+      return { ...loadGrantFromFile(fromFile), path: fromFile }
+    }
     return { ok: false, reason: 'guard_config_missing' }
   }
   let parsed
@@ -350,7 +406,40 @@ function loadGrant() {
   } catch {
     return { ok: false, reason: 'guard_config_unparsable' }
   }
-  return validateGrantObject(parsed, true)
+  // The Runner env source is a one-shot payload: it has no file to re-read and no claim to move.
+  return { ...validateGrantObject(parsed, true), path: null }
+}
+
+/**
+ * Everything a re-issued grant must keep byte-identical. Only the claim triple and `requiresClaim`
+ * may move, so a rewrite can never re-point the guard at another Run, tool set or workspace.
+ */
+function sameGrantIdentity(previous, next) {
+  return previous.schema === next.schema
+    && previous.runId === next.runId
+    && previous.botId === next.botId
+    && previous.executionEpoch === next.executionEpoch
+    && previous.workspaceReal === next.workspaceReal
+    && previous.logPath === next.logPath
+    && previous.expiresAtEpochMs === next.expiresAtEpochMs
+    && previous.allowedTools.length === next.allowedTools.length
+    && previous.allowedTools.every((tool, index) => tool === next.allowedTools[index])
+}
+
+/**
+ * The LOOM claim gate of one `write`/`edit`: a stable reason code, or `null` when this call may go on
+ * to the path policy. A grant that does not require a claim (`requiresClaim:false`, ordinary chat)
+ * returns `null` immediately, which is what keeps today's behaviour unchanged.
+ */
+function claimRefusal(grant, at) {
+  if (grant.requiresClaim !== true) return null
+  if (grant.claimId.length === 0 || grant.fenceGeneration < 1 || grant.leaseExpiresAtEpochMs < 1) {
+    return 'claim_missing'
+  }
+  // `>=` and not `>`: a lease that expires exactly now is over, the same rule LOOM's own
+  // `lease_expired` applies to the claim it hands out.
+  if (at >= grant.leaseExpiresAtEpochMs) return 'claim_expired'
+  return null
 }
 
 function toWorkspaceRelative(target, workspaceReal) {
@@ -378,6 +467,20 @@ export default async function loomRuntimeFileGuard(pi) {
   }
 
   const grant = loaded.grant
+  // P0 step 3: the LOOM claim a Run holds moves after this process starts (`loom.claim`, and later a
+  // takeover with a new fence), and Core re-issues this exact document when it does. A launch-time
+  // snapshot would decide a `write` on an authorisation the Run no longer holds — the r9 failure — so
+  // the file is read again before EVERY decision instead of being cached. The document is bounded at
+  // 64 KB and only the claim triple and `requiresClaim` may differ from the launch identity, so a
+  // rewrite can never re-point the guard at another Run, tool set, workspace or expiry.
+  const grantPath = loaded.path
+  const currentGrant = () => {
+    if (typeof grantPath !== 'string') return { ok: true, grant }
+    const reloaded = loadGrantFromFile(grantPath)
+    if (!reloaded.ok) return reloaded
+    if (!sameGrantIdentity(grant, reloaded.grant)) return { ok: false, reason: 'guard_grant_identity_changed' }
+    return reloaded
+  }
   // A log write is part of the decision: if we cannot record what happened, we cannot allow it.
   const log = (record) => {
     try {
@@ -410,6 +513,10 @@ export default async function loomRuntimeFileGuard(pi) {
     workspaceReal: grant.workspaceReal,
     allowedTools: grant.allowedTools,
     expiresAtEpochMs: grant.expiresAtEpochMs,
+    requiresClaim: grant.requiresClaim,
+    claimId: grant.claimId,
+    fenceGeneration: grant.fenceGeneration,
+    claimLeaseExpiresAtEpochMs: grant.leaseExpiresAtEpochMs,
     cwdReal,
     selfTestFailures: selfTest.failures.length
   })
@@ -440,13 +547,16 @@ export default async function loomRuntimeFileGuard(pi) {
 
     try {
       if (startupFailure) return block(startupFailure)
-      if (at > grant.expiresAtEpochMs) return block('grant_expired')
+      const live = currentGrant()
+      if (!live.ok) return block(live.reason)
+      const active = live.grant
+      if (at > active.expiresAtEpochMs) return block('grant_expired')
       if (!GRANT_TOOL_UNIVERSE.includes(toolName)) return block('tool_not_allowed')
-      if (!grant.allowedTools.includes(toolName)) return block('tool_not_granted')
+      if (!active.allowedTools.includes(toolName)) return block('tool_not_granted')
 
       const handlerCwd = typeof ctx?.cwd === 'string' && ctx.cwd.length > 0 ? realpathOrNull(ctx.cwd) : null
       if (handlerCwd === null) return block('cwd_unresolvable')
-      if (compareKey(handlerCwd) !== compareKey(grant.workspaceReal)) return block('cwd_mismatch')
+      if (compareKey(handlerCwd) !== compareKey(active.workspaceReal)) return block('cwd_mismatch')
 
       // The managed business tool carries no file `path` argument of its own, so it gets its own
       // decision instead of the native path policy: a closed operation, and for `loom.evidence` the
@@ -464,10 +574,10 @@ export default async function loomRuntimeFileGuard(pi) {
         }
         const relativePath = event?.input?.input?.relativePath
         const outcome = evaluatePath(relativePath, {
-          cwd: handlerCwd, workspaceReal: grant.workspaceReal, toolName: 'read', fsMode: true
+          cwd: handlerCwd, workspaceReal: active.workspaceReal, toolName: 'read', fsMode: true
         })
         const pathSha256 = sha256(typeof relativePath === 'string' ? relativePath : '')
-        const relPath = outcome.resolved ? toWorkspaceRelative(outcome.resolved, grant.workspaceReal) : null
+        const relPath = outcome.resolved ? toWorkspaceRelative(outcome.resolved, active.workspaceReal) : null
         const evidenceLogged = log({
           t: 'decision', at, toolCallId, toolName, decision: outcome.decision,
           reasonCode: outcome.reasonCode, operation, relPath, pathSha256
@@ -479,9 +589,18 @@ export default async function loomRuntimeFileGuard(pi) {
         return undefined
       }
 
-      const outcome = evaluatePath(rawPath, { cwd: handlerCwd, workspaceReal: grant.workspaceReal, toolName, fsMode: true })
+      // P0 step 3: a Run bound to a LOOM Task may only write under the claim it holds. This is decided
+      // BEFORE the path policy and before ANY filesystem probe, so a first `write` of a file that does
+      // not exist yet (`in_workspace_new_file`) is refused exactly like an `edit` of an existing one: the
+      // r9 shape is a write that happens six seconds before `loom.claim`.
+      if (CLAIM_GATE_TOOLS.includes(toolName)) {
+        const refusal = claimRefusal(active, at)
+        if (refusal !== null) return block(refusal, { requiresClaim: true })
+      }
+
+      const outcome = evaluatePath(rawPath, { cwd: handlerCwd, workspaceReal: active.workspaceReal, toolName, fsMode: true })
       const pathSha256 = sha256(typeof rawPath === 'string' ? rawPath : '')
-      const relPath = outcome.resolved ? toWorkspaceRelative(outcome.resolved, grant.workspaceReal) : null
+      const relPath = outcome.resolved ? toWorkspaceRelative(outcome.resolved, active.workspaceReal) : null
       const decisionLogged = log({
         t: 'decision',
         at,
