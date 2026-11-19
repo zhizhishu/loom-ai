@@ -23,10 +23,13 @@ import io
 import json
 import os
 import pathlib
+import select
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -163,7 +166,12 @@ class KeyWhitelist(unittest.TestCase):
         plan = helper.plan_input({"op": "text", "text": "Ok"}, BOUNDS, unicode_text=True)
         self.assertEqual(plan, [("unicode", ord("O")), ("unicode", ord("k"))])
         ansi = helper.plan_input({"op": "text", "text": "Ok"}, BOUNDS, unicode_text=False)
-        self.assertEqual(ansi, [("keysym", ord("O")), ("keysym", ord("k"))])
+        # The X11 path taps the shift level of the same keycode for `O`.
+        self.assertEqual(
+            ansi,
+            [("key", "shift", "down"), ("keysym", ord("o")),
+             ("key", "shift", "up"), ("keysym", ord("k"))],
+        )
         # X11 keysyms only map Latin-1 without an input-method round trip.
         with self.assertRaises(helper.Failure) as raised:
             helper.plan_input({"op": "text", "text": "中文"}, BOUNDS, unicode_text=False)
@@ -487,9 +495,10 @@ class StdinProtocol(unittest.TestCase):
 LIVE_ENV = "LOOM_COMPUTER_LIVE_ACCEPTANCE"
 LIVE_SCREENSHOT_ENV = "LOOM_COMPUTER_LIVE_ACCEPTANCE_SCREENSHOT"
 LIVE_SCREEN = (1024, 768)
-# The X11 text path is a bare keysym tap with no held shift, so only unshifted
-# characters can be delivered: the marker is deliberately lowercase ASCII.
-LIVE_MARKER = "loom isolated desktop input"
+# The marker is the upstream sample verbatim, capitals included: the X11 text path
+# must hold shift for the shift-level characters instead of delivering their
+# lowercase form.
+LIVE_MARKER = "Mikka isolated CUA input"
 LIVE_TOOLS = ("Xvfb", "xdpyinfo", "xdotool", "xmessage", "xterm")
 # The bottom-left default button, as measured in the upstream fixture.
 BUTTON_INSET = (16, 14)
@@ -516,18 +525,6 @@ def call_helper(request, environment=None, timeout=60):
     return completed.returncode, header, (body if separator else b"")
 
 
-def free_display_number(lock_dir="/tmp", socket_dir="/tmp/.X11-unix",
-                        candidates=range(101, 201)):
-    """First private display number with neither an X lock file nor a socket."""
-    for number in candidates:
-        if os.path.exists(os.path.join(lock_dir, ".X%d-lock" % number)):
-            continue
-        if os.path.exists(os.path.join(socket_dir, "X%d" % number)):
-            continue
-        return number
-    return None
-
-
 def dedicated_title(label):
     """A per-test window title, so one fixture can never match another."""
     return "loom %s %s" % (label, os.urandom(3).hex())
@@ -546,12 +543,65 @@ def find_window(environment, name, only_visible=False):
     return ""
 
 
+def socket_owner_inodes(number, socket_dir="/tmp/.X11-unix"):
+    """Socket inodes registered for one display number, from /proc.
+
+    A display number is only a name, and it has two: the filesystem socket and
+    the abstract one. Xlib prefers the abstract name, so a server that only holds
+    one of them can leave clients connecting to somebody else's desktop (or to a
+    socket that resets). The kernel knows who holds which inode, so the fixture
+    asks it instead of trusting a number.
+    """
+    path = os.path.join(socket_dir, "X%d" % number)
+    inodes = set()
+    try:
+        with open("/proc/net/unix", "r", encoding="utf-8", errors="replace") as table:
+            for line in table:
+                fields = line.split()
+                if len(fields) >= 7 and fields[-1] in (path, "@" + path):
+                    inodes.add(fields[6])
+    except OSError:
+        return None
+    return inodes
+
+
+def process_socket_inodes(pid):
+    """Socket inodes a process holds open, from /proc/<pid>/fd."""
+    inodes = set()
+    try:
+        names = os.listdir("/proc/%d/fd" % pid)
+    except OSError:
+        return inodes
+    for name in names:
+        try:
+            target = os.readlink("/proc/%d/fd/%s" % (pid, name))
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target.endswith("]"):
+            inodes.add(target[len("socket:["):-1])
+    return inodes
+
+
+def process_diagnostic(process):
+    """The stderr a fixture window reported, for a failure message only."""
+    if process is None or process.stderr is None or process.poll() is None:
+        return ""
+    try:
+        output = process.stderr.read()
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the failure
+        return ""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    output = output.strip()
+    return ": %s" % output if output else ""
+
+
 def await_window(environment, name, process=None, only_visible=False, attempts=100):
     for _ in range(attempts):
         if process is not None and process.poll() is not None:
             raise AssertionError(
-                "fixture window %r exited with %s before it was observed"
-                % (name, process.returncode)
+                "fixture window %r exited with %s before it was observed%s"
+                % (name, process.returncode, process_diagnostic(process))
             )
         window = find_window(environment, name, only_visible)
         if window:
@@ -585,45 +635,81 @@ def button_point(geometry):
 
 
 class IsolatedDisplay:
-    """A private Xvfb display: never the ambient desktop, never a fixed number."""
+    """A private Xvfb display whose number Xvfb itself hands back to us.
 
-    def __init__(self, width, height, lock_dir="/tmp", socket_dir="/tmp/.X11-unix"):
+    The number is never guessed here: `Xvfb -displayfd <pipe>` picks a free
+    display and writes the number into a pipe only this process holds. The
+    handshake is then confirmed, because a number is not ownership: the server
+    must still be alive, and every socket registered for that number (the
+    filesystem name and the abstract name Xlib prefers) must belong to this
+    process. Xvfb announces a number before it has claimed it, and a stopping
+    server can still hold one of the two names, so a number alone proves nothing.
+
+    Our own fixtures start one at a time and wait for a stopped display to
+    release its sockets, so two of them cannot share a desktop.
+    """
+
+    HANDSHAKE_TIMEOUT = 10
+    START_LOCK = threading.Lock()
+
+    def __init__(self, width, height, socket_dir="/tmp/.X11-unix"):
         self.width = width
         self.height = height
-        self.lock_dir = lock_dir
         self.socket_dir = socket_dir
         self.name = ""
+        self.number = None
+        self.binary = None
         self.process = None
 
     def start(self, attempts=3):
-        if shutil.which("Xvfb") is None:
+        self.binary = shutil.which("Xvfb")
+        if self.binary is None:
             raise RuntimeError(
                 "Xvfb is missing; scripts/bero/loom-dev-setup.sh installs the fixture tools"
             )
-        tried = []
+        failures = 0
         for _ in range(attempts):
-            number = free_display_number(
-                self.lock_dir, self.socket_dir,
-                candidates=[n for n in range(101, 201) if n not in tried],
-            )
-            if number is None:
-                break
-            tried.append(number)
-            self.name = ":%d" % number
-            if self.spawn(number):
-                return self.name
+            with IsolatedDisplay.START_LOCK:
+                if self.spawn():
+                    return self.name
+            failures += 1
         raise RuntimeError(
-            "isolated X display did not become ready (tried %s)" % (tried or "nothing")
+            "isolated X display did not start after %d attempt(s)" % failures
         )
 
-    def spawn(self, number):
-        """Try the display number already selected; a lost race is retried."""
-        self.process = subprocess.Popen(
-            ["Xvfb", ":%d" % number, "-screen", "0", "%dx%dx24" % (self.width, self.height),
-             "-nolisten", "tcp"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    def spawn(self):
+        """Start Xvfb once; accept only a display this process really serves."""
+        read_fd, write_fd = os.pipe()
+        try:
+            self.process = subprocess.Popen(
+                [self.binary or "Xvfb", "-displayfd", str(write_fd),
+                 "-screen", "0", "%dx%dx24" % (self.width, self.height),
+                 # A reset (default: when the last client disconnects) would drop
+                 # the connection of a client starting right after our probe.
+                 "-noreset", "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                pass_fds=(write_fd,),
+            )
+        finally:
+            os.close(write_fd)
+        try:
+            number = self.read_display_number(read_fd)
+        finally:
+            os.close(read_fd)
+        if number is None or self.process.poll() is not None:
+            # No handshake means this server is not serving the display we would
+            # talk to, so its desktop is never adopted as ours.
+            self.stop()
+            return False
+        if not self.owns_display(number):
+            # The number is real but not entirely ours: adopting it would drive a
+            # desktop (or a dead socket) this fixture did not start. Nothing of
+            # ours to release, so the next attempt starts clean.
+            self.stop()
+            return False
+        self.number = number
+        self.name = ":%d" % number
         for _ in range(100):
             if self.process.poll() is not None:
                 break
@@ -632,6 +718,40 @@ class IsolatedDisplay:
             time.sleep(0.1)
         self.stop()
         return False
+
+    def owns_display(self, number):
+        """Are *all* sockets named by `number` held by the process we started?
+
+        `True` when the platform cannot answer (no /proc/net/unix): the handshake
+        over the private pipe is then the only evidence available.
+        """
+        inodes = socket_owner_inodes(number, self.socket_dir)
+        if inodes is None:
+            return True
+        if not inodes:
+            return False
+        return inodes <= process_socket_inodes(self.process.pid)
+
+    @classmethod
+    def read_display_number(cls, read_fd, timeout=None):
+        """The number Xvfb reported, or None if the handshake never completed."""
+        deadline = time.monotonic() + (
+            cls.HANDSHAKE_TIMEOUT if timeout is None else timeout
+        )
+        data = b""
+        while b"\n" not in data:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([read_fd], [], [], remaining)
+            if not readable:
+                break
+            chunk = os.read(read_fd, 64)
+            if not chunk:
+                break
+            data += chunk
+        number = data.split(b"\n", 1)[0].strip()
+        return int(number) if number.isdigit() else None
 
     def environment(self):
         return dict(os.environ, DISPLAY=self.name)
@@ -645,6 +765,7 @@ class IsolatedDisplay:
 
     def stop(self):
         process, self.process = self.process, None
+        number, self.number, self.name = self.number, None, ""
         if process is None:
             return
         process.terminate()
@@ -653,6 +774,22 @@ class IsolatedDisplay:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=10)
+        if number is not None:
+            self.release(number)
+
+    def release(self, number, timeout=10.0):
+        """Wait until this display number's sockets are really gone.
+
+        The next fixture must not pick the same number while the kernel (or the
+        exiting server) still has it registered under either name.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            inodes = socket_owner_inodes(number, self.socket_dir)
+            if inodes == set():
+                return True
+            time.sleep(0.02)
+        return False
 
 
 class LiveFixtureContract(unittest.TestCase):
@@ -663,36 +800,56 @@ class LiveFixtureContract(unittest.TestCase):
         for value in ["", "0", "true", "yes", "on", "01", " "]:
             self.assertFalse(live_acceptance_enabled(value), value)
 
-    def test_the_marker_is_deliverable_by_the_x11_text_path(self):
-        # A held shift cannot be expressed, so the marker must stay unshifted.
-        self.assertEqual(LIVE_MARKER, LIVE_MARKER.lower())
+    def test_the_marker_keeps_its_case_on_the_x11_text_path(self):
+        # The upstream sample, capitals included: a capital is the shift level of
+        # the same keycode, so a bare tap would silently type the lowercase form.
+        self.assertEqual(LIVE_MARKER, "Mikka isolated CUA input")
+        self.assertTrue(any(character.isupper() for character in LIVE_MARKER))
         self.assertTrue(all(ord(character) < 0x100 for character in LIVE_MARKER))
         self.assertEqual(
-            helper.plan_input({"op": "text", "text": LIVE_MARKER}, BOUNDS,
+            helper.plan_input({"op": "text", "text": "Mi"}, BOUNDS,
                               unicode_text=False),
-            [("keysym", ord(character)) for character in LIVE_MARKER],
+            [("key", "shift", "down"), ("keysym", ord("m")),
+             ("key", "shift", "up"), ("keysym", ord("i"))],
         )
+        plan = helper.plan_input({"op": "text", "text": LIVE_MARKER}, BOUNDS,
+                                 unicode_text=False)
+        shifts = [step for step in plan if step[0] == "key"]
+        capitals = [character for character in LIVE_MARKER if character.isupper()]
+        self.assertEqual(len([step for step in shifts if step[2] == "down"]), len(capitals))
+        self.assertEqual(len([step for step in shifts if step[2] == "up"]), len(capitals))
+        keysyms = [step[1] for step in plan if step[0] == "keysym"]
+        # No uppercase keysym may be tapped: that is the shape that loses case.
+        self.assertTrue(all(chr(keysym).islower() or not chr(keysym).isalpha()
+                            for keysym in keysyms), [chr(k) for k in keysyms])
 
     def test_button_point_reproduces_the_ported_upstream_click(self):
         self.assertEqual(button_point((200, 200, 400, 140)), (216, 326))
         self.assertEqual(button_point((0, 0, 400, 140)), (16, 126))
         self.assertEqual(button_point((10, 20, 800, 300)), (26, 306))
 
-    def test_free_display_numbers_skip_locks_and_sockets(self):
-        with tempfile.TemporaryDirectory() as root:
-            locks = os.path.join(root, "locks")
-            sockets = os.path.join(root, "sockets")
-            os.makedirs(locks)
-            os.makedirs(sockets)
-            for number in (101, 102, 104):
-                pathlib.Path(locks, ".X%d-lock" % number).write_text("", encoding="utf-8")
-            pathlib.Path(sockets, "X103").write_text("", encoding="utf-8")
-            self.assertEqual(
-                free_display_number(locks, sockets, candidates=range(101, 106)), 105
-            )
-            for number in range(101, 106):
-                pathlib.Path(locks, ".X%d-lock" % number).write_text("", encoding="utf-8")
-            self.assertIsNone(free_display_number(locks, sockets, candidates=range(101, 106)))
+    def test_the_handshake_reads_only_a_display_number_xvfb_reported(self):
+        for reported, expected in [(b"104\n", 104), (b":7\n", None),
+                                   (b"", None), (b"banana\n", None)]:
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(write_fd, reported)
+            finally:
+                os.close(write_fd)
+            try:
+                self.assertEqual(
+                    IsolatedDisplay.read_display_number(read_fd, timeout=1), expected,
+                    reported,
+                )
+            finally:
+                os.close(read_fd)
+        # A silent server never yields a number, so its desktop is never adopted.
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        try:
+            self.assertIsNone(IsolatedDisplay.read_display_number(read_fd, timeout=0.2))
+        finally:
+            os.close(read_fd)
 
     @unittest.skipIf(sys.platform == "win32", "POSIX display check only")
     def test_the_shared_call_path_reports_a_refusal_without_a_body(self):
@@ -704,6 +861,21 @@ class LiveFixtureContract(unittest.TestCase):
         self.assertEqual(header["error"], "no_display")
         self.assertEqual(body, b"")
 
+    @unittest.skipUnless(os.path.exists("/proc/net/unix"),
+                         "socket ownership needs the Linux socket table")
+    def test_ownership_follows_the_listening_socket_not_the_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(server.close)
+            server.bind(os.path.join(root, "X77"))
+            server.listen(1)
+            display = IsolatedDisplay(*LIVE_SCREEN, socket_dir=root)
+            display.process = mock.Mock(pid=os.getpid())
+            self.assertTrue(display.owns_display(77), "our own listener is ours")
+            display.process = mock.Mock(pid=1)
+            self.assertFalse(display.owns_display(77),
+                             "a number our process does not listen on is not ours")
+
     def test_the_display_refuses_to_start_without_xvfb(self):
         display = IsolatedDisplay(*LIVE_SCREEN)
         with mock.patch.object(shutil, "which", return_value=None):
@@ -712,23 +884,22 @@ class LiveFixtureContract(unittest.TestCase):
         self.assertIsNone(display.process)
         display.stop()  # idempotent teardown
 
-    def test_the_display_retries_a_display_number_it_lost(self):
-        with tempfile.TemporaryDirectory() as root:
-            locks = os.path.join(root, "locks")
-            sockets = os.path.join(root, "sockets")
-            os.makedirs(locks)
-            os.makedirs(sockets)
-            display = IsolatedDisplay(*LIVE_SCREEN, lock_dir=locks, socket_dir=sockets)
-            spawned = []
+    def test_a_failing_xvfb_is_retried_and_reported(self):
+        class CountingDisplay(IsolatedDisplay):
+            attempts = 0
 
-            def spawn(_display, number):
-                spawned.append(number)
-                return len(spawned) == 2
+            def spawn(self):
+                CountingDisplay.attempts += 1
+                return super().spawn()
 
-            with mock.patch.object(shutil, "which", return_value="/usr/bin/Xvfb"), \
-                    mock.patch.object(IsolatedDisplay, "spawn", spawn):
-                self.assertEqual(display.start(attempts=3), ":102")
-            self.assertEqual(spawned, [101, 102])
+        display = CountingDisplay(*LIVE_SCREEN)
+        # A real process that exits without a handshake, not a mocked spawn.
+        failing = shutil.which("false") or "/bin/false"
+        with mock.patch.object(shutil, "which", return_value=failing):
+            with self.assertRaises(RuntimeError):
+                display.start(attempts=3)
+        self.assertEqual(CountingDisplay.attempts, 3)
+        self.assertIsNone(display.process, "a failed start leaks no server")
 
 
 @unittest.skipUnless(
@@ -765,14 +936,17 @@ class LiveDesktopAcceptance(unittest.TestCase):
     # ------------------------------------------------------------ fixtures
 
     def reap(self, process):
-        if process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+        if process.stderr is not None:
+            # The captured diagnostics are read on failure only; the pipe still
+            # has to be closed.
+            process.stderr.close()
 
     def dialog(self, title):
         process = subprocess.Popen(
@@ -780,7 +954,8 @@ class LiveDesktopAcceptance(unittest.TestCase):
              "-buttons", "OK:0", "LOOM isolated computer-use test"],
             env=self.environment,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            # Captured, never discarded: an unexpected exit must say why.
+            stderr=subprocess.PIPE,
         )
         self.addCleanup(self.reap, process)
         return process
@@ -842,6 +1017,54 @@ class LiveDesktopAcceptance(unittest.TestCase):
 
     # -------------------------------------------------------------- checks
 
+    def test_a_second_fixture_gets_its_own_display(self):
+        """Two servers started at the same instant must never share a desktop.
+
+        Real Xvfb processes, no mocked spawn: before the `-displayfd` handshake a
+        contender whose guessed number was already taken still reported success
+        because `xdpyinfo` could talk to the winner's server.
+        """
+        displays = [IsolatedDisplay(*LIVE_SCREEN), IsolatedDisplay(*LIVE_SCREEN)]
+        failures = []
+
+        def start(display):
+            try:
+                display.start()
+            except BaseException as error:  # noqa: BLE001 - reported after join
+                failures.append(error)
+
+        threads = [threading.Thread(target=start, args=(display,))
+                   for display in displays]
+        for display in displays:
+            self.addCleanup(display.stop)
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(failures, [])
+        self.assertEqual(sorted(display.name for display in displays),
+                         sorted({display.name for display in displays}),
+                         "each fixture must own a distinct display")
+        for display in displays:
+            self.assertIsNotNone(display.process, "%s never started" % display.name)
+            self.assertIsNone(display.process.poll(),
+                              "%s must still be served by its own Xvfb" % display.name)
+            self.assertNotEqual(display.name, os.environ.get("DISPLAY"))
+        # Same display would mean the same desktop: a window on one must be
+        # invisible to the other, which is the whole point of the handshake.
+        title = dedicated_title("competition")
+        window = subprocess.Popen(
+            ["xmessage", "-title", title, "-geometry", "300x120+40+40",
+             "-buttons", "OK:0", title],
+            env=displays[0].environment(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(self.reap, window)
+        self.assertNotEqual(await_window(displays[0].environment(), title, window), "")
+        self.assertEqual(find_window(displays[1].environment(), title, only_visible=True), "",
+                         "the second fixture must not see the first fixture's window")
+
     def test_capture_observes_the_isolated_desktop(self):
         header, empty = self.capture("empty")
         self.assertTrue(header["deviceId"].startswith("sha256:"))
@@ -886,6 +1109,14 @@ class LiveDesktopAcceptance(unittest.TestCase):
                          "the clicked window must disappear from the display")
         _, after = self.capture("click-after")
         self.assertNotEqual(before, after, "the desktop must be redrawn after the close")
+        box = (geometry[0], geometry[1], geometry[0] + geometry[2],
+               geometry[1] + geometry[3])
+        with self.decode(before) as shown, self.decode(after) as cleared:
+            changed = self.changed_pixels(shown, cleared, box)
+        # The dialog rectangle itself must be repainted: a moved cursor or a stale
+        # frame is not a closed window.
+        self.assertGreater(changed, (box[2] - box[0]) * (box[3] - box[1]) // 4,
+                           "the dialog rectangle must be repainted after the click")
 
     def test_typed_text_reaches_the_dedicated_window(self):
         workspace = pathlib.Path(tempfile.mkdtemp(prefix="loom-live-input-"))
@@ -920,8 +1151,12 @@ class LiveDesktopAcceptance(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(terminal.returncode, 0,
                          "the fixture application exits only after a complete line")
-        self.assertEqual(typed.read_text(encoding="utf-8"), LIVE_MARKER,
+        received = typed.read_text(encoding="utf-8")
+        self.assertEqual(received, LIVE_MARKER,
                          "observed application text must match the typed marker")
+        # Case is part of the text: the shift taps, not just the taps, must arrive.
+        self.assertTrue(any(character.isupper() for character in received),
+                        "typed text must keep the capital letters of the marker")
 
 
 if __name__ == "__main__":

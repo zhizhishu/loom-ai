@@ -93,6 +93,18 @@ WINDOWS_VK = {
     "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
 }
 
+# Characters that live on the shift level of another X11 keysym, for the baseline
+# US layout the helper targets. `XKeysymToKeycode` maps both levels of a key to the
+# same keycode, so the tap alone types the *unshifted* character: a capital letter
+# or `!` needs shift held around it, otherwise typed text silently loses its case.
+X11_SHIFTED = {
+    **{chr(code): chr(code + 32) for code in range(ord("A"), ord("Z") + 1)},
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
+    "&": "7", "*": "8", "(": "9", ")": "0", "_": "-", "+": "=",
+    "{": "[", "}": "]", "|": "\\", ":": ";", "\"": "'", "<": ",",
+    ">": ".", "?": "/", "~": "`",
+}
+
 X11_KEYSYM = {
     "enter": 0xFF0D, "tab": 0xFF09, "escape": 0xFF1B, "backspace": 0xFF08,
     "delete": 0xFFFF, "space": 0x0020, "left": 0xFF51, "right": 0xFF53,
@@ -228,8 +240,29 @@ def plan_input(request, bounds, unicode_text):
         for character in text:
             if ord(character) > 0xFF:
                 raise Failure("unsupported_input", "text encoding")
-        return [("keysym", ord(character)) for character in text]
+        return x11_text_steps(text)
     raise Failure("invalid_request", "op")
+
+
+def x11_text_steps(text):
+    """Keysym taps for the X11 text path, with the shift taps case needs.
+
+    Every character is one tap of its keysym, except the characters in
+    `X11_SHIFTED`: those are pressed as shift-down, base keysym tap, shift-up, so
+    the delivered text keeps the case the caller asked for. The shift taps stay
+    inside the same plan as the tap they wrap, so a plan can never end with shift
+    (or any other modifier) held.
+    """
+    steps = []
+    for character in text:
+        base = X11_SHIFTED.get(character)
+        if base is None:
+            steps.append(("keysym", ord(character)))
+            continue
+        steps.append(("key", "shift", "down"))
+        steps.append(("keysym", ord(base)))
+        steps.append(("key", "shift", "up"))
+    return steps
 
 
 def normalize(x, y, bounds):
@@ -645,33 +678,55 @@ def _xtst():
 def linux_apply(plan, bounds):
     ctypes, x11, display, screen, bounds = linux_display()
     xtst = _xtst()
-    for step in plan:
-        kind = step[0]
-        if kind in ("move", "button", "wheel"):
-            _, x, y = step[0], step[1], step[2]
-            xtst.XTestFakeMotionEvent(display, screen, x, y, 0)
-            if kind == "wheel":
-                synthetic = 4 if step[3] > 0 else 5
-                for _ in range(min(abs(step[3]), MAX_WHEEL_CLICKS)):
-                    xtst.XTestFakeButtonEvent(display, synthetic, 1, 0)
-                    xtst.XTestFakeButtonEvent(display, synthetic, 0, 0)
-            elif kind == "button":
-                xtst.XTestFakeButtonEvent(display, BUTTONS[step[3]],
-                                         1 if step[4] == "down" else 0, 0)
-        elif kind == "key":
-            code = x11.XKeysymToKeycode(display, X11_KEYSYM[step[1]])
-            if not code:
-                raise Failure("unsupported_input", "keycode")
-            xtst.XTestFakeKeyEvent(display, code, 1 if step[2] == "down" else 0, 0)
-        elif kind == "keysym":
-            code = x11.XKeysymToKeycode(display, step[1])
-            if not code:
-                raise Failure("unsupported_input", "keysym")
-            xtst.XTestFakeKeyEvent(display, code, 1, 0)
-            xtst.XTestFakeKeyEvent(display, code, 0, 0)
-        else:
-            raise Failure("unsupported_input", kind)
+    # Anything this plan presses and has not released yet. A plan that fails
+    # halfway (an unmapped keysym, a dropped display) must not leave a modifier
+    # or a button held on the user's desktop.
+    held = []
+    try:
+        for step in plan:
+            kind = step[0]
+            if kind in ("move", "button", "wheel"):
+                _, x, y = step[0], step[1], step[2]
+                xtst.XTestFakeMotionEvent(display, screen, x, y, 0)
+                if kind == "wheel":
+                    synthetic = 4 if step[3] > 0 else 5
+                    for _ in range(min(abs(step[3]), MAX_WHEEL_CLICKS)):
+                        xtst.XTestFakeButtonEvent(display, synthetic, 1, 0)
+                        xtst.XTestFakeButtonEvent(display, synthetic, 0, 0)
+                elif kind == "button":
+                    code = BUTTONS[step[3]]
+                    xtst.XTestFakeButtonEvent(display, code,
+                                             1 if step[4] == "down" else 0, 0)
+                    if step[4] == "down":
+                        held.append(("button", code))
+                    elif ("button", code) in held:
+                        held.remove(("button", code))
+            elif kind == "key":
+                code = x11.XKeysymToKeycode(display, X11_KEYSYM[step[1]])
+                if not code:
+                    raise Failure("unsupported_input", "keycode")
+                xtst.XTestFakeKeyEvent(display, code, 1 if step[2] == "down" else 0, 0)
+                if step[2] == "down":
+                    held.append(("key", code))
+                elif ("key", code) in held:
+                    held.remove(("key", code))
+            elif kind == "keysym":
+                code = x11.XKeysymToKeycode(display, step[1])
+                if not code:
+                    raise Failure("unsupported_input", "keysym")
+                xtst.XTestFakeKeyEvent(display, code, 1, 0)
+                xtst.XTestFakeKeyEvent(display, code, 0, 0)
+            else:
+                raise Failure("unsupported_input", kind)
+            x11.XFlush(display)
+    except BaseException:
+        for kind, code in held:
+            if kind == "key":
+                xtst.XTestFakeKeyEvent(display, code, 0, 0)
+            else:
+                xtst.XTestFakeButtonEvent(display, code, 0, 0)
         x11.XFlush(display)
+        raise
 
 
 def linux_release():
