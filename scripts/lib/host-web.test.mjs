@@ -114,6 +114,15 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
     for (const name of ['plain.js', 'unlisted-Abcdef12.js', 'missing-Abcdef12.js']) {
       assert.equal((await fetch(`${origin}/assets/${name}`)).headers.get('cache-control'), 'no-store')
     }
+    // Root-level public files are served only through the exact route allowlist.
+    for (const [name, type] of [['loom-favicon-9bd461c1.png', 'image/png'], ['loom-favicon.svg', 'image/svg+xml']]) {
+      const icon = await fetch(`${origin}/${name}`)
+      assert.equal(icon.status, 200, `${name} must be served from the Web root`)
+      assert.equal(icon.headers.get('content-type'), type)
+      assert.equal(icon.headers.get('cache-control'), 'no-store')
+      assert.deepEqual(Buffer.from(await icon.arrayBuffer()), await readAssetFile(join(ownedUiDirectory, name)), `${name} bytes are the approved file, unmodified`)
+    }
+    assert.equal((await fetch(`${origin}/index.html`)).status, 404, 'only allowlisted root files are served')
     const assetPath = join(ownedUiDirectory, assetUrl.slice(1))
     const originalAsset = await readAssetFile(assetPath)
     await writeFile(assetPath, 'changed under the same URL')
@@ -459,7 +468,7 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
     const html = await fetch(origin, { redirect: 'error' })
     assert.equal(html.status, 200)
     assert.match(html.headers.get('content-security-policy'), /frame-ancestors 'none'/)
-    assert.match(await html.text(), /<title>Rovai AI<\/title>/)
+    assert.match(await html.text(), /<title>LOOM<\/title>/)
     const assetDirectory = join(ownedUiDirectory, 'assets')
     const avatars = await Promise.all((await readdir(assetDirectory))
       .filter(name => /^icon-192-[\w-]+\.png$/.test(name))
@@ -474,12 +483,19 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
       assert.equal(avatarResponse.headers.get('content-type'), 'image/png')
       assert.deepEqual(Buffer.from(await avatarResponse.arrayBuffer()), expected)
     }
-    const commandLogo = (await readdir(assetDirectory)).find(name => /^command-code-[\w-]+\.ico$/.test(name))
-    assert.ok(commandLogo, 'production Web package includes the Command Code icon')
-    const logoResponse = await fetch(`${origin}/assets/${commandLogo}`, { redirect: 'error' })
-    assert.equal(logoResponse.status, 200)
-    assert.equal(logoResponse.headers.get('content-type'), 'image/vnd.microsoft.icon')
-    assert.deepEqual(Buffer.from(await logoResponse.arrayBuffer()), await readAssetFile(join(repository, 'apps/desktop/src/renderer/src/assets/runtime-logos/command-code.ico')))
+    const brandName = (await readdir(assetDirectory)).find(name => /^loom-brand-user-approved-256-[\w-]+\.webp$/.test(name))
+    assert.ok(brandName, 'production Web package includes the user-approved LOOM brand')
+    const brandResponse = await fetch(`${origin}/assets/${brandName}`, { redirect: 'error' })
+    assert.equal(brandResponse.status, 200)
+    assert.equal(brandResponse.headers.get('content-type'), 'image/webp')
+    assert.deepEqual(Buffer.from(await brandResponse.arrayBuffer()), await readAssetFile(join(repository, 'apps/desktop/src/renderer/src/loom-native/assets/loom-brand-user-approved-256.webp')))
+    // ICO remains a supported transport type without shipping an excluded fifth Runtime logo.
+    const icoBytes = await readAssetFile(join(repository, 'apps/desktop/src/renderer/src/assets/runtime-logos/command-code.ico'))
+    await writeFile(join(assetDirectory, 'fixture-native-icon.ico'), icoBytes)
+    const icoResponse = await fetch(`${origin}/assets/fixture-native-icon.ico`, { redirect: 'error' })
+    assert.equal(icoResponse.status, 200)
+    assert.equal(icoResponse.headers.get('content-type'), 'image/vnd.microsoft.icon')
+    assert.deepEqual(Buffer.from(await icoResponse.arrayBuffer()), icoBytes)
     const controller = new AbortController(); controllers.push(controller)
     const stream = await fetch(`${origin}/api/v1/events`, { headers: { Authorization: `Bearer ${first.token}` }, signal: controller.signal })
     assert.equal(stream.status, 200)

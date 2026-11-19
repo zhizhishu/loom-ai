@@ -1138,20 +1138,33 @@ dependencies = [
  "loom-protocol",
  "reqwest",
  "rovai-host",
+ "rovai-local-ipc",
+ "rovai-private-storage",
+ "rovai-process-boundary",
+ "rovai-runtime-entrypoint",
  "rovai-web",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tungstenite 0.29.0",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "loom-pi-launcher"
+version = "0.5.1"
 
 [[package]]
 name = "loom-protocol"
 version = "0.5.1"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1649,9 +1662,13 @@ dependencies = [
  "image",
  "json5",
  "libc",
+ "loom-protocol",
  "plist",
  "reqwest",
  "ring",
+ "rovai-local-ipc",
+ "rovai-private-storage",
+ "rovai-runtime-entrypoint",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1692,6 +1709,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "rovai-local-ipc"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "rovai-private-storage",
+ "serde",
+ "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rovai-private-storage"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "libc",
+ "serde",
+ "serde_json",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rovai-process-boundary"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rovai-private-storage",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rovai-runtime-entrypoint"
+version = "0.5.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rovai-web"
 version = "0.5.1"
 dependencies = [
@@ -1705,11 +1772,14 @@ dependencies = [
  "loom-protocol",
  "memchr",
  "rovai-core",
+ "rovai-private-storage",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "subtle",
  "tokio",
+ "toml",
  "tower",
  "url",
  "uuid",

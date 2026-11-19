@@ -208,6 +208,36 @@ describe('Runtime user status projection', () => {
     expect(result.label).toBe('Windows 尚未验证')
   })
 
+  // LOOM 自有决定（Claude 禁用，2026-11-18）：产品策略禁用与平台支持无关，
+  // 必须显示「已禁用」，且不得被 ready 可用性覆盖成可用。
+  it('reports a policy-disabled admission as 已禁用 on every platform', () => {
+    for (const platform of ['macos-arm64', 'macos-x64', 'windows-x64', 'linux-x64'] as const) {
+      const admission: RuntimePlatformAdmission = {
+        runtimeKind: 'claude-code-cli',
+        platform,
+        status: 'disabled',
+        reasonCode: 'runtime_platform.upstream_unsupported',
+        evidenceRevision: null
+      }
+      expect(runtimePlatformAdmissionAllowsUse(admission)).toBe(false)
+      expect(runtimeProductPresentation(admission, availability('ready', 'claude-code-cli'))).toEqual({
+        status: 'disabled',
+        label: '已禁用',
+        detail: '该智能体已按产品策略禁用：只识别，不启动。'
+      })
+      const member = memberRuntimePresentation(
+        profile({ status: 'ready', blockers: [] }),
+        'claude-code-cli',
+        availability('ready', 'claude-code-cli'),
+        false,
+        admission,
+        true
+      )
+      expect(member.status).toBe('disabled')
+      expect(member.label).toBe('已禁用')
+    }
+  })
+
   it('keeps preview admission usable while disclosing missing qualification evidence', () => {
     const admission: RuntimePlatformAdmission = {
       runtimeKind: 'pi',

@@ -37,9 +37,12 @@ pub enum Operation {
     MissionLinkPr,
 
     // LOOM is a Mission surface, so the workspace a browser opens has to be able to project it.
-    // Reads are the eight projections the workspace renders; the two writes are the verdicts the
-    // Owner records from that page. Registration, claims and task release stay off the network
-    // capability: those belong to the agent side that owns the workspace.
+    // Reads project the workspace and preview archived evidence; the four writes are the two verdicts
+    // and the control gate the Owner records from that page. Registration, claims, task release
+    // and assistant stage review stay off the network capability: those belong to the agent side
+    // that owns the workspace.
+    #[serde(rename = "loom.bundles.getMany")]
+    LoomBundlesGetMany,
     #[serde(rename = "loom.plan.get")]
     LoomPlanGet,
     #[serde(rename = "loom.tasks.list")]
@@ -52,6 +55,8 @@ pub enum Operation {
     LoomClaimsList,
     #[serde(rename = "loom.artifacts.list")]
     LoomArtifactsList,
+    #[serde(rename = "loom.artifact.preview")]
+    LoomArtifactPreview,
     #[serde(rename = "loom.reviews.list")]
     LoomReviewsList,
     #[serde(rename = "loom.verifications.list")]
@@ -60,6 +65,12 @@ pub enum Operation {
     LoomReviewRecord,
     #[serde(rename = "loom.verification.record")]
     LoomVerificationRecord,
+    #[serde(rename = "loom.control.get")]
+    LoomControlGet,
+    #[serde(rename = "loom.control.configure")]
+    LoomControlConfigure,
+    #[serde(rename = "loom.control.pause")]
+    LoomControlPause,
 
     #[serde(rename = "preferences.tasks.get")]
     TasksGet,
@@ -268,6 +279,10 @@ pub enum Operation {
     Members,
     #[serde(rename = "members.get")]
     Member,
+    #[serde(rename = "members.executionTarget.get")]
+    MemberExecutionGet,
+    #[serde(rename = "members.executionTarget.save")]
+    MemberExecutionSave,
     #[serde(rename = "members.runProjection.preview")]
     MemberRunProjection,
     #[serde(rename = "members.capabilityCatalog.get")]
@@ -426,6 +441,41 @@ impl Operation {
         use serde_json::json;
         match self {
             Self::AppInfo => json!({"name":value["name"],"version":value["version"]}),
+            Self::MemberExecutionGet => {
+                let mut projected = select_fields(&value, &["memberId", "revision", "selection"]);
+                for (field, keys) in [
+                    (
+                        "availableWorkspaces",
+                        &[
+                            "nodeId",
+                            "workspaceId",
+                            "workspaceRoot",
+                            "missionId",
+                            "missionTitle",
+                        ][..],
+                    ),
+                    (
+                        "runtimeDescriptors",
+                        &[
+                            "adapterKind",
+                            "permissionSchemaVersion",
+                            "permissionOptions",
+                            "memberRuntimeDefaults",
+                            "supportsRuntimeDefaultModel",
+                        ][..],
+                    ),
+                ] {
+                    if let Some(items) = value.get(field).and_then(serde_json::Value::as_array) {
+                        projected[field] = serde_json::Value::Array(
+                            items.iter().map(|item| select_fields(item, keys)).collect(),
+                        );
+                    }
+                }
+                projected
+            }
+            Self::MemberExecutionSave => {
+                select_fields(&value, &["memberId", "revision", "selection"])
+            }
             Self::MemberRunProjection => select_fields(
                 &value,
                 &[
@@ -476,6 +526,23 @@ impl Operation {
                     "issues",
                 ],
             ),
+            Self::LoomArtifactPreview => select_fields(
+                &value,
+                &[
+                    "artifactId",
+                    "relativePath",
+                    "contentType",
+                    "sizeBytes",
+                    "sha256",
+                    "text",
+                    "unavailableReason",
+                ],
+            ),
+            // The approval gate is its own projection: a strategy field added in Core stays
+            // unreachable until it is admitted here on purpose.
+            Self::LoomControlGet | Self::LoomControlConfigure | Self::LoomControlPause => {
+                project_loom_control(value)
+            }
             // Preserve only individually admitted actions and the Core decision.
             // Unknown/future actions remain unavailable at the network boundary.
             _ => {
@@ -515,16 +582,21 @@ impl Operation {
             Self::MissionStatus => "missions.status",
             Self::MissionStart => "missions.start",
             Self::MissionLinkPr => "missions.linkPr",
+            Self::LoomBundlesGetMany => "loom.bundles.getMany",
             Self::LoomPlanGet => "loom.plan.get",
             Self::LoomTasksList => "loom.tasks.list",
             Self::LoomDependenciesList => "loom.dependencies.list",
             Self::LoomCandidatesList => "loom.candidates.list",
             Self::LoomClaimsList => "loom.claims.list",
             Self::LoomArtifactsList => "loom.artifacts.list",
+            Self::LoomArtifactPreview => "loom.artifact.preview",
             Self::LoomReviewsList => "loom.reviews.list",
             Self::LoomVerificationsList => "loom.verifications.list",
             Self::LoomReviewRecord => "loom.review.record",
             Self::LoomVerificationRecord => "loom.verification.record",
+            Self::LoomControlGet => "loom.control.get",
+            Self::LoomControlConfigure => "loom.control.configure",
+            Self::LoomControlPause => "loom.control.pause",
             Self::CampRename => "camps.rename",
             Self::CampDelete => "camps.delete",
             Self::CampDeletionIssues => "camps.deletionIssues",
@@ -649,6 +721,8 @@ impl Operation {
             Self::AppInfo => "app.info",
             Self::Members => "members.list",
             Self::Member => "members.get",
+            Self::MemberExecutionGet => "members.executionTarget.get",
+            Self::MemberExecutionSave => "members.executionTarget.save",
             Self::MemberRunProjection => "members.runProjection.preview",
             Self::MemberCapabilityGet => "members.capabilityCatalog.get",
             Self::MemberCapabilitySet => "members.capabilityCatalog.set",
@@ -737,6 +811,154 @@ fn project_mcp_config(value: serde_json::Value) -> serde_json::Value {
     projected
 }
 
+/// LOOM control projection: the approval gate, its assistant stage reviews and its dispatches.
+///
+/// Every field is admitted by name, nested arrays included: a field added in Core stays
+/// unreachable until it is named here. A part of the response that is missing or malformed is
+/// passed through as it arrived — this projection never turns a broken gate into "never
+/// approved" (`policy: null`) or a broken history into an empty one.
+fn project_loom_control(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    // Cloned so a malformed value can be returned untouched without borrowing across a move.
+    let source = match value.as_object().cloned() {
+        Some(source) => source,
+        None => return value,
+    };
+    let mut projected = Map::new();
+    if let Some(mission_id) = source.get("missionId") {
+        projected.insert("missionId".into(), mission_id.clone());
+    }
+    match source.get("policy") {
+        // No gate in the response at all: leave the key out instead of inventing one.
+        None => {}
+        // A real "never approved" gate stays an explicit null.
+        Some(Value::Null) => {
+            projected.insert("policy".into(), Value::Null);
+        }
+        Some(policy) if policy.is_object() => {
+            projected.insert("policy".into(), project_loom_policy(policy));
+        }
+        // A malformed gate is passed through, never reshaped into null or an empty policy.
+        Some(policy) => {
+            projected.insert("policy".into(), policy.clone());
+        }
+    }
+    if let Some(stage_reviews) = source.get("stageReviews") {
+        projected.insert(
+            "stageReviews".into(),
+            project_loom_records(stage_reviews, project_loom_stage_review),
+        );
+    }
+    if let Some(dispatches) = source.get("dispatches") {
+        projected.insert(
+            "dispatches".into(),
+            project_loom_records(dispatches, |dispatch| {
+                select_fields(
+                    dispatch,
+                    &[
+                        "dispatchId",
+                        "taskId",
+                        "kind",
+                        "candidateId",
+                        "policyRevision",
+                        "recipientAgentId",
+                        "deliveryId",
+                        "status",
+                        "reason",
+                        "createdAt",
+                    ],
+                )
+            }),
+        );
+    }
+    if let Some(evaluated_at) = source.get("evaluatedAt") {
+        projected.insert("evaluatedAt".into(), evaluated_at.clone());
+    }
+    Value::Object(projected)
+}
+
+/// The approval gate, including its nested reviewer list.
+fn project_loom_policy(policy: &serde_json::Value) -> serde_json::Value {
+    let mut projected = select_fields(
+        policy,
+        &[
+            "missionId",
+            "planId",
+            "revision",
+            "authorizationRevision",
+            "enabled",
+            "paused",
+            "taskIds",
+            "reviewers",
+            "maxDispatches",
+            "maxReworksPerTask",
+            "expiresAt",
+            "approvedBy",
+            "approvedAt",
+            "updatedAt",
+        ],
+    );
+    if let (Some(reviewers), Some(object)) = (policy.get("reviewers"), projected.as_object_mut()) {
+        object.insert(
+            "reviewers".into(),
+            project_loom_records(reviewers, |reviewer| {
+                select_fields(reviewer, &["taskId", "reviewerAgentId"])
+            }),
+        );
+    }
+    projected
+}
+
+/// One assistant stage review, including its nested per-criterion verdicts.
+fn project_loom_stage_review(review: &serde_json::Value) -> serde_json::Value {
+    let mut projected = select_fields(
+        review,
+        &[
+            "stageReviewId",
+            "taskId",
+            "candidateId",
+            "reviewerAgentId",
+            "reviewerAgentRunId",
+            "policyRevision",
+            "manifestHash",
+            "verdict",
+            "reason",
+            "criteriaResults",
+            "reviewedAt",
+        ],
+    );
+    if let (Some(results), Some(object)) = (review.get("criteriaResults"), projected.as_object_mut())
+    {
+        object.insert(
+            "criteriaResults".into(),
+            project_loom_records(results, |result| {
+                select_fields(result, &["criterionId", "satisfied", "evidenceIds", "note"])
+            }),
+        );
+    }
+    projected
+}
+
+/// Project every entry with `project`; a malformed entry is passed through, not emptied.
+fn project_loom_records(
+    records: &serde_json::Value,
+    project: impl Fn(&serde_json::Value) -> serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::Value;
+    match records {
+        Value::Array(records) => Value::Array(
+            records
+                .iter()
+                .map(|record| match record {
+                    Value::Object(_) => project(record),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn filter_actions(value: &mut serde_json::Value, task_updates: bool) {
     match value {
         serde_json::Value::Object(object) => {
@@ -799,6 +1021,44 @@ mod tests {
                 .project(json!({"items":[{"taskId":"task_fixture", "body":"keep content", "availableActions":["update","edit"]}]})),
             json!({"items":[{"taskId":"task_fixture", "body":"keep content", "availableActions":["update"]}]})
         );
+        // These are the Core-scoped choices required by the real Web target
+        // editor, not additional caller authority or future response fields.
+        let target = json!({
+            "memberId":"member_fixture","revision":0,"selection":null,
+            "availableWorkspaces":[{
+                "nodeId":"node_fixture","workspaceId":"workspace_fixture","workspaceRoot":"C:/fixture",
+                "missionId":"mission_fixture","missionTitle":"Fixture",
+                "futureCredentialField":"target-secret"
+            }],
+            "runtimeDescriptors":[{
+                "adapterKind":"claude-code-cli","permissionSchemaVersion":1,"permissionOptions":[],
+                "memberRuntimeDefaults":{"model":{"mode":"runtime_default"},"permissions":{"schemaVersion":1,"values":{}}},
+                "supportsRuntimeDefaultModel":true,"futureCredentialField":"target-secret"
+            }],
+            "futureCredentialField":"target-secret"
+        });
+        let projected = Operation::MemberExecutionGet.project(target.clone());
+        assert_eq!(
+            projected["availableWorkspaces"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            projected["availableWorkspaces"][0]["workspaceId"],
+            "workspace_fixture"
+        );
+        assert_eq!(
+            projected["runtimeDescriptors"][0]["adapterKind"],
+            "claude-code-cli"
+        );
+        assert_eq!(
+            projected["runtimeDescriptors"][0]["memberRuntimeDefaults"],
+            target["runtimeDescriptors"][0]["memberRuntimeDefaults"]
+        );
+        assert!(!projected.to_string().contains("target-secret"));
+        assert_eq!(
+            Operation::MemberExecutionSave.project(target),
+            json!({"memberId":"member_fixture","revision":0,"selection":null})
+        );
         assert!(serde_json::from_value::<Operation>(json!("host.web.rotate")).is_err());
         assert!(
             serde_json::from_value::<Operation>(json!("camp.message.send_user_draft")).is_err()
@@ -806,6 +1066,108 @@ mod tests {
         let withdraw = serde_json::from_value::<Operation>(json!("camp.messages.withdraw"))
             .expect("User message withdrawal should be admitted by the Web Host");
         assert_eq!(withdraw.method(), "camp.messages.withdraw");
+        let preview = serde_json::from_value::<Operation>(json!("loom.artifact.preview")).unwrap();
+        assert_eq!(preview.method(), "loom.artifact.preview");
+        let preview_result = json!({
+            "artifactId":"artifact_fixture", "relativePath":"report.html",
+            "contentType":"text/html", "sizeBytes":28, "sha256":"fixture_digest",
+            "text":"<script>alert(1)</script>", "unavailableReason":null
+        });
+        let mut with_private_field = preview_result.clone();
+        with_private_field["archivePath"] = json!("private-archive");
+        assert_eq!(preview.project(with_private_field), preview_result);
+        for unregistered in ["loom.artifacts.preview", "loom.artifact.read"] {
+            assert!(serde_json::from_value::<Operation>(json!(unregistered)).is_err());
+        }
+        // The User's control gate is a fresh write path on this boundary. Admission alone is not
+        // routing, so the projection must drop fields the frozen contract never admits.
+        for (operation, method) in [
+            ("loom.control.get", "loom.control.get"),
+            ("loom.control.configure", "loom.control.configure"),
+            ("loom.control.pause", "loom.control.pause"),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<Operation>(json!(operation))
+                    .unwrap()
+                    .method(),
+                method
+            );
+        }
+        let projected = Operation::LoomControlGet.project(json!({
+            "missionId":"mission_fixture",
+            "policy":{"missionId":"mission_fixture","planId":"plan_fixture","revision":3,
+                "authorizationRevision":2,"enabled":true,"paused":false,
+                "taskIds":["task_fixture"],
+                "reviewers":[{"taskId":"task_fixture","reviewerAgentId":"agent_fixture",
+                    "futureCredentialField":"reviewer-secret"}],
+                "maxDispatches":1,"maxReworksPerTask":0,"expiresAt":"2099-01-01T00:00:00Z",
+                "approvedBy":"local_user","approvedAt":"2026-01-01T00:00:00Z",
+                "updatedAt":"2026-01-01T00:00:00Z","futureCredentialField":"policy-secret"},
+            "stageReviews":[{"stageReviewId":"stage_fixture","taskId":"task_fixture",
+                "candidateId":"candidate_fixture","reviewerAgentId":"agent_fixture",
+                "reviewerAgentRunId":"run_fixture","policyRevision":2,"manifestHash":"sha256:00",
+                "verdict":"pass","reason":"ok",
+                "criteriaResults":[{"criterionId":"criterion_fixture","satisfied":true,
+                    "evidenceIds":["artifact_fixture"],"note":null,
+                    "archivePath":"private-archive",
+                    "futureCredentialField":"criteria-secret"}],
+                "reviewedAt":"2026-01-01T00:00:00Z","reviewerId":"payload-forged"}],
+            "dispatches":[{"dispatchId":"dispatch_fixture","taskId":"task_fixture",
+                "kind":"execute","candidateId":null,"policyRevision":2,
+                "recipientAgentId":"agent_fixture","deliveryId":null,"status":"waiting",
+                "reason":null,"createdAt":"2026-01-01T00:00:00Z",
+                "futureCredentialField":"dispatch-secret"}],
+            "evaluatedAt":"2026-01-01T00:00:00Z",
+            "futureCredentialField":"control-secret"
+        }));
+        // The CAS revision and the authorization revision move independently.
+        assert_eq!(projected["policy"]["revision"], json!(3));
+        assert_eq!(projected["policy"]["authorizationRevision"], json!(2));
+        assert_eq!(projected["policy"]["approvedBy"], json!("local_user"));
+        assert_eq!(
+            projected["policy"]["reviewers"],
+            json!([{"taskId":"task_fixture","reviewerAgentId":"agent_fixture"}]),
+            "a reviewer item carries only the task it reviews and the agent that reviews it"
+        );
+        assert_eq!(projected["stageReviews"][0]["verdict"], json!("pass"));
+        assert_eq!(
+            projected["stageReviews"][0]["criteriaResults"],
+            json!([{"criterionId":"criterion_fixture","satisfied":true,
+                "evidenceIds":["artifact_fixture"],"note":null}]),
+            "a nested per-criterion verdict keeps only criterionId, satisfied, evidenceIds and note"
+        );
+        assert_eq!(projected["dispatches"][0]["status"], json!("waiting"));
+        assert_eq!(projected["evaluatedAt"], json!("2026-01-01T00:00:00Z"));
+        assert!(!projected.to_string().contains("secret"));
+        assert!(
+            !projected.to_string().contains("payload-forged"),
+            "a payload cannot nominate its own reviewer"
+        );
+        assert!(
+            !projected.to_string().contains("private-archive"),
+            "a criterion verdict never carries the artifact's private archive path"
+        );
+        // A real "never approved" gate stays an explicit null.
+        assert_eq!(
+            Operation::LoomControlPause
+                .project(json!({"missionId":"mission_fixture","policy":null})),
+            json!({"missionId":"mission_fixture","policy":null})
+        );
+        // A missing or malformed part of the response is never reshaped into an approval
+        // state or an empty history.
+        assert_eq!(
+            Operation::LoomControlConfigure.project(json!({
+                "missionId":"mission_fixture","policy":"broken",
+                "stageReviews":{"unexpected":true}
+            })),
+            json!({"missionId":"mission_fixture","policy":"broken",
+                "stageReviews":{"unexpected":true}})
+        );
+        assert_eq!(
+            Operation::LoomControlGet.project(json!({"evaluatedAt":"2026-01-01T00:00:00Z"})),
+            json!({"evaluatedAt":"2026-01-01T00:00:00Z"}),
+            "an absent gate and absent history stay absent"
+        );
         for (public, internal) in [
             ("runtime.status.get", "runtime.status.get"),
             (

@@ -1,8 +1,8 @@
 {
-  "displayName": "Gugu",
-  "teamRole": "Night Watcher",
-  "professionalResponsibilities": "Designs and runs tests, reproduces issues, checks edge cases and failure paths, and uses repeatable results to verify that features are reliable.",
-  "personalityTraits": ["Vigilant", "Patient", "Truth-seeking"],
+  "displayName": "Beichen",
+  "teamRole": "Research and Diagnosis",
+  "professionalResponsibilities": "Reads primary sources, reproduces problems and tests hypotheses, separating verified facts from guesses and stating what remains unchecked.",
+  "personalityTraits": ["Patient", "Evidence-led", "Careful"],
   "workingPrinciples": "",
   "growthTopic": ""
 }

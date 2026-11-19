@@ -21,6 +21,9 @@ Desktop.ini
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 /mcp-gateway/
 
 # Local environment configuration
@@ -35,9 +38,28 @@ Desktop.ini
 /apps/desktop/.impeccable/config.local.json
 /apps/desktop/.impeccable/mocks/decision/
 
+# LOOM local-only state, evidence, launchers and Mindkit memory
+/_artifacts/
+/root_artifacts/
+/.oce-client/
+/.oceignore
+/Start-LOOM.cmd
+/PROJECT_ID.md
+/PROJECT_CONTEXT.md
+/PROJECT_MAP.md
+/PROJECT_MAP.md.bak-*
+/TASK.md
+/LOG.md
+__pycache__/
+*.py[cod]
+
 # Local workspace caches and design-tool state
 /docs/prototypes/
 /.pnpm-store/
 /.impeccable/
 /.agent/
 /.stitch/
+# Generated, verified private Hook dependency closure.
+/resources/runtime/dsh-hook-executor/
+# Generated, verified complete official DSH ACP runtime.
+/resources/runtime/dsh/

@@ -4,6 +4,23 @@
 //! text frames so one codec covers heartbeat, dispatch, and process output.
 //! Sequence numbers are per run, starting at 1, shared by stdout and stderr.
 
+pub mod run_bundle;
+pub mod v2_domain;
+pub mod v2_coordinator;
+pub mod v2_coordinator_replay;
+pub mod v2_capability;
+pub mod command_hooks;
+pub mod computer;
+pub mod process_pipe;
+pub mod builtin_pipe;
+pub mod workspace_rpc;
+mod workspace;
+
+pub use workspace::{
+    CLI_CATALOG, FsEntry, MAX_LIST_ENTRIES, MAX_READ_BYTES, PreparedWorktree, list_directory,
+    prepare_git_worktree, read_file, resolve_inside, safe_branch, workspace_relative,
+};
+
 use serde::{Deserialize, Serialize};
 
 pub const CONNECT_PATH: &str = "/api/v1/nodes/connect";
@@ -22,6 +39,10 @@ pub struct CliReport {
     pub path: String,
     pub version: Option<String>,
     pub path_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_generation: Option<u64>,
 }
 
 /// One in-flight run the node still knows about when it reconnects.
@@ -43,6 +64,16 @@ pub struct RunReport {
     deny_unknown_fields
 )]
 pub enum ClientMessage {
+    BuiltinCall { call: builtin_pipe::BuiltinCallV1 },
+    ProcessPipeOutput { output: process_pipe::ProcessOutputEvent },
+    ProcessPipeControl { control: process_pipe::ProcessControlReply },
+    WorkspaceRpcEvent { event: workspace_rpc::WorkspaceEvent },
+    WorkspaceRpcRejected { rejection: workspace_rpc::WorkspaceRejection },
+    /// One bounded slice of a capture. Pixels never travel inside a reply.
+    ComputerFrameChunk { chunk: computer::ComputerFrameChunkV1 },
+    /// Result of one `ServerMessage::Computer` operation. `request_id` must
+    /// match a live waiter on the same connection generation.
+    ComputerReply { reply: computer::ComputerReplyV1 },
     Pair {
         pairing_code: String,
     },
@@ -61,6 +92,17 @@ pub enum ClientMessage {
         /// Older nodes omit it; the server keeps the generated display name.
         #[serde(default)]
         hostname: String,
+        /// Frozen selected-asset bundle versions this node can admit.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        run_bundle_versions: Vec<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        process_pipe_versions: Vec<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        workspace_rpc_versions: Vec<u32>,
+        /// Advertised only after the node's own metadata probe succeeded. An
+        /// empty list means the node has no computer capability at all.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        computer_versions: Vec<u32>,
     },
     Heartbeat {
         run_ids: Vec<String>,
@@ -81,11 +123,34 @@ pub enum ClientMessage {
         attempt: u32,
         seq: u64,
     },
-    /// The node refused a start. No process was created.
+    /// A refused legacy Start. Conflict/pending/unknown codes do not prove that
+    /// no prior process exists. Only the documented before-spawn codes allow retry.
     Rejected {
         run_id: String,
         attempt: u32,
         code: String,
+    },
+    /// Result of a workspace list, read, or worktree prepare. `code` is empty
+    /// on success. File bytes are base64 in `data`.
+    FsResult {
+        request_id: String,
+        code: String,
+        #[serde(default)]
+        entries: Vec<FsEntry>,
+        #[serde(default)]
+        data: String,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        worktree: String,
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        common_dir: String,
+        #[serde(default)]
+        base_sha: String,
+        #[serde(default)]
+        branch: String,
     },
 }
 
@@ -97,6 +162,14 @@ pub enum ClientMessage {
     deny_unknown_fields
 )]
 pub enum ServerMessage {
+    BuiltinReply { reply: builtin_pipe::BuiltinReplyV1 },
+    ProcessPipe { command: process_pipe::ProcessPipeCommand },
+    WorkspaceRpcDispatch { dispatch: workspace_rpc::WorkspaceDispatch },
+    WorkspaceRpcCancel { cancel: workspace_rpc::WorkspaceCancel },
+    WorkspaceRpcReplay { replay: workspace_rpc::WorkspaceReplay },
+    /// One closed computer operation for the desktop this node owns. The
+    /// operation carries no program, path, environment or URL.
+    Computer { request: computer::ComputerRequestV1 },
     Paired {
         node_id: String,
         token: String,
@@ -119,6 +192,8 @@ pub enum ServerMessage {
         env: Vec<(String, String)>,
         /// Per-run credential for the `rovai` shim. Not the node token.
         shim_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bundle: Option<run_bundle::RunBundleV1>,
     },
     /// Keep the existing process. Retransmit output with `seq > acked_seq`.
     Resume {
@@ -128,6 +203,22 @@ pub enum ServerMessage {
     },
     Error {
         code: String,
+    },
+    ListDir {
+        request_id: String,
+        root: String,
+        relative: String,
+    },
+    ReadFile {
+        request_id: String,
+        root: String,
+        relative: String,
+    },
+    PrepareWorktree {
+        request_id: String,
+        source: String,
+        worktree: String,
+        branch: String,
     },
 }
 
@@ -158,6 +249,7 @@ mod tests {
             cwd: "/work".into(),
             env: vec![],
             shim_token: "run-token".into(),
+            bundle: None,
         };
         let json = start.to_json();
         assert!(json.contains("\"type\":\"start\""));

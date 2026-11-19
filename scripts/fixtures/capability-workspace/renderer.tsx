@@ -4,6 +4,7 @@ import { NativeSkillsSettings, ToolboxSettings } from '../../../apps/desktop/src
 import { WindowDragStrip } from '../../../apps/desktop/src/renderer/src/App'
 import { maskMcpJson } from '../../../apps/desktop/src/renderer/src/McpJsonEditor'
 import { McpSettings } from '../../../apps/desktop/src/renderer/src/McpSettings'
+import { MemberCatalog } from '../../../apps/desktop/src/renderer/src/MemberCatalog'
 import { agent, server } from './data'
 import '../../../apps/desktop/src/renderer/src/styles.css'
 
@@ -71,6 +72,89 @@ let config = {
 }
 const text =
   '---\nname: ui-ux-pro-max\ndescription: UI design guidance\n---\n\n# 界面设计与实现\n\n从已有界面出发，让每个操作清晰、直接。\n\n## 使用方式\n\n1. 理解当前页面的主要任务。\n2. 保留熟悉的视觉风格和交互。\n3. 检查键盘操作、窄窗口和深色模式。\n\n## 设计原则\n\n- 主要内容优先，低频信息按需展开。\n- 原生 Skills 保持只读。\n- 工具箱按队员配置。'
+let hookReviewed = false
+let hookSelected = false
+let hookRevision = 'rev-1'
+let catalogHold: { wait: Promise<void>; release: () => void } | null = null
+let setCatalogTarget: (patch: { agentId?: string; active?: boolean; remount?: boolean }) => void = () => {}
+let skillLibrary = [
+  { id: 'skill-unchanged', name: 'unchanged-pack', origin: 'imported', enabled: true, lifecycleStatus: 'active', version: 1 },
+  { id: 'skill-design', name: 'design-review', origin: 'imported', enabled: true, lifecycleStatus: 'active', version: 3 },
+  { id: 'skill-orphan', name: 'orphan-skill', origin: 'imported', enabled: true, lifecycleStatus: 'active', version: 2 },
+  { id: 'skill-official', name: 'official-thing', origin: 'official', enabled: true, lifecycleStatus: 'active', version: 1 }
+]
+let registeredLibraryItems: { itemId: string; name: string }[] = []
+let registerFailure = false
+let importCommitFailure = false
+let importInspectWait: Promise<void> | null = null
+let releaseImportInspect: (() => void) | undefined
+function importCandidate(name: string, existing: { id: string; version: number; origin: string } | null, importAction: string) {
+  return {
+    name,
+    description: name + ' 的说明',
+    contentDigest: 'sha256:' + name,
+    riskSummary: {},
+    fileCount: 3,
+    totalBytes: 1200,
+    sourcePath: '/fixture/imports/' + name,
+    existingSkillId: existing?.id ?? null,
+    existingSkillVersion: existing?.version ?? null,
+    existingOrigin: existing?.origin ?? null,
+    importAction
+  }
+}
+const importCandidates: Record<string, ReturnType<typeof importCandidate>[]> = {
+  '/fixture/imports/skill-pack': [
+    importCandidate('review-helper', null, 'create'),
+    importCandidate('design-review', { id: 'skill-design', version: 3, origin: 'imported' }, 'update'),
+    importCandidate('unchanged-pack', { id: 'skill-unchanged', version: 1, origin: 'imported' }, 'unchanged'),
+    importCandidate('official-thing', { id: 'skill-official', version: 1, origin: 'official' }, 'official_conflict')
+  ],
+  '/fixture/imports/second-pack': [importCandidate('pack-two', null, 'create')],
+  '/fixture/imports/third-pack': [importCandidate('pack-three', null, 'create'), importCandidate('pack-four', null, 'create')]
+}
+const hookBody = `hooks:
+  stop:
+    - command: ./scripts/format.sh
+`
+function hookCatalog(agentId: string) {
+  return {
+    agentId,
+    displayName: agentId,
+    teamRole: '',
+    runtime: 'claude-code',
+    revision: hookRevision,
+    identity: { displayName: agentId, teamRole: '', professionalResponsibilities: '', personalityTraits: [], workingPrinciples: '', growthTopic: '' },
+    items: [
+      { id: 'member-studio', kind: 'skill', name: 'member-studio', note: '', source: '工具箱', scope: 'cloud', selected: true, origin: 'explicit', toolNames: [], risk: null },
+      ...registeredLibraryItems.map(item => ({ id: item.itemId, kind: 'skill', name: item.name, note: '导入', source: '库', scope: 'cloud', selected: false, origin: null, toolNames: [], risk: null })),
+      {
+        id: 'guard-' + agentId,
+        kind: 'hook',
+        name: 'guard-' + agentId,
+        note: '停止前格式化',
+        source: 'hook 目录',
+        scope: 'project',
+        selected: hookSelected,
+        origin: hookSelected ? 'explicit' : null,
+        toolNames: [],
+        risk: 'high',
+        hookDefinition: {
+          body: hookBody,
+          definitionDigest: 'sha256:fixture-definition',
+          reviewed: hookReviewed,
+          reviewScope: {
+            memberId: agentId, missionId: 'mission_1', campId: 'camp_1',
+            workspaceId: 'ws_1', nodeId: 'node_1', workspaceRoot: '/fixture/repo',
+            workspaceGeneration: 1, workspaceTokenDigest: 'sha256:fixture-token',
+            adapterKind: 'claude-code'
+          },
+          scopeDigest: 'sha256:fixture-scope'
+        }
+      }
+    ]
+  }
+}
 Object.assign(window, {
   rovai: {
     onEvent: () => () => {},
@@ -250,12 +334,71 @@ Object.assign(window, {
         config.configDigest += '-next'
         return { status: 'ok', config: structuredClone(config) }
       }
+      if (method === 'members.capabilityCatalog.get') {
+        if (catalogHold) await catalogHold.wait
+        return structuredClone(hookCatalog(params.agentId))
+      }
+      if (method === 'skills.list') return structuredClone(skillLibrary)
+      if (method === 'skills.import.inspect') {
+        const hold = importInspectWait
+        if (hold) await hold
+        return {
+          stagingToken: 'staging-1',
+          sourcePath: params.path,
+          candidates: structuredClone(importCandidates[params.path] ?? []),
+          rejectedCandidates: [{ sourcePath: params.path + '/broken', code: 'skill_missing_entry', message: '缺少 SKILL.md' }],
+          expiresAt: new Date(Date.now() + 600000).toISOString()
+        }
+      }
+      if (method === 'skills.import.commit') {
+        if (importCommitFailure) { importCommitFailure = false; throw new Error('桥接中断，结果未知。') }
+        const name = params.command.candidateName
+        const existing = skillLibrary.find(skill => skill.name === name)
+        const id = existing?.id ?? 'skill-' + name
+        if (!existing) skillLibrary.push({ id, name, origin: 'imported', enabled: true, lifecycleStatus: 'active', version: 1 })
+        return {
+          commandId: params.commandId,
+          commandType: 'skill.import.commit',
+          status: 'applied',
+          code: existing ? 'skill_import_updated' : 'skill_imported',
+          payload: { skillId: id, revisionId: 'revision-' + id },
+          resultEntity: { entityType: 'skill', entityId: id }
+        }
+      }
+      if (method === 'members.capabilityCatalog.putItem') {
+        if (registerFailure) { registerFailure = false; throw new Error('目录写入失败') }
+        const skillId = String(params.itemId).replace('library:', '')
+        const name = skillLibrary.find(skill => skill.id === skillId)?.name ?? skillId
+        registeredLibraryItems.push({ itemId: params.itemId, name })
+        return { id: params.itemId, kind: 'skill', name, toolNames: [] }
+      }
+      if (method === 'members.capabilityCatalog.set') {
+        if (catalogHold) await catalogHold.wait
+        const hook = params.selections.find((s: any) => s.kind === 'hook')
+        if (hook) hookSelected = hook.selected
+        if (hook?.selected && (params.reviewedHooks ?? []).length > 0) hookReviewed = true
+        hookRevision = 'rev-' + (Number(hookRevision.slice(4)) + 1)
+        return structuredClone(hookCatalog(params.agentId))
+      }
+      if (method === 'members.executionTarget.get')
+        return { memberId: params.memberId, revision: 1, selection: null, availableWorkspaces: [], runtimeDescriptors: [] }
+      if (method === 'members.runProjection.preview')
+        return { agentId: params.member, displayName: params.member, runtime: params.runtime, bootstrap: '', mcp: {}, skills: [], rules: [], hooks: [] }
       throw new Error('Unhandled fixture method: ' + method)
     }
   }
 })
+function HookPage() {
+  const [target, setTarget] = useState({ agentId: 'agent_0', active: true, epoch: 0 })
+  setCatalogTarget = (patch) => setTarget((current) => ({
+    ...current,
+    ...patch,
+    epoch: patch.remount ? current.epoch + 1 : current.epoch
+  }))
+  return <MemberCatalog key={target.epoch} agentId={target.agentId} active={target.active} onDirtyChange={() => {}} onOpenProfile={() => {}} nodes={null} />
+}
 function Fixture() {
-  const [page, setPage] = useState<'mcp' | 'skills' | 'toolbox'>('skills')
+  const [page, setPage] = useState<'mcp' | 'skills' | 'toolbox' | 'hook'>('skills')
   const [mcpEpoch, setMcpEpoch] = useState(0)
   remountMcp = () => setMcpEpoch(value => value + 1)
   return (
@@ -278,10 +421,14 @@ function Fixture() {
           <button className="quiet-button" id="nav-mcp" onClick={() => setPage('mcp')}>
             MCP
           </button>
+          <button className="quiet-button" id="nav-hook" onClick={() => setPage('hook')}>hook 目录</button>
+          <button className="quiet-button" id="nav-switch" onClick={() => setCatalogTarget({ agentId: 'agent_1' })}>切换队员</button>
+          <button className="quiet-button" id="nav-inactive" onClick={() => setCatalogTarget({ active: false })}>切到后台</button>
         </div>
       </aside>
       <main className="content settings-content" style={{ flex: 1, minWidth: 0 }}>
-        <div className="settings-workbench">
+        {page === 'hook' && <HookPage />}
+        <div className="settings-workbench" style={page === 'hook' ? { display: 'none' } : undefined}>
           <div className={`settings-panel settings-panel-${page}`}>
             <Activity mode={page === 'skills' ? 'visible' : 'hidden'}>
               <NativeSkillsSettings />
@@ -298,10 +445,18 @@ function Fixture() {
 }
 Object.assign(window, {
   capabilityTest: {
+    // Hidden Electron windows pause rAF on Windows; settle must still finish.
     settle: () =>
-      new Promise((resolve) =>
-        requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 60)))
-      ),
+      new Promise((resolve) => {
+        let done = false
+        const finish = () => {
+          if (done) return
+          done = true
+          setTimeout(resolve, 60)
+        }
+        requestAnimationFrame(() => requestAnimationFrame(finish))
+        setTimeout(finish, 150)
+      }),
     requests,
     resetMcp: (fail = false) => { config.servers = []; configReadFailure = fail; remountMcp() },
     restoreConfigRead: () => { configReadFailure = false },
@@ -328,6 +483,34 @@ Object.assign(window, {
       deleteWait = new Promise(resolve => { releaseDelete = resolve })
     },
     releaseDelete: () => releaseDelete?.(),
+    setCatalogTarget: (patch: any) => setCatalogTarget(patch),
+    resetHook: (options: { reviewed?: boolean; selected?: boolean } = {}) => {
+      hookReviewed = !!options.reviewed
+      hookSelected = !!options.selected
+      hookRevision = 'rev-1'
+    },
+    holdCatalog: () => {
+      let release!: () => void
+      const wait = new Promise<void>((resolve) => { release = resolve })
+      catalogHold = { wait, release }
+    },
+    releaseCatalog: () => { catalogHold?.release(); catalogHold = null },
+    failNextRegister: () => { registerFailure = true },
+    failNextImportCommit: () => { importCommitFailure = true },
+    holdImportInspect: () => {
+      importInspectWait = new Promise((resolve) => { releaseImportInspect = resolve })
+    },
+    releaseImportInspect: () => { releaseImportInspect?.(); releaseImportInspect = undefined; importInspectWait = null },
+    registeredItems: () => registeredLibraryItems.map(item => item.itemId),
+    resetImport: () => {
+      registeredLibraryItems = []
+      registerFailure = false
+      importCommitFailure = false
+      importInspectWait = null
+    },
+    hookGetCount: () => requests.filter((request) => request.method === 'members.capabilityCatalog.get').length,
+    hookSetRequests: () => requests.filter((request) => request.method === 'members.capabilityCatalog.set'),
+    catalogDialogText: () => document.querySelector('[role="dialog"]')?.textContent ?? '',
     changeMcpWhileDeleting: () => {
       config.servers = config.servers.map(s => s.name === 'new-connection' ? { ...s, name: 'updated-connection' } : s)
       config.configDigest += '-external'
@@ -337,7 +520,7 @@ Object.assign(window, {
       conflict = true
     },
     snapshot: () => {
-      const root = Array.from(document.querySelectorAll<HTMLElement>('.capability-workspace,.rebuilt-skills-columns')).find(
+      const root = Array.from(document.querySelectorAll<HTMLElement>('.capability-workspace,.rebuilt-skills-columns,.member-catalog-page')).find(
         (n) => n.getBoundingClientRect().width > 0
       )!
       const rect = (selector: string) => {

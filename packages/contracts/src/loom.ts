@@ -110,6 +110,8 @@ export interface LoomTask {
   acceptanceCriteria: LoomAcceptanceCriteriaSnapshot
   /** 真实阻塞原因（从 Run 失败或人工标记来） */
   blockedReason: string | null
+  /** 钉住的执行节点。空着表示没钉住，不能当成已经派到某台远程机器。 */
+  executionHostId?: string | null
   /** 创建时间 */
   createdAt: string
   /** 更新时间 */
@@ -235,6 +237,22 @@ export interface LoomClaimsListResult {
 export interface LoomArtifactsListResult {
   /** 该 Mission 下已登记的产物，最早的在前 */
   artifacts: LoomArtifact[]
+}
+
+export interface LoomArtifactPreviewInput {
+  missionId: string
+  artifactId: string
+}
+
+/** 只读已归档的文本（最多 256 KiB）；不会记录核验或验收状态。 */
+export interface LoomArtifactPreviewResult {
+  artifactId: string
+  relativePath: string
+  contentType: string | null
+  sizeBytes: number
+  sha256: string
+  text: string | null
+  unavailableReason: 'too_large' | 'binary' | 'not_archived' | null
 }
 
 /** 依赖未释放原因。 */
@@ -600,4 +618,109 @@ export function validateLoomDag(input: LoomDagInput): LoomDagValidationResult {
 
   for (const issue of findLoomCycles(input.tasks, adjacency)) issues.push(issue)
   return { valid: issues.length === 0, issues }
+}
+
+// ── 受权控制：User 配置的策略、助手阶段审查、自动接力投递 ──────────────────────
+
+/**
+ * 策略保存入参：User 显式批准「这些任务 + 这些审查人 + 这些预算」。
+ *
+ * 冻结语义（Core 校验，客户端不得放宽）：`enabled` 默认 false —— 从未批准就是没有
+ * 授权，不默认放行任何任务；`expectedRevision` 为 0 表示首次保存；`maxDispatches`
+ * 与 `maxReworksPerTask` 都是显式整数；`taskIds` 至少 1 个、不重复，且每条都必须
+ * 有独立的 reviewer；`enabled === true` 时 `expiresAt` 必须是非 null 的未来 ISO 时间。
+ *
+ * 保存一次会同时抬高 `revision`（CAS 版本）与 `authorizationRevision`（授权版本）。
+ */
+export interface LoomControlPolicyInput {
+  missionId: string
+  /** 幂等键：同一 commandId 重放返回既有快照，不再写第二条 */
+  commandId: string
+  /** 0 表示首次保存；非 0 是与当前 `revision`（CAS 版本）的比对值 */
+  expectedRevision: number
+  enabled: boolean
+  taskIds: string[]
+  reviewers: Array<{ taskId: string; reviewerAgentId: string }>
+  maxDispatches: number
+  maxReworksPerTask: number
+  expiresAt: string | null
+}
+
+/** 已保存的策略：批准人与批准/更新时间由 Host 从可信身份注入，客户端不得自报。 */
+export interface LoomControlPolicy {
+  missionId: string
+  planId: string
+  /** CAS 版本：任何 configure / pause / resume 写入都 +1 */
+  revision: number
+  /** 授权版本：只有 configure（改批准范围或预算）才 +1；pause / resume 不动它 */
+  authorizationRevision: number
+  enabled: boolean
+  paused: boolean
+  taskIds: string[]
+  reviewers: Array<{ taskId: string; reviewerAgentId: string }>
+  maxDispatches: number
+  maxReworksPerTask: number
+  expiresAt: string | null
+  approvedBy: string
+  approvedAt: string
+  updatedAt: string
+}
+
+/** 暂停/恢复入参：只改闸门，不改批准范围与预算。 */
+export interface LoomControlPauseInput {
+  missionId: string
+  commandId: string
+  expectedRevision: number
+  paused: boolean
+}
+
+/**
+ * 助手阶段审查：受权助手对候选的阶段判定，不是 User 的人工验收。
+ *
+ * 与 `LoomVerification`（能否被独立复现）和 `LoomReview`（User 的终判）是三条不同的
+ * 轴：这条记录既不改变人工验收结论，也不替代 accepted/rejected。
+ */
+export interface LoomStageReview {
+  stageReviewId: string
+  taskId: string
+  candidateId: string
+  reviewerAgentId: string
+  reviewerAgentRunId: string
+  /** 判定所依据的授权版本（即 `LoomControlPolicy.authorizationRevision`），不是 CAS 版本 */
+  policyRevision: number
+  manifestHash: string
+  verdict: 'pass' | 'request_changes' | 'blocked'
+  reason: string
+  criteriaResults: LoomAcceptanceCriterionResult[]
+  reviewedAt: string
+}
+
+/** 一次自动接力的投递记录：哪一版策略、把什么、交给了谁。 */
+export interface LoomDispatch {
+  dispatchId: string
+  taskId: string
+  kind: 'execute' | 'review' | 'rework' | 'handoff'
+  candidateId: string | null
+  policyRevision: number
+  recipientAgentId: string
+  deliveryId: string | null
+  status: 'waiting' | 'dispatched' | 'settled' | 'blocked' | 'cancelled'
+  reason: string | null
+  createdAt: string
+}
+
+/**
+ * 控制快照：策略 + 阶段审查 + 投递的只读投影。
+ *
+ * `policy` 为 null 表示这个 Mission 从未批准过任何受权策略。项目地图由现有的
+ * tasks/dependencies/candidates/artifacts/claims/reviews 加上这份控制投影派生，
+ * 没有单独的 graph RPC。
+ */
+export interface LoomControlSnapshot {
+  missionId: string
+  policy: LoomControlPolicy | null
+  stageReviews: LoomStageReview[]
+  dispatches: LoomDispatch[]
+  /** 判定时刻（RFC3339，服务端时钟）；客户端不得用本地时间推算 */
+  evaluatedAt: string
 }

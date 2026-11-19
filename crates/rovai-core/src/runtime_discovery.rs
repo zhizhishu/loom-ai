@@ -249,8 +249,22 @@ pub enum RuntimeLaunchPurpose {
     AgentExecution,
 }
 
-pub fn runtime_launch_allowed(_kind: AdapterKind, _purpose: RuntimeLaunchPurpose) -> bool {
-    // Every current Product Runtime participates in the same purpose-scoped
+pub fn runtime_launch_allowed(kind: AdapterKind, purpose: RuntimeLaunchPurpose) -> bool {
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别，不启动。
+    // 所有 purpose（DiscoveryVersion / AvailabilityCheck / InstallationRefresh /
+    // HealthProbe / DispatchPreflight / AgentExecution）一律拒绝启动进程："只识别"=
+    // 只看 PATH/文件存在。路径发现仍报 Found，版本探测退回
+    // `discover_runtime_version_scoped` 的静态读取分支（
+    // `runtime_version_unavailable_static_only`），因此不需要新类型。
+    // 唯一例外：显式 opt-in（经渠道网关的 Claude 端点测试），见
+    // runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in。
+    if kind == AdapterKind::ClaudeCodeCli
+        && !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in()
+    {
+        return false;
+    }
+    let _ = purpose;
+    // Every other current Product Runtime participates in the same purpose-scoped
     // lifecycle. Keeping this gate central ensures new Adapters must still make
     // an explicit launch-policy decision without reintroducing caller-local
     // exceptions.
@@ -583,6 +597,21 @@ impl RuntimeSearchEnvironment {
         manual_candidates: impl IntoIterator<Item = PathBuf>,
         override_path: Option<PathBuf>,
     ) -> Vec<RuntimeExecutableCandidate> {
+        self.candidates_with_override_and_embedded_pi(
+            kind,
+            manual_candidates,
+            override_path,
+            env::var_os(crate::embedded_pi::EMBEDDED_PI_ROOT_ENV).as_deref(),
+        )
+    }
+
+    fn candidates_with_override_and_embedded_pi(
+        &self,
+        kind: AdapterKind,
+        manual_candidates: impl IntoIterator<Item = PathBuf>,
+        override_path: Option<PathBuf>,
+        embedded_pi_root: Option<&OsStr>,
+    ) -> Vec<RuntimeExecutableCandidate> {
         let mut candidates = Vec::new();
         let manual_candidates = manual_candidates.into_iter().collect::<Vec<_>>();
         if kind == AdapterKind::ZcodeApp {
@@ -613,6 +642,18 @@ impl RuntimeSearchEnvironment {
                 }
             }
             return candidates;
+        }
+        // An owner-configured packaged Pi bundle (`ROVAI_EMBEDDED_PI_ROOT`) is an
+        // explicit, fully verified package selection, not a global native
+        // default change: it leads the candidate list so a previously saved
+        // PATH-derived entry or a login-shell npm shim cannot displace it, while
+        // native Pi stays available as a later candidate. A configured root that
+        // fails verification yields no candidates at all rather than an
+        // unverified command.
+        match explicit_embedded_pi_lead(kind, embedded_pi_root, &self.executable_suffixes) {
+            ExplicitEmbeddedPiLead::Unset => {}
+            ExplicitEmbeddedPiLead::Refused => return Vec::new(),
+            ExplicitEmbeddedPiLead::Lead(candidate) => candidates.push(candidate),
         }
         #[cfg(windows)]
         {
@@ -1073,11 +1114,75 @@ pub fn discover_runtime_entry_from_candidates(
             version_probe_succeeded: None,
             search_generation: search.generation,
             observed_at,
-            diagnostic_code: Some("runtime_not_found".to_string()),
+            diagnostic_code: Some(
+                missing_diagnostic_code(
+                    kind,
+                    env::var_os(crate::embedded_pi::EMBEDDED_PI_ROOT_ENV).as_deref(),
+                )
+                .to_string(),
+            ),
             entrypoint_locator_identity: None,
         },
         None,
     )
+}
+
+/// A configured-but-refused packaged Pi root must be attributable: reporting a
+/// generic `runtime_not_found` would hide an operator configuration error.
+fn missing_diagnostic_code(kind: AdapterKind, embedded_pi_root: Option<&OsStr>) -> &'static str {
+    if explicit_embedded_pi_refused(kind, embedded_pi_root) {
+        "runtime_embedded_pi_override_refused"
+    } else {
+        "runtime_not_found"
+    }
+}
+
+/// How an explicit packaged Pi bundle participates in candidate order.
+enum ExplicitEmbeddedPiLead {
+    Unset,
+    Lead(RuntimeExecutableCandidate),
+    Refused,
+}
+
+fn explicit_embedded_pi_lead(
+    kind: AdapterKind,
+    embedded_pi_root: Option<&OsStr>,
+    executable_suffixes: &[OsString],
+) -> ExplicitEmbeddedPiLead {
+    if kind != AdapterKind::Pi {
+        return ExplicitEmbeddedPiLead::Unset;
+    }
+    match crate::embedded_pi::explicit_embedded_pi(embedded_pi_root) {
+        crate::embedded_pi::ExplicitEmbeddedPi::Unset => ExplicitEmbeddedPiLead::Unset,
+        crate::embedded_pi::ExplicitEmbeddedPi::Refused(_) => ExplicitEmbeddedPiLead::Refused,
+        crate::embedded_pi::ExplicitEmbeddedPi::Verified(bundle) => {
+            // The launcher comes from the verified manifest, never from the
+            // caller's spelling of the root.
+            if !is_runtime_entrypoint_file(&bundle.launcher) {
+                return ExplicitEmbeddedPiLead::Refused;
+            }
+            let mut candidates = Vec::new();
+            push_candidate_for_kind(
+                &mut candidates,
+                bundle.launcher,
+                InstallationSource::Env,
+                None,
+                kind,
+            );
+            match candidates.into_iter().next() {
+                Some(candidate) => ExplicitEmbeddedPiLead::Lead(candidate),
+                None => ExplicitEmbeddedPiLead::Refused,
+            }
+        }
+    }
+}
+
+fn explicit_embedded_pi_refused(kind: AdapterKind, embedded_pi_root: Option<&OsStr>) -> bool {
+    kind == AdapterKind::Pi
+        && matches!(
+            crate::embedded_pi::explicit_embedded_pi(embedded_pi_root),
+            crate::embedded_pi::ExplicitEmbeddedPi::Refused(_)
+        )
 }
 
 pub async fn discover_runtime_version(
@@ -2096,6 +2201,100 @@ mod tests {
     }
 
     #[test]
+    fn verified_explicit_embedded_pi_leads_and_refusal_yields_no_candidates() {
+        let root = env::temp_dir().join(format!("rovai-explicit-embedded-pi-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let bundle_root = root.join("bundle");
+        fs::create_dir_all(&bundle_root).unwrap();
+        let launcher = crate::embedded_pi::write_verified_test_bundle(&bundle_root);
+
+        // A native Pi earlier in the search path would otherwise win.
+        let native = root.join("native");
+        fs::create_dir_all(&native).unwrap();
+        executable(&native.join("pi"), "#!/bin/sh\nprintf '0.99.0\\n'\n");
+        let native_pi = native.join("pi").canonicalize().unwrap();
+        let search = test_search(vec![SearchPathEntry {
+            path: native.clone(),
+            sources: vec![SearchPathSource::InheritedPath],
+        }]);
+
+        // No explicit root: existing source priority and native behavior.
+        let candidates = search.candidates_with_override_and_embedded_pi(
+            AdapterKind::Pi,
+            std::iter::empty(),
+            None,
+            None,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, native_pi);
+        assert_eq!(candidates[0].source, InstallationSource::InheritedPath);
+
+        // Verified explicit bundle leads, and native Pi stays available behind it.
+        let candidates = search.candidates_with_override_and_embedded_pi(
+            AdapterKind::Pi,
+            std::iter::empty(),
+            None,
+            Some(bundle_root.as_os_str()),
+        );
+        assert_eq!(candidates[0].path, launcher);
+        assert_eq!(candidates[0].source, InstallationSource::Env);
+        assert!(candidates.iter().any(|candidate| candidate.path == native_pi));
+
+        // A previously saved PATH-derived entry passed as a manual hint cannot
+        // displace the explicit package.
+        let candidates = search.candidates_with_override_and_embedded_pi(
+            AdapterKind::Pi,
+            [native.join("pi")],
+            None,
+            Some(bundle_root.as_os_str()),
+        );
+        assert_eq!(candidates[0].path, launcher);
+
+        // A configured root that no longer verifies yields no candidates at all,
+        // so no unverified command is silently selected.
+        let refused_root = root.join("tampered");
+        fs::create_dir_all(&refused_root).unwrap();
+        crate::embedded_pi::write_verified_test_bundle(&refused_root);
+        fs::write(refused_root.join("node").join("node"), b"tampered").unwrap();
+        let candidates = search.candidates_with_override_and_embedded_pi(
+            AdapterKind::Pi,
+            std::iter::empty(),
+            None,
+            Some(refused_root.as_os_str()),
+        );
+        assert!(candidates.is_empty());
+
+        // The refusal is attributable instead of a generic not-found.
+        assert_eq!(
+            missing_diagnostic_code(AdapterKind::Pi, Some(refused_root.as_os_str())),
+            "runtime_embedded_pi_override_refused"
+        );
+        assert_eq!(
+            missing_diagnostic_code(AdapterKind::Pi, None),
+            "runtime_not_found"
+        );
+        assert_eq!(
+            missing_diagnostic_code(AdapterKind::CodexCli, Some(refused_root.as_os_str())),
+            "runtime_not_found"
+        );
+
+        // No other Runtime gains an embedded Pi candidate.
+        let candidates = search.candidates_with_override_and_embedded_pi(
+            AdapterKind::CodexCli,
+            std::iter::empty(),
+            None,
+            Some(bundle_root.as_os_str()),
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.source != InstallationSource::Env)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn duplicate_paths_keep_all_provenance_without_changing_priority() {
         let mut entries = Vec::new();
         extend_paths(
@@ -2299,10 +2498,10 @@ mod tests {
             sources: vec![SearchPathSource::InheritedPath],
         }]);
 
-        for (index, kind) in AdapterKind::ALL
+        let mut executions = 0;
+        for kind in AdapterKind::ALL
             .into_iter()
             .filter(|kind| *kind != AdapterKind::ZcodeApp)
-            .enumerate()
         {
             use crate::agent_runtime_adapter::FULL_HASH_READS;
             FULL_HASH_READS.set(0);
@@ -2388,12 +2587,34 @@ mod tests {
             let invocations_before = fs::read_to_string(&marker).unwrap_or_default();
             assert_eq!(
                 invocations_before.lines().count(),
-                index,
+                executions,
                 "{} path discovery must not execute the CLI",
                 kind.as_str()
             );
 
             discover_runtime_version(&mut observation, &search).await;
+            if kind == AdapterKind::ClaudeCodeCli {
+                // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别，不启动。
+                // 路径发现仍报 Found，但版本必须退回静态读取（这里的 shell 夹具没有可读的
+                // 版本元数据，所以给出 runtime_version_unavailable_static_only）。
+                assert_eq!(
+                    observation.reported_version, None,
+                    "disabled Claude Code must not run --version"
+                );
+                assert_eq!(
+                    observation.diagnostic_code.as_deref(),
+                    Some("runtime_version_unavailable_static_only")
+                );
+                assert_eq!(
+                    fs::read_to_string(&marker)
+                        .unwrap_or_default()
+                        .lines()
+                        .count(),
+                    executions,
+                    "disabled Claude Code must not execute any command"
+                );
+                continue;
+            }
             let expected_version = match kind {
                 AdapterKind::CodexCli => "codex 1.2.3",
                 AdapterKind::TraeCnCli => "trae 9.9.9",
@@ -2413,10 +2634,11 @@ mod tests {
                 "{} light version check must succeed",
                 kind.as_str()
             );
+            executions += 1;
             let invocations_after = fs::read_to_string(&marker).unwrap();
             assert_eq!(
                 invocations_after.lines().count(),
-                index + 1,
+                executions,
                 "{} version enrichment must execute exactly once",
                 kind.as_str()
             );
@@ -2424,7 +2646,15 @@ mod tests {
 
         let invocations = fs::read_to_string(&marker).unwrap();
         let lines = invocations.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), AdapterKind::ALL.len() - 1);
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：ZcodeApp 不用 `--version`，
+        // Claude Code 是策略禁用的「只识别」Runtime，两者都不在一个启动计数内。
+        assert_eq!(lines.len(), AdapterKind::ALL.len() - 2);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(AdapterKind::ClaudeCodeCli.command_name())),
+            "disabled Claude Code must never appear in the launch log"
+        );
         assert!(lines.iter().all(|line| line.ends_with(":--version")));
         assert!(!invocations.contains("acp"));
         assert!(!invocations.contains("session"));
@@ -2490,8 +2720,37 @@ mod tests {
             RuntimeLaunchPurpose::AgentExecution,
         ] {
             for kind in AdapterKind::ALL {
+                // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 是这个
+                // 统一启动策略的显式例外（只识别，不启动）。
+                if kind == AdapterKind::ClaudeCodeCli {
+                    continue;
+                }
                 assert!(runtime_launch_allowed(kind, purpose));
             }
+        }
+    }
+
+    /// LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 的每个启动 purpose
+    /// 都必须被拒，包括版本探测与健康探测——否则「只识别」就不成立。
+    #[test]
+    fn claude_code_launch_is_refused_for_every_purpose() {
+        assert!(
+            !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in(),
+            "这个用例断言默认策略（Claude 已禁用）；LOOM_CLAUDE_RUNTIME_ENABLED=1 是
+             手工的渠道网关测试开关，不要在测试进程里设置"
+        );
+        for purpose in [
+            RuntimeLaunchPurpose::DiscoveryVersion,
+            RuntimeLaunchPurpose::AvailabilityCheck,
+            RuntimeLaunchPurpose::InstallationRefresh,
+            RuntimeLaunchPurpose::HealthProbe,
+            RuntimeLaunchPurpose::DispatchPreflight,
+            RuntimeLaunchPurpose::AgentExecution,
+        ] {
+            assert!(
+                !runtime_launch_allowed(AdapterKind::ClaudeCodeCli, purpose),
+                "{purpose:?} must not launch Claude Code"
+            );
         }
     }
 

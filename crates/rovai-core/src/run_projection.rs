@@ -70,7 +70,8 @@ pub(crate) struct MemberRunProjection {
     pub mcp: Value,
     /// Toolbox skills the next Run's additional-skill section will carry.
     pub skills: Vec<crate::member_capability::ProjectedCapability>,
-    /// Selected rule snippets. They are not written into the session bootstrap.
+    /// Selected rule snippets. Their bodies already travel in the frozen Session
+    /// Charter inside `[SELECTED_ASSISTANT_RULES]`; this copy only feeds the UI preview.
     pub rules: Vec<crate::member_capability::ProjectedCapability>,
     /// Selected hooks. They are not written into the session bootstrap.
     pub hooks: Vec<crate::member_capability::ProjectedCapability>,
@@ -135,10 +136,13 @@ pub(crate) fn run_bundle_mcp_document(
     match adapter {
         AdapterKind::CodexCli => crate::codex::codex_mcp_session_config(servers),
         AdapterKind::ClaudeCodeCli => Ok(crate::runtime_mcp::additive_mcp_config_document(servers)),
+        // Pi has no native MCP. The document below is exactly what the managed
+        // extension consumes, so the preview shows the real per-Run selection.
+        AdapterKind::Pi => crate::pi::managed_mcp_document(servers),
         other => Err(MemberRunProjectionError::new(
             "runtime_unsupported",
             format!(
-                "{other} has no per-run MCP bundle; pass codex-cli or claude-code",
+                "{other} has no per-run MCP bundle; pass codex-cli, claude-code or pi",
                 other = other.as_str()
             ),
         )),
@@ -265,17 +269,19 @@ fn resolve_runtime(requested: Option<&str>, profile: &AgentProfileView) -> Resul
         .as_ref()
         .map(|configuration| configuration.adapter_kind)
     {
-        Some(adapter @ (AdapterKind::CodexCli | AdapterKind::ClaudeCodeCli)) => Ok(adapter),
+        Some(adapter @ (AdapterKind::CodexCli | AdapterKind::ClaudeCodeCli | AdapterKind::Pi)) => {
+            Ok(adapter)
+        }
         Some(adapter) => Err(MemberRunProjectionError::new(
             "runtime_required",
             format!(
-                "member runtime is {}; pass codex-cli or claude-code",
+                "member runtime is {}; pass codex-cli, claude-code or pi",
                 adapter.as_str()
             ),
         )),
         None => Err(MemberRunProjectionError::new(
             "runtime_required",
-            "member has no runtime; pass codex-cli or claude-code",
+            "member has no runtime; pass codex-cli, claude-code or pi",
         )),
     }
 }
@@ -284,9 +290,10 @@ fn parse_runtime(value: &str) -> Result<AdapterKind> {
     match value {
         "codex-cli" => Ok(AdapterKind::CodexCli),
         "claude-code" | "claude-code-cli" => Ok(AdapterKind::ClaudeCodeCli),
+        "pi" => Ok(AdapterKind::Pi),
         other => Err(MemberRunProjectionError::new(
             "runtime_unsupported",
-            format!("{other} is not codex-cli or claude-code"),
+            format!("{other} is not codex-cli, claude-code or pi"),
         )),
     }
 }
@@ -295,9 +302,10 @@ fn runtime_name(adapter: AdapterKind) -> Result<&'static str> {
     match adapter {
         AdapterKind::CodexCli => Ok("codex-cli"),
         AdapterKind::ClaudeCodeCli => Ok("claude-code"),
+        AdapterKind::Pi => Ok("pi"),
         other => Err(MemberRunProjectionError::new(
             "runtime_unsupported",
-            format!("{} is not codex-cli or claude-code", other.as_str()),
+            format!("{} is not codex-cli, claude-code or pi", other.as_str()),
         )),
     }
 }
@@ -380,6 +388,8 @@ mod tests {
     fn preview_matches_the_run_bundle_for_a_fixture_member() {
         let directory =
             std::env::temp_dir().join(format!("rovai-run-projection-{}", uuid::Uuid::new_v4()));
+        let directory =
+            crate::platform::private_storage::prepare_private_directory(&directory).unwrap();
         let database = Database::open(&directory).unwrap();
         let store = McpConfigStore::new(directory.join("mcp.json"));
         let profiles = AgentProfileService::default()

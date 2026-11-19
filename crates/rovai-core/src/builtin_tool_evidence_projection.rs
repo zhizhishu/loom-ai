@@ -123,6 +123,21 @@ fn project_input(operation: &str, input: &Value) -> Result<Value> {
                 input.get("sourceMessageId"),
             );
         }
+        "loom.workspace.list"
+        | "loom.workspace.read"
+        | "loom.workspace.run"
+        | "loom.workspace.poll"
+        | "loom.workspace.cancel" => {
+            for field in ["workspaceId", "requestId", "toolId"] {
+                insert_identifier(&mut projected, field, input.get(field));
+            }
+            for field in ["offset", "maxBytes", "limit", "timeoutMs", "afterSeq"] {
+                insert_i64(&mut projected, field, input.get(field));
+            }
+            if let Some(args) = input.get("args").and_then(Value::as_array) {
+                projected.insert("argumentCount".into(), json!(args.len()));
+            }
+        }
         "loom.status" => {}
         "loom.plan" => {
             insert_semantic_text(&mut projected, "goal", input.get("goal"));
@@ -133,6 +148,10 @@ fn project_input(operation: &str, input: &Value) -> Result<Value> {
         "loom.release" | "loom.claim" => {
             insert_identifier(&mut projected, "taskId", input.get("taskId"));
         }
+        "loom.claim_heartbeat" => {
+            insert_identifier(&mut projected, "claimId", input.get("claimId"));
+            insert_i64(&mut projected, "fenceGeneration", input.get("fenceGeneration"));
+        }
         "loom.evidence" => {
             insert_identifier(&mut projected, "taskId", input.get("taskId"));
             insert_semantic_text(&mut projected, "relativePath", input.get("relativePath"));
@@ -140,6 +159,17 @@ fn project_input(operation: &str, input: &Value) -> Result<Value> {
         "loom.submit" => {
             insert_identifier(&mut projected, "taskId", input.get("taskId"));
             insert_string_array(&mut projected, "evidenceIds", input.get("evidenceIds"));
+        }
+        "loom.inspect" => {
+            insert_identifier(&mut projected, "taskId", input.get("taskId"));
+        }
+        "loom.stage-review" => {
+            insert_identifier(&mut projected, "taskId", input.get("taskId"));
+            insert_identifier(&mut projected, "candidateId", input.get("candidateId"));
+            insert_enum(&mut projected, "verdict", input.get("verdict"));
+            if let Some(results) = input.get("criteriaResults").and_then(Value::as_array) {
+                projected.insert("criterionCount".into(), json!(results.len()));
+            }
         }
         CAMP_MESSAGE_SEND_TOOL_NAME => {
             insert_string_array(&mut projected, "recipientAgentIds", input.get("to"));
@@ -426,6 +456,32 @@ fn project_result(operation: &str, result: &Value) -> Result<Value> {
             insert_identifier(&mut projected, "missionId", result.get("missionId"));
             insert_bool(&mut projected, "changed", result.get("changed"));
         }
+        "loom.workspace.list"
+        | "loom.workspace.read"
+        | "loom.workspace.run"
+        | "loom.workspace.poll"
+        | "loom.workspace.cancel" => {
+            for field in ["requestId", "runId", "sessionId"] {
+                insert_identifier(&mut projected, field, result.get(field));
+            }
+            insert_enum(&mut projected, "state", result.get("state"));
+            for field in [
+                "attempt",
+                "lastSeq",
+                "nextAfterSeq",
+                "outputBytes",
+                "omittedBytes",
+            ] {
+                insert_i64(&mut projected, field, result.get(field));
+            }
+            insert_bool(&mut projected, "hasMore", result.get("hasMore"));
+            if let Some(archives) = result.get("archives").and_then(Value::as_array) {
+                projected.insert("archiveCount".into(), json!(archives.len()));
+            }
+            if let Some(events) = result.get("events").and_then(Value::as_array) {
+                projected.insert("eventCount".into(), json!(events.len()));
+            }
+        }
         "loom.status" => {
             insert_identifier(&mut projected, "missionId", result.get("missionId"));
         }
@@ -440,6 +496,14 @@ fn project_result(operation: &str, result: &Value) -> Result<Value> {
             insert_identifier(&mut projected, "claimId", result.get("claimId"));
             insert_bool(&mut projected, "replayed", result.get("replayed"));
         }
+        "loom.claim_heartbeat" => {
+            insert_identifier(&mut projected, "claimId", result.get("claimId"));
+            insert_identifier(&mut projected, "taskId", result.get("taskId"));
+            insert_i64(&mut projected, "fenceGeneration", result.get("fenceGeneration"));
+            insert_identifier(&mut projected, "leaseExpiresAt", result.get("leaseExpiresAt"));
+            insert_identifier(&mut projected, "heartbeatAt", result.get("heartbeatAt"));
+            insert_i64(&mut projected, "extendedSeconds", result.get("extendedSeconds"));
+        }
         "loom.evidence" => {
             if let Some(artifact) = result.get("artifact") {
                 insert_identifier(&mut projected, "artifactId", artifact.get("artifactId"));
@@ -448,6 +512,30 @@ fn project_result(operation: &str, result: &Value) -> Result<Value> {
         }
         "loom.submit" => {
             insert_identifier(&mut projected, "candidateId", result.get("candidateId"));
+            insert_bool(&mut projected, "replayed", result.get("replayed"));
+        }
+        "loom.inspect" => {
+            if let Some(task) = result.get("task") {
+                insert_identifier(&mut projected, "taskId", task.get("taskId"));
+            }
+            if let Some(candidate) = result.get("candidate").filter(|value| !value.is_null()) {
+                insert_identifier(&mut projected, "candidateId", candidate.get("candidateId"));
+            }
+            insert_i64(&mut projected, "policyRevision", result.get("policyRevision"));
+            if let Some(reviews) = result.get("stageReviews").and_then(Value::as_array) {
+                projected.insert("stageReviewCount".into(), json!(reviews.len()));
+            }
+            if let Some(artifacts) = result.get("artifacts").and_then(Value::as_array) {
+                projected.insert("artifactCount".into(), json!(artifacts.len()));
+            }
+        }
+        "loom.stage-review" => {
+            if let Some(review) = result.get("review") {
+                insert_identifier(&mut projected, "stageReviewId", review.get("stageReviewId"));
+                insert_identifier(&mut projected, "candidateId", review.get("candidateId"));
+                insert_enum(&mut projected, "verdict", review.get("verdict"));
+            }
+            insert_enum(&mut projected, "taskStatus", result.get("taskStatus"));
             insert_bool(&mut projected, "replayed", result.get("replayed"));
         }
         CAMP_MESSAGE_SEND_TOOL_NAME => {
@@ -1441,5 +1529,45 @@ mod tests {
         assert!(!runs.to_string().contains("RAW_PREVIEW_MUST_NOT_PERSIST"));
         assert_eq!(runs["canonicalResult"]["items"][0]["messageCount"], 2);
         assert!(runs["canonicalResult"]["items"][0]["agentRunId"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod workspace_rpc_evidence_tests {
+    use super::*;
+    #[test]
+    fn workspace_rpc_evidence_keeps_identity_and_counts_without_paths_args_or_bytes() {
+        let input = json!({"workspaceId":"workspace","requestId":"uuid","path":"SECRET_PATH","cwd":"SECRET_CWD","toolId":"git.status","args":["SECRET_ARG"]});
+        let result = json!({"requestId":"wrpc_id","runId":"run","sessionId":"session","attempt":1,"state":"completed","lastSeq":2,
+            "outputBytes":6,"omittedBytes":0,"hasMore":false,"archives":[{"archiveId":"id","sha256":"digest","localPath":"SECRET_ARCHIVE"}],
+            "events":[{"seq":2,"body":{"kind":"completed","result":{"text":"SECRET_BYTES"}}}]});
+        for operation in [
+            "loom.workspace.list",
+            "loom.workspace.read",
+            "loom.workspace.run",
+            "loom.workspace.poll",
+            "loom.workspace.cancel",
+        ] {
+            let projection = project_builtin_tool_invocation(
+                operation,
+                &input,
+                Some(&result),
+                &canonical_json_digest(&input).unwrap(),
+                Some(&canonical_json_digest(&result).unwrap()),
+            )
+            .unwrap();
+            let serialized = serde_json::to_string(&projection).unwrap();
+            for secret in [
+                "SECRET_PATH",
+                "SECRET_CWD",
+                "SECRET_ARG",
+                "SECRET_ARCHIVE",
+                "SECRET_BYTES",
+            ] {
+                assert!(!serialized.contains(secret));
+            }
+            assert_eq!(projection["canonicalResult"]["archiveCount"], 1);
+            assert_eq!(projection["canonicalResult"]["requestId"], "wrpc_id");
+        }
     }
 }

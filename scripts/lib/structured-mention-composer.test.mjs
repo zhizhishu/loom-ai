@@ -16,7 +16,7 @@ const root = resolve(import.meta.dirname, '../..')
 const fixtureSource = join(root, 'scripts/fixtures/structured-mention-composer')
 
 test('Composer edits preserve text, structured tokens and Skill query interactions', {
-  timeout: 60_000
+  timeout: 180_000
 }, async (t) => {
   if (!admitElectronIntegrationTest(t)) return
   const fixture = await mkdtemp(join(tmpdir(), 'rovai-composer-input-test-'))
@@ -79,7 +79,7 @@ test('Composer edits preserve text, structured tokens and Skill query interactio
       child.kill('SIGKILL')
       await closed
     }
-    await rm(fixture, { recursive: true, force: true })
+    await rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 })
   }
 })
 

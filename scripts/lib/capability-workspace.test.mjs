@@ -5,6 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
+import { openSync, writeSync, closeSync } from 'node:fs'
 import react from '@vitejs/plugin-react'
 import electron from 'electron'
 import { build } from 'vite'
@@ -12,6 +13,7 @@ import { admitElectronIntegrationTest } from './electron-sandbox-capability.mjs'
 
 const root = resolve(import.meta.dirname, '../..')
 const source = join(root, 'scripts/fixtures/capability-workspace')
+const logPath = join(root, '_artifacts/completion-next/hook-ui/capability-workspace.log')
 
 test('current Skills, toolbox and MCP preserve reading, member configuration and credential editing', { timeout: 120_000 }, async (t) => {
   if (!admitElectronIntegrationTest(t)) return
@@ -29,11 +31,28 @@ test('current Skills, toolbox and MCP preserve reading, member configuration and
       ...(process.platform === 'linux' ? ['--no-sandbox'] : [])], { env: environment, stdio: ['ignore', 'pipe', 'pipe'] })
     closed = once(child, 'close')
     let output = ''
-    child.stdout.on('data', chunk => { output += chunk.toString() })
-    child.stderr.on('data', chunk => { output += chunk.toString() })
+    const logFd = openSync(logPath, 'w')
+    const record = chunk => {
+      const text = chunk.toString()
+      output += text
+      process.stderr.write(text)
+      writeSync(logFd, text)
+    }
+    child.stdout.on('data', record)
+    child.stderr.on('data', record)
     const timeout = setTimeout(() => child.kill('SIGKILL'), 90_000)
     let code
-    try { [code] = await closed } finally { clearTimeout(timeout) }
+    try { [code] = await closed } finally {
+      clearTimeout(timeout)
+      // Windows: kill('SIGKILL') maps to TerminateProcess; confirm the owned child is gone.
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL')
+        await Promise.race([closed, new Promise(resolve => setTimeout(resolve, 5000))])
+      }
+      try { closeSync(logFd) } catch {}
+      process.stderr.write(`Capability fixture log: ${logPath}
+`)
+    }
     assert.equal(code, 0, `Capability interaction regression failed:\n${output}`)
     assert.equal(JSON.parse(output.split('\n').find(line => line.startsWith('{'))).ok, true)
   } finally {

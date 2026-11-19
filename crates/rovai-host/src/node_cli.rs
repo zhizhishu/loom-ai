@@ -73,6 +73,92 @@ pub(crate) fn list(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn workspace_prepare(
+    data_dir: &Path,
+    mission_id: &str,
+    camp_id: &str,
+    node_id: &str,
+    source: &str,
+) -> Result<()> {
+    let runtime = command_runtime()?;
+    let body = runtime.block_on(async {
+        let (origin, client, session) = connect_admin(data_dir).await?;
+        let response = client
+            .post(format!("{origin}/api/v1/nodes/workspaces"))
+            .bearer_auth(session)
+            .json(&json!({
+                "missionId": mission_id,
+                "campId": camp_id,
+                "nodeId": node_id,
+                "source": source,
+            }))
+            .send()
+            .await
+            .context("workspace prepare failed")?;
+        expect_json::<serde_json::Value>(response).await
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&body).context("workspace prepare")?
+    );
+    Ok(())
+}
+
+pub(crate) fn workspace_files(
+    data_dir: &Path,
+    mission_id: &str,
+    op: &str,
+    relative: &str,
+) -> Result<()> {
+    if !matches!(op, "list" | "read") {
+        bail!("{}", node_command_rejection("invalid_workspace"));
+    }
+    let runtime = command_runtime()?;
+    let body = runtime.block_on(async {
+        let (origin, client, session) = connect_admin(data_dir).await?;
+        let response = client
+            .post(format!("{origin}/api/v1/nodes/workspaces/files"))
+            .bearer_auth(session)
+            .json(&json!({
+                "missionId": mission_id,
+                "op": op,
+                "relative": relative,
+            }))
+            .send()
+            .await
+            .context("workspace files failed")?;
+        expect_json::<serde_json::Value>(response).await
+    })?;
+    if op == "read" {
+        let encoded = body["data"]
+            .as_str()
+            .context("workspace read had no data")?;
+        let bytes = STANDARD
+            .decode(encoded)
+            .context("workspace read was not base64")?;
+        io::stdout().write_all(&bytes)?;
+        if body["truncated"] == true {
+            eprintln!("truncated");
+        }
+        return Ok(());
+    }
+    let entries = body["entries"]
+        .as_array()
+        .context("workspace list had no entries")?;
+    for entry in entries {
+        let name = entry["name"].as_str().unwrap_or("");
+        if entry["kind"] == "dir" {
+            println!("{name}/");
+        } else {
+            println!("{name}");
+        }
+    }
+    if body["truncated"] == true {
+        eprintln!("truncated");
+    }
+    Ok(())
+}
+
 pub(crate) fn exec(
     data_dir: &Path,
     runtime_kind: &str,
@@ -82,6 +168,9 @@ pub(crate) fn exec(
     member_id: Option<&str>,
     task_id: Option<&str>,
 ) -> Result<()> {
+    if task_id.is_some() && (mission_id.is_some() || member_id.is_some()) {
+        bail!("{}", node_command_rejection("task_scope_conflict"));
+    }
     let runtime = command_runtime()?;
     let outcome = runtime.block_on(exec_async(
         data_dir,
@@ -292,6 +381,11 @@ fn node_command_rejection(code: &str) -> String {
             "这台节点没有上报这个 CLI，或只留下上次见到的路径。没有启动进程。（node_cli_unreported）"
                 .into()
         }
+        "task_scope_conflict" => {
+            "指定了任务就不能再写使命或队员。（task_scope_conflict）".into()
+        }
+        "node_offline" => "这台机器不在线（node_offline）".into(),
+        "path_rejected" => "路径超出工作区（path_rejected）".into(),
         other => format!("server rejected the node command ({other})"),
     }
 }
@@ -306,6 +400,8 @@ mod tests {
         assert!(text.contains("没有上报这个 CLI"));
         assert!(text.contains("（node_cli_unreported）"));
         assert!(node_command_rejection("node_not_found").contains("node_not_found"));
+        assert!(node_command_rejection("task_scope_conflict").contains("（task_scope_conflict）"));
+        assert!(node_command_rejection("node_offline").contains("不在线"));
     }
 }
 

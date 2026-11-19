@@ -2311,6 +2311,7 @@ mod tests {
                     PermissionSemantics::CoreEnforcedV1
                 },
                 runtime: FrozenAgentRuntimeConfig {
+                    pi_purge: None,
                     environment: None,
                     custom_api: None,
                     camp_fast: None,
@@ -2514,6 +2515,7 @@ mod tests {
             },
             permission_semantics: PermissionSemantics::RuntimeManagedV2,
             runtime: FrozenAgentRuntimeConfig {
+                pi_purge: None,
                 environment: None,
                 custom_api: None,
                 camp_fast: None,
@@ -3137,6 +3139,7 @@ echo "Created conversation 0bdd2166-d420-40c6-94be-70b93eb290c5" > "$log_file"
                 },
                 permission_semantics: PermissionSemantics::RuntimeManagedV2,
                 runtime: FrozenAgentRuntimeConfig {
+                    pi_purge: None,
                     environment: None,
                     custom_api: None,
                     camp_fast: None,
@@ -3251,6 +3254,7 @@ exec sleep 30
             },
             permission_semantics: PermissionSemantics::CoreEnforcedV1,
             runtime: FrozenAgentRuntimeConfig {
+                pi_purge: None,
                 environment: None,
                 custom_api: None,
                 camp_fast: None,

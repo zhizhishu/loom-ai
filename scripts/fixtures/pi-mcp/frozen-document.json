@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "servers": [
+    {
+      "name": "fixture",
+      "transport": "stdio",
+      "command": "__NODE_EXECUTABLE__",
+      "args": ["__STDIO_FIXTURE__"],
+      "env": {}
+    }
+  ]
+}

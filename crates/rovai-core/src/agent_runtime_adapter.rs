@@ -747,6 +747,15 @@ impl AgentRuntimeAdapterRegistry {
         kind: AdapterKind,
         platform: HostPlatformKey,
     ) -> RuntimePlatformAdmission {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 已按产品决定禁用：
+        // 只识别，不启动。这个分支必须排在函数最前面：任何平台证据、debug Windows 本地
+        // 资格覆盖、后续 Adapter 分支顺序都不能把它重新放回已准入。唯一例外是显式 opt-in
+        // （见 runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in）。
+        if kind == AdapterKind::ClaudeCodeCli
+            && !crate::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in()
+        {
+            return RuntimePlatformAdmission::disabled(kind, platform);
+        }
         if platform == HostPlatformKey::LinuxX64
             && matches!(
                 kind,
@@ -1112,7 +1121,10 @@ impl AgentRuntimeAdapterRegistry {
     pub fn mcp_projection(&self, kind: AdapterKind) -> McpProjectionCapability {
         match kind {
             AdapterKind::CodexCli => self.codex_cli.mcp_projection(),
-            AdapterKind::Pi => unsupported_external_mcp_projection(),
+            // Pi has no native MCP of its own. Selected servers reach the managed
+            // extension as a frozen per-Run document, so the projection is additive
+            // and a tool the user's own Pi extension already provides keeps winning.
+            AdapterKind::Pi => additive_native_mcp_projection(McpSameNamePolicy::NativeWinsSkip),
             AdapterKind::OpencodeCli => self.opencode_cli.mcp_projection(),
             AdapterKind::CopilotCli => self.copilot_cli.mcp_projection(),
             AdapterKind::ClaudeCodeCli => self.claude_code_cli.mcp_projection(),
@@ -3524,8 +3536,50 @@ fn zcode_permission_options() -> Vec<PermissionOptionDescriptor> {
     }]
 }
 
+/// Pi's shipped file-access vocabulary. Until this option existed Pi had no permission descriptor at
+/// all, so a Pi Run always inherited Pi's native tools with no workspace boundary.
+///
+/// `native` is the default and the unchanged legacy behaviour — it is described honestly as
+/// unrestricted native tool permissions, never as a workspace restriction. `workspace_read_only` is
+/// an explicit, conservative member choice: only the native `read` tool inside the Run's canonical
+/// working directory; `bash`/`write`/`edit` and every undeclared extension/MCP tool are refused.
+/// `workspace_read_write` keeps the same workspace boundary and adds Pi's other two native file tools
+/// `write`/`edit`; `bash` and every extension/MCP tool stay refused. `workspace_workflow` is the same
+/// file boundary plus exactly one managed Core business tool (`rovai_loom`) that reaches only the nine
+/// `loom.*` operations Core already ships — never `bash`, never an arbitrary CLI or MCP server.
 fn pi_permission_options() -> Vec<PermissionOptionDescriptor> {
-    Vec::new()
+    vec![PermissionOptionDescriptor {
+        key: "loom_file_access".to_string(),
+        label: "file-access".to_string(),
+        description: "Pi 原生工具权限，未限制到工作目录（native）；workspace_read_only 是保守选项：只允许原生 read；workspace_read_write 在同一工作目录边界内允许原生 read/write/edit；workspace_workflow 在同一文件边界内额外提供一个受管 Core 业务工具，只能执行既有 8 个 loom.* 操作（status/plan/release/claim/evidence/submit/inspect/stage-review）。三种受控模式都禁止 bash 与所有未声明的扩展工具（含 MCP），不提供四能力齐全。"
+            .to_string(),
+        value_type: "enum".to_string(),
+        choices: vec![
+            choice(
+                "native",
+                "native — Pi 原生工具权限，未限制到工作目录",
+            ),
+            choice(
+                "workspace_read_only",
+                "workspace_read_only — 仅工作目录内原生 read，禁止 bash/write/edit 与未声明扩展工具",
+            ),
+            choice(
+                "workspace_read_write",
+                "workspace_read_write — 工作目录内原生 read/write/edit，禁止 bash 与未声明扩展工具",
+            ),
+            choice(
+                "workspace_workflow",
+                "workspace_workflow — 工作目录内原生 read/write/edit + 一个受管 loom 业务工具（仅 8 个 loom.*），禁止 bash 与未声明扩展工具",
+            ),
+        ],
+        // Default stays native: nothing is silently enabled or migrated for existing members.
+        recommended_value: json!("native"),
+        scope: RuntimeOptionScope::Session,
+        risk: "elevated".to_string(),
+        supported: true,
+        required: false,
+        unsupported_reason: None,
+    }]
 }
 
 fn claude_code_permission_options() -> Vec<PermissionOptionDescriptor> {
@@ -3630,7 +3684,7 @@ fn resolve_pi_runtime(
         "runtimeEntrypoint": runtime_entrypoint_compatibility(&input)?,
         "authScope": input.auth_scope,
         "protocolVersion": protocol_version,
-        "managedExtension": "rovai-pi-host-v8",
+        "managedExtension": "rovai-pi-host-v11",
     }))?;
     Ok(AdapterRuntimeProjection {
         protocol_version,
@@ -4044,6 +4098,67 @@ mod tests {
                 .flat_map(|descriptor| &descriptor.choices)
                 .all(|choice| choice.label == choice.value)
         );
+    }
+
+    #[test]
+    fn pi_file_access_descriptor_is_honest_about_native_permissions() {
+        let registry = AgentRuntimeAdapterRegistry::default();
+        // The default stays empty, i.e. the legacy native policy: nothing is silently enabled.
+        assert_eq!(registry.member_permission_defaults(AdapterKind::Pi), json!({}));
+
+        let options = registry.permission_options(AdapterKind::Pi);
+        assert_eq!(options.len(), 1, "Pi ships exactly one file-access option");
+        let descriptor = &options[0];
+        assert_eq!(descriptor.key, "loom_file_access");
+        assert_eq!(descriptor.value_type, "enum");
+        assert_eq!(descriptor.scope, RuntimeOptionScope::Session);
+        assert!(descriptor.supported);
+        assert!(!descriptor.required, "an unset value must stay valid");
+        assert_eq!(descriptor.unsupported_reason, None);
+        assert_eq!(descriptor.recommended_value, json!("native"));
+        assert_eq!(
+            descriptor
+                .choices
+                .iter()
+                .map(|choice| choice.value.as_str())
+                .collect::<Vec<_>>(),
+            ["native", "workspace_read_only", "workspace_read_write", "workspace_workflow"]
+        );
+        // The native choice must never be described as a workspace restriction.
+        assert!(descriptor.description.contains("未限制到工作目录"));
+        assert!(descriptor.description.contains("workspace_read_only"));
+        assert!(descriptor.description.contains("workspace_read_write"));
+        assert!(descriptor.description.contains("workspace_workflow"));
+        let native = descriptor
+            .choices
+            .iter()
+            .find(|choice| choice.value == "native")
+            .expect("native choice");
+        assert!(native.label.contains("未限制到工作目录"));
+        let read_only = descriptor
+            .choices
+            .iter()
+            .find(|choice| choice.value == "workspace_read_only")
+            .expect("workspace_read_only choice");
+        assert!(read_only.label.contains("read"));
+        assert!(read_only.label.contains("bash"));
+        let read_write = descriptor
+            .choices
+            .iter()
+            .find(|choice| choice.value == "workspace_read_write")
+            .expect("workspace_read_write choice");
+        assert!(read_write.label.contains("read/write/edit"));
+        assert!(read_write.label.contains("bash"));
+        // The workflow choice names its one extra tool honestly, and the default stays native.
+        let workflow = descriptor
+            .choices
+            .iter()
+            .find(|choice| choice.value == "workspace_workflow")
+            .expect("workspace_workflow choice");
+        assert!(workflow.label.contains("read/write/edit"));
+        assert!(workflow.label.contains("loom"));
+        assert!(workflow.label.contains("bash"));
+        assert_eq!(descriptor.recommended_value, json!("native"));
     }
 
     #[test]

@@ -126,6 +126,10 @@ describe('Run artifacts retain their execution author', () => {
       candidate.memberCreations = [receipt()]
       const markup = renderTimeline(candidate)
       expect(avatars(markup)).toBe(1)
+      // Builtin refs now render the seeded animated shape, not the old PNG.
+      expect(markup).toContain('open-bot-avatar member-avatar-bot')
+      // …and nothing else: no fallback initial next to it inside the same box.
+      expect(markup).toMatch(/<span class="open-bot-avatar member-avatar-bot"><\/span><\/span>/)
       expect(markup).toContain('<strong>奥黛丽</strong>')
       expect(markup).toContain('aria-label="查看奥黛丽的基础信息"')
       expect(markup).not.toContain('data-message-id=')

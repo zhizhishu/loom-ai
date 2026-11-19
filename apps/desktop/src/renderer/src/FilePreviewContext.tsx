@@ -7,6 +7,7 @@ import { FilePreviewLayoutProvider, useOptionalFilePreviewLayout } from './FileP
 import { FileFindProvider } from './FilePreviewFind'
 import { FilePreviewResources } from './file-preview-resources'
 import { FilePreviewPaneContent } from './FilePreviewPane'
+import { LiveWorkspaceProjectTree } from './WorkspaceProjectTree'
 import type { FilePreviewContextValue, FilePreviewSession } from './file-preview-controller'
 export * from './file-preview-controller'
 
@@ -34,7 +35,8 @@ function RetainedPreview({ session, resolvedTheme, current, bounds, resizing, mi
   )
   return <FilePreviewContext.Provider value={value}>
     <div className={`file-preview-retained-host${resizing ? ' is-resizing' : ''}`} hidden={!visible} inert={!visible}
-      style={bounds ?? undefined} data-preview-camp={session.threadId}>
+      style={bounds ?? undefined} data-preview-camp={session.threadId} data-preview-kind={value.activeTab?.kind}>
+      {current && <LiveWorkspaceProjectTree threadId={session.threadId} onOpen={path => { void session.actions.open({ kind: 'camp_workspace', threadId: session.threadId, rawReference: path }) }} />}
       <RetainedPane
         visible={visible}
         missionActivity={missionActivity}

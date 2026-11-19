@@ -14,14 +14,20 @@ mod execution_storage;
 mod hermes;
 #[path = "db_live_directory.rs"]
 mod live_directory;
+#[path = "db_local_hook.rs"]
+mod local_hook_migration;
 #[path = "db_loom.rs"]
 mod loom;
 #[path = "db_member_capability.rs"]
 mod member_capability_migration;
+#[path = "db_member_capability_source.rs"]
+mod member_capability_source_migration;
 #[path = "db_member_creation.rs"]
 mod member_creation;
 #[path = "db_member_environment.rs"]
 mod member_environment;
+#[path = "db_member_hook_review.rs"]
+mod member_hook_review_migration;
 #[path = "db_member_routing.rs"]
 mod member_routing;
 #[path = "db_message_mentions.rs"]
@@ -42,6 +48,10 @@ mod notification_interruption;
 pub(crate) mod notification_model;
 #[path = "db_pending_draft.rs"]
 mod pending_draft;
+#[path = "db_remote_execution.rs"]
+mod remote_execution_migration;
+#[path = "db_remote_workspace_scope.rs"]
+mod remote_workspace_scope;
 #[path = "db_run_continuation.rs"]
 mod run_continuation;
 #[path = "db_shared_environment.rs"]
@@ -58,6 +68,8 @@ mod task_capability;
 mod teams;
 #[path = "db_web_pasted_text.rs"]
 mod web_pasted_text;
+#[path = "db_workspace_rpc.rs"]
+mod workspace_rpc_migration;
 #[cfg(test)]
 pub(crate) fn assert_task_capability_upgrade(database: &mut Database) {
     task_capability::assert_upgrade(database);
@@ -505,7 +517,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 178;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 186;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -1008,6 +1020,14 @@ struct CurrentMigrationState {
     v226: bool,
     v227: bool,
     v228: bool,
+    v229: bool,
+    v230: bool,
+    v231: bool,
+    v232: bool,
+    v233: bool,
+    v234: bool,
+    v235: bool,
+    v236: bool,
 }
 
 impl CurrentMigrationState {
@@ -1029,6 +1049,70 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v236 {
+            let mut previous = *self;
+            previous.v236 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 186
+                && self.v235
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 185, classifier);
+        }
+        if self.v235 {
+            let mut previous = *self;
+            previous.v235 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 185
+                && self.v234
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 184, classifier);
+        }
+        if self.v234 {
+            let mut previous = *self;
+            previous.v234 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 184
+                && self.v233
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 183, classifier);
+        }
+        if self.v233 {
+            let mut previous = *self;
+            previous.v233 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 183
+                && self.v232
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 182, classifier);
+        }
+        if self.v232 {
+            let mut previous = *self;
+            previous.v232 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 182
+                && self.v231
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 181, classifier);
+        }
+        if self.v231 {
+            let mut previous = *self;
+            previous.v231 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 181
+                && self.v230
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 180, classifier);
+        }
+        if self.v230 {
+            let mut previous = *self;
+            previous.v230 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 180
+                && self.v229
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 179, classifier);
+        }
+        if self.v229 {
+            let mut previous = *self;
+            previous.v229 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 179
+                && self.v228
+                && previous.admits(CURRENT_DATA_CONTRACT_VERSION, 178, classifier);
+        }
         if self.v228 {
             let mut previous = *self;
             previous.v228 = false;
@@ -3863,6 +3947,14 @@ pub(crate) fn classify_database_contract(
                 | 176
                 | 177
                 | 178
+                | 179
+                | 180
+                | 181
+                | 182
+                | 183
+                | 184
+                | 185
+                | 186
         )
     {
         let expected_migration = marker.projection_schema_version + 50;
@@ -3880,6 +3972,21 @@ pub(crate) fn classify_database_contract(
                 || crate::execution_node::shim_schema_matches(connection)?)
             && (marker.projection_schema_version < 177
                 || crate::member_capability::schema_matches(connection)?)
+            && (marker.projection_schema_version < 179
+                || crate::execution_node::bundle_schema_matches(connection)?)
+            && (marker.projection_schema_version < 180
+                || crate::workspace_rpc::schema_matches(connection)?)
+            && (marker.projection_schema_version < 181
+                || (crate::remote_execution::schema_matches(connection)?
+                    && remote_workspace_scope::schema_matches(connection)?))
+            && (marker.projection_schema_version < 182
+                || loom::control_schema_matches(connection)?)
+            && (marker.projection_schema_version < 183
+                || crate::member_capability::hook_review_schema_matches(connection)?)
+            && (marker.projection_schema_version < 184
+                || crate::member_capability::skill_source_schema_matches(connection)?)
+            && (marker.projection_schema_version < 186
+                || crate::local_hook::schema_matches(connection)?)
             && (marker.projection_schema_version < 167
                 || hermes::rules_schema_matches(connection)?)
             && (marker.projection_schema_version < 166 || hermes::schema_matches(connection)?)
@@ -6206,7 +6313,15 @@ fn load_current_migration_state(
             EXISTS(SELECT 1 FROM schema_migration WHERE version=225),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=226),
             EXISTS(SELECT 1 FROM schema_migration WHERE version=227),
-            EXISTS(SELECT 1 FROM schema_migration WHERE version=228)
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=228),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=229),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=230),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=231),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=232),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=233),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=234),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=235),
+            EXISTS(SELECT 1 FROM schema_migration WHERE version=236)
         "#,
         [],
         |row| {
@@ -6370,6 +6485,14 @@ fn load_current_migration_state(
                 v226: row.get(156)?,
                 v227: row.get(157)?,
                 v228: row.get(158)?,
+                v229: row.get(159)?,
+                v230: row.get(160)?,
+                v231: row.get(161)?,
+                v232: row.get(162)?,
+                v233: row.get(163)?,
+                v234: row.get(164)?,
+                v235: row.get(165)?,
+                v236: row.get(166)?,
             })
         },
     )
@@ -9719,6 +9842,33 @@ impl Database {
             if !self.schema_migration_applied(228)? {
                 migration_step!("migration_228", loom::migrate_task_execution_host(self));
             }
+            if !self.schema_migration_applied(229)? {
+                migration_step!("migration_229", execution_nodes::migrate_run_bundle(self));
+            }
+            if !self.schema_migration_applied(230)? {
+                migration_step!("migration_230", workspace_rpc_migration::migrate(self));
+            }
+            if !self.schema_migration_applied(231)? {
+                migration_step!("migration_231", remote_execution_migration::migrate(self));
+            }
+            if !self.schema_migration_applied(232)? {
+                migration_step!("migration_232", loom::migrate_control(self));
+            }
+            if !self.schema_migration_applied(233)? {
+                migration_step!("migration_233", member_hook_review_migration::migrate(self));
+            }
+            if !self.schema_migration_applied(234)? {
+                migration_step!(
+                    "migration_234",
+                    member_capability_source_migration::migrate(self)
+                );
+            }
+            if !self.schema_migration_applied(235)? {
+                migration_step!("migration_235", loom::migrate_artifact_versions(self));
+            }
+            if !self.schema_migration_applied(236)? {
+                migration_step!("migration_236", local_hook_migration::migrate(self));
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -10633,6 +10783,33 @@ impl Database {
         }
         if !self.schema_migration_applied(228)? {
             migration_step!("migration_228", loom::migrate_task_execution_host(self));
+        }
+        if !self.schema_migration_applied(229)? {
+            migration_step!("migration_229", execution_nodes::migrate_run_bundle(self));
+        }
+        if !self.schema_migration_applied(230)? {
+            migration_step!("migration_230", workspace_rpc_migration::migrate(self));
+        }
+        if !self.schema_migration_applied(231)? {
+            migration_step!("migration_231", remote_execution_migration::migrate(self));
+        }
+        if !self.schema_migration_applied(232)? {
+            migration_step!("migration_232", loom::migrate_control(self));
+        }
+        if !self.schema_migration_applied(233)? {
+            migration_step!("migration_233", member_hook_review_migration::migrate(self));
+        }
+        if !self.schema_migration_applied(234)? {
+            migration_step!(
+                "migration_234",
+                member_capability_source_migration::migrate(self)
+            );
+        }
+        if !self.schema_migration_applied(235)? {
+            migration_step!("migration_235", loom::migrate_artifact_versions(self));
+        }
+        if !self.schema_migration_applied(236)? {
+            migration_step!("migration_236", local_hook_migration::migrate(self));
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -35570,10 +35747,10 @@ impl Database {
             (
                 LUOKE_AGENT_ID,
                 "luoke",
-                "叮叮",
-                "游学者",
-                "负责理解需求、调查项目、编写文档，并将明确的方案实现为可运行、可验证的代码变更。",
-                "[\"好奇\",\"灵活\",\"勤勉\"]",
+                "Hanzi",
+                "实现工程师",
+                "负责把明确的目标实现为可运行、可验证的代码变更，并如实说明实际执行结果与阻塞。",
+                "[]",
                 "#4F7F9F",
                 "[\"task.create\",\"task.update\",\"agent_run.create\",\"agent_run.retry\",\"agent_run.cancel\",\"member.call\"]",
                 LUOKE_AVATAR_REF,
@@ -35581,10 +35758,10 @@ impl Database {
             (
                 MUWA_AGENT_ID,
                 "muwa",
-                "芝士",
-                "鉴定士",
-                "负责文档、方案与代码评审，核查事实准确性、结构完整性、边界条件、潜在风险，以及方案与实现是否一致，并给出明确、可执行的评审结论与修改建议。",
-                "[\"严谨\",\"沉稳\",\"公正\"]",
+                "Linxi",
+                "独立审查",
+                "负责独立检查实现、边界条件与安全风险，指出可复现的问题、影响与修正建议；审查通过不代表代替用户接受成果。",
+                "[]",
                 "#B66E3C",
                 "[\"task.create\",\"task.update\",\"agent_run.create\",\"agent_run.retry\",\"agent_run.cancel\",\"member.call\",\"workspace.bind\",\"action.request\"]",
                 MUWA_AVATAR_REF,
@@ -35592,10 +35769,10 @@ impl Database {
             (
                 MIANZHI_AGENT_ID,
                 "mianzhi",
-                "咕咕",
-                "巡夜人",
-                "负责设计和执行测试、复现问题、检查边界与失败路径，并通过可重复的结果确认功能是否真正可靠。",
-                "[\"警觉\",\"耐心\",\"求真\"]",
+                "Beichen",
+                "研究与排障",
+                "负责查阅原始资料、复现问题并验证假设，区分事实、推测与未验证部分，给出可复核的定位结论。",
+                "[]",
                 "#7A6FA8",
                 "[\"task.create\",\"task.update\",\"agent_run.create\",\"member.call\"]",
                 MIANZHI_AVATAR_REF,
@@ -35603,10 +35780,10 @@ impl Database {
             (
                 QILU_AGENT_ID,
                 "qilu",
-                "小兔",
-                "绘图师",
-                "负责 UI、UX、视觉设计和前端实现，把复杂功能组织成清晰、顺手、有一致性的界面体验。",
-                "[\"敏锐\",\"细腻\",\"灵动\"]",
+                "Yezi",
+                "产品与视觉设计",
+                "负责从使用者角度组织信息与操作路径，设计清晰克制的界面，并用真实截图与交互验证效果。",
+                "[]",
                 "#4F917C",
                 "[\"task.create\",\"task.update\",\"agent_run.create\",\"member.call\"]",
                 QILU_AVATAR_REF,
@@ -42457,6 +42634,14 @@ mod tests {
             v226: version >= 226,
             v227: version >= 227,
             v228: version >= 228,
+            v229: version >= 229,
+            v230: version >= 230,
+            v231: version >= 231,
+            v232: version >= 232,
+            v233: version >= 233,
+            v234: version >= 234,
+            v235: version >= 235,
+            v236: version >= 236,
         }
     }
 
@@ -42717,10 +42902,22 @@ mod tests {
                 220,
             ),
             (
+                "v1.72/schema 184 before immutable artifact versions",
+                "v1.72",
+                184,
+                234,
+            ),
+            (
+                "v1.72/schema 185 before local Hook snapshots",
+                "v1.72",
+                185,
+                235,
+            ),
+            (
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                228,
+                236,
             ),
             (
                 "v1.72/schema 152 before compact operations",
@@ -43296,7 +43493,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(228);
+        let current = migration_state_through(236);
         assert!(current.admits(
             CURRENT_DATA_CONTRACT_VERSION,
             CURRENT_PROJECTION_SCHEMA_VERSION,
@@ -44052,7 +44249,15 @@ mod tests {
     fn database_contract_preflight_admits_current_and_rejects_future_store() {
         let directory =
             std::env::temp_dir().join(format!("rovai-current-contract-smoke-{}", Uuid::new_v4()));
-        let database = crate::test_support::fresh_schema_database_fast_at(&directory);
+        // Keep the production directory lease for initialization and reopening.
+        // The fast-copy test helper intentionally does not establish private ACLs.
+        let lease = crate::core_data_dir_lock::CoreDataDirLease::acquire(&directory).unwrap();
+        let crate::database_admission::AdmissionAssessment::Initializable(ticket) =
+            crate::database_admission::DatabaseAdmission::assess(&lease).unwrap()
+        else {
+            panic!("fresh fixture directory must be initializable");
+        };
+        let mut database = Database::initialize_new(*ticket).unwrap();
         let state = load_current_migration_state(database.connection())
             .expect("current migration markers should load");
         let (contract, schema, classifier): (String, i64, String) = database
@@ -44064,7 +44269,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(228));
+        assert_eq!(state, migration_state_through(236));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
@@ -44080,6 +44285,9 @@ mod tests {
             "optional_usage",
             "required_column",
             "current_receipt",
+            "member_hook_review",
+            "member_skill_source",
+            "member_skill_source_shape",
             "steer_identity",
             "task_guard",
             "task_settings",
@@ -44092,6 +44300,12 @@ mod tests {
             "loom",
             "loom_claim",
             "loom_candidate",
+            "node_run_bundle",
+            "node_run_bundle_guard",
+            "workspace_rpc_shape",
+            "remote_target_guard",
+            "remote_catalog_columns",
+            "remote_workspace_host_unique",
         ] {
             connection
                 .execute_batch("SAVEPOINT current_admission")
@@ -44127,11 +44341,56 @@ mod tests {
                         )
                         .unwrap();
                 }
+                "workspace_rpc_shape" => {
+                    connection
+                        .execute_batch(
+                            "ALTER TABLE workspace_rpc_events RENAME COLUMN seq TO unavailable_seq",
+                        )
+                        .unwrap();
+                }
+                "remote_target_guard" => {
+                    connection
+                        .execute_batch("DROP TRIGGER agent_run_execution_target_no_replace")
+                        .unwrap();
+                }
+                "remote_workspace_host_unique" => {
+                    connection
+                        .execute_batch("DROP INDEX mission_workspace_cleanup")
+                        .unwrap();
+                }
+                "remote_catalog_columns" => {
+                    connection.execute_batch(
+                        "ALTER TABLE execution_node_cli RENAME COLUMN installation_identity TO unavailable_identity"
+                    ).unwrap();
+                }
+                "node_run_bundle" => {
+                    connection
+                        .execute_batch("DROP TABLE node_run_bundle")
+                        .unwrap();
+                }
+                "node_run_bundle_guard" => {
+                    connection
+                        .execute_batch("DROP TRIGGER node_run_bundle_immutable_update")
+                        .unwrap();
+                }
                 "current_receipt" => {
                     // The classifier checks the newest receipt; deleting an older one would leave
                     // the database looking current and the rejection would never be proven.
                     connection
-                        .execute("DELETE FROM schema_migration WHERE version=228", [])
+                        .execute("DELETE FROM schema_migration WHERE version=(SELECT MAX(version) FROM schema_migration)", [])
+                        .unwrap();
+                }
+                "member_skill_source" => {
+                    connection
+                        .execute_batch("DROP TABLE member_skill_source")
+                        .unwrap();
+                }
+                "member_skill_source_shape" => {
+                    connection.execute_batch("ALTER TABLE member_skill_source RENAME COLUMN library_root TO unavailable_root").unwrap();
+                }
+                "member_hook_review" => {
+                    connection
+                        .execute_batch("DROP TABLE member_hook_review")
                         .unwrap();
                 }
                 "steer_identity" => {
@@ -44200,6 +44459,9 @@ mod tests {
                     change,
                     "required_column"
                         | "current_receipt"
+                        | "member_hook_review"
+                        | "member_skill_source"
+                        | "member_skill_source_shape"
                         | "steer_identity"
                         | "task_guard"
                         | "task_settings"
@@ -44212,6 +44474,12 @@ mod tests {
                         | "loom"
                         | "loom_claim"
                         | "loom_candidate"
+                        | "node_run_bundle"
+                        | "node_run_bundle_guard"
+                        | "workspace_rpc_shape"
+                        | "remote_target_guard"
+                        | "remote_catalog_columns"
+                        | "remote_workspace_host_unique"
                 ),
                 "{change}"
             );
@@ -44219,6 +44487,24 @@ mod tests {
                 .execute_batch("ROLLBACK TO current_admission; RELEASE current_admission")
                 .unwrap();
         }
+
+        // Preserve the real historical workspace upgrade, then prove 182 -> 233
+        // creates no implicit approval and rolls back a failed completion receipt.
+        // The workspace helper restores the exact 183 source state itself (234 receipt
+        // and member_skill_source removed), so only the LOOM control marker has to be
+        // stepped back to 182; 233 then admits itself as an exact supported 183 source
+        // for the 234 replay that follows, instead of a fabricated 183 marker.
+        remote_execution_migration::test_replay_180_workspace_scope(&mut database);
+        database
+            .connection()
+            .execute_batch(
+                "DROP TABLE member_hook_review;
+             DELETE FROM schema_migration WHERE version=233;
+             UPDATE rovai_data_contract SET projection_schema_version=182 WHERE singleton=1;",
+            )
+            .unwrap();
+        member_hook_review_migration::test_replay_182(&mut database);
+        member_capability_source_migration::test_replay_183(&mut database);
 
         database
             .connection()
@@ -44244,10 +44530,17 @@ mod tests {
              DROP TABLE runtime_usage_run_summary;",
             )
             .unwrap();
+        let retained_receipts = database
+            .connection()
+            .prepare("SELECT version FROM schema_migration ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
         drop(database);
         // Exercise the production opening seam: missing historical receipts
         // and optional statistics must not invoke old migrations or reset data.
-        let lease = crate::core_data_dir_lock::CoreDataDirLease::acquire(&directory).unwrap();
         let crate::database_admission::AdmissionAssessment::AdmittedExisting(ticket) =
             crate::database_admission::DatabaseAdmission::assess(&lease).unwrap()
         else {
@@ -44260,12 +44553,14 @@ mod tests {
         assert_eq!(
             reopened
                 .connection()
-                .query_row("SELECT COUNT(*) FROM schema_migration", [], |row| row
-                    .get::<_, i64>(0))
+                .prepare("SELECT version FROM schema_migration ORDER BY version")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap(),
-            // Receipts at or after 221: the LOOM projection through task host pins.
-            // Reopening must not reconstruct the deleted history or add another receipt.
-            8
+            retained_receipts,
+            "reopening must preserve exactly the retained migration receipts"
         );
         drop(reopened);
         drop(lease);
@@ -45582,7 +45877,7 @@ mod tests {
         database
             .connection()
             .execute(
-                "UPDATE agent_profile SET display_name = '历史队员应保留' WHERE id = ?1",
+                "UPDATE agent_profile SET display_name = '历史队员应保留', team_role = '历史团队角色', professional_responsibilities = '历史职责', personality_traits_json = '[\"历史标签\"]' WHERE id = ?1",
                 [LUOKE_AGENT_ID],
             )
             .unwrap();
@@ -45654,9 +45949,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(historical_teammate_name, "历史队员应保留");
+        let preserved_identity: (String, String, String) = reopened
+            .connection()
+            .query_row(
+                "SELECT team_role, professional_responsibilities, personality_traits_json FROM agent_profile WHERE id = ?1",
+                [LUOKE_AGENT_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved_identity,
+            (
+                "历史团队角色".to_string(),
+                "历史职责".to_string(),
+                "[\"历史标签\"]".to_string(),
+            ),
+            "seed reconciliation must never overwrite an edited member identity"
+        );
+        let untouched_default: (String, String, String, String) = reopened
+            .connection()
+            .query_row(
+                "SELECT display_name, team_role, professional_responsibilities, personality_traits_json FROM agent_profile WHERE id = ?1",
+                [MUWA_AGENT_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            untouched_default,
+            (
+                "Linxi".to_string(),
+                "独立审查".to_string(),
+                "负责独立检查实现、边界条件与安全风险，指出可复现的问题、影响与修正建议；审查通过不代表代替用户接受成果。"
+                    .to_string(),
+                "[]".to_string(),
+            ),
+            "an untouched built-in keeps the current practical default identity"
+        );
         assert!(connection_has_v170_or_current_data_contract(reopened.connection()).unwrap());
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn built_in_seed_identities_are_romanized_and_practical() {
+        let database = crate::test_support::seeded_runtime_database_owned();
+        let seed_identity = |id: &str| -> (String, String, String) {
+            database
+                .connection()
+                .query_row(
+                    "SELECT display_name, team_role, personality_traits_json FROM agent_profile WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            seed_identity(LUOKE_AGENT_ID),
+            (
+                "Hanzi".to_string(),
+                "实现工程师".to_string(),
+                "[]".to_string()
+            )
+        );
+        assert_eq!(
+            seed_identity(MUWA_AGENT_ID),
+            (
+                "Linxi".to_string(),
+                "独立审查".to_string(),
+                "[]".to_string()
+            )
+        );
+        assert_eq!(
+            seed_identity(MIANZHI_AGENT_ID),
+            (
+                "Beichen".to_string(),
+                "研究与排障".to_string(),
+                "[]".to_string()
+            )
+        );
+        assert_eq!(
+            seed_identity(QILU_AGENT_ID),
+            (
+                "Yezi".to_string(),
+                "产品与视觉设计".to_string(),
+                "[]".to_string()
+            )
+        );
     }
 
     #[test]
@@ -53215,13 +53593,13 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("built-in identity");
-        assert_eq!(built_in_identity.0, "芝士");
-        assert_eq!(built_in_identity.1, "鉴定士");
+        assert_eq!(built_in_identity.0, "Linxi");
+        assert_eq!(built_in_identity.1, "独立审查");
         assert_eq!(
             built_in_identity.2,
-            "负责文档、方案与代码评审，核查事实准确性、结构完整性、边界条件、潜在风险，以及方案与实现是否一致，并给出明确、可执行的评审结论与修改建议。"
+            "负责独立检查实现、边界条件与安全风险，指出可复现的问题、影响与修正建议；审查通过不代表代替用户接受成果。"
         );
-        assert_eq!(built_in_identity.3, r#"["严谨","沉稳","公正"]"#);
+        assert_eq!(built_in_identity.3, "[]");
         let removed_identity_columns = database
             .connection()
             .prepare("PRAGMA table_info(agent_profile)")
@@ -56679,7 +57057,7 @@ mod tests {
             &[
                 58, 59, 60, 61, 62, 67, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101,
                 102, 103, 104, 105, 106, 107, 108, 145, 146, 147, 205, 206, 207, 208, 209, 210,
-                211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 225, 226, 227, 228,
+                211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 225, 226, 227, 228, 229,
             ],
         );
         for table in [

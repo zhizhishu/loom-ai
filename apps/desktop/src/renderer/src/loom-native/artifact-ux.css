@@ -1,0 +1,17 @@
+/* Existing artifact visual language; only repair constrained-screen flow. */
+.ln-artifact-dialog .ln-artifact-head-actions{flex-shrink:0}
+.ln-artifact-dialog .ln-artifact-error{overflow-wrap:anywhere}
+.ln-artifact-dialog .ln-artifact-review-form button[type=submit]{min-height:38px}
+.ln-artifact-dialog .ln-artifact-fact-note{line-height:1.75}
+@media(max-width:800px){
+ .ln-artifact-dialog .ln-artifact-body{display:block;overflow-y:auto;overscroll-behavior:contain}
+ .ln-artifact-dialog .ln-artifact-document{overflow:visible;min-height:150px;padding:22px 24px 26px}
+ .ln-artifact-dialog .ln-artifact-context{overflow:visible;padding:18px 20px 24px;gap:13px}
+ .ln-artifact-dialog .ln-artifact-doc-title{font-size:21px!important}
+ .ln-artifact-dialog .ln-artifact-doc-meta{margin-bottom:20px!important}
+ .ln-artifact-dialog .ln-artifact-review-form{margin-top:4px}
+ .ln-artifact-dialog .ln-artifact-review-reason{min-height:94px}
+ .ln-artifact-dialog .ln-artifact-title{max-width:none;flex:1;font-size:13px}
+ .ln-artifact-dialog .ln-artifact-head{gap:6px;padding:0 12px}
+ .ln-artifact-dialog .ln-artifact-download>span{display:none}
+}

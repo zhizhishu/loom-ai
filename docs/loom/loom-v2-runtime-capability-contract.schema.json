@@ -1,0 +1,513 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:loom:proposal:runtime-capability:loom.v2alpha1",
+  "title": "LOOM V2 proposal - Runtime and Capability message shapes",
+  "description": "DISCUSSION ONLY. Proposal only. Initial LOOM product runtime allowlist: claude-code, codex, dsh, pi (four). The identifier schema is extensible, but Core catalog must reject all unapproved runtime kinds. This is not the current product wire protocol or authorization contract.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/RuntimeDescriptor"
+    },
+    {
+      "$ref": "#/$defs/CapabilityManifest"
+    },
+    {
+      "$ref": "#/$defs/CapabilityBinding"
+    },
+    {
+      "$ref": "#/$defs/EffectiveCapabilitySnapshot"
+    },
+    {
+      "$ref": "#/$defs/CapabilityEvidence"
+    }
+  ],
+  "$defs": {
+    "RuntimeDescriptor": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "runtimeKind",
+        "runtimeVersion",
+        "hostPlatform",
+        "protocol",
+        "features"
+      ],
+      "properties": {
+        "kind": {
+          "const": "runtime.descriptor"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "runtimeKind": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runtimeVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hostPlatform": {
+          "enum": [
+            "windows",
+            "linux",
+            "macos"
+          ]
+        },
+        "protocol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "features": {
+          "type": "object",
+          "required": [
+            "stream",
+            "cancel",
+            "recover",
+            "approval",
+            "capabilities",
+            "hookEvents"
+          ],
+          "properties": {
+            "stream": {
+              "type": "boolean"
+            },
+            "steer": {
+              "type": "boolean"
+            },
+            "cancel": {
+              "type": "boolean"
+            },
+            "recover": {
+              "type": "boolean"
+            },
+            "approval": {
+              "type": "boolean"
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "skill",
+                  "mcp",
+                  "rule",
+                  "hook",
+                  "memory"
+                ]
+              },
+              "uniqueItems": true
+            },
+            "hookEvents": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "packageDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "unsupportedReasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityManifest": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "assetId",
+        "assetKind",
+        "assetVersion",
+        "contentDigest",
+        "source",
+        "targets",
+        "requiredGrants"
+      ],
+      "properties": {
+        "kind": {
+          "const": "capability.manifest"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "assetId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "assetKind": {
+          "enum": [
+            "skill",
+            "mcp",
+            "rule",
+            "hook",
+            "memory"
+          ]
+        },
+        "assetVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contentDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "source": {
+          "type": "object",
+          "required": [
+            "provider",
+            "reference",
+            "scope",
+            "trust"
+          ],
+          "properties": {
+            "provider": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "scope": {
+              "enum": [
+                "user",
+                "workspace",
+                "project",
+                "organization",
+                "import"
+              ]
+            },
+            "trust": {
+              "enum": [
+                "unreviewed",
+                "reviewed",
+                "trusted"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "runtimeKind",
+              "platform",
+              "support"
+            ],
+            "properties": {
+              "runtimeKind": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+              },
+              "platform": {
+                "enum": [
+                  "windows",
+                  "linux",
+                  "macos",
+                  "any"
+                ]
+              },
+              "support": {
+                "enum": [
+                  "native",
+                  "adapted",
+                  "unsupported"
+                ]
+              },
+              "materializerVersion": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "requiredGrants": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+          },
+          "uniqueItems": true
+        },
+        "configSchemaRef": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hookEvents": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "credentialRefSpecs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+          },
+          "uniqueItems": true
+        },
+        "signature": {
+          "type": "string",
+          "minLength": 1
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityBinding": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "bindingId",
+        "assetId",
+        "assetDigest",
+        "scope",
+        "scopeId",
+        "enabled",
+        "revision"
+      ],
+      "properties": {
+        "kind": {
+          "const": "capability.binding"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "bindingId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "assetId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "assetDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "scope": {
+          "enum": [
+            "user",
+            "workspace",
+            "project",
+            "bot",
+            "team"
+          ]
+        },
+        "scopeId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "configurationRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+          },
+          "uniqueItems": true
+        },
+        "riskReviewDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "EffectiveCapabilitySnapshot": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "snapshotId",
+        "botId",
+        "workspaceId",
+        "runtimeKind",
+        "runtimeVersion",
+        "assetDigests",
+        "grantRefs",
+        "resolverVersion",
+        "snapshotDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "kind": {
+          "const": "capability.effectiveSnapshot"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "snapshotId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "botId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "workspaceId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runtimeKind": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runtimeVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assetDigests": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "uniqueItems": true
+        },
+        "grantRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+          },
+          "uniqueItems": true
+        },
+        "resolverVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "snapshotDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "unsupportedReasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityEvidence": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "evidenceId",
+        "snapshotId",
+        "assetId",
+        "runtimeKind",
+        "phase",
+        "eventId",
+        "proofDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "kind": {
+          "const": "capability.evidence"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "evidenceId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "snapshotId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "assetId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runtimeKind": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "phase": {
+          "enum": [
+            "discovered",
+            "inspected",
+            "selected",
+            "configured",
+            "prepared",
+            "loaded",
+            "invoked",
+            "evidenced",
+            "unsupported",
+            "failed",
+            "revoked"
+          ]
+        },
+        "eventId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "proofDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "toolCallId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "reasonCode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "enforcement": {
+          "enum": [
+            "full",
+            "partial",
+            "policy-only",
+            "none"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

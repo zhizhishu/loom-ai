@@ -52,6 +52,31 @@ pub const ZCODE_MACOS_ARM64_EVIDENCE_REVISION: &str =
 pub const ZCODE_WINDOWS_X64_EVIDENCE_REVISION: &str =
     "sha256:9c40aa1c943bc3b2e823ea2a9a48ac41441a3924190ec46d493135a46b0b00b0";
 
+/// LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 已按产品决定禁用——
+/// 只识别（PATH/文件存在仍可被发现），不启动任何进程。这是产品策略，不是能力或
+/// 证据不足，所以它既不是 `Unsupported`（上游不支持）也不是 `NotQualified`（缺证据）。
+///
+/// 唯一开关：只有显式 opt-in（环境变量 `LOOM_CLAUDE_RUNTIME_ENABLED=1`）才回到原有的
+/// 各平台准入规则。该开关只用于经渠道网关（如 oct）的 Claude 端点测试，不得用于
+/// 个人账号（个人账号直连 Anthropic 官方端点，产品已决定不启动）。
+pub const CLAUDE_RUNTIME_ENABLED_ENV: &str = "LOOM_CLAUDE_RUNTIME_ENABLED";
+
+/// `disabled` 准入状态的 blocker code。产品策略拒绝而不是平台/证据拒绝，
+/// 因此单独一个值，便于 UI 与命令层区分「已禁用」与「未通过资格矩阵」。
+pub const RUNTIME_DISABLED_BY_POLICY_BLOCKER_CODE: &str = "runtime_disabled_by_policy";
+
+/// 纯函数形式的 opt-in 判定，便于在不改动进程环境（避免并行测试互相污染）
+/// 的前提下单测。只有 `1`（允许首尾空白）算 opt-in，其余一切值都不算。
+pub fn claude_runtime_opt_in_value(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+/// 全仓唯一读取上述环境变量的地方。放在这里是为了让准入矩阵、启动策略与
+/// Claude Adapter 共用同一个判断，不再各自读环境。
+pub fn claude_runtime_enabled_by_policy_opt_in() -> bool {
+    claude_runtime_opt_in_value(std::env::var(CLAUDE_RUNTIME_ENABLED_ENV).ok().as_deref())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePlatformAdmissionStatus {
@@ -59,6 +84,8 @@ pub enum RuntimePlatformAdmissionStatus {
     Preview,
     NotQualified,
     Unsupported,
+    /// LOOM 自有决定（Claude 禁用，2026-11-18）：只识别，不启动。
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -150,6 +177,20 @@ impl RuntimePlatformAdmission {
         }
     }
 
+    /// LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 按产品决定禁用——只识别，
+    /// 不启动。这不是证据不足，所以没有 evidence revision；区分放在 `Disabled` 状态与
+    /// `runtime_disabled_by_policy` blocker code 上，reason code 复用既有的封闭枚举值
+    /// （不扩 TS 联合类型）。
+    pub fn disabled(runtime_kind: AdapterKind, platform: HostPlatformKey) -> Self {
+        Self {
+            runtime_kind,
+            platform,
+            status: RuntimePlatformAdmissionStatus::Disabled,
+            reason_code: Some(RuntimePlatformAdmissionReasonCode::UpstreamUnsupported),
+            evidence_revision: None,
+        }
+    }
+
     pub const fn runtime_kind(&self) -> AdapterKind {
         self.runtime_kind
     }
@@ -188,6 +229,10 @@ impl RuntimePlatformAdmission {
             }
             RuntimePlatformAdmissionStatus::NotQualified => Some("runtime_platform_not_qualified"),
             RuntimePlatformAdmissionStatus::Unsupported => Some("runtime_platform_unsupported"),
+            // LOOM 自有决定（Claude 禁用，2026-11-18）：策略禁用与平台/证据拒绝分开表达。
+            RuntimePlatformAdmissionStatus::Disabled => {
+                Some(RUNTIME_DISABLED_BY_POLICY_BLOCKER_CODE)
+            }
         }
     }
 }
@@ -377,6 +422,16 @@ mod tests {
                             );
                             assert!(admission.evidence_revision().is_none());
                         }
+                        AdapterKind::ClaudeCodeCli => {
+                            // LOOM 自有决定（Claude 禁用，2026-11-18）：Linux 不再隐式 Preview。
+                            assert_eq!(admission.status(), RuntimePlatformAdmissionStatus::Disabled);
+                            assert!(!admission.allows_runtime_use());
+                            assert_eq!(
+                                admission.blocker_code(),
+                                Some("runtime_disabled_by_policy")
+                            );
+                            assert!(admission.evidence_revision().is_none());
+                        }
                         _ => {
                             assert_eq!(admission.status(), RuntimePlatformAdmissionStatus::Preview);
                             assert!(admission.allows_runtime_use());
@@ -462,6 +517,16 @@ mod tests {
                 );
                 assert_eq!(admission.evidence_revision(), None);
                 assert_eq!(admission.blocker_code(), None);
+            } else if runtime_kind == AdapterKind::ClaudeCodeCli {
+                // LOOM 自有决定（Claude 禁用，2026-11-18）：Windows 不再隐式 Qualified。
+                assert_eq!(admission.status(), RuntimePlatformAdmissionStatus::Disabled);
+                assert!(!admission.allows_runtime_use());
+                assert!(!admission.is_qualified());
+                assert_eq!(
+                    admission.blocker_code(),
+                    Some("runtime_disabled_by_policy")
+                );
+                assert_eq!(admission.evidence_revision(), None);
             } else if !matches!(
                 runtime_kind,
                 AdapterKind::CursorAgent
@@ -471,6 +536,7 @@ mod tests {
                     | AdapterKind::HermesCli
                     | AdapterKind::ZcodeApp
                     | AdapterKind::DeepseekHarness
+                    | AdapterKind::ClaudeCodeCli
             ) {
                 assert!(admission.is_qualified());
                 assert!(admission.allows_runtime_use());
@@ -593,6 +659,7 @@ mod tests {
                     | AdapterKind::GrokBuild
                     | AdapterKind::ZcodeApp
                     | AdapterKind::DeepseekHarness
+                    | AdapterKind::ClaudeCodeCli
             )
         }) {
             for platform in [HostPlatformKey::MacosArm64, HostPlatformKey::MacosX64] {
@@ -617,6 +684,15 @@ mod tests {
                 Some(RuntimePlatformAdmissionReasonCode::QualificationEvidenceMissing)
             );
             assert_eq!(command.evidence_revision(), None);
+
+            // LOOM 自有决定（Claude 禁用，2026-11-18）：macOS 不再隐式使用
+            // MACOS_RUNTIME_COMPATIBILITY_EVIDENCE_REVISION 把 Claude 归为已合格。
+            let claude = registry.platform_admission(AdapterKind::ClaudeCodeCli, platform);
+            assert_eq!(claude.status(), RuntimePlatformAdmissionStatus::Disabled);
+            assert!(!claude.is_qualified());
+            assert!(!claude.allows_runtime_use());
+            assert_eq!(claude.blocker_code(), Some("runtime_disabled_by_policy"));
+            assert_eq!(claude.evidence_revision(), None);
 
             for kind in [AdapterKind::CursorAgent, AdapterKind::ClineCli] {
                 let admission = registry.platform_admission(kind, platform);
@@ -763,5 +839,74 @@ mod tests {
             qualified["evidenceRevision"],
             WINDOWS_RUNTIME_COMPATIBILITY_EVIDENCE_REVISION
         );
+
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：线上契约必须把产品策略禁用
+        // 作为独立的 `disabled` 状态串输出，而不是伪装成 `unsupported`/`not_qualified`。
+        for platform in HostPlatformKey::ALL {
+            let claude = serde_json::to_value(
+                registry.platform_admission(AdapterKind::ClaudeCodeCli, platform),
+            )
+            .unwrap();
+            assert_eq!(claude["runtimeKind"], "claude-code-cli");
+            assert_eq!(claude["status"], "disabled");
+            assert_eq!(
+                claude["reasonCode"],
+                "runtime_platform.upstream_unsupported"
+            );
+            assert!(claude["evidenceRevision"].is_null());
+            assert_eq!(
+                registry
+                    .platform_admission(AdapterKind::ClaudeCodeCli, platform)
+                    .blocker_code(),
+                Some("runtime_disabled_by_policy")
+            );
+        }
+    }
+
+    /// LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别、不启动，
+    /// 所有平台的准入都是 `disabled`，且没有 evidence revision（没有可指向的资格证据）。
+    #[test]
+    fn claude_code_is_recognised_but_never_admitted_on_any_platform() {
+        assert!(
+            !claude_runtime_enabled_by_policy_opt_in(),
+            "这个用例断言默认策略（Claude 已禁用）；LOOM_CLAUDE_RUNTIME_ENABLED=1 是
+             手工的渠道网关测试开关，不要在测试进程里设置"
+        );
+        let registry = AgentRuntimeAdapterRegistry::default();
+        for platform in HostPlatformKey::ALL {
+            let admission = registry.platform_admission(AdapterKind::ClaudeCodeCli, platform);
+            assert_eq!(admission.status(), RuntimePlatformAdmissionStatus::Disabled);
+            assert!(!admission.allows_runtime_use());
+            assert!(!admission.is_qualified());
+            assert_eq!(admission.blocker_code(), Some("runtime_disabled_by_policy"));
+            assert_eq!(
+                admission.blocker_code(),
+                Some(RUNTIME_DISABLED_BY_POLICY_BLOCKER_CODE)
+            );
+            assert!(admission.evidence_revision().is_none());
+            assert_eq!(admission.runtime_kind(), AdapterKind::ClaudeCodeCli);
+            assert_eq!(admission.platform(), platform);
+        }
+    }
+
+    /// 开关本身也是策略的一部分：只认显式 `1`，`0`/空/未设都不是 opt-in。
+    #[test]
+    fn claude_runtime_opt_in_accepts_only_the_explicit_value() {
+        assert!(claude_runtime_opt_in_value(Some("1")));
+        assert!(claude_runtime_opt_in_value(Some(" 1 ")));
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some("01"),
+            Some("1\n0"),
+        ] {
+            assert!(
+                !claude_runtime_opt_in_value(raw),
+                "{raw:?} must not opt Claude Code back in"
+            );
+        }
     }
 }

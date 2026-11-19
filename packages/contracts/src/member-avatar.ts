@@ -41,12 +41,28 @@ export type ControlledMemberAvatarRef =
       assetId: string
       value: string
     }
+  | {
+      kind: 'bot'
+      /** Catalog shape id: strict lowercase slug. */
+      id: string
+      /** Body color as `#rrggbb`. */
+      color: string
+      /** Canonical UUID of the managed still PNG behind this shape. */
+      assetId: string
+      value: string
+    }
 
 const BUILTIN_REF_PATTERN =
   /^rovai:\/\/member-avatar\/builtin\/(luoke|muwa|mianzhi|qilu)\/v1$/
 const CANONICAL_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const MANAGED_REF_PREFIX = 'rovai://member-avatar/managed/'
+/** Lowercase slug, at most 48 characters, must start with a letter. */
+export const MEMBER_AVATAR_BOT_SHAPE_PATTERN = /^[a-z][a-z0-9-]{0,47}$/
+export const MEMBER_AVATAR_BOT_COLOR_PATTERN = /^#[0-9a-f]{6}$/
+const BOT_REF_PREFIX = 'rovai://member-avatar/bot/'
+const BOT_REF_PATTERN =
+  /^rovai:\/\/member-avatar\/bot\/([a-z][a-z0-9-]{0,47})\/([0-9a-f]{6})\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/v1$/
 
 export function builtinMemberAvatarRef(role: BuiltinMemberAvatarRole): string {
   return `rovai://member-avatar/builtin/${role}/v1`
@@ -59,6 +75,28 @@ export function managedMemberAvatarRef(assetId: string): string {
   return `${MANAGED_REF_PREFIX}${assetId}`
 }
 
+/**
+ * An animated upstream shape: catalog geometry + color, backed by the managed
+ * still PNG with the same look so every static export stays consistent.
+ */
+export function botMemberAvatarRef(
+  id: string,
+  color: string,
+  assetId: string
+): string {
+  if (!MEMBER_AVATAR_BOT_SHAPE_PATTERN.test(id)) {
+    throw new Error('Bot member avatar id must be a lowercase slug')
+  }
+  const normalized = color.toLowerCase()
+  if (!MEMBER_AVATAR_BOT_COLOR_PATTERN.test(normalized)) {
+    throw new Error('Bot member avatar color must be #rrggbb')
+  }
+  if (!CANONICAL_UUID_PATTERN.test(assetId)) {
+    throw new Error('Bot member avatar assetId must be a canonical lowercase UUID')
+  }
+  return `${BOT_REF_PREFIX}${id}/${normalized.slice(1)}/${assetId}/v1`
+}
+
 export function parseControlledMemberAvatarRef(
   value: string
 ): ControlledMemberAvatarRef | null {
@@ -66,6 +104,17 @@ export function parseControlledMemberAvatarRef(
   if (builtin) {
     const role = builtin[1] as BuiltinMemberAvatarRole
     return { kind: 'builtin', role, version: 1, value }
+  }
+  if (value.startsWith(BOT_REF_PREFIX)) {
+    const bot = BOT_REF_PATTERN.exec(value)
+    if (!bot) return null
+    return {
+      kind: 'bot',
+      id: bot[1],
+      color: `#${bot[2]}`,
+      assetId: bot[3],
+      value
+    }
   }
   if (!value.startsWith(MANAGED_REF_PREFIX)) return null
   const assetId = value.slice(MANAGED_REF_PREFIX.length)

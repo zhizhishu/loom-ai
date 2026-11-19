@@ -19,16 +19,25 @@ pub const LOOM_STATUS_TOOL_NAME: &str = "loom.status";
 pub const LOOM_PLAN_TOOL_NAME: &str = "loom.plan";
 pub const LOOM_RELEASE_TOOL_NAME: &str = "loom.release";
 pub const LOOM_CLAIM_TOOL_NAME: &str = "loom.claim";
+/// P0 step 5: the one operation that extends a lease this Run already holds. It is deliberately a
+/// separate operation from `loom.claim`, so "claim a released Task" and "renew the lease I hold"
+/// can never be confused by a caller or by the guard.
+pub const LOOM_CLAIM_HEARTBEAT_TOOL_NAME: &str = "loom.claim_heartbeat";
 pub const LOOM_EVIDENCE_TOOL_NAME: &str = "loom.evidence";
 pub const LOOM_SUBMIT_TOOL_NAME: &str = "loom.submit";
+pub const LOOM_INSPECT_TOOL_NAME: &str = "loom.inspect";
+pub const LOOM_STAGE_REVIEW_TOOL_NAME: &str = "loom.stage-review";
 
-pub const LOOM_TOOL_NAMES: [&str; 6] = [
+pub const LOOM_TOOL_NAMES: [&str; 9] = [
     LOOM_STATUS_TOOL_NAME,
     LOOM_PLAN_TOOL_NAME,
     LOOM_RELEASE_TOOL_NAME,
     LOOM_CLAIM_TOOL_NAME,
+    LOOM_CLAIM_HEARTBEAT_TOOL_NAME,
     LOOM_EVIDENCE_TOOL_NAME,
     LOOM_SUBMIT_TOOL_NAME,
+    LOOM_INSPECT_TOOL_NAME,
+    LOOM_STAGE_REVIEW_TOOL_NAME,
 ];
 
 /// Default acceptance-criteria version when the Lead does not name one.
@@ -39,7 +48,23 @@ pub fn is_loom_tool(name: &str) -> bool {
 }
 
 pub fn is_read_only(name: &str) -> bool {
-    name == LOOM_STATUS_TOOL_NAME
+    matches!(name, LOOM_STATUS_TOOL_NAME | LOOM_INSPECT_TOOL_NAME)
+}
+
+/// P0 step 6: the operations that establish or extend *this Run's* claim, and therefore move the
+/// Run's write authorisation onto the claim the command just wrote.
+///
+/// `loom.claim` earns the right to write (P0 step 3) and `loom.claim_heartbeat` extends the very
+/// lease that right is bound to (P0 step 5). The shared guard compares the lease the Run's grant
+/// document carries, so a heartbeat that moved the lease in the ledger but not in the document
+/// leaves a Run that is still beating being refused with `claim_expired` once the pre-renewal lease
+/// runs out. Both operations therefore share one re-issue trigger rather than one of them silently
+/// keeping the authorisation it had. Every other `loom.*` operation leaves the authorisation alone:
+/// `loom.evidence`, `loom.submit` and the reviews are checked against the claim by the domain
+/// itself (`fence_generation` / `claim_id` comparisons in `loom::artifact_register` and
+/// `loom::candidate_record`), never by a grant rewrite.
+pub fn reissues_write_authorisation(name: &str) -> bool {
+    matches!(name, LOOM_CLAIM_TOOL_NAME | LOOM_CLAIM_HEARTBEAT_TOOL_NAME)
 }
 
 /// A rejection with a stable `loom.*` code the CLI maps to `error.recovery`.
@@ -135,6 +160,15 @@ pub struct LoomClaimToolInput {
     pub lease_seconds: Option<i64>,
 }
 
+/// The only two fields a heartbeat carries: which claim, and at which fence. The Run and the
+/// Mission stay authenticated identity, and the Task follows from the claim row itself.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomClaimHeartbeatToolInput {
+    pub claim_id: String,
+    pub fence_generation: i64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoomEvidenceToolInput {
@@ -154,6 +188,16 @@ pub struct LoomSubmitToolInput {
     pub previous_candidate_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomInspectToolInput {
+    pub task_id: String,
+}
+
+/// The stage-review tool speaks the domain input verbatim, so the closed CLI schema and the
+/// domain validation cannot drift apart and no adapter field can become a second source of truth.
+pub type LoomStageReviewToolInput = loom::control::LoomStageReviewInput;
+
 /// Schema-level validation used by the closed tool catalog.
 pub fn validate_input(name: &str, input: &Value) -> Result<()> {
     match name {
@@ -169,11 +213,30 @@ pub fn validate_input(name: &str, input: &Value) -> Result<()> {
         LOOM_CLAIM_TOOL_NAME => {
             serde_json::from_value::<LoomClaimToolInput>(input.clone()).map(|_| ())
         }
+        LOOM_CLAIM_HEARTBEAT_TOOL_NAME => {
+            serde_json::from_value::<LoomClaimHeartbeatToolInput>(input.clone()).map(|_| ())
+        }
         LOOM_EVIDENCE_TOOL_NAME => {
             serde_json::from_value::<LoomEvidenceToolInput>(input.clone()).map(|_| ())
         }
         LOOM_SUBMIT_TOOL_NAME => {
             serde_json::from_value::<LoomSubmitToolInput>(input.clone()).map(|_| ())
+        }
+        LOOM_INSPECT_TOOL_NAME => {
+            serde_json::from_value::<LoomInspectToolInput>(input.clone()).map(|_| ())
+        }
+        LOOM_STAGE_REVIEW_TOOL_NAME => {
+            let input = serde_json::from_value::<LoomStageReviewToolInput>(input.clone())
+                .map_err(|error| LoomToolError::new("loom.invalid_input", error.to_string()))?;
+            return loom::control::validate_stage_review_shape(
+                &input.task_id,
+                &input.candidate_id,
+                &input.manifest_hash,
+                &input.reason,
+                input.policy_revision,
+                &input.criteria_results,
+            )
+            .map_err(map_domain_error);
         }
         _ => anyhow::bail!("unknown LOOM tool {name}"),
     }
@@ -235,7 +298,10 @@ pub fn invoke(
         }
         LOOM_CLAIM_TOOL_NAME => {
             let input: LoomClaimToolInput = serde_json::from_value(input)?;
-            let result = loom::claim_acquire(
+            // Core claims the Task for this very Run when it admits the Run to execution, so an
+            // agent that claims again reads back the claim it already holds instead of being told
+            // the Task is held. Any other holder keeps the general refusal.
+            let result = loom::claim_acquire_reusing_own_lease(
                 database,
                 loom::LoomClaimAcquireInput {
                     mission_id,
@@ -244,6 +310,22 @@ pub fn invoke(
                     claimant_agent_id: Some(caller.agent_id.to_string()),
                     command_id: caller.command_id.to_string(),
                     lease_seconds: input.lease_seconds,
+                },
+            )
+            .map_err(map_domain_error)?;
+            Ok(serde_json::to_value(result)?)
+        }
+        LOOM_CLAIM_HEARTBEAT_TOOL_NAME => {
+            let input: LoomClaimHeartbeatToolInput = serde_json::from_value(input)?;
+            // The fence is the caller's own: Core never renews a claim this authenticated Run does
+            // not hold, and the payload can only name which of its claims to renew.
+            let result = loom::claim_heartbeat(
+                database,
+                loom::LoomClaimHeartbeatInput {
+                    mission_id,
+                    agent_run_id: caller.agent_run_id.to_string(),
+                    claim_id: input.claim_id,
+                    fence_generation: input.fence_generation,
                 },
             )
             .map_err(map_domain_error)?;
@@ -268,6 +350,25 @@ pub fn invoke(
         LOOM_SUBMIT_TOOL_NAME => {
             let input: LoomSubmitToolInput = serde_json::from_value(input)?;
             submit(database, caller, &mission_id, input)
+        }
+        LOOM_INSPECT_TOOL_NAME => {
+            let input: LoomInspectToolInput = serde_json::from_value(input)?;
+            inspect(database, &mission_id, &input.task_id)
+        }
+        LOOM_STAGE_REVIEW_TOOL_NAME => {
+            let input: LoomStageReviewToolInput = serde_json::from_value(input)?;
+            // Everything that makes the verdict trustworthy (agent, Run, command id) is the
+            // authenticated caller; the payload only names what was reviewed and the verdict.
+            let result = loom::control::stage_review_record(
+                database,
+                &mission_id,
+                caller.agent_id,
+                caller.agent_run_id,
+                caller.command_id,
+                input,
+            )
+            .map_err(map_domain_error)?;
+            Ok(serde_json::to_value(result)?)
         }
         _ => Err(LoomToolError::new(
             "loom.invalid_input",
@@ -326,6 +427,150 @@ fn status(database: &Database, mission_id: &str) -> Result<Value> {
         "claims": claims.claims,
         "evaluatedAt": claims.evaluated_at,
     }))
+}
+
+/// Read one task's latest candidate and the authorization that governs reviewing it.
+///
+/// This decides nothing: it is the read a reviewer takes before `loom.stage-review`, and it never
+/// approves, accepts or records anything. Every identity it shows comes from persisted rows and
+/// the trusted Mission, never from the caller's payload.
+fn inspect(database: &Database, mission_id: &str, task_id: &str) -> Result<Value> {
+    let tasks = loom::tasks_list(database, mission_id)?;
+    let task = tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .cloned()
+        .ok_or_else(|| {
+            LoomToolError::new(
+                "loom.task_not_found",
+                format!("task {task_id} is not part of the current Mission's plan"),
+            )
+        })?;
+    let latest = latest_candidate_id(database.connection(), mission_id, task_id)?;
+    let candidate = match &latest {
+        Some(candidate_id) => loom::candidates_list(database, mission_id)?
+            .into_iter()
+            .find(|candidate| &candidate.candidate_id == candidate_id),
+        None => None,
+    };
+    let manifest_hash = match &candidate {
+        Some(candidate) => Some(
+            loom::control::candidate_manifest_hash(database.connection(), &candidate.candidate_id)
+                .map_err(map_domain_error)?,
+        ),
+        None => None,
+    };
+    // One read of the control plane gives the authorization revision, the assigned reviewer of
+    // this task and the stage history, all from the same instant.
+    let control = loom::control::get(database, mission_id)?;
+    let policy_revision = control
+        .policy
+        .as_ref()
+        .map(|policy| policy.authorization_revision);
+    let reviewer_agent_id = control.policy.as_ref().and_then(|policy| {
+        policy
+            .reviewers
+            .iter()
+            .find(|reviewer| reviewer.task_id == task_id)
+            .map(|reviewer| reviewer.reviewer_agent_id.clone())
+    });
+    let stage_reviews: Vec<_> = control
+        .stage_reviews
+        .into_iter()
+        .filter(|review| review.task_id == task_id)
+        .collect();
+    let artifacts = match &candidate {
+        Some(candidate) => loom::artifacts_list(database, mission_id)?
+            .artifacts
+            .into_iter()
+            .filter(|artifact| {
+                candidate
+                    .evidence_ids
+                    .iter()
+                    .any(|id| id == &artifact.artifact_id)
+            })
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    // The read a reviewer needs is not only what was delivered but the exact shape it must
+    // submit. The schema below is the closed catalog's own `loom.stage-review` input schema,
+    // so this guidance cannot drift from the validation Core applies, and the only values
+    // filled in are the facts this response already read: no verdict and no criterion
+    // result is suggested, because a submission is the reviewer's judgement to make.
+    let stage_review_schema = stage_review_input_schema();
+    let criterion_ids: Vec<String> = task
+        .acceptance_criteria
+        .criteria
+        .iter()
+        .map(|criterion| criterion.criterion_id.clone())
+        .collect();
+    let review_submission = json!({
+        "tool": LOOM_STAGE_REVIEW_TOOL_NAME,
+        "cli": "rovai loom stage-review --input-file review.json",
+        "prefilled": {
+            "taskId": task.task_id.clone(),
+            "candidateId": candidate
+                .as_ref()
+                .map(|candidate| candidate.candidate_id.clone()),
+            "policyRevision": policy_revision,
+            "manifestHash": manifest_hash.clone(),
+        },
+        "criterionIds": criterion_ids,
+        "required": stage_review_schema
+            .get("required")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        "inputSchema": stage_review_schema,
+        "guidance": "Write one JSON object with exactly these required fields and pass it with \
+`--input-file`. Each criteriaResults entry is {criterionId, satisfied, evidenceIds?, note?}; \
+`satisfied` is a boolean and there is no `passed` field. Answer every criterionId listed here \
+exactly once, and cite only evidence of this candidate. Copy policyRevision and manifestHash \
+from this response instead of inventing them. This object is guidance only: it records nothing, \
+approves nothing, and only the User accepts a delivery.",
+    });
+    Ok(json!({
+        "task": task,
+        "candidate": candidate,
+        "manifestHash": manifest_hash,
+        "policyRevision": policy_revision,
+        "reviewerAgentId": reviewer_agent_id,
+        "stageReviews": stage_reviews,
+        "artifacts": artifacts,
+        "reviewSubmission": review_submission,
+        "evaluatedAt": control.evaluated_at,
+    }))
+}
+
+/// The closed catalog's `loom.stage-review` input schema, read from the same definitions the
+/// dispatcher validates against, so a reviewer's guidance and Core's refusal cannot diverge.
+fn stage_review_input_schema() -> Value {
+    crate::team_tool_catalog::builtin_tool_definitions()
+        .iter()
+        .find(|definition| {
+            definition.get("name").and_then(Value::as_str) == Some(LOOM_STAGE_REVIEW_TOOL_NAME)
+        })
+        .and_then(|definition| definition.get("inputSchema").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// The newest candidate of one task: creation order first, then the order the store assigned.
+fn latest_candidate_id(
+    connection: &Connection,
+    mission_id: &str,
+    task_id: &str,
+) -> Result<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT candidate.candidate_id
+             FROM loom_candidate AS candidate
+             JOIN loom_plan AS plan ON plan.plan_id=candidate.plan_id
+             WHERE plan.mission_id=?1 AND candidate.task_id=?2
+             ORDER BY candidate.created_at DESC, candidate.rowid DESC
+             LIMIT 1",
+            params![mission_id, task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
 }
 
 /// Submit binds to this Run's own claim. The newest claim the Run ever held on the task is
@@ -420,9 +665,11 @@ fn open_object() -> Value {
     json!({"type": "object"})
 }
 
-/// The six closed tool definitions, in `TEAM_TOOL_NAMES` order. Model-visible text follows the
+/// The nine closed tool definitions, in `TEAM_TOOL_NAMES` order. Model-visible text follows the
 /// confirmed revision of `docs/versions/v1.72/model-context-change-loom-accp.md` (the `loom.plan`
-/// description is r3). Edit that text only through a new revision.
+/// description is r3), and the two control tools follow the confirmed r1 of
+/// `docs/versions/v1.72/model-context-change-loom-control.md`. Edit that text only through a new
+/// revision.
 pub fn tool_definitions() -> Vec<Value> {
     let criterion = json!({
         "type": "object", "additionalProperties": false, "required": ["criterionId", "text"],
@@ -534,6 +781,33 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": LOOM_CLAIM_HEARTBEAT_TOOL_NAME,
+            "title": "Renew this Run's claim lease",
+            "description": "Extend the lease of a task this Run already holds. Pass the claimId and fenceGeneration from `loom.claim`. An expired or released lease is never renewed, and a claim held by another Run or at an older fence is refused.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false,
+                "required": ["claimId", "fenceGeneration"],
+                "properties": {
+                    "claimId": id_schema(),
+                    "fenceGeneration": {"type": "integer", "minimum": 1}
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["claimId", "taskId", "fenceGeneration",
+                    "previousLeaseExpiresAt", "leaseExpiresAt", "heartbeatAt"],
+                "properties": {
+                    "claimId": {"type": "string"},
+                    "taskId": {"type": "string"},
+                    "fenceGeneration": {"type": "integer"},
+                    "previousLeaseExpiresAt": {"type": "string"},
+                    "leaseExpiresAt": {"type": "string"},
+                    "heartbeatAt": {"type": "string"},
+                    "extendedSeconds": {"type": "integer"}
+                }
+            }
+        }),
+        json!({
             "name": LOOM_EVIDENCE_TOOL_NAME,
             "title": "Register delivery evidence",
             "description": "Register a file you produced as evidence. `relativePath` is relative to this Mission's working directory; Core hashes the bytes on disk.",
@@ -583,6 +857,99 @@ pub fn tool_definitions() -> Vec<Value> {
                     "taskId": {"type": "string"},
                     "verificationStatus": {"type": "string"},
                     "acceptanceStatus": {"type": "string"},
+                    "replayed": {"type": "boolean"}
+                }
+            }
+        }),
+        json!({
+            "name": LOOM_INSPECT_TOOL_NAME,
+            "title": "Inspect a candidate for stage review",
+            "description": "Read a task's latest candidate, registered evidence, review manifest and current review authorization in this Mission. Reading does not approve or accept anything.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false, "required": ["taskId"],
+                "properties": {"taskId": id_schema()}
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["task", "candidate", "manifestHash", "policyRevision",
+                    "reviewerAgentId", "stageReviews", "artifacts", "evaluatedAt"],
+                "properties": {
+                    "task": open_object(),
+                    "candidate": {"type": ["object", "null"]},
+                    "manifestHash": {"type": ["string", "null"]},
+                    "policyRevision": {"type": ["integer", "null"]},
+                    "reviewerAgentId": {"type": ["string", "null"]},
+                    "stageReviews": {"type": "array", "items": open_object()},
+                    "artifacts": {"type": "array", "items": open_object()},
+                    // Additive, read-only guidance for the submission this reviewer has to make.
+                    // It stays out of `required` so a projection recorded before it existed keeps
+                    // validating; the emitted shape itself is proven by this module's owner test.
+                    "reviewSubmission": open_object(),
+                    "evaluatedAt": {"type": "string"}
+                }
+            }
+        }),
+        json!({
+            "name": LOOM_STAGE_REVIEW_TOOL_NAME,
+            "title": "Record an authorized stage review",
+            "description": "Review the inspected candidate under the User-approved task assignment. Pass is internal approval only. Request changes returns this task for a new candidate. Blocked stops this task for the User. You cannot review your own output or accept a delivery for the User.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false,
+                "required": ["taskId", "candidateId", "policyRevision", "manifestHash",
+                    "verdict", "reason", "criteriaResults"],
+                "properties": {
+                    "taskId": id_schema(),
+                    "candidateId": id_schema(),
+                    "policyRevision": {"type": "integer", "minimum": 1},
+                    "manifestHash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "verdict": {"type": "string", "enum": ["pass", "request_changes", "blocked"]},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "criteriaResults": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "items": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["criterionId", "satisfied"],
+                            "properties": {
+                                "criterionId": id_schema(),
+                                "satisfied": {"type": "boolean"},
+                                "evidenceIds": {
+                                    "type": "array", "maxItems": 100, "items": id_schema()
+                                },
+                                "note": {
+                                    "type": ["string", "null"], "maxLength": 4000
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["review", "taskStatus", "replayed"],
+                "properties": {
+                    "review": {
+                        "type": "object",
+                        "required": ["stageReviewId", "taskId", "candidateId",
+                            "reviewerAgentId", "reviewerAgentRunId", "policyRevision",
+                            "manifestHash", "verdict", "reason", "criteriaResults",
+                            "reviewedAt"],
+                        "properties": {
+                            "stageReviewId": {"type": "string"},
+                            "taskId": {"type": "string"},
+                            "candidateId": {"type": "string"},
+                            "reviewerAgentId": {"type": "string"},
+                            "reviewerAgentRunId": {"type": "string"},
+                            "policyRevision": {"type": "integer"},
+                            "manifestHash": {"type": "string"},
+                            "verdict": {"type": "string", "enum": ["pass", "request_changes", "blocked"]},
+                            "reason": {"type": "string"},
+                            "criteriaResults": {"type": "array", "items": open_object()},
+                            "reviewedAt": {"type": "string"}
+                        }
+                    },
+                    // A replay reports the stored verdict's status, not the Task's current one:
+                    // pass → `in_review`, request_changes → `ready`, blocked → `blocked`.
+                    "taskStatus": {"type": "string", "enum": ["in_review", "ready", "blocked"]},
                     "replayed": {"type": "boolean"}
                 }
             }
@@ -899,12 +1266,164 @@ mod tests {
         .unwrap();
         assert_eq!(status["missionId"], mission_id.as_str());
         assert_eq!(status["tasks"].as_array().unwrap().len(), 2);
+
+        // The reviewer's read: the latest candidate, its manifest and the authorization that
+        // governs it. No policy exists yet, so the review fields stay null.
+        let visible = caller(&camp_id, "agent_2", "run_reviewer", "cmd_inspect");
+        let inspected = invoke(
+            &mut database,
+            &visible,
+            LOOM_INSPECT_TOOL_NAME,
+            json!({"taskId": "t1"}),
+        )
+        .unwrap();
+        assert_eq!(
+            inspected["candidate"]["candidateId"],
+            candidate["candidateId"],
+            "inspect shows the latest candidate of the task"
+        );
+        assert_eq!(inspected["task"]["taskId"], "t1");
+        assert_eq!(inspected["policyRevision"], Value::Null);
+        assert_eq!(inspected["reviewerAgentId"], Value::Null);
+        assert_eq!(
+            inspected["manifestHash"].as_str().unwrap().len(),
+            64,
+            "the manifest is a bare sha256 digest the reviewer can pass back"
+        );
+        assert_eq!(inspected["stageReviews"], json!([]), "no stage review yet");
+        assert_eq!(
+            inspected["artifacts"].as_array().unwrap().len(),
+            1,
+            "only the candidate's own evidence is listed"
+        );
+        assert_eq!(inspected["artifacts"][0]["artifactId"], json!(artifact_id));
+        // The same read carries the shape this reviewer has to submit. It is the closed
+        // catalog's own schema rather than a second copy, and it fills in only facts this
+        // response already read: no verdict and no criterion result is ever suggested.
+        let submission = &inspected["reviewSubmission"];
+        assert_eq!(submission["tool"], json!(LOOM_STAGE_REVIEW_TOOL_NAME));
+        assert_eq!(
+            submission["cli"],
+            json!("rovai loom stage-review --input-file review.json")
+        );
+        assert_eq!(submission["prefilled"]["taskId"], json!("t1"));
+        assert_eq!(
+            submission["prefilled"]["candidateId"],
+            candidate["candidateId"]
+        );
+        assert_eq!(
+            submission["prefilled"]["manifestHash"],
+            inspected["manifestHash"]
+        );
+        assert_eq!(
+            submission["prefilled"]["policyRevision"],
+            Value::Null,
+            "no approved policy exists yet, so no revision may be echoed"
+        );
+        assert_eq!(submission["criterionIds"], json!(["c1"]));
+        let canonical = crate::team_tool_catalog::builtin_tool_definitions()
+            .iter()
+            .find(|definition| {
+                definition.get("name").and_then(Value::as_str)
+                    == Some(LOOM_STAGE_REVIEW_TOOL_NAME)
+            })
+            .expect("the catalog must still define the stage review tool")["inputSchema"]
+            .clone();
+        assert_eq!(
+            submission["inputSchema"], canonical,
+            "the guidance must be the catalog's own schema, never a copy of it"
+        );
+        assert_eq!(submission["required"], canonical["required"]);
+        // What the response hands over is exactly what the tool deserializes and validates.
+        // `policyRevision` is 1 here only because this fixture has no approval to echo; a real
+        // reviewer copies the value the response returned.
+        let filled = json!({
+            "taskId": submission["prefilled"]["taskId"],
+            "candidateId": submission["prefilled"]["candidateId"],
+            "policyRevision": 1,
+            "manifestHash": submission["prefilled"]["manifestHash"],
+            "verdict": "request_changes",
+            "reason": "the recorded artifact does not answer the criterion",
+            "criteriaResults": submission["criterionIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|criterion_id| json!({"criterionId": criterion_id, "satisfied": false}))
+                .collect::<Vec<_>>(),
+        });
+        serde_json::from_value::<LoomStageReviewToolInput>(filled.clone())
+            .expect("the emitted submission shape must deserialize into the tool's own input");
+        validate_input(LOOM_STAGE_REVIEW_TOOL_NAME, &filled)
+            .expect("the emitted submission shape must pass closed validation");
+        // A guessed field name stays refused: `satisfied` has no alias.
+        let mut guessed = filled.clone();
+        guessed["criteriaResults"][0] = json!({"criterionId": "c1", "passed": false});
+        assert!(
+            serde_json::from_value::<LoomStageReviewToolInput>(guessed.clone()).is_err(),
+            "`passed` is not a criterion result and cannot stand in for `satisfied`"
+        );
+        assert!(
+            validate_input(LOOM_STAGE_REVIEW_TOOL_NAME, &guessed).is_err(),
+            "the closed schema still refuses a guessed criterion result"
+        );
+        // Reading is not a write: the same Run may inspect twice with different command ids.
+        invoke(
+            &mut database,
+            &caller(&camp_id, "agent_2", "run_reviewer", "cmd_inspect_again"),
+            LOOM_INSPECT_TOOL_NAME,
+            json!({"taskId": "t1"}),
+        )
+        .unwrap();
+        // Another Mission's task id is not readable from here, even though the id exists.
+        let error = invoke(
+            &mut database,
+            &caller(&other_camp, "agent_2", "run_other", "cmd_inspect_other"),
+            LOOM_INSPECT_TOOL_NAME,
+            json!({"taskId": "t1"}),
+        )
+        .unwrap_err();
+        assert_eq!(code(error), "loom.task_not_found");
     }
 
     #[test]
     fn domain_codes_become_agent_codes() {
         assert_eq!(agent_error_code("LOOM_PLAN_EXISTS"), "loom.plan_exists");
         assert_eq!(agent_error_code("LOOM_CLAIM_ABSENT"), "loom.claim_absent");
+    }
+
+    /// P0 step 6: `loom.claim_heartbeat` must move the Run's write authorisation exactly like
+    /// `loom.claim` does, or the guard keeps comparing the pre-renewal lease. Every other operation
+    /// is enumerated here, so a new `loom.*` tool cannot join the LOOM vocabulary while silently
+    /// keeping a stale grant (or, worse, rewriting an authorisation it never moved).
+    #[test]
+    fn only_the_claim_operations_reissue_the_write_authorisation() {
+        for name in [LOOM_CLAIM_TOOL_NAME, LOOM_CLAIM_HEARTBEAT_TOOL_NAME] {
+            assert!(
+                reissues_write_authorisation(name),
+                "assertion {name} moves the write authorisation it just re-bound"
+            );
+        }
+        let untouched: Vec<&str> = LOOM_TOOL_NAMES
+            .into_iter()
+            .filter(|name| !reissues_write_authorisation(*name))
+            .collect();
+        assert_eq!(
+            untouched,
+            vec![
+                LOOM_STATUS_TOOL_NAME,
+                LOOM_PLAN_TOOL_NAME,
+                LOOM_RELEASE_TOOL_NAME,
+                LOOM_EVIDENCE_TOOL_NAME,
+                LOOM_SUBMIT_TOOL_NAME,
+                LOOM_INSPECT_TOOL_NAME,
+                LOOM_STAGE_REVIEW_TOOL_NAME,
+            ],
+            "assertion every other loom.* operation leaves the grant where it is"
+        );
+        assert!(
+            !reissues_write_authorisation("loom.claim_heartbeats"),
+            "assertion the trigger matches the exact operation name, never a prefix"
+        );
     }
 
     #[test]
@@ -935,6 +1454,24 @@ mod tests {
                 LOOM_SUBMIT_TOOL_NAME,
                 json!({"taskId": "t", "evidenceIds": [], "contentHash": "x"}),
             ),
+            (
+                LOOM_INSPECT_TOOL_NAME,
+                json!({"taskId": "t", "missionId": "m"}),
+            ),
+            (
+                LOOM_STAGE_REVIEW_TOOL_NAME,
+                json!({"taskId": "t", "candidateId": "c", "policyRevision": 1,
+                    "manifestHash": "h", "verdict": "pass", "reason": "r",
+                    "criteriaResults": [{"criterionId": "c1", "satisfied": true}],
+                    "reviewerAgentId": "agent_2"}),
+            ),
+            (
+                LOOM_STAGE_REVIEW_TOOL_NAME,
+                json!({"taskId": "t", "candidateId": "c", "policyRevision": 1,
+                    "manifestHash": "h", "verdict": "pass", "reason": "r",
+                    "criteriaResults": [{"criterionId": "c1", "satisfied": true}],
+                    "commandId": "forged"}),
+            ),
         ] {
             let error = validate_input(name, &input).unwrap_err();
             assert_eq!(
@@ -947,6 +1484,21 @@ mod tests {
         validate_input(
             LOOM_SUBMIT_TOOL_NAME,
             &json!({"taskId": "t", "evidenceIds": ["a"]}),
+        )
+        .unwrap();
+        // Both new tools are admitted by name only; the reviewer identity is never an input.
+        validate_input(LOOM_INSPECT_TOOL_NAME, &json!({"taskId": "t"})).unwrap();
+        validate_input(
+            LOOM_STAGE_REVIEW_TOOL_NAME,
+            &json!({
+                "taskId": "t",
+                "candidateId": "c",
+                "policyRevision": 1,
+                "manifestHash": "0".repeat(64),
+                "verdict": "pass",
+                "reason": "matches every criterion",
+                "criteriaResults": [{"criterionId": "c1", "satisfied": true}]
+            }),
         )
         .unwrap();
     }
@@ -1049,5 +1601,51 @@ Optional: `acceptanceCriteriaVersion` (top level), `description` and `assigneeAg
                 "closed schema still rejects {invalid}"
             );
         }
+    }
+
+    /// The review example the packaged reference shows a reviewer must itself be a valid
+    /// stage-review submission, or the document would teach a shape Core refuses.
+    #[test]
+    fn reference_review_example_passes_the_closed_stage_review_schema() {
+        let section = LOOM_REFERENCE
+            .split_once("## Authorized stage review and handoff")
+            .expect("the reference documents the authorized stage review")
+            .1;
+        let marker = "```json\n";
+        let start = section
+            .find(marker)
+            .expect("the review section has one JSON example");
+        assert_eq!(section.matches(marker).count(), 1, "one review example only");
+        let body = &section[start + marker.len()..];
+        let end = body.find("\n```").expect("the JSON example is fenced");
+        let example: Value =
+            serde_json::from_str(&body[..end]).expect("the review example is JSON");
+        assert_eq!(
+            example["criteriaResults"][0]["satisfied"],
+            json!(false),
+            "a criterion result carries `satisfied`, never a verdict"
+        );
+        assert!(
+            example["criteriaResults"][0].get("passed").is_none(),
+            "the documented criterion result has no `passed` field"
+        );
+        // The documented placeholder hash is replaced with a real digest: the shape check is
+        // format-strict about `manifestHash`, and every other field is the document's own text.
+        let mut submission = example.clone();
+        submission["manifestHash"] = json!("0".repeat(64));
+        validate_input(LOOM_STAGE_REVIEW_TOOL_NAME, &submission)
+            .expect("the documented review shape must pass closed validation");
+        crate::team_tool_catalog::validate_builtin_tool_input(
+            LOOM_STAGE_REVIEW_TOOL_NAME,
+            &submission,
+        )
+        .expect("the documented review shape must pass the catalog schema");
+        // The document cannot smuggle an alias past the closed schema either.
+        let mut guessed = submission.clone();
+        guessed["criteriaResults"][0] = json!({"criterionId": "report-exists", "passed": false});
+        assert!(
+            validate_input(LOOM_STAGE_REVIEW_TOOL_NAME, &guessed).is_err(),
+            "`passed` is still refused"
+        );
     }
 }

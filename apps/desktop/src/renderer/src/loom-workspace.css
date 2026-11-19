@@ -1,195 +1,223 @@
-/* LOOM adds a quiet work surface inside the existing Mission activity preview. */
-/* LOOM 自有主色：由主题 accent 混出的局部变量，不写死颜色；accent 缺省时回落到品牌色。 */
-/* 工作区自身是容器：宽屏信息密度的门槛按它的实际宽度判断，不看窗口宽度——
-   真实应用里工作区宽度由使命抽屉与分栏决定，两者不是同一件事。 */
-.loom-workspace { --loom-accent: color-mix(in srgb, var(--accent, var(--brand)) 68%, transparent); container-name: loom-workspace; container-type: inline-size; display: flex; min-height: 0; flex: 1; flex-direction: column; overflow-x: hidden; color: var(--ink); background: var(--surface); }
-.loom-section-tabs { display: flex; flex: 0 0 49px; align-items: stretch; gap: 22px; padding: 0 24px; border-bottom: 1px solid var(--line); }
-.loom-section-tabs button { position: relative; display: inline-flex; align-items: center; gap: 5px; padding: 0 2px; border: 0; color: var(--muted); background: transparent; font-size: 12px; cursor: pointer; }
-.loom-section-tabs button::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: transparent; content: ''; transition: background-color 160ms ease; }
-.loom-section-tabs button:hover { color: var(--ink); }
-.loom-section-tabs button[aria-pressed='true'] { color: var(--ink); font-weight: 550; }
-.loom-section-tabs button[aria-pressed='true']::after { background: var(--loom-accent); }
-.loom-section-tabs .mission-icon { width: 14px; height: 14px; }
-.loom-section-body { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
-.loom-section-body > :is(.loom-delivery,.mission-activity-document) { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
-.loom-section-body > .mission-activity-document { padding: 24px; }
-.loom-section-body > [hidden] { display: none; }
-.loom-section-body > .mission-activity-document > .mission-delivery-panel { padding: 0; overflow: visible; }
-.loom-section-body > .mission-activity-document > div > .mission-activity-panel { margin-top: 28px; padding: 0; overflow: visible; }
-.loom-plan,.loom-delivery { max-width: 860px; padding: 30px 28px 36px; }
-.loom-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
-/* 标题层级：eyebrow 与 h2 之间留 6px。 */
-.loom-section-heading h2 { margin: 6px 0 0; font-size: 19px; font-weight: 600; letter-spacing: -.01em; line-height: 1.5; }
-.loom-eyebrow { color: var(--loom-accent); font: 10.5px ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing: .1em; }
-.loom-number { padding: 2px 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--faint); font: 11px ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric: tabular-nums; }
-.loom-intro { max-width: 62ch; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
-.loom-empty { margin: 44px 0 32px; padding: 30px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-/* 空状态插画：纯 CSS 三根竖条，中间那根用局部主色并抬起 2px。 */
-.loom-empty-mark { display: inline-flex; align-items: flex-end; gap: 5px; height: 22px; margin-bottom: 22px; }
-.loom-empty-mark i { display: block; width: 5px; border-radius: 2px; background: var(--line); transition: transform 160ms ease; }
-.loom-empty-mark i:nth-child(1) { height: 10px; }
-.loom-empty-mark i:nth-child(2) { height: 16px; background: var(--loom-accent); transform: translateY(-2px); }
-.loom-empty-mark i:nth-child(3) { height: 22px; }
-.loom-empty h3 { margin: 0 0 9px; font-size: 14px; font-weight: 550; }
-.loom-empty p { max-width: 58ch; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
-/* 骨架三格：用 1px 缝（容器底色透出）当分隔线；top padding 不跟着上色，所以裁到 content-box。 */
-.loom-foundation { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; padding-top: 18px; background: var(--line); background-clip: content-box; }
-.loom-foundation > div { display: flex; min-width: 0; flex-direction: column; gap: 6px; padding: 10px 12px; background: var(--surface); }
-.loom-foundation span { display: block; min-width: 0; overflow-wrap: anywhere; color: var(--muted); font-size: 10px; }
-.loom-foundation strong { display: block; min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 500; line-height: 1.6; }
-/* 验收状态：明确画成「未接入」提示条，不等于通过。 */
-.loom-review-state { display: flex; align-items: flex-start; gap: 10px; margin-top: 24px; padding: 12px 14px; border: 1px dashed var(--attention); border-radius: 8px; background: color-mix(in srgb, var(--attention) 6%, transparent); }
-.loom-review-mark { width: 12px; height: 12px; flex: 0 0 12px; margin-top: 4px; border: 0; border-radius: 50%; background: color-mix(in srgb, var(--attention) 35%, transparent); }
-.loom-review-state strong { margin: 0; font-size: 13px; font-weight: 600; }
-.loom-review-state p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
-.loom-criteria { padding: 21px 0 4px; }
-.loom-criteria h3 { margin: 0 0 7px; font-size: 12px; font-weight: 550; }
-.loom-criteria p { display: flex; flex-direction: column; gap: 3px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
-.loom-criteria p span { color: var(--faint); font-size: 11px; }
-.loom-delivery > .mission-delivery-panel { padding: 24px 0 0; overflow: visible; }
-.loom-delivery .mission-delivery-section h3 { font-size: 12px; }
+/* LOOM keeps one readable task surface; detail stays one click away. */
+.loom-workspace{container-name:loom-workspace;container-type:inline-size;display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;overflow:hidden;color:var(--ink);background:var(--canvas);font-size:13px;line-height:1.55;--loom-accent:var(--conversation-action-ink)}
+.loom-section-tabs{display:flex;flex:0 0 44px;gap:2px;padding:0 14px;align-items:center;border-bottom:1px solid var(--line)}
+.loom-section-tabs button{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border:0;border-radius:999px;background:none;color:var(--muted);font:inherit;font-size:12.5px;cursor:pointer}
+.loom-section-tabs button:hover{background:var(--surface-subtle);color:var(--ink)}
+.loom-section-tabs button[aria-pressed=true]{background:var(--surface-selected,var(--surface-subtle));color:var(--ink);font-weight:600}
+.loom-section-tabs .mission-icon{width:15px;height:15px}
+.loom-section-body{display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
+.loom-section-body>:is(.loom-delivery,.mission-activity-document,.loom-plan-host){flex:1;min-width:0;min-height:0;overflow:auto;overscroll-behavior:contain}
+.loom-section-body>.loom-plan-host{display:flex;flex-direction:column;overflow:hidden}
+.loom-workspace [hidden]{display:none!important}
+.loom-plan,.loom-delivery,.loom-section-body>.mission-activity-document{width:100%;max-width:1040px;margin-inline:auto;padding:24px;box-sizing:border-box}
+.loom-plan{display:flex;flex:1;flex-direction:column;min-height:0;overflow:auto}
+.loom-plan>:not(.loom-live-process){flex:0 0 auto}
+.loom-section-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:18px}
+.loom-section-heading h2{margin:0;color:var(--ink);font-size:20px;line-height:1.45;font-weight:600;letter-spacing:-.02em;overflow-wrap:anywhere}
+.loom-eyebrow{color:var(--muted);font:inherit;font-size:12px}
+.loom-section-heading .loom-eyebrow{display:none}
+.loom-number,.loom-candidate-version{flex-shrink:0;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.loom-intro,.loom-summary-line{margin:0 0 16px;color:var(--muted);font-size:13px;line-height:1.7}
+.loom-empty{padding:34px 0;max-width:54ch;color:var(--muted)}
+.loom-empty-mark{display:none}
+.loom-empty h3{margin:0 0 8px;color:var(--ink);font-size:16px;font-weight:550}
+.loom-empty p{margin:6px 0;font-size:13px;line-height:1.7}
+.loom-foundation{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;padding-top:16px;border-top:1px solid var(--line)}
+.loom-foundation>div{display:grid;gap:5px;min-width:0}.loom-foundation span{color:var(--muted);font-size:12px}.loom-foundation strong{font-weight:500;overflow-wrap:anywhere}
+.loom-workspace button{font-family:inherit}
+.loom-summary-actions,.loom-delivery-actions,.loom-control-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.loom-summary-actions{margin:0 0 26px}
+.loom-summary-actions button,.loom-delivery-actions button,.loom-control-actions button,.loom-asset-focus,.loom-preview-retry{min-height:34px;padding:6px 12px;border:1px solid var(--line);border-radius:6px;color:var(--ink);background:var(--surface);font-size:12px;line-height:1.5;cursor:pointer}
+.loom-summary-actions .loom-btn-accept,.loom-delivery-actions .loom-btn-accept,.loom-control-actions .loom-btn-approve{background:var(--conversation-action);border-color:var(--conversation-action);color:var(--conversation-action-contrast)}
+.loom-summary-actions .loom-btn-accept:hover,.loom-delivery-actions .loom-btn-accept:hover,.loom-control-actions .loom-btn-approve:hover{background:var(--conversation-action-hover)}
+.loom-workspace button:disabled{cursor:default;opacity:.5}
+.loom-summary-secondary,.loom-btn-cancel{color:var(--muted)!important}
+.loom-delivery-actions .loom-btn-reject{color:var(--ink);background:var(--surface)}
+.loom-summary-label{display:flex;align-items:center;gap:8px;margin:0 0 10px;font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.01em}
+.loom-summary-label::after{content:"";flex:1;height:1px;background:var(--line)}
+.loom-summary-pending{margin:0 0 24px;padding:0;border:0;background:none}
+.loom-summary-pending ul,.loom-summary-tasks{list-style:none;padding:0;margin:0}
+.loom-summary-row{display:flex;align-items:center;gap:12px;width:100%;min-height:52px;padding:12px 14px;text-align:left;color:var(--ink);border:1px solid var(--line);border-radius:12px;background:var(--surface);cursor:pointer;transition:background .12s ease,border-color .12s ease}
+.loom-summary-row:hover{background:var(--surface-raised,var(--surface));border-color:var(--line-strong)}
+.loom-summary-title{display:block;font-size:14px;font-weight:550;line-height:20px;overflow-wrap:anywhere}
+.loom-summary-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.loom-summary-sub{font-size:11.5px;line-height:16px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.loom-summary-owner{color:var(--muted);font-size:12px}
+.loom-summary-status,.loom-summary-tag{flex-shrink:0;color:var(--muted);font-size:12px}
+.loom-summary-tag{padding:2px 7px;border:1px solid var(--line);border-radius:5px;color:var(--conversation-action-ink)}
+.loom-summary-task+.loom-summary-task{margin-top:8px;border-top:0}
+.loom-summary-task[data-status=blocked] .loom-summary-status{color:var(--attention)}
+.loom-summary-avatar-slot{width:32px;height:32px;flex-shrink:0;border:1px dashed var(--line);border-radius:50%}
+.loom-summary-row:hover{color:var(--conversation-action-ink)}
+.loom-summary-details,.loom-control-details,.loom-asset-details,.loom-candidate-stage-review{min-width:0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.loom-summary-details{margin-top:24px;padding-top:14px;border-top:1px solid var(--line)}
+.loom-workspace summary{width:fit-content;max-width:100%;padding:4px 0;cursor:pointer;color:var(--muted);font-size:12px;line-height:1.7}
+.loom-workspace summary:hover{color:var(--ink)}
+.loom-summary-details>.mission-delivery-panel,.loom-summary-details>.mission-activity-panel{padding:16px 0 0;overflow:visible}
+.loom-plan-goal{margin:0 0 16px;color:var(--muted);font-size:13px;line-height:1.7}
+.loom-flow{margin:4px 0 12px}.loom-flow-header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px}
+.loom-flow-stats{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px}
+.loom-flow-graph{position:relative;display:flex;align-items:flex-start;gap:34px;max-width:100%;min-width:0;overflow-x:auto;padding:4px 2px 12px}
+.loom-flow-lane{display:flex;flex:1 0 200px;min-width:180px;max-width:280px;flex-direction:column;gap:12px}
+.loom-flow-lane-label{color:var(--muted);font-size:12px;padding:0 4px 4px}
+.loom-flow-node{position:relative;z-index:1;min-width:0;padding:16px;border:1px solid var(--line-strong);border-radius:9px;background:var(--surface);box-shadow:none}
+.loom-flow-node.ready{border-color:var(--line-strong)}
+.loom-flow-node.blocked{border-color:color-mix(in srgb,var(--attention) 50%,var(--line));background:color-mix(in srgb,var(--attention) 3%,var(--surface))}
+.loom-flow-node.done{opacity:.85}
+.loom-flow-node-header{display:flex;align-items:flex-start;gap:8px;margin-bottom:10px}
+.loom-flow-node-title{flex:1;min-width:0;font-size:14px;font-weight:550;line-height:1.55;overflow-wrap:anywhere}
+.loom-flow-node-dot{width:7px;height:7px;margin-top:7px;flex:0 0 7px;border-radius:50%;background:var(--muted)}
+.loom-flow-node-dot[data-status=draft]{background:transparent;box-shadow:inset 0 0 0 1px var(--muted)}
+.loom-flow-node-dot[data-status=done]{background:var(--success)}
+.loom-flow-node-dot[data-status=blocked]{background:var(--attention)}
+.loom-flow-node-dot[data-status=in_review]{background:var(--conversation-action)}
+.loom-flow-node-meta{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.loom-flow-node-status,.loom-flow-node-pin,.loom-flow-node-rework{font-size:12px;color:var(--muted)}
+.loom-flow-node-assignee{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink)}
+.loom-flow-node-deps,.loom-flow-node-blocked,.loom-flow-node-blocked-by{font-size:12px;color:var(--muted);line-height:1.6;margin-top:10px;overflow-wrap:anywhere}
+.loom-flow-node-blocked,.loom-flow-node-blocked-by,.loom-flow-node-rework{color:var(--attention)}
+.loom-flow-node details{margin-top:12px;padding-top:8px;border-top:1px solid var(--line)}
+.loom-flow-claim{display:grid;gap:4px;color:var(--muted);font-size:11px;line-height:1.6;min-width:0}
+.loom-flow-claim>span{overflow-wrap:anywhere}.loom-flow-claim[data-claim-state=expired] .loom-flow-claim-status{color:var(--attention)}
+.loom-flow-claim-fence{font-family:ui-monospace,monospace}
+.loom-flow-edges{position:absolute;left:0;top:0;z-index:0;pointer-events:none;overflow:visible}
+.loom-flow-edge{fill:none;stroke:var(--muted);stroke-width:1.4;stroke-linecap:round}
+.loom-flow-edge-artifact-accepted{stroke:var(--conversation-action-ink);stroke-dasharray:5 4}
+.loom-flow-edge-blocked{stroke:var(--attention)}
+.loom-flow-arrow path{fill:var(--muted)}.loom-flow-arrow-artifact-accepted path{fill:var(--conversation-action-ink)}.loom-flow-arrow-blocked path{fill:var(--attention)}
+.loom-flow-legend{display:flex;gap:12px;flex-wrap:wrap;padding-top:12px;color:var(--muted);font-size:11px}
+.loom-flow-legend-item{display:inline-flex;align-items:center;gap:6px}
+.loom-flow-legend-item::before{content:"";width:15px;border-top:1px solid var(--muted)}
+.loom-flow-legend-artifact-accepted::before{border-top-style:dashed}.loom-flow-legend-blocked::before{border-color:var(--attention)}
+.loom-live-strip{display:grid;gap:8px;margin:16px 0}.loom-live-lane{display:grid;grid-template-columns:90px minmax(0,1fr);gap:12px;min-width:0}
+.loom-live-lane-name{display:flex;flex-direction:column;justify-content:center;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.loom-live-lane-name em{font-style:normal;font-size:11px}.loom-live-lane-track{display:flex;gap:8px;min-width:0}
+.loom-live-strip-item{display:grid;flex:1;gap:4px;min-width:0;padding:8px 0}
+.loom-live-strip-title{display:flex;align-items:center;gap:6px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.loom-live-strip-meta{font-size:11px;color:var(--muted)}
+.loom-live-strip-track{height:2px;background:var(--line);overflow:hidden;border-radius:2px}.loom-live-strip-track i{display:block;width:100%;height:100%;background:var(--muted);transform-origin:left}
+.loom-live-strip-track i[data-phase=running]{background:var(--conversation-action)}
+.loom-live-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0;margin-top:10px;color:var(--muted);font-size:11px}
+.loom-live-badge{border:1px solid var(--line);border-radius:4px;padding:1px 5px}.loom-live-node,.loom-live-cli{overflow-wrap:anywhere;min-width:0}
+.loom-live-phase{display:inline-flex;align-items:center;gap:5px}.loom-live-phase i,.loom-live-pulse{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--muted)}
+.loom-live-phase i[data-phase=running],.loom-live-pulse{background:var(--conversation-action);animation:loom-pulse 1.8s ease-in-out infinite}
+.loom-live-open{padding:4px 0;border:0;background:none;color:var(--conversation-action-ink);font-size:12px;cursor:pointer}
+.loom-live-note{color:var(--muted);font-size:12px;margin:10px 0}
+.loom-live-process{position:relative;display:flex;flex:1;flex-direction:column;gap:8px;min-height:340px;margin-top:20px;padding:16px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.loom-live-process header{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.loom-live-process header button:last-child{margin-left:auto}.loom-live-process header strong{font-size:13px}.loom-live-process header span,.loom-live-count{font-size:11px;color:var(--muted)}
+.loom-live-output{flex:1;min-height:230px;overflow:auto;padding:12px;background:var(--surface-subtle,var(--surface));font:12px/1.65 ui-monospace,monospace;border-radius:6px}
+.loom-live-line{display:grid;grid-template-columns:3em minmax(0,1fr);gap:8px;margin:0;overflow-wrap:anywhere}.loom-live-line span{color:var(--faint)}.loom-live-line[data-stream=stderr],.loom-live-gap{color:var(--attention)}
+.loom-live-pill{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);padding:5px 12px;border:1px solid var(--line);border-radius:20px;background:var(--surface-raised);color:var(--ink);cursor:pointer}
+.loom-control{display:flex;flex-direction:column;gap:12px;margin-top:24px;padding:16px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.loom-control-header{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.loom-control-header>div:first-child{flex:1;min-width:0}.loom-control-header h3{font-size:14px;margin:0;font-weight:550}
+.loom-control-state,.loom-control-summary{color:var(--muted);font-size:12px}.loom-control[data-control-state=unreadable] .loom-control-state{color:var(--danger)}
+.loom-control-details{padding-top:4px}.loom-control-details[open]>summary{margin-bottom:12px}
+.loom-control-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 20px;margin:8px 0 16px}.loom-control-fact{display:grid;gap:3px;min-width:0}.loom-control-fact span{color:var(--muted);font-size:11px}.loom-control-fact strong{color:var(--ink);font-size:12px;font-weight:500;overflow-wrap:anywhere}
+.loom-control-dispatches{display:grid;gap:5px}.loom-dispatch{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--muted)}.loom-dispatch[data-status=blocked]{color:var(--attention)}
+.loom-control-note{margin:0;font-size:12px;color:var(--muted);line-height:1.6}.loom-control-failure,.loom-review-failure{margin:8px 0;color:var(--danger);font-size:12px;overflow-wrap:anywhere}
+.loom-control-form{display:grid;gap:16px;padding-top:12px}.loom-control-tasks{display:grid;gap:12px}.loom-control-task{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.loom-control-task-title{flex:1;min-width:100px;overflow-wrap:anywhere}
+.loom-control-task input,.loom-review-criterion input{accent-color:var(--conversation-action);width:15px;height:15px;flex-shrink:0}
+.loom-control-assignee,.loom-control-excluded{font-size:11px;color:var(--muted)}
+.loom-control-reviewer,.loom-control-field input,.loom-review-reason{border:1px solid var(--control-line);background:var(--input-surface,var(--surface));color:var(--ink);border-radius:6px;padding:7px 9px;font:inherit;font-size:13px;max-width:100%;box-sizing:border-box}
+.loom-control-budgets{display:flex;gap:14px;flex-wrap:wrap}.loom-control-field{display:grid;gap:5px;min-width:0;font-size:12px;color:var(--muted)}.loom-control-field input{width:150px}.loom-control-problems{margin:0;padding-left:18px;color:var(--muted);font-size:12px}
+.loom-delivery-context{display:flex;flex-direction:column;gap:18px}.loom-delivery-context>.loom-section-heading{margin-bottom:0}
+.loom-candidate{padding:22px 0;border-top:1px solid var(--line);min-width:0}.loom-candidate-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}
+.loom-candidate-title{margin:0;flex:1;min-width:0;color:var(--ink);font-size:17px;font-weight:600;line-height:1.5;overflow-wrap:anywhere}.loom-candidate[data-focused=true]{outline:1px solid var(--line-strong);outline-offset:8px;border-radius:6px}
+.loom-candidate-meta,.loom-candidate-verification,.loom-candidate-review{font-size:12px;line-height:1.7;color:var(--muted);overflow-wrap:anywhere;margin:10px 0}
+.loom-candidate-locked{color:var(--muted);font-size:12px;margin:8px 0 14px}.loom-candidate[data-latest=false]{opacity:.85}
+.loom-preview{border:1px solid var(--line);border-radius:9px;overflow:hidden;margin:12px 0 20px;background:var(--surface)}
+.loom-preview-file+.loom-preview-file{border-top:1px solid var(--line)}
+.loom-preview-row{display:flex;align-items:center;gap:12px;width:100%;min-height:44px;padding:11px 14px;border:0;background:var(--surface-subtle,var(--surface));color:var(--ink);font:inherit;text-align:left;cursor:pointer}
+.loom-preview-row .loom-evidence-path{font-family:inherit;font-size:13px;font-weight:550}.loom-preview-row .loom-evidence-size{font-size:11px;color:var(--muted)}
+.loom-preview-body{padding:20px;min-width:0;overflow-wrap:anywhere;color:var(--ink);font-size:14px;line-height:1.8}
+.loom-preview-body[data-preview-state=error]{color:var(--danger);display:grid;gap:10px}.loom-preview-body[data-preview-state=unavailable],.loom-preview-body[data-preview-state=reading]{color:var(--muted);font-size:13px}
+.loom-preview-markdown{font-size:14px;line-height:1.8}.loom-preview-markdown h1{font-size:21px;line-height:1.5;margin-top:0}.loom-preview-markdown h2{font-size:18px}.loom-preview-markdown p:first-child{margin-top:0}.loom-preview-markdown p:last-child{margin-bottom:0}
+.loom-preview-text{white-space:pre-wrap;word-break:break-word;font:12px/1.7 ui-monospace,monospace;margin:0}.loom-preview-body pre{max-width:100%;overflow:auto}
+.loom-candidate-facts{display:flex;flex-wrap:wrap;gap:12px 22px;margin:14px 0}.loom-fact{display:flex;align-items:baseline;flex-wrap:wrap;gap:5px;min-width:0}.loom-fact-title{font-size:12px;color:var(--muted)}
+.loom-fact[data-fact=stage-review]{flex:1 1 200px}.loom-fact[data-fact=verification]{order:3}
+.loom-badge,.loom-stage-badge{display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border:1px solid var(--line);border-radius:5px;font-size:11px;color:var(--muted);line-height:1.6}
+.loom-badge-acceptance[data-state=accepted],.loom-badge-verification[data-state=verified],.loom-stage-badge[data-verdict=pass][data-freshness=current]{color:var(--success);border-color:color-mix(in srgb,var(--success) 25%,var(--line))}
+.loom-badge-acceptance[data-state=rejected],.loom-badge-verification[data-state=failed],.loom-stage-badge[data-verdict=blocked]{color:var(--danger)}
+.loom-stage-badge[data-verdict=request_changes]{color:var(--attention)}.loom-stage-badge[data-freshness=stale],.loom-stage-badge[data-freshness=unknown]{color:var(--muted);border-style:dashed}
+.loom-stage-reviewer{font-size:12px;color:var(--ink)}.loom-candidate-stage-review{flex:1 0 100%;line-height:1.7}.loom-stage-reason{margin:8px 0;color:var(--ink)}.loom-stage-criterion{font-size:12px;color:var(--muted)}
+.loom-delivery-actions{margin-top:14px}.loom-review-form{margin-top:18px;padding:18px 0;border-top:1px solid var(--line)}.loom-review-criteria{display:grid;gap:10px}.loom-review-criterion{display:flex;align-items:flex-start;gap:8px;font-size:13px;line-height:1.7}.loom-review-criterion input{margin-top:4px}.loom-review-criterion-text{color:var(--ink);min-width:0;overflow-wrap:anywhere}.loom-review-criterion-id{display:none}.loom-review-reason{display:block;width:100%;margin-top:14px;line-height:1.6;resize:vertical}
+.loom-candidate-evidence{display:grid;gap:8px;margin:12px 0}.loom-evidence-row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:12px;min-width:0}.loom-evidence-path{flex:1;min-width:0;overflow-wrap:anywhere;color:var(--ink)}.loom-evidence-hash{font:11px ui-monospace,monospace;color:var(--muted)}.loom-evidence-size{font-variant-numeric:tabular-nums}.loom-evidence-state{font-size:11px;color:var(--muted)}.loom-evidence-state[data-artifact-state=unknown]{color:var(--attention)}
+.loom-asset-graph{display:grid;gap:10px;margin:0 0 4px;min-width:0}.loom-asset-header{display:flex;align-items:center;gap:8px}.loom-asset-header .loom-eyebrow{font-size:12px;font-weight:550}.loom-asset-hint{font-size:11px;color:var(--muted)}
+.loom-asset-row{display:flex;align-items:center;flex-wrap:wrap;gap:7px;min-width:0;padding:12px 0;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
+.loom-asset-step{min-width:0;overflow-wrap:anywhere}.loom-asset-artifact{color:var(--ink);font-weight:550}.loom-asset-arrow{color:var(--faint);flex-shrink:0}.loom-asset-focus{margin-left:auto;font-size:11px;padding:3px 7px;min-height:28px}.loom-asset-details{flex:1 0 100%;font-size:11px}.loom-asset-details>div{margin-top:4px;overflow-wrap:anywhere}.loom-asset-row[data-registration=unknown]{color:var(--attention)}
+@container loom-workspace (max-width:520px){.loom-plan,.loom-delivery,.loom-section-body>.mission-activity-document{padding:20px 18px}.loom-section-heading h2{font-size:18px}.loom-summary-row{flex-wrap:wrap;gap:7px}.loom-summary-title{flex-basis:calc(100% - 38px)}.loom-summary-owner{margin-left:27px}.loom-candidate-facts{flex-direction:column;gap:10px}.loom-fact[data-fact=stage-review]{flex-basis:auto}.loom-preview-body{padding:16px}.loom-live-lane{grid-template-columns:1fr}.loom-live-lane-name{flex-direction:row;gap:8px}.loom-flow-lane{min-width:190px}.loom-control-header{gap:8px}.loom-control-summary{flex:1 0 100%}.loom-control-facts{gap:10px}.loom-asset-focus{margin-left:0}.loom-foundation{gap:12px}}
+@media(max-width:640px){.loom-section-tabs{padding-inline:18px}.loom-summary-actions button,.loom-delivery-actions button,.loom-control-actions button{min-height:44px}.loom-control-field input,.loom-control-reviewer{min-height:40px}.loom-workspace summary{padding-block:8px}}
+@media(prefers-reduced-motion:reduce){.loom-live-phase i,.loom-live-pulse,.loom-flow-node-dot{animation:none!important}}
+@keyframes loom-pulse{50%{opacity:.35}}
+/* 电脑：执行节点。读不到就说读不到，不画假屏幕。 */
+.loom-computer{padding:20px 24px 16px}
+.loom-board-heading{margin:16px 0 6px;font-size:11.5px;font-weight:600;color:var(--muted);letter-spacing:.01em}
+.loom-board-heading:first-child{margin-top:2px}
+.loom-board-empty{margin:2px 0 8px;font-size:12px;line-height:1.7;color:var(--faint)}
+.loom-board-note{margin:12px 0 0;font-size:11px;line-height:1.6;color:var(--faint)}
+.loom-node{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}
+.loom-node:last-of-type{border-bottom:0}
+.loom-node-main{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+.loom-node-name{font-size:12.5px;font-weight:550;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.loom-node-meta{font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.loom-node-state{flex:0 0 auto;font-size:11px;font-weight:550;color:var(--faint)}
+.loom-node[data-online] .loom-node-state{color:var(--success)}
 
-/* archify 流程视图 */
-.loom-flow { margin-top: 24px; }
-.loom-flow-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-.loom-flow-stats { display: flex; gap: 16px; color: var(--muted); font-size: 11px; }
-/* 图区横向：depth 0 → n 自左向右排泳道；泳道可变宽，容器窄于「列数 × 180px + 间距」时才横滚。 */
-.loom-flow-graph { position: relative; display: flex; flex-direction: row; align-items: flex-start; gap: 32px; max-width: 100%; min-width: 0; padding-bottom: 4px; overflow-x: auto; }
-.loom-flow-lane { display: flex; flex: 1 1 0; min-width: 160px; max-width: 260px; flex-direction: column; gap: 14px; }
-/* 列头：泳道第一个子元素；列内 gap 14px，要让列头下沿只占 8px，所以回吐 6px。 */
-.loom-flow-lane-label { margin-bottom: -6px; color: var(--muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
-.loom-flow-node { position: relative; z-index: 1; width: 100%; min-width: 0; flex: 0 0 auto; border: 1px solid var(--line); border-left: 2px solid var(--line); border-radius: 8px; padding: 14px 16px; background: var(--surface); box-shadow: 0 1px 3px rgb(0 0 0 / 8%), 0 1px 2px rgb(0 0 0 / 4%); }
-.loom-flow-node.ready { border-color: var(--accent); border-left-color: var(--loom-accent); background: var(--accent-subtle); }
-.loom-flow-node.blocked { border-color: var(--attention); border-left-color: var(--attention); background: var(--attention-subtle); }
-/* 其余状态只换左侧状态条，不改边框底色。 */
-.loom-flow-node.done { border-left-color: var(--muted); }
-.loom-flow-node.in_review { border-left-color: color-mix(in srgb, var(--attention) 55%, transparent); }
-.loom-flow-node.draft { border-left-color: var(--faint); }
-.loom-flow-node.canceled { border-left-color: var(--faint); }
-.loom-flow-node-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-.loom-flow-node-title { font-size: 13px; font-weight: 600; line-height: 1.35; }
-.loom-flow-node-status { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
-.loom-flow-node-assignee { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
-.loom-flow-node-deps { font-size: 11px; color: var(--faint); margin-bottom: 4px; }
-.loom-flow-node-blocked { font-size: 10px; color: var(--attention); font-style: italic; }
-/* 认领区：节点底部一块，说的是「谁占着、租约何时到期、fence 第几代」。
-   长 ID 只靠 anywhere 折行，不撑宽游道；颜色一律走主题 token，不新增色值。
-   过期只额外用 attention 语义色，文字「租约已过期」仍在，不单靠颜色区分。 */
-.loom-flow-claim { display: flex; flex-direction: column; gap: 2px; min-width: 0; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; line-height: 1.5; }
-.loom-flow-claim > .loom-flow-claim-status,.loom-flow-claim > .loom-flow-claim-owner,.loom-flow-claim > .loom-flow-claim-lease,.loom-flow-claim > .loom-flow-claim-fence { display: block; min-width: 0; overflow-wrap: anywhere; }
-.loom-flow-claim-status { color: var(--ink); font-weight: 550; letter-spacing: .04em; }
-.loom-flow-claim[data-claim-state='held'] > .loom-flow-claim-status { color: var(--accent); }
-.loom-flow-claim[data-claim-state='expired'] > .loom-flow-claim-status { color: var(--attention); }
-.loom-flow-claim[data-claim-state='released'] > .loom-flow-claim-status { color: var(--muted); }
-/* 租约与 fence 是同一条认领的补充信息：等宽数字便于扫读，字号不低于 10px。 */
-.loom-flow-claim-lease,.loom-flow-claim-fence { color: var(--faint); font-variant-numeric: tabular-nums; }
-.loom-flow-claim-fence { font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }
-/* 依赖连线：SVG 绝对定位覆盖整个图区域，不参与命中测试。 */
-.loom-flow-edges { position: absolute; top: 0; left: 0; z-index: 0; overflow: visible; pointer-events: none; }
-.loom-flow-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; }
-.loom-flow-edge-task-done { stroke: var(--muted); }
-.loom-flow-edge-artifact-accepted { stroke: var(--accent); stroke-dasharray: 5 3; }
-/* 阻塞态盖过条件色：未释放的 artifact_accepted 边与下游 blocked 的入边都走这一条。 */
-.loom-flow-edge-blocked { stroke: var(--attention); }
-.loom-flow-arrow path { fill: var(--muted); }
-.loom-flow-arrow-artifact-accepted path { fill: var(--accent); }
-.loom-flow-arrow-blocked path { fill: var(--attention); }
-/* 节点状态点：横向排进原有 header，标题让位并允许换行。 */
-.loom-flow-node-header { gap: 7px; }
-.loom-flow-node-header > .loom-flow-node-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-/* 状态行独立一行，和标题分开；与下方内容留 6px。 */
-.loom-flow-node-meta { margin-bottom: 6px; }
-.loom-flow-node-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--faint); transition: background-color 140ms ease; }
-.loom-flow-node-dot[data-status='done'] { background: var(--muted); }
-.loom-flow-node-dot[data-status='ready'] { background: var(--accent); }
-.loom-flow-node-dot[data-status='in_review'] { background: color-mix(in srgb, var(--attention) 55%, transparent); }
-.loom-flow-node-dot[data-status='blocked'] { background: var(--attention); }
-.loom-flow-node-dot[data-status='canceled'] { background: var(--faint); opacity: .55; }
-.loom-flow-node-dot[data-status='draft'] { background: transparent; box-shadow: inset 0 0 0 1px var(--faint); }
-/* 图例：说明三种边的含义，也把图区下方的空白收住。 */
-.loom-flow-legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
-.loom-flow-legend-item { display: inline-flex; align-items: center; gap: 8px; }
-/* 小线段：默认 task_done 的实心灰线，后两条按条件色覆写。 */
-.loom-flow-legend-item::before { content: ''; width: 18px; height: 0; border-top: 1.5px solid var(--muted); }
-.loom-flow-legend-artifact-accepted::before { border-top-color: var(--accent); border-top-style: dashed; }
-.loom-flow-legend-blocked::before { border-top-color: var(--attention); }
-
-@media(max-width:640px) { .loom-section-tabs { padding-inline: 18px; }.loom-section-body > .mission-activity-document { padding: 18px; }.loom-plan,.loom-delivery { padding: 24px 20px; } }
-/* 390px 级移动端：tab 横滚收在本条内，横向滚动只留给流程图画布。 */
-@media(max-width:420px) {
-  .loom-section-tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
-  .loom-section-tabs::-webkit-scrollbar { display: none; }
-  .loom-section-heading { flex-direction: column; align-items: flex-start; gap: 6px; }
-  .loom-foundation { grid-template-columns: 1fr; }
-  .loom-flow-legend { flex-direction: column; gap: 10px; }
+/* ── 1:1 复刻 PiBot 色板（_references/pibot/web/src/styles.css:7-8）──
+   PiBot 是暖色系：米白底 + 暖灰面 + 灰绿主色；Rovai 是冷灰。
+   只覆盖 LOOM 面板作用域内的变量值，不动结构与 Rovai 其他页面。 */
+.loom-workspace{
+  --ink:#242622; --muted:#70756f; --faint:#a8aaa4;
+  --line:#e5e5df; --line-strong:#d8d8d1;
+  --surface:#faf9f6; --surface-subtle:#efeee9; --surface-raised:#ffffff;
+  --canvas:#faf9f6;
+  --conversation-action:#627565; --conversation-action-hover:#526354; --conversation-action-ink:#4c5f4f;
+  --success:#627565; --attention:#8a6a2f; --danger:#ac3434;
+  background:#faf9f6; color:#242622;
+  font-family:system-ui,-apple-system,"Noto Sans SC",sans-serif;
+  line-height:1.65;
 }
-@media(prefers-reduced-motion:reduce) { .loom-section-tabs button { transition: none; } }
-@media(prefers-reduced-motion:reduce) { .loom-section-tabs button::after { transition: none; } }
-@media(prefers-reduced-motion:reduce) { .loom-flow-node-dot { transition: none; } }
-@media(prefers-reduced-motion:reduce) { .loom-empty-mark i { transition: none; } }
-
-/* 交付候选卡片：核验与验收是两个独立徽章，各自按 data-state 上色，不合并成单一状态。 */
-.loom-candidate { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; background: var(--surface); }
-.loom-candidate-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-/* 标题让位：长 hash 或长标题不挤走右侧徽章，也不撑破卡片宽度。 */
-.loom-candidate-title { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 600; line-height: 1.35; }
-.loom-badge { display: inline-flex; flex: 0 0 auto; align-items: center; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font-size: 10px; line-height: 1.5; }
-.loom-badge-verification[data-state='unverified'] { color: var(--muted); }
-.loom-badge-verification[data-state='verified'] { color: var(--accent); }
-.loom-badge-verification[data-state='failed'] { color: var(--attention); }
-.loom-badge-acceptance[data-state='pending'] { color: var(--muted); }
-.loom-badge-acceptance[data-state='accepted'] { color: var(--accent); }
-.loom-badge-acceptance[data-state='rejected'] { color: var(--attention); }
-.loom-candidate-meta { margin-top: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
-/* 逐条证据：一行装「相对路径 + 短 hash + 大小 + 徽章」。路径可换行，卡片不被撑破；
-   三态只靠已有语义色区分（登记=主色、未登记=弱化、读不到=attention），不用纯红纯绿。 */
-.loom-candidate-evidence { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
-.loom-evidence-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
-.loom-evidence-path { min-width: 0; flex: 1 1 12ch; overflow-wrap: anywhere; color: var(--ink); font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }
-.loom-evidence-hash { flex: 0 0 auto; color: var(--faint); font: 11px ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric: tabular-nums; }
-.loom-evidence-size { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; }
-.loom-evidence-state { flex: 0 0 auto; border: 1px solid currentColor; border-radius: 999px; padding: 1px 7px; color: var(--muted); font-size: 10px; line-height: 1.5; }
-.loom-evidence-state[data-artifact-state='registered'] { color: var(--accent); }
-.loom-evidence-state[data-artifact-state='unregistered'] { color: var(--faint); border-style: dashed; }
-.loom-evidence-state[data-artifact-state='unknown'] { color: var(--attention); }
-.loom-candidate-review { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font-size: 11px; line-height: 1.7; }
-/* 写入口：验收与核验是两条独立的人工轴。按钮只提示结论方向，小圆角、无动效。 */
-/* 核验记录用独立 class：验收记录的条数断言不能被核验记录混在一起。 */
-.loom-candidate-verification { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font-size: 11px; line-height: 1.7; }
-.loom-delivery-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
-.loom-delivery-actions button { padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface); font-size: 12px; line-height: 1.5; cursor: pointer; }
-.loom-delivery-actions button:disabled { opacity: .5; cursor: default; }
-.loom-delivery-actions button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
-.loom-delivery-actions .loom-btn-accept { border-color: color-mix(in srgb, var(--success) 38%, var(--line)); color: var(--success); background: var(--success-soft); }
-.loom-delivery-actions .loom-btn-reject { border-color: color-mix(in srgb, var(--danger) 38%, var(--line)); color: var(--danger); background: var(--danger-soft); }
-.loom-delivery-actions .loom-btn-verify { border-color: color-mix(in srgb, var(--info) 38%, var(--line)); color: var(--info); background: var(--info-soft); }
-.loom-delivery-actions .loom-btn-verify[data-result='failed'] { border-color: color-mix(in srgb, var(--danger) 38%, var(--line)); color: var(--danger); background: var(--danger-soft); }
-.loom-delivery-actions .loom-btn-cancel { color: var(--muted); }
-/* 逐条验收面板：上边框与卡片内容分开，不加背景色块。 */
-.loom-review-form { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
-.loom-review-criteria { display: grid; gap: 6px; }
-.loom-review-criterion { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); font-size: 12px; line-height: 1.7; cursor: pointer; }
-.loom-review-criterion input { width: 13px; height: 13px; flex: 0 0 13px; margin: 4px 0 0; accent-color: var(--success); }
-.loom-review-criterion-id { flex: 0 0 auto; color: var(--faint); font: 11px ui-monospace,SFMono-Regular,Menlo,monospace; }
-.loom-review-criterion-text { min-width: 0; overflow-wrap: anywhere; color: var(--ink); }
-.loom-review-reason { display: block; width: 100%; margin-top: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface); font: inherit; font-size: 12px; line-height: 1.7; resize: vertical; }
-.loom-review-reason:focus-visible { border-color: var(--control-line); outline: 2px solid var(--focus-soft); outline-offset: 1px; }
-.loom-review-failure { margin: 8px 0 0; color: var(--danger); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
-/* 390px 级移动端：标题与两枚徽章上下排，不靠右挤在窄屏里。 */
-@media(max-width:420px) { .loom-candidate-header { flex-direction: column; align-items: flex-start; gap: 6px; } }
-
-/* 宽屏信息密度：工作区实际宽度 ≥1200 时把右侧留白收进内容里。
-   1040 及以下的档位完全不受影响（860 上限、单列、20 侧距都留在原处）。
-   阈值量的是**这块面板自己**的宽度，不是视口：外壳是分栏的，右栏 1440 窗口下可能只有 560，
-   两列在那种宽度会比单列更挤。所以面板不够宽就不提升，是刻意的选择，不是漏掉视口查询。 */
-@container loom-workspace (min-width: 1200px) {
-  /* 1. 两个面板不再封顶 860，撑满可用宽度；28 的左右内边距与 62ch / 58ch 的行长限制不动。 */
-  .loom-plan,.loom-delivery { max-width: none; }
-  /* 2. 泳道只保留下限 160 与间距 32，取消 260 上限：4×160 + 3×32 = 736 仍小于宽度预算。 */
-  .loom-flow-lane { max-width: none; }
-  /* 3. 交付列表两列等宽：标题、空态、单候选跨两列；卡片顶对齐并去掉底部间距，垂直间距交给 gap。 */
-  .loom-delivery-context { display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
-  .loom-delivery-context > .loom-section-heading,.loom-delivery-context > .loom-empty,.loom-delivery-context > .loom-candidate:last-child:nth-child(2) { grid-column: 1 / -1; }
-  .loom-delivery-context > .loom-section-heading { margin-bottom: 0; }
-  .loom-delivery-context > .loom-candidate { margin-bottom: 0; }
-}
+.loom-workspace .loom-summary-row{background:#faf9f6;border-color:#e5e5df;border-radius:12px}
+.loom-workspace .loom-section-tabs button[aria-pressed=true]{background:#e1e7df;color:#242622}
+.loom-workspace .loom-section-tabs button:hover{background:#efeee9}
+.loom-workspace .loom-section-tabs{border-bottom-color:#e5e5df}
+/* ── 照 BotBoard 的搜索与筛选条（pibot/web/src/BotBoard.css:10-15）── */
+.loom-board-toolbar{display:flex;align-items:center;gap:12px;margin:0 0 12px}
+.loom-board-search{flex:1;min-width:0;display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--line);border-radius:12px;background:#faf9f6;color:var(--muted)}
+.loom-board-search :is(svg,.mission-icon){width:15px;height:15px;flex:0 0 15px}
+.loom-board-search input{flex:1;min-width:0;border:0;background:none;padding:0;font:inherit;font-size:13px;color:var(--ink);outline:none;min-height:0}
+.loom-board-filters{display:flex;gap:6px;overflow-x:auto;margin:0 0 14px;padding-bottom:2px}
+.loom-board-filters button{white-space:nowrap;border:1px solid var(--line);border-radius:20px;background:transparent;padding:5px 11px;font:inherit;font-size:12.5px;color:var(--muted);cursor:pointer}
+.loom-board-filters button[aria-pressed=true]{background:var(--selection);border-color:var(--accent);color:var(--ink);font-weight:600}
+.loom-summary-chev{flex:0 0 auto;color:var(--faint);font-size:15px;line-height:1}
+/* ── 1:1 对齐 PiBot 几何（pibot/web/src/styles.css:47-53,94,100）──
+   PiBot：图标按钮 44×44 圆、主按钮 min-height 48、圆角 12、行高 1.65、messages padding 18/20。 */
+.loom-workspace .loom-summary-actions button,
+.loom-workspace .loom-delivery-actions button,
+.loom-workspace .loom-control-actions button{min-height:44px;padding:10px 16px;border-radius:12px;font-size:13px}
+.loom-workspace .loom-summary-row{min-height:60px;padding:14px 16px;border-radius:12px;gap:14px}
+/* 主按钮照 PiBot：深色底 + 浅字；次按钮透明 + 1px 描边（pibot/styles.css:49-50） */
+.loom-workspace :is(.loom-btn-accept,.loom-control-actions .loom-btn-approve){
+  background:#242622;border-color:#242622;color:#faf9f6}
+.loom-workspace :is(.loom-btn-accept,.loom-control-actions .loom-btn-approve):hover{background:#3a3d37}
+.loom-workspace :is(.loom-summary-secondary,.loom-btn-cancel,.loom-btn-reject){
+  background:transparent;border:1px solid #e5e5df;color:#242622}
+.loom-workspace .loom-summary-title{font-size:14px;line-height:1.45}
+.loom-workspace .loom-summary-sub{font-size:12px;line-height:1.45}
+.loom-workspace .loom-board-search{min-height:44px;padding:10px 12px;border-radius:12px}
+.loom-workspace .loom-board-search input{font-size:13px;line-height:1.65}
+.loom-workspace .loom-board-filters button{min-height:34px;padding:6px 14px;border-radius:999px;font-size:13px}
+/* 面板窄，胶囊换行而不是横向滚动（截断会让最右一档消失） */
+.loom-workspace .loom-board-filters{flex-wrap:wrap;overflow:visible;row-gap:6px}
+.loom-workspace .loom-section-tabs{flex:0 0 48px}
+.loom-workspace .loom-section-tabs button{height:32px;padding:0 12px;font-size:13px}
+.loom-workspace .loom-section-heading h2{font-size:22px;line-height:1.35;font-weight:650}
+.loom-workspace .loom-summary-label{font-size:12px;font-weight:650}
+.loom-workspace .loom-summary-line{font-size:13px;line-height:1.65}
+.loom-workspace .loom-summary-chev{font-size:18px}
+/* ── 电脑：照 BotScreenPanel 的深色舞台（pibot/web/src/BotScreenPanel.tsx:1-30）──
+   差别：没有屏幕流就不摆假画面，舞台中央直说未连接。 */
+.loom-screen{border:1px solid #343934;border-radius:12px;overflow:hidden;margin:0 0 10px;background:#191b19}
+.loom-screen-bar{height:28px;display:flex;align-items:center;padding:0 10px;background:#252925;color:#aab0a8;font-size:11px;line-height:1}
+.loom-screen-stage{height:150px;display:grid;place-items:center;color:#70756f;font-size:12px;
+  background:radial-gradient(120% 90% at 50% 0%,#242720 0%,#14160f 70%)}

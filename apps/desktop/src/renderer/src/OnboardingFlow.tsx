@@ -783,6 +783,8 @@ function runtimeRowDetail(presentation: RuntimeStatusPresentation): string {
     unavailable: '当前安装不可使用',
     not_qualified: 'Windows 资格验证尚未完成',
     unsupported: '当前平台不支持',
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：准入层的产品策略禁用。
+    disabled: '已按产品策略禁用',
     unknown: '尚无可靠检查结果',
     unconfigured: '尚未配置'
   })[presentation.status]

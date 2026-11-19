@@ -10,7 +10,10 @@ import electron from 'electron'
 import { build } from 'vite'
 import { admitElectronIntegrationTest } from './electron-sandbox-capability.mjs'
 
-const EXPECTED_CASES = 22
+// 26 条既有用例 + 7 条接力控制 / 返工链 / 资产关系用例（configure、pause/resume、修订冲突、
+// 控制读失败、旧候选不可接受、资产关系使用者）+ 1 条成果正文浮层用例（打开/Esc/焦点归还/不写入口）
+// ——新增用例全部是真实点击与真实回执断言。
+const EXPECTED_CASES = 34
 
 test('production LOOM workspace keeps visited sections mounted and reports honest states', { timeout: 150_000 }, async t => {
   if (!admitElectronIntegrationTest(t)) return

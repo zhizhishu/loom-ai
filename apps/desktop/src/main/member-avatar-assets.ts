@@ -167,7 +167,9 @@ export class MemberAvatarAssetService {
     rendition: 'icon' | 'portrait'
   ): Promise<MemberAvatarRendition | null> {
     const parsed = parseControlledMemberAvatarRef(avatarRef)
-    if (!parsed || parsed.kind !== 'managed') return null
+    // Shape (`bot`) refs resolve to their managed still asset, so channel/Agent
+    // reads, crop and export keep working on the same PNG.
+    if (!parsed || parsed.kind === 'builtin') return null
     try {
       await assertPrivateDirectory(this.root)
       const assetDirectory = join(this.root, parsed.assetId)

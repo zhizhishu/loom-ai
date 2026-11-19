@@ -2,6 +2,19 @@
 //! Mission; every query is scoped by `missionId`. The write paths are [`plan_import`],
 //! [`task_release`], [`claim_acquire`] and [`candidate_record`], each one Mission, one
 //! transaction.
+pub(crate) mod remote_artifact;
+/// The bytes of a registered local artifact, archived so a later verification re-reads what was
+/// registered instead of whatever the workspace file holds now.
+pub(crate) mod snapshot;
+// V2 additive coordinator ledger remains dormant until its Core migration is approved.
+pub(crate) mod v2_coordinator_adapter;
+/// The persistent automation authority of one Plan: the approved policy, the assistant stage
+/// verdicts, and the dispatch/budget ledger. Split out of this module because nothing in it may
+/// set the Owner's own `ACCEPTED` verdict — that stays in [`review_record`].
+pub mod control;
+#[cfg(all(test, feature = "extended-tests"))]
+mod control_tests;
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
@@ -9,6 +22,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
+use crate::managed_blob::{GC_OWNER_EXECUTION_LIFECYCLE, ManagedBlobStore, attach_gc_candidate};
 
 /// LOOM control-plane task state machine: DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED.
 /// The persisted literals stay uppercase; the wire shape is the contract's lowercase one.
@@ -103,6 +117,10 @@ pub struct LoomTask {
     pub status: LoomTaskStatus,
     pub acceptance_criteria: LoomAcceptanceCriteriaSnapshot,
     pub blocked_reason: Option<String>,
+    /// Node this task is pinned to. Empty means it is not pinned and must not
+    /// be treated as assigned to a remote machine.
+    #[serde(default)]
+    pub execution_host_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub revision: i64,
@@ -253,7 +271,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
             "SELECT task.task_id, task.plan_id, task.title, task.description,
                     task.assignee_agent_id, task.status, task.acceptance_criteria_json,
                     plan.acceptance_criteria_version, task.blocked_reason, task.created_at,
-                    task.updated_at, task.revision
+                    task.updated_at, task.revision, task.execution_host_id
              FROM loom_task AS task
              JOIN loom_plan AS plan ON plan.plan_id=task.plan_id
              WHERE plan.mission_id=?1
@@ -273,6 +291,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, i64>(11)?,
+                row.get::<_, Option<String>>(12)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -291,6 +310,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
                 created_at,
                 updated_at,
                 revision,
+                execution_host_id,
             )| {
                 Ok(LoomTask {
                     status: LoomTaskStatus::parse(&status)?,
@@ -305,6 +325,7 @@ pub fn tasks_list(database: &Database, mission_id: &str) -> Result<Vec<LoomTask>
                     description,
                     assignee_agent_id,
                     blocked_reason,
+                    execution_host_id,
                     created_at,
                     updated_at,
                     revision,
@@ -480,6 +501,7 @@ const LOOM_TASK_NOT_READY: &str = "LOOM_TASK_NOT_READY";
 const LOOM_DEPENDENCY_UNRELEASED: &str = "LOOM_DEPENDENCY_UNRELEASED";
 const LOOM_CLAIM_HELD: &str = "LOOM_CLAIM_HELD";
 const LOOM_CLAIM_COMMAND_REUSED: &str = "LOOM_CLAIM_COMMAND_REUSED";
+const LOOM_REMOTE_TARGET_UNAVAILABLE: &str = "LOOM_REMOTE_TARGET_UNAVAILABLE";
 const LOOM_CLAIM_ABSENT: &str = "LOOM_CLAIM_ABSENT";
 const LOOM_CLAIM_EXPIRED: &str = "LOOM_CLAIM_EXPIRED";
 const LOOM_CLAIM_AGENT_RUN_MISMATCH: &str = "LOOM_CLAIM_AGENT_RUN_MISMATCH";
@@ -488,6 +510,10 @@ const LOOM_ACCEPTANCE_CRITERIA_VERSION_MISMATCH: &str = "LOOM_ACCEPTANCE_CRITERI
 const LOOM_CANDIDATE_COMMAND_REUSED: &str = "LOOM_CANDIDATE_COMMAND_REUSED";
 const LOOM_CANDIDATE_PREVIOUS_INVALID: &str = "LOOM_CANDIDATE_PREVIOUS_INVALID";
 const LOOM_CANDIDATE_NOT_FOUND: &str = "LOOM_CANDIDATE_NOT_FOUND";
+/// A verdict — human or internal — can only judge the Task's newest Candidate. An older one was
+/// already superseded by a rework, so finishing the Task on it would settle evidence that the
+/// rework replaced.
+const LOOM_CANDIDATE_STALE: &str = "LOOM_CANDIDATE_STALE";
 const LOOM_TASK_NOT_IN_REVIEW: &str = "LOOM_TASK_NOT_IN_REVIEW";
 const LOOM_REVIEW_EXISTS: &str = "LOOM_REVIEW_EXISTS";
 const LOOM_REVIEW_CRITERIA_INCOMPLETE: &str = "LOOM_REVIEW_CRITERIA_INCOMPLETE";
@@ -917,6 +943,49 @@ pub struct LoomClaimAcquireResult {
     pub replayed: bool,
 }
 
+/// Heartbeat input: the claim a Run believes it still holds, named by the identity the claim
+/// receipt gave it.
+///
+/// There is deliberately no `commandId`: a heartbeat is not a replayable command, because
+/// "renew once more" and "replay that one renewal" are not the same request. It is judged only
+/// on the claim it names, the Run that presents it and the clock. `missionId` scopes the claim,
+/// and the Task and Plan follow from the claim row itself, so a heartbeat cannot name a Task
+/// that the claim does not hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomClaimHeartbeatInput {
+    pub mission_id: String,
+    pub agent_run_id: String,
+    pub claim_id: String,
+    /// The fence generation the Run was handed when it took the claim; a later generation means
+    /// somebody else (or a newer epoch of this Run) holds the Task now.
+    pub fence_generation: i64,
+}
+
+/// Heartbeat receipt: the lease as it now stands, plus the lease it replaced and the single
+/// server clock the extension was measured from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomClaimHeartbeatResult {
+    pub claim_id: String,
+    pub mission_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub agent_run_id: String,
+    pub fence_generation: i64,
+    pub claimed_at: String,
+    /// The lease this heartbeat found. It is always still in the future: an expired lease is
+    /// refused instead of being renewed.
+    pub previous_lease_expires_at: String,
+    /// The lease after the extension; strictly later than `previousLeaseExpiresAt`.
+    pub lease_expires_at: String,
+    /// The clock instant the extension was measured from, so a caller can tell a renewal that
+    /// waited for the write lock from one that did not.
+    pub heartbeat_at: String,
+    /// How far the lease moved, in seconds.
+    pub extended_seconds: i64,
+}
+
 const DEFAULT_CLAIM_LEASE_SECONDS: i64 = 300;
 const MAX_CLAIM_LEASE_SECONDS: i64 = 3600;
 
@@ -1002,6 +1071,36 @@ pub struct LoomArtifactsListResult {
     pub artifacts: Vec<LoomArtifact>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoomArtifactPreviewInput {
+    pub mission_id: String,
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoomArtifactPreviewUnavailableReason {
+    TooLarge,
+    Binary,
+    NotArchived,
+}
+
+/// Bounded archive text for Owner inspection; reading it records no verification or review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoomArtifactPreviewResult {
+    pub artifact_id: String,
+    pub relative_path: String,
+    pub content_type: Option<String>,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub text: Option<String>,
+    pub unavailable_reason: Option<LoomArtifactPreviewUnavailableReason>,
+}
+
+const MAX_ARTIFACT_PREVIEW_BYTES: i64 = 256 * 1024;
+
 fn required_field(operation: &str, field: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1067,13 +1166,99 @@ fn lease_expired(lease_expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> 
     }
 }
 
+/// LOOM 自有决定（P0 步骤 1）：本 Run 当前持有的活 claim（没有就是 `None`）。
+///
+/// 规则与提交侧的 fence（`candidate_record` 的 `released_at IS NULL` 查询）和
+/// [`lease_expired`] 完全对齐：释放过的 claim 和过期/不可解析的 lease 都不算活。
+/// 同一 Run 可能因为接管而有多代 fence，只报最大的那一代；它已经过期时不回退到
+/// 更早的世代——过期就是没有活 claim。此函数不写库、不加锁，调用方自己持有连接与
+/// 时钟，避免在这里偷偷读第二个时钟。
+///
+/// 消费方：`application::launch_pi_agent_run` 在发写授权（`pi::PiFileGrant`）前读它，
+/// `application::handle_builtin_operation` 在 `loom.claim` / `loom.claim_heartbeat` 成功后重签同一份
+/// 授权时读它，让 grant 携带的就是本 Run 当下真正持有的 claim/fence/租约。
+pub(crate) fn live_claim_for_run(
+    connection: &rusqlite::Connection,
+    agent_run_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<LiveClaim>> {
+    let claim: Option<LiveClaim> = connection
+        .query_row(
+            "SELECT claim_id, agent_run_id, fence_generation, lease_expires_at FROM loom_claim
+             WHERE agent_run_id=?1 AND released_at IS NULL
+             ORDER BY fence_generation DESC, rowid DESC LIMIT 1",
+            params![agent_run_id],
+            |row| {
+                Ok(LiveClaim {
+                    claim_id: row.get(0)?,
+                    agent_run_id: row.get(1)?,
+                    fence_generation: row.get(2)?,
+                    lease_expires_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(claim.filter(|claim| !lease_expired(&claim.lease_expires_at, now)))
+}
+
+/// 「这个 Run 是不是绑定了一个 LOOM 任务」+「它现在拿着哪个活 claim」（P0 步骤 3）。
+///
+/// 「先领后写」需要一个不依赖 claim 行是否存在的判据：r9 场景里 Run 先启动、6 秒后才
+/// `loom.claim`，签发写授权时根本没有 claim 行，但「这个 Run 承担的是 LOOM 任务」这件事在它
+/// 启动那一刻就已经是账本里的事实——它就是投递上的 `loom_control_dispatch`。因此：
+///
+/// - `requires_claim` = 这个 Run 关联的投递里有任意一条 dispatch，或者它已经持有活 claim；
+/// - `claim` = [`live_claim_for_run`] 的结果（没有就是 `None`，过期/不可解析也不算活）。
+///
+/// 只读，不写库、不加锁；调用方自己持有连接与时钟。消费方：`application::launch_pi_agent_run`
+/// 与 `application::handle_builtin_operation`（`loom.claim` 之后重签 grant）在发/改写授权前读它。
+pub(crate) struct RunLoomBinding {
+    /// 这个 Run 的写操作是否必须带一个活 claim。
+    pub requires_claim: bool,
+    /// 它此刻真正持有的 claim（open 且未过期）。
+    pub claim: Option<LiveClaim>,
+}
+
+pub(crate) fn loom_binding_for_run(
+    connection: &rusqlite::Connection,
+    agent_run_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RunLoomBinding> {
+    let claim = live_claim_for_run(connection, agent_run_id, now)?;
+    // 老库（还没有控制平面表）里不可能有 dispatch：读不到表就是「没有绑定」，不是偷偷放行也不
+    // 是报错——与 `runtime::preclaim_loom_dispatch_tasks` 的表可用性判定同一个口径。
+    let dispatched = if crate::remote_execution::authority_table_available(
+        connection,
+        "loom_control_dispatch",
+    )? && crate::remote_execution::authority_table_available(
+        connection,
+        "camp_message_delivery",
+    )? {
+        connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM camp_message_delivery AS delivery
+                 JOIN loom_control_dispatch AS dispatch ON dispatch.delivery_id = delivery.id
+                 WHERE delivery.claimed_agent_run_id = ?1)",
+            [agent_run_id],
+            |row| row.get::<_, bool>(0),
+        )?
+    } else {
+        false
+    };
+    Ok(RunLoomBinding {
+        // 已持有 claim 的 Run 无论如何都是绑定的：不让「账本里查不到 dispatch」变成关掉门禁的理由。
+        requires_claim: dispatched || claim.is_some(),
+        claim,
+    })
+}
+
 /// The edges that still block a claim, using the same rule as the contract's
 /// `loomEvaluateDependency`: a frozen release wins, otherwise a `TASK_DONE` edge needs its
 /// upstream Task `DONE`. The `ARTIFACT_ACCEPTED` branch needs a candidate and an accepted
 /// review, which this projection does not hold yet, so an unresolved artifact edge stays
 /// unreleased.
 fn blocking_dependencies(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     plan_id: &str,
     task_id: &str,
 ) -> Result<Vec<String>> {
@@ -1188,6 +1373,24 @@ pub fn task_release(
     })
 }
 
+/// How a claim command treats an open, unexpired lease that the *same* Run already holds on the
+/// Task. Every other Run keeps the one rule the claim path always had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SameRunClaim {
+    /// Any holder keeps the Task and the caller is refused (`LOOM_CLAIM_HELD`). This is the public
+    /// claim path, unchanged for every Run including the one that already holds the lease.
+    Refuse,
+    /// The authenticated `loom.claim` tool asks for its own Task again after Core pre-claimed it for
+    /// this very Run: the held claim *is* the answer. Nothing is renewed, nothing is granted to any
+    /// other Run, and the receipt is the claim this Run already held rather than a replay of this
+    /// command id.
+    ReturnHeld,
+    /// Core's pre-execution admission of one execution epoch: the same Run's earlier lease is
+    /// revoked and the fence advances, because the new epoch is a new holder of the same Task. A
+    /// different Run's unexpired lease is never taken this way.
+    RevokeOwnLease,
+}
+
 /// LOOM claim path: one Task, one Run, one lease. Everything the claim depends on
 /// (Mission, Plan ownership, Task state, dependency release, the previous lease) is
 /// checked and written in one immediate transaction, so a rejected or failed claim leaves
@@ -1195,6 +1398,38 @@ pub fn task_release(
 pub fn claim_acquire(
     database: &mut Database,
     input: LoomClaimAcquireInput,
+) -> Result<LoomClaimAcquireResult> {
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = claim_acquire_in(&transaction, input, SameRunClaim::Refuse)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// The authenticated `loom.claim` tool. Core may already have claimed the Task for this very Run
+/// when it admitted the Run to execution, so the Run's own live claim is returned instead of a
+/// refusal; every other holder, and every expired lease, keeps the general rule.
+pub fn claim_acquire_reusing_own_lease(
+    database: &mut Database,
+    input: LoomClaimAcquireInput,
+) -> Result<LoomClaimAcquireResult> {
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = claim_acquire_in(&transaction, input, SameRunClaim::ReturnHeld)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// The claim write itself, on a caller-owned transaction, so a Run's execution admission and the
+/// claims it cannot start without commit together. The caller owns the write lock and the commit;
+/// this function never commits, so a caller's own transaction stays in charge. The clock is still
+/// read only after that lock is held.
+pub(crate) fn claim_acquire_in(
+    transaction: &rusqlite::Transaction<'_>,
+    input: LoomClaimAcquireInput,
+    same_run_claim: SameRunClaim,
 ) -> Result<LoomClaimAcquireResult> {
     let mission_id = required_field("claim acquire", "missionId", &input.mission_id)?;
     let task_id = required_field("claim acquire", "taskId", &input.task_id)?;
@@ -1213,9 +1448,6 @@ pub fn claim_acquire(
             format!("LOOM claim leaseSeconds must be 1 to {MAX_CLAIM_LEASE_SECONDS}"),
         ));
     }
-    let transaction = database
-        .connection_mut()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
     // The clock is read only after the write lock is held. Reading it before would let a
     // wait across the held claim's expiry judge a live lease as expired, and would stamp a
     // new lease from a stale instant that may already have run out.
@@ -1290,7 +1522,7 @@ pub fn claim_acquire(
             format!("LOOM task {task_id} is {status} and cannot be claimed"),
         ));
     }
-    let blocking = blocking_dependencies(&transaction, &plan_id, &task_id)?;
+    let blocking = blocking_dependencies(transaction, &plan_id, &task_id)?;
     if !blocking.is_empty() {
         return Err(LoomCommandError::rejection(
             LOOM_DEPENDENCY_UNRELEASED,
@@ -1301,12 +1533,28 @@ pub fn claim_acquire(
         ));
     }
 
-    let open_claim: Option<(String, String)> = transaction
+    // Freeze the same real Run/epoch/Task/Node authority as the claim itself.
+    // Reject before releasing a previous lease; a failed binding rolls back all writes.
+    let remote_admission = crate::remote_execution::validate_loom_claim(
+        transaction,
+        &agent_run_id,
+        &mission_id,
+        &task_id,
+        claimant_agent_id.as_deref(),
+    )
+    .map_err(|_| {
+        LoomCommandError::rejection(
+            LOOM_REMOTE_TARGET_UNAVAILABLE,
+            "The current Run, Task and frozen remote execution target do not authorize this claim",
+        )
+    })?;
+    let open_claim: Option<(String, String, Option<String>, String)> = transaction
         .query_row(
-            "SELECT claim_id, lease_expires_at FROM loom_claim
+            "SELECT claim_id, agent_run_id, claimant_agent_id, lease_expires_at
+             FROM loom_claim
              WHERE task_id=?1 AND released_at IS NULL",
             [&task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
     // Every claim on the Task, released or not, counts: the fence only ever advances.
@@ -1315,14 +1563,36 @@ pub fn claim_acquire(
         [&task_id],
         |row| row.get::<_, i64>(0),
     )? + 1;
-    if let Some((held_claim_id, held_lease_expires_at)) = open_claim {
+    if let Some((held_claim_id, held_run_id, held_claimant, held_lease_expires_at)) = open_claim {
         if !lease_expired(&held_lease_expires_at, now) {
-            return Err(LoomCommandError::rejection(
-                LOOM_CLAIM_HELD,
-                format!(
-                    "task {task_id} is held by claim {held_claim_id} until {held_lease_expires_at}"
-                ),
-            ));
+            // A live lease belongs to its holder. Only the same Run, asking as the same claimant,
+            // may read it back or revoke it, and only in the shape the caller declared; nothing
+            // here renews a lease, and no other Run is ever handed somebody else's Task.
+            let same_holder = held_run_id == agent_run_id
+                && held_claimant.as_deref() == claimant_agent_id.as_deref();
+            match same_run_claim {
+                SameRunClaim::ReturnHeld if same_holder => {
+                    let held = transaction.query_row(
+                        "SELECT claim_id, plan_id, task_id, agent_run_id, claimant_agent_id,
+                                fence_generation, claimed_at, lease_expires_at, released_at
+                         FROM loom_claim WHERE claim_id=?1",
+                        [&held_claim_id],
+                        StoredClaim::read,
+                    )?;
+                    // Not a replay of this command id: this Run held the Task before the call and
+                    // reads back the lease it took then, unrenewed and unextended.
+                    return Ok(held.into_result(&mission_id, false));
+                }
+                SameRunClaim::RevokeOwnLease if same_holder => {}
+                _ => {
+                    return Err(LoomCommandError::rejection(
+                        LOOM_CLAIM_HELD,
+                        format!(
+                            "task {task_id} is held by claim {held_claim_id} until {held_lease_expires_at}"
+                        ),
+                    ));
+                }
+            }
         }
         transaction.execute(
             "UPDATE loom_claim SET released_at=?1 WHERE claim_id=?2 AND released_at IS NULL",
@@ -1346,7 +1616,16 @@ pub fn claim_acquire(
             &claimed_at,
         ],
     )?;
-    transaction.commit()?;
+    if let Some(admission) = remote_admission.as_ref() {
+        crate::remote_execution::record_loom_claim(&transaction, &claim_id, admission).map_err(
+            |_| {
+                LoomCommandError::rejection(
+                    LOOM_REMOTE_TARGET_UNAVAILABLE,
+                    "The remote claim binding could not be recorded",
+                )
+            },
+        )?;
+    }
     Ok(LoomClaimAcquireResult {
         claim_id,
         mission_id,
@@ -1359,6 +1638,184 @@ pub fn claim_acquire(
         lease_expires_at,
         released_at: None,
         replayed: false,
+    })
+}
+
+/// LOOM heartbeat path: a Run extends the lease it already holds, and nothing else.
+///
+/// One immediate transaction with the same write ordering as the claim itself: the clock is read
+/// only after the write lock is held, so a lease that lapses while the heartbeat waits for the
+/// lock is expired and is refused rather than renewed. The guards are the claim's own identity —
+/// this Mission, this claim, this Run, this fence generation — plus `released_at IS NULL` and a
+/// lease that has not yet run out:
+///
+/// * an expired lease is never renewed, so a late heartbeat cannot revive a dead lease;
+/// * a claim released by a takeover (or by any other path) is no longer a claim and cannot be
+///   renewed either;
+/// * a stale fence generation, or a claim that belongs to another Run, is refused.
+///
+/// The lease moves forward by [`DEFAULT_CLAIM_LEASE_SECONDS`] — the same length a fresh claim
+/// takes — measured from the lease the Run already holds, so a heartbeat can only ever lengthen a
+/// lease and can never shorten the one it is extending.
+///
+/// The read of the claim and the write that extends it happen under one lock and therefore cannot
+/// interleave with another writer; the `UPDATE` still names every guard again, so a row that no
+/// longer matches can never be renewed by a stale decision made earlier in this transaction.
+///
+/// Consumer (P0 step 6): `application::handle_builtin_operation` re-issues this Run's Pi write
+/// authorisation from [`live_claim_for_run`] after a successful heartbeat, exactly as it does after
+/// `loom.claim`. The lease this function writes is what the shared guard compares, so a heartbeat
+/// that moved only the ledger would turn a Run that is still beating into `claim_expired` once its
+/// previous lease ran out.
+pub fn claim_heartbeat(
+    database: &mut Database,
+    input: LoomClaimHeartbeatInput,
+) -> Result<LoomClaimHeartbeatResult> {
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = claim_heartbeat_in(&transaction, input)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// The heartbeat write itself, on a caller-owned transaction, so a caller that already holds the
+/// write lock does not open a second one. This function never commits.
+fn claim_heartbeat_in(
+    transaction: &rusqlite::Transaction<'_>,
+    input: LoomClaimHeartbeatInput,
+) -> Result<LoomClaimHeartbeatResult> {
+    let mission_id = required_field("claim heartbeat", "missionId", &input.mission_id)?;
+    let agent_run_id = required_field("claim heartbeat", "agentRunId", &input.agent_run_id)?;
+    let claim_id = required_field("claim heartbeat", "claimId", &input.claim_id)?;
+    if input.fence_generation < 1 {
+        return Err(LoomCommandError::rejection(
+            LOOM_INVALID_INPUT,
+            "LOOM claim heartbeat requires a fenceGeneration of at least 1",
+        ));
+    }
+    let fence_generation = input.fence_generation;
+    // Read the clock only after the lock is held, exactly like the claim: a lease that lapses
+    // while this call waits is expired, not live, and must not be extended from a stale instant.
+    let now = chrono::Utc::now();
+    let heartbeat_at = now.to_rfc3339();
+
+    let mission_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mission WHERE id=?1)",
+        [&mission_id],
+        |row| row.get(0),
+    )?;
+    if !mission_exists {
+        return Err(LoomCommandError::rejection(
+            LOOM_MISSION_NOT_FOUND,
+            format!("mission {mission_id} does not exist"),
+        ));
+    }
+
+    // One read scoped through the Mission's own plan, so a claim of another Mission is not even
+    // visible here. Released claims are read too: the refusal has to say "absent", not "expired".
+    let claim: Option<StoredClaim> = transaction
+        .query_row(
+            "SELECT claim.claim_id, claim.plan_id, claim.task_id, claim.agent_run_id,
+                    claim.claimant_agent_id, claim.fence_generation, claim.claimed_at,
+                    claim.lease_expires_at, claim.released_at
+             FROM loom_claim AS claim
+             JOIN loom_plan AS plan ON plan.plan_id=claim.plan_id
+             WHERE plan.mission_id=?1 AND claim.claim_id=?2",
+            params![&mission_id, &claim_id],
+            StoredClaim::read,
+        )
+        .optional()?;
+    let Some(claim) = claim else {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!("mission {mission_id} carries no claim {claim_id} to renew"),
+        ));
+    };
+    // A released claim is a finished lease: a takeover already closed it, so there is nothing left
+    // to extend and reviving it would hand the Task's write authority back to a superseded holder.
+    if claim.released_at.is_some() {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!("claim {claim_id} on task {} is already released", claim.task_id),
+        ));
+    }
+    if lease_expired(&claim.lease_expires_at, now) {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_EXPIRED,
+            format!(
+                "claim {claim_id} on task {} expired at {}; an expired lease is never renewed",
+                claim.task_id, claim.lease_expires_at
+            ),
+        ));
+    }
+    if claim.agent_run_id != agent_run_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_AGENT_RUN_MISMATCH,
+            format!(
+                "claim {claim_id} on task {} belongs to agentRun {}, not {agent_run_id}",
+                claim.task_id, claim.agent_run_id
+            ),
+        ));
+    }
+    if claim.fence_generation != fence_generation {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_FENCE_STALE,
+            format!(
+                "claim {claim_id} on task {} is at fence generation {}, not the stale generation {fence_generation}",
+                claim.task_id, claim.fence_generation
+            ),
+        ));
+    }
+
+    let previous_lease_expires_at = claim.lease_expires_at.clone();
+    // `lease_expired` already refused anything that does not parse, so this cannot fail; it is
+    // written as an explicit refusal rather than an `unwrap` because a lease is data from disk.
+    let previous_expires = chrono::DateTime::parse_from_rfc3339(&previous_lease_expires_at)
+        .map(|expires| expires.with_timezone(&chrono::Utc))
+        .map_err(|_| {
+            LoomCommandError::rejection(
+                LOOM_CLAIM_EXPIRED,
+                format!("claim {claim_id} carries an unreadable lease {previous_lease_expires_at}"),
+            )
+        })?;
+    let lease_expires_at = (previous_expires
+        + chrono::Duration::seconds(DEFAULT_CLAIM_LEASE_SECONDS))
+        .to_rfc3339();
+
+    // Every guard is repeated here, so the write itself is what decides: a claim released, taken
+    // over or re-fenced after the read above matches no row and is refused instead of renewed.
+    let updated = transaction.execute(
+        "UPDATE loom_claim SET lease_expires_at=?1
+         WHERE claim_id=?2 AND agent_run_id=?3 AND fence_generation=?4 AND released_at IS NULL",
+        params![
+            &lease_expires_at,
+            &claim_id,
+            &agent_run_id,
+            fence_generation
+        ],
+    )?;
+    if updated != 1 {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_FENCE_STALE,
+            format!(
+                "claim {claim_id} no longer matches agentRun {agent_run_id} at fence generation {fence_generation}"
+            ),
+        ));
+    }
+
+    Ok(LoomClaimHeartbeatResult {
+        claim_id,
+        mission_id,
+        plan_id: claim.plan_id,
+        task_id: claim.task_id,
+        agent_run_id,
+        fence_generation,
+        claimed_at: claim.claimed_at,
+        previous_lease_expires_at,
+        lease_expires_at,
+        heartbeat_at,
+        extended_seconds: DEFAULT_CLAIM_LEASE_SECONDS,
     })
 }
 
@@ -1523,11 +1980,14 @@ impl StoredCandidate {
 
 /// The live claim a submitting Run must hold: the fence is the Run identity, the claim
 /// identity, the fence generation and an unexpired lease, never a task state alone.
-struct LiveClaim {
-    claim_id: String,
-    agent_run_id: String,
-    fence_generation: i64,
-    lease_expires_at: String,
+///
+/// LOOM 自有决定：同一个类型既是提交侧的 fence，也是只读口
+/// [`live_claim_for_run`] 的返回值，不再造平行的镜像类型。
+pub(crate) struct LiveClaim {
+    pub(crate) claim_id: String,
+    pub(crate) agent_run_id: String,
+    pub(crate) fence_generation: i64,
+    pub(crate) lease_expires_at: String,
 }
 
 /// LOOM candidate path: a Run submits the delivery for the Task it holds, and the Task
@@ -1741,6 +2201,48 @@ pub fn candidate_record(
             LOOM_TASK_NOT_READY,
             format!("LOOM task {task_id} is {status} and cannot submit a candidate"),
         ));
+    }
+
+    // A rework has to chain. Once a Task carries a Candidate, the next submission must name the
+    // newest one as `previousCandidateId`: skipping the link (or pointing at an older version)
+    // would let two deliveries both claim to be the current version, and a verdict could then be
+    // attached to a lineage that never happened. This is judged after the Task-state fence, so a
+    // Task that cannot take a delivery at all still reports its state rather than a chain error.
+    let newest_candidate: Option<String> = transaction
+        .query_row(
+            "SELECT candidate_id FROM loom_candidate WHERE plan_id=?1 AND task_id=?2
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![&plan_id, &task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match (newest_candidate.as_deref(), previous_candidate_id.as_deref()) {
+        (None, None) => {}
+        (Some(newest), Some(previous)) if previous == newest => {}
+        (Some(newest), Some(previous)) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_CANDIDATE_PREVIOUS_INVALID,
+                format!(
+                    "task {task_id} is at candidate {newest}; previousCandidateId must name it, not {previous}"
+                ),
+            ));
+        }
+        (Some(newest), None) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_CANDIDATE_PREVIOUS_INVALID,
+                format!(
+                    "task {task_id} already carries candidate {newest}; a rework must name it as previousCandidateId"
+                ),
+            ));
+        }
+        (None, Some(previous)) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_CANDIDATE_PREVIOUS_INVALID,
+                format!(
+                    "task {task_id} carries no earlier candidate, so {previous} cannot be its previous version"
+                ),
+            ));
+        }
     }
 
     let candidate_id = format!("candidate_{}", uuid::Uuid::new_v4().simple());
@@ -2029,6 +2531,7 @@ fn mission_workspace(
         .query_row(
             "SELECT working_directory, state FROM mission_workspace
              WHERE mission_id=?1
+               AND execution_host_id=(SELECT id FROM mission_execution_host WHERE singleton=1)
              ORDER BY generation DESC, updated_at DESC LIMIT 1",
             [mission_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2064,9 +2567,16 @@ fn mission_workspace(
 
 /// Register one artifact for the Mission's plan and return the immutable row.
 ///
-/// Registering the same path again with the same bytes replays the original row; the same path
-/// with different bytes is refused, because changed evidence must arrive as a new artifact rather
-/// than silently rewriting what an earlier verdict was based on.
+/// The bytes are archived in the Managed Blob store before the artifact row commits, so a later
+/// verification re-reads what was registered instead of whatever the workspace file holds then.
+///
+/// Registering the same path, Task, producer and bytes replays that immutable version (and gives
+/// a historical artifact its missing snapshot). Changed bytes or a new producer Run create a new
+/// artifact id at the same logical path. Older candidates continue to read their own archives.
+///
+/// Local evidence is fenced exactly like remote evidence: a registration that names both a producer
+/// Run and a Task is only written while that Run holds the Task's live claim, so an unclaimed or
+/// taken-over Run can never deposit evidence under somebody else's Task.
 pub fn artifact_register(
     database: &mut Database,
     creator_id: &str,
@@ -2094,63 +2604,125 @@ pub fn artifact_register(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let transaction = database
-        .connection_mut()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let workspace = mission_workspace(&transaction, &mission_id)?;
-    let plan_id: Option<String> = transaction
-        .query_row(
-            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
-            [&mission_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(plan_id) = plan_id else {
-        return Err(LoomCommandError::rejection(
-            LOOM_PLAN_NOT_FOUND,
-            format!("mission {mission_id} has no LOOM plan"),
-        ));
-    };
-    if let Some(task_id) = task_id.as_deref() {
-        let known: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM loom_task WHERE plan_id=?1 AND task_id=?2)",
-            params![&plan_id, task_id],
-            |row| row.get(0),
+    // Phase one is read-only. Everything registration needs to know about the Mission, its plan,
+    // the Task and the file is proven before a single byte leaves the workspace, because copying
+    // those bytes happens outside the artifact transaction.
+    let (workspace, plan_id) = {
+        let connection = database.connection();
+        refuse_remote_artifact_producer(connection, agent_run_id.as_deref())?;
+        let workspace = mission_workspace(connection, &mission_id)?;
+        let plan_id = artifact_plan(connection, &mission_id)?;
+        ensure_artifact_task(connection, &plan_id, &mission_id, task_id.as_deref())?;
+        ensure_artifact_claim(
+            connection,
+            agent_run_id.as_deref(),
+            &plan_id,
+            task_id.as_deref(),
+            chrono::Utc::now(),
         )?;
-        if !known {
-            return Err(LoomCommandError::rejection(
-                LOOM_TASK_NOT_FOUND,
-                format!("task {task_id} does not belong to the plan of mission {mission_id}"),
-            ));
-        }
-    }
+        (workspace, plan_id)
+    };
+    let data_dir = snapshot::data_directory(database)?;
 
     let resolved = resolve_artifact_path(&workspace, &relative_path)?;
     #[cfg(test)]
     artifact_swap_hook::run();
-    let (sha256, size_bytes) = artifact_digest(&resolved).map_err(|error| {
+    let (bytes, sha256, size_bytes) = snapshot::read_artifact_bytes(&resolved).map_err(|error| {
         LoomCommandError::rejection(
             LOOM_ARTIFACT_PATH_REJECTED,
             format!("artifact {relative_path} cannot be read without following links: {error:#}"),
         )
     })?;
 
-    let existing: Option<(String, String)> = transaction
+    // The bytes are frozen in the Managed Blob store before the artifact row exists. The candidate
+    // marker makes that safe without a second transaction: a crash, or any refusal below, leaves a
+    // Blob the GC collects instead of an artifact pointing at bytes nobody wrote down.
+    let media_type = content_type
+        .as_deref()
+        .filter(|value| !value.is_empty() && value.len() <= 127 && value.contains('/'))
+        .unwrap_or("application/octet-stream");
+    let candidate = ManagedBlobStore::new(&data_dir).put_bytes_candidate(
+        database,
+        &bytes,
+        media_type,
+        "sensitive",
+        // Archived artifact bytes are Run execution-lifecycle content: the historical managed_blob
+        // owner CHECK admits only these owners, a candidate whose registration failed before its
+        // artifact row committed stays collectable, and a committed snapshot protects the Blob
+        // through its Foreign Key.
+        GC_OWNER_EXECUTION_LIFECYCLE,
+    )?;
+    if candidate.sha256 != sha256 || candidate.byte_size != size_bytes as u64 {
+        anyhow::bail!("Managed Blob candidate does not hold the bytes that were read");
+    }
+
+    let transaction = database
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Every fact phase one proved is proved again under the write lock: the archive is only sound
+    // while the Mission, its plan, the Task and the file are still the facts it was built from.
+    refuse_remote_artifact_producer(&transaction, agent_run_id.as_deref())?;
+    let plan_id_now = artifact_plan(&transaction, &mission_id)?;
+    if plan_id_now != plan_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} changed its LOOM plan while the artifact was archived"),
+        ));
+    }
+    ensure_artifact_task(&transaction, &plan_id, &mission_id, task_id.as_deref())?;
+    // The fence is judged again under the write lock, against a clock read inside it: a lease that
+    // lapsed while this command waited for the lock is expired, not still live, so the archived
+    // bytes can never be recorded under a claim the producer has already lost.
+    ensure_artifact_claim(
+        &transaction,
+        agent_run_id.as_deref(),
+        &plan_id,
+        task_id.as_deref(),
+        chrono::Utc::now(),
+    )?;
+    let workspace_now = mission_workspace(&transaction, &mission_id)?;
+    let resolved_now = resolve_artifact_path(&workspace_now, &relative_path).map_err(|error| {
+        LoomCommandError::rejection(
+            LOOM_ARTIFACT_PATH_REJECTED,
+            format!("artifact {relative_path} cannot be read without following links: {error:#}"),
+        )
+    })?;
+    let (_, sha256_now, size_bytes_now) = snapshot::read_artifact_bytes(&resolved_now).map_err(
+        |error| {
+            LoomCommandError::rejection(
+                LOOM_ARTIFACT_PATH_REJECTED,
+                format!(
+                    "artifact {relative_path} cannot be read without following links: {error:#}"
+                ),
+            )
+        },
+    )?;
+    if sha256_now != sha256 || size_bytes_now != size_bytes {
+        return Err(LoomCommandError::rejection(
+            LOOM_ARTIFACT_CONTENT_CHANGED,
+            format!(
+                "artifact {relative_path} changed while it was being archived; nothing was recorded"
+            ),
+        ));
+    }
+
+    // A path names a mutable workspace file, not an immutable artifact identity.
+    // Keep the producer and bytes in the replay key so rework creates a new row
+    // without borrowing another Run's evidence or changing any older snapshot.
+    let existing: Option<String> = transaction
         .query_row(
-            "SELECT artifact_id, sha256 FROM loom_artifact WHERE plan_id=?1 AND relative_path=?2",
-            params![&plan_id, &relative_path],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT artifact_id FROM loom_artifact
+             WHERE plan_id=?1 AND origin_key='local' AND relative_path=?2
+               AND task_id IS ?3 AND agent_run_id IS ?4 AND creator_id=?5 AND sha256=?6",
+            params![&plan_id, &relative_path, &task_id, &agent_run_id, &creator_id, &sha256],
+            |row| row.get(0),
         )
         .optional()?;
-    if let Some((artifact_id, stored_sha256)) = existing {
-        if stored_sha256 != sha256 {
-            return Err(LoomCommandError::rejection(
-                LOOM_ARTIFACT_CONTENT_CHANGED,
-                format!(
-                    "artifact {relative_path} was registered with sha256 {stored_sha256} and the file has since changed; register the new content under a new path"
-                ),
-            ));
-        }
+    if let Some(artifact_id) = existing {
+        // Same bytes: replay the row. An artifact registered before archiving existed gets its
+        // snapshot here, and only because the file still has the digest that row recorded.
+        snapshot::record(&transaction, &artifact_id, &candidate.id, &sha256, size_bytes)?;
+        attach_gc_candidate(&transaction, &candidate.id)?;
         let artifact = read_stored_artifact(&transaction, &artifact_id)?;
         transaction.commit()?;
         return Ok(LoomArtifactRegisterResult {
@@ -2188,11 +2760,151 @@ pub fn artifact_register(
             &artifact.created_at,
         ],
     )?;
+    snapshot::record(
+        &transaction,
+        &artifact.artifact_id,
+        &candidate.id,
+        &artifact.sha256,
+        artifact.size_bytes,
+    )?;
+    attach_gc_candidate(&transaction, &candidate.id)?;
     transaction.commit()?;
     Ok(LoomArtifactRegisterResult {
         artifact,
         replayed: false,
     })
+}
+
+/// Remote producers own their own archive path; a local registration may not stand in for one.
+fn refuse_remote_artifact_producer(
+    connection: &rusqlite::Connection,
+    agent_run_id: Option<&str>,
+) -> Result<()> {
+    let Some(run_id) = agent_run_id else {
+        return Ok(());
+    };
+    if crate::remote_execution::authority_table_available(connection, "agent_run_execution_target")?
+        && crate::remote_execution::load_run_target(connection, run_id)?.is_some()
+    {
+        return Err(LoomCommandError::rejection(
+            LOOM_ARTIFACT_PATH_REJECTED,
+            "Remote producer evidence must use its authenticated archive registration path",
+        ));
+    }
+    Ok(())
+}
+
+fn artifact_plan(connection: &rusqlite::Connection, mission_id: &str) -> Result<String> {
+    let plan_id: Option<String> = connection
+        .query_row(
+            "SELECT plan_id FROM loom_plan WHERE mission_id=?1",
+            [mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    plan_id.ok_or_else(|| {
+        LoomCommandError::rejection(
+            LOOM_PLAN_NOT_FOUND,
+            format!("mission {mission_id} has no LOOM plan"),
+        )
+    })
+}
+
+fn ensure_artifact_task(
+    connection: &rusqlite::Connection,
+    plan_id: &str,
+    mission_id: &str,
+    task_id: Option<&str>,
+) -> Result<()> {
+    let Some(task_id) = task_id else {
+        return Ok(());
+    };
+    let known: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loom_task WHERE plan_id=?1 AND task_id=?2)",
+        params![plan_id, task_id],
+        |row| row.get(0),
+    )?;
+    if !known {
+        return Err(LoomCommandError::rejection(
+            LOOM_TASK_NOT_FOUND,
+            format!("task {task_id} does not belong to the plan of mission {mission_id}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The local evidence fence, with the same rules as the remote one: a registration that names both a
+/// producer Run and a Task may only be written by the Run that still holds that Task's claim.
+///
+/// The claim identity and its fence generation are read from the Task's open claim, never supplied by
+/// the caller, so a local registration cannot present a fence it does not hold; only the Run's
+/// identity is authenticated, exactly like `loom.submit`. Liveness is the same rule the submit-side
+/// fence uses: a released claim, a lapsed lease and an unparsable lease are not a fence for new
+/// evidence. `now` is the caller's clock because the artifact path re-judges the fence inside its
+/// write transaction.
+///
+/// A registration that names no Run (a human or the main assistant) or no Task binds itself to no
+/// Task, so it has no claim to hold and keeps the unfenced behaviour. Only a Run that names a Task is
+/// gated here.
+fn ensure_artifact_claim(
+    connection: &rusqlite::Connection,
+    agent_run_id: Option<&str>,
+    plan_id: &str,
+    task_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let (Some(agent_run_id), Some(task_id)) = (agent_run_id, task_id) else {
+        return Ok(());
+    };
+    // `loom_claim_open_task_idx` keeps this at most one row per Task, so the fence this registration
+    // is written under is never ambiguous.
+    let holding: Option<(String, String, i64, String)> = connection
+        .query_row(
+            "SELECT claim_id, agent_run_id, fence_generation, lease_expires_at FROM loom_claim
+             WHERE plan_id=?1 AND task_id=?2 AND released_at IS NULL",
+            params![plan_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((claim_id, holder_run_id, fence_generation, lease_expires_at)) = holding else {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!("task {task_id} carries no unreleased claim to register evidence under"),
+        ));
+    };
+    // Same reading as the remote evidence path: a claim on the Task that does not name this Run is
+    // not this Run's claim. A takeover releases the previous holder first, so a superseded producer
+    // lands here too. (The local submit fence splits this case out as
+    // `LOOM_CLAIM_AGENT_RUN_MISMATCH`; evidence registration keeps the remote path's code so both
+    // evidence routes answer a lost Task identically.)
+    if holder_run_id != agent_run_id {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_ABSENT,
+            format!(
+                "task {task_id} is held at fence generation {fence_generation} by claim {claim_id} for agentRun {holder_run_id}, not {agent_run_id}"
+            ),
+        ));
+    }
+    if lease_expired(&lease_expires_at, now) {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_EXPIRED,
+            format!(
+                "claim {claim_id} on task {task_id} expired at {lease_expires_at}; register evidence under a live claim"
+            ),
+        ));
+    }
+    // The Run's own live claim, read through the one reader the write authorisation also uses. A Run
+    // whose newest generation already lapsed has no live fence left to present, even while a row of
+    // its own is still open.
+    if live_claim_for_run(connection, agent_run_id, now)?.is_none() {
+        return Err(LoomCommandError::rejection(
+            LOOM_CLAIM_EXPIRED,
+            format!(
+                "agentRun {agent_run_id} holds no live claim on task {task_id} to register evidence under"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn read_stored_artifact(
@@ -2252,47 +2964,113 @@ fn ensure_evidence_artifacts(
 
 /// Re-read the bytes behind every referenced artifact and compare them with the digest recorded
 /// at registration. A passing verification cannot be recorded over changed or missing bytes.
+///
+/// A local artifact whose registration archived its bytes is judged on those bytes; only an
+/// artifact registered before archiving existed is re-read from the workspace file.
 fn ensure_evidence_bytes_match(
     connection: &rusqlite::Connection,
-    workspace: &std::path::Path,
+    mission_id: &str,
+    archive_root: Option<&std::path::Path>,
+    snapshot_root: Option<&std::path::Path>,
     plan_id: &str,
     evidence_ids: &[String],
 ) -> Result<()> {
+    use sha2::Digest;
+    let mut local_workspace = None;
     for evidence_id in evidence_ids {
-        let stored: Option<(String, String)> = connection
-            .query_row(
-                "SELECT relative_path, sha256 FROM loom_artifact WHERE plan_id=?1 AND artifact_id=?2",
-                params![plan_id, evidence_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((relative_path, expected)) = stored else {
+        let stored: Option<(String,String,String)> = connection.query_row(
+            "SELECT relative_path,sha256,origin_key FROM loom_artifact WHERE plan_id=?1 AND artifact_id=?2",
+            params![plan_id,evidence_id],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        let Some((relative_path, expected, origin)) = stored else {
             return Err(LoomCommandError::rejection(
                 LOOM_EVIDENCE_NOT_FOUND,
                 format!("evidence {evidence_id} is not a registered artifact of this plan"),
             ));
         };
-        // A refused path or a vanished file is "cannot re-read", not "the bytes differ": the two
-        // call for different repairs, so they must not share an error code.
-        let resolved = resolve_artifact_path(workspace, &relative_path).map_err(|error| {
-            LoomCommandError::rejection(
-                LOOM_EVIDENCE_UNREADABLE,
-                format!("evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"),
-            )
-        })?;
-        #[cfg(test)]
-        artifact_swap_hook::run();
-        let (actual, _) = artifact_digest(&resolved).map_err(|error| {
-            LoomCommandError::rejection(
-                LOOM_EVIDENCE_UNREADABLE,
-                format!("evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"),
-            )
-        })?;
+        let actual = if origin == "local" {
+            let remote_locator: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM loom_artifact_archive WHERE artifact_id=?1)",
+                [evidence_id],
+                |r| r.get(0),
+            )?;
+            if remote_locator {
+                return Err(LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    "Local evidence cannot carry a remote archive locator",
+                ));
+            }
+            let data_dir = snapshot_root.ok_or_else(|| {
+                LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    "Local evidence snapshots require Core's data directory",
+                )
+            })?;
+            // The archived bytes are what was registered. A row that names a Blob that is
+            // missing, unreadable or no longer the recorded content fails here; it is never
+            // answered with whatever the workspace file holds now.
+            match snapshot::read_verified_bytes(connection, data_dir, plan_id, evidence_id)
+                .map_err(|error| {
+                    LoomCommandError::rejection(
+                        LOOM_EVIDENCE_UNREADABLE,
+                        format!("evidence {evidence_id} archived bytes cannot be read: {error:#}"),
+                    )
+                })?
+            {
+                Some(bytes) => format!("{:x}", sha2::Sha256::digest(&bytes)),
+                None => {
+                    // Artifacts registered before archiving existed keep their historical read.
+                    if local_workspace.is_none() {
+                        local_workspace = Some(mission_workspace(connection, mission_id)?);
+                    }
+                    let workspace = local_workspace
+                        .as_deref()
+                        .expect("local workspace was resolved");
+                    let resolved =
+                        resolve_artifact_path(workspace, &relative_path).map_err(|error| {
+                            LoomCommandError::rejection(
+                                LOOM_EVIDENCE_UNREADABLE,
+                                format!(
+                                    "evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"
+                                ),
+                            )
+                        })?;
+                    #[cfg(test)]
+                    artifact_swap_hook::run();
+                    artifact_digest(&resolved)
+                        .map_err(|error| {
+                            LoomCommandError::rejection(
+                                LOOM_EVIDENCE_UNREADABLE,
+                                format!(
+                                    "evidence {evidence_id} at {relative_path} cannot be re-read: {error:#}"
+                                ),
+                            )
+                        })?
+                        .0
+                }
+            }
+        } else {
+            let root = archive_root.ok_or_else(|| {
+                LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    "Remote evidence verification requires Core's private archive service",
+                )
+            })?;
+            let bytes =
+                remote_artifact::read_verified_bytes(connection, root, plan_id, evidence_id)?
+                    .ok_or_else(|| {
+                        LoomCommandError::rejection(
+                            LOOM_EVIDENCE_UNREADABLE,
+                            "Remote evidence cannot fall back to a local workspace path",
+                        )
+                    })?;
+            format!("{:x}", sha2::Sha256::digest(&bytes))
+        };
         if actual != expected {
             return Err(LoomCommandError::rejection(
                 LOOM_EVIDENCE_HASH_MISMATCH,
                 format!(
-                    "evidence {evidence_id} at {relative_path} no longer matches its recorded sha256; the bytes changed after registration"
+                    "evidence {evidence_id} at {relative_path} no longer matches its recorded sha256"
                 ),
             ));
         }
@@ -2410,6 +3188,92 @@ pub fn artifacts_list(database: &Database, mission_id: &str) -> Result<LoomArtif
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(LoomArtifactsListResult { artifacts })
+}
+
+/// Preview only the immutable bytes registered for this Mission, never the mutable workspace.
+pub fn artifact_preview(
+    database: &Database,
+    data_dir: &std::path::Path,
+    input: LoomArtifactPreviewInput,
+) -> Result<LoomArtifactPreviewResult> {
+    let mission_id = scoped_mission(&input.mission_id)?;
+    let artifact_id = required_field("artifact.preview", "artifactId", &input.artifact_id)?;
+    let connection = database.connection();
+    let stored = connection
+        .query_row(
+            "SELECT artifact.plan_id, artifact.origin_key, artifact.artifact_id,
+                    artifact.relative_path, artifact.content_type, artifact.size_bytes,
+                    artifact.sha256,
+                    EXISTS(SELECT 1 FROM loom_artifact_archive WHERE artifact_id=artifact.artifact_id)
+             FROM loom_artifact AS artifact
+             JOIN loom_plan AS plan ON plan.plan_id=artifact.plan_id
+             WHERE plan.mission_id=?1 AND artifact.artifact_id=?2",
+            params![mission_id, artifact_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(7)?,
+                    LoomArtifactPreviewResult {
+                        artifact_id: row.get(2)?,
+                        relative_path: row.get(3)?,
+                        content_type: row.get(4)?,
+                        size_bytes: row.get(5)?,
+                        sha256: row.get(6)?,
+                        text: None,
+                        unavailable_reason: None,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    let Some((plan_id, origin, remote_locator, mut preview)) = stored else {
+        return Err(LoomCommandError::rejection(
+            LOOM_EVIDENCE_NOT_FOUND,
+            "The artifact does not belong to this Mission",
+        ));
+    };
+    if origin == "local" && remote_locator {
+        return Err(LoomCommandError::rejection(
+            LOOM_EVIDENCE_UNREADABLE,
+            "Local evidence cannot carry a remote archive locator",
+        ));
+    }
+    // Refuse by recorded size before either store opens or allocates the archived content.
+    if preview.size_bytes > MAX_ARTIFACT_PREVIEW_BYTES {
+        preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::TooLarge);
+        return Ok(preview);
+    }
+    let bytes = if origin == "local" {
+        snapshot::read_verified_bytes(connection, data_dir, &plan_id, &artifact_id).map_err(
+            |error| {
+                LoomCommandError::rejection(
+                    LOOM_EVIDENCE_UNREADABLE,
+                    format!("evidence {artifact_id} archived bytes cannot be read: {error:#}"),
+                )
+            },
+        )?
+    } else {
+        Some(
+            remote_artifact::read_verified_bytes(connection, data_dir, &plan_id, &artifact_id)?
+                .ok_or_else(|| {
+                    LoomCommandError::rejection(
+                        LOOM_EVIDENCE_UNREADABLE,
+                        "Remote evidence cannot fall back to a local workspace path",
+                    )
+                })?,
+        )
+    };
+    match bytes {
+        None => {
+            preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::NotArchived);
+        }
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(text) if !text.contains('\0') => preview.text = Some(text),
+            _ => preview.unavailable_reason = Some(LoomArtifactPreviewUnavailableReason::Binary),
+        },
+    }
+    Ok(preview)
 }
 
 pub fn candidates_list(database: &Database, mission_id: &str) -> Result<Vec<LoomCandidate>> {
@@ -2866,6 +3730,25 @@ pub fn review_record(
         )
         .into());
     }
+    // Only the newest Candidate of the Task can be judged. An older one was already replaced by a
+    // rework, and accepting it would finish the Task on delivery evidence the rework superseded.
+    let newest_candidate: Option<String> = transaction
+        .query_row(
+            "SELECT candidate_id FROM loom_candidate WHERE plan_id=?1 AND task_id=?2
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![&plan_id, &task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if newest_candidate.as_deref() != Some(candidate_id.as_str()) {
+        return Err(LoomCommandError::rejection(
+            LOOM_CANDIDATE_STALE,
+            format!(
+                "candidate {candidate_id} is not the newest candidate of task {task_id}; a superseded delivery cannot be accepted or rejected"
+            ),
+        )
+        .into());
+    }
     let reviewed: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM loom_review WHERE candidate_id=?1)",
         [&candidate_id],
@@ -3197,6 +4080,24 @@ pub fn verification_record(
     database: &mut Database,
     input: LoomVerificationRecordInput,
 ) -> Result<LoomVerificationRecordResult> {
+    verification_record_internal(database, None, input)
+}
+
+/// The application supplies its trusted data directory; no request field can
+/// choose a local archive root or convert a Node filename into an A path.
+pub fn verification_record_with_archives(
+    database: &mut Database,
+    data_dir: &std::path::Path,
+    input: LoomVerificationRecordInput,
+) -> Result<LoomVerificationRecordResult> {
+    verification_record_internal(database, Some(data_dir), input)
+}
+
+fn verification_record_internal(
+    database: &mut Database,
+    archive_root: Option<&std::path::Path>,
+    input: LoomVerificationRecordInput,
+) -> Result<LoomVerificationRecordResult> {
     let mission_id = required_field("verification record", "missionId", &input.mission_id)?;
     let task_id = required_field("verification record", "taskId", &input.task_id)?;
     let candidate_id = required_field("verification record", "candidateId", &input.candidate_id)?;
@@ -3204,6 +4105,12 @@ pub fn verification_record(
     let method = required_field("verification record", "method", &input.method)?;
     let executor_id = required_field("verification record", "executorId", &input.executor_id)?;
     let result = input.result;
+    // Where the archived bytes live: the trusted data directory the caller supplied, or the
+    // directory the open database itself sits in. A process working directory is never an answer
+    // here, so an unknown root stays `None` rather than turning into a relative path.
+    let snapshot_root = archive_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| database.path().parent().map(std::path::Path::to_path_buf));
 
     let transaction = database
         .connection_mut()
@@ -3350,8 +4257,14 @@ pub fn verification_record(
             )
             .into());
         }
-        let workspace = mission_workspace(&transaction, &mission_id)?;
-        ensure_evidence_bytes_match(&transaction, &workspace, &plan_id, &checked_evidence)?;
+        ensure_evidence_bytes_match(
+            &transaction,
+            &mission_id,
+            archive_root,
+            snapshot_root.as_deref(),
+            &plan_id,
+            &checked_evidence,
+        )?;
     }
 
     let verification_id = format!("verification_{}", uuid::Uuid::new_v4().simple());
@@ -3635,6 +4548,10 @@ mod tests {
                 "assertion imported_draft_task_has_no_blocked_reason"
             );
             assert_eq!(
+                task.execution_host_id, None,
+                "assertion imported_task_starts_unpinned"
+            );
+            assert_eq!(
                 task.acceptance_criteria, plan.acceptance_criteria,
                 "assertion every_task_inherits_the_plan_criteria_snapshot"
             );
@@ -3656,6 +4573,33 @@ mod tests {
                 "assertion task_acceptance_criteria_wire_shape_is_version_and_criteria"
             );
         }
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_task SET execution_host_id=?1 WHERE task_id='task_a'",
+                ["node_desk"],
+            )
+            .unwrap();
+        let pinned = tasks_list(&database, &mission_id).unwrap();
+        assert_eq!(
+            pinned
+                .iter()
+                .find(|task| task.task_id == "task_a")
+                .unwrap()
+                .execution_host_id
+                .as_deref(),
+            Some("node_desk"),
+            "assertion tasks_list_returns_the_pinned_execution_host"
+        );
+        assert_eq!(
+            pinned
+                .iter()
+                .find(|task| task.task_id == "task_b")
+                .unwrap()
+                .execution_host_id,
+            None,
+            "assertion an_unpinned_task_stays_unpinned"
+        );
 
         let dependencies = dependencies_list(&database, &mission_id).unwrap();
         assert_eq!(
@@ -4135,6 +5079,53 @@ mod tests {
             .unwrap();
     }
 
+    /// Your own claim's lease, read straight from the row so no projection can hide a write.
+    fn claim_lease(database: &Database, claim_id: &str) -> String {
+        database
+            .connection()
+            .query_row(
+                "SELECT lease_expires_at FROM loom_claim WHERE claim_id=?1",
+                [claim_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn released_at(database: &Database, claim_id: &str) -> Option<String> {
+        database
+            .connection()
+            .query_row(
+                "SELECT released_at FROM loom_claim WHERE claim_id=?1",
+                [claim_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The exact instant a lease would carry after one more full lease length, rendered the same
+    /// way the heartbeat renders it, so "extended by one lease length" is proven, not approximated.
+    fn lease_after_one_more_length(lease: &str) -> String {
+        (chrono::DateTime::parse_from_rfc3339(lease)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::seconds(DEFAULT_CLAIM_LEASE_SECONDS))
+        .to_rfc3339()
+    }
+
+    fn heartbeat_input(
+        mission_id: &str,
+        agent_run_id: &str,
+        claim_id: &str,
+        fence_generation: i64,
+    ) -> LoomClaimHeartbeatInput {
+        LoomClaimHeartbeatInput {
+            mission_id: mission_id.into(),
+            agent_run_id: agent_run_id.into(),
+            claim_id: claim_id.into(),
+            fence_generation,
+        }
+    }
+
     #[test]
     fn release_moves_a_draft_task_to_ready_and_a_second_release_is_rejected() {
         let mut database = fixture();
@@ -4395,6 +5386,433 @@ mod tests {
             task_status(&database, "task_a"),
             "READY",
             "assertion takeover_keeps_the_task_ready"
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_extends_the_lease_of_the_run_that_holds_it() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let first_lease = claim_lease(&database, &claim.claim_id);
+        assert_eq!(
+            first_lease, claim.lease_expires_at,
+            "assertion the claim receipt names the stored lease"
+        );
+
+        let renewed = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            renewed.claim_id, claim.claim_id,
+            "assertion a heartbeat renews the very claim it names"
+        );
+        assert_eq!(
+            renewed.task_id, "task_a",
+            "assertion the Task comes from the claim row, not from the caller"
+        );
+        assert_eq!(
+            renewed.agent_run_id, "run_one",
+            "assertion the receipt echoes the holder's own Run"
+        );
+        assert_eq!(
+            renewed.fence_generation, claim.fence_generation,
+            "assertion a heartbeat never advances the fence"
+        );
+        assert_eq!(
+            renewed.previous_lease_expires_at, first_lease,
+            "assertion the receipt names the lease it replaced"
+        );
+        assert_eq!(
+            renewed.lease_expires_at,
+            lease_after_one_more_length(&first_lease),
+            "assertion a heartbeat lengthens the lease by exactly one lease length"
+        );
+        assert!(
+            renewed.lease_expires_at > first_lease,
+            "assertion the renewed lease is later than the lease it replaced"
+        );
+        assert_eq!(
+            renewed.extended_seconds, DEFAULT_CLAIM_LEASE_SECONDS,
+            "assertion the receipt reports the one lease length it moved"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            renewed.lease_expires_at,
+            "assertion the renewed lease is what the row now holds"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion a heartbeat writes no second claim row"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion a heartbeat leaves exactly one open claim"
+        );
+        assert_eq!(
+            task_status(&database, "task_a"),
+            "READY",
+            "assertion a heartbeat does not move the Task"
+        );
+        let projected = claims_list(&database, &mission_id)
+            .unwrap()
+            .claims
+            .into_iter()
+            .find(|row| row.claim_id == claim.claim_id)
+            .unwrap();
+        assert_eq!(
+            projected.lease_expires_at, renewed.lease_expires_at,
+            "assertion the claim projection shows the renewed lease"
+        );
+        assert!(
+            !projected.expired,
+            "assertion a renewed lease is still live in the projection"
+        );
+
+        // A second heartbeat extends the lease it finds, so a Run that keeps beating keeps moving
+        // forward instead of falling back to a fixed wall-clock instant.
+        let again = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            again.lease_expires_at,
+            lease_after_one_more_length(&renewed.lease_expires_at),
+            "assertion every heartbeat extends the lease it finds"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            1,
+            "assertion a second heartbeat writes no second claim row"
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_never_revives_an_expired_lease() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat expired");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        expire_lease(&database, &claim.claim_id);
+        let expired_lease = claim_lease(&database, &claim.claim_id);
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_EXPIRED,
+            "assertion a lease that already ran out is not renewed by its own heartbeat"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            expired_lease,
+            "assertion a refused heartbeat writes nothing"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion a refused heartbeat leaves the lease where it was"
+        );
+        assert_eq!(
+            released_at(&database, &claim.claim_id),
+            None,
+            "assertion a refused heartbeat does not release the expired claim"
+        );
+
+        // The only way forward for the Task is a takeover, which releases this lease and advances
+        // the fence; the old heartbeat can never walk that back.
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation, 2,
+            "assertion a takeover after an expiry still advances the fence"
+        );
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion a heartbeat cannot renew the released lease of a takeover"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            expired_lease,
+            "assertion a late heartbeat never revives a dead lease"
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_refuses_a_stale_fence_generation() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat fence");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let first_lease = claim_lease(&database, &claim.claim_id);
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation + 1,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_FENCE_STALE,
+            "assertion a generation the claim never reached is a stale fence"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            first_lease,
+            "assertion a stale fence renews nothing"
+        );
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(&mission_id, "run_one", &claim.claim_id, 0),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_INVALID_INPUT,
+            "assertion generation zero is not a fence at all"
+        );
+
+        // Fence 2 exists, but it belongs to the takeover's claim: naming the new generation with
+        // an older holder's identity is still a stale pair, not a renewal.
+        expire_lease(&database, &claim.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation, 2,
+            "assertion the takeover holds the newest generation"
+        );
+        let takeover_lease = claim_lease(&database, &takeover.claim_id);
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(&mission_id, "run_two", &takeover.claim_id, 1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_FENCE_STALE,
+            "assertion the previous generation cannot renew the current claim"
+        );
+        assert_eq!(
+            claim_lease(&database, &takeover.claim_id),
+            takeover_lease,
+            "assertion a refused stale pair leaves the current lease untouched"
+        );
+        claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_two",
+                &takeover.claim_id,
+                takeover.fence_generation,
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn claim_heartbeat_refuses_another_runs_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat foreign");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let first_lease = claim_lease(&database, &claim.claim_id);
+
+        // Another Run knows the claim id and the generation, and still cannot renew it.
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_two",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_AGENT_RUN_MISMATCH,
+            "assertion a claim belongs to the Run that holds it"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            first_lease,
+            "assertion a foreign heartbeat extends nothing"
+        );
+
+        // The refusal was about the Run, not about the lease: its own holder still renews it.
+        let renewed = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            renewed.lease_expires_at,
+            lease_after_one_more_length(&first_lease),
+            "assertion the holder still renews the same lease"
+        );
+    }
+
+    #[test]
+    fn claim_heartbeat_refuses_a_released_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM claim heartbeat released");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        let live_lease = claim_lease(&database, &claim.claim_id);
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at='2026-11-18T00:00:00+00:00' WHERE claim_id=?1",
+                [&claim.claim_id],
+            )
+            .unwrap();
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion a released claim is no longer a claim to renew"
+        );
+        assert_eq!(
+            claim_lease(&database, &claim.claim_id),
+            live_lease,
+            "assertion a released lease is never extended"
+        );
+
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(&mission_id, "run_one", "claim_missing", 1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion an unknown claim id has nothing to renew"
+        );
+
+        // A claim of another Mission is not reachable through this Mission at all.
+        let other_mission = create_mission(&mut database, "LOOM claim heartbeat other mission");
+        let mut other_plan = plan_input(&other_mission);
+        other_plan.tasks = vec![task("task_c", "Task C")];
+        other_plan.dependencies = vec![];
+        plan_import(&mut database, other_plan).unwrap();
+        task_release(&mut database, release_input(&other_mission, "task_c")).unwrap();
+        let other = claim_acquire(
+            &mut database,
+            claim_input(&other_mission, "task_c", "run_other", "command_other"),
+        )
+        .unwrap();
+        let other_lease = claim_lease(&database, &other.claim_id);
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(&mission_id, "run_other", &other.claim_id, other.fence_generation),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion a heartbeat is scoped to its own Mission"
+        );
+        assert_eq!(
+            claim_lease(&database, &other.claim_id),
+            other_lease,
+            "assertion a cross-Mission heartbeat extends nothing"
+        );
+        assert_eq!(
+            claim_rows(&database),
+            2,
+            "assertion no refused heartbeat wrote a claim row"
         );
     }
 
@@ -6622,6 +8040,558 @@ mod tests {
         );
     }
 
+    /// LOOM 自有决定（P0 步骤 1）：`live_claim_for_run` 只报「这个 Run 现在真的还活着」的 claim。
+    /// 释放过的、过期的、以及被更新一代 fence 接管的一律不报。
+    #[test]
+    fn live_claim_for_run_reports_only_the_open_unexpired_claim() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM live claim for run");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("an open, unexpired lease must read as live");
+        assert_eq!(live.claim_id, claim.claim_id.as_str());
+        assert_eq!(live.agent_run_id, "run_one");
+        assert_eq!(
+            live.fence_generation, 1,
+            "assertion the live claim reports its own fence generation"
+        );
+        assert_eq!(live.lease_expires_at, claim.lease_expires_at.as_str());
+        assert!(
+            live_claim_for_run(database.connection(), "run_two", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released or expired lease is never reported as live"
+        );
+
+        // 过期租约不算活：过期就是没有活 claim，不回退也不静默续期。
+        expire_lease(&database, &claim.claim_id);
+        assert!(
+            live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released or expired lease is never reported as live"
+        );
+
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation, 2,
+            "assertion the takeover advances the fence generation"
+        );
+        assert!(
+            live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released or expired lease is never reported as live"
+        );
+        let second = live_claim_for_run(database.connection(), "run_two", chrono::Utc::now())
+            .unwrap()
+            .expect("the takeover Run holds the live claim");
+        assert_eq!(second.claim_id, takeover.claim_id.as_str());
+        assert_eq!(second.fence_generation, 2);
+
+        // 显式释放同样立刻失效：交还的 claim 不能再支撑提交。
+        database
+            .connection()
+            .execute(
+                "UPDATE loom_claim SET released_at=?1 WHERE claim_id=?2",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), &takeover.claim_id],
+            )
+            .unwrap();
+        assert!(
+            live_claim_for_run(database.connection(), "run_two", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released or expired lease is never reported as live"
+        );
+    }
+
+    /// P0 步骤 2：写授权携带的就是这个 Run 当下真正持有的 claim。真库真租约，
+    /// 不构造假 claim：活 claim → 三字段齐全；过期 claim → 三字段为空。
+    #[test]
+    fn pi_file_grant_carries_only_a_live_claim() {
+        use crate::pi::{PiFileAccessMode, PiFileGrant, now_epoch_ms};
+
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM pi grant claim");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+        let workspace = std::env::temp_dir()
+            .join(format!("rovai-loom-pi-grant-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let build = |claim: Option<&LiveClaim>| {
+            PiFileGrant::for_run(
+                PiFileAccessMode::WorkspaceWorkflow,
+                "run_one",
+                "bot_one",
+                1,
+                &workspace,
+                &workspace.join("guard.jsonl"),
+                now_epoch_ms(),
+                claim,
+                true,
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("an open, unexpired lease must read as live");
+        let grant = build(Some(&live));
+        assert_eq!(grant.claim_id, claim.claim_id.as_str());
+        assert_eq!(grant.fence_generation, 1);
+        assert_eq!(
+            grant.claim(),
+            Some((
+                claim.claim_id.as_str(),
+                1,
+                chrono::DateTime::parse_from_rfc3339(&claim.lease_expires_at)
+                    .unwrap()
+                    .timestamp_millis()
+            )),
+            "assertion the grant carries the exact claim, fence and lease the Run holds"
+        );
+
+        // 未绑定 LOOM 任务（普通聊天）的 Run 本来就没有 claim：同样为空，而且不是报错。
+        let unbound = build(None);
+        assert_eq!(unbound.claim_id, "");
+        assert_eq!(unbound.fence_generation, 0);
+        assert_eq!(unbound.lease_expires_at_epoch_ms, 0);
+        // 过期租约既不算活 claim，也不会被塞进写授权冒充活 fence。
+        expire_lease(&database, &claim.claim_id);
+        let expired =
+            live_claim_for_run(database.connection(), "run_one", chrono::Utc::now()).unwrap();
+        assert!(expired.is_none());
+        let grant = build(expired.as_ref());
+        assert_eq!(
+            grant.claim_id, "",
+            "assertion an expired lease is never carried into a write grant"
+        );
+        assert_eq!(grant.fence_generation, 0);
+        assert_eq!(grant.lease_expires_at_epoch_ms, 0);
+        assert!(grant.claim().is_none());
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// P0 步骤 3：绑定判据来自 LOOM 任务（dispatch），不来自 claim 行是否存在。
+    /// r9 里 Run 先启动、6 秒后才 claim，那一刻根本没有 `loom_claim` 行，但「这一段工作绑了
+    /// LOOM 任务」已经是账本里的事实。这里用一个只含三张表的最小关系 fixture 把这条 SQL 钉住。
+    #[test]
+    fn loom_binding_for_run_requires_a_claim_for_a_dispatched_run() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE loom_claim(claim_id TEXT, plan_id TEXT, task_id TEXT,
+                         agent_run_id TEXT, claimant_agent_id TEXT, command_id TEXT,
+                         lease_expires_at TEXT, fence_generation INTEGER, claimed_at TEXT,
+                         released_at TEXT);
+                 CREATE TABLE camp_message_delivery(id TEXT PRIMARY KEY, claimed_agent_run_id TEXT);
+                 CREATE TABLE loom_control_dispatch(dispatch_id TEXT PRIMARY KEY, delivery_id TEXT);
+                 INSERT INTO camp_message_delivery VALUES('delivery_one','run_bound');
+                 INSERT INTO loom_control_dispatch VALUES('dispatch_one','delivery_one');",
+            )
+            .unwrap();
+
+        // r9 形状：已绑定 LOOM 任务、但还没有 claim 行。
+        let bound = loom_binding_for_run(&connection, "run_bound", chrono::Utc::now()).unwrap();
+        assert!(
+            bound.requires_claim,
+            "assertion a Run carrying a LOOM dispatch requires a claim before it holds one"
+        );
+        assert!(bound.claim.is_none());
+
+        // 普通聊天 Run：没有 dispatch，也没有 claim。
+        let chat = loom_binding_for_run(&connection, "run_chat", chrono::Utc::now()).unwrap();
+        assert!(
+            !chat.requires_claim,
+            "assertion an ordinary chat Run is never gated on a claim"
+        );
+        assert!(chat.claim.is_none());
+
+        // 活 claim 自己就是绑定：账本里查不到 dispatch 也不能把门禁关掉。
+        connection
+            .execute(
+                "INSERT INTO loom_claim VALUES('claim_one','plan_one','task_a','run_claimed',
+                     'agent_one','command_one',?1,1,'2026-08-31T00:00:00+00:00',NULL)",
+                [(chrono::Utc::now() + chrono::Duration::seconds(90)).to_rfc3339()],
+            )
+            .unwrap();
+        let claimed = loom_binding_for_run(&connection, "run_claimed", chrono::Utc::now()).unwrap();
+        assert!(claimed.requires_claim);
+        assert_eq!(claimed.claim.unwrap().claim_id, "claim_one");
+
+        // 旧库没有控制平面表：读不到表就是「没有绑定」，既不是报错也不是偷偷放行。
+        let bare = rusqlite::Connection::open_in_memory().unwrap();
+        bare.execute_batch(
+            "CREATE TABLE loom_claim(claim_id TEXT, plan_id TEXT, task_id TEXT,
+                     agent_run_id TEXT, claimant_agent_id TEXT, command_id TEXT,
+                     lease_expires_at TEXT, fence_generation INTEGER, claimed_at TEXT,
+                     released_at TEXT);",
+        )
+        .unwrap();
+        assert!(
+            !loom_binding_for_run(&bare, "run_chat", chrono::Utc::now())
+                .unwrap()
+                .requires_claim
+        );
+    }
+
+    /// P0 步骤 3：`loom.claim` 成功（含同一 Run 的换代）之后重签的写授权，携带的就是这一代
+    /// claim 与 fence；而且重签只动 claim，不动 Run/epoch/workspace/过期时刻。
+    #[test]
+    fn a_reissued_grant_carries_the_fence_loom_claim_just_created() {
+        use crate::pi::{PiFileAccessMode, PiFileGrant, now_epoch_ms};
+
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM pi grant reissue");
+        let workspace = std::env::temp_dir()
+            .join(format!("rovai-loom-pi-grant-reissue-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log = workspace.join("guard.jsonl");
+        let now = now_epoch_ms();
+
+        // r9：Run 先启动，写授权先签发，此刻还没有 claim 行。
+        let launched = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run_one",
+            "bot_one",
+            1,
+            &workspace,
+            &log,
+            now,
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(launched.requires_claim);
+        assert!(launched.claim().is_none());
+
+        // loom.claim 成功：Core 把同一份 grant 文档重签成新一代。
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("an open, unexpired lease must read as live");
+        let after_claim = launched
+            .reissued_for_claim(Some(&live), true, now_epoch_ms())
+            .unwrap();
+        assert_eq!(after_claim.claim_id, claim.claim_id.as_str());
+        assert_eq!(after_claim.fence_generation, 1);
+        assert_eq!(
+            after_claim.expires_at_epoch_ms, launched.expires_at_epoch_ms,
+            "assertion re-issuing after loom.claim never extends the grant expiry"
+        );
+
+        // 同一 Run 的换代（过期后被自己重新领回）：fence 前进，重签的是新一代。
+        expire_lease(&database, &claim.claim_id);
+        let second = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            second.fence_generation, 2,
+            "assertion the takeover advances the fence generation"
+        );
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("the re-claim Run holds the live claim");
+        let reissued = after_claim
+            .reissued_for_claim(Some(&live), true, now_epoch_ms())
+            .unwrap();
+        assert_eq!(reissued.claim_id, second.claim_id.as_str());
+        assert_eq!(
+            reissued.fence_generation, 2,
+            "assertion the re-issued write grant carries the fence loom.claim just created"
+        );
+        assert_ne!(reissued.claim_id, after_claim.claim_id);
+        assert!(reissued.requires_claim);
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// P0 步骤 6：`loom.claim_heartbeat` 续租成功后，写授权必须和 `loom.claim` 一样重签——guard
+    /// 比的是 grant 文档里那条 lease。只改库不重签，一个还在心跳的 Run 会在旧租约到点的那一刻被
+    /// 判成 `claim_expired`。这里把「续租 → 读回活 claim → 重签」整条链钉死。
+    #[test]
+    fn a_heartbeat_reissues_the_write_authorisation_it_extends() {
+        use crate::pi::{PiFileAccessMode, PiFileGrant, now_epoch_ms};
+
+        let lease_epoch_ms = |lease: &str| {
+            chrono::DateTime::parse_from_rfc3339(lease)
+                .unwrap()
+                .timestamp_millis()
+        };
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM pi grant heartbeat");
+        let workspace = std::env::temp_dir().join(format!(
+            "rovai-loom-pi-grant-heartbeat-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log = workspace.join("guard.jsonl");
+
+        // r9 形状：Run 先启动、写授权先签发（空三元组 + requiresClaim），随后才 claim。
+        let launched = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run_one",
+            "bot_one",
+            1,
+            &workspace,
+            &log,
+            now_epoch_ms(),
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("the claiming Run holds the live claim");
+        let after_claim = launched
+            .reissued_for_claim(Some(&live), true, now_epoch_ms())
+            .unwrap();
+        let claimed_lease_ms = lease_epoch_ms(&claim.lease_expires_at);
+        assert_eq!(
+            after_claim.lease_expires_at_epoch_ms, claimed_lease_ms,
+            "assertion the grant re-issued after loom.claim carries the lease the claim wrote"
+        );
+
+        // 心跳：库里的 lease 前移，fence 不动。
+        let renewed = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &claim.claim_id,
+                claim.fence_generation,
+            ),
+        )
+        .unwrap();
+        let renewed_lease_ms = lease_epoch_ms(&renewed.lease_expires_at);
+        assert!(
+            renewed_lease_ms > claimed_lease_ms,
+            "assertion a heartbeat moves the lease the claim holds forward"
+        );
+        assert_eq!(
+            renewed.fence_generation, claim.fence_generation,
+            "assertion a heartbeat never advances the fence"
+        );
+
+        // 不重签的样子：guard 只会在旧租约到点那一刻把仍在心跳的 Run 判成 `claim_expired`，
+        // 而这正是缺口——grant 必须跟着续过的租约走。
+        assert!(
+            claimed_lease_ms >= after_claim.lease_expires_at_epoch_ms,
+            "assertion a grant that was not re-issued is expired from the instant the old lease ends"
+        );
+
+        // 重签（`application::handle_builtin_operation` 在心跳成功后做的正是这一步）：文档带的是
+        // 续过的租约，在同一个时刻照旧放行。
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("a renewed lease still reads as live");
+        assert_eq!(
+            lease_epoch_ms(&live.lease_expires_at),
+            renewed_lease_ms,
+            "assertion the live claim read after a heartbeat is the renewed lease"
+        );
+        let reissued = after_claim
+            .reissued_for_claim(Some(&live), true, now_epoch_ms())
+            .unwrap();
+        assert_eq!(
+            reissued.lease_expires_at_epoch_ms, renewed_lease_ms,
+            "assertion re-issuing after loom.claim_heartbeat carries the renewed lease"
+        );
+        assert!(
+            claimed_lease_ms < reissued.lease_expires_at_epoch_ms,
+            "assertion the re-issued authorisation is live at the instant the old one expired"
+        );
+        assert_ne!(
+            reissued.lease_expires_at_epoch_ms, after_claim.lease_expires_at_epoch_ms,
+            "assertion a heartbeat re-issue is a real rewrite, not a no-op"
+        );
+        // 重签只动 claim 三元组：Run/bot/epoch/workspace/工具/日志/过期时刻一字节不变。
+        assert_eq!(reissued.claim_id, after_claim.claim_id);
+        assert_eq!(reissued.fence_generation, after_claim.fence_generation);
+        assert!(reissued.requires_claim);
+        assert_eq!(reissued.schema, after_claim.schema);
+        assert_eq!(reissued.run_id, after_claim.run_id);
+        assert_eq!(reissued.bot_id, after_claim.bot_id);
+        assert_eq!(reissued.execution_epoch, after_claim.execution_epoch);
+        assert_eq!(reissued.workspace_real, after_claim.workspace_real);
+        assert_eq!(reissued.allowed_tools, after_claim.allowed_tools);
+        assert_eq!(reissued.log_path, after_claim.log_path);
+        assert_eq!(
+            reissued.expires_at_epoch_ms, after_claim.expires_at_epoch_ms,
+            "assertion a heartbeat re-issue never extends the grant expiry"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// P0 步骤 6：被接管的旧 Run 再也拿不到活的写授权。接管只在旧租约过期后发生，旧 Run 手里那份
+    /// 文档因此从它自己的租约终点起就是 `claim_expired`；而且没有任何路径能把它救回来——
+    /// `live_claim_for_run` 读不到活 claim（接管已释放），心跳对已释放的 claim 直接
+    /// `LOOM_CLAIM_ABSENT`，所以 Core 也永远不会为它重签出更晚的 lease。fence 更旧的提交与证据
+    /// 登记由 `candidate_record` / `artifact_register` 自己拒
+    /// （`artifact_register_from_a_superseded_claim_is_refused`）。
+    #[test]
+    fn a_takeover_leaves_only_the_new_fence_with_a_live_write_authorisation() {
+        use crate::pi::{PiFileAccessMode, PiFileGrant, now_epoch_ms};
+
+        let lease_epoch_ms = |lease: &str| {
+            chrono::DateTime::parse_from_rfc3339(lease)
+                .unwrap()
+                .timestamp_millis()
+        };
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM pi grant takeover");
+        let workspace = std::env::temp_dir().join(format!(
+            "rovai-loom-pi-grant-takeover-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log = workspace.join("guard.jsonl");
+
+        let stale = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("the claiming Run holds the live claim");
+        let stale_grant = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run_one",
+            "bot_one",
+            1,
+            &workspace,
+            &log,
+            now_epoch_ms(),
+            Some(&live),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let stale_lease_ms = lease_epoch_ms(&stale.lease_expires_at);
+        assert_eq!(
+            stale_grant.lease_expires_at_epoch_ms, stale_lease_ms,
+            "assertion the superseded Run's document carries the lease it holds"
+        );
+
+        // 租约到期后另一个 Run 接管：旧 claim 被释放，fence 前进一代。
+        expire_lease(&database, &stale.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation,
+            stale.fence_generation + 1,
+            "assertion a takeover advances the fence generation"
+        );
+
+        // 旧 Run 没有任何活 claim，也没有任何路径能把它救回来。
+        assert!(
+            live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+                .unwrap()
+                .is_none(),
+            "assertion a released claim is never live for its superseded Run"
+        );
+        let error = claim_heartbeat(
+            &mut database,
+            heartbeat_input(
+                &mission_id,
+                "run_one",
+                &stale.claim_id,
+                stale.fence_generation,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion a superseded Run cannot heartbeat a released claim into a new lease"
+        );
+        // 它手里那份文档从自己的租约终点起就是过期的：guard 的 `at >= leaseExpiresAtEpochMs`
+        // 在那一刻就把写拿掉，不需要任何额外机制。
+        assert!(
+            stale_lease_ms >= stale_grant.lease_expires_at_epoch_ms,
+            "assertion the superseded Run's grant expires with the lease the takeover ended"
+        );
+        // 就算 Core 以后以「没有活 claim」重签，要求开关也只能保持开着（guard 此时报
+        // `claim_missing`，而不是回到先领后写之前的放行）。
+        let emptied = stale_grant
+            .reissued_for_claim(None, true, now_epoch_ms())
+            .unwrap();
+        assert!(emptied.claim().is_none());
+        assert!(
+            emptied.requires_claim,
+            "assertion losing the claim never switches the write gate off"
+        );
+
+        // 只有接管者的 fence 是活的，而它拿的正是新一代。
+        let live = live_claim_for_run(database.connection(), "run_two", chrono::Utc::now())
+            .unwrap()
+            .expect("the takeover's Run holds the only live claim");
+        assert_eq!(live.claim_id, takeover.claim_id);
+        assert_eq!(live.fence_generation, takeover.fence_generation);
+        assert_ne!(
+            live.claim_id, stale.claim_id,
+            "assertion the takeover binds a new claim row, never the released one"
+        );
+        let takeover_grant = PiFileGrant::for_run(
+            PiFileAccessMode::WorkspaceWorkflow,
+            "run_two",
+            "bot_two",
+            1,
+            &workspace,
+            &log,
+            now_epoch_ms(),
+            Some(&live),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            takeover_grant.fence_generation, takeover.fence_generation,
+            "assertion the new fence is the only write authority on the Task"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
     #[test]
     fn claims_list_stays_inside_the_mission_and_never_writes() {
         let mut database = fixture();
@@ -6747,7 +8717,7 @@ mod tests {
                     "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,source_directory,
                          repository_root,git_common_dir,worktree_path,working_directory,branch,base_sha,
                          preparation_token,state,created_at,updated_at)
-                     VALUES(?1,?2,?3,'host',?4,?4,?5,?6,?6,?7,'0000','tok',?8,'2026-10-31','2026-10-31')",
+                     VALUES(?1,?2,?3,(SELECT id FROM mission_execution_host WHERE singleton=1),?4,?4,?5,?6,?6,?7,'0000','tok',?8,'2026-10-31','2026-10-31')",
                     params![
                         id,
                         mission_id,
@@ -6777,6 +8747,15 @@ mod tests {
             .execute("DELETE FROM mission_workspace WHERE id='ws-old'", [])
             .unwrap();
         insert("ready", "ws-ready");
+        database.connection().execute_batch(
+            "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,source_directory,
+                repository_root,git_common_dir,worktree_path,working_directory,branch,base_sha,
+                preparation_token,state,generation,created_at,updated_at)
+             SELECT 'ws-remote-shadow',mission_id,camp_id,'fixture-other-node',source_directory,
+                repository_root,git_common_dir,worktree_path,'Z:/must-not-read-on-core',branch,
+                base_sha,'remote-fixture-token','ready',99,created_at,updated_at
+             FROM mission_workspace WHERE id='ws-ready';",
+        ).unwrap();
         assert_eq!(
             mission_workspace(database.connection(), &mission_id).unwrap(),
             worktree,
@@ -6869,36 +8848,585 @@ mod tests {
         assert_eq!(rows, 1, "assertion a replay writes no second row");
     }
 
+    /// Registration archives the bytes it hashed. The workspace file is then rewritten, and the
+    /// archived copy still holds what was registered; a second path in the same plan keeps its own
+    /// snapshot instead of replacing the first.
     #[test]
-    fn artifact_register_refuses_changed_bytes_under_a_used_path() {
+    fn artifact_register_archives_the_bytes_it_hashed() {
         let mut database = fixture();
-        let mission_id = create_mission(&mut database, "LOOM artifact changed");
+        let mission_id = create_mission(&mut database, "LOOM artifact archive");
         plan_import(&mut database, plan_input(&mission_id)).unwrap();
-        write_workspace_file(&database, &mission_id, "report.md", "original");
-        register(&mut database, &mission_id, "report.md");
+        write_workspace_file(&database, &mission_id, "report.md", "archived bytes");
+        let first = register(&mut database, &mission_id, "report.md");
+        let preview_input = json!({"missionId":mission_id,"artifactId":first.artifact_id});
+        assert!(serde_json::from_value::<LoomArtifactPreviewInput>(preview_input.clone()).is_ok());
+        for field in ["relativePath", "path", "dataDir"] {
+            let mut unknown = preview_input.clone();
+            unknown[field] = json!("../untrusted");
+            assert!(serde_json::from_value::<LoomArtifactPreviewInput>(unknown).is_err());
+        }
+        let preview = |database: &OwnedTestDatabase, mission_id: &str, artifact_id: &str| {
+            artifact_preview(
+                database,
+                database.directory(),
+                LoomArtifactPreviewInput {
+                    mission_id: mission_id.into(),
+                    artifact_id: artifact_id.into(),
+                },
+            )
+        };
+        let expected = LoomArtifactPreviewResult {
+            artifact_id: first.artifact_id.clone(),
+            relative_path: first.relative_path.clone(),
+            content_type: first.content_type.clone(),
+            size_bytes: first.size_bytes,
+            sha256: first.sha256.clone(),
+            text: Some("archived bytes".into()),
+            unavailable_reason: None,
+        };
+        assert_eq!(preview(&database, &mission_id, &first.artifact_id).unwrap(), expected);
+        let other_mission = create_mission(&mut database, "LOOM preview other mission");
+        let other_plan = LoomPlanImportInput {
+            tasks: vec![task("other_task_a", "Task A"), task("other_task_b", "Task B")],
+            dependencies: vec![edge("other_task_a", "other_task_b")],
+            ..plan_input(&other_mission)
+        };
+        plan_import(&mut database, other_plan).unwrap();
+        let error = preview(&database, &other_mission, &first.artifact_id).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_NOT_FOUND
+        );
 
+        let archived = |database: &OwnedTestDatabase, artifact_id: &str| {
+            database
+                .connection()
+                .query_row(
+                    "SELECT blob_id, sha256, size_bytes FROM loom_artifact_snapshot
+                     WHERE artifact_id=?1",
+                    [artifact_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let before = archived(&database, &first.artifact_id);
+        assert_eq!(
+            before.1, first.sha256,
+            "assertion the archived digest is the one the artifact recorded"
+        );
+        assert_eq!(before.2, first.size_bytes);
+
+        write_workspace_file(&database, &mission_id, "report.md", "rewritten after register");
+        assert_eq!(preview(&database, &mission_id, &first.artifact_id).unwrap(), expected);
+        assert_eq!(
+            archived(&database, &first.artifact_id),
+            before,
+            "assertion rewriting the file leaves the archived bytes untouched"
+        );
+
+        write_workspace_file(&database, &mission_id, "second.md", "another artifact");
+        let second = register(&mut database, &mission_id, "second.md");
+        assert_ne!(second.artifact_id, first.artifact_id);
+        assert_ne!(
+            archived(&database, &second.artifact_id),
+            before,
+            "assertion a second path archives its own bytes"
+        );
+        let snapshots: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact_snapshot", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            snapshots, 2,
+            "assertion both artifacts keep their archived bytes"
+        );
+
+        // The archived bytes are Run execution-lifecycle content, so the legacy unreferenced
+        // collector must leave them alone even though the workspace file they came from was
+        // already rewritten: the snapshot row's Foreign Key is what protects them, and a read that
+        // still yields the registered bytes can only come from the archive, not from the file.
+        let store = crate::managed_blob::ManagedBlobStore::new(database.directory());
+        let collected = store
+            .collect_unreferenced_before(&mut database, "2999-01-01T00:00:00Z")
+            .unwrap();
+        assert!(
+            !collected.contains(&before.0),
+            "assertion the first artifact Blob is still referenced by its snapshot"
+        );
+        let second_before = archived(&database, &second.artifact_id);
+        assert!(
+            !collected.contains(&second_before.0),
+            "assertion the second artifact Blob is still referenced by its snapshot"
+        );
+        assert_eq!(
+            snapshot::read_verified_bytes(
+                database.connection(),
+                database.directory(),
+                &first.plan_id,
+                &first.artifact_id,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(b"archived bytes".as_slice()),
+            "assertion the archived bytes survive collection unchanged, never the rewritten file"
+        );
+        // A snapshot that committed keeps its Blob attachable, so the registration cleared the
+        // candidate marker instead of leaving the archived bytes collectable.
+        for blob_id in [&before.0, &second_before.0] {
+            let marker: (Option<String>, Option<String>) = database
+                .connection()
+                .query_row(
+                    "SELECT gc_candidate_at, gc_candidate_owner FROM managed_blob WHERE id=?1",
+                    [blob_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                marker,
+                (None, None),
+                "assertion a committed snapshot carries no GC candidate marker"
+            );
+        }
+
+        // Legacy rows have no archive: even a readable workspace file must not become a preview.
+        seed_evidence(&mut database, &mission_id);
+        let legacy = preview(&database, &mission_id, &evidence_id("evidence_one", &mission_id))
+            .unwrap();
+        assert_eq!(legacy.text, None);
+        assert_eq!(
+            legacy.unavailable_reason,
+            Some(LoomArtifactPreviewUnavailableReason::NotArchived)
+        );
+
+        let workspace = mission_workspace(database.connection(), &mission_id).unwrap();
+        for (path, bytes) in [
+            ("non-utf8.bin", vec![0xff, 0xfe]),
+            // Test NUL bytes, not the reserved Windows device filename NUL.bin.
+            ("nul-content.bin", b"text\0content".to_vec()),
+        ] {
+            std::fs::write(workspace.join(path), bytes).unwrap();
+            let artifact = register(&mut database, &mission_id, path);
+            let result = preview(&database, &mission_id, &artifact.artifact_id).unwrap();
+            assert_eq!(result.text, None);
+            assert_eq!(
+                result.unavailable_reason,
+                Some(LoomArtifactPreviewUnavailableReason::Binary)
+            );
+        }
+        let boundary_text = "x".repeat(MAX_ARTIFACT_PREVIEW_BYTES as usize);
+        write_workspace_file(&database, &mission_id, "boundary.txt", &boundary_text);
+        let boundary = register(&mut database, &mission_id, "boundary.txt");
+        assert_eq!(
+            preview(&database, &mission_id, &boundary.artifact_id).unwrap().text,
+            Some(boundary_text)
+        );
         write_workspace_file(
             &database,
             &mission_id,
-            "report.md",
-            "rewritten after the verdict",
+            "too-large.txt",
+            &"x".repeat(MAX_ARTIFACT_PREVIEW_BYTES as usize + 1),
         );
+        let large = register(&mut database, &mission_id, "too-large.txt");
+        let blob_path = |sha256: &str| {
+            database.directory().join("managed-blobs").join("sha256")
+                .join(&sha256[..2]).join(sha256)
+        };
+        // Removing the bytes proves the metadata refusal does not attempt a storage read.
+        std::fs::remove_file(blob_path(&large.sha256)).unwrap();
+        let too_large = preview(&database, &mission_id, &large.artifact_id).unwrap();
+        assert_eq!(too_large.text, None);
+        assert_eq!(
+            too_large.unavailable_reason,
+            Some(LoomArtifactPreviewUnavailableReason::TooLarge)
+        );
+
+        std::fs::write(blob_path(&first.sha256), b"corrupted").unwrap();
+        std::fs::remove_file(blob_path(&second.sha256)).unwrap();
+        let changes_before = database.connection().total_changes();
+        for artifact in [&first, &second] {
+            let error = preview(&database, &mission_id, &artifact.artifact_id).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<LoomCommandError>().unwrap().code(),
+                LOOM_EVIDENCE_UNREADABLE
+            );
+        }
+        let error = preview(&database, &other_mission, &first.artifact_id).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LoomCommandError>().unwrap().code(),
+            LOOM_EVIDENCE_NOT_FOUND,
+            "Mission scoping must precede reading the now-corrupt archive"
+        );
+        preview(&database, &mission_id, &boundary.artifact_id).unwrap();
+        assert_eq!(database.connection().total_changes(), changes_before);
+    }
+
+    /// A verification judges the archived bytes: evidence whose workspace files were rewritten
+    /// after registration still passes, and a Blob that no longer holds the recorded content fails
+    /// rather than quietly falling back to the file on disk.
+    #[test]
+    fn passed_verification_reads_the_archived_bytes_and_refuses_a_corrupted_blob() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact archive verify");
+        let candidate = submitted_candidate(&mut database, plan_input(&mission_id), "task_a");
+
+        // The seeded evidence predates archiving: registering each path again replays its row and
+        // gives it the archived bytes that still match the digest it recorded.
+        let one = register(&mut database, &mission_id, "evidence_one.txt");
+        let two = register(&mut database, &mission_id, "evidence_two.txt");
+        assert_eq!(one.artifact_id, evidence_id("evidence_one", &mission_id));
+        assert_eq!(two.artifact_id, evidence_id("evidence_two", &mission_id));
+
+        write_workspace_file(&database, &mission_id, "evidence_one.txt", "rewritten one");
+        write_workspace_file(&database, &mission_id, "evidence_two.txt", "rewritten two");
+        let verified = verification_record(
+            &mut database,
+            verification_input(
+                &mission_id,
+                "task_a",
+                &candidate.candidate_id,
+                "verify_archived",
+                LoomVerificationResult::Passed,
+            ),
+        )
+        .unwrap();
+        assert_eq!(verified.verification.result, LoomVerificationResult::Passed);
+
+        // Corrupting the archived Blob is a hard failure for the same check, and there is no
+        // second Candidate to record it against: the bytes cannot be substituted by the file.
+        let sha256: String = database
+            .connection()
+            .query_row(
+                "SELECT sha256 FROM loom_artifact_snapshot WHERE artifact_id=?1",
+                [&one.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blob = database
+            .directory()
+            .join("managed-blobs")
+            .join("sha256")
+            .join(&sha256[..2])
+            .join(&sha256);
+        std::fs::write(&blob, b"corrupted").unwrap();
+        let error = snapshot::read_verified_bytes(
+            database.connection(),
+            database.directory(),
+            &one.plan_id,
+            &one.artifact_id,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot be read"),
+            "assertion a corrupted Blob is not answered with other bytes: {error:#}"
+        );
+    }
+
+    #[test]
+    fn artifact_register_versions_a_path_without_rewriting_prior_evidence() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact versions");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "original");
+        let first = register(&mut database, &mission_id, "report.md");
+
+        write_workspace_file(&database, &mission_id, "report.md", "reviewed revision");
+        let revised = register(&mut database, &mission_id, "report.md");
+        assert_ne!(revised.artifact_id, first.artifact_id);
+        assert_ne!(revised.sha256, first.sha256);
+        assert_eq!(
+            register(&mut database, &mission_id, "report.md").artifact_id,
+            revised.artifact_id,
+            "manual registration with no Run remains idempotent"
+        );
+        for (artifact, expected) in [(&first, "original"), (&revised, "reviewed revision")] {
+            let preview = artifact_preview(
+                &database,
+                database.directory(),
+                LoomArtifactPreviewInput {
+                    mission_id: mission_id.clone(),
+                    artifact_id: artifact.artifact_id.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(preview.text.as_deref(), Some(expected));
+            assert_eq!(preview.sha256, artifact.sha256);
+        }
+
+        // The tool boundary supplies the authenticated Run and creator. Equal bytes in a new
+        // Run cannot replay an old producer's identity, including after a no-change rework.
+        let producer_input = |run: &str| LoomArtifactRegisterInput {
+            mission_id: mission_id.clone(),
+            task_id: Some("task_a".into()),
+            agent_run_id: Some(run.into()),
+            relative_path: "report.md".into(),
+            content_type: None,
+        };
+        // A producer Run may only register evidence for the Task it holds, so the delivery's claim
+        // is taken first and the rework below is a real takeover of it.
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run-first", "command_one"),
+        )
+        .unwrap();
+        let produced = artifact_register(
+            &mut database, "agent_1", producer_input("run-first"),
+        ).unwrap();
+        let replay = artifact_register(
+            &mut database, "agent_1", producer_input("run-first"),
+        ).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.artifact.artifact_id, produced.artifact.artifact_id);
+        // The rework is a new Run under a new claim: the first lease lapsed and the second Run took
+        // the Task over, which released the old claim and advanced the fence generation.
+        expire_lease(&database, &claim.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run-rework", "command_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            takeover.fence_generation,
+            claim.fence_generation + 1,
+            "assertion the rework advances the fence generation"
+        );
+        let next_run = artifact_register(
+            &mut database, "agent_1", producer_input("run-rework"),
+        ).unwrap();
+        assert!(!next_run.replayed);
+        assert_ne!(next_run.artifact.artifact_id, produced.artifact.artifact_id);
+        assert_eq!(next_run.artifact.sha256, produced.artifact.sha256);
+        assert_eq!(next_run.artifact.agent_run_id.as_deref(), Some("run-rework"));
+        assert_eq!(next_run.artifact.task_id.as_deref(), Some("task_a"));
+        assert_eq!(next_run.artifact.creator_id, "agent_1");
+    }
+
+    fn artifact_rows(database: &Database) -> i64 {
+        database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM loom_artifact", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// The producer registration the tool boundary builds: the Run is authenticated, the Task is what
+    /// the evidence claims to belong to, and the creator is who the Run acts for.
+    fn producer_evidence_input(
+        mission_id: &str,
+        task_id: &str,
+        agent_run_id: &str,
+    ) -> LoomArtifactRegisterInput {
+        LoomArtifactRegisterInput {
+            mission_id: mission_id.into(),
+            task_id: Some(task_id.into()),
+            agent_run_id: Some(agent_run_id.into()),
+            relative_path: "report.md".into(),
+            content_type: Some("text/markdown".into()),
+        }
+    }
+
+    #[test]
+    fn artifact_register_from_a_live_claim_is_recorded() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact live claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "delivered bytes");
+
+        let registered = artifact_register(
+            &mut database,
+            "agent_1",
+            producer_evidence_input(&mission_id, "task_a", "run_one"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            registered.artifact.agent_run_id.as_deref(),
+            Some(claim.agent_run_id.as_str()),
+            "assertion a fenced registration records the Run that holds the claim"
+        );
+        assert_eq!(
+            registered.artifact.task_id.as_deref(),
+            Some("task_a"),
+            "assertion a fenced registration records the claimed Task"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            1,
+            "assertion a live claim registers exactly one artifact"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion registering evidence leaves the holder's claim open"
+        );
+    }
+
+    #[test]
+    fn artifact_register_by_a_run_without_a_live_claim_is_refused() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact unclaimed");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        // RELEASED is not CLAIMED: only a live claim authorises a Run's evidence.
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "unclaimed bytes");
+
         let error = artifact_register(
             &mut database,
-            "local_user",
+            "agent_1",
+            producer_evidence_input(&mission_id, "task_a", "run_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&error),
+            LOOM_CLAIM_ABSENT,
+            "assertion artifact_register_by_a_run_without_a_live_claim_is_refused"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            0,
+            "assertion an unclaimed registration writes no artifact"
+        );
+
+        // A registration that names no Task binds itself to nothing, so the unfenced path that the
+        // User and the main assistant use keeps working.
+        let taskless = artifact_register(
+            &mut database,
+            "agent_1",
             LoomArtifactRegisterInput {
                 mission_id: mission_id.clone(),
                 task_id: None,
-                agent_run_id: None,
+                agent_run_id: Some("run_one".into()),
                 relative_path: "report.md".into(),
                 content_type: None,
             },
         )
+        .unwrap();
+        assert_eq!(
+            taskless.artifact.task_id, None,
+            "assertion a taskless registration binds no Task and needs no claim"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            1,
+            "assertion the taskless path records its artifact"
+        );
+    }
+
+    #[test]
+    fn artifact_register_from_an_expired_claim_is_refused() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact expired claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let claim = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "late bytes");
+        expire_lease(&database, &claim.claim_id);
+
+        let error = artifact_register(
+            &mut database,
+            "agent_1",
+            producer_evidence_input(&mission_id, "task_a", "run_one"),
+        )
         .unwrap_err();
         assert_eq!(
-            error.downcast_ref::<LoomCommandError>().unwrap().code(),
-            LOOM_ARTIFACT_CONTENT_CHANGED,
-            "assertion changed bytes under a registered path are refused: {error}"
+            command_code(&error),
+            LOOM_CLAIM_EXPIRED,
+            "assertion artifact_register_from_an_expired_claim_is_refused"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            0,
+            "assertion an expired claim writes no artifact"
+        );
+        assert_eq!(
+            open_claims(&database, "task_a"),
+            1,
+            "assertion a refused registration does not release the lapsed claim"
+        );
+    }
+
+    #[test]
+    fn artifact_register_from_a_superseded_claim_is_refused() {
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM artifact superseded claim");
+        plan_import(&mut database, plan_input(&mission_id)).unwrap();
+        task_release(&mut database, release_input(&mission_id, "task_a")).unwrap();
+        let stale = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_one", "command_one"),
+        )
+        .unwrap();
+        write_workspace_file(&database, &mission_id, "report.md", "handed over bytes");
+        // The lease lapses and another Run takes the Task over: the old claim is released and the
+        // fence generation advances, so the takeover is the only live fence on the Task.
+        expire_lease(&database, &stale.claim_id);
+        let takeover = claim_acquire(
+            &mut database,
+            claim_input(&mission_id, "task_a", "run_two", "command_two"),
+        )
+        .unwrap();
+        assert_ne!(
+            takeover.claim_id, stale.claim_id,
+            "assertion the_takeover_writes_a_new_claim"
+        );
+        assert_eq!(
+            takeover.fence_generation,
+            stale.fence_generation + 1,
+            "assertion the_takeover_advances_the_fence_generation"
+        );
+
+        // The superseded Run's own claim was released by the takeover, so its registration arrives as
+        // a Run that no longer holds the Task and is refused before a byte is archived.
+        let late = artifact_register(
+            &mut database,
+            "agent_1",
+            producer_evidence_input(&mission_id, "task_a", "run_one"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            command_code(&late),
+            LOOM_CLAIM_ABSENT,
+            "assertion artifact_register_from_a_superseded_claim_is_refused"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            0,
+            "assertion a superseded producer writes no artifact"
+        );
+
+        // Only the live fence's Run registers the evidence.
+        let accepted = artifact_register(
+            &mut database,
+            "agent_2",
+            producer_evidence_input(&mission_id, "task_a", "run_two"),
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.artifact.agent_run_id.as_deref(),
+            Some("run_two"),
+            "assertion the takeover's Run registers the evidence it holds the Task for"
+        );
+        assert_eq!(
+            artifact_rows(&database),
+            1,
+            "assertion only the live fence records an artifact"
         );
     }
 

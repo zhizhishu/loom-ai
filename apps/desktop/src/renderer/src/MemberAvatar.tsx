@@ -1,11 +1,13 @@
 import { uiAttribute } from './interface-language'
 import { useState, type CSSProperties } from 'react'
 import { parseControlledMemberAvatarRef } from '@contracts'
-import { builtinMemberAvatarAssets } from './member-avatar-registry'
+import { builtinMemberAvatarAssets, builtinMemberBotAvatar } from './member-avatar-registry'
 import { firstGrapheme } from './member-identity'
 import { identityColorToken } from './theme'
 import { avatarDisplayStyle } from './member-avatar-crop'
 import { useManagedAvatarUrl } from './use-managed-avatar'
+import { OpenBotAvatar } from './OpenBotAvatar'
+import { openBotAvatarShape } from './open-bot-avatar-catalog'
 
 export type MemberAvatarSize = 'execution' | 'mention' | 'list' | 'workspace' | 'picker' | 'profile'
 
@@ -39,16 +41,21 @@ export function MemberAvatar({
 }: MemberAvatarProps): React.JSX.Element {
   const parsed = avatarRef ? parseControlledMemberAvatarRef(avatarRef) : null
   const builtin = builtinMemberAvatarAssets(avatarRef)
+  const builtinBot = builtinMemberBotAvatar(avatarRef)
   const managed = useManagedAvatarUrl(avatarRef, 'icon')
   const renditionKey = parsed?.kind === 'builtin'
     ? `${avatarRef}:glyph`
-    : parsed?.kind === 'managed'
-      ? `${avatarRef}:icon`
-      : 'fallback'
+    : parsed?.kind === 'bot'
+      ? `${avatarRef}:bot`
+      : parsed?.kind === 'managed'
+        ? `${avatarRef}:icon`
+        : 'fallback'
   const [failedRenditionKey, setFailedRenditionKey] = useState<string | null>(null)
   const failed = failedRenditionKey === renditionKey
   const hasManagedImage = parsed?.kind === 'managed' && managed.url && !failed
-  const hasBuiltinImage = parsed?.kind === 'builtin' && builtin && !failed
+  const botShape = parsed?.kind === 'bot' ? openBotAvatarShape(parsed.id) : null
+  const hasBuiltinImage = parsed?.kind === 'builtin' && builtin && !failed && !builtinBot
+  const hasBotAvatar = Boolean(parsed?.kind === 'bot' && parsed.color && botShape)
   const style = {
     '--member-avatar-accent': identityColorToken(agentId),
     '--member-avatar-size': `${MEMBER_AVATAR_PIXEL_SIZE[size]}px`
@@ -77,6 +84,23 @@ export function MemberAvatar({
           onError={() => setFailedRenditionKey(renditionKey)}
         />
       )}
+      {builtinBot && (
+        <OpenBotAvatar
+          definition={builtinBot.definition}
+          color={builtinBot.color}
+          label=""
+          className="member-avatar-bot"
+        />
+      )}
+      {hasBotAvatar && parsed?.kind === 'bot' && botShape && (
+        <OpenBotAvatar
+          definition={botShape.definition}
+          color={parsed.color}
+          // The surrounding member-avatar span owns the accessible name.
+          label=""
+          className="member-avatar-bot"
+        />
+      )}
       {hasManagedImage && (
         <img
           className="member-avatar-image"
@@ -87,7 +111,7 @@ export function MemberAvatar({
           onError={() => setFailedRenditionKey(renditionKey)}
         />
       )}
-      {!hasBuiltinImage && !hasManagedImage && (
+      {!hasBuiltinImage && !hasManagedImage && !hasBotAvatar && !builtinBot && (
         <span className="member-avatar-fallback" aria-hidden="true">
           {firstGrapheme(displayName)}
         </span>

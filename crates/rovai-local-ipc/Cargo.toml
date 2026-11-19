@@ -1,0 +1,19 @@
+[package]
+name = "rovai-local-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+uuid = "1"
+tokio = { version = "1", features = ["net"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+rovai-private-storage = { path = "../rovai-private-storage" }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security"] }

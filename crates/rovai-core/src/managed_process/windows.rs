@@ -90,7 +90,14 @@ pub(super) struct WindowsManagedProcess {
 
 impl WindowsManagedProcess {
     pub(super) fn spawn(spec: &ManagedProcessLaunchSpec) -> Result<Self> {
-        let application = wide_nul(spec.application().as_os_str(), "application")?;
+        // Some native programs (including Git for Windows) derive their config
+        // prefix from GetModuleFileNameW and fail when it preserves a verbatim
+        // image spelling. This is representation only: the captured identity is
+        // still compared below, and its no-write/no-delete-share handle remains
+        // held through CreateProcessW. Long or verbatim-dependent paths retain
+        // their original representation; argv, environment and Job policy do not
+        // change.
+        let application = wide_nul(compatible_native_image_path(spec.application()).as_os_str(), "application")?;
         let working_directory = match spec.windows_entrypoint() {
             WindowsRuntimeEntrypoint::CommandShim { .. } => {
                 command_shim_working_directory(spec.working_directory())?
@@ -897,9 +904,44 @@ fn last_os_error(stable_error: &str) -> anyhow::Error {
     anyhow!("{stable_error}: {}", io::Error::last_os_error())
 }
 
+fn compatible_native_image_path(application: &Path) -> &Path {
+    let simplified = dunce::simplified(application);
+    if simplified.as_os_str().encode_wide().count() < 260 {
+        simplified
+    } else {
+        application
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_image_spelling_preserves_long_and_verbatim_dependent_paths() {
+        for (input, expected) in [
+            (r"\\?\C:\Program Files\Git\bin\git.exe", r"C:\Program Files\Git\bin\git.exe"),
+            (r"C:\tools\worker.exe", r"C:\tools\worker.exe"),
+            // The existing borrowed-path helper only shortens a safe DOS
+            // spelling; UNC stays verbatim rather than being reinterpreted.
+            (r"\\?\UNC\server\share\worker.exe", r"\\?\UNC\server\share\worker.exe"),
+        ] {
+            assert_eq!(compatible_native_image_path(Path::new(input)), Path::new(expected));
+        }
+        let long = format!(r"\\?\C:\{}\worker.exe", "directory\\".repeat(35));
+        assert_eq!(compatible_native_image_path(Path::new(&long)), Path::new(&long));
+        let special = Path::new(r"\\?\C:\a trailing dot.\worker.exe");
+        assert_eq!(compatible_native_image_path(special), special);
+        for length in [256, 257, 259, 260] {
+            let ordinary = format!(r"C:\{}\{}.exe", "a".repeat(120), "b".repeat(length - 128));
+            assert_eq!(ordinary.encode_utf16().count(), length);
+            let captured = format!(r"\\?\{ordinary}");
+            // dunce also budgets the original four-character verbatim prefix.
+            // Keep its conservative limit instead of stripping it ourselves.
+            let expected = if length + 4 <= 260 { &ordinary } else { &captured };
+            assert_eq!(compatible_native_image_path(Path::new(&captured)), Path::new(expected));
+        }
+    }
 
     fn quoted(value: &str) -> String {
         let mut output = Vec::new();

@@ -316,7 +316,7 @@ export function FilePreviewResizeHandle({ onClose }: { onClose(): void }): React
     aria-valuetext={hint}
     aria-describedby={hintId}
     tabIndex={0}
-    title={uiAttribute("拖动调整 · 双击恢复 44/56 · 方向键调整 · Delete 关闭")}
+    title={uiAttribute("拖动调整 · 双击恢复 58/42 · 方向键调整 · Delete 关闭")}
     {...splitter.handlers}
     onDoubleClick={() => {
       splitter.cancel()

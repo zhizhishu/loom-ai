@@ -1,6 +1,47 @@
 export type CapabilityKind = 'skill' | 'mcp' | 'rule' | 'hook'
 export type CapabilityOrigin = 'inherited' | 'explicit' | null
 
+/** Core-owned review scope. It carries ids, never a caller-supplied label or digest. */
+export type RemoteHookReviewScope = {
+  memberId: string
+  missionId: string
+  campId: string
+  workspaceId: string
+  nodeId: string
+  workspaceRoot: string
+  workspaceGeneration: number
+  workspaceTokenDigest: string
+  adapterKind: string
+}
+
+export type LocalHookReviewScope = {
+  scopeKind: 'local'
+  memberId: string
+  campId: string
+  executionHostId: string
+  workspaceRoot: string
+  workspaceAuthority:
+    | { kind: 'camp'; campId: string }
+    | { kind: 'mission'; missionId: string; workspaceId: string; workspaceGeneration: number; workspaceTokenDigest: string }
+  adapterKind: 'deepseek-harness'
+  permissionsDigest: string
+  permissions: { adapterKind: 'deepseek-harness'; schemaVersion: number; values: Record<string, unknown> }
+}
+
+export type HookReviewScope = RemoteHookReviewScope | LocalHookReviewScope
+
+export function isLocalHookScope(scope: HookReviewScope): scope is LocalHookReviewScope {
+  return 'scopeKind' in scope && scope.scopeKind === 'local'
+}
+
+export type HookDefinition = {
+  body: string
+  definitionDigest: string
+  reviewed: boolean
+  reviewScope: HookReviewScope
+  scopeDigest: string
+}
+
 export type CapabilityItem = {
   id: string
   kind: CapabilityKind
@@ -12,6 +53,10 @@ export type CapabilityItem = {
   origin: CapabilityOrigin
   toolNames: readonly string[]
   risk: 'high' | null
+  /** Present only when Core supplies an authoritative local or remote run scope. */
+  hookDefinition?: HookDefinition | null
+  /** Read-model stamp failure. It only blocks a new check, never removing an existing one. */
+  sourceError?: string | null
 }
 
 export type CapabilityIdentity = {
@@ -127,15 +172,130 @@ export function sameSelection(left: readonly CapabilityItem[], right: readonly C
   return signature(left) === signature(right)
 }
 
+/**
+ * 任何非空的 Core runtime 名称都值得问一次真实预览：能不能给出投影由 Core 裁决
+ * （runtime_required / runtime_unsupported），界面不再按品牌自己判死。
+ * claude-code-cli 只是同一个运行端的旧持久化别名，请求仍用规范 id。
+ */
 export function previewRuntime(runtime: string | null): string | null {
-  if (runtime === 'codex-cli' || runtime === 'claude-code') return runtime
-  if (runtime === 'claude-code-cli') return 'claude-code'
-  return null
+  const name = runtime?.trim()
+  if (!name) return null
+  if (name === 'claude-code-cli') return 'claude-code'
+  return name
 }
 
 export function highRiskToConfirm(draft: readonly CapabilityItem[], saved: readonly CapabilityItem[]): CapabilityItem[] {
   const savedOn = new Set(saved.filter((item) => item.selected).map(itemKey))
   return draft.filter((item) => item.risk === 'high' && item.selected && !savedOn.has(itemKey(item)))
+}
+
+export type HookApproval = { id: string, definitionDigest: string, scopeDigest: string }
+
+export type HookReviewEntry = {
+  id: string
+  name: string
+  body: string
+  scope: HookReviewScope
+  definitionDigest: string
+  scopeDigest: string
+}
+
+/** Everything the confirmation sends. It is frozen when the dialog opens. */
+export type HookReviewSnapshot = {
+  agentId: string
+  revision: string
+  token: number
+  acknowledgeHighRisk: boolean
+  selections: CapabilitySelection[]
+  approvals: HookApproval[]
+  entries: HookReviewEntry[]
+}
+
+/** A hook needs exact approval only when it is selected and Core reports it unreviewed. */
+export function pendingHookReview(items: readonly CapabilityItem[]): CapabilityItem[] {
+  return items.filter((item) => item.kind === 'hook' && item.selected
+    && !!item.hookDefinition && !item.hookDefinition.reviewed)
+}
+
+/** 只在 off → on 时生效的本地前置拒绝。取消选择永远不被拦。 */
+export type SelectionRefusal = '' | 'source' | 'hook-scope'
+
+/** Core 精确审阅范围里真正绑定目标的字段（与 Core 的 matches_target 同一组）。 */
+const HOOK_SCOPE_KEYS = ['memberId', 'workspaceId', 'nodeId', 'workspaceRoot', 'workspaceTokenDigest', 'adapterKind'] as const
+
+/**
+ * 这条 hook 是否缺 Core 给出的可审阅定义。缺了就既不能审也不能新启用，
+ * 但已经勾上的仍要能取消。这里只看 Core 给的定义，不猜品牌、系统或本地路径。
+ */
+export function hookDefinitionMissing(item: Pick<CapabilityItem, 'kind' | 'hookDefinition'>): boolean {
+  if (item.kind !== 'hook') return false
+  const definition = item.hookDefinition
+  if (!definition) return true
+  if (!definition.body.trim()) return true
+  if (!definition.definitionDigest.trim() || !definition.scopeDigest.trim()) return true
+  const scope = definition.reviewScope
+  if (!scope) return true
+  if (isLocalHookScope(scope)) {
+    if ([scope.memberId, scope.campId, scope.executionHostId, scope.workspaceRoot, scope.permissionsDigest].some(value => !value?.trim())) return true
+    if (scope.adapterKind !== 'deepseek-harness' || !scope.workspaceAuthority || scope.permissions?.adapterKind !== 'deepseek-harness') return true
+    const authority = scope.workspaceAuthority
+    if (authority.kind === 'camp') return authority.campId !== scope.campId
+    return authority.kind !== 'mission' || !authority.missionId?.trim() || !authority.workspaceId?.trim()
+      || !Number.isSafeInteger(authority.workspaceGeneration) || authority.workspaceGeneration < 0 || !authority.workspaceTokenDigest?.trim()
+  }
+  if (!Number.isFinite(scope.workspaceGeneration)) return true
+  return HOOK_SCOPE_KEYS.some((key) => !String(scope[key] ?? '').trim())
+}
+
+/** Off to on only. A broken source never blocks unchecking; Core fails closed on its own. */
+export function selectRefusal(item: CapabilityItem): SelectionRefusal {
+  if (item.selected) return ''
+  if (item.sourceError) return 'source'
+  return hookDefinitionMissing(item) ? 'hook-scope' : ''
+}
+
+/** Returns null when a pending hook has no readable definition, so nothing can send an empty approval. */
+export function hookReviewSnapshot(input: {
+  agentId: string
+  revision: string
+  token: number
+  acknowledgeHighRisk: boolean
+  selections: readonly CapabilitySelection[]
+  pending: readonly CapabilityItem[]
+}): HookReviewSnapshot | null {
+  const entries: HookReviewEntry[] = []
+  for (const item of input.pending) {
+    const definition = item.hookDefinition
+    if (!definition) return null
+    entries.push({
+      id: item.id,
+      name: item.name,
+      body: definition.body,
+      scope: definition.reviewScope,
+      definitionDigest: definition.definitionDigest,
+      scopeDigest: definition.scopeDigest
+    })
+  }
+  entries.sort((left, right) => left.id.localeCompare(right.id))
+  return {
+    agentId: input.agentId,
+    revision: input.revision,
+    token: input.token,
+    acknowledgeHighRisk: input.acknowledgeHighRisk,
+    selections: input.selections.map((selection) => ({ ...selection })),
+    approvals: entries.map((entry) => ({ id: entry.id, definitionDigest: entry.definitionDigest, scopeDigest: entry.scopeDigest })),
+    entries
+  }
+}
+
+/** A snapshot dies with its member or its request generation, not just its revision. */
+export function snapshotApplies(snapshot: HookReviewSnapshot, agentId: string, token: number): boolean {
+  return snapshot.agentId === agentId && snapshot.token === token
+}
+
+/** Cancel and stale-dialog recovery: drop only the keys that were never saved. */
+export function revertPending(items: readonly CapabilityItem[], keys: ReadonlySet<string>): CapabilityItem[] {
+  return items.map((item) => keys.has(itemKey(item)) ? { ...item, selected: false } : item)
 }
 
 export function conflictPartners(items: readonly CapabilityItem[], item: CapabilityItem): Array<{ names: string, tool: string }> {

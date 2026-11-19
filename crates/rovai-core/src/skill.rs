@@ -20,7 +20,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -934,14 +934,23 @@ impl SkillLibraryService {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(anyhow::Error::from)?;
         for skill in &mut skills {
-            skill.group_assignments = load_group_assignments(database, &skill.id)?;
+            skill.group_assignments = load_group_assignments(database.connection(), &skill.id)?;
         }
         Ok(skills)
     }
 
     pub fn get(&self, database: &Database, skill_id: &str) -> Result<Option<SkillView>> {
-        let mut skill = database
-            .connection()
+        self.get_with_connection(database.connection(), skill_id)
+    }
+
+    /// Same read as `get` for callers that already hold the connection, such as
+    /// one Run's delivery context. Both entry points share one statement.
+    pub(crate) fn get_with_connection(
+        &self,
+        connection: &Connection,
+        skill_id: &str,
+    ) -> Result<Option<SkillView>> {
+        let mut skill = connection
             .query_row(
                 r#"
                 SELECT skill.id, skill.name, skill.origin, skill.enabled,
@@ -963,7 +972,7 @@ impl SkillLibraryService {
             .optional()
             .map_err(anyhow::Error::from)?;
         if let Some(skill) = &mut skill {
-            skill.group_assignments = load_group_assignments(database, &skill.id)?;
+            skill.group_assignments = load_group_assignments(connection, &skill.id)?;
         }
         Ok(skill)
     }
@@ -2456,10 +2465,10 @@ fn skill_view_from_row(row: &Row<'_>) -> rusqlite::Result<SkillView> {
 }
 
 fn load_group_assignments(
-    database: &Database,
+    connection: &Connection,
     skill_id: &str,
 ) -> Result<Vec<SkillGroupAssignmentView>> {
-    let mut statement = database.connection().prepare(
+    let mut statement = connection.prepare(
         r#"
         SELECT group_key, revision_id, created_at, updated_at
         FROM skill_group_assignment

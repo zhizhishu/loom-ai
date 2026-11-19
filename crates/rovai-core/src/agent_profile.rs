@@ -29,6 +29,7 @@ use crate::{
     },
     db::Database,
     member_avatar::validate_member_avatar_update,
+    pi::{PiFileAccessMode, mode_from_permissions},
     runtime_failure::RuntimeFailureView,
 };
 
@@ -453,6 +454,67 @@ pub struct AdapterPermissionConfig {
     pub values: Value,
 }
 
+/// Pi-only prompt extension, never a tool/OS authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiPurgeMode {
+    Off,
+    Append,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PiPurgeSelection {
+    pub mode: PiPurgeMode,
+    pub persona: String,
+}
+
+const PI_PURGE_PERSONA_MAX_BYTES: usize = 16 * 1024;
+
+// Legacy JSON column stores the Pi-only prompt extension alongside (not inside)
+// the permission value map. Core strips it before checking native permissions;
+// future V2 storage may give Persona its own table without changing the API.
+fn saved_pi_purge(json_text: &str) -> Result<Option<PiPurgeSelection>> {
+    let value: Value = serde_json::from_str(json_text)?;
+    value.get("piPurge")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()).map_err(Into::into))
+        .transpose()
+}
+
+fn permissions_with_pi_purge(
+    permissions: &AdapterPermissionConfig,
+    preference: Option<&PiPurgeSelection>,
+) -> Result<String> {
+    let mut document = serde_json::to_value(permissions)?;
+    if let Some(preference) = preference {
+        document.as_object_mut().context("permission document is not an object")?
+            .insert("piPurge".to_string(), serde_json::to_value(preference)?);
+    }
+    Ok(serde_json::to_string(&document)?)
+}
+
+// A Pi Purge Append Run only starts when Core issues a workspace file grant, and that grant exists
+// only for a guarded `loom_file_access` mode (pi/host.rs `stage_pi_purge`). Reject the selection at
+// configuration time instead of failing the first Run, and never widen or upgrade the member's own
+// permission choice to satisfy the purge. An unreadable policy is not guarded, so it is rejected.
+// `workspace_workflow` is a guarded mode and is therefore accepted here as well; the legacy `native`
+// policy stays exactly as gated as before and is never upgraded.
+fn pi_purge_append_without_file_grant(
+    selection: Option<&PiPurgeSelection>,
+    permissions: &AdapterPermissionConfig,
+) -> bool {
+    if !selection.is_some_and(|selection| selection.mode == PiPurgeMode::Append) {
+        return false;
+    }
+    !matches!(
+        mode_from_permissions(&permissions.values),
+        Ok(PiFileAccessMode::WorkspaceReadOnly
+            | PiFileAccessMode::WorkspaceReadWrite
+            | PiFileAccessMode::WorkspaceWorkflow)
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResolvedRuntimeBinding {
@@ -468,6 +530,8 @@ pub struct MemberRuntimeConfiguration {
     pub adapter_kind: AdapterKind,
     pub model: ModelSelection,
     pub permissions: AdapterPermissionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_purge: Option<PiPurgeSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -503,6 +567,8 @@ pub struct FrozenAgentRuntimeConfig {
     pub protocol_version: String,
     pub model: ResolvedModelSelection,
     pub permissions: AdapterPermissionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_purge: Option<PiPurgeSelection>,
     pub native_session_compatibility_key: Option<String>,
     pub binding_compatibility_digest: Option<String>,
     pub host_config_digest: Option<String>,
@@ -866,6 +932,7 @@ pub struct AgentProfileView {
     pub presence: String,
     pub runtime_configuration: Option<MemberRuntimeConfiguration>,
     pub runtime_readiness: RuntimeReadiness,
+    pub execution_availability: crate::member_execution_availability::MemberExecutionAvailability,
     pub member_order: i64,
     pub version: i64,
     pub created_at: String,
@@ -935,6 +1002,8 @@ pub struct SetMemberRuntimeConfigurationCommand {
     pub adapter_kind: AdapterKind,
     pub model: ModelSelection,
     pub permissions: AdapterPermissionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_purge: Option<PiPurgeSelection>,
 }
 
 impl sealed::Sealed for SetMemberRuntimeConfigurationCommand {}
@@ -3008,6 +3077,27 @@ impl AgentProfileService {
                     }),
                 ));
             }
+            if let Some(selection) = &envelope.payload.pi_purge {
+                if envelope.payload.adapter_kind != AdapterKind::Pi
+                    || selection.persona.len() > PI_PURGE_PERSONA_MAX_BYTES
+                    || selection.persona.contains('\0')
+                    || (selection.mode == PiPurgeMode::Append && selection.persona.trim().is_empty())
+                {
+                    return Ok(CommandHandlerResult::rejected(
+                        "pi_purge_configuration_invalid",
+                        json!({"adapterKind": envelope.payload.adapter_kind}),
+                    ));
+                }
+                if pi_purge_append_without_file_grant(
+                    Some(selection),
+                    &envelope.payload.permissions,
+                ) {
+                    return Ok(CommandHandlerResult::rejected(
+                        "pi_purge_requires_file_grant",
+                        json!({"adapterKind": envelope.payload.adapter_kind}),
+                    ));
+                }
+            }
             let mut binding = ResolvedRuntimeBinding {
                 adapter_kind: envelope.payload.adapter_kind,
                 installation_id: ready.installation_id.clone(),
@@ -3089,7 +3179,7 @@ impl AgentProfileService {
                     envelope.payload.adapter_kind.as_str(),
                     ready.installation_id,
                     serde_json::to_string(&binding.model)?,
-                    serde_json::to_string(&binding.permissions)?,
+                    permissions_with_pi_purge(&binding.permissions, envelope.payload.pi_purge.as_ref())?,
                     now,
                     envelope.payload.expected_version,
                     ready.installation_generation,
@@ -3879,6 +3969,7 @@ impl AgentProfileService {
             .context("invalid AgentProfile default capabilities")?;
         let personality_traits = serde_json::from_str(&raw.personality_traits_json)
             .context("invalid AgentProfile personality traits")?;
+        let mut pi_purge = None;
         let resolved_runtime_binding = match (
             raw.selected_runtime_adapter_kind,
             raw.installation_id,
@@ -3887,6 +3978,8 @@ impl AgentProfileService {
         ) {
             (None, None, None, None) => None,
             (Some(adapter_kind), Some(installation_id), Some(model), Some(permissions)) => {
+                pi_purge = saved_pi_purge(&permissions)
+                    .context("invalid AgentProfile Pi Purge selection")?;
                 Some(ResolvedRuntimeBinding {
                     adapter_kind: AdapterKind::from_str(&adapter_kind)?,
                     installation_id,
@@ -3906,7 +3999,14 @@ impl AgentProfileService {
                     adapter_kind: binding.adapter_kind,
                     model: binding.model.clone(),
                     permissions: binding.permissions.clone(),
+                    pi_purge: pi_purge.clone(),
                 });
+        let execution_availability = crate::member_execution_availability::evaluate(
+            database.connection(),
+            &raw.id,
+            runtime_configuration.as_ref(),
+            &runtime_readiness,
+        )?;
         Ok(AgentProfileView {
             agent_id: raw.id,
             display_name: raw.display_name,
@@ -3921,6 +4021,7 @@ impl AgentProfileService {
             presence: raw.presence,
             runtime_configuration,
             runtime_readiness,
+            execution_availability,
             member_order: raw.member_order,
             version: raw.version,
             created_at: raw.created_at,
@@ -4625,6 +4726,18 @@ pub fn resolve_frozen_runtime(
     conversation_id: &str,
     agent_id: &str,
 ) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
+    // A member's explicit Node choice is authoritative for every Run-creation
+    // path. Only the caller that freezes the target and source in this same
+    // transaction may invoke resolve_remote_frozen_runtime; other paths must
+    // report the missing integration instead of silently choosing a local CLI.
+    if crate::remote_execution::authority_table_available(transaction, "member_execution_target")?
+        && crate::remote_execution::load_member_target(transaction, agent_id)?.selection.is_some()
+    {
+        return Ok(Err(runtime_blocker(
+            "remote_run_creation_not_connected",
+            json!({"agentId": agent_id, "conversationId": conversation_id}),
+        )));
+    }
     let profile = transaction
         .query_row(
             r#"
@@ -4717,6 +4830,15 @@ pub fn resolve_frozen_runtime(
     };
     // A malformed member record is a lane failure; SQL/storage errors above
     // remain outer errors so a database outage cannot be mistaken for bad input.
+    let pi_purge = match saved_pi_purge(&permissions_json) {
+        Ok(selection) => selection,
+        Err(_) => {
+            return Ok(Err(runtime_blocker(
+                "pi_purge_configuration_invalid",
+                json!({"agentId": agent_id}),
+            )));
+        }
+    };
     let binding = (|| -> Result<ResolvedRuntimeBinding> {
         Ok(ResolvedRuntimeBinding {
             adapter_kind: AdapterKind::from_str(&selected_runtime_adapter_kind)?,
@@ -4751,6 +4873,14 @@ pub fn resolve_frozen_runtime(
     )?;
     if let Ok(runtime) = &mut result {
         crate::camp_fast::freeze(transaction, conversation_id, agent_id, runtime)?;
+        if pi_purge.is_some() && runtime.adapter_kind != AdapterKind::Pi {
+            return Ok(Err(runtime_blocker(
+                "pi_purge_configuration_invalid",
+                json!({"agentId": agent_id}),
+            )));
+        }
+        runtime.pi_purge = pi_purge;
+        runtime.refresh_config_digest()?;
     }
     Ok(result)
 }
@@ -4770,6 +4900,16 @@ fn resolve_frozen_runtime_binding_with_snapshot(
     native_binding_compatibility_digest: Option<&str>,
 ) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
     let installation_id = binding.installation_id.clone();
+    // A remote placeholder installation exists only to satisfy Core's established
+    // native-session and Run foreign key. It is never a local launch intent, even
+    // if its `enabled` flag was flipped by hand, so the local resolver rejects it
+    // before it can observe a remote URI as an executable path.
+    if remote_installation_present(transaction, &installation_id)? {
+        return Ok(Err(runtime_blocker(
+            "runtime_remote_installation_not_local",
+            json!({ "installationId": installation_id }),
+        )));
+    }
     let installation = transaction
         .query_row(
             r#"
@@ -4928,6 +5068,7 @@ fn resolve_frozen_runtime_binding_with_snapshot(
         protocol_version: projection.protocol_version,
         model,
         permissions: binding.permissions.clone(),
+        pi_purge: None,
         native_session_compatibility_key,
         binding_compatibility_digest: projection.binding_compatibility_digest,
         host_config_digest: projection.host_config_digest,
@@ -4949,6 +5090,225 @@ fn resolve_frozen_runtime_binding_with_snapshot(
     }
     frozen.refresh_config_digest()?;
     Ok(Ok(frozen))
+}
+
+/// A remote mapping can only exist once the node catalog tables exist. Pre-migration
+/// fixtures have no such table and therefore no remote installation to reject.
+fn remote_installation_present(connection: &Connection, installation_id: &str) -> Result<bool> {
+    if !crate::remote_execution::authority_table_available(connection, "remote_runtime_installation")? {
+        return Ok(false);
+    }
+    crate::remote_execution::is_remote_installation(connection, installation_id)
+}
+
+/// Pure shipped adapter validation for a remote selection; no installation,
+/// filesystem, runtime probe or inherited environment is needed.
+pub(crate) fn validate_remote_member_configuration(
+    adapter_kind: AdapterKind, model: &ModelSelection, permissions: &AdapterPermissionConfig,
+) -> Result<Option<RuntimeConfigurationBlocker>> {
+    let descriptors = AgentRuntimeAdapterRegistry::default().permission_options(adapter_kind);
+    let binding = ResolvedRuntimeBinding {
+        adapter_kind, installation_id:"remote-selection".into(),
+        model:ModelSelection::RuntimeDefault, permissions:permissions.clone(),
+    };
+    if let Some(issue) = runtime_configuration_issue(
+        "[]", 1, &serde_json::to_string(&descriptors)?, &binding,
+    )? { return Ok(Some(runtime_blocker(issue.code,issue.payload))); }
+    match resolve_model_selection(adapter_kind, &provisional_runtime_models(adapter_kind), model)? {
+        Ok(_) => Ok(None),
+        Err(blocker) => Ok(Some(blocker)),
+    }
+}
+
+/// Build the frozen launch policy for an explicit remote member selection.
+///
+/// The model and permission registries are the same ones the local path uses. The
+/// installation facts come only from Core's own remote catalog rows: no Core
+/// startup snapshot, provider credential, environment plan or file probe is read,
+/// and the Node workspace root is never resolved as a Core path.
+pub(crate) fn resolve_remote_frozen_runtime(
+    transaction: &Connection,
+    target: &crate::remote_execution::FrozenRunTarget,
+) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
+    let installation_id = target.installation_id.clone();
+    let adapter_kind = target.selection.adapter_kind;
+    if !matches!(
+        adapter_kind,
+        AdapterKind::ClaudeCodeCli | AdapterKind::CodexCli
+    ) {
+        return Ok(Err(runtime_blocker(
+            "remote_runtime_adapter_unsupported",
+            json!({ "adapterKind": adapter_kind }),
+        )));
+    }
+    let remote = transaction
+        .query_row(
+            r#"
+            SELECT remote.node_id, remote.adapter_kind, remote.installation_identity,
+                   remote.installation_generation, remote.reported_version,
+                   installation.executable_path, installation.auth_scope
+            FROM remote_runtime_installation AS remote
+            JOIN adapter_installation AS installation
+              ON installation.id = remote.installation_id
+            WHERE remote.installation_id = ?1 AND installation.enabled = 0
+              AND installation.adapter_kind = remote.adapter_kind
+              AND installation.generation = remote.installation_generation
+              AND installation.source = 'custom'
+              AND installation.executable_path =
+                    'rovai-remote://' || remote.node_id || '/' || remote.adapter_kind
+              AND installation.auth_scope = 'remote_node:' || remote.node_id
+            "#,
+            [&installation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        node_id,
+        stored_adapter_kind,
+        installation_identity,
+        installation_generation,
+        reported_version,
+        executable_path,
+        auth_scope,
+    )) = remote
+    else {
+        return Ok(Err(runtime_blocker(
+            "runtime_remote_installation_missing",
+            json!({ "installationId": installation_id }),
+        )));
+    };
+    // The frozen target and the disabled installation row must describe one Node
+    // installation. A drifted identity, generation or Node is never re-selected.
+    if stored_adapter_kind != adapter_kind.as_str()
+        || node_id != target.target.node_id
+        || installation_identity != target.target.program_identity
+        || u64::try_from(installation_generation).ok() != Some(target.target.node_generation)
+    {
+        return Ok(Err(runtime_blocker(
+            "runtime_remote_installation_mismatch",
+            json!({ "installationId": installation_id, "nodeId": node_id }),
+        )));
+    }
+    let registry = AgentRuntimeAdapterRegistry::default();
+    let permission_descriptors = registry.permission_options(adapter_kind);
+    let mut validation_binding = ResolvedRuntimeBinding {
+        adapter_kind,
+        installation_id: installation_id.clone(),
+        model: target.selection.model.clone(),
+        permissions: target.selection.permissions.clone(),
+    };
+    // The installed model catalog is a Node fact, so only the permission and
+    // adapter portions of the binding are validated against today's registry.
+    validation_binding.model = ModelSelection::RuntimeDefault;
+    if let Some(issue) = runtime_configuration_issue(
+        "[]",
+        1,
+        &serde_json::to_string(&permission_descriptors)?,
+        &validation_binding,
+    )? {
+        return Ok(Err(runtime_blocker(issue.code, issue.payload)));
+    }
+    let model = match resolve_model_selection(
+        adapter_kind,
+        &provisional_runtime_models(adapter_kind),
+        &target.selection.model,
+    )? {
+        Ok(model) => model,
+        Err(blocker) => return Ok(Err(blocker)),
+    };
+    let protocol = provisional_runtime_protocol(adapter_kind);
+    let protocols = vec![protocol.to_owned()];
+    // Node identity, not a Core-shaped path or an environment digest: reconnecting
+    // the same Node keeps this key, and a different Node can never reuse the Host.
+    let native_session_compatibility_key = format!(
+        "remote:{}:{}:{}:{}:{}",
+        target.target.node_id,
+        adapter_kind.as_str(),
+        installation_identity,
+        installation_generation,
+        target.target.configuration_digest
+    );
+    let projection = match registry.resolve_runtime(
+        adapter_kind,
+        AdapterRuntimeResolutionInput {
+            installation_id: &installation_id,
+            executable_path: &executable_path,
+            auth_scope: &auth_scope,
+            reported_version: reported_version.as_deref(),
+            executable_fingerprint: &installation_identity,
+            protocols: &protocols,
+            native_session_compatibility_key: Some(native_session_compatibility_key.as_str()),
+            permissions: &target.selection.permissions,
+            permission_descriptors: &permission_descriptors,
+        },
+    ) {
+        Ok(projection) => projection,
+        Err(error) => {
+            return Ok(Err(runtime_blocker(
+                "runtime_adapter_not_implemented",
+                json!({
+                    "adapterKind": adapter_kind,
+                    "detail": error.to_string(),
+                }),
+            )));
+        }
+    };
+    let remote_identity = json!({
+        "nodeId": target.target.node_id,
+        "installationIdentity": target.target.program_identity,
+        "installationGeneration": target.target.node_generation,
+        "configurationDigest": target.target.configuration_digest,
+    });
+    let mut frozen = FrozenAgentRuntimeConfig {
+        environment: None,
+        custom_api: None,
+        camp_fast: None,
+        adapter_kind,
+        installation_id,
+        installation_generation,
+        // Core's search-environment generation belongs to the local Host only.
+        search_environment_generation: 0,
+        executable_path,
+        auth_scope,
+        reported_version,
+        executable_fingerprint: installation_identity,
+        capabilities: Vec::new(),
+        protocol_version: projection.protocol_version,
+        model,
+        permissions: target.selection.permissions.clone(),
+        pi_purge: None,
+        native_session_compatibility_key: Some(native_session_compatibility_key),
+        binding_compatibility_digest: remote_compatible_digest(
+            projection.binding_compatibility_digest,
+            &remote_identity,
+        )?,
+        host_config_digest: remote_compatible_digest(projection.host_config_digest, &remote_identity)?,
+        config_digest: String::new(),
+    };
+    frozen.refresh_config_digest()?;
+    Ok(Ok(frozen))
+}
+
+/// The adapter projection digests gain the Node/installation/target identity, so a
+/// Host or native-session compatibility key can never span two Node installations.
+fn remote_compatible_digest(native: Option<String>, remote: &Value) -> Result<Option<String>> {
+    Ok(match native {
+        Some(native) => Some(canonical_json_digest(&json!({
+            "native": native,
+            "remote": remote,
+        }))?),
+        None => None,
+    })
 }
 
 fn resolve_model_selection(
@@ -5664,7 +6024,7 @@ fn model_option_validation_rejects_preserved_effort_after_catalog_refresh() {
     }
 }
 
-fn member_runtime_defaults(adapter_kind: AdapterKind) -> MemberRuntimeConfiguration {
+pub(crate) fn member_runtime_defaults(adapter_kind: AdapterKind) -> MemberRuntimeConfiguration {
     MemberRuntimeConfiguration {
         adapter_kind,
         model: ModelSelection::RuntimeDefault,
@@ -5673,6 +6033,7 @@ fn member_runtime_defaults(adapter_kind: AdapterKind) -> MemberRuntimeConfigurat
             schema_version: 1,
             values: AgentRuntimeAdapterRegistry::default().member_permission_defaults(adapter_kind),
         },
+        pi_purge: None,
     }
 }
 
@@ -6043,6 +6404,68 @@ fn professional_responsibilities_use_trimmed_unicode_scalar_limits() {
         (String::new(), String::new(), "x".repeat(301)),
     ] {
         assert!(normalize_member_identity("A", &role, "", &[], &principles, &growth).is_err());
+    }
+}
+
+// This is the sole scalar owner for Pi Purge persistence: old permission
+// projections stay byte-semantically equivalent, while Persona is round-tripped
+// separately and cannot become a native ToolGrant value.
+#[cfg(test)]
+#[test]
+fn pi_purge_selection_roundtrips_without_entering_runtime_permissions() {
+    let permissions = member_runtime_defaults(AdapterKind::Pi).permissions;
+    let selection = PiPurgeSelection {
+        mode: PiPurgeMode::Append,
+        persona: "Use concise responses".to_owned(),
+    };
+    let saved = permissions_with_pi_purge(&permissions, Some(&selection)).unwrap();
+    let native: AdapterPermissionConfig = serde_json::from_str(&saved).unwrap();
+    assert_eq!(native, permissions);
+    assert_eq!(saved_pi_purge(&saved).unwrap(), Some(selection));
+    let document: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(document["values"], permissions.values);
+    assert!(document["values"].get("piPurge").is_none());
+
+    let old_saved = permissions_with_pi_purge(&permissions, None).unwrap();
+    assert!(saved_pi_purge(&old_saved).unwrap().is_none());
+    let malformed = old_saved.trim_end_matches('}').to_owned()
+        + ",\"piPurge\":{\"mode\":\"unknown\",\"persona\":\"x\"}}";
+    assert!(saved_pi_purge(&malformed).is_err());
+
+    // Append only runs with a Core-issued workspace file grant. Both guarded spellings satisfy it,
+    // while native, missing and malformed policies do not; nothing is upgraded to satisfy the purge.
+    let append = PiPurgeSelection {
+        mode: PiPurgeMode::Append,
+        persona: "Use concise responses".to_owned(),
+    };
+    let off = PiPurgeSelection {
+        mode: PiPurgeMode::Off,
+        persona: "Use concise responses".to_owned(),
+    };
+    for (values, expected) in [
+        (json!({ "loom_file_access": "workspace_read_only" }), false),
+        (json!({ "loom_file_access": { "mode": "workspace_read_only" } }), false),
+        (json!({ "loom_file_access": "workspace_read_write" }), false),
+        (json!({ "loom_file_access": { "mode": "workspace_read_write" } }), false),
+        (json!({ "loom_file_access": "workspace_workflow" }), false),
+        (json!({ "loom_file_access": { "mode": "workspace_workflow" } }), false),
+        (json!({}), true),
+        (json!({ "loom_file_access": "native" }), true),
+        (json!({ "loom_file_access": { "mode": "native" } }), true),
+        (json!({ "loom_file_access": "workspace" }), true),
+        (json!({ "loom_file_access": { "mode": "workspace_read_write", "tools": ["read"] } }), true),
+    ] {
+        let mut candidate = permissions.clone();
+        candidate.values = values.clone();
+        assert_eq!(
+            pi_purge_append_without_file_grant(Some(&append), &candidate),
+            expected,
+            "{values} must {} require a file grant",
+            if expected { "" } else { "not" }
+        );
+        // Off and an absent selection keep their saved meaning under every policy.
+        assert!(!pi_purge_append_without_file_grant(Some(&off), &candidate));
+        assert!(!pi_purge_append_without_file_grant(None, &candidate));
     }
 }
 
@@ -6877,6 +7300,7 @@ mod slow_tests {
                     &user_command(
                         "expired-catalog-runtime-default",
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: profile.version,
@@ -6902,6 +7326,7 @@ mod slow_tests {
                     &user_command(
                         "expired-catalog-explicit-model",
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: configured.agent_id,
                             expected_version: configured.version,
@@ -7191,6 +7616,7 @@ mod slow_tests {
                 &user_command(
                     "set-runtime",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile_id.clone(),
                         expected_version: profile.version,
@@ -7631,6 +8057,7 @@ mod slow_tests {
                 &user_command(
                     "set-mismatched-runtime",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id,
                         expected_version: profile.version,
@@ -7691,6 +8118,7 @@ mod slow_tests {
                 &user_command(
                     "explicit-runtime-config",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,
@@ -7740,6 +8168,7 @@ mod slow_tests {
                 &user_command(
                     "invalid-runtime-config",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: configured.version,
@@ -7871,6 +8300,7 @@ mod slow_tests {
                     &user_command(
                         &format!("retain-model-{index}"),
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: if stale_version { version - 1 } else { version },
@@ -7919,6 +8349,7 @@ mod slow_tests {
                     &user_command(
                         &format!("manual-model-{index}"),
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: version,
@@ -7960,6 +8391,7 @@ mod slow_tests {
                 &user_command(
                     "select-unresolved-codex",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,
@@ -8249,6 +8681,7 @@ mod slow_tests {
                     &user_command(
                         "configure-detected",
                         SetMemberRuntimeConfigurationCommand {
+                            pi_purge: None,
                             environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: profile.version,
@@ -8275,6 +8708,7 @@ mod slow_tests {
                             &user_command(
                                 &uuid::Uuid::new_v4().to_string(),
                                 SetMemberRuntimeConfigurationCommand {
+                                    pi_purge: None,
                                     environment_update: None,
                                     agent_id: profile.agent_id,
                                     expected_version: profile.version,
@@ -8322,6 +8756,7 @@ mod slow_tests {
                                 &user_command(
                                     &uuid::Uuid::new_v4().to_string(),
                                     SetMemberRuntimeConfigurationCommand {
+                                        pi_purge: None,
                                         environment_update: None,
                                         agent_id: profile.agent_id,
                                         expected_version: profile.version,
@@ -8395,6 +8830,7 @@ mod slow_tests {
                         &user_command(
                             "save-after-catalog-failure",
                             SetMemberRuntimeConfigurationCommand {
+                                pi_purge: None,
                                 environment_update: None,
                                 agent_id: profile.agent_id.clone(),
                                 expected_version: after_failure.version,
@@ -8798,6 +9234,7 @@ mod slow_tests {
                 &user_command(
                     "select-managed-codex",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id,
                         expected_version: profile.version,
@@ -9077,6 +9514,7 @@ mod slow_tests {
                 &user_command(
                     "configure-light-qwen",
                     SetMemberRuntimeConfigurationCommand {
+                        pi_purge: None,
                         environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,

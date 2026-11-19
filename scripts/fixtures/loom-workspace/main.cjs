@@ -16,6 +16,8 @@ app.setPath('sessionData', join(userData, 'session'))
 
 const cases = []
 const shots = []
+// 指针几何证据单独一栏：证明「真的滚出视区、滚回来之后才点得到」，不占 cases 名额。
+const uiGeometry = {}
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
 
 app.whenReady().then(async () => {
@@ -36,11 +38,39 @@ app.whenReady().then(async () => {
     }
     throw new Error(message)
   }
+  // 目标可能滚在自己的滚动容器里（编排/交付面板都是），先滚进可视区再量；
+  // 量完还要过一遍命中测试：坐标落在视窗外、或被别的元素盖住，都必须响亮地失败，
+  // 而不是发一次打空的 sendInputEvent 让后面干等 8 秒。
   const pointForExpression = expression => script(`(() => {
     const element = ${expression}
     if (!element) return null
+    element.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' })
     const bounds = element.getClientRects()[0] ?? element.getBoundingClientRect()
-    return { x: Math.round(bounds.x + bounds.width / 2), y: Math.round(bounds.y + bounds.height / 2) }
+    const x = Math.min(Math.max(Math.round(bounds.x + bounds.width / 2), 0), window.innerWidth - 1)
+    const y = Math.min(Math.max(Math.round(bounds.y + bounds.height / 2), 0), window.innerHeight - 1)
+    const hit = document.elementFromPoint(x, y)
+    if (hit !== element && !element.contains(hit)) {
+      const describe = node => node === null || node === undefined
+        ? 'null'
+        : node.tagName.toLowerCase() + (typeof node.className === 'string' && node.className !== ''
+          ? '.' + node.className.trim().split(/\\s+/u).join('.')
+          : '')
+      const pane = document.querySelector('.loom-plan')
+      throw new Error([
+        'LOOM fixture pointer target is not clickable at its own centre.',
+        'target=' + describe(element),
+        'hit=' + describe(hit),
+        'rect=' + JSON.stringify({
+          x: Math.round(bounds.x), y: Math.round(bounds.y),
+          width: Math.round(bounds.width), height: Math.round(bounds.height),
+          top: Math.round(bounds.top), bottom: Math.round(bounds.bottom)
+        }),
+        'point=' + JSON.stringify({ x, y }),
+        'innerSize=' + JSON.stringify({ width: window.innerWidth, height: window.innerHeight }),
+        'planScrollTop=' + Math.round(pane?.scrollTop ?? -1)
+      ].join(' '))
+    }
+    return { x, y }
   })()`)
   const pointFor = selector => pointForExpression(`document.querySelector(${JSON.stringify(selector)})`)
   const clickAt = async (point, label) => {
@@ -52,24 +82,85 @@ app.whenReady().then(async () => {
     window.webContents.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
     window.webContents.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
   }
-  const click = async selector => clickAt(await pointFor(selector), selector)
-  // 交付用例要在某张候选卡片内部点按钮，指针目标是一个表达式而不是全局 CSS 选择器。
-  const clickElement = async expression => clickAt(await pointForExpression(expression), expression)
+  // Open real disclosure summaries using native pointer input before reaching a
+  // deliberately collapsed control. The hit-test guard still applies to both.
+  const revealControl = async expression => {
+    const summary = `(() => {
+      const element = ${expression}
+      let closed = null
+      for (let node = element?.parentElement; node; node = node.parentElement) {
+        if (node.tagName === 'DETAILS' && !node.open) closed = node
+      }
+      return closed?.querySelector(':scope > summary') ?? null
+    })()`
+    for (let count = 0; count < 8; count++) {
+      if (!await script(`Boolean(${summary})`)) return
+      await clickAt(await pointForExpression(summary), 'Open control disclosure')
+      await settle(80)
+    }
+    throw new Error('Control remained inside a closed disclosure')
+  }
+  const click = async selector => {
+    await revealControl(`document.querySelector(${JSON.stringify(selector)})`)
+    return clickAt(await pointFor(selector), selector)
+  }
+  const clickElement = async expression => {
+    await revealControl(expression)
+    return clickAt(await pointForExpression(expression), expression)
+  }
   const pressKey = keyCode => {
     window.webContents.sendInputEvent({ type: 'keyDown', keyCode })
     if (keyCode === 'Enter') window.webContents.sendInputEvent({ type: 'char', keyCode: '\r' })
     window.webContents.sendInputEvent({ type: 'keyUp', keyCode })
   }
   const pressed = () => script("[...document.querySelectorAll('.loom-section-tabs button')].map(button => button.getAttribute('aria-pressed'))")
+  // 生产现在是四块（工作／流程／资产／电脑）：状态数组长度必须跟真实按钮数一致，且恰好一处
+  // aria-pressed=true。长度写死 4，多一块或少一块都要响亮地失败。
+  const SECTION_TABS = 4
   const expectPressed = async (index, message) => {
     await waitFor(`document.querySelectorAll('.loom-section-tabs button')[${index}]?.getAttribute('aria-pressed') === 'true'`, message)
     const state = await pressed()
-    assert.deepEqual(state, [0, 1, 2].map(position => position === index ? 'true' : 'false'),
+    assert.equal(state.length, SECTION_TABS, `Unexpected LOOM section tab count ${JSON.stringify(state)}`)
+    assert.deepEqual(state, Array.from({ length: SECTION_TABS }, (_, position) => position === index ? 'true' : 'false'),
       `Unexpected LOOM section state ${JSON.stringify(state)}`)
+  }
+  // 共享的交付／活动面板现在收在「活动与交付记录」折叠区里：要读它们的文案、可见性或高度
+  // 必须先显式展开。默认折叠态就是生产默认态，截图也按默认态拍。
+  const ACTIVITY_DETAILS = '.loom-workspace details[data-details="activity"]'
+  const setActivityDetails = async open => {
+    await script(`(() => {
+      const details = document.querySelector(${JSON.stringify(ACTIVITY_DETAILS)})
+      if (!details) return null
+      details.open = ${open ? 'true' : 'false'}
+      return details.open
+    })()`)
+    await settle(120)
+  }
+  const openActivityDetails = async message => {
+    await waitFor(`!!document.querySelector(${JSON.stringify(ACTIVITY_DETAILS)})`, message, 15000)
+    await setActivityDetails(true)
+    await waitFor(`document.querySelector(${JSON.stringify(ACTIVITY_DETAILS)})?.open === true`, message)
+  }
+  const resizeTo = async (width, height, label) => {
+    window.setContentSize(width, height)
+    await waitFor(`window.innerWidth === ${width} && window.innerHeight === ${height}`,
+      `LOOM fixture did not resize to ${width}x${height} for ${label}`)
+    await settle(200)
+  }
+  // 候选卡里的折叠区（证据/详情）展开后是真实的阅读长度：只有量滚动的用例才需要它，
+  // 其余时候保持默认折叠，截图也不改动。
+  const setCandidateDetails = async open => {
+    const count = await script(`(() => {
+      const nodes = [...document.querySelectorAll('.loom-delivery-context .loom-candidate details')]
+      for (const node of nodes) node.open = ${open ? 'true' : 'false'}
+      return nodes.length
+    })()`)
+    await settle(120)
+    return count
   }
   // 交付验收：候选卡片按内容（内容 hash）定位，不依赖列表下标，也不共用别条候选的状态。
   const TARGET_CANDIDATE = 'sha256:restore-runtime'
-  const cardFor = hash => `[...document.querySelectorAll('.loom-delivery-context .loom-candidate')].find(card => (card.querySelector('.loom-candidate-meta')?.innerText ?? '').includes(${JSON.stringify(hash)}))`
+  const cardFor = hash => `[...document.querySelectorAll('.loom-delivery-context .loom-candidate')].find(card => (card.querySelector('.loom-candidate-meta')?.textContent ?? '').includes(${JSON.stringify(hash)}))`
   const inCard = (hash, selector) => `${cardFor(hash)}?.querySelector(${JSON.stringify(selector)}) ?? null`
   const criterionBox = (hash, index) => `${cardFor(hash)}?.querySelectorAll('.loom-review-criterion input')[${index}] ?? null`
   const submitFor = hash => `${cardFor(hash)}?.querySelector('.loom-review-form button[type=submit]') ?? null`
@@ -79,20 +170,20 @@ app.whenReady().then(async () => {
     const verification = card.querySelector('.loom-badge-verification')
     const acceptance = card.querySelector('.loom-badge-acceptance')
     const submit = card.querySelector('.loom-review-form button[type=submit]')
-    const actionRow = card.querySelector(':scope > .loom-delivery-actions')
+    const actionRow = card
     return {
       verificationState: verification?.getAttribute('data-state') ?? null,
       verificationCopy: verification?.innerText ?? '',
       acceptanceState: acceptance?.getAttribute('data-state') ?? null,
       acceptanceCopy: acceptance?.innerText ?? '',
-      actionRow: [...(actionRow?.querySelectorAll('button') ?? [])].map(button => button.innerText),
+      actionRow: [...(actionRow?.querySelectorAll('.loom-delivery-actions button') ?? [])].map(button => button.textContent.trim()),
       forms: card.querySelectorAll('.loom-review-form').length,
       criteriaLabels: [...card.querySelectorAll('.loom-review-criterion-id')].map(node => node.innerText),
       checkboxes: [...card.querySelectorAll('.loom-review-criterion input')].map(input => input.checked),
       reason: card.querySelector('.loom-review-reason')?.value ?? null,
       submit: submit === null ? null : { label: submit.innerText, disabled: submit.disabled },
-      review: card.querySelector('.loom-candidate-review')?.innerText ?? null,
-      verification: card.querySelector('.loom-candidate-verification')?.innerText ?? null,
+      review: card.querySelector('.loom-candidate-review') ? [...card.querySelector('.loom-candidate-review').children].map(node => node.textContent).join('\\n') : null,
+      verification: card.querySelector('.loom-candidate-verification')?.textContent ?? null,
       failure: card.querySelector('.loom-review-failure')?.innerText ?? null
     }
   })()`)
@@ -137,16 +228,16 @@ app.whenReady().then(async () => {
     assert.equal(counts.activity, 1, `${label} repeated the activity read: ${JSON.stringify(counts)}`)
     assert.equal(counts.delivery, 1, `${label} repeated the delivery read: ${JSON.stringify(counts)}`)
     for (const method of ['plan', 'tasksList', 'dependencies', 'candidates', 'reviews', 'verifications']) {
-      assert.equal(counts[method], 2,
-        `${label} must re-read ${method} exactly once after the write (1 mount + 1 refresh): ${JSON.stringify(counts)}`)
+      assert.equal(counts[method], 3,
+        `${label} must re-read ${method} exactly once after the write (1 mount + 1 explicit section switch + 1 write refresh): ${JSON.stringify(counts)}`)
     }
     // 第七个投影：写后刷新里删掉 loom.claims.list 的请求，认领区会停在旧租约上而其他六个投影照样新鲜，
-    // 所以它必须同样精确计数（挂载 1 + 写后 1），不许只靠「至少读过一次」。
-    assert.equal(counts.claims, 2,
-      `${label} must re-read the seventh projection (loom.claims.list) exactly once after the write (1 mount + 1 refresh): ${JSON.stringify(counts)}`)
-    // 第八个投影：产物读只影响候选卡的证据区，但同样是「挂载 1 + 写后 1」，不能靠「至少读过一次」蒙过去。
-    assert.equal(counts.artifacts, 2,
-      `${label} must re-read the eighth projection (loom.artifacts.list) exactly once after the write (1 mount + 1 refresh): ${JSON.stringify(counts)}`)
+    // 所以它必须同样精确计数（挂载 1 + 切区 1 + 写后 1），不许只靠「至少读过一次」。
+    assert.equal(counts.claims, 3,
+      `${label} must re-read the seventh projection (loom.claims.list) exactly once after the write (1 mount + 1 explicit section switch + 1 write refresh): ${JSON.stringify(counts)}`)
+    // 第八个投影：产物读只影响候选卡的证据区，但同样是「挂载 1 + 切区 1 + 写后 1」，不能靠「至少读过一次」蒙过去。
+    assert.equal(counts.artifacts, 3,
+      `${label} must re-read the eighth projection (loom.artifacts.list) exactly once after the write (1 mount + 1 explicit section switch + 1 write refresh): ${JSON.stringify(counts)}`)
     return counts
   }
   // 回读不能只是夹具内存变了：切到「编排」tab 看任务节点是否真的被推进，再切回「交付」看徽章。
@@ -298,6 +389,12 @@ app.whenReady().then(async () => {
     await waitFor("document.querySelectorAll('.loom-delivery-context .loom-candidate').length === 2",
       'Delivery section did not relist the two recorded candidates after the reset')
     await waitFor(`!!(${cardFor(TARGET_CANDIDATE)})`, 'The target candidate card is missing after the reset')
+    // Existing production semantics already refresh on explicit section selection.
+    // Verify the two pre-write reads, then require exactly one write read-back.
+    const beforeWrite = await script(`Object.fromEntries(['loom.plan.get','loom.tasks.list','loom.dependencies.list','loom.candidates.list','loom.reviews.list','loom.verifications.list','loom.claims.list','loom.artifacts.list'].map(method => [method, window.loomQA.countOf(method)]))`)
+    for (const [method, count] of Object.entries(beforeWrite)) assert.equal(count, 2,
+      `Before a write, ${method} must have exactly mount + explicit section-switch reads`)
+
     // 只挪交付面板自己的滚动位置，不动整个文档的滚动位置，否则后面的 tab 点击会落空。
     await script(`(() => {
       const card = ${cardFor(TARGET_CANDIDATE)}
@@ -316,7 +413,7 @@ app.whenReady().then(async () => {
     // Scroll-retention cases leave the panes part-way down. Screenshots are read by a human
     // deciding whether the surface is finished, so each one starts at the top of its pane.
     await script(`(() => {
-      for (const selector of ['.loom-delivery', '.mission-activity-document']) {
+      for (const selector of ['.loom-delivery', '.mission-activity-document', '.loom-plan']) {
         const pane = document.querySelector(selector)
         if (pane) pane.scrollTop = 0
       }
@@ -339,8 +436,10 @@ app.whenReady().then(async () => {
     'LOOM workspace did not mount the shared delivery and activity panels', 15000)
   await waitFor("!!document.querySelector('.mission-changes-unread')", 'collapsed workspace read state did not mount')
   const tabs = await script("[...document.querySelectorAll('.loom-section-tabs button')].map(button => button.textContent)")
-  assert.deepEqual(tabs, ['活动', '编排', '交付'], `Unexpected LOOM section tabs ${JSON.stringify(tabs)}`)
+  assert.deepEqual(tabs, ['工作', '流程', '资产', '电脑'], `Unexpected LOOM section tabs ${JSON.stringify(tabs)}`)
   await expectPressed(0, 'LOOM workspace did not open on the activity section')
+  // 活动与交付记录默认折叠：读记录内容前显式展开（展开是用户真实可达的状态）。
+  await openActivityDetails('The collapsed 活动与交付记录 block did not open')
   const activityCopy = await script("document.querySelector('.mission-activity-panel')?.innerText ?? ''")
   assert(activityCopy.includes('创建了使命'), `Activity history lost its recorded creation row: ${activityCopy}`)
   assert(activityCopy.includes('将状态改为“进行中”'), `Activity history lost its recorded status row: ${activityCopy}`)
@@ -393,7 +492,8 @@ app.whenReady().then(async () => {
       legendItems: document.querySelectorAll('.loom-plan .loom-flow-legend-item').length,
       graphScrollWidth: document.querySelector('.loom-plan .loom-flow-graph')?.scrollWidth ?? -1,
       graphClientWidth: document.querySelector('.loom-plan .loom-flow-graph')?.clientWidth ?? -1,
-      controls: document.querySelectorAll('.loom-plan input, .loom-plan button, .loom-plan textarea').length
+      controls: document.querySelectorAll('.loom-plan input, .loom-plan button, .loom-plan textarea').length,
+      flowControls: document.querySelectorAll('.loom-plan .loom-flow input, .loom-plan .loom-flow button, .loom-plan .loom-flow textarea').length
     }
   })()`)
   assert.equal(plan.flow, true, `Plan section did not render the archify flow view: ${JSON.stringify(plan)}`)
@@ -420,7 +520,8 @@ app.whenReady().then(async () => {
   assert(plan.graphScrollWidth >= 0 && plan.graphScrollWidth <= plan.graphClientWidth + 1,
     `Plan flow graph overflows its 1440px lane budget: ${plan.graphScrollWidth} > ${plan.graphClientWidth}`)
   assert.equal(plan.legendItems, 3, `Plan flow must explain all three edge kinds: ${JSON.stringify(plan.legendItems)}`)
-  assert.equal(plan.controls, 0, 'Plan section must not offer controls for a read-only plan')
+  // 控制区已是真实的写入口（批准接力范围），但依赖图本身仍只读：只数图区里的控件。
+  assert.equal(plan.flowControls, 0, 'The dependency flow must stay read-only; only the relay control region may offer actions')
   cases.push('编排 section renders the real task dependency flow with four nodes, the blocked task reason, honest stats and no invented controls')
 
   stage = 'delivery section by keyboard Enter'
@@ -436,7 +537,7 @@ app.whenReady().then(async () => {
     staleCriteria: document.querySelector('.loom-criteria') === null,
     placeholder: document.querySelector('.loom-review-state') === null,
     controls: document.querySelectorAll('.loom-delivery-actions button').length,
-    actionLabels: [...document.querySelectorAll('.loom-delivery-actions button')].map(button => button.innerText),
+    actionLabels: [...document.querySelectorAll('.loom-delivery-actions button')].map(button => button.textContent.trim()),
     reviewForm: document.querySelector('.loom-review-form') === null,
     sharedDelivery: document.querySelector('.loom-workspace .mission-delivery-panel') === window.__loomNodes.delivery,
     sharedActivity: document.querySelector('.loom-workspace .mission-activity-panel') === window.__loomNodes.activity,
@@ -450,7 +551,7 @@ app.whenReady().then(async () => {
   assert.equal(review.staleCriteria, true, 'Delivery section kept the placeholder criteria block after real criteria arrived')
   assert.equal(review.placeholder, true, 'Delivery section still shows the old independent-acceptance placeholder')
   assert.ok(review.controls >= 2, `Delivery section must offer acceptance and verification actions: ${JSON.stringify(review.controls)}`)
-  assert.deepEqual(review.actionLabels, ['接受', '驳回', '通过核验', '核验失败'],
+  assert.deepEqual(review.actionLabels, ['接受', '退回', '通过核验', '核验失败'],
     `Delivery actions do not match the two independent human axes: ${JSON.stringify(review.actionLabels)}`)
   assert.equal(review.reviewForm, true, 'Delivery section expanded the review form before any user intent')
   assert.equal(review.sharedDelivery, true, 'Delivery section remounted the shared delivery panel')
@@ -500,16 +601,28 @@ app.whenReady().then(async () => {
   cases.push('Returning to 活动 performs no repeat missions.activity read and does not unmount the reading state')
 
   stage = 'section scroll retention and activity spacing'
+  // 两个共享面板挂在折叠区里：折叠区自己负责 16px 上间距，面板本身不许添横向或额外内衬。
+  const activityPanelPadding = () => script(`(() => {
+    const read = selector => {
+      const style = getComputedStyle(document.querySelector(selector))
+      return [style.paddingTop, style.paddingRight, style.paddingBottom, style.paddingLeft]
+    }
+    return {
+      delivery: read('.mission-activity-document .mission-delivery-panel'),
+      history: read('.mission-activity-document .mission-activity-panel')
+    }
+  })()`)
   const scrolled = await script(`(() => {
     const node = document.querySelector('.mission-activity-document')
     node.scrollTop = 600
-    const deliveryStyle = getComputedStyle(document.querySelector('.mission-activity-document > .mission-delivery-panel'))
-    const historyStyle = getComputedStyle(document.querySelector('.mission-activity-document > div > .mission-activity-panel'))
-    return { top: node.scrollTop, deliveryPadding: deliveryStyle.paddingTop, historyPadding: historyStyle.paddingTop }
+    return { top: node.scrollTop }
   })()`)
   assert(scrolled.top > 100, `Activity history must be scrollable before testing restoration: ${JSON.stringify(scrolled)}`)
-  assert.equal(scrolled.deliveryPadding, '0px', `Activity delivery gained extra padding: ${JSON.stringify(scrolled)}`)
-  assert.equal(scrolled.historyPadding, '0px', `Activity history gained extra padding: ${JSON.stringify(scrolled)}`)
+  const activityPaddingBefore = await activityPanelPadding()
+  assert.deepEqual(
+    [activityPaddingBefore.delivery[1], activityPaddingBefore.delivery[3], activityPaddingBefore.history[1], activityPaddingBefore.history[3]],
+    ['0px', '0px', '0px', '0px'],
+    `Activity panels gained horizontal padding: ${JSON.stringify(activityPaddingBefore)}`)
   await click('.loom-section-tabs button:nth-of-type(3)')
   await expectPressed(2, 'Delivery did not open after activity scroll')
   const deliveryScroll = await script("document.querySelector('.loom-delivery').scrollTop")
@@ -517,16 +630,25 @@ app.whenReady().then(async () => {
   await click('.loom-section-tabs button:nth-of-type(1)')
   await expectPressed(0, 'Activity did not reopen after delivery scroll test')
   await waitFor(`Math.abs(document.querySelector('.mission-activity-document').scrollTop - ${scrolled.top}) <= 1`, 'Activity scroll position was not restored after section switch')
+  const activityPaddingAfter = await activityPanelPadding()
+  assert.deepEqual(activityPaddingAfter, activityPaddingBefore,
+    `Activity panels changed their own padding across a delivery switch: ${JSON.stringify({ before: activityPaddingBefore, after: activityPaddingAfter })}`)
   cases.push('Activity retains its scroll position and original panel spacing across delivery switches')
 
   stage = 'delivery scroll retention'
+  // 交付页不再包含共享的交付/活动面板（它们在工作页的折叠区里），可滚长度只能来自交付自己：
+  // 1040x700 时两张候选卡上下排列，正好量「交付自己拥有并恢复阅读位置」。
+  await resizeTo(1040, 700, 'the delivery scroll retention check')
   await click('.loom-section-tabs button:nth-of-type(3)')
   await expectPressed(2, 'Delivery did not open for its own scroll test')
+  await setCandidateDetails(true)
   const deliveryScrolled = await script(`(() => {
     const node = document.querySelector('.loom-delivery')
-    node.scrollTop = 180
-    return { top: node.scrollTop, overflow: getComputedStyle(node).overflowY, outer: document.querySelector('.loom-section-body').scrollTop }
+    const max = node.scrollHeight - node.clientHeight
+    node.scrollTop = Math.min(180, max)
+    return { top: node.scrollTop, max, overflow: getComputedStyle(node).overflowY, outer: document.querySelector('.loom-section-body').scrollTop }
   })()`)
+  assert(deliveryScrolled.max > 100, `Delivery must own more than 100px of scrollable reading position: ${JSON.stringify(deliveryScrolled)}`)
   assert(deliveryScrolled.top > 100, `Delivery must own its scrollable reading position: ${JSON.stringify(deliveryScrolled)}`)
   assert.equal(deliveryScrolled.outer, 0, 'Outer section body must not own delivery scrolling')
   await click('.loom-section-tabs button:nth-of-type(2)')
@@ -534,18 +656,12 @@ app.whenReady().then(async () => {
   await click('.loom-section-tabs button:nth-of-type(3)')
   await expectPressed(2, 'Delivery did not reopen from plan')
   await waitFor(`Math.abs(document.querySelector('.loom-delivery').scrollTop - ${deliveryScrolled.top}) <= 1`, 'Delivery scroll position was not restored after visiting plan')
+  await setCandidateDetails(false)
   cases.push('Delivery owns and restores its scroll position across the short plan section')
 
   stage = 'wide layout density'
-  // 宽屏信息密度（Astra 方案 B）：三档全部量「工作区实际宽度」的占比与卡片相对位置，
-  // 不用「看起来更满」当证据；既有断言一条不动，这里只加。本段不新增 cases 条目，
-  // 因为 scripts/lib/loom-workspace.test.mjs 的 EXPECTED_CASES 是既有预算（本段不占名额）。
-  const resizeTo = async (width, height, label) => {
-    window.setContentSize(width, height)
-    await waitFor(`window.innerWidth === ${width} && window.innerHeight === ${height}`,
-      `LOOM fixture did not resize to ${width}x${height} for ${label}`)
-    await settle(200)
-  }
+  // 右栏几何按当前生产的 1040px 自适应框量：宽屏不铺满，窄屏由容器查询收侧距，
+  // 候选卡始终单列。本段不新增 cases 条目：EXPECTED_CASES 是既有预算。
   const openDensitySection = async (index, label) => {
     await click(`.loom-section-tabs button:nth-of-type(${index + 1})`)
     await expectPressed(index, label)
@@ -582,67 +698,95 @@ app.whenReady().then(async () => {
     }
   })()`)
 
-  // 1440：面板必须撑满可用宽度，交付必须两列等宽同排。
+  // 当前生产的右栏几何：.loom-plan / .loom-delivery 都是 max-width:1040px 的自适应框
+  // （loom-workspace.css:12），候选卡始终单列，390 下由容器查询把侧距收成 18px。
+  // 这里量的就是这条真实几何，不再假设「宽屏两列等宽同排」。
+  const paneFrame = selector => script(`(() => {
+    const node = document.querySelector(${JSON.stringify(selector)})
+    if (!node) return null
+    const style = getComputedStyle(node)
+    return {
+      width: Math.round(node.getBoundingClientRect().width),
+      clientWidth: node.clientWidth,
+      maxWidth: style.maxWidth,
+      paddingLeft: style.paddingLeft,
+      paddingRight: style.paddingRight,
+      pageScrollWidth: document.documentElement.scrollWidth,
+      pageClientWidth: document.documentElement.clientWidth
+    }
+  })()`)
+
+  // 1440：右栏仍是 1040 框，编排图在自己的框里不溢出。
   await resizeTo(1440, 920, 'the 1440px density check')
   await openDensitySection(1, '编排 did not open for the 1440px density check')
   await waitFor("document.querySelectorAll('.loom-plan .loom-flow-lane').length >= 2",
     '编排 flow lanes did not render for the 1440px density check')
+  const widePlanFrame = await paneFrame('.loom-plan')
   const widePlan = await flowDensity()
   assert(widePlan.workspace >= 1200,
     `The 1440px LOOM workspace must be at least 1200 wide before the wide layout check: ${JSON.stringify(widePlan)}`)
-  assert(widePlan.clientWidth / widePlan.workspace >= 0.95,
-    `The 编排 flow graph must fill the wide workspace instead of stopping at the 860px cap: ${JSON.stringify(widePlan)}`)
+  assert.equal(widePlanFrame.maxWidth, '1040px',
+    `The 编排 pane lost its 1040px frame: ${JSON.stringify(widePlanFrame)}`)
+  assert.equal(widePlanFrame.width, 1040,
+    `The 编排 pane must use the full 1040px frame at 1440: ${JSON.stringify(widePlanFrame)}`)
   assert(widePlan.scrollWidth <= widePlan.clientWidth + 1,
     `The 编排 flow graph must not overflow its own pane at 1440: ${JSON.stringify(widePlan)}`)
   assert.equal(widePlan.lanes.length, 4,
     `编排 must still layer the four-task DAG into four lanes: ${JSON.stringify(widePlan.lanes)}`)
   assert(widePlan.lanes.every(width => width >= 160),
     `编排 lanes must keep their 160px floor: ${JSON.stringify(widePlan.lanes)}`)
-  assert(4 * 160 + 3 * 32 <= widePlan.workspace - 56,
-    `The lane width budget (4×160 + 3×32 = 736) must still fit 工作区宽度 − 56: ${JSON.stringify(widePlan)}`)
+  assert(4 * 160 + 3 * 32 <= widePlan.clientWidth,
+    `The lane width budget (4×160 + 3×32 = 736) must fit the real graph viewport: ${JSON.stringify(widePlan)}`)
 
   await openDensitySection(2, '交付 did not open for the 1440px density check')
   await waitFor("document.querySelectorAll('.loom-delivery-context .loom-candidate').length === 2",
     'Delivery section did not list both candidates for the 1440px density check')
   await script("(() => { const pane = document.querySelector('.loom-delivery'); if (pane) pane.scrollTop = 0; return true })()")
   await settle(120)
+  const wideFrame = await paneFrame('.loom-delivery')
   const wideDelivery = await deliveryDensity()
-  assert(wideDelivery.context / wideDelivery.workspace >= 0.94,
-    `The 交付 list must fill the wide workspace instead of staying one 860px column: ${JSON.stringify(wideDelivery)}`)
+  assert.equal(wideFrame.maxWidth, '1040px',
+    `The 交付 pane lost its 1040px frame: ${JSON.stringify(wideFrame)}`)
+  assert.equal(wideFrame.width, 1040,
+    `The 交付 pane must use the full 1040px frame at 1440: ${JSON.stringify(wideFrame)}`)
+  assert.equal(wideDelivery.context, wideFrame.clientWidth - 48,
+    `The delivery list must fill the frame client area minus 24px side padding, excluding the native scrollbar: ${JSON.stringify({ frame: wideFrame, delivery: wideDelivery })}`)
   assert.equal(wideDelivery.cards.length, 2,
     `交付 must still list both recorded candidates at 1440: ${JSON.stringify(wideDelivery.cards)}`)
-  assert.equal(wideDelivery.cards[0].top, wideDelivery.cards[1].top,
-    `The two 交付 candidate cards must share one row at 1440 (equal top): ${JSON.stringify(wideDelivery.cards)}`)
-  assert.notEqual(wideDelivery.cards[0].left, wideDelivery.cards[1].left,
-    `The two 交付 candidate cards must sit side by side at 1440 (different left): ${JSON.stringify(wideDelivery.cards)}`)
-  assert(Math.abs(wideDelivery.cards[0].width - wideDelivery.cards[1].width) <= 1,
-    `The two 交付 columns must be equal width: ${JSON.stringify(wideDelivery.cards)}`)
+  assert.equal(wideDelivery.cards[0].left, wideDelivery.cards[1].left,
+    `The 交付 cards must stack one per row inside the inspector pane: ${JSON.stringify(wideDelivery.cards)}`)
+  assert.notEqual(wideDelivery.cards[0].top, wideDelivery.cards[1].top,
+    `The two 交付 candidate cards must not share one row: ${JSON.stringify(wideDelivery.cards)}`)
+  assert(wideFrame.pageScrollWidth <= wideFrame.pageClientWidth + 1,
+    `The 1440px page itself must not scroll horizontally: ${JSON.stringify(wideFrame)}`)
 
-  // 1040：860 上限与单列必须原样保留。
+  // 1040：框宽与单列保持不变，页宽刚好等于框宽。
   await resizeTo(1040, 700, 'the 1040px density check')
+  const mediumFrame = await paneFrame('.loom-delivery')
   const mediumDelivery = await deliveryDensity()
-  assert(mediumDelivery.workspace < 1200,
-    `The 1040px LOOM workspace must stay under the wide threshold: ${JSON.stringify(mediumDelivery)}`)
-  assert(mediumDelivery.context <= 805,
-    `The 交付 panel must keep its 860px cap at 1040 (860 − 2×28 = 804): ${JSON.stringify(mediumDelivery)}`)
+  assert.equal(mediumFrame.width, mediumDelivery.workspace,
+    `The 交付 pane must exactly fill a 1040px workspace: ${JSON.stringify({ frame: mediumFrame, pane: mediumDelivery.workspace })}`)
+  assert(mediumDelivery.context <= 992,
+    `The 交付 list must stay inside the 1040px frame minus gutters at 1040: ${JSON.stringify(mediumDelivery)}`)
   assert.equal(mediumDelivery.cards[0].left, mediumDelivery.cards[1].left,
     `交付 must stay one column at 1040 (shared left): ${JSON.stringify(mediumDelivery.cards)}`)
   assert.notEqual(mediumDelivery.cards[0].top, mediumDelivery.cards[1].top,
     `交付 must stay one column at 1040 (different top): ${JSON.stringify(mediumDelivery.cards)}`)
 
-  // 390：20 侧距、单列、页面本身不横向溢出；编排仍只在自己的图区内横滚。
+  // 390：容器查询把侧距收成 18px、单列、页面本身不横向溢出；编排仍只在自己的图区内横滚。
   await resizeTo(390, 844, 'the 390px density check')
+  const mobileFrame = await paneFrame('.loom-delivery')
   const mobileDelivery = await deliveryDensity()
-  assert.equal(mobileDelivery.panePaddingLeft, '20px',
-    `The 交付 panel must keep its 20px side padding at 390: ${JSON.stringify(mobileDelivery)}`)
-  assert.equal(mobileDelivery.panePaddingRight, '20px',
-    `The 交付 panel must keep its 20px side padding at 390: ${JSON.stringify(mobileDelivery)}`)
+  assert.equal(mobileFrame.paddingLeft, '18px',
+    `The 交付 pane must take the narrow container padding at 390: ${JSON.stringify(mobileFrame)}`)
+  assert.equal(mobileFrame.paddingRight, '18px',
+    `The 交付 pane must take the narrow container padding at 390: ${JSON.stringify(mobileFrame)}`)
   assert.equal(mobileDelivery.cards[0].left, mobileDelivery.cards[1].left,
     `交付 must stay one column at 390 (shared left): ${JSON.stringify(mobileDelivery.cards)}`)
   assert.notEqual(mobileDelivery.cards[0].top, mobileDelivery.cards[1].top,
     `交付 must stay one column at 390 (different top): ${JSON.stringify(mobileDelivery.cards)}`)
-  assert(mobileDelivery.pageScrollWidth <= mobileDelivery.pageClientWidth + 1,
-    `The 390px page itself must not scroll horizontally: ${JSON.stringify(mobileDelivery)}`)
+  assert(mobileFrame.pageScrollWidth <= mobileFrame.pageClientWidth + 1,
+    `The 390px page itself must not scroll horizontally: ${JSON.stringify(mobileFrame)}`)
   await openDensitySection(1, '编排 did not open for the 390px density check')
   await waitFor("document.querySelectorAll('.loom-plan .loom-flow-lane').length >= 2",
     '编排 flow lanes did not render for the 390px density check')
@@ -653,6 +797,8 @@ app.whenReady().then(async () => {
     `编排 must still scroll the flow graph horizontally inside its own pane at 390: ${JSON.stringify(mobilePlan)}`)
 
   stage = 'screenshots'
+  // 截图拍生产默认态：活动与交付记录是折叠的；展开只用于断言里面的内容。
+  await setActivityDetails(false)
   for (const [width, height] of [[1440, 920], [1040, 700], [390, 844]]) {
     window.setContentSize(width, height)
     await waitFor(`window.innerWidth === ${width} && window.innerHeight === ${height}`, `LOOM fixture did not resize to ${width}x${height}`)
@@ -710,7 +856,7 @@ app.whenReady().then(async () => {
   assert.equal(acceptStart.acceptanceState, 'pending', `Target candidate acceptance badge did not start pending: ${JSON.stringify(acceptStart)}`)
   assert.equal(acceptStart.acceptanceCopy, '待验收', `Acceptance badge copy changed: ${JSON.stringify(acceptStart.acceptanceCopy)}`)
   assert.equal(acceptStart.verificationState, 'unverified', `Target candidate verification axis did not start unverified: ${JSON.stringify(acceptStart.verificationState)}`)
-  assert.deepEqual(acceptStart.actionRow, ['接受', '驳回', '通过核验', '核验失败'],
+  assert.deepEqual(acceptStart.actionRow, ['接受', '退回', '通过核验', '核验失败'],
     `Target candidate lost its two independent action axes: ${JSON.stringify(acceptStart.actionRow)}`)
   assert.equal(acceptStart.forms, 0, 'The review form was already open before any pointer click')
 
@@ -834,12 +980,12 @@ app.whenReady().then(async () => {
   await openDelivery()
   const rejectStart = await cardState(TARGET_CANDIDATE)
   assert.equal(rejectStart.acceptanceState, 'pending', `Reset did not restore the pending acceptance axis: ${JSON.stringify(rejectStart.acceptanceState)}`)
-  assert.deepEqual(rejectStart.actionRow, ['接受', '驳回', '通过核验', '核验失败'],
+  assert.deepEqual(rejectStart.actionRow, ['接受', '退回', '通过核验', '核验失败'],
     `Reset did not restore both action axes: ${JSON.stringify(rejectStart.actionRow)}`)
 
   await clickElement(inCard(TARGET_CANDIDATE, '.loom-btn-reject'))
   const rejectOpened = await waitCard(TARGET_CANDIDATE, state => state.forms === 1, 'Reject did not open the review form')
-  assert.deepEqual(rejectOpened.submit, { label: '确认驳回', disabled: true },
+  assert.deepEqual(rejectOpened.submit, { label: '确认退回', disabled: true },
     `Reject started submittable without a reason: ${JSON.stringify(rejectOpened.submit)}`)
   await clickElement(submitFor(TARGET_CANDIDATE))
   await settle(160)
@@ -850,7 +996,7 @@ app.whenReady().then(async () => {
   await settle(120)
   const rejectReady = await cardState(TARGET_CANDIDATE)
   assert.deepEqual(rejectReady.checkboxes, [false, false], `Reject must not demand criterion checks: ${JSON.stringify(rejectReady.checkboxes)}`)
-  assert.deepEqual(rejectReady.submit, { label: '确认驳回', disabled: false },
+  assert.deepEqual(rejectReady.submit, { label: '确认退回', disabled: false },
     `A reject with a reason and no checks must be submittable: ${JSON.stringify(rejectReady.submit)}`)
   await clickElement(submitFor(TARGET_CANDIDATE))
   await waitFor("window.loomQA.countOf('loom.review.record') >= 1", 'Reject never sent loom.review.record')
@@ -862,7 +1008,7 @@ app.whenReady().then(async () => {
     `Reject must remove its own buttons and keep the verification buttons: ${JSON.stringify(rejected.actionRow)}`)
   assert.equal(rejected.verificationState, 'unverified', 'Rejecting a candidate must not move the verification axis')
   const rejectedLines = rejected.review.split('\n').map(line => line.trim()).filter(line => line !== '')
-  assert(rejectedLines.some(line => line.includes('验收结论：驳回')), `The rejected verdict line is missing: ${JSON.stringify(rejected.review)}`)
+  assert(rejectedLines.some(line => line.includes('验收结论：退回')), `The rejected verdict line is missing: ${JSON.stringify(rejected.review)}`)
   assert(rejectedLines.some(line => line.includes(rejectReason.trim())), `The written reject reason was not rendered back: ${JSON.stringify(rejected.review)}`)
   assert.deepEqual(criterionVerdicts(rejected.review), [{ criterionId: 'c1', satisfied: false }, { criterionId: 'c2', satisfied: false }],
     `A rejection that checked nothing must record every criterion as unsatisfied: ${JSON.stringify(rejected.review)}`)
@@ -896,7 +1042,7 @@ app.whenReady().then(async () => {
     'The read-back candidate must carry the rejected verdict')
   assert.equal(rejectState.reviews.filter(review => review.candidateId === 'candidate-2').length, 1, 'The rejection write must add exactly one row')
   await expectWriteReadback('Reject')
-  // 驳回把任务送回 READY：编排 tab 的节点必须回到可执行（就绪），不是停在评审中。
+  // 退回把任务送回 READY：编排 tab 的节点必须回到可执行（就绪），不是停在评审中。
   await openPlanTab('the rejected review')
   const rejectedNode = await waitFlowNode(TARGET_TASK_TITLE, state => state.status === 'ready',
     '编排 never showed the rejected task back in ready')
@@ -916,7 +1062,7 @@ app.whenReady().then(async () => {
     `The rejection badge fell back to stale data after the section round trip: ${JSON.stringify(rejectedStill)}`)
   assert.equal(rejectedStill.acceptanceCopy, '已驳回',
     `The rejection badge copy fell back to stale data after the section round trip: ${JSON.stringify(rejectedStill)}`)
-  cases.push('驳回 requires a reason but no criterion checks, writes exactly one loom.review.record, reads rejected back and leaves the verification axis untouched')
+  cases.push('退回 requires a reason but no criterion checks, writes exactly one loom.review.record, reads rejected back and leaves the verification axis untouched')
 
   stage = 'delivery verification passed'
   await resetLoom()
@@ -932,7 +1078,7 @@ app.whenReady().then(async () => {
   const verified = await waitCard(TARGET_CANDIDATE, state => state.verificationState === 'verified',
     'The verified verdict was never read back into the delivery section')
   assert.equal(verified.verificationCopy, '已核验', `Verified badge copy is not the recorded verdict: ${JSON.stringify(verified.verificationCopy)}`)
-  assert.deepEqual(verified.actionRow, ['接受', '驳回'],
+  assert.deepEqual(verified.actionRow, ['接受', '退回'],
     `Both verification buttons must disappear once a verification is recorded: ${JSON.stringify(verified.actionRow)}`)
   assert.equal(verified.acceptanceState, 'pending', 'Verification must not decide the acceptance axis')
   assert.equal(verified.acceptanceCopy, '待验收', `Verification moved the acceptance badge copy: ${JSON.stringify(verified.acceptanceCopy)}`)
@@ -996,7 +1142,7 @@ app.whenReady().then(async () => {
   const failed = await waitCard(TARGET_CANDIDATE, state => state.verificationState === 'failed',
     'The failed verdict was never read back into the delivery section')
   assert.equal(failed.verificationCopy, '核验失败', `Failed badge copy is not the recorded verdict: ${JSON.stringify(failed.verificationCopy)}`)
-  assert.deepEqual(failed.actionRow, ['接受', '驳回'],
+  assert.deepEqual(failed.actionRow, ['接受', '退回'],
     `Both verification buttons must disappear after a failed verification: ${JSON.stringify(failed.actionRow)}`)
   assert.equal(failed.acceptanceState, 'pending', 'A failed verification must not decide the acceptance axis')
   assert.equal(failed.forms, 0, 'A failed verification must not open the acceptance form')
@@ -1234,6 +1380,52 @@ app.whenReady().then(async () => {
     `The target candidate's unmatched evidence id must read 未登记: ${JSON.stringify(targetEvidence[0].badge)}`)
   cases.push('对不上任何已登记产物的 evidenceId 显示 evidenceId 原文与「未登记」徽章，不借用其他候选的路径、hash 或大小')
 
+  stage = 'artifact preview dialog'
+  // 正文预览现在在浮层里读：点行打开夹具返回的真实快照文本，Esc 关闭、焦点回到触发行，全程不发写。
+  const previewRow = inCard('sha256:restore-protocol', '.loom-preview-row')
+  // inCard 的表达式自带 `?? null` 尾巴，必须再加一层括号再串 ?. / 否则焦点会落到 null 上。
+  await script(`(${previewRow})?.focus()`)
+  await settle(120)
+  await clickElement(previewRow)
+  await waitFor("!!document.querySelector('.loom-artifact-dialog')",
+    'Clicking an evidence row did not open the artifact preview overlay')
+  const previewDialog = await script(`(() => {
+    const dialog = document.querySelector('.loom-artifact-dialog')
+    return {
+      role: dialog?.getAttribute('role') ?? null,
+      title: dialog?.querySelector('.loom-artifact-title')?.innerText ?? '',
+      state: dialog?.querySelector('.loom-preview-body')?.getAttribute('data-preview-state') ?? null,
+      copy: dialog?.querySelector('.loom-artifact-doc')?.innerText ?? '',
+      haspopup: (${previewRow})?.getAttribute('aria-haspopup') ?? null,
+      forms: document.querySelectorAll('.loom-artifact-dialog .loom-review-form').length
+    }
+  })()`)
+  assert.equal(previewDialog.role, 'dialog',
+    `The preview overlay is not a modal dialog: ${JSON.stringify(previewDialog.role)}`)
+  assert.equal(previewDialog.title, 'restore-protocol.md',
+    `The overlay title is not the real file name: ${JSON.stringify(previewDialog.title)}`)
+  assert.equal(previewDialog.state, 'ready',
+    `The overlay did not show the ready preview state: ${JSON.stringify(previewDialog.state)}`)
+  assert(previewDialog.copy.includes('LOOM-PREVIEW-READY'),
+    `The overlay did not render the archived text the fixture returned: ${JSON.stringify(previewDialog.copy)}`)
+  assert.equal(previewDialog.haspopup, 'dialog',
+    `The evidence row does not announce a dialog: ${JSON.stringify(previewDialog.haspopup)}`)
+  assert.equal(previewDialog.forms, 0, 'Opening the preview opened an acceptance form by itself')
+  await pressKey('Escape')
+  await waitFor("!document.querySelector('.loom-artifact-dialog')", 'Escape did not close the artifact preview overlay')
+  const previewClosed = await script(`({
+    dialog: !!document.querySelector('.loom-artifact-dialog'),
+    focusInCard: ${cardFor('sha256:restore-protocol')}?.contains(document.activeElement) ?? false,
+    records: window.loomQA.countOf('loom.review.record') + window.loomQA.countOf('loom.verification.record'),
+    errors: window.loomQA.errors.slice()
+  })`)
+  assert.equal(previewClosed.dialog, false, 'The preview overlay survived Escape')
+  assert.equal(previewClosed.focusInCard, true,
+    `Closing the overlay did not return focus to the invoking card: ${JSON.stringify(previewClosed)}`)
+  assert.equal(previewClosed.records, 0, 'Opening and closing a preview must not record acceptance or verification')
+  assert.deepEqual(previewClosed.errors, [], `The preview overlay asked for an unanswered method: ${JSON.stringify(previewClosed.errors)}`)
+  cases.push('产物正文在浮层里只读展示夹具取到的真实快照文本，Esc 关闭并把焦点还给触发行，全程不写验收/核验')
+
   stage = 'artifact projection: read failure'
   await resetLoom()
   await switchArtifacts({ fail: true })
@@ -1255,7 +1447,7 @@ app.whenReady().then(async () => {
     candidates: document.querySelectorAll('.loom-delivery-context .loom-candidate').length,
     verificationBadges: [...document.querySelectorAll('.loom-badge-verification')].map(node => node.getAttribute('data-state')),
     acceptanceBadges: [...document.querySelectorAll('.loom-badge-acceptance')].map(node => node.getAttribute('data-state')),
-    actions: [...document.querySelectorAll('.loom-delivery-actions button')].map(button => button.innerText),
+    actions: [...document.querySelectorAll('.loom-delivery-actions button')].map(button => button.textContent.trim()),
     review: document.querySelector('.loom-candidate-review')?.innerText ?? null,
     sharedEvidence: document.querySelectorAll('.loom-workspace .mission-evidence-row').length,
     deliveryEmpty: document.querySelectorAll('.loom-delivery-context .loom-empty').length
@@ -1266,7 +1458,7 @@ app.whenReady().then(async () => {
     `A failed artifacts read changed the verification axis: ${JSON.stringify(afterArtifactsFailure.verificationBadges)}`)
   assert.deepEqual(afterArtifactsFailure.acceptanceBadges, ['accepted', 'pending'],
     `A failed artifacts read changed the acceptance axis: ${JSON.stringify(afterArtifactsFailure.acceptanceBadges)}`)
-  assert.deepEqual(afterArtifactsFailure.actions, ['接受', '驳回', '通过核验', '核验失败'],
+  assert.deepEqual(afterArtifactsFailure.actions, ['接受', '退回', '通过核验', '核验失败'],
     `A failed artifacts read removed the delivery actions: ${JSON.stringify(afterArtifactsFailure.actions)}`)
   assert.equal(typeof afterArtifactsFailure.review, 'string',
     `A failed artifacts read dropped the recorded review: ${JSON.stringify(afterArtifactsFailure.review)}`)
@@ -1298,13 +1490,489 @@ app.whenReady().then(async () => {
     'A forced artifacts read failure was misreported as an unanswered fixture method')
   cases.push('loom.artifacts.list 读失败时只有候选卡产物区降级成「产物信息读取失败」（不冒充未登记），其余七个投影照常渲染')
 
-  console.log(JSON.stringify({ ok: true, cases, shots, counts: final, output }))
+  const afterRemount = async (expression) => {
+    const before = await script('document.querySelector("[data-loom-generation]")?.getAttribute("data-loom-generation")')
+    await script(expression)
+    await waitFor(`document.querySelector("[data-loom-generation]")?.getAttribute("data-loom-generation") !== ${JSON.stringify(before)}`,
+      `LOOM workspace did not remount after ${expression}`)
+  }
+
+  stage = 'live placements'
+  await resetLoom()
+  await afterRemount('window.loomQA.setLive("mixed")')
+  await openPlanTab('the live placements')
+  await waitFor("(document.querySelector('.loom-live-strip')?.innerText ?? '').includes('loom-a') && (document.querySelector('.loom-live-strip')?.innerText ?? '').includes('desk-b')",
+    'The mission strip did not name both the local node and the remote node')
+  const live = await script(`(() => {
+    const text = value => (value ?? '').replace(/\\s+/gu, ' ').trim()
+    const item = title => [...document.querySelectorAll('.loom-live-strip-item')].find(node => (node.querySelector('.loom-live-strip-title')?.innerText ?? '').includes(title))
+    const lane = role => document.querySelector('.loom-live-lane[data-live-role="' + role + '"]')
+    const row = role => document.querySelector('.loom-live-row[data-live-role="' + role + '"]')
+    return {
+      done: text(item('设计恢复协议')?.innerText),
+      local: text(lane('local')?.innerText),
+      remote: text(lane('remote')?.innerText),
+      localRole: row('local')?.getAttribute('data-live-role') ?? null,
+      localPhase: row('local')?.getAttribute('data-live-phase') ?? null,
+      remoteRole: row('remote')?.getAttribute('data-live-role') ?? null,
+      remotePhase: row('remote')?.getAttribute('data-live-phase') ?? null,
+      localCopy: text(row('local')?.innerText),
+      remoteCopy: text(row('remote')?.innerText),
+      claims: [...document.querySelectorAll('.loom-flow-claim-status')].map(node => text(node.innerText))
+    }
+  })()`)
+  assert(live.done.includes('已完成') && !live.done.includes('loom-a'), `A finished task without a run must stay done and unassigned: ${JSON.stringify(live.done)}`)
+  assert(live.local.includes('本机') && live.local.includes('loom-a') && live.local.includes('在跑'),
+    `The local run lost its machine or running state on the strip: ${JSON.stringify(live.local)}`)
+  assert(live.remote.includes('远端') && live.remote.includes('desk-b') && live.remote.includes('离线'),
+    `The remote run lost its badge, machine or offline state on the strip: ${JSON.stringify(live.remote)}`)
+  assert(live.localCopy.includes('codex-cli'), `The local card lost its CLI: ${JSON.stringify(live.localCopy)}`)
+  assert(live.remoteCopy.includes('claude-code-cli'), `The remote card lost its CLI: ${JSON.stringify(live.remoteCopy)}`)
+  assert(live.remoteCopy.includes('最后心跳') && live.remoteCopy.includes('秒前'), `An offline card must show how long since the last heartbeat: ${JSON.stringify(live.remoteCopy)}`)
+  const lanes = await script(`({
+    roles: [...document.querySelectorAll('.loom-live-lane')].map(node => node.getAttribute('data-live-role')),
+    localStatus: [...document.querySelectorAll('.loom-flow-node')].find(node => (node.innerText || '').includes('实现恢复逻辑'))?.querySelector('.loom-flow-node-status')?.innerText ?? ''
+  })`)
+  assert.deepEqual(lanes.roles, ['local', 'remote', 'none'], `Lanes must be one row per node, local first: ${JSON.stringify(lanes.roles)}`)
+  assert.equal(lanes.localStatus.trim(), '在跑', `A running task must not keep a contradictory workflow status: ${JSON.stringify(lanes.localStatus)}`)
+  const pins = await script(`[...document.querySelectorAll('.loom-flow-node-pin')].map(node => node.innerText.trim())`)
+  assert(pins.some(text => text.includes('钉在') && text.includes('loom-a')), `The local task did not show its pinned node: ${JSON.stringify(pins)}`)
+  assert(pins.some(text => text.includes('钉在') && text.includes('desk-b')), `The remote task did not show its pinned node: ${JSON.stringify(pins)}`)
+  assert.equal(live.localRole, 'local')
+  assert.equal(live.localPhase, 'running')
+  assert.equal(live.remoteRole, 'remote')
+  assert.equal(live.remotePhase, 'offline')
+  assert(live.localCopy.includes('已进行'), `A running card did not show elapsed time: ${JSON.stringify(live.localCopy)}`)
+  assert(live.claims.includes('已认领'), `Live node rows replaced the claim block: ${JSON.stringify(live.claims)}`)
+  await expectPlanWidths('live placements')
+  cases.push('编排卡片和使命进度条写出本机与远端、CLI、在跑或离线、已进行，完成的任务不编造节点，认领行还在')
+
+  stage = 'live output follows until the reader scrolls up'
+  // 先量真实几何再点：这条用例要证的是「按钮确实在可视区外，被滚回来之后才点得到」，
+  // 不是推断。before/after 两帧几何最后挂在 report.uiGeometry，不参与 cases 计数。
+  const liveButtonGeometry = () => script(`(() => {
+    const element = document.querySelector('.loom-live-row[data-live-role="local"] .loom-live-open')
+    const pane = document.querySelector('.loom-plan')
+    if (!element) return null
+    const bounds = element.getBoundingClientRect()
+    return {
+      top: Math.round(bounds.top),
+      bottom: Math.round(bounds.bottom),
+      height: Math.round(bounds.height),
+      innerHeight: window.innerHeight,
+      planScrollTop: Math.round(pane?.scrollTop ?? -1),
+      planClientHeight: Math.round(pane?.clientHeight ?? -1),
+      inViewport: bounds.top >= 0 && bounds.bottom <= window.innerHeight
+    }
+  })()`)
+  const liveGeometryBefore = await liveButtonGeometry()
+  await click('.loom-live-row[data-live-role="local"] .loom-live-open')
+  const liveGeometryAfter = await liveButtonGeometry()
+  uiGeometry.liveOpen = { before: liveGeometryBefore, after: liveGeometryAfter }
+  await waitFor("(document.querySelector('.loom-live-output')?.innerText ?? '').includes('帧 2')",
+    'Opening a card did not grow the node output')
+  await waitFor("(() => { const node = document.querySelector('.loom-live-output'); return !!node && node.clientHeight >= 260 && node.scrollHeight > node.clientHeight + 24 })()",
+    'The execution log did not grow to a scrolling viewport', 20000)
+  await script(`(() => {
+    const node = document.querySelector('.loom-live-output')
+    node.scrollTop = 0
+    node.dispatchEvent(new Event('scroll', { bubbles: true }))
+    return true
+  })()`)
+  const linesBeforePause = await script("document.querySelectorAll('.loom-live-line').length")
+  await waitFor("document.querySelector('.loom-live-output')?.getAttribute('data-follow') === 'false'",
+    'Scrolling the output up did not pause follow')
+  await waitFor(`document.querySelectorAll('.loom-live-line').length > ${linesBeforePause} && !!document.querySelector('.loom-live-pill')`,
+    'Paused output stopped receiving frames', 15000)
+  const paused = await script(`(() => {
+    const node = document.querySelector('.loom-live-output')
+    const pill = document.querySelector('.loom-live-pill')
+    const header = document.querySelector('.loom-live-process header')?.innerText ?? ''
+    const output = node.getBoundingClientRect()
+    const pillBox = pill?.getBoundingClientRect()
+    return { follow: node.getAttribute('data-follow'), top: node.scrollTop, height: node.clientHeight, text: node.innerText, pill: pill?.innerText ?? '', header, pillClears: !!pillBox && pillBox.top >= output.bottom - 1 }
+  })()`)
+  assert.equal(paused.follow, 'false', `Follow resumed on its own: ${JSON.stringify(paused)}`)
+  assert.equal(paused.top, 0, `A paused reader was pulled back to the latest line: ${JSON.stringify(paused)}`)
+  assert(paused.height >= 260, `The execution log is shorter than the reading viewport: ${JSON.stringify(paused.height)}`)
+  assert.equal(paused.pillClears, true, `The new-output pill covers the log: ${JSON.stringify(paused)}`)
+  assert(paused.text.includes('帧 1') && paused.text.includes('帧 3'), `The stream did not resume from the lines already shown: ${JSON.stringify(paused.text)}`)
+  assert(/^新输出 \d+/u.test(paused.pill.trim()), `Scrolling up did not show a new-output count: ${JSON.stringify(paused.pill)}`)
+  assert(paused.header.includes('共') && paused.header.includes('行'), `The process header lost its line count: ${JSON.stringify(paused.header)}`)
+  cases.push('点开卡片后执行过程按序号追加，读者往上滚时停止自动跟随，并标出新输出的行数')
+
+  stage = 'claims failure keeps node names off the cards'
+  await afterRemount('window.loomQA.failClaimsWithNodes()')
+  await openPlanTab('claims failed while nodes are known')
+  await waitFor("(document.querySelector('.loom-plan')?.innerText ?? '').includes('认领状态未知')",
+    'A failed claims read with a node list stopped saying 认领状态未知')
+  const unknownLive = await script(`(() => {
+    const text = document.querySelector('.loom-plan')?.innerText ?? ''
+    return {
+      desk: text.includes('desk-b'),
+      rows: document.querySelectorAll('.loom-live-row').length,
+      states: [...document.querySelectorAll('.loom-flow-claim')].map(node => node.getAttribute('data-claim-state')),
+      strip: document.querySelectorAll('.loom-live-strip-item').length
+    }
+  })()`)
+  assert.equal(unknownLive.desk, false, `A failed claims read still named a node: ${JSON.stringify(unknownLive)}`)
+  assert.equal(unknownLive.rows, 0, `A failed claims read still drew a run row: ${JSON.stringify(unknownLive)}`)
+  assert.deepEqual(unknownLive.states, [null, null, null, null], `A failed claims read stamped a claim state: ${JSON.stringify(unknownLive.states)}`)
+  assert.equal(unknownLive.strip, 4, `A failed claims read removed the progress strip: ${JSON.stringify(unknownLive)}`)
+  cases.push('认领读失败时即使节点列表在，也不把 Run 安到卡片上，认领状态未知保持，进度条只剩任务本身')
+
+  stage = 'no plan keeps the empty orchestration'
+  await afterRemount('window.loomQA.setPlanHidden(true)')
+  await click('.loom-section-tabs button:nth-of-type(2)')
+  await expectPressed(1, '编排 did not open for the empty plan')
+  await waitFor("(document.querySelector('.loom-plan')?.innerText ?? '').includes('尚未配置编排')",
+    'Hiding the plan did not restore 尚未配置编排')
+  const emptyPlan = await script(`({
+    strip: document.querySelectorAll('.loom-live-strip').length,
+    nodes: document.querySelectorAll('.loom-flow-node').length,
+    foundation: document.querySelectorAll('.loom-foundation').length,
+    title: document.querySelector('.loom-empty h3')?.innerText ?? ''
+  })`)
+  assert.equal(emptyPlan.strip, 0, `An unplanned mission still drew the live strip: ${JSON.stringify(emptyPlan)}`)
+  assert.equal(emptyPlan.nodes, 0, `An unplanned mission still drew flow nodes: ${JSON.stringify(emptyPlan)}`)
+  assert.equal(emptyPlan.foundation, 1, `An unplanned mission lost the foundation counts: ${JSON.stringify(emptyPlan)}`)
+  assert.equal(emptyPlan.title, '尚未配置编排', `The empty title changed: ${JSON.stringify(emptyPlan.title)}`)
+  cases.push('没有计划时仍是尚未配置编排和三格基础计数，不画进度条，也不画节点行')
+
+  stage = 'relay control: unapproved scope'
+  // 控制区专用：受控 select / input 只认原生 setter + 事件，直接赋 value 不会触发 React。
+  const setNativeValue = (expression, value, prototype, eventName) => script(`(() => {
+    const node = ${expression}
+    if (!node) return null
+    const setter = Object.getOwnPropertyDescriptor(${prototype}.prototype, 'value').set
+    setter.call(node, ${JSON.stringify(value)})
+    node.dispatchEvent(new Event(${JSON.stringify(eventName)}, { bubbles: true }))
+    return node.value
+  })()`)
+  const setSelect = (expression, value) => setNativeValue(expression, value, 'HTMLSelectElement', 'change')
+  const setTextField = (expression, value) => setNativeValue(expression, value, 'HTMLInputElement', 'input')
+  const controlState = () => script("document.querySelector('.loom-control')?.getAttribute('data-control-state') ?? null")
+  const waitControlState = async (expected, message) => {
+    const deadline = Date.now() + 8000
+    let seen = null
+    while (Date.now() < deadline) {
+      seen = await controlState()
+      if (seen === expected) return seen
+      await sleep(30)
+    }
+    throw new Error(`${message}: ${JSON.stringify(seen)}`)
+  }
+  const controlCalls = method => script(
+    `window.loomQA.calls.filter(call => call.method === ${JSON.stringify(method)}).map(call => call.params)`)
+  const controlFacts = () => script(`([...document.querySelectorAll('.loom-control-fact')].map(node => node.innerText.replace(/\\s+/gu, ' ')))`)
+  const openControl = async label => {
+    await openPlanTab(label)
+    await waitFor("!!document.querySelector('.loom-control')", `${label}: 编排 did not render the relay control region`)
+  }
+
+  await resetLoom()
+  await openControl('the unapproved relay scope')
+  await waitControlState('unapproved', 'A mission without an approved policy must read 尚未批准')
+  const controlEmpty = await script(`(() => {
+    const root = document.querySelector('.loom-control')
+    const approve = document.querySelector('.loom-control-approve')
+    return {
+      copy: (root?.innerText ?? '').replace(/\\s+/gu, ' '),
+      stateCopy: root?.querySelector('.loom-control-state')?.innerText ?? '',
+      taskBoxes: [...document.querySelectorAll('.loom-control-task input[type=checkbox]')].map(input => input.checked),
+      reviewers: [...document.querySelectorAll('.loom-control-reviewer')].map(select => select.value),
+      dispatches: document.querySelector('.loom-control-max-dispatches')?.value ?? null,
+      reworks: document.querySelector('.loom-control-max-reworks')?.value ?? null,
+      expires: document.querySelector('.loom-control-expires')?.value ?? null,
+      problems: [...document.querySelectorAll('.loom-control-problems li')].map(node => node.innerText),
+      approve: approve === null ? null : { label: approve.innerText, disabled: approve.disabled },
+      facts: document.querySelectorAll('.loom-control-fact').length,
+      pause: document.querySelectorAll('.loom-control-pause').length
+    }
+  })()`)
+  assert.equal(controlEmpty.stateCopy, '尚未批准接力范围', `未批准状态文案不对: ${JSON.stringify(controlEmpty.stateCopy)}`)
+  assert.deepEqual(controlEmpty.taskBoxes, [false, false, false, false], `控制区替用户预勾了任务: ${JSON.stringify(controlEmpty.taskBoxes)}`)
+  assert.deepEqual(controlEmpty.reviewers, ['', '', '', ''], `控制区替用户预选了审查者: ${JSON.stringify(controlEmpty.reviewers)}`)
+  assert.deepEqual([controlEmpty.dispatches, controlEmpty.reworks, controlEmpty.expires], ['', '', ''],
+    `控制区替用户填了预算或到期: ${JSON.stringify(controlEmpty)}`)
+  assert.ok(controlEmpty.problems.length >= 3,
+    `空表单没有列出缺口: ${JSON.stringify(controlEmpty.problems)}`)
+  assert.deepEqual(controlEmpty.approve, { label: '批准此范围', disabled: true },
+    `空表单就能提交批准: ${JSON.stringify(controlEmpty.approve)}`)
+  assert.equal(controlEmpty.facts, 0, '未批准就展示了策略事实')
+  assert.equal(controlEmpty.pause, 0, '未批准就给出了暂停入口')
+  // 独立审查者排除执行者本人：task-3 的执行者是「临舟」，审查者候选项里不能再出现他。
+  const reviewerChoices = await script(`(() => {
+    const row = document.querySelector('.loom-control-task[data-task-id="task-3"]')
+    return [...(row?.querySelectorAll('.loom-control-reviewer option') ?? [])].map(option => option.textContent)
+  })()`)
+  assert.equal(reviewerChoices.includes('临舟'), false,
+    `The executor is still offered as an independent reviewer: ${JSON.stringify(reviewerChoices)}`)
+  assert.equal(reviewerChoices.includes('亚纪'), true,
+    `The reviewer options lost a real independent candidate: ${JSON.stringify(reviewerChoices)}`)
+  assert(controlEmpty.copy.includes('不会终止正在运行的任务'),
+    `控制区没有说明不终止当前运行: ${JSON.stringify(controlEmpty.copy)}`)
+  assert(controlEmpty.copy.includes('不代替你验收候选或批准发布'),
+    `控制区没有说明不代替验收/发布: ${JSON.stringify(controlEmpty.copy)}`)
+  cases.push('未批准时控制区不预勾任务、不预选审查者、不预填预算，逐条列出缺口并禁用批准，文案说明不终止运行也不代替验收')
+
+  stage = 'relay control: approve scope'
+  await clickElement("document.querySelector('.loom-control-task[data-task-id=\"task-3\"] input[type=checkbox]')")
+  await waitFor("document.querySelector('.loom-control-task[data-task-id=\"task-3\"] input[type=checkbox]')?.checked === true",
+    'Clicking a task checkbox did not include the task in the relay scope')
+  assert.equal(await setSelect("document.querySelector('.loom-control-task[data-task-id=\"task-3\"] .loom-control-reviewer')", 'agent-lead'),
+    'agent-lead', 'The reviewer select did not take the chosen reviewer')
+  assert.equal(await setTextField("document.querySelector('.loom-control-max-dispatches')", '3'), '3',
+    'The dispatch budget input did not take the typed number')
+  assert.equal(await setTextField("document.querySelector('.loom-control-max-reworks')", '1'), '1',
+    'The rework budget input did not take the typed number')
+  await setTextField("document.querySelector('.loom-control-expires')", '2026-10-01T00:00')
+  await settle(160)
+  await waitFor("document.querySelector('.loom-control-approve')?.disabled === false",
+    'A fully specified scope still could not be approved')
+  await clickElement("document.querySelector('.loom-control-approve')")
+  await waitControlState('approved', 'Approving the scope did not come back as 已批准')
+  const configure = (await controlCalls('loom.control.configure')).at(-1)
+  assert(configure, 'The approve click never called loom.control.configure')
+  assert.equal(configure.enabled, true, `configure did not send enabled=true: ${JSON.stringify(configure)}`)
+  assert.equal(configure.expectedRevision, 0, `The first approval must send expectedRevision 0: ${JSON.stringify(configure.expectedRevision)}`)
+  assert.equal(configure.missionId, 'mission-loom-018', `configure sent the wrong mission: ${JSON.stringify(configure.missionId)}`)
+  assert.match(configure.commandId, UUID_PATTERN, `configure needs a real command id: ${JSON.stringify(configure.commandId)}`)
+  assert.deepEqual(configure.taskIds, ['task-3'], `configure sent the wrong task scope: ${JSON.stringify(configure.taskIds)}`)
+  assert.deepEqual(configure.reviewers, [{ taskId: 'task-3', reviewerAgentId: 'agent-lead' }],
+    `configure sent the wrong reviewers: ${JSON.stringify(configure.reviewers)}`)
+  assert.equal(configure.maxDispatches, 3, `configure lost the typed dispatch budget: ${JSON.stringify(configure.maxDispatches)}`)
+  assert.equal(configure.maxReworksPerTask, 1, `configure lost the typed rework budget: ${JSON.stringify(configure.maxReworksPerTask)}`)
+  assert.equal(typeof configure.expiresAt, 'string', `configure dropped the expiry: ${JSON.stringify(configure.expiresAt)}`)
+  assert.equal(Number.isNaN(Date.parse(configure.expiresAt)), false, `configure sent an unparseable expiry: ${JSON.stringify(configure.expiresAt)}`)
+  const approvedFacts = await controlFacts()
+  assert(approvedFacts.some(text => text.includes('修订') && text.includes('1')),
+    `The approved policy facts lost its revision: ${JSON.stringify(approvedFacts)}`)
+  assert(approvedFacts.some(text => text.includes('已使用 2 / 上限 3')),
+    `The approved policy facts must show 已使用/上限 from every historical dispatch: ${JSON.stringify(approvedFacts)}`)
+  const approvedForm = await script(`({
+    form: document.querySelectorAll('.loom-control-form').length,
+    pause: document.querySelector('.loom-control-pause')?.innerText ?? null,
+    rows: document.querySelectorAll('.loom-control-dispatches .loom-dispatch').length
+  })`)
+  assert.equal(approvedForm.form, 0, 'The approval form stayed open after a successful configure')
+  assert.equal(approvedForm.pause, '暂停接力', `An approved scope must offer 暂停接力: ${JSON.stringify(approvedForm.pause)}`)
+  assert.equal(approvedForm.rows, 2, `The control region lost the real dispatch rows: ${JSON.stringify(approvedForm.rows)}`)
+  cases.push('批准此范围发出 configure 的真实入参（enabled/expectedRevision 0/uuid/任务/审查者/预算/到期）并回读真实策略事实与派发计数')
+
+  stage = 'relay control: pause and resume'
+  await clickElement("document.querySelector('.loom-control-pause')")
+  await waitControlState('paused', 'Pausing did not come back as 已暂停')
+  const pauseCall = (await controlCalls('loom.control.pause')).at(-1)
+  assert(pauseCall, 'The pause click never called loom.control.pause')
+  assert.equal(pauseCall.paused, true, `pause did not send paused=true: ${JSON.stringify(pauseCall)}`)
+  assert.equal(pauseCall.expectedRevision, 1, `pause must send the observed revision: ${JSON.stringify(pauseCall.expectedRevision)}`)
+  assert.match(pauseCall.commandId, UUID_PATTERN, `pause needs a real command id: ${JSON.stringify(pauseCall.commandId)}`)
+  await waitFor("(document.querySelector('.loom-control-pause')?.innerText ?? '') === '继续接力'",
+    'A paused scope did not turn its action into 继续接力')
+  await clickElement("document.querySelector('.loom-control-pause')")
+  await waitControlState('approved', 'Resuming did not come back as 已批准')
+  const resumeCall = (await controlCalls('loom.control.pause')).at(-1)
+  assert.equal(resumeCall.paused, false, `resume did not send paused=false: ${JSON.stringify(resumeCall)}`)
+  assert.equal(resumeCall.expectedRevision, 2, `resume must send the revision it just observed: ${JSON.stringify(resumeCall.expectedRevision)}`)
+  assert.notEqual(resumeCall.commandId, pauseCall.commandId, 'resume reused the pause command id')
+  // pause/resume 只推进 revision，不推进授权修订：旧授权下的审查不会因为暂停而突然有效。
+  const afterResumeFacts = await controlFacts()
+  assert(afterResumeFacts.some(text => text.includes('授权版本') && text.includes('1')),
+    `pause/resume must not advance authorizationRevision: ${JSON.stringify(afterResumeFacts)}`)
+  cases.push('暂停与继续都发出带 uuid 与真实修订的 pause 入参，并各自回读成已暂停/已批准')
+
+  stage = 'relay control: revision conflict'
+  // 另一个客户端把策略改了：界面手里的 revision 已过期，写必须撞冲突而不是本地伪造。
+  await script('window.loomQA.driftControlRevision()')
+  await clickElement("document.querySelector('.loom-control-pause')")
+  await waitFor("(document.querySelector('.loom-control-failure')?.innerText ?? '') !== ''",
+    'A stale revision write failed without any visible message')
+  const conflicted = await script(`({
+    state: document.querySelector('.loom-control')?.getAttribute('data-control-state'),
+    failure: document.querySelector('.loom-control-failure')?.innerText ?? '',
+    pauseCopy: document.querySelector('.loom-control-pause')?.innerText ?? null,
+    pauseDisabled: document.querySelector('.loom-control-pause')?.disabled ?? null
+  })`)
+  assert.equal(conflicted.state, 'approved', `A failed write must not locally fake the paused state: ${JSON.stringify(conflicted)}`)
+  assert.equal(conflicted.pauseCopy, '暂停接力', `A failed write rewrote the button label locally: ${JSON.stringify(conflicted.pauseCopy)}`)
+  assert.equal(conflicted.pauseDisabled, true, `A conflicted scope still accepted more writes: ${JSON.stringify(conflicted)}`)
+  assert(conflicted.failure.includes('刷新'), `The conflict message must ask for a refresh: ${JSON.stringify(conflicted.failure)}`)
+  await clickElement("document.querySelector('.loom-control-failure button')")
+  await waitControlState('approved', 'Refreshing after the conflict did not return to the real state')
+  const afterConflict = await script(`({
+    disabled: document.querySelector('.loom-control-pause')?.disabled ?? null,
+    revision: ([...document.querySelectorAll('.loom-control-fact')].map(node => node.innerText.replace(/\\s+/gu, ' ')).find(text => text.includes('修订')) ?? '')
+  })`)
+  assert.equal(afterConflict.disabled, false, `Refreshing after a conflict left the scope unusable: ${JSON.stringify(afterConflict)}`)
+  assert(Number((afterConflict.revision.match(/\d+/u) ?? ['0'])[0]) > 3,
+    `Refreshing did not adopt the newer revision from the receipt: ${JSON.stringify(afterConflict.revision)}`)
+  cases.push('策略修订冲突时可见失败并引用刷新，不本地伪造暂停；刷新后按真实修订继续')
+
+  stage = 'relay control: read failure'
+  await resetLoom()
+  await afterRemount('window.loomQA.setControl({ fail: true })')
+  await openControl('the failing control read')
+  await waitControlState('unreadable', 'A failing loom.control.get did not read as 读不到')
+  const unreadable = await script(`({
+    stateCopy: document.querySelector('.loom-control-state')?.innerText ?? '',
+    copy: (document.querySelector('.loom-control')?.innerText ?? '').replace(/\\s+/gu, ' '),
+    approve: document.querySelectorAll('.loom-control-approve').length,
+    pause: document.querySelectorAll('.loom-control-pause').length,
+    facts: document.querySelectorAll('.loom-control-fact').length,
+    nodes: document.querySelectorAll('.loom-plan .loom-flow-node').length,
+    errors: window.loomQA.errors.slice()
+  })`)
+  assert.equal(unreadable.stateCopy, '控制策略读取失败', `控制读失败的文案不对: ${JSON.stringify(unreadable.stateCopy)}`)
+  assert.equal(unreadable.copy.includes('尚未批准'), false,
+    `A failed control read pretended the scope was never approved: ${JSON.stringify(unreadable.copy)}`)
+  assert.equal(unreadable.copy.includes('接力已停用'), false,
+    `A failed control read pretended the relay was disabled: ${JSON.stringify(unreadable.copy)}`)
+  assert.equal(unreadable.approve + unreadable.pause + unreadable.facts, 0,
+    `A failed control read still offered write entries or facts: ${JSON.stringify(unreadable)}`)
+  assert.equal(unreadable.nodes, 4, `A failed control read took the task nodes down with it: ${JSON.stringify(unreadable.nodes)}`)
+  assert.deepEqual(unreadable.errors, [], 'A forced control read failure was misreported as an unanswered fixture method')
+
+  // 第二轮：快照缺必需字段（authorizationRevision / dispatches）同样只能是「读不到」，不能落成未批准。
+  await resetLoom()
+  await afterRemount('window.loomQA.setControl({ partial: true })')
+  await openControl('the incomplete control snapshot')
+  await waitControlState('unreadable', 'An incomplete control snapshot did not read as 读不到')
+  const partialSnapshot = await script(`({
+    stateCopy: document.querySelector('.loom-control-state')?.innerText ?? '',
+    copy: (document.querySelector('.loom-control')?.innerText ?? '').replace(/\\s+/gu, ' '),
+    approve: document.querySelectorAll('.loom-control-approve').length,
+    nodes: document.querySelectorAll('.loom-plan .loom-flow-node').length
+  })`)
+  assert.equal(partialSnapshot.stateCopy, '控制策略读取失败', `缺字段快照的文案不对: ${JSON.stringify(partialSnapshot.stateCopy)}`)
+  assert.equal(partialSnapshot.copy.includes('尚未批准'), false,
+    `An incomplete snapshot was rendered as 未批准: ${JSON.stringify(partialSnapshot.copy)}`)
+  assert(partialSnapshot.copy.includes('缺少必需字段'),
+    `The incomplete snapshot did not say which field is missing: ${JSON.stringify(partialSnapshot.copy)}`)
+  assert.equal(partialSnapshot.approve, 0, 'A partial snapshot still offered approval')
+  assert.equal(partialSnapshot.nodes, 4, `A partial snapshot took the task nodes down: ${JSON.stringify(partialSnapshot.nodes)}`)
+  cases.push('loom.control.get 读失败或快照缺必需字段时控制区只说读不到，不冒充未批准或已停用，也不给批准/暂停入口，编排其余部分照常')
+
+  stage = 'delivery: rework chain locks the old candidate'
+  await resetLoom()
+  await afterRemount('window.loomQA.setReworkChain()')
+  await click('.loom-section-tabs button:nth-of-type(3)')
+  await expectPressed(2, '交付 did not open for the rework chain')
+  await waitFor("document.querySelectorAll('.loom-delivery-context .loom-candidate').length === 3",
+    'The rework chain did not list three candidate cards')
+  const chain = await script(`(() => {
+    const cards = [...document.querySelectorAll('.loom-delivery-context .loom-candidate')]
+    return cards.map(card => ({
+      candidateId: card.getAttribute('data-candidate-id'),
+      version: card.getAttribute('data-chain-version'),
+      latest: card.getAttribute('data-latest'),
+      versionCopy: card.querySelector('.loom-candidate-version')?.innerText ?? '',
+      facts: [...card.querySelectorAll('.loom-fact')].map(node => node.getAttribute('data-fact')),
+      buttons: [...(card.querySelector(':scope > .loom-delivery-actions')?.querySelectorAll('button') ?? [])].map(button => button.textContent.trim()),
+      locked: card.querySelector('.loom-candidate-locked')?.innerText ?? null,
+      stageVerdict: card.querySelector('.loom-stage-badge')?.getAttribute('data-verdict') ?? null,
+      stageFreshness: card.querySelector('.loom-stage-badge')?.getAttribute('data-freshness') ?? null,
+      stageBadgeCopy: card.querySelector('.loom-stage-badge')?.innerText ?? null,
+      stageCopy: card.querySelector('.loom-candidate-stage-review')?.innerText ?? null
+    }))
+  })()`)
+  const oldCandidate = chain.find(card => card.candidateId === 'candidate-2')
+  const newCandidate = chain.find(card => card.candidateId === 'candidate-3')
+  assert(oldCandidate && newCandidate, `The rework chain lost a candidate: ${JSON.stringify(chain.map(card => card.candidateId))}`)
+  // 版本是「每个任务各自一条链」：task-3 是 candidate-2(v1) → candidate-3(v2)，
+  // candidate-1 属于 task-1，不参与这条链。
+  assert.equal(oldCandidate.version, '1', `candidate-2 is the first version of the task-3 chain: ${JSON.stringify(oldCandidate.versionCopy)}`)
+  assert.equal(oldCandidate.versionCopy.includes('v1'), true, `The old candidate lost its version label: ${JSON.stringify(oldCandidate.versionCopy)}`)
+  assert.equal(oldCandidate.versionCopy.includes('最新'), false, `The old candidate claimed to be latest: ${JSON.stringify(oldCandidate.versionCopy)}`)
+  assert.equal(oldCandidate.latest, 'false', 'The superseded candidate is still marked latest')
+  assert.deepEqual(oldCandidate.facts, ['verification', 'stage-review', 'acceptance'],
+    `The three axes are not kept apart: ${JSON.stringify(oldCandidate.facts)}`)
+  assert.deepEqual(oldCandidate.buttons, [], `A superseded candidate still offered 接受/核验: ${JSON.stringify(oldCandidate.buttons)}`)
+  assert((oldCandidate.locked ?? '').includes('接受只对最新候选生效'),
+    `A superseded candidate lost its refusal note: ${JSON.stringify(oldCandidate.locked)}`)
+  assert.equal(oldCandidate.stageVerdict, 'request_changes',
+    `The helper review verdict is not read separately from verification: ${JSON.stringify(oldCandidate.stageVerdict)}`)
+  assert((oldCandidate.stageCopy ?? '').includes('恢复失败分支没有覆盖'),
+    `The helper review reason disappeared: ${JSON.stringify(oldCandidate.stageCopy)}`)
+  // 这条审查挂在旧授权（policyRevision 1）上，而当前 authorizationRevision 是 2：
+  // 留历史、明确失效，绝不能当「当前通过」渲染；request_changes 也不是人工驳回。
+  assert.equal(oldCandidate.stageFreshness, 'stale',
+    `A review from a superseded authorization is presented as current: ${JSON.stringify(oldCandidate.stageFreshness)}`)
+  assert((oldCandidate.stageBadgeCopy ?? '').includes('旧授权已失效'),
+    `A stale-authorization review lost its expiry copy: ${JSON.stringify(oldCandidate.stageBadgeCopy)}`)
+  const stalePasses = await script(`([...document.querySelectorAll('.loom-stage-badge[data-freshness="stale"]')]
+    .map(node => node.innerText.trim()).filter(copy => copy === '通过'))`)
+  assert.deepEqual(stalePasses, [], `A stale review still reads exactly 通过: ${JSON.stringify(stalePasses)}`)
+  assert.equal(newCandidate.version, '2', `candidate-3 is the second version of the task-3 chain: ${JSON.stringify(newCandidate.versionCopy)}`)
+  assert.equal(newCandidate.versionCopy.includes('v2'), true, `The new candidate lost its version label: ${JSON.stringify(newCandidate.versionCopy)}`)
+  assert.equal(newCandidate.latest, 'true', 'The chain tip is not marked latest')
+  assert.deepEqual(newCandidate.buttons, ['接受', '退回', '通过核验', '核验失败'],
+    `The chain tip lost its two independent action axes: ${JSON.stringify(newCandidate.buttons)}`)
+  assert.equal(newCandidate.locked, null, 'The chain tip was refused as an old version')
+  const axes = await script(`([...document.querySelectorAll('.loom-delivery-context .loom-candidate')].map(card => ({
+    verification: card.querySelector('.loom-badge-verification')?.getAttribute('data-state') ?? null,
+    stage: card.querySelector('.loom-stage-badge')?.getAttribute('data-verdict') ?? null,
+    acceptance: card.querySelector('.loom-badge-acceptance')?.getAttribute('data-state') ?? null
+  })))`)
+  assert(axes.every(axis => axis.verification !== null && axis.stage !== null && axis.acceptance !== null),
+    `A candidate dropped one of the three axes: ${JSON.stringify(axes)}`)
+  assert(axes.every(axis => axis.stage !== axis.verification),
+    `The helper review was merged into the verification badge: ${JSON.stringify(axes)}`)
+  cases.push('返工链上 previousCandidateId 标出 v1/v2（每个任务各自一条链），旧版失去接受与核验入口并给出理由，旧授权审查留历史并明确失效，每张候选仍分列技术核验/助手审查/用户接受三条事实')
+
+  stage = 'delivery: asset relations'
+  await resetLoom()
+  await openDelivery()
+  await script("(() => { const pane = document.querySelector('.loom-delivery'); if (pane) pane.scrollTop = 0; return true })()")
+  await settle(120)
+  await waitFor("document.querySelectorAll('.loom-asset-graph .loom-asset-row').length > 0",
+    'The delivery section did not render the asset relation region')
+  const assetRows = await script(`([...document.querySelectorAll('.loom-asset-graph .loom-asset-row')].map(row => ({
+    registration: row.getAttribute('data-registration'),
+    hasConsumer: row.getAttribute('data-has-consumer'),
+    producer: row.querySelector('.loom-asset-producer')?.innerText ?? '',
+    artifact: row.querySelector('.loom-asset-artifact')?.innerText ?? '',
+    candidate: row.querySelector('.loom-asset-candidate')?.innerText ?? '',
+    review: row.querySelector('.loom-asset-review')?.innerText ?? '',
+    consumer: row.querySelector('.loom-asset-consumer')?.innerText ?? ''
+  })))`)
+  const registeredAsset = assetRows.find(row => row.registration === 'registered')
+  assert(registeredAsset, `A registered artifact is missing from the asset relations: ${JSON.stringify(assetRows)}`)
+  assert.equal(registeredAsset.artifact, 'artifacts/restore-protocol.md',
+    `The asset row lost the real relative path: ${JSON.stringify(registeredAsset.artifact)}`)
+  assert.equal(registeredAsset.producer, '生产 Run run-1',
+    `The asset row did not name the real producer run: ${JSON.stringify(registeredAsset.producer)}`)
+  assert.equal(registeredAsset.review, '审查 通过',
+    `The asset row lost the helper review fact: ${JSON.stringify(registeredAsset.review)}`)
+  // artifact_accepted 边仍未冻结：使用者必须是「尚未确定」，不许把 task-4 当既成事实。
+  assert(assetRows.every(row => row.hasConsumer === 'false'),
+    `An unfrozen dependency was presented as a consumer: ${JSON.stringify(assetRows.map(row => row.hasConsumer))}`)
+  assert(assetRows.every(row => row.consumer.includes('使用者尚未确定')),
+    `The consumer column invented a downstream: ${JSON.stringify(assetRows.map(row => row.consumer))}`)
+  assert(assetRows.every(row => row.consumer.includes('验收测试') === false),
+    `An unfrozen downstream task was named as a consumer: ${JSON.stringify(assetRows.map(row => row.consumer))}`)
+  const unregisteredAsset = assetRows.find(row => row.registration === 'unregistered')
+  assert(unregisteredAsset, `Unregistered evidence ids vanished from the asset relations: ${JSON.stringify(assetRows)}`)
+  assert.equal(unregisteredAsset.artifact, 'evidence-2',
+    `An unregistered asset row must keep the raw evidenceId: ${JSON.stringify(unregisteredAsset.artifact)}`)
+  assert.equal(assetRows.some(row => row.artifact.includes('restore-trace-with-a-deliberately-long-file-name.log')), false,
+    'The asset region listed an artifact no candidate evidenceId refers to')
+  await clickElement("document.querySelector('.loom-asset-graph .loom-asset-row')")
+  await waitFor("document.querySelector('.loom-delivery-context .loom-candidate[data-focused=\"true\"]') !== null",
+    'Clicking an asset row did not focus the matching candidate card')
+  const focusedCandidate = await script(
+    "document.querySelector('.loom-delivery-context .loom-candidate[data-focused=\"true\"]')?.getAttribute('data-candidate-id') ?? null")
+  assert.equal(focusedCandidate, 'candidate-1',
+    `The asset row focused the wrong candidate: ${JSON.stringify(focusedCandidate)}`)
+  cases.push('资产关系区就地按真实产物/候选/审查派生生产者→候选→审查，未冻结依赖不标使用者，未登记只显示 evidenceId，点击聚焦对应候选')
+
+  console.log(JSON.stringify({ ok: true, cases, shots, counts: final, output, uiGeometry }))
   app.exit(0)
 }).catch(async error => {
   try {
     writeFileSync(join(output, `loom-workspace-failure-${Date.now()}.png`), (await BrowserWindow.getAllWindows()[0].webContents.capturePage()).toPNG())
   } catch {}
   console.error(`LOOM workspace fixture failed during ${stage}:`, error)
-  console.error(JSON.stringify({ ok: false, stage, cases, shots, output }))
+  console.error(JSON.stringify({ ok: false, stage, cases, shots, output, uiGeometry }))
   app.exit(1)
 })

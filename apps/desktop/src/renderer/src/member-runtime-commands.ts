@@ -81,6 +81,8 @@ export function commandCodeLabel(code: string): string {
         runtime_permission_option_unsupported: '运行环境不支持此权限选项，请调整权限。填写内容已保留。',
         runtime_permission_option_invalid: '权限选项值无效，请调整权限。填写内容已保留。',
         runtime_permission_value_invalid: '权限选项值无效，请调整权限。填写内容已保留。',
+        pi_purge_requires_file_grant:
+          '启用 Pi Purge 前，请先设置助手的工作目录文件权限。本次未保存，填写内容已保留。',
         'agent_profile.default_lead_successor_required':
           '该队员仍是某个会话的默认负责人，请先在对应会话中指定继任者',
         'adapter_installation.already_exists': '这个智能体已经存在',

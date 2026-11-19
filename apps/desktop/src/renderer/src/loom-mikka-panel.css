@@ -1,0 +1,397 @@
+/* LOOM Mikka 右栏：工作清单 / 资产 / 成果浮层。
+   全部规则限定在 .loom-mikka 之下（浮层在 Portal 里自带同名作用域类），
+   只补几何与层次，不改任何契约类名或行为。变量优先取主样式表提供的 --mm-*，
+   缺失时回落到与参考图一致的中性值；夜间由 --mm-* 直接覆盖，无需另写反色规则。 */
+
+.loom-mikka .loom-section-tabs {
+  flex: 0 0 40px;
+  gap: 2px;
+  padding: 0 12px;
+  border-bottom: 0;
+}
+.loom-mikka .loom-section-tabs button {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  color: var(--mm-muted, #777);
+  font-size: 13px;
+}
+.loom-mikka .loom-section-tabs button:hover {
+  background: var(--mm-hover, #e5e5e3);
+  color: var(--mm-text, #1a1a18);
+}
+.loom-mikka .loom-section-tabs button[aria-pressed='true'] {
+  background: var(--mm-tab-selected, #f0f0ee);
+  color: var(--mm-text, #1a1a18);
+  font-weight: 600;
+}
+
+/* 工作清单：紧凑标题 + 真实控件，不再有大号统计块。 */
+.loom-mikka .loom-overview {
+  padding: 18px 16px 28px;
+  max-width: none;
+}
+.loom-mikka .loom-overview .loom-section-heading {
+  margin: 0 0 6px;
+  align-items: baseline;
+}
+.loom-mikka .loom-overview .loom-section-heading h2 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.loom-mikka .loom-work-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 14px;
+}
+.loom-mikka .loom-board-search {
+  flex: 1 1 160px;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--mm-line, #e8e8e8);
+  border-radius: 999px;
+  background: var(--mm-content, #ffffff);
+  color: var(--mm-muted, #777);
+}
+.loom-mikka .loom-board-search input {
+  font-size: 12.5px;
+  color: var(--mm-text, #1a1a18);
+}
+.loom-mikka .loom-work-filter select {
+  height: 30px;
+  max-width: 160px;
+  padding: 0 10px;
+  border: 1px solid var(--mm-line, #e8e8e8);
+  border-radius: 999px;
+  background: var(--mm-content, #ffffff);
+  color: var(--mm-text, #1a1a18);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.loom-mikka .loom-work-actions {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
+}
+.loom-mikka .loom-work-actions button {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  color: var(--mm-muted, #777);
+  font-size: 12px;
+}
+.loom-mikka .loom-work-actions button:hover:not(:disabled) {
+  color: var(--mm-text, #1a1a18);
+  background: var(--mm-hover, #e5e5e3);
+}
+
+/* 分组标题：小号灰字 + 长分隔线（保留既有 ::after 分隔线，只统一颜色）。 */
+.loom-mikka .loom-summary-label {
+  margin: 0 0 8px;
+  color: var(--mm-muted, #777);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.loom-mikka .loom-summary-label::after {
+  background: var(--mm-line, #e8e8e8);
+}
+.loom-mikka .loom-summary-group + .loom-summary-group {
+  margin-top: 18px;
+}
+.loom-mikka .loom-summary-tasks {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.loom-mikka .loom-summary-task + .loom-summary-task {
+  margin-top: 0;
+}
+
+/* 卡片：整行浅灰、60px、无描边；状态用前置描边图标表达，不做彩色徽标堆叠。 */
+.loom-mikka .loom-summary-row {
+  min-height: 60px;
+  padding: 10px 14px;
+  gap: 12px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--mm-card, #f7f7f7);
+  color: var(--mm-text, #1a1a18);
+}
+.loom-mikka .loom-summary-row:hover {
+  background: var(--mm-hover, #e5e5e3);
+  border-color: transparent;
+  color: var(--mm-text, #1a1a18);
+}
+.loom-mikka .loom-summary-state {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--mm-line-strong, #c8c8c4);
+  border-radius: 50%;
+}
+.loom-mikka .loom-summary-state[data-status='in_review'] {
+  border-color: var(--mm-text, #1a1a18);
+}
+.loom-mikka .loom-summary-state[data-status='blocked'] {
+  border-color: var(--mm-attention, #b4541f);
+  border-style: dotted;
+}
+.loom-mikka .loom-summary-state[data-status='done'] {
+  border-color: var(--mm-text, #1a1a18);
+  background: var(--mm-text, #1a1a18);
+}
+.loom-mikka .loom-summary-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+}
+.loom-mikka .loom-summary-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--mm-muted, #777);
+}
+.loom-mikka .loom-summary-sub .member-avatar {
+  flex: 0 0 auto;
+}
+.loom-mikka .loom-summary-status {
+  color: var(--mm-muted, #777);
+  font-size: 12px;
+}
+.loom-mikka .loom-summary-status[data-status='blocked'] {
+  color: var(--mm-attention, #b4541f);
+}
+.loom-mikka .loom-summary-chev {
+  color: var(--mm-line-strong, #c8c8c4);
+  font-size: 15px;
+}
+
+/* 空闲档折叠：只收真正空闲的任务，标题沿用真实档名。 */
+.loom-mikka .loom-summary-details {
+  margin-top: 18px;
+  padding-top: 0;
+  border-top: 0;
+  color: var(--mm-muted, #777);
+  font-size: 12px;
+}
+.loom-mikka .loom-summary-details > summary {
+  font-size: 12px;
+  color: var(--mm-muted, #777);
+}
+
+/* 电脑：真实队长身份在上，屏幕没有流就明说未连接。 */
+.loom-mikka .loom-computer {
+  padding: 20px 16px 28px;
+  max-width: none;
+}
+.loom-mikka .loom-computer-profile {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  margin: 0 0 18px;
+  text-align: center;
+}
+.loom-mikka .loom-computer-profile .member-avatar {
+  width: 64px;
+  height: 64px;
+}
+.loom-mikka .loom-computer-name {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--mm-text, #1a1a18);
+}
+.loom-mikka .loom-computer-role {
+  font-size: 12px;
+  color: var(--mm-muted, #777);
+}
+.loom-mikka .loom-screen {
+  border: 0;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--mm-screen, #101010);
+}
+.loom-mikka .loom-screen-bar {
+  color: color-mix(in srgb, var(--mm-content, #ffffff) 62%, transparent);
+  font-size: 11px;
+}
+.loom-mikka .loom-screen-stage {
+  aspect-ratio: 16 / 10;
+  display: grid;
+  place-items: center;
+  color: color-mix(in srgb, var(--mm-content, #ffffff) 54%, transparent);
+  font-size: 12px;
+}
+
+/* 成果浮层 */
+.loom-mikka .loom-artifact-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background: color-mix(in srgb, #1a1a18 34%, transparent);
+  backdrop-filter: blur(6px);
+}
+.loom-mikka .loom-artifact-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 121;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(1220px, calc(100vw - 48px));
+  height: min(820px, calc(100vh - 48px));
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--mm-content, #ffffff);
+  color: var(--mm-text, #1a1a18);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.28);
+}
+.loom-mikka .loom-artifact-dialog:focus-visible {
+  outline: none;
+}
+.loom-mikka .loom-artifact-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--mm-line, #e8e8e8);
+}
+.loom-mikka .loom-artifact-mark {
+  display: inline-flex;
+  flex-direction: column;
+  justify-content: space-between;
+  width: 16px;
+  height: 18px;
+  padding: 2px 0;
+}
+.loom-mikka .loom-artifact-mark i {
+  height: 2px;
+  border-radius: 1px;
+  background: var(--mm-line-strong, #c8c8c4);
+}
+.loom-mikka .loom-artifact-titles {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.loom-mikka .loom-artifact-title {
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.loom-mikka .loom-artifact-subtitle {
+  font-size: 12px;
+  color: var(--mm-muted, #777);
+}
+.loom-mikka .loom-artifact-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.loom-mikka .loom-artifact-download,
+.loom-mikka .loom-artifact-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--mm-line, #e8e8e8);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--mm-text, #1a1a18);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.loom-mikka .loom-artifact-close {
+  width: 28px;
+  padding: 0;
+  border-radius: 50%;
+}
+.loom-mikka .loom-artifact-close svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+}
+.loom-mikka .loom-artifact-download:hover,
+.loom-mikka .loom-artifact-close:hover {
+  background: var(--mm-hover, #e5e5e3);
+}
+.loom-mikka .loom-artifact-body {
+  display: grid;
+  grid-template-columns: minmax(0, 68fr) minmax(0, 32fr);
+  min-height: 0;
+}
+.loom-mikka .loom-artifact-doc {
+  overflow: auto;
+  padding: 28px 24px;
+  background: var(--mm-content, #ffffff);
+}
+.loom-mikka .loom-artifact-doc > .loom-preview-body {
+  padding: 0;
+  font-size: 14px;
+  line-height: 1.8;
+}
+.loom-mikka .loom-artifact-doc .loom-preview-markdown {
+  max-width: 670px;
+  margin-inline: auto;
+}
+.loom-mikka .loom-artifact-side {
+  overflow: auto;
+  padding: 16px;
+  border-left: 1px solid var(--mm-line, #e8e8e8);
+  background: var(--mm-side, #f7f7f5);
+}
+.loom-mikka .loom-artifact-side-title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--mm-muted, #777);
+}
+.loom-mikka .loom-artifact-side .loom-review-form,
+.loom-mikka .loom-artifact-side .loom-review-criteria {
+  display: grid;
+  gap: 8px;
+}
+.loom-mikka .loom-artifact-side .loom-review-reason {
+  width: 100%;
+  font-size: 12.5px;
+}
+.loom-mikka .loom-artifact-side .loom-delivery-actions button {
+  border-radius: 999px;
+}
+
+@media (max-width: 1200px) {
+  .loom-mikka .loom-artifact-dialog {
+    width: calc(100vw - 32px);
+    height: calc(100vh - 32px);
+  }
+  .loom-mikka .loom-artifact-body {
+    grid-template-columns: minmax(0, 64fr) minmax(0, 36fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .loom-mikka .loom-artifact-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .loom-mikka .loom-artifact-side {
+    border-left: 0;
+    border-top: 1px solid var(--mm-line, #e8e8e8);
+    max-height: 45%;
+  }
+}

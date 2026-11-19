@@ -49,6 +49,13 @@ fn acceptance() -> Result<()> {
     ));
     let _cleanup = RemoveDir(root.clone());
     fs::create_dir_all(&root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // The fixture root holds the captured run token; only this process may
+        // read the directory itself.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    }
     let a = root.join("a");
     let b = root.join("b");
     let bin = root.join("bin");
@@ -66,8 +73,14 @@ fn acceptance() -> Result<()> {
     )?;
     fs::write(
         bin.join("codex"),
-        r#"#!/usr/bin/python3
+        format!(
+            r#"#!/usr/bin/python3
 import json, os, pathlib, shutil, sys, time
+def write_private(target, text):
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.chmod(target, 0o600)
 if "--version" in sys.argv:
     print("b4-codex 0")
     raise SystemExit(0)
@@ -77,21 +90,18 @@ if not rovai:
     raise SystemExit(9)
 cred = json.loads(pathlib.Path(rovai).resolve().parent.parent.joinpath("credential").read_text())
 token = cred["token"]
-capture = os.environ.get("B4_CAPTURE")
-if capture:
-    pathlib.Path(capture).write_text(token)
-env_path = os.environ.get("B4_ENV")
-if env_path:
-    lines = [f"{key}={value}" for key, value in sorted(os.environ.items())]
-    pathlib.Path(env_path).write_text("\n".join(lines))
-which_path = os.environ.get("B4_WHICH")
-if which_path:
-    pathlib.Path(which_path).write_text(rovai + "\n" + os.environ.get("PATH", ""))
+write_private({capture}, token)
+write_private({env_dump}, "\n".join(f"{{key}}={{value}}" for key, value in sorted(os.environ.items())))
+write_private({which_dump}, rovai + "\n" + os.environ.get("PATH", ""))
 if "sleep" in sys.argv:
     time.sleep(45)
     raise SystemExit(0)
 os.execvp(rovai, ["rovai", "loom", "status"])
 "#,
+            capture = serde_json::to_string(&capture.display().to_string())?,
+            env_dump = serde_json::to_string(&env_dump.display().to_string())?,
+            which_dump = serde_json::to_string(&which_dump.display().to_string())?,
+        ),
     )?;
     #[cfg(unix)]
     {
@@ -170,12 +180,16 @@ os.execvp(rovai, ["rovai", "loom", "status"])
         );
     }
 
+    // A real member through the product's own command path: the run bundle
+    // freezes a real profile instead of a fabricated id.
+    let member_id = create_member(&host, &session)?;
+
     let status_body = serde_json::json!({
         "runtime": "codex-cli",
         "cwd": work.display().to_string(),
         "args": ["exec", "status"],
         "missionId": "mission_b4",
-        "memberId": "member_b4",
+        "memberId": member_id.clone(),
     })
     .to_string();
     let status = api_json_timeout(
@@ -227,7 +241,7 @@ os.execvp(rovai, ["rovai", "loom", "status"])
             expired.body
         );
     }
-    assert_credential_row(&a, "member_b4", "mission_b4", &run_token)?;
+    assert_credential_row(&a, &member_id, "mission_b4", &run_token)?;
     if contains_sqlite(&b) {
         bail!("node data directory contains a product database");
     }
@@ -238,7 +252,7 @@ os.execvp(rovai, ["rovai", "loom", "status"])
         "cwd": work.display().to_string(),
         "args": ["exec", "sleep"],
         "missionId": "mission_b4",
-        "memberId": "member_b4",
+        "memberId": member_id.clone(),
     })
     .to_string();
     let host_for_sleep = host.clone();
@@ -402,6 +416,52 @@ fn node_token(data_dir: &Path) -> Result<String> {
         .context("node credential has no token")
 }
 
+/// A real member created through the same Core command the product uses. The id
+/// is read back from the applied receipt; nothing is written to the database
+/// directly and no permission is bypassed.
+#[cfg(target_os = "linux")]
+fn create_member(host: &str, session: &str) -> Result<String> {
+    let body = serde_json::json!({
+        "operation": "members.create",
+        "params": {
+            "commandId": format!("cmd_b4_member_{}", std::process::id()),
+            "command": {
+                "displayName": "B4 shim member",
+                "teamRole": "fixture worker",
+                "professionalResponsibilities": "fixture only",
+                "personalityTraits": ["steady"],
+                "workingPrinciples": "fixture only",
+                "growthTopic": "fixture only",
+            },
+        },
+    })
+    .to_string();
+    let (status, text) = request(
+        "POST",
+        host,
+        "/api/v1/request",
+        Some(session),
+        Some(&body),
+        Duration::from_secs(20),
+    )?;
+    if status != 200 {
+        bail!("members.create failed ({status}): {text}");
+    }
+    let reply: serde_json::Value = serde_json::from_str(&text).context("members.create reply")?;
+    if reply["error"] != serde_json::Value::Null {
+        bail!("members.create was rejected: {}", reply["error"]);
+    }
+    let result = &reply["result"];
+    if result["status"] != "applied" {
+        bail!("members.create was not applied: {result}");
+    }
+    let agent = result["payload"]["agentId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("an applied members.create receipt had no agentId")?;
+    Ok(agent.to_owned())
+}
+
 #[cfg(target_os = "linux")]
 fn decode_b64(value: &str) -> Result<String> {
     let bytes = STANDARD
@@ -512,16 +572,13 @@ fn spawn_node(
     connect: &str,
     pair_code: Option<&str>,
     stderr: &Path,
-    capture: &Path,
-    env_dump: &Path,
-    which_dump: &Path,
+    _capture: &Path,
+    _env_dump: &Path,
+    _which_dump: &Path,
 ) -> Result<std::process::Child> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_loom-node"));
     command
         .env("PATH", bin)
-        .env("B4_CAPTURE", capture)
-        .env("B4_ENV", env_dump)
-        .env("B4_WHICH", which_dump)
         .arg("--data-dir")
         .arg(data)
         .arg("--server")

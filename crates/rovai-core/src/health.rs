@@ -606,6 +606,37 @@ async fn claude_code_probe_at(
         );
     }
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别，不启动。
+    // 健康探测不得执行 `--version` / `--help` / `auth status` / 模型目录查询，
+    // 因此在这里就返回「已发现、未探测版本」的静态结果与策略 blocker。
+    if !runtime_launch_allowed(
+        AdapterKind::ClaudeCodeCli,
+        RuntimeLaunchPurpose::HealthProbe,
+    ) {
+        let purpose = RuntimeLaunchPurpose::HealthProbe;
+        let detail = runtime_launch_disallowed_detail(purpose);
+        let reported_version =
+            discover_static_runtime_version(AdapterKind::ClaudeCodeCli, &canonical);
+        let failure = public_probe_failure(
+            AdapterKind::ClaudeCodeCli,
+            RuntimeFailureOrigin::Rovai,
+            RuntimeFailurePhase::Spawn,
+            rovai_core::runtime_platform_admission::RUNTIME_DISABLED_BY_POLICY_BLOCKER_CODE,
+            "Claude Code 已按产品决定禁用：只识别，不启动（2026-11-18）",
+            &detail,
+            path,
+            false,
+        );
+        return claude_code_probe_failure(
+            path_text,
+            None,
+            reported_version,
+            AgentRuntimeProbeStatus::ProbeFailed,
+            detail,
+            failure,
+            probed_at,
+        );
+    }
     let fingerprint = match fingerprint {
         Some(value) => Some(value.to_owned()),
         None => executable_fingerprint_async(canonical.clone()).await,
@@ -1494,6 +1525,17 @@ async fn claude_code_model_catalog(
     path: &Path,
     deadline: Duration,
 ) -> Result<Vec<ModelDescriptor>> {
+    // LOOM 自有决定（Claude 禁用，2026-11-18）：模型目录查询也是 AvailabilityCheck
+    // 启动，策略拒绝时不得 spawn Claude 进程（与 refresh_model_catalog_for_selection
+    // 同一个闸门）。
+    if !runtime_launch_allowed(
+        AdapterKind::ClaudeCodeCli,
+        RuntimeLaunchPurpose::AvailabilityCheck,
+    ) {
+        bail!(runtime_launch_disallowed_detail(
+            RuntimeLaunchPurpose::AvailabilityCheck
+        ));
+    }
     let mut command = runtime_command(path, Some(AdapterKind::ClaudeCodeCli));
     command.args([
         "--print",
@@ -1994,18 +2036,23 @@ async fn acp_probe_at(
         Err(error) => {
             let detail = format!("ACP probe failed: {error:#}");
             let status = classify_acp_probe_failure(&detail);
+            let mut result = agent_probe_result(
+                kind.as_str(),
+                Some(path_text),
+                reported_version,
+                fingerprint,
+                status,
+                Vec::new(),
+                required_capabilities,
+                Some(detail),
+                probed_at,
+            );
+            // Probe attempts persist the public failure, not this transient
+            // detail string. Keep the same bounded redaction used by model
+            // discovery so a later successful refresh does not erase the cause.
+            result.failure = Some(model_catalog_failure(kind, &error, &canonical));
             AcpCapabilityProbe {
-                result: agent_probe_result(
-                    kind.as_str(),
-                    Some(path_text),
-                    reported_version,
-                    fingerprint,
-                    status,
-                    Vec::new(),
-                    required_capabilities,
-                    Some(detail),
-                    probed_at,
-                ),
+                result,
                 initialize_result: None,
                 session_result: None,
             }
@@ -4467,6 +4514,12 @@ while IFS= read -r ignored; do :; done
                 let diagnostic = probe.result.detail.unwrap();
                 assert!(diagnostic.contains(detail), "{diagnostic}");
                 assert!(diagnostic.contains("fixture diagnostic"), "{diagnostic}");
+                let public = probe.result.failure.expect("failed ACP attempt keeps its public cause");
+                assert_eq!(public.runtime_kind, kind);
+                let public_detail = public.detail.expect("bounded public diagnostic");
+                assert!(public_detail.contains(detail), "{public_detail}");
+                assert!(public_detail.contains("fixture diagnostic"), "{public_detail}");
+                assert!(!public_detail.contains(runtime.to_str().unwrap()));
             }
         }
     }

@@ -104,3 +104,37 @@ pub(super) fn migrate_run_credential(database: &mut Database) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+
+/// Migration 229: immutable A-side selection/source snapshot for a remote Run.
+/// Retries rebind its attempt envelope; later catalog saves cannot rewrite it.
+pub(super) fn migrate_run_bundle(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 178),
+        "run bundle migration requires schema 178"
+    );
+    tx.execute_batch(crate::execution_node::BUNDLE_SCHEMA_SQL)?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(229,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=179,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(&tx, &["node_run_bundle"])?;
+    anyhow::ensure!(
+        crate::execution_node::bundle_schema_matches(&tx)?,
+        "run bundle migration did not create the required immutable table"
+    );
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 179
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "run bundle schema admission failed");
+    tx.commit()?;
+    Ok(())
+}

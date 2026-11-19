@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "target": "windows-x64",
+  "python": {
+    "version": "3.14.10",
+    "url": "https://www.python.org/ftp/python/3.14.10/python-3.14.10-embed-amd64.zip",
+    "filename": "python-3.14.10-embed-amd64.zip",
+    "sha256": "90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159",
+    "source": "https://www.python.org/downloads/release/python-31410/",
+    "license": "PSF-2.0",
+    "licenseFile": "python/LICENSE.txt"
+  },
+  "pillow": {
+    "version": "13.0.0",
+    "url": "https://files.pythonhosted.org/packages/50/e2/7ad17747517e4c813dca78257d6bb593466f8231baf1384bc98d92745edb/pillow-13.0.0-cp314-cp314-win_amd64.whl",
+    "filename": "pillow-13.0.0-cp314-cp314-win_amd64.whl",
+    "sha256": "f7cbb7a64e7ec664775195e4f81923bc8a93d9451b963f844e59118f63147a7a",
+    "source": "https://pypi.org/project/pillow/13.0.0/",
+    "license": "MIT-CMU",
+    "licenseFile": "python/pillow-13.0.0.dist-info/licenses/LICENSE"
+  }
+}

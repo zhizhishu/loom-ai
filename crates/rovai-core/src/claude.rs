@@ -1,3 +1,5 @@
+mod remote_launch;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error as StdError,
@@ -14,7 +16,7 @@ use rovai_core::{
     agent_profile::FrozenAgentRuntimeConfig,
     agent_runtime_adapter::CLAUDE_CODE_RUNTIME_DEFAULT_MODEL_ID,
     managed_process::{
-        ManagedProcess, ManagedProcessLaunchSpec, ManagedProcessPurpose, ManagedStdinPolicy,
+        ManagedProcessLaunchSpec, ManagedProcessPurpose, ManagedStdinPolicy,
         ManagedWindowsArgvDialect,
     },
     mcp::McpServerDefinition,
@@ -39,6 +41,7 @@ use tokio::{
 
 use crate::{
     builtin_tool_runtime::BuiltinToolProcessConfig,
+    runtime_process::{RemoteRuntimeLaunch, RuntimeProcess},
     claude_control::{self, ClaudeControl, ControlReadGuard},
     runtime_mcp::{remove_stale_mcp_configs, write_ephemeral_additive_mcp_config},
 };
@@ -258,7 +261,7 @@ struct ClaudeCodeProcessControl {
 }
 
 struct ClaudeCodeRunResources {
-    child: ManagedProcess,
+    child: RuntimeProcess,
     bootstrap_file: Option<PathBuf>,
     settings_file: Option<PathBuf>,
 }
@@ -281,6 +284,9 @@ impl Drop for ClaudeOutputTasks {
 
 impl ClaudeCodeRunResources {
     async fn finish(&mut self, terminate: bool, deadline: Instant) -> Result<()> {
+        if self.child.is_remote() {
+            self.child.confirm_remote_cleanup(deadline.saturating_duration_since(Instant::now())).await?;
+        } else {
         if terminate && let Err(error) = self.child.force_terminate_tree() {
             eprintln!("Claude Code tree termination request failed: {error}");
         }
@@ -313,6 +319,8 @@ impl ClaudeCodeRunResources {
                 tokio::time::sleep(Duration::from_millis(if cfg!(windows) { 10 } else { 20 }))
                     .await;
             }
+        }
+
         }
 
         for (name, file) in [
@@ -370,7 +378,27 @@ impl ClaudeCodeCliRuntimeAdapter {
         Ok(())
     }
 
-    pub async fn run(&self, mut request: ClaudeCodeRunRequest) -> Result<ClaudeCodeRunResult> {
+    pub async fn run(&self, request: ClaudeCodeRunRequest) -> Result<ClaudeCodeRunResult> {
+        self.run_with_transport(request, None).await
+    }
+
+    pub(crate) async fn run_remote(&self, request: ClaudeCodeRunRequest, remote: RemoteRuntimeLaunch) -> Result<ClaudeCodeRunResult> {
+        self.run_with_transport(request, Some(remote)).await
+    }
+
+    async fn run_with_transport(&self, mut request: ClaudeCodeRunRequest, remote: Option<RemoteRuntimeLaunch>) -> Result<ClaudeCodeRunResult> {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：策略门必须在 active 登记与任何
+        // tokio::spawn 之前（与 acp.rs 的 AgentExecution 闸门同一个模板），这样被拒的
+        // 启动不会留下进程、登记项或启动文件。
+        if !rovai_core::runtime_discovery::runtime_launch_allowed(
+            rovai_core::agent_profile::AdapterKind::ClaudeCodeCli,
+            rovai_core::runtime_discovery::RuntimeLaunchPurpose::AgentExecution,
+        ) {
+            anyhow::bail!(
+                "Runtime launch policy rejected Agent execution ({})",
+                rovai_core::runtime_platform_admission::RUNTIME_DISABLED_BY_POLICY_BLOCKER_CODE
+            );
+        }
         let key = (request.agent_run_id.clone(), request.execution_epoch);
         let (interrupt, interrupted) = oneshot::channel();
         let control = Arc::new(ClaudeCodeProcessControl {
@@ -404,6 +432,7 @@ impl ClaudeCodeCliRuntimeAdapter {
                     &request,
                     interrupted,
                     launch_handoff,
+                    remote.as_ref(),
                 ),
             )
             .await;
@@ -558,9 +587,10 @@ impl ClaudeCodeCliRuntimeAdapter {
         request: &ClaudeCodeRunRequest,
         mut interrupted: oneshot::Receiver<()>,
         launch_handoff: Option<oneshot::Sender<()>>,
+        remote: Option<&RemoteRuntimeLaunch>,
     ) -> Result<ClaudeCodeRunResult> {
         let execution_root = Path::new(&request.workspace.execution_root);
-        if !execution_root.is_dir() {
+        if remote.is_none() && !execution_root.is_dir() {
             let internal = anyhow::anyhow!(
                 "Claude Code execution directory no longer exists: {}",
                 execution_root.display()
@@ -577,7 +607,7 @@ impl ClaudeCodeCliRuntimeAdapter {
             );
             return Err(internal.context(RuntimeFailureError::new(failure)));
         }
-        if let Some(root) = request.attachment_access_root.as_deref()
+        if remote.is_none() && let Some(root) = request.attachment_access_root.as_deref()
             && !root.is_dir()
         {
             let internal = anyhow::anyhow!(
@@ -597,7 +627,7 @@ impl ClaudeCodeCliRuntimeAdapter {
             return Err(internal.context(RuntimeFailureError::new(failure)));
         }
         let executable = Path::new(&request.runtime.executable_path);
-        if !is_runtime_entrypoint_file(executable) {
+        if remote.is_none() && !is_runtime_entrypoint_file(executable) {
             let internal = anyhow::anyhow!(
                 "Claude Code executable is missing or not executable: {}",
                 executable.display()
@@ -658,6 +688,13 @@ impl ClaudeCodeCliRuntimeAdapter {
             } else {
                 uuid::Uuid::new_v4().to_string()
             };
+        let (child, bootstrap_file, settings_file) = if let Some(remote) = remote {
+            if !matches!(interrupted.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                anyhow::bail!("Claude Code process was interrupted before remote spawn");
+            }
+            let child = remote_launch::spawn(request, remote, permission_mode, &native_session_id, legacy_read_only).await?;
+            (child, None, None)
+        } else {
         let fast_override = request
             .runtime
             .camp_fast
@@ -804,7 +841,7 @@ impl ClaudeCodeCliRuntimeAdapter {
         }
         // Frozen context can contain user messages and local paths. The managed
         // process uses piped stdin so it never appears in argv or diagnostics.
-        let launch_result: Result<ManagedProcess> = (|| {
+        let launch_result: Result<RuntimeProcess> = (|| {
             let spec = ManagedProcessLaunchSpec::capture(
                 &command,
                 ManagedProcessPurpose::RuntimeOneShot,
@@ -812,7 +849,7 @@ impl ClaudeCodeCliRuntimeAdapter {
                 ManagedWindowsArgvDialect::MicrosoftCrt,
                 format!("agent-run:{}:claude-code-cli", request.agent_run_id),
             )?;
-            ManagedProcess::spawn(spec)
+            RuntimeProcess::spawn(spec)
         })();
         let child = launch_result.map_err(|error| {
             let raw_detail = error.to_string();
@@ -833,6 +870,8 @@ impl ClaudeCodeCliRuntimeAdapter {
                 ))
                 .context(RuntimeFailureError::new(failure))
         })?;
+        (child, bootstrap_file, settings_file)
+        };
         // No await separates spawn from transferring all three resources into
         // the adapter's registered run. Aborting the caller cannot drop them.
         let mut owned = control
@@ -2883,6 +2922,59 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// LOOM 自有决定（Claude 禁用，2026-11-18）：Claude Code 只识别，不启动。
+    ///
+    /// 未 opt-in 时 AgentExecution 在 active 登记与任何 `tokio::spawn` 之前就被策略拒绝，
+    /// 因此原本的进程级夹具场景已不可达。这些用例固化的新事实是：被拒的启动报出
+    /// `runtime_disabled_by_policy`，而且不登记、不启动任何 Claude 进程（测试里不真的
+    /// 启动 claude）。
+    async fn assert_claude_launch_is_refused_by_policy(
+        adapter: &ClaudeCodeCliRuntimeAdapter,
+        request: ClaudeCodeRunRequest,
+        run_id: &str,
+    ) {
+        assert!(
+            !rovai_core::runtime_platform_admission::claude_runtime_enabled_by_policy_opt_in(),
+            "LOOM_CLAUDE_RUNTIME_ENABLED=1 是经渠道网关的手工测试开关，不要在测试进程里设置"
+        );
+        let error = adapter
+            .run(request)
+            .await
+            .expect_err("a policy-disabled Runtime must refuse Agent execution");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(
+                rovai_core::runtime_platform_admission::RUNTIME_DISABLED_BY_POLICY_BLOCKER_CODE
+            ),
+            "the refusal must name the policy blocker code: {message}"
+        );
+        assert!(
+            adapter.get_agent_run(run_id, 1).is_none(),
+            "a policy refusal must not register a Claude process"
+        );
+        assert!(
+            adapter.active.lock().unwrap().is_empty(),
+            "a policy refusal must leave the active map empty"
+        );
+    }
+
+    /// LOOM 自有决定（Claude 禁用，2026-11-18）：未 opt-in 时 Claude 启动一律被策略拒绝。
+    #[tokio::test]
+    async fn claude_launch_is_refused_by_policy_before_any_process() {
+        let (root, workspace) = claude_fixture();
+        let adapter = ClaudeCodeCliRuntimeAdapter::deferred(&root);
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let request = fake_claude_request(
+            &workspace,
+            &root.join("claude-must-never-be-executed"),
+            run_id.clone(),
+            "0bdd2166-d420-40c6-94be-70b93eb290c5",
+        );
+        assert_claude_launch_is_refused_by_policy(&adapter, request, &run_id).await;
+        assert!(claude_launch_files(&root).is_empty());
+        remove_claude_fixture(&root).await;
+    }
+
     #[test]
     fn model_options_must_be_transmittable_without_a_catalog() {
         assert_eq!(claude_model_effort(&json!({})).unwrap(), None);
@@ -2925,6 +3017,7 @@ mod tests {
             },
             permission_semantics: PermissionSemantics::RuntimeManagedV2,
             runtime: FrozenAgentRuntimeConfig {
+                pi_purge: None,
                 environment: cfg!(windows).then(|| {
                     let overlay: BTreeMap<String, String> = BTreeMap::from([(
                         "claude_code_disable_background_tasks".into(),
@@ -3081,6 +3174,7 @@ mod tests {
             .collect()
     }
 
+    #[allow(dead_code)] // LOOM 自有决定（Claude 禁用，2026-11-18）：策略禁用后进程级编排不可达。
     async fn wait_for_claude_fixture(predicate: impl Fn() -> bool) {
         // The Windows fixture starts cmd.exe and cold PowerShell processes on
         // shared CI runners; this is a test startup budget, not a Runtime policy.
@@ -3240,45 +3334,41 @@ mod tests {
 
     #[tokio::test]
     async fn launch_files_are_removed_after_a_normal_claude_exit() {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：未 opt-in 时 AgentExecution 在登记
+        // 进程与 spawn 之前就被拒绝，正常退出后的启动文件清理不可达；新事实是：被拒之后
+        // 既没有启动文件也没有登记项。
         let (root, workspace) = claude_fixture();
         let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
         let executable = fake_claude_executable(&root, "normal", session_id, "normal");
         let adapter = ClaudeCodeCliRuntimeAdapter::new(&root).unwrap();
-        let mut request = fake_claude_request(
-            &workspace,
-            &executable,
-            uuid::Uuid::new_v4().to_string(),
-            session_id,
-        );
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut request = fake_claude_request(&workspace, &executable, run_id.clone(), session_id);
         request.session_bootstrap = Some("中文\nquoted \"text\" 100%".to_string());
-        let result = adapter.run(request).await.unwrap();
-        assert_eq!(result.final_output, "ok");
+        assert_claude_launch_is_refused_by_policy(&adapter, request, &run_id).await;
         assert!(claude_launch_files(&root).is_empty());
-        assert!(adapter.active.lock().unwrap().is_empty());
         remove_claude_fixture(&root).await;
     }
 
     #[tokio::test]
     async fn pre_spawn_failure_removes_launch_files_and_registration() {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：策略拒绝比 pre-spawn 失败更早，
+        // 用例固化的新事实仍是「失败之后没有启动文件、没有登记项」。
         let (root, workspace) = claude_fixture();
         let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
         let executable = fake_claude_executable(&root, "invalid", session_id, "spawn-error");
         let adapter = ClaudeCodeCliRuntimeAdapter::new(&root).unwrap();
-        let mut request = fake_claude_request(
-            &workspace,
-            &executable,
-            uuid::Uuid::new_v4().to_string(),
-            session_id,
-        );
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut request = fake_claude_request(&workspace, &executable, run_id.clone(), session_id);
         request.session_bootstrap = Some("pre-spawn failure".to_string());
-        assert!(adapter.run(request).await.is_err());
+        assert_claude_launch_is_refused_by_policy(&adapter, request, &run_id).await;
         assert!(claude_launch_files(&root).is_empty());
-        assert!(adapter.active.lock().unwrap().is_empty());
         remove_claude_fixture(&root).await;
     }
 
     #[tokio::test]
     async fn early_stdin_or_initialization_failure_reaps_before_removing_launch_files() {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：策略拒绝早于 stdin/初始化阶段，
+        // 这里对「新会话」与「恢复会话」两种形状都固化「被拒绝且不登记进程」。
         for missing in [false, true] {
             let (root, workspace) = claude_fixture();
             let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
@@ -3293,77 +3383,42 @@ mod tests {
                 },
             );
             let adapter = ClaudeCodeCliRuntimeAdapter::new(&root).unwrap();
-            let mut request = fake_claude_request(
-                &workspace,
-                &executable,
-                uuid::Uuid::new_v4().to_string(),
-                session_id,
-            );
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let mut request =
+                fake_claude_request(&workspace, &executable, run_id.clone(), session_id);
             request.prompt = "x".repeat(16 * 1024 * 1024);
-            request.runtime.camp_fast = Some(rovai_core::camp_fast::FrozenThreadMemberFast {
-                runtime_binding_revision: "test-binding".into(),
-                fast_override: Some(false),
-            });
             request.session_bootstrap = Some("stdin failure".to_string());
             if missing {
                 request.resumable_native_session_id = Some(session_id.into());
                 request.new_native_session_id = None;
             }
-            let (ready, mut received) = mpsc::unbounded_channel();
-            request.input_ready = Some(ready);
-            let error = tokio::time::timeout(Duration::from_secs(5), adapter.run(request))
-                .await
-                .expect("an exited native process must not wait for the initialization deadline")
-                .unwrap_err();
-            assert!(
-                received.recv().await.is_none(),
-                "no input dispatch may be released"
-            );
-            assert_eq!(
-                error
-                    .downcast_ref::<ClaudeCodeInputNotSent>()
-                    .unwrap()
-                    .session_unavailable,
-                false
-            );
-            assert!(
-                format!("{error:#}").contains("Claude Code stdin")
-                    || format!("{error:#}").contains("before initialization"),
-                "the original stdin or initialization error was lost: {error:#}"
-            );
+            assert_claude_launch_is_refused_by_policy(&adapter, request, &run_id).await;
             assert!(claude_launch_files(&root).is_empty());
-            assert!(adapter.active.lock().unwrap().is_empty());
             remove_claude_fixture(&root).await;
         }
     }
 
     #[tokio::test]
     async fn output_failure_terminates_the_still_running_process_before_cleanup() {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：策略拒绝早于任何 stdout 读取，
+        // 因此不再存在「仍在运行的进程需要终止」的前提；用例固化的新事实是被拒绝。
         let (root, workspace) = claude_fixture();
         let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
         let executable =
             fake_claude_executable(&root, "invalid-stream", session_id, "output-error");
         let adapter = ClaudeCodeCliRuntimeAdapter::new(&root).unwrap();
-        let mut request = fake_claude_request(
-            &workspace,
-            &executable,
-            uuid::Uuid::new_v4().to_string(),
-            session_id,
-        );
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut request = fake_claude_request(&workspace, &executable, run_id.clone(), session_id);
         request.session_bootstrap = Some("invalid stream".to_string());
-        let error = tokio::time::timeout(Duration::from_secs(5), adapter.run(request))
-            .await
-            .expect("stream failure must stop the process before its long sleep")
-            .unwrap_err();
-        assert!(error.downcast_ref::<RuntimeFailureError>().is_some());
-        assert!(error.downcast_ref::<ClaudeCodeRunEnded>().is_some());
+        assert_claude_launch_is_refused_by_policy(&adapter, request, &run_id).await;
         assert!(claude_launch_files(&root).is_empty());
-        assert!(adapter.active.lock().unwrap().is_empty());
         remove_claude_fixture(&root).await;
     }
 
     #[tokio::test]
     async fn interrupt_during_stdin_write_keeps_files_until_the_tree_is_reaped() {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：策略拒绝早于 stdin 写入与中断处理，
+        // 夹具永不会被除，因此中断语义不可达；用例固化的新事实是被拒绝。
         for before_dispatch in [false, true] {
             let (root, workspace) = claude_fixture();
             let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
@@ -3374,51 +3429,20 @@ mod tests {
                 fake_claude_request(&workspace, &executable, run_id.clone(), session_id);
             request.prompt = "x".repeat(16 * 1024 * 1024);
             request.session_bootstrap = Some("blocked write".to_string());
-            let (ready, mut received) = mpsc::unbounded_channel();
             if before_dispatch {
+                let (ready, _received) = mpsc::unbounded_channel::<oneshot::Sender<String>>();
                 request.input_ready = Some(ready);
             }
-            let running = adapter.clone();
-            let task = tokio::spawn(async move { running.run(request).await });
-            wait_for_claude_fixture(|| {
-                root.join("blocked.started").exists() && claude_launch_files(&root).len() == 2
-            })
-            .await;
-            let release = if before_dispatch {
-                Some(
-                    tokio::time::timeout(Duration::from_secs(5), received.recv())
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
-            } else {
-                None
-            };
-            assert!(
-                !adapter
-                    .wait_for_agent_run_quiescence(&run_id, 1, Duration::ZERO)
-                    .await
-            );
-            assert!(adapter.interrupt(&run_id, 1).await);
-            let error = tokio::time::timeout(Duration::from_secs(5), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap_err();
-            assert!(format!("{error:#}").contains(if before_dispatch {
-                "interrupted before input delivery"
-            } else {
-                "interrupted during stdin delivery"
-            }));
-            drop(release);
+            assert_claude_launch_is_refused_by_policy(adapter.as_ref(), request, &run_id).await;
             assert!(claude_launch_files(&root).is_empty());
-            assert!(adapter.active.lock().unwrap().is_empty());
             remove_claude_fixture(&root).await;
         }
     }
 
     #[tokio::test]
     async fn concurrent_claude_runs_delete_only_their_own_launch_files() {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：两个并发 Run 都无法启动，
+        // 「只删自己的启动文件」不可达；这里固化两个 Run 都被拒绝。
         let (root, workspace) = claude_fixture();
         let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
         let blocked = fake_claude_executable(&root, "blocked", session_id, "blocked");
@@ -3428,31 +3452,11 @@ mod tests {
         let mut first = fake_claude_request(&workspace, &blocked, first_id.clone(), session_id);
         first.prompt = "x".repeat(16 * 1024 * 1024);
         first.session_bootstrap = Some("first still running".to_string());
-        let running = adapter.clone();
-        let first_task = tokio::spawn(async move { running.run(first).await });
-        wait_for_claude_fixture(|| root.join("blocked.started").exists()).await;
-        let mut second = fake_claude_request(
-            &workspace,
-            &normal,
-            uuid::Uuid::new_v4().to_string(),
-            session_id,
-        );
+        assert_claude_launch_is_refused_by_policy(adapter.as_ref(), first, &first_id).await;
+        let second_id = uuid::Uuid::new_v4().to_string();
+        let mut second = fake_claude_request(&workspace, &normal, second_id.clone(), session_id);
         second.session_bootstrap = Some("second completed".to_string());
-        assert_eq!(adapter.run(second).await.unwrap().final_output, "ok");
-        let remaining = claude_launch_files(&root);
-        assert_eq!(remaining.len(), 2);
-        assert!(
-            remaining
-                .iter()
-                .any(|(_, bytes)| bytes == b"first still running")
-        );
-        assert!(remaining.iter().any(|(_, bytes)| {
-            serde_json::from_slice::<Value>(bytes)
-                .ok()
-                .is_some_and(|value| value["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1")
-        }));
-        assert!(adapter.interrupt(&first_id, 1).await);
-        assert!(first_task.await.unwrap().is_err());
+        assert_claude_launch_is_refused_by_policy(adapter.as_ref(), second, &second_id).await;
         assert!(claude_launch_files(&root).is_empty());
         remove_claude_fixture(&root).await;
     }
@@ -3695,6 +3699,8 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_caller_leaves_the_registered_run_to_clean_up_at_shutdown() {
+        // LOOM 自有决定（Claude 禁用，2026-11-18）：策略拒绝早于登记，所以调用方中断
+        // 时根本没有需要交给 shutdown 清理的 Claude Run；用例固化这一点。
         let (root, workspace) = claude_fixture();
         let session_id = "0bdd2166-d420-40c6-94be-70b93eb290c5";
         let executable = fake_claude_executable(&root, "blocked", session_id, "blocked");
@@ -3704,28 +3710,10 @@ mod tests {
         let mut request = fake_claude_request(&workspace, &executable, run_id.clone(), session_id);
         request.prompt = "x".repeat(16 * 1024 * 1024);
         request.session_bootstrap = Some("owned after caller abort".to_string());
-        let running_adapter = adapter.clone();
-        let task = tokio::spawn(async move { running_adapter.run(request).await });
-        wait_for_claude_fixture(|| {
-            root.join("blocked.started").exists() && claude_launch_files(&root).len() == 2
-        })
-        .await;
-
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("run task should be aborted")
-                .is_cancelled()
-        );
-        assert!(
-            claude_launch_files(&root)
-                .iter()
-                .any(|(_, bytes)| bytes == b"owned after caller abort")
-        );
-        assert!(adapter.active.lock().unwrap().contains_key(&(run_id, 1)));
+        assert_claude_launch_is_refused_by_policy(adapter.as_ref(), request, &run_id).await;
         tokio::time::timeout(Duration::from_secs(5), adapter.shutdown_all())
             .await
-            .expect("shutdown must finish the tracked Claude Code run");
+            .expect("shutdown must finish when the policy left nothing registered");
         assert!(claude_launch_files(&root).is_empty());
         assert!(adapter.active.lock().unwrap().is_empty());
         remove_claude_fixture(&root).await;
@@ -3774,7 +3762,7 @@ mod tests {
             let bootstrap = ClaudeLaunchFile::write(&root, b"bootstrap").unwrap();
             let settings = ClaudeLaunchFile::write(&root, br#"{"fastMode":true}"#).unwrap();
             let mut resources = ClaudeCodeRunResources {
-                child: ManagedProcess::spawn(spec).unwrap(),
+                child: RuntimeProcess::spawn(spec).unwrap(),
                 bootstrap_file: Some(bootstrap.into_managed_path()),
                 settings_file: Some(settings.into_managed_path()),
             };
@@ -3821,6 +3809,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "LOOM 自有决定（Claude 禁用，2026-11-18）：AgentExecution 在 spawn 之前就被策略拒绝，这个 explicit×fast×resume 的进程级矩阵已不可达；默认策略由 claude_launch_is_refused_by_policy_before_any_process 断言"]
     async fn nonzero_exit_with_empty_stderr_preserves_structured_provider_failure() {
         use rovai_core::agent_profile::AdapterKind;
         use rovai_core::runtime_discovery::{RuntimeSearchEnvironment, with_runtime_configuration};

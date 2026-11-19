@@ -5,6 +5,11 @@ members = [
     "crates/rovai-web",
     "crates/loom-protocol",
     "crates/loom-node",
+    "crates/loom-pi-launcher",
+    "crates/rovai-private-storage",
+    "crates/rovai-process-boundary",
+    "crates/rovai-runtime-entrypoint",
+    "crates/rovai-local-ipc",
 ]
 resolver = "3"
 

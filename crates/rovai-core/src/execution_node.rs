@@ -9,9 +9,16 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
+};
+
+mod run_bundle;
+mod workspace_rpc;
+pub use run_bundle::{
+    BUNDLE_SCHEMA_SQL, MAX_MANIFEST_BYTES, RunBundleStoreError, StoredRunBundle,
+    bundle_schema_matches, launch_digest,
 };
 
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -190,7 +197,7 @@ fn is_path_sentinel(path: &str) -> bool {
     path.is_empty() || path == "path_missing"
 }
 
-fn fresh_heartbeat(stamp: Option<&str>, now: DateTime<Utc>) -> bool {
+pub(crate) fn fresh_heartbeat(stamp: Option<&str>, now: DateTime<Utc>) -> bool {
     let Some(stamp) = stamp else {
         return false;
     };
@@ -217,6 +224,8 @@ pub struct CliRecord {
     pub version: Option<String>,
     pub path_present: bool,
     pub reported_at: String,
+    pub installation_identity: Option<String>,
+    pub installation_generation: Option<u64>,
 }
 
 pub struct DispatchRecord {
@@ -227,6 +236,7 @@ pub struct DispatchRecord {
     pub status: String,
     pub acked_seq: u64,
     pub exit_code: Option<i32>,
+    pub started_at: String,
 }
 
 pub struct NodeRecord {
@@ -242,6 +252,9 @@ pub struct NodeRecord {
     pub last_heartbeat: Option<String>,
     pub clis: Vec<CliRecord>,
     pub active_runs: Vec<DispatchRecord>,
+    /// Latest dispatches, including ones that already finished. The live view
+    /// reads these. `active_runs` stays the running set the node list counts.
+    pub recent_runs: Vec<DispatchRecord>,
 }
 
 pub struct OutputFrame {
@@ -257,6 +270,23 @@ pub enum OutputWrite {
     Gap,
     TooLarge,
     Missing,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceRecord {
+    pub id: String,
+    pub mission_id: String,
+    pub camp_id: String,
+    pub execution_host_id: String,
+    pub source_directory: String,
+    pub repository_root: String,
+    pub git_common_dir: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub base_sha: String,
+    pub owner_name: String,
+    pub owner_role: String,
+    pub last_heartbeat: Option<String>,
 }
 
 #[derive(Debug)]
@@ -295,6 +325,22 @@ pub enum NextAttempt {
     Missing,
 }
 
+/// SQL INTEGER is signed. Convert only the advertised safe positive counter
+/// range; malformed retained rows are errors rather than a wrapped generation.
+fn read_installation_generation(row:&rusqlite::Row<'_>, index:usize)
+    ->rusqlite::Result<Option<u64>> {
+    row.get::<_,Option<i64>>(index)?.map(|value|{
+        u64::try_from(value).ok()
+            .filter(|generation|(1..=(1_u64<<53)-1).contains(generation))
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(index,value))
+    }).transpose()
+}
+
+fn valid_installation_identity(identity: &str) -> bool {
+    identity.strip_prefix("sha256:").is_some_and(|hex| hex.len() == 64
+        && hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+}
+
 impl NodeStore {
     pub fn open(path: &Path) -> Result<Self> {
         let connection =
@@ -316,6 +362,9 @@ impl NodeStore {
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         connection.execute_batch(SCHEMA_SQL)?;
         connection.execute_batch(SHIM_SCHEMA_SQL)?;
+        connection.execute_batch(BUNDLE_SCHEMA_SQL)?;
+        // The production columns arrive through migration 231; this is a schema-only fixture.
+        connection.execute_batch("ALTER TABLE execution_node_cli ADD COLUMN installation_identity TEXT; ALTER TABLE execution_node_cli ADD COLUMN installation_generation INTEGER CHECK(installation_generation IS NULL OR installation_generation>=1);")?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -393,6 +442,25 @@ impl NodeStore {
             {
                 bail!("invalid cli report");
             }
+            match (&cli.installation_identity, cli.installation_generation) {
+                (None, None) => {}
+                (Some(identity), Some(generation))
+                    if valid_installation_identity(identity) && (1..=(1_u64 << 53) - 1).contains(&generation) => {}
+                _ => bail!("invalid cli installation report"),
+            }
+            if let (Some(identity), Some(generation)) = (&cli.installation_identity, cli.installation_generation) {
+                let previous: Option<(String, Option<String>, Option<u64>)> = tx.query_row(
+                    "SELECT path,installation_identity,installation_generation FROM execution_node_cli WHERE node_id=?1 AND adapter_kind=?2",
+                    params![node_id,cli.adapter_kind], |row| Ok((row.get(0)?,row.get(1)?,read_installation_generation(row,2)?))
+                ).optional()?;
+                if let Some((previous_path, Some(previous_identity), Some(previous_generation))) = previous {
+                    let same_binding = previous_identity == *identity && previous_path == cli.path;
+                    if (same_binding && previous_generation != generation)
+                        || (!same_binding && previous_generation >= generation) {
+                        bail!("cli installation generation regressed");
+                    }
+                }
+            }
             if is_path_sentinel(&cli.path) {
                 if cli.path_present {
                     bail!("invalid cli report");
@@ -401,20 +469,25 @@ impl NodeStore {
             }
             tx.execute(
                 "INSERT INTO execution_node_cli(
-                    node_id, adapter_kind, path, version, path_present, reported_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                    node_id, adapter_kind, path, version, path_present, reported_at, installation_identity, installation_generation
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(node_id, adapter_kind) DO UPDATE SET
                     path=excluded.path,
                     version=excluded.version,
                     path_present=excluded.path_present,
-                    reported_at=excluded.reported_at",
+                    reported_at=excluded.reported_at,
+                    installation_identity=excluded.installation_identity,
+                    installation_generation=excluded.installation_generation",
                 params![
                     node_id,
                     cli.adapter_kind,
                     cli.path,
                     cli.version,
                     if cli.path_present { 1 } else { 0 },
-                    now
+                    now,
+                    cli.installation_identity,
+                    cli.installation_generation.map(i64::try_from).transpose()
+                        .map_err(|_|anyhow::anyhow!("invalid cli installation report"))?
                 ],
             )?;
         }
@@ -576,6 +649,96 @@ impl NodeStore {
             .map_err(Into::into)
     }
 
+    pub fn sqlite_directory(&self) -> Result<PathBuf> {
+        let connection = self.lock()?;
+        let path = connection
+            .path()
+            .context("node store has no file path")?
+            .to_owned();
+        Ok(Path::new(&path)
+            .parent()
+            .context("node store path has no parent")?
+            .to_path_buf())
+    }
+
+    pub fn save_workspace(&self, record: &WorkspaceRecord) -> Result<()> {
+        let now = now_stamp();
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO mission_workspace(
+                id, mission_id, camp_id, execution_host_id, source_directory,
+                repository_root, git_common_dir, worktree_path, working_directory,
+                base_branch, branch, base_sha, preparation_token, preparation_kind,
+                generation, state, created_at, updated_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,NULL,?9,?10,?11,'create',1,'ready',?12,?12)",
+            params![
+                record.id,
+                record.mission_id,
+                record.camp_id,
+                record.execution_host_id,
+                record.source_directory,
+                record.repository_root,
+                record.git_common_dir,
+                record.worktree_path,
+                record.branch,
+                record.base_sha,
+                record.id,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn revalidate_remote_launch(&self, launch: &crate::remote_process::ScopedRemoteLaunch) -> Result<()> {
+        let connection = self.lock()?;
+        crate::remote_execution::revalidate_remote_launch(&connection, launch)
+    }
+
+    pub fn workspace_by_id(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>> {
+        self.workspace_where("w.id=?1", workspace_id)
+    }
+
+    pub fn workspace_by_mission(&self, mission_id: &str) -> Result<Option<WorkspaceRecord>> {
+        self.workspace_where("w.mission_id=?1", mission_id)
+    }
+
+    pub fn workspace_by_camp(&self, camp_id: &str) -> Result<Option<WorkspaceRecord>> {
+        self.workspace_where("w.camp_id=?1", camp_id)
+    }
+
+    fn workspace_where(&self, clause: &str, value: &str) -> Result<Option<WorkspaceRecord>> {
+        let connection = self.lock()?;
+        let sql = format!(
+            "SELECT w.id, w.mission_id, w.camp_id, w.execution_host_id, w.source_directory,
+                    w.repository_root, w.git_common_dir, w.worktree_path, w.branch, w.base_sha,
+                    n.display_name, n.role, n.last_heartbeat
+             FROM mission_workspace w
+             JOIN execution_node n ON n.node_id = w.execution_host_id
+             WHERE {clause} AND w.state='ready' AND n.revoked_at IS NULL
+             ORDER BY w.created_at DESC LIMIT 1"
+        );
+        connection
+            .query_row(&sql, [value], |row| {
+                Ok(WorkspaceRecord {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    camp_id: row.get(2)?,
+                    execution_host_id: row.get(3)?,
+                    source_directory: row.get(4)?,
+                    repository_root: row.get(5)?,
+                    git_common_dir: row.get(6)?,
+                    worktree_path: row.get(7)?,
+                    branch: row.get(8)?,
+                    base_sha: row.get(9)?,
+                    owner_name: row.get(10)?,
+                    owner_role: row.get(11)?,
+                    last_heartbeat: row.get(12)?,
+                })
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// The host pin on one LOOM task. NULL is unpinned and must not fall
     /// through to a remote node.
     pub fn task_execution_host(&self, task_id: &str) -> Result<TaskHost> {
@@ -639,12 +802,13 @@ impl NodeStore {
                 last_heartbeat,
                 clis: Vec::new(),
                 active_runs: Vec::new(),
+                recent_runs: Vec::new(),
             });
         }
         drop(statement);
         for node in &mut nodes {
             let mut clis = connection.prepare(
-                "SELECT adapter_kind, path, version, path_present, reported_at
+                "SELECT adapter_kind, path, version, path_present, reported_at, installation_identity, installation_generation
                    FROM execution_node_cli WHERE node_id=?1 ORDER BY adapter_kind",
             )?;
             node.clis = clis
@@ -655,16 +819,28 @@ impl NodeStore {
                         version: row.get(2)?,
                         path_present: row.get::<_, i64>(3)? != 0,
                         reported_at: row.get(4)?,
+                        installation_identity: row.get(5)?,
+                        installation_generation: read_installation_generation(row,6)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             let mut runs = connection.prepare(
-                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code
+                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
                    FROM node_dispatch
                   WHERE node_id=?1 AND status='running'
                   ORDER BY started_at, run_id",
             )?;
             node.active_runs = runs
+                .query_map([&node.node_id], read_dispatch)?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut recent = connection.prepare(
+                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
+                   FROM node_dispatch
+                  WHERE node_id=?1
+                  ORDER BY started_at DESC, run_id
+                  LIMIT 8",
+            )?;
+            node.recent_runs = recent
                 .query_map([&node.node_id], read_dispatch)?
                 .collect::<Result<Vec<_>, _>>()?;
         }
@@ -692,7 +868,7 @@ impl NodeStore {
     pub fn running_for_node(&self, node_id: &str) -> Result<Vec<DispatchRecord>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code
+            "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
                FROM node_dispatch
               WHERE node_id=?1 AND status='running'
               ORDER BY started_at, run_id",
@@ -701,6 +877,17 @@ impl NodeStore {
             .query_map([node_id], read_dispatch)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Read one exact current attempt without loading its output body.
+    pub fn current_attempt(&self, run_id: &str, attempt: u32) -> Result<Option<DispatchRecord>> {
+        let connection = self.lock()?;
+        Ok(connection.query_row(
+            "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
+             FROM node_dispatch WHERE run_id=?1 AND attempt=?2
+             AND NOT EXISTS (SELECT 1 FROM node_dispatch newer
+                             WHERE newer.run_id=?1 AND newer.attempt>?2)",
+            params![run_id, attempt], read_dispatch).optional()?)
     }
 
     pub fn append_output(
@@ -799,6 +986,43 @@ impl NodeStore {
         Ok(updated == 1)
     }
 
+    /// A durable Node NoProcess receipt is usable only before any output.
+    /// The cursor and output existence check share the write transaction.
+    pub fn interrupt_unspawned(&self, run_id: &str, attempt: u32) -> Result<bool> {
+        let now = now_stamp();
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+        let updated = tx.execute(
+            "UPDATE node_dispatch SET status='interrupted', finished_at=?3
+             WHERE run_id=?1 AND attempt=?2 AND status='running' AND acked_seq=0
+             AND NOT EXISTS (SELECT 1 FROM node_dispatch_output
+                             WHERE run_id=?1 AND attempt=?2)",
+            params![run_id, attempt, now])?;
+        if updated == 1 { revoke_run_credential(&tx, run_id, attempt, &now)?; }
+        tx.commit()?;
+        Ok(updated == 1)
+    }
+
+    /// Completion must read the attempt it admitted, never the latest attempt.
+    pub fn output_for_attempt(
+        &self, run_id: &str, attempt: u32, from_seq: u64,
+    ) -> Result<Option<(DispatchRecord, Vec<OutputFrame>)>> {
+        let connection = self.lock()?;
+        let dispatch = connection.query_row(
+            "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
+             FROM node_dispatch WHERE run_id=?1 AND attempt=?2",
+            params![run_id, attempt], read_dispatch).optional()?;
+        let Some(dispatch) = dispatch else { return Ok(None); };
+        let mut statement = connection.prepare(
+            "SELECT seq, stream, data FROM node_dispatch_output
+             WHERE run_id=?1 AND attempt=?2 AND seq>=?3 ORDER BY seq")?;
+        let frames = statement.query_map(params![run_id, attempt, from_seq.max(1) as i64],
+            |row| Ok(OutputFrame { seq: row.get::<_, i64>(0)? as u64,
+                stream: row.get(1)?, data: row.get(2)? }))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some((dispatch, frames)))
+    }
+
     pub fn output_from(
         &self,
         run_id: &str,
@@ -807,7 +1031,7 @@ impl NodeStore {
         let connection = self.lock()?;
         let dispatch = connection
             .query_row(
-                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code
+                "SELECT run_id, attempt, node_id, runtime, status, acked_seq, exit_code, started_at
                    FROM node_dispatch
                   WHERE run_id=?1
                   ORDER BY attempt DESC
@@ -920,12 +1144,38 @@ fn read_dispatch(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchRecord> {
         status: row.get(4)?,
         acked_seq: row.get::<_, i64>(5)? as u64,
         exit_code: row.get(6)?,
+        started_at: row.get(7)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_no_process_requires_zero_cursor_and_no_output_and_reads_exact_attempt() {
+        let store = NodeStore::open_ephemeral().unwrap();
+        store.insert_remote("node_a", "desk", &"ab".repeat(32)).unwrap();
+        store.begin_dispatch("run_zero", 1, "node_a", "codex-cli").unwrap();
+        assert!(store.interrupt_unspawned("run_zero", 1).unwrap());
+        assert!(!store.interrupt_unspawned("run_zero", 1).unwrap());
+        assert!(matches!(store.open_next_attempt("run_zero").unwrap(),
+            NextAttempt::Opened { attempt: 2, .. }));
+        assert!(store.current_attempt("run_zero", 1).unwrap().is_none());
+        assert_eq!(store.output_for_attempt("run_zero", 1, 1).unwrap().unwrap().0.status,
+            "interrupted");
+        assert_eq!(store.output_for_attempt("run_zero", 2, 1).unwrap().unwrap().0.status,
+            "running");
+        store.append_output("run_zero", 2, 1, "stdout", b"owned", 100).unwrap();
+        assert!(!store.interrupt_unspawned("run_zero", 2).unwrap());
+        // A corrupted zero cursor still cannot erase evidence of process output.
+        store.lock().unwrap().execute(
+            "UPDATE node_dispatch SET acked_seq=0 WHERE run_id='run_zero' AND attempt=2", [])
+            .unwrap();
+        assert!(!store.interrupt_unspawned("run_zero", 2).unwrap());
+        assert!(matches!(store.open_next_attempt("run_zero").unwrap(),
+            NextAttempt::StillRunning { attempt: 2 }));
+    }
 
     #[test]
     fn interrupted_run_opens_a_new_attempt_and_a_live_one_does_not() {
@@ -1025,6 +1275,32 @@ mod tests {
     }
 
     #[test]
+    fn installation_generation_roundtrips_without_signed_wrap_or_catalog_regression() {
+        let store=NodeStore::open_ephemeral().unwrap();
+        store.insert_remote("node_a","desk",&"ab".repeat(32)).unwrap();
+        let report=|path:&str,generation:u64|CliRecord {
+            adapter_kind:"codex-cli".into(),path:path.into(),version:None,path_present:true,
+            reported_at:String::new(),installation_identity:Some(format!("sha256:{}","a".repeat(64))),
+            installation_generation:Some(generation),
+        };
+        store.record_hello("node_a","linux","x86_64",&[report("/opt/codex",1)]).unwrap();
+        assert_eq!(listed_cli(&store,"codex-cli").installation_generation,Some(1));
+        store.record_hello("node_a","linux","x86_64",&[report("/opt/codex",1)]).unwrap();
+        assert!(store.record_hello("node_a","linux","x86_64",&[report("/moved/codex",1)]).is_err());
+        store.record_hello("node_a","linux","x86_64",&[report("/moved/codex",2)]).unwrap();
+        assert_eq!(listed_cli(&store,"codex-cli").installation_generation,Some(2));
+        assert!(store.record_hello("node_a","linux","x86_64",&[report("/moved/codex",3)]).is_err());
+        for invalid in [0,1_u64<<53,u64::MAX] {
+            assert!(store.record_hello("node_a","linux","x86_64",&[report("/moved/codex",invalid)]).is_err());
+        }
+        assert_eq!(listed_cli(&store,"codex-cli").installation_generation,Some(2));
+        store.lock().unwrap().execute(
+            "UPDATE execution_node_cli SET installation_generation=?1 WHERE node_id='node_a'",
+            [1_i64<<53]).unwrap();
+        assert!(store.list_nodes().is_err(),"out-of-wire-range retained SQL rows must fail closed");
+    }
+
+    #[test]
     fn a_missing_path_stays_last_seen_and_is_not_rewritten_to_path_missing() {
         let store = NodeStore::open_ephemeral().unwrap();
         store
@@ -1041,6 +1317,8 @@ mod tests {
                     version: Some("b3".into()),
                     path_present: true,
                     reported_at: String::new(),
+                    installation_identity: None,
+                    installation_generation: None,
                 }],
             )
             .unwrap();
@@ -1069,6 +1347,8 @@ mod tests {
                     version: None,
                     path_present: false,
                     reported_at: String::new(),
+                    installation_identity: None,
+                    installation_generation: None,
                 }],
             )
             .unwrap();
@@ -1088,6 +1368,8 @@ mod tests {
                     version: Some("b3".into()),
                     path_present: false,
                     reported_at: String::new(),
+                    installation_identity: None,
+                    installation_generation: None,
                 }],
             )
             .unwrap();
@@ -1114,6 +1396,8 @@ mod tests {
                     version: Some("b3-codex 0".into()),
                     path_present: true,
                     reported_at: String::new(),
+                    installation_identity: None,
+                    installation_generation: None,
                 }],
             )
             .unwrap();

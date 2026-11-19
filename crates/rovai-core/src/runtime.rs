@@ -135,7 +135,21 @@ impl AgentRunWorkspace {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !Path::new(&self.execution_root).is_absolute() {
+        self.validate_for_execution_target(None)
+    }
+
+    // A remote root belongs to the executor's OS. Only Core's already validated
+    // claim target or immutable stored Run target may supply this authority.
+    fn validate_for_execution_target(
+        &self,
+        remote_target: Option<&crate::remote_execution::FrozenRunTarget>,
+    ) -> Result<()> {
+        if let Some(target) = remote_target {
+            anyhow::ensure!(
+                self.execution_root == target.target.workspace_root,
+                "AgentRun executionRoot must match its frozen remote target"
+            );
+        } else if !Path::new(&self.execution_root).is_absolute() {
             anyhow::bail!("AgentRun executionRoot must be absolute");
         }
         if !matches!(self.access.as_str(), "read_only" | "write") {
@@ -753,6 +767,47 @@ pub(crate) fn runtime_cleanup_blocked_since_connection(
     )?)
 }
 
+/// The remote mapping table belongs to a later migration. A historical schema has no
+/// remote installation at all, while a current schema without the table is an error
+/// rather than a silent local fallback.
+fn remote_installation(connection: &Connection, installation_id: &str) -> Result<bool> {
+    if !crate::remote_execution::authority_table_available(
+        connection,
+        "remote_runtime_installation",
+    )? {
+        return Ok(false);
+    }
+    crate::remote_execution::is_remote_installation(connection, installation_id)
+}
+
+/// A remote Node session is never replayed across machines, installations or
+/// configuration. The pure local rule stays untouched: only a Run whose current or
+/// previous installation is remote reaches this decision.
+fn remote_session_resume_disposition(
+    execution: &AgentRunExecution,
+    current_is_remote: bool,
+    previous_is_remote: bool,
+) -> NativeSessionResumeDisposition {
+    let same_remote_installation = current_is_remote
+        && previous_is_remote
+        && execution.native_adapter_installation_id.as_deref()
+            == Some(execution.runtime.installation_id.as_str())
+        && execution.native_installation_generation
+            == Some(execution.runtime.installation_generation)
+        && execution.native_binding_compatibility_digest.as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && execution.native_binding_compatibility_digest
+            == execution.runtime.binding_compatibility_digest
+        && execution.native_session_compatibility_key.as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && execution.native_session_compatibility_key
+            == execution.runtime.native_session_compatibility_key;
+    if !same_remote_installation {
+        return NativeSessionResumeDisposition::New;
+    }
+    execution.native_session_resume_disposition()
+}
+
 #[derive(Debug, Default)]
 pub struct ExecutionRuntimeService {
     gateway: DomainCommandGateway,
@@ -1030,7 +1085,21 @@ impl ExecutionRuntimeService {
     ) -> Result<NativeSessionResumeDisposition> {
         // Run/epoch, input-delivery and native writer-lock fences remain the
         // execution authority. Historical configuration attempts are audit only.
-        let _ = database;
+        // The real catalog mapping, never a string prefix of an identifier,
+        // decides whether either side belongs to a remote Node installation.
+        let current_is_remote =
+            remote_installation(database.connection(), &execution.runtime.installation_id)?;
+        let previous_is_remote = match execution.native_adapter_installation_id.as_deref() {
+            Some(previous) => remote_installation(database.connection(), previous)?,
+            None => false,
+        };
+        if current_is_remote || previous_is_remote {
+            return Ok(remote_session_resume_disposition(
+                execution,
+                current_is_remote,
+                previous_is_remote,
+            ));
+        }
         Ok(execution.native_session_resume_disposition())
     }
 
@@ -1749,7 +1818,17 @@ impl ExecutionRuntimeService {
         };
         let workspace = serde_json::from_str::<AgentRunWorkspace>(&workspace)
             .context("claimed AgentRun has no valid frozen workspace")?;
-        workspace.validate()?;
+        // Reading a claimed Run preserves its frozen authority; it does not
+        // revalidate future member selections or workspace preparation changes.
+        let remote_target = if crate::remote_execution::authority_table_available(
+            database.connection(),
+            "agent_run_execution_target",
+        )? {
+            crate::remote_execution::load_run_target(database.connection(), &agent_run_id)?
+        } else {
+            None
+        };
+        workspace.validate_for_execution_target(remote_target.as_ref())?;
         let effective_config: Value = serde_json::from_str(&effective_config)
             .context("AgentRun effective config is invalid")?;
         let runtime: FrozenAgentRuntimeConfig = serde_json::from_value(
@@ -1853,9 +1932,6 @@ impl ExecutionRuntimeService {
         database: &mut Database,
         envelope: &CommandEnvelope<ClaimAgentRunCommand>,
     ) -> Result<CommandExecution> {
-        if let Some(workspace) = &envelope.payload.workspace {
-            workspace.validate()?;
-        }
         self.gateway.execute(database, envelope, |transaction| {
             if !matches!(
                 &envelope.actor,
@@ -1882,6 +1958,26 @@ impl ExecutionRuntimeService {
             if let Some(rejection) = claim_admission_rejection(transaction, &run, envelope)? {
                 return Ok(rejection);
             }
+            // A Run frozen to a remote target proves that target before the CAS below
+            // can acquire a lease. A drifted or revoked Node is never claimed as local.
+            // The binding table belongs to a later migration than some fixtures; its
+            // absence means this Core has no frozen remote target at all.
+            let remote_target_table = crate::remote_execution::authority_table_available(
+                transaction, "agent_run_execution_target"
+            )?;
+            let remote_target = if remote_target_table {
+                match crate::remote_execution::revalidate_run_claim(transaction, &run.id) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        return Ok(rejected(
+                            "agent_run.remote_target_unavailable",
+                            "Remote execution target is no longer trusted",
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
             let budget_now = camp_turn_execution_budget_now();
             let budget_now_text = budget_now.to_rfc3339();
             let audit_now_text = chrono::Utc::now().to_rfc3339();
@@ -1902,13 +1998,25 @@ impl ExecutionRuntimeService {
                 (None, Some(requested)) => Some(serde_json::to_value(requested)?),
                 (None, None) => None,
             };
-            if let Some(workspace) = frozen_workspace.as_ref()
-                && !workspace_matches_camp(transaction, &run.camp_id, workspace)?
-            {
-                return Ok(rejected(
-                    "agent_run.workspace_scope_mismatch",
-                    "AgentRun workspace does not match the Thread project path",
-                ));
+            if let Some(workspace) = frozen_workspace.as_ref() {
+                // A remote Run's workspace is the frozen Node root, which is never equal
+                // to this Core's project path; it is compared to the frozen target only.
+                let in_scope = match &remote_target {
+                    Some(target) => {
+                        workspace["executionRoot"].as_str()
+                            == Some(target.target.workspace_root.as_str())
+                    }
+                    None => workspace_matches_camp(transaction, &run.camp_id, workspace)?,
+                };
+                if !in_scope {
+                    return Ok(rejected(
+                        "agent_run.workspace_scope_mismatch",
+                        "AgentRun workspace does not match the Thread project path",
+                    ));
+                }
+                let workspace: AgentRunWorkspace = serde_json::from_value(workspace.clone())
+                    .context("stored AgentRun workspace is invalid")?;
+                workspace.validate_for_execution_target(remote_target.as_ref())?;
             }
             let starting_git_observation = envelope
                 .payload
@@ -1921,6 +2029,14 @@ impl ExecutionRuntimeService {
                 + chrono::Duration::seconds(envelope.payload.lease_seconds))
             .to_rfc3339();
             let next_epoch = run.execution_epoch + 1;
+            // The write lock is already held here, so the CAS below and the LOOM claims it
+            // authorizes are one unit: a Run either starts holding the claims of the
+            // policy-authorized work it is about to execute, or it does not start at all. The
+            // savepoint exists only so an expected claim refusal can be undone while its rejection
+            // receipt is still recorded by the gateway.
+            transaction
+                .execute_batch(LOOM_PRECLAIM_SAVEPOINT_OPEN)
+                .context("failed to open the LOOM pre-claim savepoint")?;
             let updated = transaction.execute(
                 r#"
                 UPDATE agent_run
@@ -1968,10 +2084,38 @@ impl ExecutionRuntimeService {
                 ],
             )?;
             if updated != 1 {
+                transaction
+                    .execute_batch(LOOM_PRECLAIM_SAVEPOINT_RELEASE)
+                    .context("failed to release the LOOM pre-claim savepoint")?;
                 return Ok(rejected(
                     "agent_run.claim_race_lost",
                     "AgentRun changed before its lease was acquired",
                 ));
+            }
+            match preclaim_loom_dispatch_tasks(transaction, &run, next_epoch) {
+                Ok(()) => {
+                    transaction
+                        .execute_batch(LOOM_PRECLAIM_SAVEPOINT_RELEASE)
+                        .context("failed to release the LOOM pre-claim savepoint")?;
+                }
+                Err(error) => {
+                    let refusal = error
+                        .downcast_ref::<crate::loom::LoomCommandError>()
+                        .map(|rejection| (rejection.code(), rejection.message().to_string()));
+                    let Some((code, message)) = refusal else {
+                        // Not a domain refusal. Propagating it rolls the caller's transaction back
+                        // whole, so neither the lease nor a half-written claim can survive, and the
+                        // scheduler retries against the real state instead of a swallowed error.
+                        return Err(error);
+                    };
+                    transaction
+                        .execute_batch(LOOM_PRECLAIM_SAVEPOINT_ROLLBACK)
+                        .context("failed to roll back the LOOM pre-claim savepoint")?;
+                    return Ok(rejected(
+                        "agent_run.loom_claim_unavailable",
+                        &format!("{code}: {message}"),
+                    ));
+                }
             }
             // A reusable Native Session may outlive an AgentRun epoch. Clear the
             // previous Team Tool credential before the new epoch can execute so
@@ -6556,6 +6700,145 @@ pub(crate) fn pump_target_after_run_terminal(
     Ok(())
 }
 
+/// Savepoint names for the pre-execution LOOM claim, written as SQL so the rollback and the release
+/// are explicit at the only two places that can undo it.
+const LOOM_PRECLAIM_SAVEPOINT_OPEN: &str = "SAVEPOINT loom_preclaim";
+const LOOM_PRECLAIM_SAVEPOINT_ROLLBACK: &str = "ROLLBACK TO loom_preclaim; RELEASE loom_preclaim";
+const LOOM_PRECLAIM_SAVEPOINT_RELEASE: &str = "RELEASE loom_preclaim";
+/// Bounded lease of a claim Core writes on the Run's behalf; `loom::DEFAULT_CLAIM_LEASE_SECONDS` is
+/// the agent-facing default and is deliberately not reused, because this lease covers a whole epoch.
+const LOOM_PRECLAIM_LEASE_SECONDS: i64 = 1800;
+
+/// Claim every policy-authorized LOOM Task this Run is about to execute, in the same transaction that
+/// admits it to execution.
+///
+/// Only an `EXECUTE` or `REWORK` dispatch carries work that is later submitted under a claim, so only
+/// those Tasks are claimed here. A `REVIEW` or `HANDOFF` dispatch reads another Run's Candidate under
+/// no claim of its own, and an ordinary chat Run has no dispatch row at all, so neither acquires
+/// anything. Every identity is read from the ledger and the Run, never from a payload: the Task's
+/// Mission comes from its Plan, and the claimant is the scheduler's proven recipient, which must be
+/// the agent this Run belongs to. The first epoch takes the claim; a later epoch of the same real Run
+/// revokes only that Run's own earlier lease and advances the fence through
+/// [`crate::loom::SameRunClaim::RevokeOwnLease`], so another Run's live lease is never taken.
+fn preclaim_loom_dispatch_tasks(
+    transaction: &Transaction<'_>,
+    run: &ClaimableRun,
+    execution_epoch: i64,
+) -> Result<()> {
+    if !crate::remote_execution::authority_table_available(transaction, "loom_control_dispatch")? {
+        return Ok(());
+    }
+    let run_agent_id: Option<String> = transaction
+        .query_row(
+            "SELECT conversation.agent_id FROM agent_run
+             JOIN conversation ON conversation.id = agent_run.conversation_id
+             WHERE agent_run.id = ?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(run_agent_id) = run_agent_id else {
+        anyhow::bail!("AgentRun {} has no conversation agent to claim for", run.id);
+    };
+    let mut targets: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT dispatch.plan_id, dispatch.task_id, dispatch.recipient_agent_id,
+                    plan.mission_id, mission.camp_id, task.assignee_agent_id, task.task_id
+             FROM camp_message_delivery AS delivery
+             JOIN loom_control_dispatch AS dispatch ON dispatch.delivery_id = delivery.id
+             LEFT JOIN loom_plan AS plan ON plan.plan_id = dispatch.plan_id
+             LEFT JOIN mission ON mission.id = plan.mission_id
+             LEFT JOIN loom_task AS task
+                    ON task.plan_id = dispatch.plan_id AND task.task_id = dispatch.task_id
+             WHERE delivery.claimed_agent_run_id = ?1
+               AND dispatch.kind IN ('EXECUTE','REWORK')
+             ORDER BY delivery.queue_sequence, dispatch.dispatch_id",
+        )?;
+        let rows = statement.query_map([&run.id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?;
+        for row in rows {
+            targets.push(row?);
+        }
+    }
+    for (plan_id, task_id, recipient_agent_id, mission_id, mission_camp_id, assignee, task_row_id) in
+        targets
+    {
+        // A dispatch whose Plan, Mission or Task cannot be resolved is a broken authority row, not
+        // an empty lane: it stops this Run instead of being filtered away as "no work to claim".
+        let (Some(mission_id), Some(mission_camp_id), Some(assignee), Some(task_row_id)) =
+            (mission_id, mission_camp_id, assignee, task_row_id)
+        else {
+            anyhow::bail!(
+                "LOOM dispatch task {task_id} has no readable Plan, Mission or Task to claim"
+            );
+        };
+        anyhow::ensure!(
+            task_row_id == task_id,
+            "LOOM dispatch task {task_id} resolved to another Task"
+        );
+        let plan_of_mission: Option<String> = transaction
+            .query_row(
+                "SELECT plan_id FROM loom_plan WHERE plan_id=?1 AND mission_id=?2",
+                params![&plan_id, &mission_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            plan_of_mission.as_deref() == Some(plan_id.as_str()),
+            "LOOM dispatch task {task_id} does not belong to Mission {mission_id}"
+        );
+        // The scheduler already re-proved these before the Run was claimed; the Run's own Camp and
+        // agent are checked again here because the claim is written by this transaction alone.
+        anyhow::ensure!(
+            mission_camp_id == run.camp_id,
+            "LOOM dispatch task {task_id} belongs to Camp {mission_camp_id}, not to this Run's Camp"
+        );
+        anyhow::ensure!(
+            recipient_agent_id == run_agent_id,
+            "LOOM dispatch task {task_id} was addressed to {recipient_agent_id}, not to this Run's agent"
+        );
+        anyhow::ensure!(
+            assignee == run_agent_id,
+            "LOOM task {task_id} is assigned to {assignee}, not to this Run's agent"
+        );
+        let command_id = format!(
+            "core-loom-claim:{}:{}:{}",
+            run.id, execution_epoch, task_id
+        );
+        crate::loom::claim_acquire_in(
+            transaction,
+            crate::loom::LoomClaimAcquireInput {
+                mission_id,
+                task_id,
+                agent_run_id: run.id.clone(),
+                claimant_agent_id: Some(recipient_agent_id),
+                command_id,
+                lease_seconds: Some(LOOM_PRECLAIM_LEASE_SECONDS),
+            },
+            crate::loom::SameRunClaim::RevokeOwnLease,
+        )?;
+    }
+    Ok(())
+}
+
 fn claim_admission_rejection(
     transaction: &Transaction<'_>,
     run: &ClaimableRun,
@@ -6572,6 +6855,31 @@ fn claim_admission_rejection(
             "agent_run.version_conflict",
             "AgentRun version is stale",
         )));
+    }
+    // A Delivery carrying a LOOM handoff can already be claimed when the approval is paused or
+    // revoked. This check sits in the same transaction as the transition to `running`, so the write
+    // lock orders a pause against a start instead of letting a paused dispatch begin; the control
+    // plane judges the authority, malformed or missing answers count as blocked, and an ordinary
+    // Delivery without a dispatch row asks nothing.
+    if crate::remote_execution::authority_table_available(transaction, "loom_control_dispatch")? {
+        let dispatch_ids = transaction
+            .prepare(
+                "SELECT dispatch.dispatch_id
+                 FROM camp_message_delivery AS delivery
+                 JOIN loom_control_dispatch AS dispatch ON dispatch.delivery_id = delivery.id
+                 WHERE delivery.claimed_agent_run_id = ?1
+                 ORDER BY delivery.queue_sequence",
+            )?
+            .query_map([&run.id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for dispatch_id in dispatch_ids {
+            if let Some(reason) =
+                crate::loom::control::dispatch_block_reason(transaction, &dispatch_id, &now)?
+            {
+                return Ok(Some(rejected("agent_run.loom_control_blocked", &reason)));
+            }
+        }
     }
     if !run.camp_turn_id.is_empty() {
         if run.execution_budget_exhausted_at.is_some() {
@@ -7493,6 +7801,7 @@ mod tests {
             purpose: "resume safely".to_string(),
             effective_config: json!({}),
             runtime: FrozenAgentRuntimeConfig {
+                pi_purge: None,
                 environment: None,
                 custom_api: None,
                 camp_fast: None,
@@ -7556,6 +7865,126 @@ mod tests {
                 assert_eq!(execution.resumable_native_session_id(), None);
             }
         }
+
+        // The local rule above is unchanged: a local Run with no configuration key
+        // still resumes. Only a Run whose current or previous installation is a
+        // remote Node reaches the extra decision below, fed by the real catalog
+        // mapping rather than by an identifier prefix.
+        let local_only = resume_execution(None, None, 1, 1);
+        assert_eq!(
+            local_only.native_session_resume_disposition(),
+            NativeSessionResumeDisposition::Compatible
+        );
+        let remote = |key: &str, generation: i64| {
+            let mut execution = resume_execution(Some(key), Some(key), generation, generation);
+            execution.runtime.auth_scope = "remote_node:node-a".to_string();
+            execution
+        };
+
+        // One Node installation, generation, binding digest and key keep the session.
+        let same = remote("remote-key", 3);
+        assert_eq!(
+            remote_session_resume_disposition(&same, true, true),
+            NativeSessionResumeDisposition::Compatible
+        );
+
+        // A→B, B→A and B→C cross Node installations and must start a new session.
+        let mut other_node = remote("remote-key", 3);
+        other_node.runtime.installation_id = "remote-node-b".to_string();
+        assert_eq!(
+            remote_session_resume_disposition(&other_node, true, true),
+            NativeSessionResumeDisposition::New
+        );
+        let mut other_node_previous = remote("remote-key", 3);
+        other_node_previous.native_adapter_installation_id = Some("remote-node-b".to_string());
+        assert_eq!(
+            remote_session_resume_disposition(&other_node_previous, true, true),
+            NativeSessionResumeDisposition::New
+        );
+        // B→C with every other fact identical: only the Node installation separates
+        // them, so this cannot ride on a shared digest or key.
+        let mut third_node = remote("remote-key", 3);
+        third_node.native_adapter_installation_id = Some("remote-node-b".to_string());
+        third_node.runtime.installation_id = "remote-node-c".to_string();
+        assert_eq!(
+            remote_session_resume_disposition(&third_node, true, true),
+            NativeSessionResumeDisposition::New
+        );
+
+        // A local↔remote switch is never resumed on either side.
+        assert_eq!(
+            remote_session_resume_disposition(&local_only, true, false),
+            NativeSessionResumeDisposition::New
+        );
+        assert_eq!(
+            remote_session_resume_disposition(&local_only, false, true),
+            NativeSessionResumeDisposition::New
+        );
+
+        // Same installation with any drifted fact is a new Node session.
+        for drift in [
+            "key",
+            "digest",
+            "generation",
+            "previous-key",
+            "previous-digest",
+            "previous-generation",
+        ] {
+            let mut execution = remote("remote-key", 3);
+            match drift {
+                "key" => {
+                    execution.runtime.native_session_compatibility_key = Some("changed".into())
+                }
+                "digest" => execution.runtime.binding_compatibility_digest = Some("changed".into()),
+                "generation" => execution.runtime.installation_generation = 4,
+                "previous-key" => {
+                    execution.native_session_compatibility_key = Some("changed".into())
+                }
+                "previous-digest" => {
+                    execution.native_binding_compatibility_digest = Some("changed".into())
+                }
+                "previous-generation" => execution.native_installation_generation = Some(4),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                remote_session_resume_disposition(&execution, true, true),
+                NativeSessionResumeDisposition::New,
+                "{drift}"
+            );
+        }
+
+        // A missing digest or key fails closed instead of inventing an identity.
+        for missing in ["key", "digest", "previous-key", "previous-digest"] {
+            let mut execution = remote("remote-key", 3);
+            match missing {
+                "key" => execution.runtime.native_session_compatibility_key = None,
+                "digest" => execution.runtime.binding_compatibility_digest = None,
+                "previous-key" => execution.native_session_compatibility_key = None,
+                "previous-digest" => execution.native_binding_compatibility_digest = None,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                remote_session_resume_disposition(&execution, true, true),
+                NativeSessionResumeDisposition::New,
+                "{missing}"
+            );
+        }
+
+        for empty in ["", "   "] {
+            let mut execution = remote(empty, 3);
+            execution.native_binding_compatibility_digest = Some(empty.to_string());
+            execution.runtime.binding_compatibility_digest = Some(empty.to_string());
+            assert_eq!(remote_session_resume_disposition(&execution, true, true),
+                NativeSessionResumeDisposition::New);
+        }
+
+        // The adapter-kind rule still applies inside one remote installation.
+        let mut other_adapter = remote("remote-key", 3);
+        other_adapter.runtime.adapter_kind = AdapterKind::ClaudeCodeCli;
+        assert_eq!(
+            remote_session_resume_disposition(&other_adapter, true, true),
+            NativeSessionResumeDisposition::New
+        );
     }
 
     #[test]

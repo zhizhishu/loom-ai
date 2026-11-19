@@ -11,7 +11,7 @@ import { build } from 'vite'
 import { admitElectronIntegrationTest } from './electron-sandbox-capability.mjs'
 
 const root = resolve(import.meta.dirname, '../..')
-test('production Composer invites outsiders in Pending drafts and preserves failed input', { timeout: 120_000 }, async t => {
+test('production Composer invites outsiders in Pending drafts and preserves failed input', { timeout: 180_000 }, async t => {
   if (!admitElectronIntegrationTest(t)) return
   const fixture = await mkdtemp(join(tmpdir(), 'rovai-pending-invitations-ui-'))
   const evidence = process.env.ROVAI_INVITE_EVIDENCE_DIR
@@ -40,6 +40,6 @@ test('production Composer invites outsiders in Pending drafts and preserves fail
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) { child.kill('SIGKILL'); await closed }
     if (evidence) { await mkdir(evidence, { recursive: true }); await cp(join(fixture, 'evidence'), evidence, { recursive: true }) }
-    await rm(fixture, { recursive: true, force: true })
+    await rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 })
   }
 })

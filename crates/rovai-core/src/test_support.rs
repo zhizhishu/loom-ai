@@ -213,7 +213,8 @@ fn clone_template_to(
     mode: TestDatabaseOpenMode,
 ) -> Database {
     assert_clean_template(&template.directory, &template.database_path);
-    std::fs::create_dir_all(directory).expect("test database clone directory should exist");
+    crate::platform::private_storage::prepare_private_directory(directory)
+        .expect("test database clone directory should be private");
     // Camp Attachment View receipts bind the physical Runtime Files Root identity.
     // Materialize that root before opening the cloned connection so tests never
     // freeze the synthetic "unmaterialized" identity and then change it later.

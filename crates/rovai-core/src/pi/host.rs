@@ -17,7 +17,7 @@ use std::{fs::OpenOptions, io::Write as _};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rovai_core::{
-    agent_profile::{AdapterKind, FrozenAgentRuntimeConfig},
+    agent_profile::{AdapterKind, FrozenAgentRuntimeConfig, PiPurgeMode, PiPurgeSelection},
     agent_runtime_adapter::{
         AdapterRuntimeProjection, AdapterRuntimeResolutionInput, AgentRuntimeAdapter,
         AgentRuntimeAdapterRegistry, McpProjectionCapability, PI_RUNTIME_DEFAULT_MODEL_ID,
@@ -45,6 +45,7 @@ use url::Url;
 use crate::{
     acp::CompletedAcpAction,
     builtin_tool_runtime::{BuiltinToolProcessConfig, BuiltinToolProcessConfigFactory},
+    loom::LiveClaim,
     runtime_fleet::{
         AgentRuntimeFleetManager, FleetAcquireRequest, FleetReleaseDisposition,
         RuntimeCompatibilityKey, RuntimeProcessHost,
@@ -53,11 +54,79 @@ use crate::{
 
 use super::{
     PI_COMMAND_TIMEOUT, PI_HOST_EXTENSION_VERSION, PI_MAX_INBOUND_RECORD_BYTES,
-    PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiIncoming, PiTransportFailure,
+    PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiFileAccessMode, PiFileGrant, PiIncoming,
+    PiTransportFailure, mode_from_permissions, now_epoch_ms,
     assistant_message_text, completed_action, read_jsonl_record, value_id,
 };
 
 const MANAGED_HOST_EXTENSION: &str = include_str!("managed-host.ts");
+const MANAGED_PURGE_ADAPTER: &str =
+    include_str!("../../../../scripts/loom-v2-pi-purge-extension.ts");
+const PI_PURGE_SOURCE_SHA256: &str =
+    "983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d";
+
+struct PreparedPiPurge {
+    adapter_path: PathBuf,
+    binding_path: PathBuf,
+    receipt_path: PathBuf,
+}
+
+/// Materialise only the frozen Run's selected Persona, after the native file
+/// grant is available. Never infer an opt-in from global Pi configuration.
+fn stage_pi_purge(
+    launch: &PiHostLaunch<'_>,
+    config_root: &Path,
+    grant_present: bool,
+) -> Result<Option<PreparedPiPurge>> {
+    let Some(selection) = launch.pi_purge else {
+        return Ok(None);
+    };
+    if selection.mode == PiPurgeMode::Off {
+        return Ok(None);
+    }
+    anyhow::ensure!(grant_present, "pi_purge_requires_core_file_grant");
+    anyhow::ensure!(
+        selection.mode == PiPurgeMode::Append
+            && !selection.persona.trim().is_empty()
+            && selection.persona.len() <= 16 * 1024
+            && !selection.persona.contains('\0'),
+        "pi_purge_persona_invalid"
+    );
+    let runtime_root = launch.executable.parent()
+        .and_then(Path::parent)
+        .context("pi_purge_bundled_runtime_root_missing")?;
+    let upstream_path = runtime_root
+        .join("extensions").join("pi-purge").join("upstream")
+        .join("extensions").join("pi-purge.ts");
+    let metadata = std::fs::symlink_metadata(&upstream_path)
+        .context("pi_purge_pinned_source_not_packaged")?;
+    anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink(),
+        "pi_purge_pinned_source_not_regular");
+    anyhow::ensure!(metadata.len() <= 256 * 1024, "pi_purge_pinned_source_oversized");
+    let bytes = std::fs::read(&upstream_path)?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    anyhow::ensure!(digest == PI_PURGE_SOURCE_SHA256, "pi_purge_upstream_digest_mismatch");
+
+    let persona_path = config_root.join("pi-purge-persona.md");
+    let binding_path = config_root.join("pi-purge-run.json");
+    let adapter_path = config_root.join("loom-pi-purge-extension.ts");
+    let receipt_path = config_root.join("pi-purge-receipt.jsonl");
+    write_private_file(&persona_path, selection.persona.as_bytes())?;
+    write_private_file(&adapter_path, MANAGED_PURGE_ADAPTER.as_bytes())?;
+    write_private_json(&binding_path, &json!({
+        "schema": "loom.pi-purge.run.v1",
+        "runId": launch.initial_binding.agent_run_id,
+        "botId": launch.agent_id,
+        "executionEpoch": launch.initial_binding.execution_epoch,
+        "mode": "append",
+        "upstreamPath": node_path(&upstream_path),
+        "upstreamSha256": PI_PURGE_SOURCE_SHA256,
+        "personaPath": node_path(&persona_path),
+        "personaSha256": format!("{:x}", Sha256::digest(selection.persona.as_bytes())),
+        "receiptPath": node_path(&receipt_path),
+    }))?;
+    Ok(Some(PreparedPiPurge { adapter_path, binding_path, receipt_path }))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -126,6 +195,30 @@ struct PiManagedSessionState {
     session_id: String,
     session_file: String,
     cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PiManagedGuardState {
+    schema_version: i64,
+    extension_version: String,
+    host_instance_id: String,
+    host_binding_generation: u64,
+    run_id: String,
+    bot_id: String,
+    execution_epoch: i64,
+    allowed_tools: Vec<String>,
+    workspace_real: String,
+    expires_at_epoch_ms: i64,
+    guard_log_path: String,
+    /// The LOOM claim the grant was issued under (empty for a Run bound to no LOOM Task). The
+    /// acknowledgement must echo it byte for byte, or this Host is not the one Core fenced.
+    claim_id: String,
+    fence_generation: i64,
+    lease_expires_at_epoch_ms: i64,
+    /// P0 step 3: whether the grant refuses `write`/`edit` without a live claim. Echoed for the same
+    /// reason as the triple: a Host that acknowledges a different requirement is not this Run's guard.
+    requires_claim: bool,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +401,11 @@ pub(crate) struct PiHost {
     binding_generation: AtomicU64,
     binding_document: RwLock<Option<PiHostBindingDocument>>,
     managed_session_state: RwLock<Option<PiManagedSessionState>>,
+    /// Core-issued per-Run file grant. `None` = the unchanged legacy native policy (no guard).
+    file_grant: Option<PiFileGrant>,
+    purge_receipt_path: Option<PathBuf>,
+    /// Binding-side guard acknowledgement published by the managed extension.
+    guard_state: RwLock<Option<PiManagedGuardState>>,
     session_id: RwLock<String>,
     session_file: RwLock<PathBuf>,
     model_identity: RwLock<Option<(String, String, String)>>,
@@ -322,8 +420,17 @@ struct PiHostLaunch<'a> {
     session_dir: Option<&'a Path>,
     initial_session_file: Option<&'a Path>,
     initial_binding: &'a PiBindingSeed,
+    agent_id: &'a str,
     incoming: mpsc::UnboundedSender<PiIncoming>,
     builtin_tools: Option<BuiltinToolProcessConfig>,
+    mcp: Option<&'a PiMcpProjection>,
+    /// `Some` only for an explicit guarded policy (`workspace_read_only` / `workspace_read_write`).
+    file_grant: Option<&'a PiFileGrant>,
+    /// Explicit Core-frozen Pi-only Persona intent; never inherited from Pi globals.
+    pi_purge: Option<&'a PiPurgeSelection>,
+    /// `true` only for `workspace_workflow`: the managed business tool needs the Core-injected CLI
+    /// context, so a Host without it must fail closed instead of loading an unusable tool.
+    require_builtin_tools: bool,
 }
 
 struct PiProbeRootCleanup(PathBuf);
@@ -476,11 +583,24 @@ fn append_initial_session_argument(command: &mut Command, session_file: Option<&
     }
 }
 
-fn append_host_arguments(command: &mut Command, extension_path: &Path) {
+fn append_host_arguments(
+    command: &mut Command,
+    extension_path: &Path,
+    file_access: Option<(&Path, &str)>,
+    purge_extension: Option<&Path>,
+) {
     command.args(["--mode", "rpc"]);
-    command
-        .args(["--no-themes", "--approve", "--extension"])
-        .arg(extension_path);
+    command.args(["--no-themes", "--approve"]);
+    // Only the explicit managed guard is added: the pre-existing isolation switches (including
+    // `--no-extensions`) stay exactly as the frozen launch already declared them. `--tools` carries the
+    // comma-joined tool list Core derived from the frozen access mode, never a caller-composed list.
+    if let Some((guard_path, tools)) = file_access {
+        command.args(["--tools", tools, "--extension"]).arg(guard_path);
+    }
+    command.args(["--extension"]).arg(extension_path);
+    if let Some(path) = purge_extension {
+        command.args(["--extension"]).arg(path);
+    }
 }
 
 fn configure_host_working_directory(command: &mut Command, cwd: &Path) -> Result<()> {
@@ -513,6 +633,12 @@ impl PiHost {
         .await
     }
     async fn spawn_in_environment(launch: PiHostLaunch<'_>) -> Result<Arc<Self>> {
+        // Fail closed before touching the filesystem: the workflow policy's managed business tool needs
+        // the Core-injected CLI context, so a Host that cannot carry it must not start at all.
+        anyhow::ensure!(
+            !launch.require_builtin_tools || launch.builtin_tools.is_some(),
+            "workspace_workflow_requires_builtin_tool_cli"
+        );
         create_private_directory(launch.private_runtime_dir)?;
         if let Some(session_dir) = launch.session_dir {
             create_private_directory(session_dir)?;
@@ -525,9 +651,49 @@ impl PiHost {
         create_private_directory(&config_root)?;
         let extension_path = config_root.join("rovai-pi-host.ts");
         write_private_file(&extension_path, MANAGED_HOST_EXTENSION.as_bytes())?;
+        // The managed Host extension imports the workflow bridge from this same private directory. It is
+        // written for every policy (one extra small file) so the import can never be the reason a Host
+        // fails to load; the bridge itself registers nothing unless the grant carries its tool.
+        write_private_file(
+            &config_root.join(super::MANAGED_WORKFLOW_TOOL_EXTENSION_NAME),
+            super::MANAGED_WORKFLOW_TOOL_EXTENSION.as_bytes(),
+        )?;
+        // Public input shapes only; binding credentials never enter this document or model help.
+        write_private_json(
+            &config_root.join(super::MANAGED_WORKFLOW_CONTRACT_NAME),
+            &super::managed_workflow_contract(),
+        )?;
+        let managed_mcp = match launch.mcp {
+            Some(mcp) => {
+                anyhow::ensure!(super::managed_mcp_document_digest(&mcp.document)? == mcp.digest,
+                    "Pi MCP document digest does not match frozen selection");
+                let (document_path, file_digest) = write_pi_mcp_document(
+                    &config_root, &mcp.document, &mcp.digest,
+                )?;
+                write_private_file(&config_root.join("managed-mcp.bundle.mjs"), super::MANAGED_MCP_EXTENSION.as_bytes())?;
+                let entry = config_root.join("index.mjs");
+                write_private_file(&entry, MANAGED_MCP_ENTRY.as_bytes())?;
+                Some((document_path, file_digest, entry))
+            }
+            None => None,
+        };
         let binding_path = config_root.join("binding.json");
         let initial_document = launch.initial_binding.document(&host_instance_id, 1);
         write_private_json(&binding_path, &initial_document)?;
+
+        // Materialize the shared guard from its single canonical source and hand the guard the exact
+        // Core-issued grant through a private file (never an environment-asserted identity).
+        let file_access = match launch.file_grant {
+            Some(grant) => {
+                let guard_path = config_root.join(super::PI_FILE_GUARD_EXTENSION_NAME);
+                write_private_file(&guard_path, super::PI_FILE_GUARD_EXTENSION_SOURCE.as_bytes())?;
+                let grant_path = config_root.join(GUARD_GRANT_FILE_NAME);
+                write_private_json(&grant_path, &grant.to_document()?)?;
+                Some((guard_path, grant.allowed_tools.join(","), grant_path))
+            }
+            None => None,
+        };
+        let prepared_purge = stage_pi_purge(&launch, &config_root, file_access.is_some())?;
 
         let mut command = Command::new(launch.executable);
         rovai_core::runtime_discovery::configure_runtime_command(AdapterKind::Pi, &mut command);
@@ -537,12 +703,29 @@ impl PiHost {
         if let Some(config) = &launch.builtin_tools {
             config.configure_command(&mut command)?;
         }
-        append_host_arguments(&mut command, &extension_path);
+        let entry = managed_mcp.as_ref().map_or(extension_path.as_path(), |(_, _, entry)| entry.as_path());
+        append_host_arguments(
+            &mut command,
+            Path::new(&node_path(entry)),
+            file_access
+                .as_ref()
+                .map(|(guard_path, tools, _)| (guard_path.as_path(), tools.as_str())),
+            prepared_purge.as_ref().map(|p| p.adapter_path.as_path()),
+        );
         append_session_directory_argument(&mut command, launch.session_dir);
         append_initial_session_argument(&mut command, launch.initial_session_file);
         command
-            .env("ROVAI_PI_HOST_BINDING_FILE", &binding_path)
+            .env("ROVAI_PI_HOST_BINDING_FILE", node_path(&binding_path))
             .env("PI_TELEMETRY", "0");
+        if let Some((_, _, grant_path)) = &file_access {
+            command.env("ROVAI_PI_FILE_GRANT_FILE", node_path(grant_path));
+        }
+        if let Some(purge) = &prepared_purge {
+            command.env("LOOM_PI_PURGE_BINDING_FILE", node_path(&purge.binding_path));
+        }
+        if let Some((document_path, digest, _)) = &managed_mcp {
+            command.envs(pi_mcp_environment(&config_root, document_path, digest, launch.cwd));
+        }
         configure_host_working_directory(&mut command, launch.cwd)?;
         let spec = ManagedProcessLaunchSpec::capture(
             &command,
@@ -581,6 +764,9 @@ impl PiHost {
             binding_generation: AtomicU64::new(1),
             binding_document: RwLock::new(Some(initial_document)),
             managed_session_state: RwLock::new(None),
+            file_grant: launch.file_grant.cloned(),
+            purge_receipt_path: prepared_purge.map(|p| p.receipt_path),
+            guard_state: RwLock::new(None),
             session_id: RwLock::new(String::new()),
             session_file: RwLock::new(PathBuf::new()),
             model_identity: RwLock::new(None),
@@ -878,6 +1064,17 @@ impl PiHost {
             }
             return;
         }
+        if message.get("type").and_then(Value::as_str) == Some("extension_ui_request")
+            && message.get("method").and_then(Value::as_str) == Some("setStatus")
+            && message.get("statusKey").and_then(Value::as_str)
+                == Some("rovai-managed-guard-state")
+        {
+            let result = self.capture_managed_guard_state(&message).await;
+            if result.is_err() {
+                self.poisoned.store(true, Ordering::Release);
+            }
+            return;
+        }
         let Some(owner) = self.owner.read().await.clone() else {
             return;
         };
@@ -1004,12 +1201,29 @@ impl PiHost {
             ));
         }
         let generation = self.binding_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // A guarded Host is bound to exactly one Run: its guard, its grant file and its log were all
+        // materialized at spawn. Re-activating it for a different Run would let that Run's tools run
+        // under the previous grant, so this is refused outright instead of re-pointed.
+        if let Some(grant) = self.file_grant.as_ref() {
+            if grant.run_id != seed.agent_run_id || grant.execution_epoch != seed.execution_epoch {
+                return Err(activation_failure(
+                    PiActivationFailureKind::ActivationFailed,
+                    "Pi Host file grant is bound to another AgentRun",
+                ));
+            }
+        }
         let document = seed.document(&self.host_instance_id, generation);
         write_private_json(&self.binding_path, &document).map_err(|error| {
             activation_failure(PiActivationFailureKind::ActivationFailed, error)
         })?;
         *self.binding_document.write().await = Some(document.clone());
         *self.managed_session_state.write().await = None;
+        // The previous generation's guard ACK must never satisfy the next generation's gate.
+        *self.guard_state.write().await = None;
+        // Ignore the preflight Session's receipt: this Run needs a fresh
+        // post-reset native extension activation before any model prompt.
+        let purge_receipt_offset = self.purge_receipt_path.as_ref()
+            .map(|path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0));
 
         if let Some(expected_session_id) = seed.expected_native_session_id.as_deref() {
             let locator = read_session_locator(locator_root, expected_session_id, &self.cwd)
@@ -1101,6 +1315,10 @@ impl PiHost {
             &self.cwd,
         )
         .map_err(|error| activation_failure(PiActivationFailureKind::ActivationFailed, error))?;
+        if let Some(offset) = purge_receipt_offset {
+            self.await_purge_receipt(seed, offset).await
+                .map_err(|error| activation_failure(PiActivationFailureKind::ActivationFailed, error))?;
+        }
         let options = frozen_runtime.model.options.as_object().ok_or_else(|| {
             activation_failure(
                 PiActivationFailureKind::ConfigurationFailed,
@@ -1258,6 +1476,49 @@ impl PiHost {
         })
     }
 
+    async fn await_purge_receipt(&self, seed: &PiBindingSeed, previous_size: u64) -> Result<()> {
+        let path = self.purge_receipt_path.as_ref()
+            .context("pi_purge_not_staged")?;
+        let bot_id = &self.file_grant.as_ref()
+            .context("pi_purge_file_grant_missing")?.bot_id;
+        let until = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Ok(metadata) = std::fs::symlink_metadata(path) {
+                anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink(),
+                    "pi_purge_receipt_invalid_file");
+                anyhow::ensure!(metadata.len() <= 128 * 1024,
+                    "pi_purge_receipt_oversized");
+                if metadata.len() > previous_size {
+                    let content = std::fs::read(path)?;
+                    let offset = usize::try_from(previous_size)?;
+                    anyhow::ensure!(offset <= content.len(), "pi_purge_receipt_truncated");
+                    for line in String::from_utf8_lossy(&content[offset..]).lines() {
+                        let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+                        if record.get("hook").and_then(Value::as_str) != Some("session_start") {
+                            continue;
+                        }
+                        anyhow::ensure!(
+                            record.get("schema").and_then(Value::as_str) == Some("loom.pi-purge.receipt.v1")
+                            && record.get("runtimeEvidence").and_then(Value::as_str) == Some("native_extension_local")
+                            && record.get("providerPromptSeen").and_then(Value::as_bool) == Some(false)
+                            && record.get("runId").and_then(Value::as_str) == Some(seed.agent_run_id.as_str())
+                            && record.get("botId").and_then(Value::as_str) == Some(bot_id.as_str())
+                            && record.get("executionEpoch").and_then(Value::as_i64) == Some(seed.execution_epoch)
+                            && record.get("mode").and_then(Value::as_str) == Some("append")
+                            && record.get("activated").and_then(Value::as_bool) == Some(true),
+                            "pi_purge_native_activation_refused"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= until {
+                bail!("pi_purge_native_activation_receipt_missing");
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+
     async fn bind(&self, owner: PiRuntimeOwner) -> Result<()> {
         let mut current = self.owner.write().await;
         if current.is_some() {
@@ -1368,6 +1629,142 @@ impl PiHost {
 
     pub(crate) async fn shutdown_and_reap(&self) {
         let _ = self.shutdown_and_reap_with_status().await;
+    }
+
+    async fn capture_managed_guard_state(&self, message: &Value) -> Result<()> {
+        let text = message
+            .get("statusText")
+            .and_then(Value::as_str)
+            .context("Pi managed guard state has no status text")?;
+        let state: PiManagedGuardState =
+            serde_json::from_str(text).context("Pi managed guard state is invalid")?;
+        *self.guard_state.write().await = Some(state);
+        Ok(())
+    }
+
+    /// Re-issue this Host's guard grant document for the claim the Run holds now (P0 step 3).
+    ///
+    /// A Run earns its write authorisation when its LOOM claim exists, and that claim can appear or
+    /// advance *after* the Host started (r9: the Run starts, then claims six seconds later; a takeover
+    /// hands out a new fence). The shared guard re-reads the document before every decision, so
+    /// rewriting it here is what moves the authorisation — nothing in the launch path is re-run and the
+    /// Host binding (and its acknowledgement) stays exactly as issued.
+    ///
+    /// `Ok(false)`: this Host has no guarded grant (legacy native policy), or the document already
+    /// carries exactly this claim.
+    pub(crate) fn reissue_guard_grant(
+        &self,
+        claim: Option<&LiveClaim>,
+        requires_claim: bool,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let Some(grant) = self.file_grant.as_ref() else {
+            return Ok(false);
+        };
+        Ok(reissue_guard_grant_file(&self.config_root, grant, claim, requires_claim, now_ms)?.is_some())
+    }
+
+    /// Whether an acknowledgement echoes a claim this Host could legitimately be holding.
+    ///
+    /// The ack is published on every `session_start`, and P0 step 3 re-issues the grant document after
+    /// `loom.claim` (and again on a takeover with a new fence). So the ack may echo either the claim
+    /// this Host was LAUNCHED with or the one currently on disk — both are this Run's guard, and nothing
+    /// else is accepted. The live decision is never taken from the ack anyway: the shared guard
+    /// re-reads the document before every tool call.
+    fn acknowledges_claim_of(&self, state: &PiManagedGuardState, grant: &PiFileGrant) -> bool {
+        let matches = |candidate: &PiFileGrant| {
+            state.claim_id == candidate.claim_id
+                && state.fence_generation == candidate.fence_generation
+                && state.lease_expires_at_epoch_ms == candidate.lease_expires_at_epoch_ms
+                && state.requires_claim == candidate.requires_claim
+        };
+        if matches(grant) {
+            return true;
+        }
+        std::fs::read(self.config_root.join(GUARD_GRANT_FILE_NAME))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PiFileGrant>(&bytes).ok())
+            .is_some_and(|current| matches(&current))
+    }
+
+    /// Prove this Run is actually guarded before any prompt is sent.
+    ///
+    /// Two independent receipts are required: the managed extension's binding-side acknowledgement
+    /// (generation/Run/tools/workspace/expiry), and the executed guard's OWN `guard_ready` +
+    /// `guard_selftest(failures=0)` lines in its log file. A file merely existing is not evidence.
+    ///
+    /// The acknowledgement is the ack of the grant this Host is running under, and after P0 step 3
+    /// that grant can legitimately move (Core re-issues it when `loom.claim` succeeds). See
+    /// [`Self::acknowledges_claim_of`].
+    async fn await_guard_ready(&self, grant: &PiFileGrant) -> Result<()> {
+        let binding = self
+            .binding_document
+            .read()
+            .await
+            .clone()
+            .context("Pi file grant requires an active Host binding")?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(state) = self.guard_state.read().await.clone() {
+                if state.schema_version != super::PI_MANAGED_GUARD_SCHEMA_VERSION
+                    || state.extension_version != super::PI_HOST_EXTENSION_VERSION
+                    || state.host_instance_id != self.host_instance_id
+                    || state.host_binding_generation != binding.host_binding_generation
+                {
+                    bail!("Pi managed guard state does not match the active Host binding");
+                }
+                if state.run_id != grant.run_id
+                    || state.bot_id != grant.bot_id
+                    || state.execution_epoch != grant.execution_epoch
+                    || state.allowed_tools != grant.allowed_tools
+                    || state.workspace_real != grant.workspace_real
+                    || state.expires_at_epoch_ms != grant.expires_at_epoch_ms
+                    || state.guard_log_path != grant.log_path
+                {
+                    bail!("Pi managed guard state is not bound to this Run's file grant");
+                }
+                if !self.acknowledges_claim_of(&state, grant) {
+                    bail!("Pi managed guard state is not bound to this Run's file grant");
+                }
+                if grant.is_expired(super::now_epoch_ms()) {
+                    bail!("Pi file grant expired before the prompt");
+                }
+                let log = std::fs::read_to_string(&grant.log_path)
+                    .context("Pi file guard receipt is unreadable")?;
+                let mut ready = false;
+                let mut self_test_ok = false;
+                for line in log.lines() {
+                    let Ok(record) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+                    match record.get("t").and_then(Value::as_str) {
+                        Some("guard_selftest") => {
+                            self_test_ok =
+                                record.get("failures").and_then(Value::as_u64) == Some(0);
+                        }
+                        Some("guard_ready") => {
+                            ready = record.get("runId").and_then(Value::as_str)
+                                == Some(grant.run_id.as_str())
+                                && record.get("botId").and_then(Value::as_str)
+                                    == Some(grant.bot_id.as_str())
+                                && record.get("workspaceReal").and_then(Value::as_str)
+                                    == Some(grant.workspace_real.as_str())
+                                && record.get("expiresAtEpochMs").and_then(Value::as_i64)
+                                    == Some(grant.expires_at_epoch_ms);
+                        }
+                        _ => {}
+                    }
+                }
+                if !ready || !self_test_ok {
+                    bail!("Pi file guard has not proven readiness for this Run");
+                }
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("Pi file guard did not acknowledge readiness before the prompt");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
 
@@ -1494,6 +1891,9 @@ impl PiRuntime {
         *self.final_stop_reason.write().await = None;
         self.active_tool_executions.lock().await.clear();
         self.validate_images(images)?;
+        if let Some(grant) = self.host.file_grant.as_ref() {
+            self.host.await_guard_ready(grant).await?;
+        }
         let mut fields = json!({"message":message});
         if !images.is_empty() {
             fields["images"] = serde_json::to_value(images)?;
@@ -1715,6 +2115,19 @@ impl PiRuntime {
         self.host.builtin_tool_process_config()
     }
 
+    /// Re-issue the grant document the shared guard reads for this Run (P0 step 3).
+    ///
+    /// See [`PiHost::reissue_guard_grant`]. `Ok(false)` means nothing moved (no guarded grant, or the
+    /// document already carries this claim), which is the common case for an ordinary chat Run.
+    pub(crate) fn reissue_file_grant(
+        &self,
+        claim: Option<&LiveClaim>,
+        requires_claim: bool,
+        now_ms: i64,
+    ) -> Result<bool> {
+        self.host.reissue_guard_grant(claim, requires_claim, now_ms)
+    }
+
     fn belongs_to_camp(&self, camp_id: &str) -> bool {
         self.camp_id == camp_id
     }
@@ -1735,8 +2148,60 @@ impl PiRuntime {
     }
 }
 
+/// The grant document the shared guard reads, inside the Host's private config root.
+///
+/// One file, one writer (`write_private_json` publishes atomically), and the guard re-reads it before
+/// every tool decision — which is what makes a re-issue after `loom.claim` take effect in a Host that
+/// is already running.
+const GUARD_GRANT_FILE_NAME: &str = "guard-grant.json";
+
+/// Re-issue the guard grant document for the claim the Run holds now (P0 step 3, producer side).
+///
+/// Only the claim triple and `requiresClaim` may move (see `PiFileGrant::reissued_for_claim`): the
+/// Run/bot/epoch/workspace/tool/log/expiry identity is copied verbatim, so a re-issue can never
+/// re-point the guard at another Run or another workspace. `Ok(None)` means there was nothing to
+/// write — either the Run holds no guarded grant, or the document already says this.
+pub(crate) fn reissue_guard_grant_file(
+    config_root: &Path,
+    grant: &PiFileGrant,
+    claim: Option<&LiveClaim>,
+    requires_claim: bool,
+    now_ms: i64,
+) -> Result<Option<PiFileGrant>> {
+    let reissued = grant.reissued_for_claim(claim, requires_claim, now_ms)?;
+    if reissued == *grant {
+        return Ok(None);
+    }
+    write_private_json(
+        &config_root.join(GUARD_GRANT_FILE_NAME),
+        &reissued.to_document()?,
+    )?;
+    Ok(Some(reissued))
+}
+
 type PiRuntimeCreationKey = (String, i64);
 type PiRuntimeCreationGate = Weak<Mutex<()>>;
+
+/// The warm-Host reuse key of one guarded Run.
+///
+/// The frozen compatibility digest alone says nothing about the write authorisation: two launches of
+/// the SAME Run under different claim fences hold different grants, so they must never share one
+/// materialized grant document. The live Runtime map (`PiRpcRuntimeAdapter::active`) re-issues the
+/// document instead of reusing a stale one (P0 step 3, see `reissue_guard_grant_file`); this key is
+/// what keeps the fleet from treating two different fences as one compatible Host. An unbound Run keys
+/// on `claim=none`, which keeps single-Run warm reuse working exactly as before.
+fn guarded_compatibility_digest(base: &str, mode: PiFileAccessMode, grant: &PiFileGrant) -> String {
+    let claim = grant.claim().map_or_else(
+        || "none".to_string(),
+        |(claim_id, fence_generation, _)| format!("{claim_id}:{fence_generation}"),
+    );
+    format!(
+        "{base}#file-access={};run={};epoch={};claim={claim}",
+        mode.as_str(),
+        grant.run_id,
+        grant.execution_epoch
+    )
+}
 
 pub struct PiRpcRuntimeAdapter {
     active: Mutex<HashMap<String, Arc<PiRuntime>>>,
@@ -1745,6 +2210,15 @@ pub struct PiRpcRuntimeAdapter {
     fleet: Arc<AgentRuntimeFleetManager>,
     private_runtime_dir: PathBuf,
 }
+
+#[derive(Debug, Clone)]
+pub struct PiMcpProjection {
+    pub document: Value,
+    pub digest: String,
+}
+
+// One explicitly loaded entry owns the platform host and the selected MCP tools.
+const MANAGED_MCP_ENTRY: &str = "import host from \"./rovai-pi-host.ts\";\nimport mcp from \"./managed-mcp.bundle.mjs\";\nexport default async function (pi) { host(pi); await mcp(pi); }\n";
 
 pub struct PiAgentRunRuntimeRequest<'a> {
     pub agent_run_id: &'a str,
@@ -1761,6 +2235,16 @@ pub struct PiAgentRunRuntimeRequest<'a> {
     pub native_binding_generation: i64,
     pub bootstrap: &'a PreparedSessionBootstrap,
     pub builtin_tool_factory: &'a BuiltinToolProcessConfigFactory,
+    pub mcp: Option<&'a PiMcpProjection>,
+    /// The live LOOM claim the calling Core already read for exactly this Run (see
+    /// `loom::live_claim_for_run`). `None` means the Run holds none right now, which is not the same as
+    /// "no claim needed": in the r9 shape the Run starts before it claims. This module owns no
+    /// database connection, so the claim is read by its owner and only carried here.
+    pub live_claim: Option<&'a LiveClaim>,
+    /// Whether this Run is bound to a LOOM Task (see `loom::loom_binding_for_run`), i.e. whether the
+    /// grant must refuse `write`/`edit` until a live claim is presented (P0 step 3). `false` keeps
+    /// ordinary chat Grants byte-identical to the pre-P0 behaviour.
+    pub requires_claim: bool,
 }
 
 impl PiRpcRuntimeAdapter {
@@ -1816,6 +2300,16 @@ impl PiRpcRuntimeAdapter {
                     );
                 }
                 PiEpochDisposition::ReuseOrRetireSame if existing.host.is_alive() => {
+                    // P0 step 3: a warm Host is only reusable if its write authorisation still says
+                    // what THIS launch was asked to run under. The grant document is re-issued from
+                    // the claim just read, so a Run that claimed after its first launch never keeps
+                    // writing under the pre-claim grant — and the check is fail-closed: a re-issue
+                    // that cannot be written refuses the launch instead of reusing a stale grant.
+                    existing.reissue_file_grant(
+                        request.live_claim,
+                        request.requires_claim,
+                        now_epoch_ms(),
+                    )?;
                     return Ok(existing);
                 }
                 PiEpochDisposition::ReuseOrRetireSame | PiEpochDisposition::ReplaceOlder => {}
@@ -1858,6 +2352,47 @@ impl PiRpcRuntimeAdapter {
         let spawn_builtin_tool_factory = request.builtin_tool_factory.clone();
         let spawn_environment = request.frozen_runtime.environment.clone();
         let spawn_environment_source = rovai_core::member_environment::launch_source();
+        let spawn_mcp = request.mcp.cloned();
+        let spawn_purge = request.frozen_runtime.pi_purge.clone();
+        let spawn_agent_id = request.agent_id.to_string();
+        // The policy comes from the frozen runtime permissions; the workspace is the canonical root Core
+        // already chose for this AgentRun. Neither the prompt nor the environment may supply either.
+        let file_access_mode = mode_from_permissions(&request.frozen_runtime.permissions.values)?;
+        // The workflow policy adds a managed Core business tool that runs the bundled CLI. The managed
+        // Host only gets the CLI context through `builtin_tools`, so the launch below asserts that
+        // requirement instead of registering a tool that could never authenticate.
+        let require_builtin_tools = file_access_mode == PiFileAccessMode::WorkspaceWorkflow;
+        let guard_log_dir = self
+            .private_runtime_dir
+            .join("pi-file-guard")
+            .join(format!("{}-{}", request.agent_run_id, request.execution_epoch));
+        if file_access_mode.guarded() {
+            std::fs::create_dir_all(&guard_log_dir)
+                .context("failed to create the Pi file-guard log directory")?;
+        }
+        let spawn_file_grant = PiFileGrant::for_run(
+            file_access_mode,
+            request.agent_run_id,
+            request.agent_id,
+            request.execution_epoch,
+            request.cwd,
+            &guard_log_dir.join("guard.jsonl"),
+            now_epoch_ms(),
+            request.live_claim,
+            request.requires_claim,
+        )?;
+        // A guarded Run must never share a warm Host with another Run or with the native policy, so the
+        // reuse key carries the access mode, the Run identity and the claim fence the grant was issued
+        // under. Native Runs keep the digest verbatim, which leaves today's warm-reuse behaviour
+        // byte-identical.
+        let compatibility_digest = match spawn_file_grant.as_ref() {
+            Some(grant) => guarded_compatibility_digest(
+                request.runtime_compatibility_digest,
+                file_access_mode,
+                grant,
+            ),
+            None => request.runtime_compatibility_digest.to_string(),
+        };
         let lease = self
             .fleet
             .acquire(
@@ -1869,7 +2404,7 @@ impl PiRpcRuntimeAdapter {
                         request.camp_id,
                         request.agent_id,
                         Some(request.native_binding_id),
-                        request.runtime_compatibility_digest,
+                        &compatibility_digest,
                     ),
                 },
                 move || async move {
@@ -1886,8 +2421,19 @@ impl PiRpcRuntimeAdapter {
                         session_dir: None,
                         initial_session_file: None,
                         initial_binding: &spawn_seed,
+                        agent_id: &spawn_agent_id,
                         incoming: spawn_incoming,
                         builtin_tools: Some(spawn_builtin_tool_factory.create()?),
+                        // A read-only Run never installs MCP: the policy grants exactly one native tool,
+                        // so projecting MCP servers while denying every `mcp__*` call would be dishonest.
+                        mcp: if spawn_file_grant.is_some() {
+                            None
+                        } else {
+                            spawn_mcp.as_ref()
+                        },
+                        file_grant: spawn_file_grant.as_ref(),
+                        pi_purge: spawn_purge.as_ref(),
+                        require_builtin_tools,
                     })
                     .await?;
                     Ok(RuntimeProcessHost::Pi(host))
@@ -1981,6 +2527,24 @@ impl PiRpcRuntimeAdapter {
             .get(agent_run_id)
             .filter(|runtime| runtime.agent_run_epoch() == execution_epoch)
             .cloned()
+    }
+
+    /// P0 step 3 (consumer side): move a live guarded Run's write authorisation onto the claim it
+    /// holds now, e.g. right after `loom.claim` succeeded.
+    ///
+    /// `Ok(false)` means this Run has no guarded Host to re-issue for (the legacy native policy, or a
+    /// Host that is already gone). That is not an error: there is no grant document anybody reads.
+    pub(crate) async fn reissue_file_grant(
+        &self,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        claim: Option<&LiveClaim>,
+        requires_claim: bool,
+    ) -> Result<bool> {
+        let Some(runtime) = self.get_agent_run(agent_run_id, execution_epoch).await else {
+            return Ok(false);
+        };
+        runtime.reissue_file_grant(claim, requires_claim, now_epoch_ms())
     }
 
     pub async fn get_agent_run_on_host(
@@ -2135,8 +2699,13 @@ async fn spawn_probe_host(executable: &Path) -> Result<(Arc<PiHost>, PiProbeRoot
         session_dir: Some(&session_dir),
         initial_session_file: Some(&initial_session_file),
         initial_binding: &seed,
+        agent_id: "pi-probe",
         incoming,
         builtin_tools: None,
+        mcp: None,
+        file_grant: None,
+        pi_purge: None,
+        require_builtin_tools: false,
     })
     .await?;
     Ok((host, _probe_root_cleanup))
@@ -2163,6 +2732,18 @@ async fn read_probe_model_catalog(host: &PiHost) -> Result<Value> {
     let models = catalog
         .as_array()
         .context("Pi probe model catalog is malformed")?;
+    if models.is_empty() {
+        // A successful RPC response with zero native models is not a Ready
+        // observation: Pi answers with an empty list when its own provider
+        // configuration is unreachable, and the only selectable model would
+        // then be a fabricated default. Name the Core-owned isolated probe
+        // config root only; inherited user configuration and credential
+        // values stay out of the diagnostic.
+        bail!(
+            "model_required: Pi reported an empty native model catalog (isolated probe config root {})",
+            host.config_root.display()
+        );
+    }
     if models.iter().any(|model| {
         ["provider", "id"].iter().any(|key| {
             model
@@ -2641,6 +3222,59 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     write_private_file(path, &bytes)
 }
 
+/// Path spelling a Node child (and the extension) can consume.
+///
+/// Windows `\\?\` verbatim prefixes are not part of the path a child process
+/// should receive. Containment is *not* relaxed here: the extension still
+/// re-resolves the document and refuses anything outside the private root.
+pub(crate) fn node_path(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    if let Some(tail) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", tail)
+    } else {
+        text.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(text)
+    }
+}
+
+/// Write the frozen MCP document exactly as Core serialized it.
+///
+/// Returns the absolute path and the digest of the **exact bytes written**, which
+/// is what the extension recomputes over the file it read. Using this writer (and
+/// `pi::managed_mcp_document_file` as the only serializer) removes the drift
+/// between the digest Core stamps and the bytes the extension hashes.
+pub(crate) fn write_pi_mcp_document(
+    config_root: &Path,
+    document: &Value,
+    expected_digest: &str,
+) -> Result<(PathBuf, String)> {
+    let digest = super::managed_mcp_document_digest(document)?;
+    anyhow::ensure!(digest == expected_digest, "Pi MCP frozen file digest changed before publication");
+    create_private_directory(config_root)?;
+    let path = config_root.join("mcp.json");
+    write_private_file(&path, &super::managed_mcp_document_bytes(document)?)?;
+    Ok((path, digest))
+}
+
+/// The exact environment the managed extension reads, with Node-consumable spelling.
+///
+/// `ROVAI_PI_MCP_ROOT` is the private config root and `ROVAI_PI_MCP_FILE` is the
+/// document inside it: the extension re-resolves both and refuses anything that
+/// escapes the root, so stripping the Windows verbatim prefix does not relax
+/// containment. The workspace is the prepared execution root, never a guess.
+pub(crate) fn pi_mcp_environment(
+    config_root: &Path,
+    document_path: &Path,
+    document_digest: &str,
+    workspace_root: &Path,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("ROVAI_PI_MCP_FILE", node_path(document_path)),
+        ("ROVAI_PI_MCP_DIGEST", document_digest.to_string()),
+        ("ROVAI_PI_MCP_ROOT", node_path(config_root)),
+        ("ROVAI_PI_MCP_WORKSPACE", node_path(workspace_root)),
+    ]
+}
+
 #[cfg(windows)]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     // Windows does not support Unix directory fsync. The shared primitive
@@ -2955,7 +3589,7 @@ write_session() {
 emit_managed_session_state() {
   host_instance_id=$(/usr/bin/sed -n 's/.*"hostInstanceId":"\([^"]*\)".*/\1/p' "$ROVAI_PI_HOST_BINDING_FILE")
   host_binding_generation=$(/usr/bin/sed -n 's/.*"hostBindingGeneration":\([0-9][0-9]*\).*/\1/p' "$ROVAI_PI_HOST_BINDING_FILE")
-  event=$(printf '{"type":"extension_ui_request","method":"setStatus","statusKey":"rovai-managed-session-state","statusText":"{\\"schemaVersion\\":3,\\"extensionVersion\\":\\"rovai-pi-host-v8\\",\\"hostInstanceId\\":\\"%s\\",\\"hostBindingGeneration\\":%s,\\"sessionId\\":\\"%s\\",\\"sessionFile\\":\\"%s\\",\\"cwd\\":\\"%s\\"}"}' "$host_instance_id" "$host_binding_generation" "$session_id" "$session_file" "$PWD")
+  event=$(printf '{"type":"extension_ui_request","method":"setStatus","statusKey":"rovai-managed-session-state","statusText":"{\\"schemaVersion\\":3,\\"extensionVersion\\":\\"rovai-pi-host-v11\\",\\"hostInstanceId\\":\\"%s\\",\\"hostBindingGeneration\\":%s,\\"sessionId\\":\\"%s\\",\\"sessionFile\\":\\"%s\\",\\"cwd\\":\\"%s\\"}"}' "$host_instance_id" "$host_binding_generation" "$session_id" "$session_file" "$PWD")
   printf '%s\n' "$event" >> "$event_log"
   printf '%s\n' "$event"
 }
@@ -2979,7 +3613,11 @@ while IFS= read -r request; do
       if [ -f "$fixture_dir/stderr-only" ]; then
         printf '%s\n' 'provider warning text without structured evidence' >&2
       fi
-      printf '{"type":"response","id":"%s","success":true,"command":"get_available_models","data":{"models":[{"provider":"minimax","id":"MiniMax-M3","name":"MiniMax M3"},{"provider":"other","id":"MiniMax-M3"},{"provider":"minimax","id":"next"}]}}\n' "$request_id"
+      if [ -f "$fixture_dir/catalog-empty" ]; then
+        printf '{"type":"response","id":"%s","success":true,"command":"get_available_models","data":{"models":[]}}\n' "$request_id"
+      else
+        printf '{"type":"response","id":"%s","success":true,"command":"get_available_models","data":{"models":[{"provider":"minimax","id":"MiniMax-M3","name":"MiniMax M3"},{"provider":"other","id":"MiniMax-M3"},{"provider":"minimax","id":"next"}]}}\n' "$request_id"
+      fi
       ;;
     new_session)
       session_number=$((session_number + 1))
@@ -3142,6 +3780,55 @@ done
         // partial-looking list, with only arbitrary stderr, remains an observation.
         std::fs::write(root.join("stderr-only"), "").unwrap();
         assert_eq!(model_catalog_probe(&executable).await.unwrap(), catalog);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_native_model_catalog_is_rejected_without_a_false_ready() {
+        let root = std::env::temp_dir().join(format!(
+            "rovai-pi-empty-catalog-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = write_pi_host_fixture(&root);
+        std::fs::write(root.join("catalog-empty"), "").unwrap();
+
+        let catalog_error = model_catalog_probe(&executable)
+            .await
+            .expect_err("an empty native catalog is not a Ready observation")
+            .to_string();
+        assert!(
+            catalog_error.contains("model_required"),
+            "the empty catalog keeps its own error class: {catalog_error}"
+        );
+        // The diagnostic names the Core-owned isolated probe root, so an empty
+        // catalog is attributable without reading inherited user configuration.
+        assert!(
+            catalog_error.contains("rovai-pi-probe-"),
+            "the diagnostic names the isolated probe root: {catalog_error}"
+        );
+        assert!(
+            !catalog_error.contains("/.pi/") && !catalog_error.contains("\\.pi\\"),
+            "the diagnostic never points at a user Pi configuration: {catalog_error}"
+        );
+
+        let ready_error = match machine_ready_probe(&executable).await {
+            Ok(_) => panic!("Machine Ready must not accept an empty catalog"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            ready_error.contains("model_required"),
+            "Machine Ready rejects the same observation: {ready_error}"
+        );
+
+        // Removing the marker restores the existing non-empty observation.
+        std::fs::remove_file(root.join("catalog-empty")).unwrap();
+        let catalog = model_catalog_probe(&executable)
+            .await
+            .expect("a non-empty native catalog remains a valid observation");
+        assert!(!catalog.as_array().unwrap().is_empty());
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3338,8 +4025,13 @@ done
             session_dir: None,
             initial_session_file: None,
             initial_binding: &seed,
+            agent_id: "pi-abort-test",
             incoming,
             builtin_tools: None,
+        mcp: None,
+            file_grant: None,
+            pi_purge: None,
+            require_builtin_tools: false,
         })
         .await
         .unwrap();
@@ -3524,8 +4216,13 @@ done
                 session_dir: None,
                 initial_session_file: Some(&root.join("session.jsonl")),
                 initial_binding: &seed,
+                agent_id: "pi-frame-test",
                 incoming,
                 builtin_tools: None,
+        mcp: None,
+                file_grant: None,
+                pi_purge: None,
+                require_builtin_tools: false,
             })
             .await
             .unwrap();
@@ -3662,9 +4359,9 @@ done
 
     #[test]
     fn production_host_launch_preserves_pi_native_resources() {
-        let extension = Path::new("/private/rovai-pi-host-v8.ts");
+        let extension = Path::new("/private/rovai-pi-host-v11.ts");
         let mut production = Command::new("pi");
-        append_host_arguments(&mut production, extension);
+        append_host_arguments(&mut production, extension, None, None);
         let production_args = production
             .as_std()
             .get_args()
@@ -3678,7 +4375,7 @@ done
                 "--no-themes",
                 "--approve",
                 "--extension",
-                "/private/rovai-pi-host-v8.ts",
+                "/private/rovai-pi-host-v11.ts",
             ]
         );
         for forbidden in [
@@ -3691,6 +4388,114 @@ done
         ] {
             assert!(!production_args.iter().any(|argument| argument == forbidden));
         }
+    }
+
+    #[test]
+    fn guarded_host_launch_adds_only_the_granted_tools_and_the_managed_guard() {
+        let extension = Path::new("/private/rovai-pi-host-v11.ts");
+        let guard = Path::new("/private/rovai-pi-file-guard.ts");
+        // One table over the three exact frozen tool sets Core can emit; the joined spelling is what the
+        // Host receives, so it is asserted verbatim. The workflow set adds exactly one managed business
+        // tool and still carries the three native file tools.
+        for tools in ["read", "read,write,edit", "read,write,edit,rovai_loom"] {
+            let mut production = Command::new("pi");
+            append_host_arguments(&mut production, extension, Some((guard, tools)), None);
+            let production_args = production
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                production_args,
+                [
+                    "--mode",
+                    "rpc",
+                    "--no-themes",
+                    "--approve",
+                    "--tools",
+                    tools,
+                    "--extension",
+                    "/private/rovai-pi-file-guard.ts",
+                    "--extension",
+                    "/private/rovai-pi-host-v11.ts",
+                ]
+            );
+            // Exactly one `--tools` flag, and no isolation switch is dropped by the guard slice.
+            assert_eq!(
+                production_args.iter().filter(|argument| *argument == "--tools").count(),
+                1
+            );
+            for forbidden in [
+                "--no-skills",
+                "--no-context-files",
+                "--no-prompt-templates",
+                "--no-builtin-tools",
+                "--no-approve",
+                "--no-extensions",
+                "--no-builtin-read",
+            ] {
+                assert!(!production_args.iter().any(|argument| argument == forbidden));
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_host_reuse_key_carries_the_claim_fence_it_was_issued_under() {
+        let workspace = std::env::temp_dir()
+            .join(format!("rovai-pi-host-claim-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let now = now_epoch_ms();
+        let build = |claim: Option<&LiveClaim>| {
+            PiFileGrant::for_run(
+                PiFileAccessMode::WorkspaceWorkflow,
+                "run-1",
+                "bot-1",
+                3,
+                &workspace,
+                &workspace.join("guard.jsonl"),
+                now,
+                claim,
+                claim.is_some(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // An unbound Run keys exactly once, so its warm Host is still reused.
+        let unbound = build(None);
+        assert_eq!(
+            guarded_compatibility_digest("base", PiFileAccessMode::WorkspaceWorkflow, &unbound),
+            "base#file-access=workspace_workflow;run=run-1;epoch=3;claim=none"
+        );
+        // Two fences of the same Run hold different grants and must never share one warm Host.
+        let first = build(Some(&LiveClaim {
+            claim_id: "claim-1".to_string(),
+            agent_run_id: "run-1".to_string(),
+            fence_generation: 1,
+            lease_expires_at: chrono::DateTime::from_timestamp_millis(now + 90_000)
+                .unwrap()
+                .to_rfc3339(),
+        }));
+        let second = build(Some(&LiveClaim {
+            claim_id: "claim-2".to_string(),
+            agent_run_id: "run-1".to_string(),
+            fence_generation: 2,
+            lease_expires_at: chrono::DateTime::from_timestamp_millis(now + 90_000)
+                .unwrap()
+                .to_rfc3339(),
+        }));
+        let first_key =
+            guarded_compatibility_digest("base", PiFileAccessMode::WorkspaceWorkflow, &first);
+        let second_key =
+            guarded_compatibility_digest("base", PiFileAccessMode::WorkspaceWorkflow, &second);
+        assert_eq!(
+            first_key,
+            "base#file-access=workspace_workflow;run=run-1;epoch=3;claim=claim-1:1"
+        );
+        assert_ne!(
+            first_key, second_key,
+            "assertion two claim fences of one Run never share a warm Host"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
     }
 
     #[cfg(windows)]
@@ -3764,8 +4569,13 @@ done
                 session_dir: None,
                 initial_session_file: None,
                 initial_binding: &seed,
+                agent_id: "pi-cwd-test",
                 incoming,
                 builtin_tools: None,
+        mcp: None,
+                file_grant: None,
+                pi_purge: None,
+                require_builtin_tools: false,
             })
             .await?;
             let state = host.command("get_state", json!({})).await;

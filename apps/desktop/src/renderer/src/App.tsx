@@ -1,3 +1,4 @@
+import { LoomApp } from './loom-native/LoomApp'
 import { LanguagePreferenceReadNotice } from './LanguagePreferenceControl'
 import { WindowCloseDialog } from './WindowCloseSettings'
 import { ShortcutProvider } from './ShortcutProvider'
@@ -138,7 +139,7 @@ export function App(): React.JSX.Element {
     workspace = (
       <div className="authoritative-workspace">
         <ThreadClientProvider client={desktopThreadClient}><ShortcutProvider api={window.rovai.shortcuts} platform={window.rovai.platform}><CurrentUserProfileProvider api={window.rovai.currentUserProfile}>
-          <BusinessApp environment={desktopBusinessEnvironment}
+          <LoomApp environment={desktopBusinessEnvironment}
             initialStartupSnapshot={startupSnapshot}
             startupStartedAtMs={startupStartedAt.current}
           />

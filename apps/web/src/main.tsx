@@ -2,29 +2,53 @@ import { browserAuthStorage } from './auth-storage'
 import { acquireTabRecovery } from './tab-recovery'
 import { takeLoginTicket } from './login-ticket'
 import { StrictMode, useEffect, useState, useRef } from 'react'
-import { RemoteConnectionStatus } from '../../desktop/src/renderer/src/RemoteConnectionStatus'
 import { HostWorkspacePicker } from './HostWorkspacePicker'
 import { WebLogin } from './WebLogin'
 import { WebConnectionRecovery } from './WebConnectionRecovery'
-import '../../desktop/src/renderer/src/remote-connection.css'
 import { browserGeneralPreferences } from './general-preferences'
 import { createLoginLanguagePreferences } from './login-language'
 import { observeInterfaceLanguage, useUiText } from '../../desktop/src/renderer/src/interface-language'
 import { LanguagePreferenceReadNotice } from '../../desktop/src/renderer/src/LanguagePreferenceControl'
 import type { InterfaceLanguageApi, WorkspaceSelection } from '@contracts'
 import { createRoot } from 'react-dom/client'
-import { BusinessApp } from '../../desktop/src/renderer/src/BusinessApp'
+import { LoomApp } from '../../desktop/src/renderer/src/loom-native/LoomApp'
 import { ThreadClientProvider } from '../../desktop/src/renderer/src/camp-client'
 import { CurrentUserProfileProvider } from '../../desktop/src/renderer/src/CurrentUserProfile'
-import { ConsoleClient, type ConnectionState } from './client'
+import { ConsoleClient, HttpRequestError, type ConnectionState } from './client'
+import { registerWorkspaceFileReader, registerWorkspaceTreeLoader, type WorkspaceTreeModel } from '../../desktop/src/renderer/src/WorkspaceProjectTree'
 import { UploadStatus } from './UploadStatus'
 import { createThreadAdapter, browserPlatform } from './camp-adapter'
-import '../../desktop/src/renderer/src/styles.css'
-import '../../desktop/src/renderer/src/member-editor.css'
-import './styles.css'
-import './mobile.css'
+import './native-entry.css'
 
 const transport = new ConsoleClient(window.location.origin, fetch, sessionStorage, browserAuthStorage(window.location.origin))
+registerWorkspaceTreeLoader(async (threadId, relative): Promise<WorkspaceTreeModel | null> => {
+  try {
+    const page = await transport.workspaceFiles({ threadId, relative, op: 'list' })
+    const entries = page.entries ?? []
+    return {
+      ownerName: page.ownerName ?? '',
+      online: page.online !== false,
+      lastHeartbeat: page.lastHeartbeat,
+      status: entries.length === 0 ? 'empty' : 'ready',
+      relative,
+      entries,
+      truncated: page.truncated,
+    }
+  } catch (error) {
+    if (error instanceof HttpRequestError && error.code === 'workspace_not_found') return null
+    if (error instanceof HttpRequestError && error.code === 'node_offline') {
+      const detail = error as HttpRequestError & { ownerName?: string }
+      return { ownerName: detail.ownerName ?? '', online: false, status: 'offline', relative, entries: [], message: error.message }
+    }
+    return { ownerName: '', online: false, status: 'error', relative, entries: [], message: '列出文件失败' }
+  }
+})
+registerWorkspaceFileReader(async (threadId, relative) => {
+  const page = await transport.workspaceFiles({ threadId, relative, op: 'read' })
+  const encoded = page.data ?? ''
+  const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0))
+  return { path: relative, text: new TextDecoder().decode(bytes), size: page.size ?? bytes.length, truncated: Boolean(page.truncated) }
+})
 const entryKind = document.querySelector<HTMLMetaElement>('meta[name="rovai-host-kind"]')?.content
 const hostKind = entryKind === 'desktop' || entryKind === 'server' ? entryKind : null
 document.documentElement.dataset.platform = browserPlatform()
@@ -189,7 +213,7 @@ function WebEntry() {
     <WebConnectionRecovery transport={transport} enabled={authenticated} onNotice={setError}>
       {current && <div className="web-authenticated-shell" hidden={!authenticated} inert={!authenticated}><ThreadClientProvider client={current.environment.client}>
         <CurrentUserProfileProvider api={current.profile}>
-          <BusinessApp environment={current.environment} remoteConnection={<RemoteConnectionStatus origin={transport.origin} state={authenticated ? connection : 'expired'} onLogout={() => { setError(null); void transport.logout().catch(e => setError(e instanceof Error ? e.message : '退出未完成，请重试。')) }} />} />
+          <LoomApp environment={current.environment} onLogout={() => { setError(null); void transport.logout().catch(e => setError(e instanceof Error ? e.message : '退出未完成，请重试。')) }} />
         </CurrentUserProfileProvider>
       </ThreadClientProvider></div>}
       {authenticated && <UploadStatus transport={transport} />}

@@ -1,8 +1,8 @@
-export const DEFAULT_FILE_PREVIEW_RATIO = .56
+export const DEFAULT_FILE_PREVIEW_RATIO = .42
 export const MIN_CONVERSATION_WIDTH = 420
 export const MIN_FILE_PREVIEW_WIDTH = 420
 export const FILE_PREVIEW_SPLIT_MIN_WIDTH = MIN_CONVERSATION_WIDTH + MIN_FILE_PREVIEW_WIDTH + 1
-export const FILE_PREVIEW_RATIO_STORAGE_KEY = 'rovai.file-preview.preferred-ratio'
+export const FILE_PREVIEW_RATIO_STORAGE_KEY = 'loom.file-preview.preferred-ratio.mikka.v1'
 
 export function filePreviewSplitMinWidth(_activityMode = false): number {
   return FILE_PREVIEW_SPLIT_MIN_WIDTH

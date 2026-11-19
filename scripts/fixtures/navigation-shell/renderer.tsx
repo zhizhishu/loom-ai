@@ -11,6 +11,14 @@ import type { ConsoleClient } from '../../../apps/web/src/client'
 import type { NavigationThreadItem, NavigationPin, NavigationSnapshot, NavigationThreadReadState } from '@contracts'
 import '../../../apps/desktop/src/renderer/src/styles.css'
 import '../../../apps/web/src/styles.css'
+// Production LOOM layers, in the same order the app loads them: the shared
+// shell, chat and panel packages first, then the final composition layer. Without
+// these the fixture measured pre-redesign geometry (no `.loom-mikka` tokens,
+// no 52px rows, no `mm-row-*` row structure), which is not the production UI.
+import '../../../apps/desktop/src/renderer/src/loom-mikka-shell.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka-chat.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka-panel.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka.css'
 
 const noop = (): void => undefined
 const navigationListeners = new Set<(direction: 'back' | 'forward') => void>()
@@ -79,7 +87,7 @@ function Fixture(): React.JSX.Element {
     hostListenerCount: () => navigationListeners.size,
     settle: () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 150))))
   } })
-  return <><WindowsApplicationMenu /><NavigationShell platform={platform} browser={browser} disabled={disabled} settings={settings} navigation={navigation} nativeWindowControls={browser ? undefined : window.rovai.windowControls}>
+  return <><WindowsApplicationMenu /><NavigationShell className="loom-mikka" platform={platform} browser={browser} disabled={disabled} settings={settings} navigation={navigation} nativeWindowControls={browser ? undefined : window.rovai.windowControls}>
     <ThreadNavigation platform={platform} view={settings ? 'settings' : 'compose'} state="ready"
       navigation={{ ...navigationSnapshot, projects: navigationSnapshot.projects.map(project => ({ ...project,
         recentThreads: [{ ...runningCamp, marker: running ? 'loading' : 'none' }] })) }}

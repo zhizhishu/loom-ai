@@ -159,7 +159,8 @@ describe('StructuredMentionComposer V2', () => {
     }))
 
     expect(memberMarkup).toContain('class="member-avatar mention-avatar"')
-    expect(memberMarkup).toContain('class="member-avatar-image"')
+    // Builtin refs now use the controlled animated catalog; PNG is a fallback.
+    expect(memberMarkup).toContain('class="open-bot-avatar member-avatar-bot"')
     expect(allMembersMarkup).toContain('class="mention-avatar"')
     expect(allMembersMarkup).toContain('data-navigation-icon="users"')
     expect(allMembersMarkup).toContain('<circle cx="9" cy="7" r="4"')

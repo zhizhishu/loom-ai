@@ -238,6 +238,8 @@ export interface MemberRuntimeConfiguration {
   adapterKind: AdapterKind
   model: ModelSelection
   permissions: AdapterPermissionConfig
+  /** Pi-only; never a tool/OS permission. */
+  piPurge?: { mode: 'off' | 'append'; persona: string } | null
 }
 
 export type RuntimeReadinessStatus =
@@ -246,6 +248,21 @@ export type RuntimeReadinessStatus =
   | 'light_ready'
   | 'installed_unverified'
   | 'ready'
+
+export interface MemberExecutionAvailability {
+  location: 'local' | 'remote'
+  configured: boolean
+  /** Eligibility to attempt the next launch; provider authentication is checked at runtime. */
+  canLaunch: boolean
+  adapterKind: AdapterKind | null
+  readiness: {
+    status: RuntimeReadinessStatus
+    blockers: Array<{ code: string; detail: string | null }>
+  }
+  nodeId?: string
+  workspaceId?: string
+  targetRevision: number
+}
 
 export type MemberPresence = 'present' | 'away' | 'removed'
 
@@ -266,6 +283,8 @@ export interface AgentProfile {
     status: RuntimeReadinessStatus
     blockers: Array<{ code: string; detail: string | null }>
   }
+  /** Current Core sends this read-only projection; absence supports older local-only snapshots. */
+  executionAvailability?: MemberExecutionAvailability
   memberOrder: number
   version: number
   createdAt: string
@@ -303,6 +322,7 @@ export interface SetMemberRuntimeConfigurationCommand {
   adapterKind: AdapterKind
   model: ModelSelection
   permissions: AdapterPermissionConfig
+  piPurge?: { mode: 'off' | 'append'; persona: string } | null
 }
 
 export interface ClearMemberRuntimeConfigurationCommand {
@@ -445,7 +465,11 @@ export interface ProductRuntimeCatalogEntry {
 
 export type HostPlatformKey = 'macos-arm64' | 'macos-x64' | 'windows-x64' | 'linux-x64'
 
-export type RuntimePlatformAdmissionStatus = 'qualified' | 'preview' | 'not_qualified' | 'unsupported'
+/**
+ * LOOM 自有决定（Claude 禁用，2026-11-18）：`disabled` 是产品策略禁用（只识别，不启动），
+ * 与 `unsupported`（上游/平台不支持）和 `not_qualified`（缺资格证据）区分开。
+ */
+export type RuntimePlatformAdmissionStatus = 'qualified' | 'preview' | 'not_qualified' | 'unsupported' | 'disabled'
 
 export type RuntimePlatformAdmissionReasonCode =
   | 'runtime_platform.qualification_evidence_missing'
@@ -866,6 +890,7 @@ export interface ThreadCreationPreflight {
     memberOrder: number
     runtimeConfigured: boolean
     runtimeReadiness: RuntimeReadinessStatus
+    executionAvailability?: MemberExecutionAvailability
   }>
   initialLeadAgentId: string | null
   lastMemberCreationHelperAgentId?: string | null
@@ -4297,6 +4322,8 @@ export type CoreMethod =
   | 'members.capabilityCatalog.get'
   | 'members.capabilityCatalog.set'
   | 'members.capabilityCatalog.putItem'
+  | 'members.executionTarget.get'
+  | 'members.executionTarget.save'
   | 'automations.list'
   | 'automations.get'
   | 'automations.runs.list'
@@ -4315,6 +4342,7 @@ export type CoreMethod =
   | 'missions.status'
   | 'missions.start'
   | 'missions.linkPr'
+  | 'loom.bundles.getMany'
   | 'loom.plan.get'
   | 'loom.plan.import'
   | 'loom.task.release'
@@ -4326,10 +4354,14 @@ export type CoreMethod =
   | 'loom.claims.list'
   | 'loom.artifact.register'
   | 'loom.artifacts.list'
+  | 'loom.artifact.preview'
   | 'loom.reviews.list'
   | 'loom.review.record'
   | 'loom.verifications.list'
   | 'loom.verification.record'
+  | 'loom.control.get'
+  | 'loom.control.configure'
+  | 'loom.control.pause'
   | 'automations.create'
   | 'automations.update'
   | 'automations.configureTimeLimit'
@@ -4586,10 +4618,34 @@ export interface ExecutionNodeRun {
   runtime: string
   status: string
   ackedSeq: number
+  exitCode?: number | null
+  startedAt?: string | null
+}
+
+/** One page of `GET /api/v1/nodes/runs/{runId}/output/{from}`. Frame bytes are standard base64. */
+export interface NodeOutputFrame {
+  seq: number
+  stream: string
+  data: string
+}
+
+export interface NodeOutputPage {
+  runId: string
+  attempt: number
+  nodeId: string
+  runtime: string
+  status: string
+  ackedSeq: number
+  exitCode: number | null
+  frames: NodeOutputFrame[]
+  truncated: boolean
+  nextFrom: number | null
 }
 
 /** One row of `GET /api/v1/nodes`. The node token is never included. */
 export interface ExecutionNodeRecord {
+  /** Live paired-connection fact; absent on older Hosts, not inferred from OS. */
+  computer?: { advertised: boolean; version: number }
   nodeId: string
   displayName: string
   role: string
@@ -4602,6 +4658,8 @@ export interface ExecutionNodeRecord {
   lastHeartbeat: string | null
   activeRunCount: number
   activeRuns: ExecutionNodeRun[]
+  /** Newest dispatches, finished ones included. Absent on an older Host. */
+  recentRuns?: ExecutionNodeRun[]
   clis: ExecutionNodeCli[]
 }
 
@@ -4630,6 +4688,7 @@ export interface NodeChannelApi {
   list(): Promise<NodeChannelResult<ExecutionNodeList>>
   pair(): Promise<NodeChannelResult<ExecutionNodePairing>>
   revoke(nodeId: string): Promise<NodeChannelResult<ExecutionNodeRevocation>>
+  output(runId: string, from: number): Promise<NodeChannelResult<NodeOutputPage>>
 }
 
 /**

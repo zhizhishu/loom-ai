@@ -67,6 +67,28 @@ enum Command {
         #[arg(long)]
         task: Option<String>,
     },
+    /// Create the mission worktree on the owner node and record `execution_host_id`.
+    WorkspacePrepare {
+        #[arg(long)]
+        mission: String,
+        #[arg(long)]
+        camp: String,
+        #[arg(long)]
+        node: String,
+        /// Git repository on the owner machine.
+        #[arg(long)]
+        source: String,
+    },
+    /// List or read one file in a mission worktree. Read-only.
+    WorkspaceFiles {
+        #[arg(long)]
+        mission: String,
+        /// `list` or `read`.
+        op: String,
+        /// Relative path. Empty lists the worktree root.
+        #[arg(default_value = "")]
+        relative: String,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -114,6 +136,23 @@ pub fn run() -> Result<()> {
             member.as_deref(),
             task.as_deref(),
         );
+    }
+    if let Some(Command::WorkspacePrepare {
+        mission,
+        camp,
+        node,
+        source,
+    }) = &cli.command
+    {
+        return crate::node_cli::workspace_prepare(&data_dir, mission, camp, node, source);
+    }
+    if let Some(Command::WorkspaceFiles {
+        mission,
+        op,
+        relative,
+    }) = &cli.command
+    {
+        return crate::node_cli::workspace_files(&data_dir, mission, op, relative);
     }
     // Resolve packaged resources before creating data. A missing WebUI should
     // report a broken installation, not leave a new empty business instance.

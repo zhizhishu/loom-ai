@@ -94,7 +94,9 @@ export class ControlledMemberBotAvatarSourceResolver implements MemberBotAvatarS
     const parsed = parseControlledMemberAvatarRef(avatarRef)
     if (!parsed) throw new Error('feishu_member_bot_avatar_ref_invalid')
 
-    if (parsed.kind === 'managed') {
+    // A shape avatar (`bot`) is backed by the same managed PNG, so it reads through
+    // the managed asset path as well. Only the builtin roles use bundled images.
+    if (parsed.kind !== 'builtin') {
       const rendition = await this.#managedAvatars.read(avatarRef, 'icon', edge)
       if (!rendition || rendition.mediaType !== 'image/png'
         || rendition.width !== edge || rendition.height !== edge) {

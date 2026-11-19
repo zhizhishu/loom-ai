@@ -15,6 +15,7 @@ getrandom = "0.3"
 if-addrs = "0.15"
 memchr = "2"
 rovai-core = { path = "../rovai-core" }
+rovai-private-storage = { path = "../rovai-private-storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -22,6 +23,11 @@ subtle = "2"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt", "sync", "time"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+
+
+# Native client configuration parsers (read-only).
+toml = "0.9"
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -11,6 +11,17 @@ last_updated: 2026-10-27
 
 # Rovai-ai v1.72：Lark 独立渠道
 
+## LOOM 用户级工作台产品化（2026-11-13）
+
+本地 LOOM 独立产品线在用户确认的 `loom-native` 前端中增加助手资料、四类能力、主副助手群聊、工作区域、权限配置与真实工作/资产关系图。界面与接口边界见 [产品接口](../../loom/archive/plans-2026-11-18/productization-interfaces-2026-11-13.md)，实际发布与验收见 [阶段交接](../../../LOOM-IMPLEMENTATION.md)。新 Run 的短引导和新助手种子文字见 [精确模型上下文变更](model-context-change-loom-productization.md)。
+
+原生权限、Core 数据权威、候选/审查/人工接受与发布仍分开。本轮没有内置 Pi 分发产物，也没有图形屏幕提供者；接口存在不代表这两项已交付。不切换上游版本指针、不修改旧 Migration 或用户全局 Runtime/凭据。
+
+
+## LOOM 远端 Run 能力快照（2026-11-04）
+
+B7/B8 正在按本轮用户授权实现。字段级前后合同、原生交付、私有存储、秘密拒绝和验证边界见 [独立变更说明](model-context-change-loom-run-bundle.md)；集成过程见 [本轮交接](../../loom/archive/legacy-plans-2026-11-15/integration-handoff-2026-11-04.md)。技术复核与实际测试状态分别记录，不把源码完成当作真实远端验收。
+
 ## LOOM 编排与交付工作区（2026-10-27）
 
 LOOM 独立副本在 Rovai Mission 的现有 Activity 预览中增加编排与交付视图，保留原生对话、执行、Diff 和 Composer，不另建全局控制面。首版只消费已有 Mission/交付数据，不实现 DAG、独立验收或 Runtime 接管。无权威计划/验收数据时明确显示未配置/未接入，不从 AgentRun 或 Mission completed 推导业务验收。

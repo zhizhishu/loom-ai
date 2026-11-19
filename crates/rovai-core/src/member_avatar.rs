@@ -81,6 +81,29 @@ impl BuiltinMemberAvatar {
 pub enum MemberAvatarReference {
     Builtin(BuiltinMemberAvatar),
     Managed(Uuid),
+    /// A generated bot avatar. The slug and colour are renderer inputs; the
+    /// pixels always come from an existing managed asset, never a path or URL.
+    Bot {
+        id: String,
+        color: String,
+        asset_id: Uuid,
+    },
+}
+
+/// Bot slugs stay inside a path-safe alphabet so a stored Profile value can
+/// never smuggle a separator, wildcard or percent escape into an asset lookup.
+fn is_canonical_bot_slug(slug: &str) -> bool {
+    let mut bytes = slug.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && slug.len() <= 48
+        && bytes.all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+}
+
+fn is_canonical_bot_color(color: &str) -> bool {
+    color.len() == 6
+        && color
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub fn parse_member_avatar_ref(value: &str) -> Result<MemberAvatarReference> {
@@ -121,6 +144,26 @@ pub fn parse_member_avatar_ref(value: &str) -> Result<MemberAvatarReference> {
                 return Err(invalid_avatar_ref());
             }
             Ok(MemberAvatarReference::Managed(asset_id))
+        }
+        ["bot", slug, color, asset_id, "v1"] => {
+            if !is_canonical_bot_slug(slug) || !is_canonical_bot_color(color) {
+                return Err(invalid_avatar_ref());
+            }
+            // Uuid accepts upper-case, simple, braced and URN spellings; only
+            // the lower-case hyphenated form is canonical in a stored value.
+            let asset_id = Uuid::parse_str(asset_id).map_err(|_| invalid_avatar_ref())?;
+            let canonical = format!(
+                "rovai://member-avatar/bot/{slug}/{color}/{}/v1",
+                asset_id.hyphenated()
+            );
+            if value != canonical {
+                return Err(invalid_avatar_ref());
+            }
+            Ok(MemberAvatarReference::Bot {
+                id: slug.to_string(),
+                color: color.to_string(),
+                asset_id,
+            })
         }
         _ => Err(invalid_avatar_ref()),
     }
@@ -445,7 +488,7 @@ pub fn recrop_member_avatar(
     // source; built-in coordinates refer to the packaged icon the Agent sees.
     let managed = matches!(
         parse_member_avatar_ref(avatar_ref)?,
-        MemberAvatarReference::Managed(_)
+        MemberAvatarReference::Managed(_) | MemberAvatarReference::Bot { .. }
     );
     let source_bytes = member_avatar_bytes(data_dir, avatar_ref, managed)?;
     if parse_gif_info(&source_bytes).is_ok() {
@@ -685,7 +728,7 @@ pub fn materialize_member_avatar(
     );
     let managed = matches!(
         parse_member_avatar_ref(avatar_ref)?,
-        MemberAvatarReference::Managed(_)
+        MemberAvatarReference::Managed(_) | MemberAvatarReference::Bot { .. }
     );
     let rendition = managed_member_avatar_rendition(data_dir, avatar_ref, managed)?;
     use base64::Engine;
@@ -741,7 +784,9 @@ fn managed_member_avatar_rendition(
                 },
             })
         }
-        MemberAvatarReference::Managed(_) => {
+        // A bot avatar is rendered by the client; Core only serves the managed
+        // asset it points at, so an absent asset is an error, not a built-in.
+        MemberAvatarReference::Managed(_) | MemberAvatarReference::Bot { .. } => {
             read_managed_member_avatar(data_dir, avatar_ref, portrait)?
                 .ok_or_else(|| anyhow::anyhow!("Avatar rendition is unavailable"))
         }
@@ -957,8 +1002,11 @@ pub fn read_managed_member_avatar(
     portrait: bool,
 ) -> Result<Option<ManagedMemberAvatarRendition>> {
     use base64::Engine;
-    let MemberAvatarReference::Managed(asset_id) = parse_member_avatar_ref(avatar_ref)? else {
-        return Ok(None);
+    let asset_id = match parse_member_avatar_ref(avatar_ref)? {
+        MemberAvatarReference::Managed(asset_id) | MemberAvatarReference::Bot { asset_id, .. } => {
+            asset_id
+        }
+        MemberAvatarReference::Builtin(_) => return Ok(None),
     };
     let root = data_dir.join("member-avatars");
     let directory = root.join(asset_id.hyphenated().to_string());
@@ -2278,6 +2326,28 @@ mod tests {
             parse_member_avatar_ref(&value).unwrap(),
             MemberAvatarReference::Managed(asset_id)
         );
+        let bot = format!("rovai://member-avatar/bot/harbor-scout/3fa9c1/{asset_id}/v1");
+        assert_eq!(
+            parse_member_avatar_ref(&bot).unwrap(),
+            MemberAvatarReference::Bot {
+                id: "harbor-scout".to_string(),
+                color: "3fa9c1".to_string(),
+                asset_id,
+            }
+        );
+        // The slug alphabet is [a-z][a-z0-9-]{0,47}; both ends are accepted.
+        for slug in ["a".to_string(), format!("{}{}", "a".repeat(46), "-z")] {
+            let value = format!("rovai://member-avatar/bot/{slug}/000000/{asset_id}/v1");
+            assert_eq!(
+                parse_member_avatar_ref(&value).unwrap(),
+                MemberAvatarReference::Bot {
+                    id: slug.clone(),
+                    color: "000000".to_string(),
+                    asset_id,
+                },
+                "{slug}"
+            );
+        }
     }
 
     #[test]
@@ -2300,8 +2370,39 @@ mod tests {
             "ROVAI://MEMBER-AVATAR/builtin/luoke/v1",
             "rovai://member-avatar/managed/2b945f3f-4b45-4ae5-92b2-739fce600338/extra",
             "rovai://member-avatar/managed/2b945f3f-4b45-4ae5-92b2-739fce600338%2Fextra",
+            "rovai://member-avatar/bot/Harbor/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
+            "rovai://member-avatar/bot/-harbor/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
+            "rovai://member-avatar/bot/9harbor/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
+            "rovai://member-avatar/bot/harbor_scout/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
+            "rovai://member-avatar/bot/harbor.scout/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
+            "rovai://member-avatar/bot/harbor/3FA9C1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
+            "rovai://member-avatar/bot/harbor/#3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
+            "rovai://member-avatar/bot/harbor/3fa9c/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
+            "rovai://member-avatar/bot/harbor/3fa9c1/2B945F3F-4B45-4AE5-92B2-739FCE600338/v1",
+            "rovai://member-avatar/bot/harbor/3fa9c1/2b945f3f4b454ae592b2739fce600338/v1",
+            "rovai://member-avatar/bot/harbor/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v2",
+            "rovai://member-avatar/bot/harbor/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338",
+            "rovai://member-avatar/bot/harbor/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1/extra",
+            "rovai://member-avatar/bot/harbor/3fa9c1//v1",
+            "rovai://member-avatar/bot/harbor/3fa9c1/../../../etc/passwd/v1",
+            "rovai://member-avatar/bot!/3fa9c1/2b945f3f-4b45-4ae5-92b2-739fce600338/v1",
         ] {
             assert!(parse_member_avatar_ref(value).is_err(), "{value}");
+        }
+        let asset_id = "2b945f3f-4b45-4ae5-92b2-739fce600338";
+        for value in [
+            // 49-character slug exceeds the documented ceiling.
+            format!(
+                "rovai://member-avatar/bot/{}/3fa9c1/{asset_id}/v1",
+                "a".repeat(49)
+            ),
+            format!("rovai://member-avatar/bot/harbor%2Fescape/3fa9c1/{asset_id}/v1"),
+            format!("rovai://member-avatar/bot/harbor/3fa9c1/{asset_id}/v1?size=32"),
+            format!("rovai://member-avatar/bot/harbor/3fa9c1/{asset_id}/v1#preview"),
+            format!("ROVAI://member-avatar/bot/harbor/3fa9c1/{asset_id}/v1"),
+            format!("rovai://user@member-avatar/bot/harbor/3fa9c1/{asset_id}/v1"),
+        ] {
+            assert!(parse_member_avatar_ref(&value).is_err(), "{value}");
         }
     }
 
@@ -2312,6 +2413,99 @@ mod tests {
         assert!(validate_member_avatar_update(None, legacy).is_err());
         assert!(validate_member_avatar_update(legacy, None).is_ok());
         assert!(validate_member_avatar_update(legacy, Some(MUWA_AVATAR_REF)).is_ok());
+    }
+
+    #[test]
+    fn bot_reference_reads_the_same_managed_asset_and_never_a_builtin() {
+        let directory = temporary_directory();
+        let pattern = RgbaImage::from_fn(400, 500, |x, y| {
+            if x < 200 && y < 200 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let source_png = encode_png(&DynamicImage::ImageRgba8(pattern)).unwrap();
+        let crop = MemberAvatarCrop {
+            center_x: 0.25,
+            center_y: 0.2,
+            size: 0.5,
+        };
+        let saved =
+            save_member_avatar_image(&directory, &source_png, 400, 500, crop.clone()).unwrap();
+        let asset_id = saved.avatar_ref.rsplit('/').next().unwrap();
+        let bot_ref = format!("rovai://member-avatar/bot/harbor-scout/3fa9c1/{asset_id}/v1");
+        assert!(validate_new_member_avatar_ref(Some(&bot_ref)).is_ok());
+
+        // Icon, portrait, export and materialization resolve to the managed file.
+        for portrait in [true, false] {
+            let managed = read_managed_member_avatar(&directory, &saved.avatar_ref, portrait)
+                .unwrap()
+                .unwrap();
+            let bot = read_managed_member_avatar(&directory, &bot_ref, portrait)
+                .unwrap()
+                .unwrap();
+            assert_eq!(bot.base64, managed.base64);
+            assert_eq!(bot.media_type, managed.media_type);
+            assert_eq!(bot.display_crop, managed.display_crop);
+            assert_eq!(bot.crop, saved.crop);
+        }
+        let managed_export =
+            read_managed_member_avatar_static_png(&directory, &saved.avatar_ref, 192)
+                .unwrap()
+                .unwrap();
+        let bot_export = read_managed_member_avatar_static_png(&directory, &bot_ref, 192)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bot_export.base64, managed_export.base64);
+        let managed_avatar =
+            materialize_member_avatar(&directory, &directory, &saved.avatar_ref).unwrap();
+        let bot_avatar = materialize_member_avatar(&directory, &directory, &bot_ref).unwrap();
+        assert_eq!(
+            fs::read(&bot_avatar.path).unwrap(),
+            fs::read(&managed_avatar.path).unwrap()
+        );
+        assert_eq!(bot_avatar.display_crop, Some(crop.clone()));
+        // Bot pixels are the managed source and carry the saved framing, so
+        // they can never silently become a packaged built-in rendition.
+        let bot_portrait = read_managed_member_avatar(&directory, &bot_ref, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((bot_portrait.width, bot_portrait.height), (400, 500));
+        assert_ne!(
+            bot_portrait.base64,
+            base64::engine::general_purpose::STANDARD
+                .encode(builtin_avatar_bytes(BuiltinMemberAvatar::Luoke, true))
+        );
+        // Re-cropping a bot yields a plain managed reference for the new asset.
+        let recropped =
+            recrop_member_avatar(&directory, &bot_ref, default_member_avatar_crop()).unwrap();
+        assert!(matches!(
+            parse_member_avatar_ref(&recropped.avatar_ref).unwrap(),
+            MemberAvatarReference::Managed(_)
+        ));
+        // An absent asset is unavailable; nothing falls back to another avatar.
+        let missing = format!(
+            "rovai://member-avatar/bot/harbor-scout/3fa9c1/{}/v1",
+            Uuid::new_v4()
+        );
+        assert!(
+            read_managed_member_avatar(&directory, &missing, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_managed_member_avatar(&directory, &missing, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_managed_member_avatar_static_png(&directory, &missing, 192)
+                .unwrap()
+                .is_none()
+        );
+        assert!(materialize_member_avatar(&directory, &directory, &missing).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

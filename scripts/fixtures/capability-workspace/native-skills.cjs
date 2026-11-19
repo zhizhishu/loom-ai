@@ -1,6 +1,9 @@
 const assert = require('node:assert/strict')
 
 module.exports = async ({ run, click, key, settle, capture, snapshot, window }) => {
+  // The retired Skill Library may only be touched by the member-catalog import surface,
+  // which runs before this settings sequence. Everything below must stay clear of it.
+  const skillsCallsAtStart = await run("window.capabilityTest.requests.filter(r => r.method.startsWith('skills.')).length")
   assert.ok((await snapshot()).text.includes('界面设计与实现'))
   assert.equal((await snapshot()).list.width, 320)
   assert.equal(await run("document.querySelectorAll('.rebuilt-skills-page button').length > 0"), true)
@@ -29,7 +32,7 @@ module.exports = async ({ run, click, key, settle, capture, snapshot, window }) 
   await key('Escape')
   assert.equal((await snapshot()).dialogs, 0)
   await capture('toolbox-day-wide')
-  assert.equal(await run("window.capabilityTest.requests.some(r => r.method.startsWith('skills.'))"), false, 'Current settings never call the retired Skill Library')
+  assert.equal(await run("window.capabilityTest.requests.filter(r => r.method.startsWith('skills.')).length"), skillsCallsAtStart, 'Current settings never call the retired Skill Library')
 
   await click('Skills')
   await click('ui-ux-pro-max')

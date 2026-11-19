@@ -1,0 +1,585 @@
+# Candidate-only E3. Never run on push or release; no real Provider credentials.
+# Run only the reviewed candidate branch/PR; never publish or deploy from this job.
+name: LOOM V2 Windows isolated E3
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/loom-v2-e3-windows.yml
+      - apps/desktop/src/renderer/src/loom-native/**
+      - apps/desktop/src/renderer/src/**
+      - apps/web/**
+      - web.vite.config.ts
+      - crates/rovai-host/**
+      - crates/rovai-web/**
+      - crates/rovai-core/**
+      - crates/loom-pi-launcher/**
+      - crates/loom-protocol/**
+      - crates/loom-node/**
+      - scripts/loom-v2-*
+      - scripts/lib/loom-v2-*
+      - scripts/lib/host-*
+      - scripts/fixtures/host-web-parity/**
+      - scripts/fixtures/loom-*/**
+      - scripts/package-embedded-pi.mjs
+      - scripts/package-dsh-hook-executor.mjs
+      - scripts/package-dsh-runtime.mjs
+      - scripts/accept-local-hook-executor.mjs
+      - resources/dsh-hook-executor/**
+      - resources/dsh-runtime/**
+      - scripts/runtime/pi-source/**
+      - scripts/start-loom-personal.cmd
+      - scripts/install-loom-personal.cmd
+      - scripts/manage-loom-personal.ps1
+      - scripts/package-computer-runtime.ps1
+      - scripts/runtime/computer-windows.json
+      - scripts/lib/personal-install.test.mjs
+      - resources/computer/**
+      - docs/loom/LOOM-PERSONAL-CANDIDATE.md
+      - package.json
+      - pnpm-workspace.yaml
+      - pnpm-lock.yaml
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: loom-v2-e3-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e3-windows:
+    name: Windows fresh Host + guarded Pi + production Mikka Electron
+    # Manual runs must select a reviewed V2 branch; never treat main as a V2 result.
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+      ROVAI_REQUIRE_ELECTRON_INTEGRATION: '1'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      LOOM_E3_READY_BUDGET_MS: '180000'
+      LOOM_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout without retained credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Node 24 (pinned runtime)
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.14.1
+
+      - name: Install pnpm 11.20.0
+        shell: pwsh
+        run: npm install --global pnpm@11.20.0
+
+      - name: Install Rust 1.97.1 MSVC toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust install failed' }
+          rustup default 1.97.1
+          if ($LASTEXITCODE -ne 0) { throw 'Rust selection failed' }
+
+      - name: Restore isolated candidate Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: loom-v2-e3-windows-msvc
+          cache-on-failure: true
+
+      - name: Install locked project dependencies
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Locked dependency install failed' }
+
+      - name: Check the V2 workflow fail-closed contract
+        shell: pwsh
+        run: |
+          node --test --test-force-exit scripts/lib/loom-v2-e3-workflow-contract.test.mjs scripts/lib/embedded-pi.test.mjs scripts/lib/windows-native-stack.test.mjs scripts/lib/personal-install.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'V2 E3 CI contract test failed' }
+
+      - name: Checkout pinned optional Pi Purge source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ZiChuanLan/pi-purge
+          ref: d0196ccfd773b0ed342bd2f25372aff65f1a4a53
+          path: _artifacts/reference-repos/pi-purge-current
+          persist-credentials: false
+
+      - name: Verify Pi Purge source and managed adapter without a model
+        shell: pwsh
+        run: |
+          $source = (Resolve-Path '_artifacts/reference-repos/pi-purge-current').Path
+          $commit = (git -C $source rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $commit -ne 'd0196ccfd773b0ed342bd2f25372aff65f1a4a53') { throw 'Pi Purge reference moved' }
+          # The accepted Windows source pin uses CRLF; normalize only this isolated checkout.
+          git -C $source config --local core.autocrlf true
+          if ($LASTEXITCODE -ne 0) { throw 'Pi Purge checkout configuration failed' }
+          git -C $source -c core.autocrlf=true checkout-index --force --all
+          if ($LASTEXITCODE -ne 0) { throw 'Pi Purge fixed checkout materialization failed' }
+          $sha = (Get-FileHash (Join-Path $source 'extensions/pi-purge.ts') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -ne '983a3c3cc3011928a33805d84414060729fd2aa81822bc7ba94008943a65d71d') { throw 'Pi Purge source byte pin mismatch' }
+          node --test --test-force-exit scripts/loom-v2-pi-purge-extension.test.mjs scripts/loom-pi-purge-bridge.test.mjs scripts/loom-v2-pi-purge-hook.test.mjs scripts/loom-v2-pi-purge-stage.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Managed Pi Purge regression failed' }
+
+      - name: Fresh official Host and native Pi launcher
+        shell: pwsh
+        run: |
+          cargo build --locked -p rovai-host -p rovai-core -p loom-pi-launcher -p loom-node --bins --jobs 2
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh Host/launcher build failed' }
+          if (!(Test-Path target/debug/rovai-host.exe)) { throw 'Fresh Host binary missing' }
+          if (!(Test-Path target/debug/loom-pi-launcher.exe)) { throw 'Native Pi launcher missing' }
+          if (!(Test-Path target/debug/loom-node.exe)) { throw 'Same-source device Node missing' }
+          if (!(Test-Path target/debug/rovai-core.exe) -or !(Test-Path target/debug/rovai.exe)) { throw 'Same-source Core/helper binaries missing' }
+          foreach ($name in @('rovai-host', 'rovai-server', 'rovai-core', 'rovai')) {
+            $stream = [System.IO.File]::OpenRead((Resolve-Path "target/debug/$name.exe").Path)
+            $reader = [System.IO.BinaryReader]::new($stream)
+            try {
+              $stream.Position = 0x3c
+              $pe = $reader.ReadUInt32()
+              $stream.Position = $pe
+              if ($reader.ReadUInt32() -ne 0x4550) { throw 'Invalid PE signature' }
+              $stream.Position = $pe + 24
+              if ($reader.ReadUInt16() -ne 0x20b) { throw 'Expected a PE32+ native binary' }
+              $stream.Position = $pe + 24 + 72
+              $reserve = $reader.ReadUInt64()
+              if ($reserve -lt 8388608) { throw "$name has an insufficient native main-stack reserve: $reserve" }
+              Write-Host "$name main-stack reserve: $reserve bytes"
+            } finally { $reader.Dispose(); $stream.Dispose() }
+          }
+
+      - name: Verify same-source managed workflow CLI through real processes
+        shell: pwsh
+        run: |
+          $env:LOOM_MANAGED_WORKFLOW_CLI = (Resolve-Path 'target/debug/rovai.exe' -ErrorAction Stop).Path
+          Remove-Item Env:LOOM_MANAGED_WORKFLOW_BASELINE_CLI -ErrorAction SilentlyContinue
+          $workflowCliTap = Join-Path $env:RUNNER_TEMP 'loom-workflow-cli-tap.txt'
+          node --test --test-reporter=tap scripts/lib/loom-workflow-cli.test.mjs 2>&1 | Tee-Object -FilePath $workflowCliTap
+          $workflowCliExit = $LASTEXITCODE
+          if ($workflowCliExit -ne 0) { throw 'Same-source managed workflow CLI regression failed' }
+          $workflowCliResult = Get-Content -LiteralPath $workflowCliTap -Raw
+          foreach ($expected in @('# tests 1', '# pass 1', '# fail 0', '# skipped 0')) {
+            if ($workflowCliResult -notmatch ('(?m)^' + [regex]::Escape($expected) + '\s*$')) { throw 'Managed workflow CLI owner did not run exactly once without skips' }
+          }
+
+      - name: Reject native Codex sandbox disagreement before model dispatch
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'loom-codex-policy-test.log'
+          cargo test --locked -p rovai-core --lib codex::native_policy_tests::effective_sandbox_readback_matches_the_requested_mode_or_fails_closed -- --exact *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log -Tail 30
+          if ($code -ne 0) { throw 'Native Codex policy regression failed to compile or pass' }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Native Codex policy regression did not execute exactly once' }
+
+      - name: Verify Core relay, file grants, and typed workflow isolation
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'loom-core-library-tests.log'
+          cargo test --locked -p rovai-core --lib *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log -Tail 60
+          if ($code -ne 0) { throw 'Core library regression failed' }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'test result: ok\. [1-9][0-9]* passed; 0 failed;') { throw 'Core library tests did not actually run' }
+          node --test --test-force-exit --test-timeout=120000 scripts/loom-v2-workflow-tool.test.mjs scripts/loom-v2-core-file-grant.test.mjs scripts/lib/accept-loom-live-lead.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Typed workflow and immutable artifact evidence tests failed' }
+
+      - name: Verify computer consent and assistant revocation
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'loom-computer-safety-tests.log'
+          cargo test --locked -p rovai-web --lib computer_agent::tests:: -- --test-threads=1 *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log -Tail 35
+          if ($code -ne 0) { throw 'Assistant computer authorization regression failed' }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw 'Assistant computer tests did not execute' }
+          cargo test --locked -p rovai-web --lib computer::tests:: -- --test-threads=1 *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log -Tail 25
+          if ($code -ne 0) { throw 'Manual computer consent or lease regression failed' }
+          $text = Get-Content -LiteralPath $log -Raw
+          if ($text -notmatch 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw 'Manual computer tests did not execute' }
+
+      - name: Fresh production Mikka Web bundle
+        shell: pwsh
+        run: |
+          pnpm build:web
+          if ($LASTEXITCODE -ne 0) { throw 'Production Web bundle build failed' }
+          if (!(Test-Path out/web/index.html)) { throw 'Production Web index missing' }
+
+      - name: Record compile-only candidate provenance (not an acceptance or release)
+        shell: pwsh
+        run: |
+          $files = [ordered]@{}
+          $actualCommit = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $env:LOOM_SOURCE_COMMIT) { throw 'Candidate checkout does not match the selected source commit' }
+          foreach ($path in @('target/debug/rovai-host.exe', 'target/debug/rovai-server.exe', 'target/debug/rovai-core.exe', 'target/debug/rovai.exe', 'target/debug/loom-pi-launcher.exe', 'target/debug/loom-node.exe', 'out/web/index.html')) {
+            if (!(Test-Path -LiteralPath $path)) { throw "Missing compiler output: $path" }
+            $files[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          [ordered]@{
+            qualification = 'compile-only-development-candidate'
+            commit = $actualCommit
+            hostAndCoreBuiltTogether = $true
+            embeddedPiIncluded = $false
+            E3 = 'NOT_RUN'
+            E4 = 'NOT_RUN'
+            E5 = 'NOT_RUN'
+            E6 = 'NOT_RUN'
+            E7 = 'NOT_RUN'
+            files = $files
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath 'compile-only-manifest.json' -Encoding utf8
+
+      - name: Retain compiler outputs for isolated native verification only
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-v2-compile-only-windows-${{ env.LOOM_SOURCE_COMMIT }}
+          path: |
+            compile-only-manifest.json
+            target/debug/rovai-host.exe
+            target/debug/rovai-server.exe
+            target/debug/rovai-core.exe
+            target/debug/rovai.exe
+            target/debug/loom-pi-launcher.exe
+            target/debug/loom-node.exe
+            out/web/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Test exact public brand routes over real Host HTTP
+        shell: pwsh
+        run: |
+          $env:ROVAI_HOST_BIN = (Resolve-Path 'target/debug/rovai-host.exe').Path
+          $env:ROVAI_WEB_UI = (Resolve-Path 'out/web').Path
+          node --test --test-force-exit --test-timeout=180000 --test-name-pattern="Desktop and Web share one Core" scripts/lib/host-web.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Real Host HTTP brand/auth regression failed' }
+
+      - name: Stage exact Pi 0.85.1 into isolated repository runtime directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'loom-v2-pi-source'
+          New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+          Copy-Item scripts/runtime/pi-source/package.json, scripts/runtime/pi-source/package-lock.json -Destination $sourceRoot
+          npm ci --prefix $sourceRoot --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Locked Pi 0.85.1 source install failed (no fallback version)' }
+          $sourceLockSha = (Get-FileHash (Join-Path $sourceRoot 'package-lock.json') -Algorithm SHA256).Hash
+          $committedLockSha = (Get-FileHash scripts/runtime/pi-source/package-lock.json -Algorithm SHA256).Hash
+          if ($sourceLockSha -ne $committedLockSha) { throw 'Pi source lock changed during installation' }
+          $source = Join-Path $sourceRoot 'node_modules/@earendil-works/pi-coding-agent'
+          $nodeExecutable = (Get-Command node).Source
+          $launcher = (Resolve-Path 'target/debug/loom-pi-launcher.exe').Path
+          node scripts/package-embedded-pi.mjs --source $source --node $nodeExecutable --launcher-built $launcher --destination resources/runtime/pi
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned native Pi staging failed' }
+          node scripts/package-embedded-pi.mjs --verify --destination resources/runtime/pi
+          if ($LASTEXITCODE -ne 0) { throw 'Pi manifest verification failed' }
+
+      - name: Stage the fixed private DSH Hook executor
+        shell: pwsh
+        run: |
+          node scripts/package-dsh-hook-executor.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed DSH Hook executor staging failed' }
+          node scripts/package-dsh-hook-executor.mjs --verify
+          if ($LASTEXITCODE -ne 0) { throw 'DSH Hook executor closed manifest verification failed' }
+          $hookProofPath = Join-Path $env:RUNNER_TEMP 'loom-hook-executor-evidence.json'
+          node scripts/accept-local-hook-executor.mjs --bundle resources/runtime/dsh-hook-executor --node resources/runtime/pi/node/node.exe --output $hookProofPath
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled Hook executor confinement regression failed' }
+          $hookProof = Get-Content -LiteralPath $hookProofPath -Raw | ConvertFrom-Json
+          if ($hookProof.status -cne 'PASS_PRIVATE_EXECUTOR_ONLY' -or
+              $hookProof.checks.Count -ne 5 -or
+              @($hookProof.checks | Where-Object { $_.status -cne 'PASS' }).Count -ne 0 -or
+              $hookProof.modelCalls -ne 0 -or $hookProof.globalRuntimeModified) {
+            throw 'Bundled Hook executor checks did not all execute'
+          }
+
+      - name: Stage clean official DSH 0.2.0-rc.2 from the committed lock
+        shell: pwsh
+        run: |
+          node scripts/package-dsh-runtime.mjs --destination resources/runtime/dsh
+          if ($LASTEXITCODE -ne 0) { throw 'Official DSH 0.2 complete package failed to stage' }
+          node scripts/package-dsh-runtime.mjs --verify --destination resources/runtime/dsh
+          if ($LASTEXITCODE -ne 0) { throw 'Official DSH runtime manifest verification failed' }
+          $dsh = Get-Content resources/runtime/dsh/dsh-runtime-bundle.json -Raw | ConvertFrom-Json
+          if ($dsh.rootVersion -ne '0.2.0-rc.2' -or !$dsh.closureComplete -or
+              $dsh.files.Count -lt 100 -or $dsh.packages.Count -lt 1 -or
+              $dsh.installScripts -ne $false) {
+            throw 'DSH official runtime did not prove its complete exact-version closure'
+          }
+
+      - name: Test real guarded Pi + official Host + production Web Electron (E3 only)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'loom-v2-e3'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $env:ROVAI_HOST_BIN = (Resolve-Path 'target/debug/rovai-host.exe').Path
+          $env:ROVAI_WEB_UI = (Resolve-Path 'out/web').Path
+          $tapFile = Join-Path $evidence 'e3-tap.txt'
+          node --test --test-force-exit --test-reporter=tap --test-timeout=900000 scripts/lib/loom-v2-official-host-electron-review.test.mjs 2>&1 | Tee-Object -FilePath $tapFile
+          $exit = $LASTEXITCODE
+          if ($exit -ne 0) { throw "E3 test failed with exit $exit" }
+          $tap = Get-Content -LiteralPath $tapFile -Raw
+          foreach ($expected in @('(?m)^# tests 1\s*$', '(?m)^# pass 1\s*$', '(?m)^# fail 0\s*$', '(?m)^# skipped 0\s*$')) {
+            if ($tap -notmatch $expected) { throw "Missing acceptance TAP summary: $expected" }
+          }
+          if ($tap -match '(?im)(authorization:\s*bearer\s+\S+|api[_-]?key\s*[:=]\s*\S+)') {
+            throw 'Potential credential-shaped output in TAP; evidence upload refused'
+          }
+          $hostSha = (Get-FileHash $env:ROVAI_HOST_BIN -Algorithm SHA256).Hash.ToLowerInvariant()
+          $piSha = (Get-FileHash 'resources/runtime/pi/pi.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $piManifestPath = 'resources/runtime/pi/pi-bundle.json'
+          $piManifest = Get-Content -LiteralPath $piManifestPath -Raw | ConvertFrom-Json
+          if ($piManifest.piVersion -ne '0.85.1' -or !$piManifest.closureComplete -or $piManifest.launchKind -ne 'native') {
+            throw 'Embedded Pi provenance is not the pinned native 0.85.1 release'
+          }
+          # npm ci enforces the committed dependency versions and registry integrity.
+          # Record the platform-specific closure; do not compare it with a different
+          # machine's unlocked npm install or native optional dependencies.
+          [string[]]$closureRows = @($piManifest.files | Where-Object { $_.path.StartsWith('node_modules/') } | ForEach-Object { "$($_.path)`t$($_.sha256)" })
+          [Array]::Sort($closureRows, [System.StringComparer]::Ordinal)
+          $closureData = [string]::Join("`n", $closureRows) + "`n"
+          $closureSha = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($closureData))).ToLowerInvariant()
+          if ($closureRows.Count -lt 1) { throw 'Pi dependency closure is empty' }
+          $sourceLockSha = (Get-FileHash scripts/runtime/pi-source/package-lock.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          $piManifestSha = (Get-FileHash $piManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $nodeSha = (Get-FileHash 'resources/runtime/pi/node/node.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $webSha = (Get-FileHash 'out/web/index.html' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $testSha = (Get-FileHash 'scripts/lib/loom-v2-official-host-electron-review.test.mjs' -Algorithm SHA256).Hash.ToLowerInvariant()
+          [ordered]@{
+            scope = 'E3-Windows-GitHub-candidate-only'
+            commit = $env:LOOM_SOURCE_COMMIT
+            os = $env:RUNNER_OS
+            runner = $env:RUNNER_NAME
+            hostSha256 = $hostSha
+            piExecutableSha256 = $piSha
+            piManifestSha256 = $piManifestSha
+            piManifestTreeSha256 = $piManifest.treeSha256
+            piDependencyClosureSha256 = $closureSha
+            piSourceLockSha256 = $sourceLockSha
+            piDependencyFileCount = $closureRows.Count
+            bundledNodeSha256 = $nodeSha
+            bundledPiVersion = $piManifest.piVersion
+            dependencyTreeSourceLock = 'committed npm lockfile with registry integrity; npm ci --ignore-scripts'
+            webIndexSha256 = $webSha
+            testSourceSha256 = $testSha
+            freshHostBuild = $true
+            hostBuildEvidence = 'workflow cargo build step; standalone test self-report does not verify freshness'
+            freshWebBuild = $true
+            expectedTests = 1
+            pass = 1
+            fail = 0
+            skipped = 0
+            actualElectronPointerInput = $true
+            humanClickedUI = $false
+            mockProvider = $true
+            realExternalProvider = $false
+            localHookExecutor = 'PASS_PRIVATE_EXECUTOR_ONLY'
+            E4 = 'NOT_RUN'
+            E5 = 'NOT_RUN'
+            E6 = 'NOT_RUN'
+            E7 = 'NOT_RUN'
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence 'e3-manifest.json') -Encoding utf8
+
+      - name: Assemble isolated personal preview only after E3 passes
+        if: success()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kit = Join-Path $env:RUNNER_TEMP 'loom-personal-preview'
+          if (Test-Path $kit) { throw 'Refusing to replace an existing candidate package' }
+          New-Item -ItemType Directory -Path $kit | Out-Null
+          foreach ($name in @('rovai-host', 'rovai-server', 'rovai-core', 'rovai', 'loom-node')) {
+            Copy-Item "target/debug/$name.exe" $kit
+          }
+          Copy-Item out/web (Join-Path $kit 'web-ui') -Recurse
+          Copy-Item skills (Join-Path $kit 'skills') -Recurse
+          New-Item -ItemType Directory -Path (Join-Path $kit 'runtime') | Out-Null
+          Copy-Item resources/runtime/pi (Join-Path $kit 'runtime/pi') -Recurse
+          Copy-Item resources/runtime/dsh (Join-Path $kit 'runtime/dsh') -Recurse
+          node scripts/package-dsh-runtime.mjs --verify --destination (Join-Path $kit 'runtime/dsh')
+          if ($LASTEXITCODE -ne 0) { throw 'Copied official DSH 0.2 runtime verification failed' }
+          $dshManifestPath = Join-Path $kit 'runtime/dsh/dsh-runtime-bundle.json'
+          $dshBundle = Get-Content -LiteralPath $dshManifestPath -Raw | ConvertFrom-Json
+          $dshManifestSha = (Get-FileHash -LiteralPath $dshManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Copy-Item resources/runtime/dsh-hook-executor (Join-Path $kit 'runtime/dsh-hook-executor') -Recurse
+          node scripts/package-dsh-hook-executor.mjs --verify --destination (Join-Path $kit 'runtime/dsh-hook-executor')
+          if ($LASTEXITCODE -ne 0) { throw 'Copied candidate DSH Hook executor failed verification' }
+          $hookManifestPath = Join-Path $kit 'runtime/dsh-hook-executor/hook-executor-bundle.json'
+          $hookBundle = Get-Content -LiteralPath $hookManifestPath -Raw | ConvertFrom-Json
+          $hookManifestSha = (Get-FileHash -LiteralPath $hookManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          & ./scripts/package-computer-runtime.ps1 -Destination (Join-Path $kit 'runtime/computer') -CacheDirectory (Join-Path $env:RUNNER_TEMP 'loom-computer-downloads')
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned computer runtime staging failed' }
+          $computerBundle = Get-Content (Join-Path $kit 'runtime/computer/computer-bundle.json') -Raw | ConvertFrom-Json
+          & (Join-Path $kit 'runtime/computer/python/python.exe') -I -B -m unittest discover -s resources/computer -p 'test_*.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled computer helper/bridge regression failed' }
+          node scripts/package-embedded-pi.mjs --verify --destination (Join-Path $kit 'runtime/pi')
+          if ($LASTEXITCODE -ne 0) { throw 'Copied candidate Pi bundle failed verification' }
+          $purge = Join-Path $kit 'runtime/extensions/pi-purge'
+          New-Item -ItemType Directory -Path $purge -Force | Out-Null
+          node scripts/loom-v2-pi-purge-stage.mjs --source (Resolve-Path '_artifacts/reference-repos/pi-purge-current').Path --output (Join-Path $purge 'upstream') --output-root $purge --apply
+          if ($LASTEXITCODE -ne 0) { throw 'Optional Pi Purge fixed-source staging failed' }
+          node scripts/loom-v2-pi-purge-stage.mjs --verify (Join-Path $purge 'upstream')
+          if ($LASTEXITCODE -ne 0) { throw 'Optional Pi Purge staged closure mismatch' }
+          Copy-Item scripts/loom-v2-pi-purge-extension.ts (Join-Path $purge 'loom-pi-purge-extension.ts')
+          [ordered]@{ schema = 1; extension = 'pi-purge'; version = '0.3.0'; upstreamCommit = 'd0196ccfd773b0ed342bd2f25372aff65f1a4a53'; defaultEnabled = $false; supportedManagedModes = @('off', 'append'); coreUiBindingVerified = $false; providerVerifiedByThisCi = $false } | ConvertTo-Json | Set-Content (Join-Path $purge 'extension-info.json') -Encoding utf8
+          Copy-Item LICENSE (Join-Path $kit 'LICENSE')
+          Copy-Item scripts/start-loom-personal.cmd (Join-Path $kit 'Start-Loom.cmd')
+          Copy-Item scripts/install-loom-personal.cmd (Join-Path $kit 'Install-Loom.cmd')
+          Copy-Item scripts/manage-loom-personal.ps1 (Join-Path $kit 'Manage-Loom.ps1')
+          Copy-Item docs/loom/LOOM-PERSONAL-CANDIDATE.md (Join-Path $kit 'README.md')
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'loom-v2-e3/e3-manifest.json') (Join-Path $kit 'e3-manifest.json')
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          "schema=1`nversion=$version`ntarget=windows-x64`n" | Set-Content (Join-Path $kit 'package-info') -Encoding ascii
+          "[InternetShortcut]`r`nURL=http://127.0.0.1:64852/`r`n" | Set-Content (Join-Path $kit 'Open-Loom.url') -Encoding ascii
+          $databaseSource = Get-Content crates/rovai-core/src/db.rs -Raw
+          $contractVersion = [regex]::Match($databaseSource, 'pub\(crate\) const CURRENT_DATA_CONTRACT_VERSION: &str = "([^"]+)";')
+          $projectionVersion = [regex]::Match($databaseSource, 'pub\(crate\) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = ([0-9]+);')
+          if (!$contractVersion.Success -or !$projectionVersion.Success) { throw 'Core data compatibility metadata is missing' }
+          $hashes = [ordered]@{}
+          foreach ($file in (Get-ChildItem -LiteralPath $kit -File -Recurse -Force | Sort-Object FullName)) {
+            $relative = [System.IO.Path]::GetRelativePath($kit, $file.FullName).Replace('\', '/')
+            $hashes[$relative] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          [ordered]@{
+            qualification = 'isolated-personal-development-preview'
+            dataContract = [ordered]@{ version = $contractVersion.Groups[1].Value; projectionSchema = [int]$projectionVersion.Groups[1].Value }
+            version = $version
+            target = 'windows-x64'
+            profile = 'debug'
+            commit = $env:LOOM_SOURCE_COMMIT
+            E3 = 'PASS_SCRIPTED_PROVIDER_ONLY'
+            realProviderVerified = $false
+            ownerAccepted = $false
+            dailyDataIncluded = $false
+            computerRuntime = [ordered]@{ python = $computerBundle.pythonVersion; pillow = $computerBundle.pillowVersion }
+            dshHookExecutor = [ordered]@{ dshVersion = $hookBundle.dshVersion; manifestSha256 = $hookManifestSha; treeSha256 = $hookBundle.treeSha256; lockSha256 = $hookBundle.lockSha256; packageCount = $hookBundle.packages.Count }
+            dshRuntime = [ordered]@{ rootVersion = $dshBundle.rootVersion; manifestSha256 = $dshManifestSha; treeSha256 = $dshBundle.treeSha256; lockSha256 = $dshBundle.lockSha256; packageCount = $dshBundle.packages.Count }
+            embeddedPiVersion = '0.85.1'
+            optionalPiPurgeVersion = '0.3.0'
+            piPurgeDefaultEnabled = $false
+            piPurgeCoreUiBindingVerified = $false
+            files = $hashes
+          } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $kit 'candidate-manifest.json') -Encoding utf8
+
+      - name: Upload complete non-release personal preview
+        id: upload_preview
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-personal-preview-windows-${{ env.LOOM_SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/loom-personal-preview/
+          # Only the deliberately assembled credential-free package, never the checkout.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Wait for this immutable upload to appear in artifact metadata
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOOM_PREVIEW_ARTIFACT_ID: ${{ steps.upload_preview.outputs.artifact-id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactId = $env:LOOM_PREVIEW_ARTIFACT_ID
+          if ($artifactId -notmatch '^[1-9][0-9]*$') { throw 'Upload did not return an immutable artifact ID' }
+          $expectedName = "loom-personal-preview-windows-$env:LOOM_SOURCE_COMMIT"
+          $visible = $false
+          # Retry only the read of the exact artifact just uploaded. Do not rebuild,
+          # upload another package, select a previous run, or waive byte verification.
+          for ($attempt = 0; $attempt -lt 6; $attempt++) {
+            $raw = gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$artifactId" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $artifact = ($raw -join "`n") | ConvertFrom-Json
+              if ([string]$artifact.id -ne $artifactId -or $artifact.name -ne $expectedName -or $artifact.expired) { throw 'Uploaded artifact identity mismatch' }
+              if ([string]$artifact.workflow_run.id -ne $env:GITHUB_RUN_ID) { throw 'Uploaded artifact belongs to a different workflow run' }
+              $visible = $true
+              break
+            }
+            if ($attempt -lt 5) { Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt + 1))) }
+          }
+          if (!$visible) { throw 'Uploaded artifact is still unavailable; delivery verification remains blocked' }
+
+      - name: Download the actual uploaded preview for delivery verification
+        if: success()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.upload_preview.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/loom-personal-roundtrip/
+
+      - name: Verify the delivered preview byte for byte including hidden dependencies
+        if: success()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kit = [System.IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'loom-personal-roundtrip'))
+          $manifest = Get-Content -LiteralPath (Join-Path $kit 'candidate-manifest.json') -Raw | ConvertFrom-Json
+          if ($manifest.commit -ne $env:LOOM_SOURCE_COMMIT) { throw 'Delivered preview source commit mismatch' }
+          if ($manifest.dailyDataIncluded -or $manifest.ownerAccepted -or $manifest.realProviderVerified) { throw 'Unexpected preview qualification' }
+          $admitted = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($entry in $manifest.files.PSObject.Properties) {
+            $relative = $entry.Name
+            if ([System.IO.Path]::IsPathRooted($relative) -or $relative.Contains('\') -or @($relative.Split('/') | Where-Object { $_ -in @('', '.', '..') }).Count) { throw 'Unsafe delivered manifest path' }
+            if (!$admitted.Add($relative)) { throw 'Duplicate delivered manifest path' }
+            $path = [System.IO.Path]::GetFullPath((Join-Path $kit $relative))
+            if (!$path.StartsWith($kit + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Delivered path escaped package' }
+            if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Delivered package omitted $relative" }
+            if ((Get-Item -LiteralPath $path -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'Delivered package contains a reparse point' }
+            $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $entry.Value) { throw "Delivered package hash mismatch: $relative" }
+          }
+          foreach ($file in Get-ChildItem -LiteralPath $kit -File -Recurse -Force) {
+            $relative = [System.IO.Path]::GetRelativePath($kit, $file.FullName).Replace('\', '/')
+            if ($relative -ne 'candidate-manifest.json' -and !$admitted.Contains($relative)) { throw "Unexpected delivered file: $relative" }
+          }
+          node scripts/package-embedded-pi.mjs --verify --destination (Join-Path $kit 'runtime/pi')
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered Pi closed manifest verification failed' }
+          node scripts/package-dsh-hook-executor.mjs --verify --destination (Join-Path $kit 'runtime/dsh-hook-executor')
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered DSH Hook executor closed manifest verification failed' }
+          $hookPath = Join-Path $kit 'runtime/dsh-hook-executor/hook-executor-bundle.json'
+          $deliveredHook = Get-Content -LiteralPath $hookPath -Raw | ConvertFrom-Json
+          $deliveredHookSha = (Get-FileHash -LiteralPath $hookPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($manifest.dshHookExecutor.manifestSha256 -cne $deliveredHookSha -or
+              $manifest.dshHookExecutor.treeSha256 -cne $deliveredHook.treeSha256 -or
+              $manifest.dshHookExecutor.lockSha256 -cne $deliveredHook.lockSha256 -or
+              $manifest.dshHookExecutor.dshVersion -cne $deliveredHook.dshVersion -or
+              $manifest.dshHookExecutor.packageCount -ne $deliveredHook.packages.Count) {
+            throw 'Delivered Hook provenance does not match the candidate manifest'
+          }
+          & ./scripts/package-computer-runtime.ps1 -Verify -Destination (Join-Path $kit 'runtime/computer')
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered computer runtime verification failed' }
+          node scripts/loom-v2-pi-purge-stage.mjs --verify (Join-Path $kit 'runtime/extensions/pi-purge/upstream')
+          if ($LASTEXITCODE -ne 0) { throw 'Delivered optional Pi Purge closed manifest verification failed' }
+          $extensionInfo = Get-Content (Join-Path $kit 'runtime/extensions/pi-purge/extension-info.json') -Raw | ConvertFrom-Json
+          if ($extensionInfo.defaultEnabled -or $extensionInfo.coreUiBindingVerified -or $extensionInfo.providerVerifiedByThisCi) { throw 'Optional Pi Purge has an invalid delivery qualification' }
+          [ordered]@{ commit = $env:LOOM_SOURCE_COMMIT; deliveryVerified = $true; verifiedFileCount = $admitted.Count; hiddenFilesPreserved = $true; realProviderVerified = $false; ownerAccepted = $false } | ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'loom-v2-e3/delivery-manifest.json') -Encoding utf8
+
+      - name: Upload only validated candidate E3 evidence (no build binaries)
+        # A failed or credential-shaped TAP stays in restricted job logs; never upload it.
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: loom-v2-e3-win-${{ env.LOOM_SOURCE_COMMIT }}
+          path: |
+            ${{ runner.temp }}/loom-v2-e3/e3-tap.txt
+            ${{ runner.temp }}/loom-v2-e3/e3-manifest.json
+            ${{ runner.temp }}/loom-v2-e3/delivery-manifest.json
+            ${{ runner.temp }}/loom-hook-executor-evidence.json
+          if-no-files-found: error
+          retention-days: 3

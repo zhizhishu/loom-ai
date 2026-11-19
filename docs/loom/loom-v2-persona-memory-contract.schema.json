@@ -1,0 +1,743 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:loom:proposal:persona-memory:loom.v2alpha1",
+  "title": "LOOM Core V2 Proposal - Persona, Prompt, Memory and Security Lab Contracts",
+  "description": "DISCUSSION_PROPOSAL only. Agent Runtime allowlist pi,dsh,codex,claude-code. These schemas do not grant tools, modify provider policies, disable approvals, or change current v1.72 production contracts.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/PersonaManifest"
+    },
+    {
+      "$ref": "#/$defs/PersonaBinding"
+    },
+    {
+      "$ref": "#/$defs/EffectivePromptSnapshot"
+    },
+    {
+      "$ref": "#/$defs/MemoryScopePolicy"
+    },
+    {
+      "$ref": "#/$defs/SecurityLabSpec"
+    },
+    {
+      "$ref": "#/$defs/PersonaPromptReceipt"
+    }
+  ],
+  "$defs": {
+    "PersonaManifest": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "personaId",
+        "name",
+        "version",
+        "bodyDigest",
+        "origin",
+        "runtimeTargets",
+        "license"
+      ],
+      "properties": {
+        "kind": {
+          "const": "persona.manifest"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "personaId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bodyDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "origin": {
+          "type": "object",
+          "required": [
+            "sourceKind",
+            "sourceRef",
+            "trust"
+          ],
+          "properties": {
+            "sourceKind": {
+              "enum": [
+                "local-file",
+                "git-pinned",
+                "user-editor"
+              ]
+            },
+            "sourceRef": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sourceCommit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "trust": {
+              "enum": [
+                "unreviewed",
+                "reviewed",
+                "trusted"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "runtimeTargets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "pi",
+              "dsh",
+              "codex",
+              "claude-code"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "bodyRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "defaultMode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "append",
+            "replace_host_persona",
+            "isolated_prompt_only"
+          ]
+        },
+        "suggestedCapabilityRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+          },
+          "uniqueItems": true
+        },
+        "memoryPolicyRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "importedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PersonaBinding": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "bindingId",
+        "personaId",
+        "personaBodyDigest",
+        "scopeKind",
+        "scopeId",
+        "applyMode",
+        "revision"
+      ],
+      "properties": {
+        "kind": {
+          "const": "persona.binding"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "bindingId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "personaId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "personaBodyDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "scopeKind": {
+          "type": "string",
+          "enum": [
+            "user",
+            "workspace",
+            "project",
+            "bot",
+            "team",
+            "run",
+            "lab"
+          ]
+        },
+        "scopeId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "applyMode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "append",
+            "replace_host_persona",
+            "isolated_prompt_only"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "appliesOnNewAttempt": {
+          "const": true
+        },
+        "memoryScopePolicyRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "applyMode": {
+                "const": "isolated_prompt_only"
+              }
+            },
+            "required": [
+              "applyMode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "scopeKind": {
+                "const": "lab"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "EffectivePromptSnapshot": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "snapshotId",
+        "runAttemptId",
+        "botId",
+        "runtimeKind",
+        "runtimeVersion",
+        "personaDigest",
+        "capabilitySnapshotRef",
+        "memoryScopeRef",
+        "policyDigest",
+        "segments",
+        "promptDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "kind": {
+          "const": "persona.promptSnapshot"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "snapshotId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runAttemptId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "botId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runtimeKind": {
+          "type": "string",
+          "enum": [
+            "pi",
+            "dsh",
+            "codex",
+            "claude-code"
+          ]
+        },
+        "runtimeVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "personaDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "capabilitySnapshotRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "memoryScopeRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "policyDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "role",
+              "sourceKind",
+              "digest"
+            ],
+            "properties": {
+              "role": {
+                "enum": [
+                  "system",
+                  "developer",
+                  "user",
+                  "tool",
+                  "runtime-proprietary"
+                ]
+              },
+              "sourceKind": {
+                "enum": [
+                  "platform",
+                  "runtime",
+                  "project-rule",
+                  "persona",
+                  "goal",
+                  "memory",
+                  "capability"
+                ]
+              },
+              "digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "tokenEstimate": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "redacted": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "promptDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "unsupportedReasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "MemoryScopePolicy": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "policyId",
+        "ownerScope",
+        "ownerId",
+        "readScopes",
+        "writeGate",
+        "retention",
+        "revision"
+      ],
+      "properties": {
+        "kind": {
+          "const": "persona.memoryPolicy"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "policyId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "ownerScope": {
+          "enum": [
+            "bot",
+            "project",
+            "team",
+            "run",
+            "lab"
+          ]
+        },
+        "ownerId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "readScopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "user",
+              "workspace",
+              "project",
+              "bot",
+              "team",
+              "run",
+              "lab"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "writeGate": {
+          "enum": [
+            "disabled",
+            "explicit-user",
+            "reviewed-summary",
+            "auto-validated"
+          ]
+        },
+        "retention": {
+          "enum": [
+            "run-only",
+            "until-revoked",
+            "ttl"
+          ]
+        },
+        "ttlSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sourceRequired": {
+          "type": "boolean"
+        },
+        "summarization": {
+          "type": "boolean"
+        },
+        "crossBotSharing": {
+          "const": false
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "memoryRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+          },
+          "uniqueItems": true
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "ownerScope": {
+                "const": "lab"
+              }
+            },
+            "required": [
+              "ownerScope"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retention": {
+                "enum": [
+                  "ttl",
+                  "run-only"
+                ]
+              },
+              "crossBotSharing": {
+                "const": false
+              },
+              "writeGate": {
+                "enum": [
+                  "disabled",
+                  "explicit-user"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SecurityLabSpec": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "labRunId",
+        "ownerId",
+        "authorizedScopeRef",
+        "sandboxId",
+        "networkPolicy",
+        "toolPolicy",
+        "memoryPolicyRef",
+        "personaBindingRef",
+        "promptApplyMode",
+        "expiresAt"
+      ],
+      "properties": {
+        "kind": {
+          "const": "persona.securityLabSpec"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "labRunId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "ownerId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "authorizedScopeRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "sandboxId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "networkPolicy": {
+          "enum": [
+            "deny",
+            "allowlist-explicit"
+          ]
+        },
+        "toolPolicy": {
+          "enum": [
+            "mock-only",
+            "read-only-fixtures",
+            "authorized-lab-tools"
+          ]
+        },
+        "memoryPolicyRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "personaBindingRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "promptApplyMode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "append",
+            "replace_host_persona",
+            "isolated_prompt_only"
+          ]
+        },
+        "credentialPolicy": {
+          "const": "fake-only"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "scopeApprovalRef": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "reviewRequired": {
+          "const": true
+        },
+        "auditTraceId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "promptApplyMode": {
+                "const": "isolated_prompt_only"
+              }
+            },
+            "required": [
+              "promptApplyMode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "networkPolicy": {
+                "const": "deny"
+              },
+              "toolPolicy": {
+                "const": "mock-only"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "PersonaPromptReceipt": {
+      "type": "object",
+      "required": [
+        "kind",
+        "apiVersion",
+        "receiptId",
+        "runAttemptId",
+        "snapshotId",
+        "runtimeKind",
+        "phase",
+        "appliedRole",
+        "promptDigest",
+        "policyDigest",
+        "evidenceDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "kind": {
+          "const": "persona.promptReceipt"
+        },
+        "apiVersion": {
+          "const": "loom.v2alpha1"
+        },
+        "receiptId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runAttemptId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "snapshotId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+        },
+        "runtimeKind": {
+          "type": "string",
+          "enum": [
+            "pi",
+            "dsh",
+            "codex",
+            "claude-code"
+          ]
+        },
+        "phase": {
+          "enum": [
+            "imported",
+            "selected",
+            "prepared",
+            "loaded",
+            "prompt-seen",
+            "behavior-observed",
+            "unsupported",
+            "failed",
+            "revoked"
+          ]
+        },
+        "appliedRole": {
+          "enum": [
+            "system",
+            "developer",
+            "user",
+            "runtime-proprietary",
+            "not-observed"
+          ]
+        },
+        "promptDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "policyDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "evidenceDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reasonCode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "support": {
+          "enum": [
+            "native",
+            "adapted",
+            "partial",
+            "unsupported"
+          ]
+        },
+        "actualRequestSeen": {
+          "type": "boolean"
+        },
+        "permissionsUnchanged": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

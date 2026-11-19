@@ -4,7 +4,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const BUILTIN_TOOL_REPLAY_CACHE_CAPACITY: usize = 1_024;
@@ -35,6 +38,7 @@ pub(crate) struct BuiltinToolProcessConfigFactory {
     core_endpoint: LocalIpcEndpoint,
     private_root: PathBuf,
     context_file: bool,
+    remote_process: Option<crate::remote_process::RemoteProcessKey>,
 }
 
 impl BuiltinToolProcessConfigFactory {
@@ -48,7 +52,34 @@ impl BuiltinToolProcessConfigFactory {
             core_endpoint: core_endpoint.clone(),
             private_root: private_root.to_path_buf(),
             context_file: true,
+            remote_process: None,
         }
+    }
+
+    pub(crate) fn remote(
+        core_endpoint: &LocalIpcEndpoint,
+        private_root: &Path,
+        key: crate::remote_process::RemoteProcessKey,
+    ) -> Result<Self> {
+        key.validate()?;
+        Ok(Self {
+            // A never resolves or executes a CLI for this remote process.
+            cli_executable: PathBuf::new(),
+            core_endpoint: core_endpoint.clone(),
+            private_root: private_root.to_path_buf(),
+            context_file: false,
+            remote_process: Some(key),
+        })
+    }
+
+    pub(crate) fn for_remote_process(
+        mut self,
+        key: crate::remote_process::RemoteProcessKey,
+    ) -> Result<Self> {
+        key.validate()?;
+        self.context_file = false;
+        self.remote_process = Some(key);
+        Ok(self)
     }
 
     pub(crate) fn without_context_file(mut self) -> Self {
@@ -62,6 +93,7 @@ impl BuiltinToolProcessConfigFactory {
             &self.core_endpoint,
             &self.private_root,
             self.context_file,
+            self.remote_process.clone(),
         )
     }
 }
@@ -79,6 +111,9 @@ struct BuiltinToolProcessConfigInner {
     run_tmp: PathBuf,
     process_id: String,
     process_token: String,
+    remote_process: Option<crate::remote_process::RemoteProcessKey>,
+    tasks_enabled: Arc<AtomicBool>,
+    remote_owner: std::sync::Mutex<Option<crate::remote_process::RemoteOwnerBinding>>,
 }
 
 impl Drop for BuiltinToolProcessConfigInner {
@@ -106,7 +141,7 @@ impl BuiltinToolProcessConfig {
         core_endpoint: &LocalIpcEndpoint,
         private_root: &Path,
     ) -> Result<Self> {
-        Self::create_with_context_file(cli_executable, core_endpoint, private_root, true)
+        Self::create_with_context_file(cli_executable, core_endpoint, private_root, true, None)
     }
 
     fn create_with_context_file(
@@ -114,12 +149,15 @@ impl BuiltinToolProcessConfig {
         core_endpoint: &LocalIpcEndpoint,
         private_root: &Path,
         context_file: bool,
+        remote_process: Option<crate::remote_process::RemoteProcessKey>,
     ) -> Result<Self> {
-        if !cli_executable.is_absolute() || !private_root.is_absolute() {
+        if (remote_process.is_none() && !cli_executable.is_absolute())
+            || !private_root.is_absolute()
+        {
             bail!("Built-in Tool process paths must be absolute");
         }
         core_endpoint.validate()?;
-        if !cli_executable.is_file() {
+        if remote_process.is_none() && !cli_executable.is_file() {
             bail!(
                 "bundled Rovai Agent CLI is unavailable: {}",
                 cli_executable.display()
@@ -146,10 +184,71 @@ impl BuiltinToolProcessConfig {
                 process_root,
                 process_id,
                 process_token,
+                remote_process,
+                tasks_enabled: Arc::new(AtomicBool::new(false)),
+                remote_owner: std::sync::Mutex::new(None),
             }),
         };
         config.write_context(None)?;
         Ok(config)
+    }
+
+    pub(crate) fn remote_process_key(&self) -> Option<&crate::remote_process::RemoteProcessKey> {
+        self.inner.remote_process.as_ref()
+    }
+
+    pub(crate) fn tasks_enabled(&self) -> bool {
+        self.inner.tasks_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn install_remote_owner_binding(
+        &self,
+        binding: crate::remote_process::RemoteOwnerBinding,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.remote_process_key() == Some(binding.key()),
+            "remote_builtin_owner_identity"
+        );
+        let mut current = self
+            .inner
+            .remote_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote_builtin_owner_unavailable"))?;
+        if let Some(previous) = current.as_ref() {
+            anyhow::ensure!(
+                previous.same_instance(&binding),
+                "remote_builtin_owner_conflict"
+            );
+        } else {
+            *current = Some(binding);
+        }
+        Ok(())
+    }
+
+    /// No Core lease/token is sent here: only its already-authenticated Run owner
+    /// and current capability bit reach the existing owner-control channel.
+    pub(crate) async fn synchronize_remote_tasks(
+        &self,
+        owner: crate::remote_process::AgentRunOwner,
+    ) -> Result<bool> {
+        let binding = self
+            .inner
+            .remote_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote_builtin_owner_unavailable"))?
+            .clone();
+        let Some(binding) = binding else {
+            // The pre-Open lease already carries the desired bit. Spawn installs
+            // its handle and synchronizes again before returning the process.
+            return Ok(false);
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            binding.sync_tasks(owner, self.inner.tasks_enabled.clone()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("remote_builtin_owner_timeout"))??;
+        Ok(true)
     }
 
     pub(crate) fn process_id(&self) -> &str {
@@ -173,6 +272,9 @@ impl BuiltinToolProcessConfig {
     }
 
     pub(crate) fn configure_command(&self, command: &mut Command) -> Result<()> {
+        if self.remote_process_key().is_some() {
+            bail!("remote_builtin_context_cannot_configure_local_command");
+        }
         let context_path = self
             .context_path()
             .context("Runtime requires a CLI context file")?;
@@ -211,7 +313,11 @@ impl BuiltinToolProcessConfig {
         lease: Option<BuiltinToolLeaseContext>,
         tasks_enabled: bool,
     ) -> Result<()> {
+        let tasks_enabled = lease.is_some() && tasks_enabled;
         let Some(path) = self.context_path() else {
+            self.inner
+                .tasks_enabled
+                .store(tasks_enabled, Ordering::Release);
             return Ok(());
         };
         let document = BuiltinToolCliContext {
@@ -223,7 +329,11 @@ impl BuiltinToolProcessConfig {
             lease,
             tasks_enabled,
         };
-        atomic_write_private_json(path, &document)
+        atomic_write_private_json(path, &document)?;
+        self.inner
+            .tasks_enabled
+            .store(tasks_enabled, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -287,12 +397,60 @@ impl BuiltinToolLeaseRegistry {
         native_binding: &BuiltinToolBindingCredential,
         execution_root: &Path,
     ) -> Result<BuiltinToolAuth> {
+        if config.remote_process_key().is_some() {
+            bail!("remote_builtin_workspace_requires_typed_binding");
+        }
         if !execution_root.is_absolute() || !execution_root.is_dir() {
             bail!("Built-in Tool lease requires an absolute execution workspace");
         }
         let execution_root = execution_root
             .to_str()
             .context("AgentRun workspace is not UTF-8")?;
+        self.bind_scoped(
+            config,
+            agent_run_id,
+            execution_epoch,
+            native_binding,
+            execution_root,
+        )
+        .await
+    }
+
+    /// The Core-frozen Node workspace is validated by remote_execution; never
+    /// call A's filesystem to prove a path that belongs to B.
+    pub(crate) async fn bind_remote(
+        &self,
+        config: &BuiltinToolProcessConfig,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        native_binding: &BuiltinToolBindingCredential,
+        target: &crate::remote_process::FrozenRemoteTarget,
+    ) -> Result<BuiltinToolAuth> {
+        target.validate()?;
+        let key = config
+            .remote_process_key()
+            .context("remote_builtin_process_required")?;
+        if key.node_id != target.node_id {
+            bail!("remote_builtin_target_mismatch");
+        }
+        self.bind_scoped(
+            config,
+            agent_run_id,
+            execution_epoch,
+            native_binding,
+            &target.workspace_root,
+        )
+        .await
+    }
+
+    async fn bind_scoped(
+        &self,
+        config: &BuiltinToolProcessConfig,
+        agent_run_id: &str,
+        execution_epoch: i64,
+        native_binding: &BuiltinToolBindingCredential,
+        execution_root: &str,
+    ) -> Result<BuiltinToolAuth> {
         let (binding, retired_run_tmp) = {
             let _gate = self.invocation_gate.lock().await;
             if agent_run_id.trim().is_empty() || execution_epoch <= 0 {
@@ -370,36 +528,64 @@ impl BuiltinToolLeaseRegistry {
         enabled_runs: &std::collections::HashSet<String>,
         target: Option<(&str, &str, i64)>,
     ) -> bool {
-        let processes = self.processes.lock().await;
         let mut refreshed = true;
-        for process in processes.values() {
-            if process.config.context_path().is_none() {
-                continue;
-            }
-            let Some(active) = &process.active else {
-                continue;
-            };
-            if let Some((process_id, agent_run_id, execution_epoch)) = target {
-                if process.config.process_id() != process_id
-                    || active.agent_run_id != agent_run_id
-                    || active.execution_epoch != execution_epoch
+        let mut remote_updates = Vec::new();
+        {
+            let processes = self.processes.lock().await;
+            for process in processes.values() {
+                if process.config.context_path().is_none()
+                    && process.config.remote_process_key().is_none()
                 {
                     continue;
                 }
+                let Some(active) = &process.active else {
+                    continue;
+                };
+                if let Some((process_id, agent_run_id, execution_epoch)) = target {
+                    if process.config.process_id() != process_id
+                        || active.agent_run_id != agent_run_id
+                        || active.execution_epoch != execution_epoch
+                    {
+                        continue;
+                    }
+                }
+                let context = BuiltinToolLeaseContext {
+                    execution_root: active.execution_root.clone(),
+                    run_tmp: active.run_tmp.to_string_lossy().into_owned(),
+                    lease_id: active.lease_id.clone(),
+                    lease_generation: active.lease_generation,
+                    lease_token: active.lease_token.clone(),
+                };
+                if let Err(error) = process.config.write_context_with_tasks(
+                    Some(context),
+                    enabled_runs.contains(&active.agent_run_id),
+                ) {
+                    eprintln!("Task CLI discovery refresh failed: {error:#}");
+                    refreshed = false;
+                } else if process.config.remote_process_key().is_some() {
+                    let Ok(execution_epoch) = u64::try_from(active.execution_epoch) else {
+                        refreshed = false;
+                        continue;
+                    };
+                    remote_updates.push((
+                        process.config.clone(),
+                        crate::remote_process::AgentRunOwner {
+                            agent_run_id: active.agent_run_id.clone(),
+                            execution_epoch,
+                        },
+                    ));
+                }
             }
-            let context = BuiltinToolLeaseContext {
-                execution_root: active.execution_root.clone(),
-                run_tmp: active.run_tmp.to_string_lossy().into_owned(),
-                lease_id: active.lease_id.clone(),
-                lease_generation: active.lease_generation,
-                lease_token: active.lease_token.clone(),
-            };
-            if let Err(error) = process.config.write_context_with_tasks(
-                Some(context),
-                enabled_runs.contains(&active.agent_run_id),
-            ) {
-                eprintln!("Task CLI discovery refresh failed: {error:#}");
-                refreshed = false;
+        }
+        // The invocation gate is owned by the caller, but never hold the process
+        // map lock while a remote control receipt is pending.
+        for (config, owner) in remote_updates {
+            match config.synchronize_remote_tasks(owner).await {
+                Ok(applied) => refreshed &= applied,
+                Err(error) => {
+                    eprintln!("Remote Task CLI discovery refresh failed: {error:#}");
+                    refreshed = false;
+                }
             }
         }
         refreshed
@@ -543,6 +729,34 @@ impl BuiltinToolLeaseRegistry {
         });
         let auth = matches.next().ok_or_else(run_not_bound)?;
         if matches.next().is_some() {
+            return Err(run_not_bound());
+        }
+        Ok(auth)
+    }
+
+    /// The authenticated Hub supplies only opaque process/Run ownership.
+    /// Core credentials remain here and are resolved from exactly this process.
+    pub(crate) async fn auth_for_remote_execution(
+        &self,
+        key: &crate::remote_process::RemoteProcessKey,
+        owner: &crate::remote_process::AgentRunOwner,
+    ) -> std::result::Result<BuiltinToolAuth, BuiltinToolLeaseError> {
+        let processes = self.processes.lock().await;
+        let mut matching = processes.iter().filter_map(|(id, process)| {
+            let active = process.active.as_ref()?;
+            (process.config.remote_process_key() == Some(key)
+                && active.agent_run_id == owner.agent_run_id
+                && u64::try_from(active.execution_epoch).ok() == Some(owner.execution_epoch))
+            .then(|| BuiltinToolAuth {
+                process_id: id.clone(),
+                process_token: process.process_token.clone(),
+                lease_id: active.lease_id.clone(),
+                lease_generation: active.lease_generation,
+                lease_token: active.lease_token.clone(),
+            })
+        });
+        let auth = matching.next().ok_or_else(run_not_bound)?;
+        if matching.next().is_some() {
             return Err(run_not_bound());
         }
         Ok(auth)

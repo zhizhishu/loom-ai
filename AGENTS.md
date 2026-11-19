@@ -31,5 +31,9 @@
 - When native skill discovery is unavailable, read the installed `impeccable/SKILL.md` and its
   referenced files directly. The skill is not a repository authority.
 - Do not install or enable Impeccable hooks or plugins without explicit user approval.
-- Incremental work preserves the established Rovai AI visual world. Do not enter a
-  replacement-world flow unless the user explicitly requests a redesign.
+- The user has explicitly selected the independent LOOM native Mikka/PiBot-style visual world.
+  Incremental work preserves `loom-native` and the current root DESIGN.md; do not restore legacy Rovai
+  page shells or CSS. Keep Core security/data/runtime contracts separate from visual styling.
+- Current productization scope, user corrections and verification status: `LOOM-IMPLEMENTATION.md`.
+  LOOM plans (only three are current): `docs/loom/LOOM-ARCHITECTURE.md` (architecture + per-layer reuse table), `docs/loom/LOOM-HANDOFF.md` (handoff + reuse rules), `docs/loom/LOOM-ACCEPTANCE.md` (acceptance). Older plans live in `docs/loom/archive/plans-2026-11-18/` and are history only.
+- Mindkit project memory: `PROJECT_ID.md` → `TASK.md` → `PROJECT_CONTEXT.md` (local-only); the handoff is `docs/loom/LOOM-HANDOFF.md` (Mikka + PiBot are the main body, other references are parts; read its reuse rules before writing any new module). Do not create new plan or handoff files. Do not change the parent `skill-cli` memory files for LOOM-specific work.

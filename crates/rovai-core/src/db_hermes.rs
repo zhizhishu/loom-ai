@@ -196,7 +196,8 @@ pub(super) fn migrate_rules(database: &mut Database) -> Result<()> {
 
 #[cfg(test)]
 pub(super) fn downgrade_rules_for_test(c: &Connection) {
-    super::loom::downgrade_for_test(c);
+    // 234 and 233 are the newest steps; they revert their own tables before 232..218 run.
+    super::member_capability_source_migration::downgrade_for_test(c);
     if c.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=217)",
         [],

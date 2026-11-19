@@ -9,6 +9,7 @@ import { adapterLabel, PRODUCT_RUNTIME_LOGOS } from './runtime-products'
 import { normalizedStartupConfiguration, runtimeStartupKey, startupEdits } from './runtime-startup-draft'
 import { readErrorMessage } from './error-message'
 import { UiText, uiAttribute } from './interface-language'
+import { SurfaceDialog } from './loom-native/Controls'
 
 const EMPTY: RuntimeStartupConfiguration = { programPath: null, environment: [] }
 const INSPECTION_LABELS: Record<RuntimeStartupInspection['status'], string> = {
@@ -18,9 +19,10 @@ const INSPECTION_LABELS: Record<RuntimeStartupInspection['status'], string> = {
 
 export type RuntimeStartupLeaveGuard = () => Promise<boolean>
 
-export function RuntimeStartupSettings({ runtimeKind, health, onBack, backLabel, active = true, onLeaveGuardChange }: {
+export function RuntimeStartupSettings({ runtimeKind, health, onBack, backLabel, active = true, onLeaveGuardChange, nativeTheme }: {
   runtimeKind: AdapterKind; health: RuntimeStatus | null; onBack(): void; backLabel?: string; active?: boolean
   onLeaveGuardChange?(guard: RuntimeStartupLeaveGuard | null): void
+  nativeTheme?: 'day' | 'night'
 }): React.JSX.Element {
   const client = useThreadClient()
   const common = useCommonEnvironment(runtimeKind, health?.hostPlatform === 'windows-x64')
@@ -247,7 +249,7 @@ export function RuntimeStartupSettings({ runtimeKind, health, onBack, backLabel,
         {environmentIncomplete && <p className="runtime-startup-result is-warning" role="status"><UiText zh={"部分查找来源不可用，本次结果使用已读取的可用环境。"} /></p>}
       </section>
 
-      <CommonEnvironmentEditor environment={common} disabled={locked} onChange={() => { sequence.current++; setInspection(null); setError(null); setSaveCompleted(false) }}/>
+      <CommonEnvironmentEditor environment={common} fields={Boolean(nativeTheme)} disabled={locked} onChange={() => { sequence.current++; setInspection(null); setError(null); setSaveCompleted(false) }}/>
       {saved && error && <p className="inline-error" role="alert">{error}</p>}
       {conflicts.map((conflict) => <div className="runtime-save-conflict" role="alert" key={JSON.stringify(conflict.path)}>
         <p>{conflict.label}<UiText zh={"也在外部修改过，请选择保留哪一项。其他编辑已保留。"} /></p>
@@ -266,9 +268,9 @@ export function RuntimeStartupSettings({ runtimeKind, health, onBack, backLabel,
       </footer>
     </form>
   </section></Activity>
-    <Dialog.Root open={confirmLeave} onOpenChange={(open) => { if (!open) finishLeave(false) }}><Dialog.Portal><Dialog.Overlay className="dialog-overlay app-dialog-overlay" /><AppDialogContent width="compact" tone="attention">
+    {nativeTheme ? <SurfaceDialog open={confirmLeave} title="放弃更改？" description="连接设置还未保存。" theme={nativeTheme} onClose={() => finishLeave(false)} className="ln-room-dialog"><div className="ln-room-content"><footer className="ln-form-actions"><button type="button" className="ln-action" onClick={() => finishLeave(false)}>继续编辑</button><button type="button" className="ln-action is-primary" onClick={() => finishLeave(true)}>放弃更改</button></footer></div></SurfaceDialog> : <Dialog.Root open={confirmLeave} onOpenChange={(open) => { if (!open) finishLeave(false) }}><Dialog.Portal><Dialog.Overlay className="dialog-overlay app-dialog-overlay" /><AppDialogContent width="compact" tone="attention">
       <AppDialogHeader title={uiAttribute("放弃更改？")} description={uiAttribute("当前编辑的启动设置尚未保存。")} />
       <AppDialogFooter><button className="quiet-button" data-dialog-autofocus onClick={() => finishLeave(false)}><UiText zh={"继续编辑"} /></button><button className="danger-button" onClick={() => finishLeave(true)}><UiText zh={"放弃更改"} /></button></AppDialogFooter>
-    </AppDialogContent></Dialog.Portal></Dialog.Root>
+    </AppDialogContent></Dialog.Portal></Dialog.Root>}
   </>
 }

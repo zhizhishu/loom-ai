@@ -40,6 +40,7 @@ describe('desktop node channel', () => {
       if (url.endsWith('/api/v1/nodes')) return Response.json({ nodes: [] })
       if (url.endsWith('/api/v1/nodes/pair')) return Response.json({ pairingCode: 'same-code', expiresInSeconds: 500, connectUrl: 'ws://127.0.0.1:8767/api/v1/nodes/connect' })
       if (url.endsWith('/api/v1/nodes/node_desk/revoke')) return Response.json({ nodeId: 'node_desk', revokedAt: '2026-11-01T10:19:00.000Z', status: 'offline' })
+      if (url.includes('/output/')) return Response.json({ runId: 'run-local-1', frames: [], status: 'running' })
       return new Response(JSON.stringify({ error: { code: 'missing' } }), { status: 404 })
     }
     const session: NodeChannelSession = { current: null }
@@ -51,6 +52,9 @@ describe('desktop node channel', () => {
     expect(revoked.ok && revoked.value).toMatchObject({ nodeId: 'node_desk' })
     expect(calls.filter(call => call.includes('/login'))).toHaveLength(1)
     expect(calls.some(call => call.includes('administratorToken'))).toBe(false)
+    const output = await nodeChannelCall(core(), session, 'output', undefined, fetchImpl, { runId: 'run-local-1', from: 4 })
+    expect(output.ok && output.value).toMatchObject({ runId: 'run-local-1' })
+    expect(calls.some(call => call.startsWith('GET ') && call.includes('/api/v1/nodes/runs/run-local-1/output/4'))).toBe(true)
   })
 
   it('reports a closed web service without calling login', async () => {

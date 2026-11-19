@@ -5,6 +5,8 @@ import type { NodeApi } from './nodes-api'
 
 /** Only dependencies the production business shell uses; never a replacement window.rovai. */
 export interface BusinessEnvironment {
+  /** Authenticated optional Host providers; never simulated when absent. */
+  workbench?: import('./loom-native/host-services').HostWorkbench
   navigationHistory?: import('./desktop-navigation').NavigationHistory
   client: ThreadClient
   files: FilePreviewApi

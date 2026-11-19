@@ -233,7 +233,8 @@ export function resolveAvailableNewConversationDefaults(
   const resolved = resolveNewConversationDefaults(preferences, agents, teams)
   return resolved?.members.every((agent) => isNewConversationMemberAvailable({
     runtimeConfigured: agent.runtimeConfiguration !== null,
-    runtimeReadiness: agent.runtimeReadiness.status
+    runtimeReadiness: agent.runtimeReadiness.status,
+    executionAvailability: agent.executionAvailability
   })) ? resolved : null
 }
 

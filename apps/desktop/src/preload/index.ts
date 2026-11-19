@@ -97,7 +97,8 @@ const api: RovaiApi = {
   nodes: {
     list: () => ipcRenderer.invoke('rovai:nodes', 'list'),
     pair: () => ipcRenderer.invoke('rovai:nodes', 'pair'),
-    revoke: (nodeId: string) => ipcRenderer.invoke('rovai:nodes', 'revoke', { nodeId })
+    revoke: (nodeId: string) => ipcRenderer.invoke('rovai:nodes', 'revoke', { nodeId }),
+    output: (runId: string, from: number) => ipcRenderer.invoke('rovai:nodes', 'output', { runId, from })
   },
   async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
     const transport = await ipcRenderer.invoke(

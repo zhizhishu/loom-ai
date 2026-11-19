@@ -227,9 +227,10 @@ export function createThreadAdapter(transport: ConsoleClient, selectWorkspaceDir
   const nodes: NodeApi = {
     list: () => transport.listNodes(),
     pair: () => transport.pairNode(),
-    revoke: nodeId => transport.revokeNode(nodeId)
+    revoke: nodeId => transport.revokeNode(nodeId),
+    output: (runId, from) => transport.nodeOutput(runId, from)
   }
-  const environment: BusinessEnvironment = { navigationHistory: createBrowserNavigationHistory(transport.editingScope), client, preferences, files, selectWorkspaceDirectory, nodes,
+  const environment: BusinessEnvironment = { workbench: transport.workbench, navigationHistory: createBrowserNavigationHistory(transport.editingScope), client, preferences, files, selectWorkspaceDirectory, nodes,
     serverUpdates: transport.channels === 'desktop' ? undefined : createServerUpdates(transport) }
   return { environment, profile, invalidate: (change: ThreadReadInvalidation = { resync: true }) => { for (const listener of listeners) listener(change); void refreshUpdates() } }
 }

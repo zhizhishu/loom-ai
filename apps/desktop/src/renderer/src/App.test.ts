@@ -2955,6 +2955,36 @@ describe('task event projections', () => {
     })
   })
 
+  it('keeps remote availability through Quick Chat preflight and initial member selection', () => {
+    const unconfigured = agentProfile()
+    const remote: AgentProfile = {
+      ...agentProfile(), agentId: 'remote-member', memberOrder: 1,
+      executionAvailability: {
+        location: 'remote', configured: true, canLaunch: true,
+        adapterKind: 'claude-code-cli', targetRevision: 2,
+        nodeId: 'node-b', workspaceId: 'workspace-b',
+        readiness: { status: 'installed_unverified', blockers: [] }
+      }
+    }
+    const preflight = campCreationPreflightFromAgents([remote, unconfigured])
+    expect(preflight.initialLeadAgentId).toBe(remote.agentId)
+    expect(preflight.presentMembers.find(member => member.agentId === remote.agentId))
+      .toMatchObject({ runtimeConfigured: true, runtimeReadiness: 'installed_unverified',
+        executionAvailability: remote.executionAvailability })
+    expect(planInitialThreadSelection(preflight, null))
+      .toEqual({ memberIds: [remote.agentId], leadId: remote.agentId })
+    expect(remote.runtimeConfiguration).toBeNull()
+    expect(remote.runtimeReadiness.status).toBe('runtime_not_configured')
+    remote.runtimeConfiguration = configuredRuntime('codex-cli')
+    remote.runtimeReadiness = { status: 'ready', blockers: [] }
+    remote.executionAvailability!.canLaunch = false
+    remote.executionAvailability!.readiness = {
+      status: 'needs_attention', blockers: [{ code: 'remote_node_offline', detail: null }]
+    }
+    expect(planInitialThreadSelection(campCreationPreflightFromAgents([remote, unconfigured]), null))
+      .toEqual({ memberIds: [], leadId: '' })
+  })
+
   it('orders Thread navigation by the authoritative activity sequence', () => {
     const baseThread = {
       title: '对话', activationState: 'active' as const,
@@ -3061,11 +3091,11 @@ describe('task event projections', () => {
     expect(markup).toContain('新对话')
     expect(markup).toContain('<kbd aria-hidden="true">Ctrl+K</kbd>')
     expect(markup).not.toContain('⌘K')
-    expect(markup).toContain('aria-label="Rovai AI"')
-    expect(markup).toContain('data-brand-mark="horizon"')
+    expect(markup).toContain('aria-label="LOOM"')
+    expect(markup).toContain('data-brand-mark="loom-l"')
     expect(markup).toContain('data-brand-layout="separated"')
-    expect(markup).toContain('data-brand-point="rendezvous"')
-    expect(markup).toContain('<strong>Rovai AI</strong>')
+    expect(markup).toContain('<strong>LOOM</strong>')
+    expect(markup).toContain('aria-label="搜索对话和项目"')
     expect(markup).toContain('队员')
     expect(markup).toContain('记忆，2 条普通提案待确认')
     expect(markup).toContain('使命板，3 个使命有未读回复')
@@ -3086,7 +3116,7 @@ describe('task event projections', () => {
     expect(markup).toContain(longTitle)
     expect(markup).toContain(`aria-label="【飞书话题】${longTitle}，有新回复"`)
     expect(markup).toContain(`title="【飞书话题】${longTitle} · 未读"`)
-    expect(markup).toContain(`class="truncate">【飞书话题】${longTitle}</span>`)
+    expect(markup).toContain(`class="mm-row-primary truncate">【飞书话题】${longTitle}</span>`)
     expect(markup).toContain('管理')
     expect(markup).toContain('aria-label="管理项目“rovai-ai”"')
     expect(markup).toContain('aria-label="管理“快速对话讨论”"')
@@ -3362,7 +3392,7 @@ describe('task event projections', () => {
     }))
 
     expect(markup).toContain('aria-label="设置分类"')
-    expect(markup).toContain('aria-label="Rovai AI"')
+    expect(markup).toContain('aria-label="LOOM"')
     expect(markup).toContain('返回 App')
     expect(markup).toContain('应用级偏好与本机能力')
     expect(markup.match(/class="settings-sidebar-group"/g)).toHaveLength(3)
@@ -3456,7 +3486,7 @@ describe('task event projections', () => {
       open: async () => ({ ok: true, value: null })
     }
     for (const [section, heading] of Object.entries(contentBySection) as Array<[NavigationSettingsSection, string]>) {
-      const markup = renderToStaticMarkup(createElement(SettingsView, { remoteConnection: createElement(RemoteConnectionStatus, { origin: 'http://fixture.invalid', state: 'live', onLogout: () => undefined }), remoteHosts: createElement(RemoteHostsSettings, { api: remoteHostTestApi }), nodes: createElement(NodesSettings, { api: { list: async () => ({ nodes: [] }), pair: async () => ({ pairingCode: 'code', expiresInSeconds: 600, connectUrl: 'ws://127.0.0.1:9/api/v1/nodes/connect' }), revoke: async () => ({ nodeId: 'node', revokedAt: '', status: 'offline' }) } }), preferencesApi: {} as import('@contracts').GeneralPreferencesApi, ...baseProps, section }))
+      const markup = renderToStaticMarkup(createElement(SettingsView, { remoteConnection: createElement(RemoteConnectionStatus, { origin: 'http://fixture.invalid', state: 'live', onLogout: () => undefined }), remoteHosts: createElement(RemoteHostsSettings, { api: remoteHostTestApi }), nodes: createElement(NodesSettings, { api: { list: async () => ({ nodes: [] }), pair: async () => ({ pairingCode: 'code', expiresInSeconds: 600, connectUrl: 'ws://127.0.0.1:9/api/v1/nodes/connect' }), revoke: async () => ({ nodeId: 'node', revokedAt: '', status: 'offline' }), output: async () => ({ runId: 'run', attempt: 1, nodeId: 'node', runtime: 'codex-cli', status: 'running', ackedSeq: 0, exitCode: null, frames: [], truncated: false, nextFrom: null }) } }), preferencesApi: {} as import('@contracts').GeneralPreferencesApi, ...baseProps, section }))
       if (section === 'shortcuts') {
         expect(markup).not.toContain('<h1>快捷键</h1>') // Desktop capability is required.
       } else if (section === 'mcp') {
@@ -3576,7 +3606,7 @@ describe('task event projections', () => {
       onError: () => undefined
     }))
 
-    expect(markup).toContain('跳转到对话')
+    expect(markup).toContain('搜索对话和项目')
     expect(markup).toContain('新对话')
     expect(markup).toContain('设置')
     expect(markup).toContain('should-not-render')
@@ -3669,6 +3699,8 @@ describe('task event projections', () => {
       ...workspaceProps,
       agents: [{
         ...unreadyProfile,
+        // A ready fixture must also carry an actual Runtime configuration.
+        runtimeConfiguration: configuredRuntime('codex-cli'),
         runtimeReadiness: { status: 'ready', blockers: [] }
       }]
     }))
@@ -3784,6 +3816,7 @@ describe('task event projections', () => {
     const ready = {
       ...agentProfile(),
       agentId: member.agentId,
+      runtimeConfiguration: configuredRuntime('codex-cli'),
       runtimeReadiness: { status: 'ready' as const, blockers: [] }
     }
     const unready = {

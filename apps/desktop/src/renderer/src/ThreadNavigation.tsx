@@ -1,4 +1,5 @@
 import { TeamGlyph } from './MissionDefinitionEditor'
+import { MemberAvatar } from './MemberAvatar'
 import { useShortcutAction, useShortcutLabel, useShortcuts } from './ShortcutProvider'
 import { useThreadClient } from './camp-client'
 import { useMobileLayout } from './MobileLayout'
@@ -13,6 +14,7 @@ import {
   type FormEvent,
   type JSX
 } from 'react'
+import { createPortal } from 'react-dom'
 import * as Dialog from '@radix-ui/react-dialog'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import type {
@@ -127,6 +129,10 @@ export function navigationGroupWindow(
 }
 
 export function ThreadNavigation({
+  agents = [],
+  missions = [],
+  activeMissionId = null,
+  onOpenMission,
   navigationId = 'global-navigation',
   settingsNavigation,
   footer,
@@ -176,6 +182,12 @@ export function ThreadNavigation({
   onDeleteError,
   onError
 }: {
+  /** 左栏顶部的队员列表：照 PiBot 的助手列表（头像 + 名字），点进「队员」页。 */
+  agents?: ReadonlyArray<{ agentId: string; displayName: string; avatarRef: string | null; teamRole?: string }>
+  /** 左栏使命列表：中间列表隐去后，使命切换走这里（照 Mikka 把可切换项放进左栏）。 */
+  missions?: ReadonlyArray<{ missionId: string; number: number; title: string; hasUnread: boolean }>
+  activeMissionId?: string | null
+  onOpenMission?(missionId: string): void
   navigationId?: string
   settingsNavigation?: React.ReactNode
   footer?: React.ReactNode
@@ -236,6 +248,10 @@ export function ThreadNavigation({
   const [renameProject, setRenameProject] = useState<ProjectNavigationGroup | null>(null)
   const [actionBusy, setActionBusy] = useState(false)
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const [globalSearchHost, setGlobalSearchHost] = useState<HTMLElement | null>(null)
+  useEffect(() => {
+    setGlobalSearchHost(mobile ? null : document.getElementById('loom-global-search-slot'))
+  }, [mobile])
   const loadingGroupsRef = useRef<Set<string>>(new Set())
   const navigationThreads = useMemo(
     () => navigation ? allNavigationThreads(navigation) : [],
@@ -388,26 +404,31 @@ export function ThreadNavigation({
     }
   }
 
+  const searchTrigger = <button className="conversation-jump" type="button" disabled={disabled}
+    aria-label={uiAttribute('搜索对话和项目')} onClick={() => setPaletteOpen(true)}>
+    <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4" strokeLinecap="round"/></svg>
+    <span><UiText zh={"搜索对话和项目"} /></span><kbd aria-hidden="true">{jumpLabel}</kbd>
+  </button>
+
   return (
     <>
+      {globalSearchHost && createPortal(searchTrigger, globalSearchHost)}
       <aside id={navigationId} className={`unified-sidebar ${view === 'settings' && !mobile ? 'settings-navigation-mode' : ''}${navigationCollapsed ? ' is-collapsed' : ''}`} inert={disabled || navigationCollapsed} aria-label={view === 'settings' && !mobile ? uiAttribute("设置分类") : uiAttribute("全局导航")}>
         <div className="unified-sidebar-drag" aria-hidden="true" />
         <div className="unified-brand">
-          <span className="rail-logo" role="img" aria-label="Rovai AI">
+          <span className="rail-logo" role="img" aria-label="LOOM">
             <svg
               className="rail-logo-mark"
-              data-brand-mark="horizon"
+              data-brand-mark="loom-l"
               data-brand-layout="separated"
               width="20"
               height="20"
               viewBox="0 0 24 24"
               aria-hidden="true"
             >
-              <path d="M12 2 L13.16 7.3 L17.76 8.84 L13.16 10.38 L12 15.68 L10.84 10.38 L6.24 8.84 L10.84 7.3 Z" fill="currentColor" />
-              <path d="M3 20.96 Q12 15.96 21 20.96" fill="none" stroke="currentColor" strokeWidth="2.08" strokeLinecap="round" />
-              <circle className="brand-rendezvous-point" data-brand-point="rendezvous" cx="12" cy="18.46" r="1.05" />
+              <path d="M6.8 3.4h3.3v13.9h7.3v3.3H6.8z" fill="currentColor" />
             </svg>
-            <span><strong>Rovai AI</strong></span>
+            <span><strong>LOOM</strong></span>
           </span>
         </div>
         {view === 'settings' && !mobile
@@ -448,11 +469,49 @@ export function ThreadNavigation({
                     <span className="rail-glyph" aria-hidden="true"><NavigationIcon name="calendar-clock" /></span><span className="rail-label"><UiText zh={"定时任务"} /></span>
                   </button>
                 </nav>
-                <button className="conversation-jump" type="button" onClick={() => setPaletteOpen(true)}>
-                  <span><UiText zh={"跳转到对话…"} /></span><kbd aria-hidden="true">{jumpLabel}</kbd>
-                </button>
+                {!globalSearchHost && <div className="mm-topsearch">{searchTrigger}</div>}
 
       <div className="navigation-scroll">
+        {missions.length > 0 && (
+          <section className="sidebar-agents sidebar-missions" aria-label={uiAttribute('使命')}>
+            <div className="sidebar-group-title navigation-section-title">
+              <span><UiText zh={"使命"} /></span>
+            </div>
+            {missions.map(mission => (
+              <button key={mission.missionId} type="button"
+                className={`camp-nav-row${mission.missionId === activeMissionId ? ' selected' : ''}`}
+                onClick={() => onOpenMission?.(mission.missionId)}>
+                <span className="camp-nav-open">
+                  <span className="mm-row-main">
+                    <span className="mm-row-primary">M-{String(mission.number).padStart(3, '0')}</span>
+                    <span className="mm-row-sub truncate" title={mission.title}>{mission.title}</span>
+                  </span>
+                  {mission.hasUnread && <span className="camp-status-cluster" data-status="unread" aria-hidden="true"><span className="camp-status-slot"><i className="camp-unread-dot"/></span></span>}
+                </span>
+              </button>
+            ))}
+          </section>
+        )}
+        {agents.length > 0 && (
+          <section className="sidebar-agents" aria-label={uiAttribute('队员')}>
+            <div className="sidebar-group-title navigation-section-title">
+              <span><UiText zh={"队员"} /></span>
+            </div>
+            {agents.map(agent => (
+              <button key={agent.agentId} type="button" className="camp-nav-row" onClick={onMembers}>
+                <span className="camp-nav-open">
+                  <MemberAvatar
+                    agentId={agent.agentId} avatarRef={agent.avatarRef}
+                    displayName={agent.displayName} size="workspace" decorative/>
+                  <span className="mm-row-main">
+                    <span className="mm-row-primary truncate">{agent.displayName}</span>
+                    {(agent.teamRole ?? '').trim() !== '' && <span className="mm-row-sub truncate" title={agent.teamRole}>{agent.teamRole}</span>}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </section>
+        )}
         {mobile && <header className="mobile-navigation-heading"><h2><UiText zh={"对话"} /></h2><div>
           <button className="mobile-icon-button" type="button" aria-label={uiAttribute("选择工作目录")} disabled={state !== 'ready'} onClick={onOpenProject}><NavigationIcon name="folder-open" /></button>
           <button className="mobile-icon-button" type="button" aria-label={uiAttribute("搜索对话")} onClick={() => setPaletteOpen(true)}><NavigationIcon name="search" /></button>
@@ -1194,8 +1253,14 @@ function ThreadRow({
         onClick={() => onThread(thread)}
       >
         {pinned && <span className="pinned-camp-icon" aria-hidden="true"><NavigationIcon name="messages" /></span>}
-        <span className="truncate">{title}</span>
-        {thread.activationState === 'pending' && <span className="camp-draft-badge"><UiText zh={"草稿"} /></span>}
+        <span className="mm-row-main">
+          <span className="mm-row-primary truncate">{title}</span>
+          {thread.activationState === 'pending'
+            ? <span className="mm-row-sub"><span className="camp-draft-badge"><UiText zh={"草稿"} /></span></span>
+            : loadingStatus !== null
+              ? <span className="mm-row-sub"><UiText zh={opening ? "正在打开" : "正在运行"} /></span>
+              : null}
+        </span>
         <span className="camp-status-cluster" data-status={status} aria-hidden="true">
           {showDot && <span className="camp-status-slot"><i className="camp-unread-dot" /></span>}
           {loadingStatus && <span className="camp-status-slot"><span className={`camp-loading-spinner ${opening ? 'camp-open-spinner' : 'camp-marker-loading'}`} /></span>}

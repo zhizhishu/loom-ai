@@ -18,7 +18,11 @@ async function fixture() {
   await copyFile(resolve('scripts/eval-host.mjs'), join(source, 'scripts/eval-host.mjs'))
   await copyFile(resolve('scripts/eval-wait.mjs'), join(source, 'scripts/eval-wait.mjs'))
   await copyFile(resolve('scripts/lib/windows-process-table.mjs'), join(source, 'scripts/lib/windows-process-table.mjs'))
-  await copyFile(resolve('scripts/lib/eval-host-build-path.mjs'), join(source, 'scripts/lib/eval-host-build-path.mjs'))
+  // This fixture replaces buildProduct with a synthetic file writer below.
+  // Its lifecycle assertions must not require a Rust toolchain on the CI host;
+  // the actual build-path resolver has its own executable/PATH contract tests.
+  await writeFile(join(source, 'scripts/lib/eval-host-build-path.mjs'),
+    "export async function evaluationBuildPath() { return process.env.PATH ?? ''; }\n")
   await writeFile(join(source, 'scripts/lib/context-weekly.mjs'), "export { runPlan as runWeekly } from './context-evaluation.mjs'\n")
   await writeFile(join(source, 'scripts/lib/context-evaluation.mjs'), `
 import {mkdir, readFile, writeFile} from 'node:fs/promises';
@@ -92,6 +96,24 @@ async function processHasLiveExecution(pid: number): Promise<boolean> {
   return true
 }
 
+// Terminal-state assertions stay exactly as before; on failure this names the
+// real job outcome and the worker's own last words instead of only a poll diff.
+async function expectJobState(f: Awaited<ReturnType<typeof fixture>>, jobId: string, expected: string, timeout?: number) {
+  const started = Date.now(); let job: Record<string, unknown> | undefined
+  try {
+    await expect.poll(async () => {
+      const value = await f.service.status({ jobId })
+      if (!value || typeof value !== 'object') throw new Error('Evaluation status is not an object')
+      job = value as Record<string, unknown>
+      return job.state
+    }, timeout === undefined ? {} : { timeout }).toBe(expected)
+  } catch (cause) {
+    const tail = await readFile(join(f.root, `owner/evaluation/jobs/${jobId}/worker.log`), 'utf8')
+      .then(text => text.slice(-2000)).catch(() => '<no worker.log: Host-side start failure>')
+    throw new Error(`job ${jobId} expected ${expected} after ${Date.now() - started}ms | state=${job?.state} reason=${job?.reason} endedAt=${job?.endedAt} reportStatus=${job?.reportStatus} | engine=${job?.engine === null ? 'null (Host #start threw)' : 'set'} directory=${job?.directory} | core=${f.calls.join(',')} | worker.log:\n${tail}`, { cause })
+  }
+}
+
 it('does no Core queries or writes until configured; freezes installation and manual job identity independently of Gate verdict', async () => {
   const f = await fixture()
   try {
@@ -102,7 +124,7 @@ it('does no Core queries or writes until configured; freezes installation and ma
     const params = { jobId: 'manual-1', plan: await f.plan('gate'), output: join(f.workspace, 'manual') }
     await expect(f.service.start({ ...params, command: 'arbitrary' }, 'gate')).rejects.toThrow('Unsupported')
     await f.service.start(params, 'gate')
-    await expect.poll(async () => (await f.service.status({ jobId: params.jobId }) as { state: string }).state).toBe('completed')
+    await expectJobState(f, params.jobId, 'completed')
     const result = await f.service.status({ jobId: params.jobId }) as { reportStatus: string }
     expect(result.reportStatus).toBe('insufficient')
     expect(await f.service.start(params, 'gate')).toEqual(await f.service.status({ jobId: params.jobId }))
@@ -126,7 +148,7 @@ it('binds an existing Automation and consumes each accepted run once, exposing o
     f.setRuns([{ runId: 'auto-run-1', threadId: 'camp-1', status: 'running', createdAt: now.toISOString() }])
     f.consumeOnce() // Core consumes once schedules without an owner version change.
     await f.service.tick(now)
-    await expect.poll(async () => (await f.service.status({ jobId: 'auto-run-1' }) as { state: string }).state).toBe('completed')
+    await expectJobState(f, 'auto-run-1', 'completed')
     await f.service.tick(new Date(now.getTime() + 6000))
     const receipt = JSON.parse(await readFile(join(output, 'automation/camp-1.json'), 'utf8'))
     expect(receipt).toMatchObject({ jobId: 'auto-run-1', threadId: 'camp-1', state: 'completed', reportStatus: 'insufficient' })
@@ -149,7 +171,7 @@ it.each(['cancel', 'stop'] as const)('stops the actual worker and its detached d
     const pid = Number(await readFile(join(output, 'fixture-child.pid'), 'utf8'))
     if (operation === 'cancel') await f.service.cancel({ jobId: 'cancel-1' })
     else await f.service.stop()
-    await expect.poll(async () => (await f.service.status({ jobId: 'cancel-1' }) as { state: string }).state, { timeout: 15000 }).toBe('interrupted')
+    await expectJobState(f, 'cancel-1', 'interrupted', 15000)
     await expect.poll(() => processHasLiveExecution(pid), { timeout: 5000 }).toBe(false)
     expect(await f.service.status({ jobId: 'cancel-1' })).toMatchObject({ reason: operation === 'cancel' ? 'cancelled_by_owner' : 'app_shutdown', reportStatus: null })
   } finally { await f.close() }

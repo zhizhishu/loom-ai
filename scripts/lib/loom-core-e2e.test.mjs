@@ -208,7 +208,9 @@ function startCore(dataDir, skillRoot, mcpPath) {
   let resolveReady
   let rejectReady
   const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
-  const startupTimeout = setTimeout(() => rejectReady(new Error(`Core ready timeout: ${stderr}`)), 15000)
+  // A fresh protected DACL root makes authority initialization slow, so this budget matches
+  // startIsolatedCore below instead of timing out on a Core that is merely still starting.
+  const startupTimeout = setTimeout(() => rejectReady(new Error(`Core ready timeout: ${stderr}`)), 60000)
   const closed = new Promise((resolve) => child.once('close', resolve))
   child.stdin.on('error', () => {})
   child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8000) })
@@ -821,6 +823,16 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
       downstreamTaskId: verificationOnlyDownstreamId,
       version: 'ac-verify-only'
     })
+    // A check is judged against the bytes that were registered, not against whatever the workspace
+    // holds now: this file is rewritten after registration and the check below still passes.
+    const verificationOnlyRewritten = `${verificationOnlyArtifact.evidence.contents}rewritten after registration\n`
+    await writeWorkspaceFile(verificationOnlyArtifact.evidence.relativePath, verificationOnlyRewritten)
+    assert.equal(
+      sha256Of(await readFile(join(workspaceDirectory, verificationOnlyArtifact.evidence.relativePath))),
+      sha256Of(verificationOnlyRewritten),
+      `the evidence file must hold the rewritten bytes: ${verificationOnlyArtifact.evidence.relativePath}`)
+    assert.notEqual(sha256Of(verificationOnlyRewritten), verificationOnlyArtifact.evidence.artifact.sha256,
+      'the rewritten bytes must differ from the registered digest')
     const verificationOnly = await core.request('loom.verification.record', {
       missionId: verificationOnlyMissionId,
       taskId: verificationOnlyUpstreamId,
@@ -966,8 +978,10 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     await expectListLength('loom.candidates.list', unregisteredMissionId, 0,
       'a candidate citing unregistered evidence must not be recorded')
 
-    // (h2) Changed bytes cannot pass: the same candidate, checked with result=passed over a file
-    // that was rewritten after registration, must be refused and store nothing.
+    // (h2) Changed bytes cannot pass: the archived Blob, which is what a check actually reads, is
+    // damaged on disk below, so the very first check over it must be refused and store nothing.
+    // The positive half - a rewritten workspace file that leaves the archived digest alone - is
+    // covered by the verification-only chain above.
     const tamperMissionId = await createMission('LOOM tampered evidence')
     const tamperUpstreamId = 'loom-tamper-upstream'
     const tamperDownstreamId = 'loom-tamper-downstream'
@@ -997,31 +1011,94 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     })
     const tamperedContents = `${tamperArtifact.evidence.contents}rewritten after registration\n`
     await writeWorkspaceFile(tamperArtifact.evidence.relativePath, tamperedContents)
-    // The tamper has to be real on disk, or the rejection below would prove nothing.
+    // The tamper has to be real on disk, or the archived-bytes proof below would say nothing.
     assert.equal(
       sha256Of(await readFile(join(workspaceDirectory, tamperArtifact.evidence.relativePath))),
       sha256Of(tamperedContents),
       `the evidence file must hold the rewritten bytes: ${tamperArtifact.evidence.relativePath}`)
     assert.notEqual(sha256Of(tamperedContents), tamperArtifact.evidence.artifact.sha256,
       'the rewritten bytes must differ from the registered digest')
-    const tamperedPassedCommandId = randomUUID()
-    await expectRejection(core.request('loom.verification.record', {
-      missionId: tamperMissionId,
-      taskId: tamperUpstreamId,
-      candidateId: tamperArtifact.candidate.candidateId,
-      commandId: tamperedPassedCommandId,
-      method: 'e2e',
-      result: 'passed',
-      evidenceIds: [tamperArtifact.evidence.artifactId],
-      executorId: 'fake'
-    }), 'loom.verification.record', 'LOOM_EVIDENCE_HASH_MISMATCH')
-    await expectListLength('loom.verifications.list', tamperMissionId, 0,
-      'a passing check over changed bytes must not record a verification')
-    const [untouchedCandidate] = await core.request('loom.candidates.list', { missionId: tamperMissionId })
-    assert.equal(untouchedCandidate.candidateId, tamperArtifact.candidate.candidateId,
-      `the refused check must leave its candidate alone: ${JSON.stringify(untouchedCandidate)}`)
-    assert.equal(untouchedCandidate.verificationStatus, 'unverified',
-      `a refused passing check must not verify the candidate: ${JSON.stringify(untouchedCandidate)}`)
+    // A passing check reads the archived bytes, so the first check over this candidate must be
+    // refused once the archive itself is damaged. Its location is never guessed: the artifact's
+    // snapshot row names the Blob, the Blob row names its storage path, and both are read
+    // read-only and closed again before a single byte is written. Everything is restored in the
+    // finally block, so the failed-check chain below runs over the registered bytes.
+    const archivedSha256 = tamperArtifact.evidence.artifact.sha256
+    let snapshotRow
+    let blobRow
+    let blobPath
+    {
+      let blobRead
+      try {
+        blobRead = new DatabaseSync(join(dataDir, 'rovai.sqlite'), { readOnly: true })
+        snapshotRow = blobRead.prepare(
+          'SELECT blob_id, sha256, size_bytes FROM loom_artifact_snapshot WHERE artifact_id = ?'
+        ).get(tamperArtifact.evidence.artifactId)
+        assert.ok(snapshotRow,
+          `the registered artifact must own one archived snapshot: ${tamperArtifact.evidence.artifactId}`)
+        assert.equal(snapshotRow.sha256, archivedSha256,
+          `the snapshot must store the registered digest: ${JSON.stringify(snapshotRow)}`)
+        blobRow = blobRead.prepare(
+          'SELECT sha256, byte_size, storage_relative_path, state FROM managed_blob WHERE id = ?'
+        ).get(snapshotRow.blob_id)
+        assert.ok(blobRow, `the snapshot must resolve to one Managed Blob: ${JSON.stringify(snapshotRow)}`)
+        assert.equal(blobRow.sha256, archivedSha256,
+          `the Managed Blob must be content-addressed by the registered digest: ${JSON.stringify(blobRow)}`)
+        assert.equal(blobRow.byte_size, snapshotRow.size_bytes,
+          `the Managed Blob must agree with its snapshot size: ${JSON.stringify(blobRow)}`)
+      } finally {
+        if (blobRead) blobRead.close()
+      }
+      const blobRoot = resolve(dataDir, 'managed-blobs')
+      assert.equal(isAbsolute(blobRow.storage_relative_path), false,
+        `a stored Managed Blob path must be relative to Core's data dir: ${JSON.stringify(blobRow)}`)
+      blobPath = resolve(blobRoot, blobRow.storage_relative_path)
+      assert.ok(!isAbsolute(relative(blobRoot, blobPath)) && relative(blobRoot, blobPath) !== ''
+        && !relative(blobRoot, blobPath).startsWith(`..${sep}`) && relative(blobRoot, blobPath) !== '..',
+      `the Managed Blob path must stay inside ${blobRoot}: ${blobPath}`)
+    }
+    const originalBlobStat = await lstat(blobPath)
+    assert.ok(originalBlobStat.isFile() && !originalBlobStat.isSymbolicLink(),
+      `the archived Blob must be one plain file, never a link: ${blobPath}`)
+    const originalBlobBytes = await readFile(blobPath)
+    assert.equal(sha256Of(originalBlobBytes), archivedSha256,
+      `the archived Blob must still hold the registered bytes: ${blobPath}`)
+    assert.equal(originalBlobBytes.length, snapshotRow.size_bytes,
+      `the archived Blob must keep its recorded size: ${JSON.stringify(snapshotRow)}`)
+    assert.equal(originalBlobBytes.toString('utf8'), tamperArtifact.evidence.contents,
+      `the archived Blob must hold exactly the registered evidence: ${blobPath}`)
+    const damagedBlobBytes = Buffer.from(originalBlobBytes)
+    damagedBlobBytes[damagedBlobBytes.length - 1] ^= 0xff
+    assert.equal(damagedBlobBytes.length, originalBlobBytes.length,
+      'the damage must keep the recorded size so the refusal is about content, not truncation')
+    assert.notEqual(sha256Of(damagedBlobBytes), archivedSha256,
+      'the damaged bytes must differ from the registered digest')
+    try {
+      await writeFile(blobPath, damagedBlobBytes)
+      assert.equal(sha256Of(await readFile(blobPath)), sha256Of(damagedBlobBytes),
+        `the archived Blob must really hold the damaged bytes: ${blobPath}`)
+      await expectRejection(core.request('loom.verification.record', {
+        missionId: tamperMissionId,
+        taskId: tamperUpstreamId,
+        candidateId: tamperArtifact.candidate.candidateId,
+        commandId: randomUUID(),
+        method: 'e2e',
+        result: 'passed',
+        evidenceIds: [tamperArtifact.evidence.artifactId],
+        executorId: 'fake'
+      }), 'loom.verification.record', 'LOOM_EVIDENCE_UNREADABLE')
+      await expectListLength('loom.verifications.list', tamperMissionId, 0,
+        'a check over a damaged archive must record no verification')
+      const [stillUnverifiedCandidate] = await core.request('loom.candidates.list', { missionId: tamperMissionId })
+      assert.equal(stillUnverifiedCandidate.candidateId, tamperArtifact.candidate.candidateId,
+        `the Mission must list exactly its one candidate: ${JSON.stringify(stillUnverifiedCandidate)}`)
+      assert.equal(stillUnverifiedCandidate.verificationStatus, 'unverified',
+        `a refused check must leave the candidate unverified: ${JSON.stringify(stillUnverifiedCandidate)}`)
+    } finally {
+      await writeFile(blobPath, originalBlobBytes)
+      assert.equal(sha256Of(await readFile(blobPath)), archivedSha256,
+        `the archived Blob must be restored to its registered bytes: ${blobPath}`)
+    }
 
     // (h3) The same changed bytes may still be *reported as failing*: a failed check is a
     // conclusion, not a claim about the bytes, so it records and moves only the check axis.
@@ -1096,7 +1173,7 @@ test('a real Core carries one LOOM delivery through release, claim, candidate, r
     assert.deepEqual([...new Set(verificationRows.map(row => row.executor_id))], ['local_user'],
       `every stored verification must carry the Host identity, never the spoofed executorId: ${JSON.stringify(verificationRows)}`)
     // Three chains pass (the accepted delivery, the verification-only chain and the rejected
-    // chain); the tampered-bytes chain is the one recorded failure.
+    // chain); the damaged-archive chain is the one recorded failure.
     const passedVerificationRows = verificationRows.filter(row => row.result === 'PASSED')
     assert.equal(passedVerificationRows.length, 3,
       `each passing chain must store exactly one PASSED check: ${JSON.stringify(verificationRows)}`)

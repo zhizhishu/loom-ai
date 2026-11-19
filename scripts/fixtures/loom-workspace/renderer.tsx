@@ -1,13 +1,23 @@
 import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { AgentProfile, MissionActivity, MissionDelivery, MissionRecord, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
+import type { AgentProfile, ExecutionNodeRecord, MissionActivity, MissionDelivery, MissionRecord, NodeOutputPage, LoomPlan, LoomTask, LoomTaskStatus, LoomDependency, LoomCandidate, LoomReview, LoomVerification, LoomReviewRecordInput, LoomReviewRecordReceipt, LoomVerificationRecordInput, LoomVerificationRecordReceipt, LoomClaim, LoomClaimsListResult, LoomArtifact, LoomArtifactsListResult } from '@contracts'
+// 控制层类型只从 renderer 的唯一切换点取，不在夹具里另写一套。
+import type { LoomControlPauseInput, LoomControlPolicy, LoomControlPolicyInput, LoomControlSnapshot, LoomDispatch, LoomStageReview } from '../../../apps/desktop/src/renderer/src/loom-control-model'
 import { LoomWorkspace } from '../../../apps/desktop/src/renderer/src/LoomWorkspace'
+import type { NodeApi } from '../../../apps/desktop/src/renderer/src/nodes-api'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { applyAppearanceSnapshot } from '../../../apps/desktop/src/renderer/src/theme'
 import { DEFAULT_APPEARANCE } from '../../../apps/desktop/src/shared/appearance'
+import type { LoomArtifactPreviewInput, LoomArtifactPreviewResult } from '@contracts'
 import '../../../apps/desktop/src/renderer/src/styles.css'
 import '../../../apps/desktop/src/renderer/src/mission.css'
 import '../../../apps/desktop/src/renderer/src/loom-workspace.css'
+// Mikka 外壳／对话／右栏 + 组合层：夹具是独立的右栏工作区，不是 navigation-shell，
+// 所以只给根节点挂 .loom-mikka 拿到令牌与作用域，不引入外壳布局。
+import '../../../apps/desktop/src/renderer/src/loom-mikka-shell.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka-chat.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka-panel.css'
+import '../../../apps/desktop/src/renderer/src/loom-mikka.css'
 
 // UI-only acceptance for the production LOOM workspace: production component tree,
 // production stylesheets and a deterministic in-memory Thread client.
@@ -28,7 +38,7 @@ type LoomState = {
   verifications: LoomVerification[]
 }
 // 认领回读的六种回包形态：空 / held / 同任务多代次 / 租约过期 / 已释放 / 认领者为空。
-type LoomClaimsScenario = 'empty' | 'held' | 'multiGeneration' | 'expired' | 'released' | 'anonymous'
+type LoomClaimsScenario = 'empty' | 'held' | 'multiGeneration' | 'expired' | 'released' | 'anonymous' | 'live'
 type LoomQa = {
   calls: LoomCall[]
   writes: LoomWrite[]
@@ -40,6 +50,12 @@ type LoomQa = {
   setTheme(theme: 'day' | 'night'): void
   setClaims(scenario: LoomClaimsScenario, options?: { fail?: boolean }): void
   setArtifacts(options?: { fail?: boolean }): void
+  setLive(mode: 'mixed' | 'none'): void
+  failClaimsWithNodes(): void
+  setPlanHidden(hidden: boolean): void
+  setControl(options?: { fail?: boolean; approved?: boolean; paused?: boolean; partial?: boolean }): void
+  setReworkChain(): void
+  driftControlRevision(): void
 }
 declare global { interface Window { loomQA: LoomQa } }
 
@@ -111,14 +127,14 @@ const tasks: LoomTask[] = [
     title: '实现恢复逻辑', description: '从快照恢复工作区状态',
     assigneeAgentId: 'agent-build', status: 'in_review',
     acceptanceCriteria: plan.acceptanceCriteria,
-    blockedReason: null, createdAt, updatedAt: submittedAt, revision: 2
+    blockedReason: null, executionHostId: 'node_local', createdAt, updatedAt: submittedAt, revision: 2
   },
   {
     taskId: 'task-4', planId: plan.planId,
     title: '验收测试', description: '验证恢复正确性',
     assigneeAgentId: 'agent-lead', status: 'blocked',
     acceptanceCriteria: plan.acceptanceCriteria,
-    blockedReason: '等待恢复逻辑完成', createdAt, updatedAt: createdAt, revision: 1
+    blockedReason: '等待恢复逻辑完成', executionHostId: 'node_desk', createdAt, updatedAt: createdAt, revision: 1
   }
 ]
 
@@ -182,7 +198,68 @@ const claimsByScenario: Readonly<Record<LoomClaimsScenario, LoomClaim[]>> = {
   // e. 已释放（且刻意让 expired 也为 true）：释放是结论，过期只是没续上，UI 必须先认释放。
   released: [makeClaim({ claimId: 'claim-task-1-fence-1', taskId: 'task-1', agentRunId: 'run-2b2b2b22', claimantAgentId: 'agent-build', releasedAt: claimReleasedAt, expired: true })],
   // f. claimantAgentId 为 null：没有绑定 Agent 的认领只能回退到 agentRunId 原值。
-  anonymous: [makeClaim({ claimId: 'claim-task-2-fence-1', taskId: 'task-2', agentRunId: 'run-7f7f7f7f', claimantAgentId: null })]
+  anonymous: [makeClaim({ claimId: 'claim-task-2-fence-1', taskId: 'task-2', agentRunId: 'run-7f7f7f7f', claimantAgentId: null })],
+  live: [
+    makeClaim({ claimId: 'claim-live-local', taskId: 'task-3', agentRunId: 'run-local-1', claimantAgentId: 'agent-build' }),
+    makeClaim({ claimId: 'claim-live-remote', taskId: 'task-4', agentRunId: 'run-remote-1', claimantAgentId: 'agent-lead' })
+  ]
+}
+
+function encodeFrame(text: string): string {
+  const bytes = new TextEncoder().encode(text)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
+
+let liveNodes: ExecutionNodeRecord[] = []
+let liveLines: string[] = []
+let planHidden = false
+
+function mixedNodes(): ExecutionNodeRecord[] {
+  const startedAt = new Date(Date.now() - 90_000).toISOString()
+  const heartbeat = new Date(Date.now() - 40_000).toISOString()
+  return [
+    {
+      nodeId: 'node_local', displayName: 'loom-a', role: 'local', revocable: false, status: 'online',
+      os: 'linux', arch: 'x64', pairedAt: startedAt, revokedAt: null, lastHeartbeat: new Date().toISOString(),
+      activeRunCount: 1,
+      activeRuns: [{ runId: 'run-local-1', attempt: 1, runtime: 'codex-cli', status: 'running', ackedSeq: 1, startedAt }],
+      clis: []
+    },
+    {
+      nodeId: 'node_desk', displayName: 'desk-b', role: 'remote', revocable: true, status: 'offline',
+      os: 'linux', arch: 'x64', pairedAt: startedAt, revokedAt: null, lastHeartbeat: heartbeat,
+      activeRunCount: 1,
+      activeRuns: [{ runId: 'run-remote-1', attempt: 1, runtime: 'claude-code-cli', status: 'running', ackedSeq: 8, startedAt }],
+      clis: []
+    }
+  ]
+}
+
+const fixtureNodes: NodeApi = {
+  list: async () => ({ nodes: structuredClone(liveNodes) }),
+  pair: async () => { throw new Error('LOOM fixture does not pair nodes') },
+  revoke: async () => { throw new Error('LOOM fixture does not revoke nodes') },
+  output: async (runId, from): Promise<NodeOutputPage> => {
+    if (runId === 'run-local-1' && liveLines.length < 40) liveLines.push(`帧 ${liveLines.length + 1}`)
+    const source = runId === 'run-local-1' ? liveLines : ['远端停在断线前']
+    const frames = source.map((text, index) => ({ seq: index + 1, stream: 'stdout', data: encodeFrame(text) }))
+      .filter(frame => frame.seq >= from)
+    const last = frames.at(-1)
+    return {
+      runId,
+      attempt: 1,
+      nodeId: runId === 'run-remote-1' ? 'node_desk' : 'node_local',
+      runtime: runId === 'run-remote-1' ? 'claude-code-cli' : 'codex-cli',
+      status: 'running',
+      ackedSeq: source.length,
+      exitCode: null,
+      frames,
+      truncated: false,
+      nextFrom: last ? last.seq + 1 : from
+    }
+  }
 }
 
 let claimsScenario: LoomClaimsScenario = 'empty'
@@ -222,6 +299,128 @@ let artifactsReadFails = false
 function readArtifacts(): LoomArtifactsListResult {
   if (artifactsReadFails) throw new Error('LOOM fixture forced the artifacts projection read to fail')
   return { artifacts: structuredClone(artifacts) }
+}
+
+// 正文只读预览：只有 evidence-1 归档了正文，文本固定，供浮层断言使用；其余产物按 Core 的语义
+// 回 not_archived，不编造正文。预览不记录任何验收/核验状态。
+const artifactPreviewText: Readonly<Record<string, string>> = {
+  'evidence-1': '# 恢复协议\n\n恢复顺序：快照 → 校验 → 回放。\n回滚窗口：15 分钟。\n\nLOOM-PREVIEW-READY\n'
+}
+
+function readArtifactPreview(input: LoomArtifactPreviewInput): LoomArtifactPreviewResult {
+  const artifact = artifacts.find(entry => entry.artifactId === input.artifactId)
+  if (artifact === undefined) throw new Error(`LOOM fixture has no artifact ${input.artifactId}`)
+  const text = artifactPreviewText[artifact.artifactId]
+  return {
+    artifactId: artifact.artifactId,
+    relativePath: artifact.relativePath,
+    contentType: artifact.contentType,
+    sizeBytes: artifact.sizeBytes,
+    sha256: artifact.sha256,
+    text: text === undefined ? null : text,
+    unavailableReason: text === undefined ? 'not_archived' : null
+  }
+}
+
+// 助手审查（stageReviews）与技术核验、用户接受是三条独立的轴。
+// 基线：candidate-1 阶段审查通过，candidate-2 还没有审查（任务停在 in_review）。
+const stageReviewsBaseline: LoomStageReview[] = [{
+  stageReviewId: 'stage-review-1', taskId: 'task-1', candidateId: 'candidate-1',
+  reviewerAgentId: 'agent-lead', reviewerAgentRunId: 'run-review-1', policyRevision: 1,
+  manifestHash: 'sha256:manifest-1', verdict: 'pass', reason: '协议与验收标准一一对应',
+  criteriaResults: loomCriteria.criteria.map((criterion, index) => ({
+    criterionId: criterion.criterionId, satisfied: true,
+    evidenceIds: index === 0 ? ['evidence-1'] : [], note: null
+  })),
+  reviewedAt: artifactsRegisteredAt
+}]
+
+// 派发记录：一条已结算的执行派发 + 一条在途的审查派发，预算用得起来也读得出来。
+const dispatchesBaseline: LoomDispatch[] = [
+  { dispatchId: 'dispatch-1', taskId: 'task-3', kind: 'execute', candidateId: null, policyRevision: 1, recipientAgentId: 'agent-build', deliveryId: null, status: 'settled', reason: null, createdAt },
+  { dispatchId: 'dispatch-2', taskId: 'task-3', kind: 'review', candidateId: 'candidate-2', policyRevision: 1, recipientAgentId: 'agent-lead', deliveryId: null, status: 'dispatched', reason: '等待助手审查结论', createdAt: submittedAt }
+]
+
+// 返工链场景：candidate-2 被要求返工，所以 candidate-3 沿 previousCandidateId 出现。
+// 旧版（candidate-2）必须从界面上失去接受入口——这条只能靠真实数据造出来。
+const reworkCandidate: LoomCandidate = {
+  candidateId: 'candidate-3', taskId: 'task-3', agentRunId: 'run-3',
+  contentHash: 'sha256:restore-runtime-v2', evidenceIds: ['evidence-1'], acceptanceCriteria: loomCriteria,
+  previousCandidateId: 'candidate-2', verificationStatus: 'unverified', acceptanceStatus: 'pending',
+  createdAt: '2026-09-27T09:10:00.000Z'
+}
+const reworkStageReview: LoomStageReview = {
+  stageReviewId: 'stage-review-2', taskId: 'task-3', candidateId: 'candidate-2',
+  reviewerAgentId: 'agent-lead', reviewerAgentRunId: 'run-review-2', policyRevision: 1,
+  manifestHash: 'sha256:manifest-2', verdict: 'request_changes', reason: '恢复失败分支没有覆盖',
+  criteriaResults: loomCriteria.criteria.map((criterion, index) => ({
+    criterionId: criterion.criterionId, satisfied: index === 0,
+    evidenceIds: [], note: index === 0 ? null : '缺失败分支证据'
+  })),
+  reviewedAt: submittedAt
+}
+
+// 控制投影：策略默认为 null（真实未批准）。controlRevision 是 Core 侧修订计数（任何 write +1），
+// controlAuthorizationRevision 只在 configure 时 +1——两者分开记才能造出「别人改了策略」的冲突，
+// 也才能证明 pause/resume 不会让旧授权的审查突然复活。
+type FixtureControlPolicy = LoomControlPolicy & { authorizationRevision: number }
+let controlPolicy: FixtureControlPolicy | null = null
+let controlRevision = 0
+let controlAuthorizationRevision = 0
+let controlReadFails = false
+let controlPartial = false
+let stageReviews: LoomStageReview[] = structuredClone(stageReviewsBaseline)
+let dispatches: LoomDispatch[] = structuredClone(dispatchesBaseline)
+
+function controlSnapshot(): LoomControlSnapshot {
+  if (controlReadFails) throw new Error('LOOM fixture forced the control projection read to fail')
+  const snapshot = {
+    missionId: mission.missionId,
+    policy: controlPolicy === null ? null : structuredClone(controlPolicy),
+    stageReviews: structuredClone(stageReviews),
+    dispatches: structuredClone(dispatches),
+    evaluatedAt: claimsEvaluatedAt
+  }
+  if (controlPartial) {
+    // 缺必需字段的投影：界面必须落到「读不到」，不能当成「未批准」。
+    const partial = snapshot as unknown as Record<string, unknown>
+    if (snapshot.policy !== null) delete (partial.policy as Record<string, unknown>).authorizationRevision
+    delete partial.dispatches
+  }
+  return snapshot
+}
+
+// 修订冲突是真冲突：expectedRevision 对不上就抛，和 Core 的乐观并发一致。
+function expectControlRevision(expectedRevision: number): void {
+  if (expectedRevision !== controlRevision) {
+    throw new Error(`loom control revision conflict: expected ${expectedRevision} but current is ${controlRevision}`)
+  }
+}
+
+function configureControl(input: LoomControlPolicyInput): LoomControlSnapshot {
+  expectControlRevision(input.expectedRevision)
+  controlRevision += 1
+  // configure 是唯一推进授权修订的写入：旧授权下的审查从此失效。
+  controlAuthorizationRevision += 1
+  controlPolicy = {
+    missionId: input.missionId, planId: plan.planId, revision: controlRevision,
+    authorizationRevision: controlAuthorizationRevision,
+    enabled: input.enabled, paused: false,
+    taskIds: [...input.taskIds],
+    reviewers: input.reviewers.map(reviewer => ({ ...reviewer })),
+    maxDispatches: input.maxDispatches, maxReworksPerTask: input.maxReworksPerTask,
+    expiresAt: input.expiresAt, approvedBy: 'local_user',
+    approvedAt: writeStamp, updatedAt: writeStamp
+  }
+  return controlSnapshot()
+}
+
+function pauseControl(input: LoomControlPauseInput): LoomControlSnapshot {
+  if (controlPolicy === null) throw new Error('LOOM fixture has no control policy to pause')
+  expectControlRevision(input.expectedRevision)
+  controlRevision += 1
+  controlPolicy = { ...controlPolicy, revision: controlRevision, paused: input.paused, updatedAt: writeStamp }
+  return controlSnapshot()
 }
 
 const delivery: MissionDelivery = {
@@ -373,9 +572,21 @@ async function request<T>(method: string, params: unknown = {}): Promise<T> {
   } else if (method === 'loom.claims.list') {
     // 认领投影按场景生成；读失败开关在这里抛错，让 UI 走「认领状态未知」分支。
     reply = readClaims()
+  } else if (planHidden && (method === 'loom.plan.get' || method === 'loom.tasks.list' || method === 'loom.dependencies.list')) {
+    reply = method === 'loom.plan.get' ? null : []
   } else if (method === 'loom.artifacts.list') {
     // 产物投影固定两条；读失败开关在这里抛错，让 UI 只降级候选卡的产物区。
     reply = readArtifacts()
+  } else if (method === 'loom.artifact.preview') {
+    // 正文只读预览（LoomArtifactPreviewResult）：固定文本，不动任何写入口。
+    reply = readArtifactPreview(params as LoomArtifactPreviewInput)
+  } else if (method === 'loom.control.get') {
+    // 控制投影：读失败开关在这里抛错，UI 只能落到「读不到」，不许冒充未启用。
+    reply = controlSnapshot()
+  } else if (method === 'loom.control.configure') {
+    reply = configureControl(params as LoomControlPolicyInput)
+  } else if (method === 'loom.control.pause') {
+    reply = pauseControl(params as LoomControlPauseInput)
   } else if (method === 'missions.diffSession.release') {
     // 写成功后的收尾副作用：只应答，不进 writes，也不参与 loom 写方法统计。
     reply = { released: true }
@@ -414,14 +625,17 @@ function LoomFixture() {
   const [generation, setGeneration] = useState(0)
   remountWorkspace = () => setGeneration(current => current + 1)
   return <ThreadClientProvider client={client}>
+    <div className="loom-mikka" data-loom-generation={generation} style={{ display: 'contents' }}>
     <LoomWorkspace
       key={generation}
       mission={mission}
       agents={agents}
+      nodes={fixtureNodes}
       onSource={messageId => { selections.push(messageId) }}
       onNotify={() => undefined}
       onWorkspaceCleanupRequested={async () => undefined}
     />
+    </div>
   </ThreadClientProvider>
 }
 
@@ -437,8 +651,19 @@ window.loomQA = {
     // 认领回读也回初始态：空列表、读成功，下一条用例自己切形态。
     claimsScenario = 'empty'
     claimsReadFails = false
+    liveNodes = []
+    liveLines = []
+    planHidden = false
     // 产物回读同样回初始态：两条已登记产物、读成功。
     artifactsReadFails = false
+    // 控制投影回初始态：没有批准过策略、两个修订归零、读成功、基线审查与派发。
+    controlPolicy = null
+    controlRevision = 0
+    controlAuthorizationRevision = 0
+    controlReadFails = false
+    controlPartial = false
+    stageReviews = structuredClone(stageReviewsBaseline)
+    dispatches = structuredClone(dispatchesBaseline)
     calls.length = 0
     writes.length = 0
     remountWorkspace()
@@ -454,6 +679,73 @@ window.loomQA = {
   setArtifacts: options => {
     artifactsReadFails = options?.fail === true
     remountWorkspace()
+  },
+  setLive: mode => {
+    planHidden = false
+    liveLines = []
+    claimsReadFails = false
+    if (mode === 'none') {
+      liveNodes = []
+      claimsScenario = 'empty'
+    } else {
+      liveNodes = mixedNodes()
+      claimsScenario = 'live'
+    }
+    remountWorkspace()
+  },
+  failClaimsWithNodes: () => {
+    planHidden = false
+    liveLines = []
+    liveNodes = mixedNodes()
+    claimsScenario = 'live'
+    claimsReadFails = true
+    remountWorkspace()
+  },
+  setPlanHidden: hidden => {
+    planHidden = hidden
+    remountWorkspace()
+  },
+  // 控制投影开关：读失败 / 已批准（可选已暂停）/ 缺必需字段。都走重挂载，三种生产实现都能拿到新回包。
+  setControl: options => {
+    controlReadFails = options?.fail === true
+    controlPartial = options?.partial === true
+    if (options?.approved === true) {
+      controlRevision += 1
+      controlAuthorizationRevision += 1
+      controlPolicy = {
+        missionId: mission.missionId, planId: plan.planId, revision: controlRevision,
+        authorizationRevision: controlAuthorizationRevision,
+        enabled: true, paused: options?.paused === true, taskIds: ['task-3'],
+        reviewers: [{ taskId: 'task-3', reviewerAgentId: 'agent-lead' }],
+        maxDispatches: 3, maxReworksPerTask: 1, expiresAt: null,
+        approvedBy: 'local_user', approvedAt: writeStamp, updatedAt: writeStamp
+      }
+    }
+    remountWorkspace()
+  },
+  // 返工链：candidate-2 的审查要求返工，candidate-3 成为链头；
+  // 期间又 configure 过一次（authorizationRevision 2），所以 candidate-2 那条 policyRevision 1 的审查已失效。
+  setReworkChain: () => {
+    candidates.push(structuredClone(reworkCandidate))
+    stageReviews.push(structuredClone(reworkStageReview))
+    // 重新授权过一次（authorizationRevision 2）：candidate-2 那条 policyRevision 1 的审查因此失效。
+    // revision 任何 write 都 +1，所以这里前进 2 步，保持 revision ≥ authorizationRevision。
+    controlRevision += 2
+    controlAuthorizationRevision = 2
+    controlPolicy = {
+      missionId: mission.missionId, planId: plan.planId, revision: controlRevision,
+      authorizationRevision: controlAuthorizationRevision,
+      enabled: true, paused: false, taskIds: ['task-3'],
+      reviewers: [{ taskId: 'task-3', reviewerAgentId: 'agent-lead' }],
+      maxDispatches: 3, maxReworksPerTask: 1, expiresAt: null,
+      approvedBy: 'local_user', approvedAt: writeStamp, updatedAt: writeStamp
+    }
+    remountWorkspace()
+  },
+  // 模拟另一个客户端改了策略：修订号前推但不通知界面，下一次写入必须撞冲突。
+  driftControlRevision: () => {
+    controlRevision += 1
+    if (controlPolicy !== null) controlPolicy = { ...controlPolicy, revision: controlRevision }
   }
 }
 

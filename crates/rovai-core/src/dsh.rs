@@ -1,6 +1,7 @@
 //! DeepSeek Harness's official ACP profile plus a scoped system-prompt section.
 //! Transport, process ownership, approvals and LRU remain in the shared ACP host.
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
@@ -12,10 +13,30 @@ use crate::{
 };
 
 pub const MINIMUM_VERSION: &str = "0.1.5-rc.2";
-pub const BOOTSTRAP_REVISION: &str = "dsh-native-web-models-v6";
+pub const BOOTSTRAP_REVISION: &str = "dsh-local-hook-private-executor-v9";
 const BOOTSTRAP_PLUGIN: &str = include_str!("dsh/bootstrap.mjs");
 const MODEL_PLUGIN: &str = include_str!("dsh/models.mjs");
+const LOCAL_HOOK_PLUGIN: &str = include_str!("dsh/local-hooks.mjs");
+const LOCAL_HOOK_CLIENT: &str = include_str!("dsh/local-hook-executor.mjs");
+const LOCAL_HOOK_EXECUTOR: &str = include_str!("../../../resources/dsh-hook-executor/executor.mjs");
+const LOCAL_HOOK_VERIFY: &str = include_str!("../../../resources/dsh-hook-executor/verify.mjs");
+const LOCAL_HOOK_PACKAGE: &str = include_str!("../../../resources/dsh-hook-executor/package.json");
+const LOCAL_HOOK_LOCK: &str =
+    include_str!("../../../resources/dsh-hook-executor/package-lock.json");
+
 const MAX_OBSERVED_FILE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
+
+/// The native `skill-filesystem` entry this Host patches. DSH discovers
+/// `customSkillDirs[]` roots, reading `<root>/<name>/SKILL.md`, and replaces a
+/// patched `config` wholesale, so the entry is addressed by its own id here.
+const SKILL_FILESYSTEM_ID: &str = "skill-filesystem";
+/// A Run's frozen Skill copy is published by the Context service as
+/// `<dataDir>/runtime/skills/<runId>` with this manifest written last.
+const SKILL_MATERIAL_ROOT: [&str; 2] = ["runtime", "skills"];
+const SKILL_MATERIAL_CONTENT_DIR: &str = "skills";
+const SKILL_MATERIAL_MANIFEST: &str = "manifest.json";
+const SKILL_MATERIAL_SCHEMA_VERSION: u32 = 1;
+const MAX_SKILL_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 pub fn supported_version(version: Option<&str>) -> bool {
     let Some(version) = version.map(str::trim) else {
@@ -275,6 +296,198 @@ pub fn preparation_diagnostic(result: &Value) -> Option<&'static str> {
     }
 }
 
+/// One Run's frozen Skill tree as its native provider must read it.
+///
+/// The root and the identity digest both come from the manifest the Context
+/// service already verified and published for this Run. A Run that selected no
+/// imported source owns no directory, and that absence is carried explicitly as
+/// an empty root list rather than as an unspecified field: a Host is never left
+/// free to inherit a directory from an earlier Run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrozenSkillRoots {
+    schema_version: u32,
+    custom_skill_dirs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_digest: Option<String>,
+}
+
+impl FrozenSkillRoots {
+    /// The state of a Run that selected no imported Skill source.
+    fn unselected() -> Self {
+        Self {
+            schema_version: SKILL_MATERIAL_SCHEMA_VERSION,
+            custom_skill_dirs: Vec::new(),
+            identity_digest: None,
+        }
+    }
+
+    pub fn identity_digest(&self) -> Option<&str> {
+        self.identity_digest.as_deref()
+    }
+
+    /// The per-Run payload the Core hands its own Host spawn. It travels with the
+    /// compatibility digest, so a changed selection acquires a new Host instead
+    /// of silently reusing the previous Run's provider configuration.
+    pub fn encode(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn decode(payload: &str) -> Result<Self> {
+        let roots: Self = serde_json::from_str(payload)
+            .context("dsh_skill_roots_invalid")?;
+        roots.validate()?;
+        Ok(roots)
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == SKILL_MATERIAL_SCHEMA_VERSION,
+            "dsh_skill_roots_invalid"
+        );
+        anyhow::ensure!(self.custom_skill_dirs.len() <= 1, "dsh_skill_roots_invalid");
+        for root in &self.custom_skill_dirs {
+            anyhow::ensure!(
+                Path::new(root).is_absolute(),
+                "dsh_skill_roots_invalid"
+            );
+        }
+        match self.identity_digest.as_deref() {
+            None => anyhow::ensure!(
+                self.custom_skill_dirs.is_empty(),
+                "dsh_skill_roots_invalid"
+            ),
+            Some(digest) => anyhow::ensure!(
+                !self.custom_skill_dirs.is_empty()
+                    && digest.len() == 64
+                    && digest
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()),
+                "dsh_skill_roots_invalid"
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// Reads the manifest of one Run's published Skill material. The bytes are owned
+/// and re-verified by the Context service on every claim and replay; this reads
+/// that same manifest so the native provider points at exactly one Run's own
+/// tree, and refuses the Host when the tree does not describe this Run.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillMaterialManifest {
+    schema_version: u32,
+    run_id: String,
+    member_id: String,
+    imports: Vec<Value>,
+    files: Vec<Value>,
+    identity_digest: String,
+}
+
+pub fn resolve_frozen_skill_roots(
+    data_dir: &Path,
+    run_id: &str,
+    member_id: &str,
+) -> Result<FrozenSkillRoots> {
+    anyhow::ensure!(
+        !run_id.is_empty()
+            && run_id.len() <= 64
+            && run_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+        "dsh_skill_material_run_invalid"
+    );
+    let run_root = SKILL_MATERIAL_ROOT
+        .iter()
+        .fold(data_dir.to_path_buf(), |path, part| path.join(part))
+        .join(run_id);
+    let metadata = match fs::symlink_metadata(&run_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FrozenSkillRoots::unselected());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "dsh_skill_material_root_invalid"
+    );
+    let content = run_root.join(SKILL_MATERIAL_CONTENT_DIR);
+    let content_metadata = fs::symlink_metadata(&content)?;
+    anyhow::ensure!(
+        content_metadata.is_dir() && !content_metadata.file_type().is_symlink(),
+        "dsh_skill_material_content_invalid"
+    );
+    let manifest_path = run_root.join(SKILL_MATERIAL_MANIFEST);
+    let manifest_metadata = fs::symlink_metadata(&manifest_path)
+        .context("dsh_skill_material_manifest_missing")?;
+    anyhow::ensure!(
+        manifest_metadata.is_file()
+            && !manifest_metadata.file_type().is_symlink()
+            && manifest_metadata.len() <= MAX_SKILL_MANIFEST_BYTES,
+        "dsh_skill_material_manifest_invalid"
+    );
+    let manifest: SkillMaterialManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+        .context("dsh_skill_material_manifest_invalid")?;
+    anyhow::ensure!(
+        manifest.schema_version == SKILL_MATERIAL_SCHEMA_VERSION
+            && manifest.run_id == run_id
+            && manifest.member_id == member_id
+            && !manifest.imports.is_empty()
+            && !manifest.files.is_empty(),
+        "dsh_skill_material_manifest_invalid"
+    );
+    let roots = FrozenSkillRoots {
+        schema_version: SKILL_MATERIAL_SCHEMA_VERSION,
+        custom_skill_dirs: vec![
+            dunce::simplified(&content)
+                .to_str()
+                .context("dsh_skill_material_root_not_utf8")?
+                .to_string(),
+        ],
+        identity_digest: Some(manifest.identity_digest),
+    };
+    roots.validate()?;
+    Ok(roots)
+}
+
+/// Points the existing native `skill-filesystem` entry at this Run's verified
+/// frozen tree. DSH replaces a patched `config` wholesale, so the empty state is
+/// written out as an empty `customSkillDirs` instead of being left unmentioned.
+/// This only ever re-points the provider; it registers no Skill of its own.
+pub fn configure_skill_roots(root: &Path, bootstrap: Option<&str>) -> Result<()> {
+    let payload = bootstrap.context("dsh_skill_roots_missing")?;
+    let roots = FrozenSkillRoots::decode(payload)?;
+    let path = root.join("rovai.patch.json");
+    let mut patches: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let patches = patches
+        .as_array_mut()
+        .context("dsh_skill_patch_invalid")?;
+    anyhow::ensure!(
+        !patches
+            .iter()
+            .any(|patch| patch["id"] == SKILL_FILESYSTEM_ID),
+        "dsh_skill_duplicate_configuration"
+    );
+    let config = if roots.custom_skill_dirs.is_empty() {
+        json!({ "customSkillDirs": [] })
+    } else {
+        // A Run's frozen tree is the only directory this Host may discover: the
+        // native project, user and bundled roots would let the same model read a
+        // different copy of a Skill this Run never froze.
+        json!({
+            "customSkillDirs": roots.custom_skill_dirs,
+            "includeDefaultRoots": false,
+            "watch": false
+        })
+    };
+    patches.push(json!({ "id": SKILL_FILESYSTEM_ID, "config": config }));
+    fs::write(&path, serde_json::to_vec(&patches)?)?;
+    private_file(&path)?;
+    Ok(())
+}
+
 pub fn configure_host(
     command: &mut Command,
     root: &Path,
@@ -350,6 +563,7 @@ pub fn enrich_message(root: &Path, message: &mut Value) -> Result<()> {
         .context("dsh_session_id_missing")?
         .to_string();
     let update = &mut params["update"];
+    append_hook_observations(root, &session_id, update)?;
     if update["sessionUpdate"] == "usage_update" {
         let prefix = format!("{:x}.usage-", Sha256::digest(session_id.as_bytes()));
         let mut observations = Vec::new();
@@ -437,6 +651,221 @@ pub fn enrich_message(root: &Path, message: &mut Value) -> Result<()> {
         }
     }
     fs::remove_file(path)?;
+    Ok(())
+}
+
+pub(crate) fn configure_local_hooks(
+    root: &Path,
+    launch: &crate::local_hook::LocalHookLaunch,
+) -> Result<()> {
+    anyhow::ensure!(
+        launch.schema_version == 1 && launch.execution_epoch >= 0,
+        "local_hook_launch_invalid"
+    );
+    let path = root.join("rovai.patch.json");
+    let mut patches: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let bootstrap = patches
+        .as_array_mut()
+        .context("local_hook_patch_invalid")?
+        .iter_mut()
+        .filter_map(|p| p.get_mut("insert").and_then(Value::as_array_mut))
+        .flat_map(|v| v.iter_mut())
+        .find(|p| p["id"] == "rovai-bootstrap")
+        .context("local_hook_bootstrap_missing")?;
+    anyhow::ensure!(
+        bootstrap["config"].get("localHook").is_none(),
+        "local_hook_duplicate_configuration"
+    );
+    bootstrap["config"]["localHook"] = serde_json::to_value(launch)?;
+    for (name, source) in [
+        ("local-hooks.mjs", LOCAL_HOOK_PLUGIN),
+        ("local-hook-executor.mjs", LOCAL_HOOK_CLIENT),
+    ] {
+        let plugin = root.join(name);
+        fs::write(&plugin, source)?;
+        private_file(&plugin)?;
+    }
+    let marker = root.join("local-hook-launch.json");
+    let launch_bytes = serde_json::to_vec(launch)?;
+    fs::write(&marker, &launch_bytes)?;
+    private_file(&marker)?;
+    let executor = local_hook_executor_configuration(&marker, &launch_bytes)?;
+    bootstrap["config"]["localHookExecutor"] = executor.clone();
+    let executor_marker = root.join("local-hook-executor.json");
+    fs::write(&executor_marker, serde_json::to_vec(&executor)?)?;
+    private_file(&executor_marker)?;
+    fs::write(&path, serde_json::to_vec(&patches)?)?;
+    private_file(&path)?;
+    Ok(())
+}
+
+fn local_hook_executor_configuration(launch_path: &Path, launch_bytes: &[u8]) -> Result<Value> {
+    anyhow::ensure!(cfg!(windows), "local_hook_executor_platform_unsupported");
+    let configured_pi = std::env::var_os(crate::embedded_pi::EMBEDDED_PI_ROOT_ENV)
+        .map(std::path::PathBuf::from)
+        .context("local_hook_bundled_node_unavailable")?;
+    anyhow::ensure!(
+        configured_pi.is_absolute(),
+        "local_hook_bundled_node_unavailable"
+    );
+    let pi = crate::embedded_pi::embedded_pi_bundle(&configured_pi)
+        .context("local_hook_bundled_node_unverified")?;
+    // The installed kit keeps both closures under the same runtime directory.
+    // The Node binary is admitted by Pi's existing complete bundle verifier.
+    let root = configured_pi
+        .parent()
+        .context("local_hook_bundle_missing")?
+        .join("dsh-hook-executor")
+        .canonicalize()
+        .context("local_hook_bundle_missing")?;
+    for (name, expected) in [
+        ("executor.mjs", LOCAL_HOOK_EXECUTOR),
+        ("verify.mjs", LOCAL_HOOK_VERIFY),
+        ("package.json", LOCAL_HOOK_PACKAGE),
+        ("package-lock.json", LOCAL_HOOK_LOCK),
+    ] {
+        let path = root.join(name);
+        let meta = fs::symlink_metadata(&path).context("local_hook_bundle_file_missing")?;
+        anyhow::ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "local_hook_bundle_file_invalid"
+        );
+        anyhow::ensure!(
+            fs::read(path)? == expected.as_bytes(),
+            "local_hook_bundle_source_mismatch"
+        );
+    }
+    let manifest_path = root.join("hook-executor-bundle.json");
+    let metadata =
+        fs::symlink_metadata(&manifest_path).context("local_hook_bundle_manifest_missing")?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= 2 * 1024 * 1024,
+        "local_hook_bundle_manifest_invalid"
+    );
+    let bytes = fs::read(manifest_path)?;
+    let manifest: Value = serde_json::from_slice(&bytes)?;
+    let candidate_path = configured_pi
+        .parent()
+        .and_then(Path::parent)
+        .context("local_hook_candidate_manifest_missing")?
+        .join("candidate-manifest.json");
+    let candidate_metadata =
+        fs::symlink_metadata(&candidate_path).context("local_hook_candidate_manifest_missing")?;
+    anyhow::ensure!(
+        candidate_metadata.is_file()
+            && !candidate_metadata.file_type().is_symlink()
+            && candidate_metadata.len() <= 8 * 1024 * 1024,
+        "local_hook_candidate_manifest_invalid"
+    );
+    let candidate: Value = serde_json::from_slice(&fs::read(candidate_path)?)?;
+    let expected = &candidate["dshHookExecutor"];
+    let manifest_digest = format!("{:x}", Sha256::digest(&bytes));
+    anyhow::ensure!(
+        expected["dshVersion"] == MINIMUM_VERSION
+            && expected["manifestSha256"] == manifest_digest
+            && candidate["files"]["runtime/dsh-hook-executor/hook-executor-bundle.json"]
+                == manifest_digest
+            && expected["treeSha256"] == manifest["treeSha256"]
+            && expected["lockSha256"] == manifest["lockSha256"]
+            && expected["packageCount"].as_u64()
+                == manifest["packages"]
+                    .as_array()
+                    .map(|items| items.len() as u64),
+        "local_hook_candidate_bundle_mismatch"
+    );
+    anyhow::ensure!(
+        manifest["schemaVersion"] == 1
+            && manifest["kind"] == "loom-local-hook-executor"
+            && manifest["platform"] == "win32"
+            && manifest["arch"] == "x64"
+            && manifest["dshVersion"] == MINIMUM_VERSION
+            && manifest["closureComplete"] == true
+            && manifest["entry"] == "executor.mjs",
+        "local_hook_bundle_manifest_invalid"
+    );
+    // Node cannot load a module through a verbatim (\\?\) path: it re-prefixes
+    // the argument and reports MODULE_NOT_FOUND with empty stdout, which reaches
+    // the Host as `local_hook_executor_result_missing`. Both handed-over paths
+    // are therefore the plain native form; the admitted identity above stays
+    // canonicalized.
+    let executor_root = dunce::simplified(&root).to_path_buf();
+    let executor_launch = dunce::simplified(&launch_path.canonicalize()?).to_path_buf();
+    Ok(json!({
+        "schemaVersion":1, "node":pi.node, "root":executor_root,
+        "manifestDigest":manifest_digest,
+        "launchPath":executor_launch,
+        "launchDigest":format!("{:x}",Sha256::digest(launch_bytes))
+    }))
+}
+
+pub(crate) async fn await_local_hook_preparation(root: &Path) -> Result<()> {
+    let marker = root.join("local-hook-launch.json");
+    if !marker.exists() {
+        return Ok(());
+    }
+    let launch: crate::local_hook::LocalHookLaunch = serde_json::from_slice(&fs::read(marker)?)?;
+    let executor: Value =
+        serde_json::from_slice(&fs::read(root.join("local-hook-executor.json"))?)?;
+    tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        loop {
+            match fs::read(root.join("observations/local-hook-ready.json")) {
+                Ok(bytes) => {
+                    let ready: Value = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        ready["schemaVersion"] == 1
+                            && ready["status"] == "ready"
+                            && ready["agentRunId"] == launch.agent_run_id
+                            && ready["executionEpoch"] == launch.execution_epoch
+                            && ready["snapshotDigest"] == launch.snapshot_digest
+                            && ready["sandboxMode"] == launch.sandbox_mode
+                            && ready["chain"] == "private-pinned"
+                            && ready["manifestDigest"] == executor["manifestDigest"],
+                        "local_hook_preparation_mismatch"
+                    );
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => bail!("local_hook_preparation_unreadable"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("local_hook_preparation_timed_out")?
+}
+fn append_hook_observations(root: &Path, session_id: &str, update: &mut Value) -> Result<()> {
+    let prefix = format!("{:x}.hook-", Sha256::digest(session_id.as_bytes()));
+    let mut rows = Vec::new();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root.join("observations"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        anyhow::ensure!(
+            rows.len() < 256 && entry.file_type()?.is_file() && entry.metadata()?.len() <= 16384,
+            "local_hook_observation_budget"
+        );
+        let row: crate::local_hook::HookObservation =
+            serde_json::from_slice(&fs::read(entry.path())?)?;
+        anyhow::ensure!(
+            row.session_id == session_id && row.schema_version == 1,
+            "local_hook_observation_mismatch"
+        );
+        rows.push(row);
+        files.push(entry.path());
+    }
+    if !rows.is_empty() {
+        rows.sort_by_key(|r| r.seq);
+        update["_meta"]["dshHooks"] = serde_json::to_value(rows)?;
+        for file in files {
+            fs::remove_file(file)?;
+        }
+    }
     Ok(())
 }
 
