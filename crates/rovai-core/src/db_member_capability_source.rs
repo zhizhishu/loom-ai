@@ -93,7 +93,13 @@ pub(super) fn test_replay_183(database: &mut Database) {
     migrate(database).unwrap();
     assert!(matches!(classify_database_contract(database.connection()).unwrap(),
         DatabaseContractClassification::SupportedMigrationSource(ref m) if m.projection_schema_version==184));
+    // The replay has to reach the current projection, not the schema that happened to be newest
+    // when this fixture was written: each later migration is replayed in its own order (235
+    // artifact versions, 236 local Hook snapshots, 237 the LOOM recovery ledger) before asking
+    // whether the database is Current again.
     super::loom::migrate_artifact_versions(database).unwrap();
+    super::local_hook_migration::migrate(database).unwrap();
+    super::loom::migrate_recovery_ledger(database).unwrap();
     let c = database.connection();
     assert!(connection_has_current_data_contract(c).unwrap());
     for sql in [
