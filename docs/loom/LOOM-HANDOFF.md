@@ -67,6 +67,13 @@
   - **已修（2026-11-18 23:25 PST，方案②，Pi 工兵执笔、Hark 审+复测）**：`ArtifactIdentity::unchanged_by_admission` 只在 unix 准入复核忽略 ctime（dev:ino、长度、mtime 仍须一致；旁路文件有无须一致）；身份 token 与迁移 manifest 仍严格；Windows 不变。新增测试 `admission_revalidation_ignores_only_a_ctime_change_on_unix`；macOS xattr 断言同批翻转。Bero 容器 root + `--init`：**rovai-core lib 639 过 / 0 败 / 1 忽略**。Windows 上尚未跑此测试，macOS 未验证。
 - 下一位接手顺序：① ~~`--init`~~ 已重建；~~身份判等~~ 已修；② 用户电脑上跑一次 `cargo test -p rovai-core --lib database_admission::` 确认 Windows 不回退；③ 在容器里装 Pi 固定版本、DSH `0.2.0-rc.2`、Codex（密钥只进容器环境），`cospan doctor --check` 见到 codex、dsh；④ 进 P0。
 
+**2026-11-19 更新（Hark，阶段交接）**
+- **用户硬规则**：用户 Win11 是大本营，不浪费本机资源。编译、测试、文档检查全在 Bero；Windows 包走 GitHub Actions；用户电脑只做 git、文档编辑和安装冒烟。要在用户电脑跑重活必须先问。
+- Windows 回归：`cargo test -p rovai-core --lib database_admission::` 在用户电脑 **13 过 / 0 败**（2026-11-19 01:28 PST）；之后全量测试按用户要求中止，不再在本机跑。
+- **Pi 工兵已搬进 `loom-dev`**：Pi `1.5.0` + pi-skill + 守卫，模型走 Octopus 公网 `https://oct.agent-ai.vip/v1`（内网 `10.10.0.101` 从 Bero 不可达），密钥只在容器环境。容器内只读冒烟 94 s 通过。用法见 [`scripts/bero/README.md`](../../scripts/bero/README.md)。
+- 仍未做：容器里装 DSH `0.2.0-rc.2`、Codex（P1b 前）；macOS 未验证；20+ 本地提交未推送（等用户同意）。
+- 下一步：**P0 先领后写**，Pi 在容器里先只读出计划，Root 审后授权落地，测试在 Bero 跑。
+
 **留给 GitHub 与用户电脑**
 - Windows：Bero 通过后，由 GitHub 镜像仓库 Actions（`windows-package.yml`、`loom-v2-e3-windows.yml`）多构建 Windows 包；用户电脑只做安装冒烟，不碰 64851/64852、日常 userData。
 - 云端：DE-BERO 上的部署按云端形态做（Linux Core + Web 登录 + Node 连入）。
