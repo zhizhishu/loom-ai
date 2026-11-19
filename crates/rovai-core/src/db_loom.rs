@@ -2,6 +2,7 @@
 //! lease claim that binds a Task to one AgentRun. This module only owns the tables; the write
 //! paths are `loom::plan_import`, `loom::task_release` and `loom::claim_acquire`.
 use super::*;
+use chrono::{DateTime, Utc};
 
 const PLAN_TABLE: &str = "loom_plan";
 const TASK_TABLE: &str = "loom_task";
@@ -15,6 +16,7 @@ const CONTROL_POLICY_TABLE: &str = "loom_control_policy";
 const CONTROL_COMMAND_TABLE: &str = "loom_control_command";
 const STAGE_REVIEW_TABLE: &str = "loom_stage_review";
 const CONTROL_DISPATCH_TABLE: &str = "loom_control_dispatch";
+const RECOVERY_TABLE: &str = "loom_task_recovery";
 
 /// Task states follow the LOOM control-plane contract
 /// (DRAFT → READY → BLOCKED → IN_REVIEW → DONE / CANCELED).
@@ -939,6 +941,8 @@ pub(super) fn migrate_artifact_versions(database: &mut Database) -> Result<()> {
 /// Only synthetic fixtures reverse this index. Real artifacts are never removed or rewritten.
 #[cfg(test)]
 pub(super) fn downgrade_artifact_versions_for_test(connection: &Connection) {
+    // The recovery ledger is the newest projection, so it reverts before 236 and 235 do.
+    downgrade_recovery_ledger_for_test(connection);
     super::local_hook_migration::downgrade_for_test(connection);
     let applied: bool = connection
         .query_row(
@@ -1044,6 +1048,7 @@ pub(super) fn schema_matches(
             && artifact_schema_matches(connection)?);
     let task_host_recorded =
         projection_schema_version < 178 || task_holds_execution_host(connection)?;
+    let recovery_recorded = projection_schema_version < 187 || recovery_schema_matches(connection)?;
     Ok(holds(
         PLAN_TABLE,
         &[
@@ -1073,7 +1078,8 @@ pub(super) fn schema_matches(
         && review_recorded
         && verification_recorded
         && artifact_recorded
-        && task_host_recorded)
+        && task_host_recorded
+        && recovery_recorded)
 }
 
 fn task_holds_execution_host(connection: &Connection) -> rusqlite::Result<bool> {
@@ -1442,6 +1448,7 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             DROP TABLE IF EXISTS workspace_rpc_requests;
             DROP TABLE IF EXISTS loom_artifact_snapshot;
             DROP TABLE IF EXISTS loom_artifact;
+            DROP TABLE IF EXISTS loom_task_recovery;
             DROP TABLE IF EXISTS loom_verification;
             DROP TABLE IF EXISTS loom_stage_review;
             DROP TABLE IF EXISTS loom_control_dispatch;
@@ -1467,6 +1474,389 @@ pub(super) fn downgrade_for_test(connection: &Connection) {
             UPDATE rovai_data_contract SET projection_schema_version=167 WHERE singleton=1;",
         )
         .unwrap();
+}
+
+/// The upstream sweep stores one `task_watchdog` receipt per Task *and* Attempt
+/// (`factoryEventId('task-watchdog', attemptId:sourceEventId)`), and derives the durable
+/// budget by summing `recoveryTries` over every receipt of the same Task and source Event:
+/// `SELECT COALESCE(sum(COALESCE((result->>'recoveryTries')::int,0)),0) ... AND
+/// request->>'requestEpoch'=$2`. The ledger keeps that identity: the primary key is the
+/// upstream event identity, so a new Attempt inherits the epoch's spent budget instead of
+/// restarting it.
+///
+/// The seven action literals are the upstream decision table's spelling (see
+/// `loom::watchdog`), not LOOM control-plane capitals: a receipt diffed against the
+/// TypeScript source must read the same.
+const RECOVERY_ACTION: &str = "CHECK(action IN ('wait','external_effect','recover_stall',\
+     'stop_timeout','reconcile','dispatch','stalled'))";
+
+fn recovery_sql() -> String {
+    format!(
+        r#"
+        CREATE TABLE {RECOVERY_TABLE} (
+            task_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL CHECK(length(attempt_id) BETWEEN 1 AND 120),
+            request_epoch TEXT NOT NULL CHECK(length(request_epoch) BETWEEN 1 AND 120),
+            action TEXT NOT NULL {RECOVERY_ACTION},
+            tries INTEGER NOT NULL CHECK(tries >= 0),
+            recovery_tries INTEGER NOT NULL CHECK(recovery_tries >= 0),
+            blocked INTEGER NOT NULL CHECK(blocked IN (0,1)),
+            progress_at TEXT,
+            observed_at TEXT NOT NULL,
+            next_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, attempt_id, request_epoch),
+            FOREIGN KEY(task_id) REFERENCES {TASK_TABLE}(task_id) ON DELETE CASCADE
+        );
+        CREATE INDEX loom_task_recovery_epoch_idx
+            ON {RECOVERY_TABLE}(task_id, request_epoch);
+        CREATE INDEX loom_task_recovery_next_idx ON {RECOVERY_TABLE}(next_at);
+        CREATE TRIGGER loom_task_recovery_budget_never_shrinks
+            BEFORE UPDATE ON {RECOVERY_TABLE}
+            WHEN NEW.recovery_tries < OLD.recovery_tries
+            BEGIN SELECT RAISE(ABORT,
+                'a recorded LOOM recovery budget is never refunded'); END;
+        "#
+    )
+}
+
+/// Every object this module's `recovery_sql()` creates, with SQLite's own SQL text.
+fn recovery_schema_objects(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+    let mut statement = connection
+        .prepare("SELECT type,name,sql FROM sqlite_master WHERE tbl_name=?1 ORDER BY type,name")?;
+    statement
+        .query_map([RECOVERY_TABLE], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, Option<String>>(2)?
+                    .map(|sql| normalized_control_sql(&sql)),
+            ))
+        })?
+        .collect()
+}
+
+/// The ledger is only admitted when it is the shape `recovery_sql()` builds: the same columns
+/// in the same order, the same primary key and cascade, both real indexes over the columns
+/// their names promise, and the real budget trigger body.
+///
+/// Counting ten columns or looking for object names is not enough. Renaming `next_at` keeps the
+/// count while `defers` can no longer read the stored backoff, and a trigger called
+/// `loom_task_recovery_budget_never_shrinks` whose body is `SELECT 1` keeps the name while
+/// refunding a spent budget. The comparison therefore runs this module's own SQL in a scratch
+/// database and diffs SQLite's reported objects, then re-checks the required columns so a broken
+/// ledger has a readable failure reason.
+fn recovery_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(&recovery_sql())?;
+    if recovery_schema_objects(connection)? != recovery_schema_objects(&expected)? {
+        return Ok(false);
+    }
+    let declared: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name IN
+             ('task_id','attempt_id','request_epoch','action','tries','recovery_tries',
+              'blocked','progress_at','observed_at','next_at')",
+        [RECOVERY_TABLE],
+        |row| row.get(0),
+    )?;
+    let total: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1)",
+        [RECOVERY_TABLE],
+        |row| row.get(0),
+    )?;
+    let holds =
+        |name: &str, expected_sql: &str| trigger_sql_matches(connection, name, expected_sql);
+    Ok(declared == 10
+        && total == 10
+        && holds(
+            "loom_task_recovery_budget_never_shrinks",
+            &format!(
+                "CREATE TRIGGER loom_task_recovery_budget_never_shrinks
+                 BEFORE UPDATE ON {RECOVERY_TABLE}
+                 WHEN NEW.recovery_tries < OLD.recovery_tries
+                 BEGIN SELECT RAISE(ABORT,
+                     'a recorded LOOM recovery budget is never refunded'); END"
+            ),
+        )?)
+}
+
+/// Migration 237: the durable watchdog recovery ledger. Upstream keeps `tries`,
+/// `recoveryTries` and `nextAt` on the persisted `task_watchdog` receipt, so a Core restart
+/// resumes the same spend and the same backoff instead of starting a fresh budget. Nothing
+/// here reads the wall clock: a receipt is written by whoever observed the Task.
+pub(super) fn migrate_recovery_ledger(database: &mut Database) -> Result<()> {
+    let tx = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        matches!(
+            classify_database_contract(&tx)?,
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 186
+        ),
+        "LOOM recovery ledger migration requires schema 186"
+    );
+    tx.execute_batch(&recovery_sql())?;
+    tx.execute_batch(
+        "INSERT INTO schema_migration VALUES(237,datetime('now'));
+         UPDATE rovai_data_contract SET projection_schema_version=187,updated_at=datetime('now') WHERE singleton=1;",
+    )?;
+    validate_migration_foreign_keys(&tx, &[RECOVERY_TABLE])?;
+    anyhow::ensure!(
+        recovery_schema_matches(&tx)?,
+        "LOOM recovery ledger schema invalid"
+    );
+    // 187 is only Current while nothing newer exists; a later migration must leave this
+    // receipt admissible as a supported source instead of pinning Current.
+    let admitted = match classify_database_contract(&tx)? {
+        DatabaseContractClassification::Current(_) => true,
+        DatabaseContractClassification::SupportedMigrationSource(ref marker) => {
+            marker.projection_schema_version == 187
+        }
+        DatabaseContractClassification::Unknown(_) => false,
+    };
+    anyhow::ensure!(admitted, "LOOM recovery ledger schema admission failed");
+    tx.commit()?;
+    Ok(())
+}
+
+/// Only synthetic migration fixtures reverse this ledger; product code never drops it.
+#[cfg(test)]
+pub(super) fn downgrade_recovery_ledger_for_test(connection: &Connection) {
+    let applied: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=237)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !applied {
+        return;
+    }
+    connection
+        .execute_batch(
+            "DROP TABLE loom_task_recovery;
+             DELETE FROM schema_migration WHERE version=237;
+             UPDATE rovai_data_contract SET projection_schema_version=186
+               WHERE singleton=1 AND projection_schema_version=187;",
+        )
+        .unwrap();
+}
+
+/// One persisted watchdog receipt: the upstream `task_watchdog` event's `request` and
+/// `result` in one row. `request_epoch` is the Task's source Event the receipt is bound to,
+/// `attempt_id` is the Attempt that observed it, and `tries`/`recovery_tries`/`next_at` are
+/// the durable budget and backoff that must survive a restart.
+// The M5 watchdog sweep is the consumer, and its LOOM wiring lands next; until then the
+// receipt API is exercised only by the migration tests, so the dead-code lint is expected
+// rather than a sign that the port is unused (same posture as `loom::watchdog`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LoomRecoveryReceipt {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub request_epoch: String,
+    pub action: String,
+    pub tries: i64,
+    pub recovery_tries: i64,
+    pub blocked: bool,
+    pub progress_at: Option<String>,
+    pub observed_at: String,
+    pub next_at: String,
+}
+
+#[allow(dead_code)]
+impl LoomRecoveryReceipt {
+    /// Upstream: a receipt whose `nextAt` is still in the future defers a new observation.
+    /// An unreadable instant is not "long past": it simply stops deferring, never aborts.
+    pub(super) fn defers(&self, now: DateTime<Utc>) -> bool {
+        DateTime::parse_from_rfc3339(&self.next_at).is_ok_and(|next| next > now)
+    }
+}
+
+/// Upstream `tries = action === 'stalled' ? 0 : (previous?.result?.tries ?? 0) + 1`.
+/// A `stalled` receipt resets the Attempt counter because the stop itself is a new
+/// observation, while every other action spends one more try of the same Attempt.
+#[allow(dead_code)]
+pub(super) fn next_watchdog_tries(previous: Option<i64>, action: &str) -> i64 {
+    if action == "stalled" {
+        0
+    } else {
+        previous.unwrap_or(0) + 1
+    }
+}
+
+/// Upstream `recoveryTries = (previous?.result?.recoveryTries ?? 0) + (action ===
+/// 'recover_stall' ? 1 : 0)`: only an actual replay spends the automatic recovery budget.
+#[allow(dead_code)]
+pub(super) fn next_recovery_tries(previous: Option<i64>, action: &str) -> i64 {
+    previous.unwrap_or(0) + i64::from(action == "recover_stall")
+}
+
+/// Upstream `nextAt = now + Math.min(15, 2 ** tries) * 60_000`: minutes 1, 2, 4, 8, then a
+/// 15-minute ceiling, so a retry storm can never exceed one observation per 15 minutes.
+#[allow(dead_code)]
+pub(super) fn watchdog_next_at(now: DateTime<Utc>, tries: i64) -> DateTime<Utc> {
+    let minutes = (1_i64 << tries.clamp(0, 4)).min(15);
+    now + chrono::Duration::minutes(minutes)
+}
+
+/// Upstream literals in the `wait` branch: `task.status === 'blocked' ? 60_000 : 5 * 60_000`.
+/// A wait is not a repair attempt, so it must not fall through to the exponential budget.
+pub(super) const WATCHDOG_WAIT_BLOCKED_MINUTES: i64 = 1;
+pub(super) const WATCHDOG_WAIT_MINUTES: i64 = 5;
+
+/// Upstream `nextAt = now + (task.status === 'blocked' ? 60_000 : 5 * 60_000)` for `wait`:
+/// a progressing or human-owned Task is simply re-observed later.
+#[allow(dead_code)]
+pub(super) fn watchdog_wait_next_at(now: DateTime<Utc>, blocked: bool) -> DateTime<Utc> {
+    let minutes = if blocked {
+        WATCHDOG_WAIT_BLOCKED_MINUTES
+    } else {
+        WATCHDOG_WAIT_MINUTES
+    };
+    now + chrono::Duration::minutes(minutes)
+}
+
+/// Upstream `exhausted = tries > WATCHDOG_MAX_RECOVERIES || (action === 'recover_stall' &&
+/// budget.count >= WATCHDOG_MAX_RECOVERIES)`, with the budget summed over the epoch.
+#[allow(dead_code)]
+pub(super) fn recovery_exhausted(tries: i64, action: &str, budget: i64) -> bool {
+    let max = crate::loom::watchdog::WATCHDOG_MAX_RECOVERIES;
+    tries > max || (action == "recover_stall" && budget >= max)
+}
+
+#[allow(dead_code)]
+pub(super) fn recovery_receipt(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    request_epoch: &str,
+) -> rusqlite::Result<Option<LoomRecoveryReceipt>> {
+    connection
+        .query_row(
+            "SELECT task_id,attempt_id,request_epoch,action,tries,recovery_tries,blocked,
+                    progress_at,observed_at,next_at FROM loom_task_recovery
+             WHERE task_id=?1 AND attempt_id=?2 AND request_epoch=?3",
+            params![task_id, attempt_id, request_epoch],
+            |row| {
+                Ok(LoomRecoveryReceipt {
+                    task_id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    request_epoch: row.get(2)?,
+                    action: row.get(3)?,
+                    tries: row.get(4)?,
+                    recovery_tries: row.get(5)?,
+                    blocked: row.get(6)?,
+                    progress_at: row.get(7)?,
+                    observed_at: row.get(8)?,
+                    next_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+}
+
+/// The spent automatic-recovery budget of one Task and source Event, summed across its
+/// Attempts exactly like the upstream budget query.
+#[allow(dead_code)]
+pub(super) fn recovery_budget(
+    connection: &Connection,
+    task_id: &str,
+    request_epoch: &str,
+) -> rusqlite::Result<i64> {
+    connection.query_row(
+        "SELECT COALESCE(SUM(recovery_tries),0) FROM loom_task_recovery
+         WHERE task_id=?1 AND request_epoch=?2",
+        params![task_id, request_epoch],
+        |row| row.get(0),
+    )
+}
+
+/// Observe one Task once: read the durable previous receipt, derive `tries`,
+/// `recoveryTries` and `nextAt` with the upstream arithmetic, then persist the receipt.
+/// The write is an upsert on the upstream event identity, so a restarted Core continues the
+/// recorded spend instead of resetting it.
+///
+/// `wait` is the upstream branch that does not spend anything: the receipt keeps the recorded
+/// `action`, `tries` and `recoveryTries`, refreshes `observedAt`/`progressAt`, and stores
+/// `nextAt = now + (blocked ? 1 : 5) minutes`. `blocked` is this observation's blocked fact —
+/// for a wait that is the Task's current blocked status, for every other action it is the
+/// decision's `blocked` result. A wait therefore never consumes the budget and never rewrites a
+/// recorded `stalled`/`reconcile` action, exactly like the upstream `ON CONFLICT` result merge.
+#[allow(dead_code)]
+pub(super) fn record_watchdog_recovery(
+    connection: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    request_epoch: &str,
+    action: &str,
+    blocked: bool,
+    progress_at: Option<&str>,
+    now: DateTime<Utc>,
+) -> rusqlite::Result<LoomRecoveryReceipt> {
+    let previous = recovery_receipt(connection, task_id, attempt_id, request_epoch)?;
+    let waiting = action == "wait";
+    // Upstream `action: previous?.result?.action ?? 'wait'`.
+    let recorded_action = if waiting {
+        previous
+            .as_ref()
+            .map_or_else(|| "wait".to_string(), |prior| prior.action.clone())
+    } else {
+        action.to_string()
+    };
+    // Upstream leaves `tries`/`recoveryTries` untouched while waiting.
+    let tries = if waiting {
+        previous.as_ref().map_or(0, |prior| prior.tries)
+    } else {
+        next_watchdog_tries(previous.as_ref().map(|prior| prior.tries), action)
+    };
+    let recovery_tries = if waiting {
+        previous.as_ref().map_or(0, |prior| prior.recovery_tries)
+    } else {
+        next_recovery_tries(previous.as_ref().map(|prior| prior.recovery_tries), action)
+    };
+    let next_at = if waiting {
+        watchdog_wait_next_at(now, blocked)
+    } else {
+        watchdog_next_at(now, tries)
+    };
+    let receipt = LoomRecoveryReceipt {
+        task_id: task_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        request_epoch: request_epoch.to_string(),
+        action: recorded_action,
+        tries,
+        recovery_tries,
+        blocked,
+        progress_at: progress_at.map(str::to_string),
+        observed_at: now.to_rfc3339(),
+        next_at: next_at.to_rfc3339(),
+    };
+    connection.execute(
+        "INSERT INTO loom_task_recovery(task_id,attempt_id,request_epoch,action,tries,
+                recovery_tries,blocked,progress_at,observed_at,next_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(task_id,attempt_id,request_epoch) DO UPDATE SET
+             action=excluded.action,tries=excluded.tries,
+             recovery_tries=excluded.recovery_tries,blocked=excluded.blocked,
+             progress_at=excluded.progress_at,observed_at=excluded.observed_at,
+             next_at=excluded.next_at",
+        params![
+            receipt.task_id,
+            receipt.attempt_id,
+            receipt.request_epoch,
+            receipt.action,
+            receipt.tries,
+            receipt.recovery_tries,
+            receipt.blocked,
+            receipt.progress_at,
+            receipt.observed_at,
+            receipt.next_at,
+        ],
+    )?;
+    Ok(receipt)
 }
 
 #[cfg(test)]
@@ -1794,11 +2184,14 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_artifact_version_receipt;")
             .unwrap();
         migrate_artifact_versions(&mut database).unwrap();
-        assert!(matches!(classify_database_contract(database.connection()).unwrap(),
+        assert!(
+            matches!(classify_database_contract(database.connection()).unwrap(),
             DatabaseContractClassification::SupportedMigrationSource(ref marker)
-                if marker.projection_schema_version == 185));
+                if marker.projection_schema_version == 185)
+        );
         assert_eq!(migration_receipts(&database, 235), 1);
         crate::db::local_hook_migration::migrate(&mut database).unwrap();
+        migrate_recovery_ledger(&mut database).unwrap();
         assert!(connection_has_current_data_contract(database.connection()).unwrap());
         for sql in [
             "SELECT COUNT(*) FROM (SELECT * FROM prior_artifact_versions EXCEPT SELECT * FROM loom_artifact)",
@@ -2306,5 +2699,525 @@ mod tests {
             verdict, "ACCEPTED",
             "assertion the_acceptance_axis_stays_writable_for_review"
         );
+    }
+
+    fn instant(minute: i64) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::minutes(minute)
+    }
+
+    fn imported_plan_task(
+        database: &mut Database,
+        directory: &std::path::Path,
+        title: &str,
+    ) -> (String, String) {
+        let mission_id = create_mission(database, directory, title);
+        let imported = plan_import(
+            database,
+            LoomPlanImportInput {
+                mission_id,
+                goal: "Keep the recovery budget across a restart".into(),
+                acceptance_criteria_version: "ac-v1".into(),
+                criteria: vec![LoomPlanImportCriterion {
+                    criterion_id: "budget".into(),
+                    text: "Budget and backoff survive".into(),
+                }],
+                tasks: vec![LoomPlanImportTask {
+                    task_id: "recovery-task".into(),
+                    title: "Recover a stalled task".into(),
+                    description: String::new(),
+                    assignee_agent_id: None,
+                }],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+        (imported.plan_id, imported.task_ids[0].clone())
+    }
+
+    #[test]
+    fn recovery_arithmetic_keeps_the_upstream_tries_budget_and_backoff() {
+        // Upstream: `tries = action === 'stalled' ? 0 : (previous?.result?.tries ?? 0) + 1`.
+        assert_eq!(next_watchdog_tries(None, "reconcile"), 1);
+        assert_eq!(next_watchdog_tries(Some(2), "reconcile"), 3);
+        assert_eq!(next_watchdog_tries(Some(2), "stalled"), 0);
+        // Upstream: only `recover_stall` spends the automatic recovery budget.
+        assert_eq!(next_recovery_tries(None, "reconcile"), 0);
+        assert_eq!(next_recovery_tries(Some(2), "recover_stall"), 3);
+        assert_eq!(next_recovery_tries(Some(2), "wait"), 2);
+        // Upstream: `nextAt = now + Math.min(15, 2 ** tries) * 60_000`.
+        for (tries, minutes) in [(0, 1), (1, 2), (2, 4), (3, 8), (4, 15), (9, 15)] {
+            assert_eq!(
+                watchdog_next_at(instant(0), tries),
+                instant(minutes),
+                "assertion try {tries} waits {minutes} minutes"
+            );
+        }
+        // Upstream: `tries > WATCHDOG_MAX_RECOVERIES || (recover_stall && budget >= max)`.
+        let max = crate::loom::watchdog::WATCHDOG_MAX_RECOVERIES;
+        assert_eq!(
+            max, 3,
+            "assertion automatic recovery is bounded at three tries"
+        );
+        assert!(!recovery_exhausted(3, "recover_stall", max - 1));
+        assert!(recovery_exhausted(3, "recover_stall", max));
+        assert!(recovery_exhausted(max + 1, "reconcile", 0));
+        assert!(!recovery_exhausted(max, "reconcile", max));
+    }
+
+    /// The ledger has to answer the two questions the sweep asks after a crash: how much of
+    /// this epoch's budget is already spent, and whether the recorded `nextAt` still defers.
+    #[test]
+    fn recovery_ledger_opens_a_stored_next_at_and_summed_budget() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let (_, task_id) =
+            imported_plan_task(&mut database, &directory, "LOOM recovery arithmetic");
+        let connection = database.connection();
+        let first = record_watchdog_recovery(
+            connection,
+            &task_id,
+            "run_one",
+            "event_one",
+            "recover_stall",
+            false,
+            Some("2026-09-01T00:00:00+00:00"),
+            instant(0),
+        )
+        .unwrap();
+        assert_eq!((first.tries, first.recovery_tries), (1, 1));
+        assert_eq!(first.next_at, instant(2).to_rfc3339());
+        assert!(first.defers(instant(1)));
+        assert!(!first.defers(instant(2)));
+
+        // A second observation of the same Attempt continues from the stored receipt.
+        let second = record_watchdog_recovery(
+            connection,
+            &task_id,
+            "run_one",
+            "event_one",
+            "recover_stall",
+            false,
+            None,
+            instant(2),
+        )
+        .unwrap();
+        assert_eq!((second.tries, second.recovery_tries), (2, 2));
+        assert_eq!(second.next_at, instant(6).to_rfc3339());
+        assert_eq!(
+            recovery_budget(connection, &task_id, "event_one").unwrap(),
+            2
+        );
+
+        // Upstream sums the budget over the epoch, so a fresh Attempt inherits it.
+        let next_attempt = record_watchdog_recovery(
+            connection,
+            &task_id,
+            "run_two",
+            "event_one",
+            "recover_stall",
+            false,
+            None,
+            instant(6),
+        )
+        .unwrap();
+        assert_eq!(
+            (next_attempt.tries, next_attempt.recovery_tries),
+            (1, 1),
+            "assertion a new Attempt restarts tries but not the epoch budget"
+        );
+        assert_eq!(
+            recovery_budget(connection, &task_id, "event_one").unwrap(),
+            3
+        );
+        assert!(recovery_exhausted(
+            next_attempt.tries,
+            "recover_stall",
+            recovery_budget(connection, &task_id, "event_one").unwrap()
+        ));
+
+        // A different source Event is a different epoch: it has its own budget.
+        assert_eq!(
+            recovery_budget(connection, &task_id, "event_two").unwrap(),
+            0
+        );
+        assert!(
+            recovery_receipt(connection, &task_id, "run_two", "event_two")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A reopened database keeps the recorded spend: the ledger is the budget, not a cache.
+    #[test]
+    fn recovery_budget_and_backoff_survive_a_database_reopen() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database();
+        let (_, task_id) = imported_plan_task(&mut database, &directory, "LOOM recovery restart");
+        let mut stored = None;
+        for minute in [0, 2, 6] {
+            stored = Some(
+                record_watchdog_recovery(
+                    database.connection(),
+                    &task_id,
+                    "run_one",
+                    "event_one",
+                    "recover_stall",
+                    false,
+                    Some("2026-09-01T00:00:00+00:00"),
+                    instant(minute),
+                )
+                .unwrap(),
+            );
+        }
+        let stored = stored.unwrap();
+        assert_eq!((stored.tries, stored.recovery_tries), (3, 3));
+        assert_eq!(stored.next_at, instant(14).to_rfc3339());
+        // The budget is never refunded: a rewrite cannot hand tries back.
+        assert!(
+            database
+                .connection()
+                .execute(
+                    "UPDATE loom_task_recovery SET recovery_tries=0 WHERE task_id=?1",
+                    [&task_id],
+                )
+                .is_err(),
+            "assertion a_recorded_recovery_budget_is_never_refunded"
+        );
+
+        drop(database);
+        let reopened = Database::open(&directory).expect("database should reopen");
+        assert_eq!(
+            recovery_receipt(reopened.connection(), &task_id, "run_one", "event_one").unwrap(),
+            Some(stored.clone()),
+            "assertion the_request_epoch_receipt_survives_a_restart"
+        );
+        assert_eq!(
+            recovery_budget(reopened.connection(), &task_id, "event_one").unwrap(),
+            3,
+            "assertion the_spent_budget_survives_a_restart"
+        );
+        assert!(recovery_schema_matches(reopened.connection()).unwrap());
+
+        // A fourth observation continues from the reopened receipt instead of a fresh budget.
+        let fourth = record_watchdog_recovery(
+            reopened.connection(),
+            &task_id,
+            "run_one",
+            "event_one",
+            "recover_stall",
+            true,
+            None,
+            instant(14),
+        )
+        .unwrap();
+        assert_eq!((fourth.tries, fourth.recovery_tries), (4, 4));
+        assert_eq!(fourth.next_at, instant(29).to_rfc3339());
+        assert!(fourth.blocked);
+        assert_eq!(
+            recovery_budget(reopened.connection(), &task_id, "event_one").unwrap(),
+            4
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A database still at schema 186 upgrades through the product open path, and the new
+    /// receipt is what makes it Current.
+    #[test]
+    fn recovery_ledger_migration_upgrades_an_old_database() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let (_, task_id) = imported_plan_task(&mut database, &directory, "LOOM recovery upgrade");
+        let connection = database.connection();
+        downgrade_recovery_ledger_for_test(connection);
+        assert_eq!(projection_version(&database), 186);
+        assert_eq!(migration_receipts(&database, 237), 0);
+        assert!(!recovery_schema_matches(connection).unwrap());
+        assert!(matches!(classify_database_contract(connection).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 186));
+
+        database.close();
+        let reopened =
+            Database::open(&directory).expect("schema 186 must reopen through the product path");
+        assert_eq!(projection_version(&reopened), 187);
+        assert_eq!(migration_receipts(&reopened, 237), 1);
+        assert!(recovery_schema_matches(reopened.connection()).unwrap());
+        assert!(matches!(
+            classify_database_contract(reopened.connection()).unwrap(),
+            DatabaseContractClassification::Current(_)
+        ));
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM loom_task WHERE task_id=?1",
+                    [&task_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "assertion the_existing_plan_task_survives_the_upgrade"
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A refused receipt rolls the whole migration back: no ledger, no half-applied source.
+    #[test]
+    fn recovery_ledger_migration_rolls_back_when_its_receipt_fails() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let directory = database.directory().to_path_buf();
+        let (_, task_id) = imported_plan_task(&mut database, &directory, "LOOM recovery rollback");
+        database
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_recovery_receipt BEFORE INSERT ON schema_migration
+                 WHEN NEW.version=237 BEGIN SELECT RAISE(ABORT,'fixture receipt failure'); END;",
+            )
+            .unwrap();
+        downgrade_recovery_ledger_for_test(database.connection());
+        assert_eq!(projection_version(&database), 186);
+
+        let refused = migrate_recovery_ledger(&mut database)
+            .expect_err("a refused receipt must not leave the ledger behind");
+        assert!(
+            refused.to_string().contains("fixture receipt failure"),
+            "assertion the_refusal_is_the_fixture_trigger: {refused}"
+        );
+        assert_eq!(projection_version(&database), 186);
+        assert_eq!(migration_receipts(&database, 237), 0);
+        assert!(!recovery_schema_matches(database.connection()).unwrap());
+        assert!(
+            matches!(classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                if marker.projection_schema_version == 186)
+        );
+
+        database
+            .connection()
+            .execute_batch("DROP TRIGGER refuse_recovery_receipt;")
+            .unwrap();
+        migrate_recovery_ledger(&mut database).unwrap();
+        assert_eq!(projection_version(&database), 187);
+        assert_eq!(migration_receipts(&database, 237), 1);
+        assert!(recovery_schema_matches(database.connection()).unwrap());
+        assert!(matches!(
+            classify_database_contract(database.connection()).unwrap(),
+            DatabaseContractClassification::Current(_)
+        ));
+        // The retried migration is usable immediately: the Task survived and a receipt lands.
+        let recorded = record_watchdog_recovery(
+            database.connection(),
+            &task_id,
+            "run_one",
+            "event_one",
+            "reconcile",
+            false,
+            None,
+            instant(0),
+        )
+        .unwrap();
+        assert_eq!((recorded.tries, recorded.recovery_tries), (1, 0));
+        assert_eq!(
+            database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Upstream `if (action === 'wait') { ... }` keeps `action`, `tries` and `recoveryTries` on
+    /// the receipt and only moves `nextAt` by one (blocked) or five minutes. Without that branch a
+    /// healthy wait was charged a try, so a Task that merely waited three times exhausted its
+    /// automatic recovery budget before it ever stalled.
+    #[test]
+    fn waiting_never_spends_the_recovery_budget_or_the_tries_counter() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database();
+        let (_, task_id) =
+            imported_plan_task(&mut database, &directory, "LOOM recovery wait budget");
+        let connection = database.connection();
+        let mut waited = None;
+        for minute in [0, 5, 10, 15] {
+            let receipt = record_watchdog_recovery(
+                connection,
+                &task_id,
+                "run_one",
+                "event_one",
+                "wait",
+                false,
+                Some("2026-09-01T00:00:00+00:00"),
+                instant(minute),
+            )
+            .unwrap();
+            assert_eq!(
+                receipt.action, "wait",
+                "assertion a wait stays a wait: {minute}"
+            );
+            assert_eq!(receipt.tries, 0, "assertion wait {minute} spends no try");
+            assert_eq!(
+                receipt.recovery_tries, 0,
+                "assertion wait {minute} spends no recovery budget"
+            );
+            assert_eq!(
+                receipt.next_at,
+                instant(minute + 5).to_rfc3339(),
+                "assertion wait {minute} is re-observed five minutes later"
+            );
+            waited = Some(receipt);
+        }
+        assert!(waited.unwrap().defers(instant(19)));
+
+        // Four waits must not turn the first real repair into an exhausted Task.
+        let first_repair = record_watchdog_recovery(
+            connection,
+            &task_id,
+            "run_one",
+            "event_one",
+            "reconcile",
+            false,
+            None,
+            instant(20),
+        )
+        .unwrap();
+        assert_eq!((first_repair.tries, first_repair.recovery_tries), (1, 0));
+        assert!(!recovery_exhausted(
+            first_repair.tries,
+            "reconcile",
+            recovery_budget(connection, &task_id, "event_one").unwrap()
+        ));
+        assert_eq!(first_repair.next_at, instant(22).to_rfc3339());
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Upstream's wait receipt merges into the previous one, so a wait after a `stalled` decision
+    /// must not overwrite the recorded action or hand the tries back to the sweep.
+    #[test]
+    fn a_wait_after_a_stall_keeps_the_recorded_action_and_tries() {
+        let (mut database, directory) = crate::test_support::seeded_runtime_database();
+        let (_, task_id) =
+            imported_plan_task(&mut database, &directory, "LOOM recovery stall wait");
+        let connection = database.connection();
+        let stalled = record_watchdog_recovery(
+            connection,
+            &task_id,
+            "run_one",
+            "event_one",
+            "stalled",
+            true,
+            None,
+            instant(0),
+        )
+        .unwrap();
+        assert_eq!((stalled.tries, stalled.recovery_tries), (0, 0));
+
+        // A blocked Task is re-observed after one minute, not five.
+        let blocked_wait = record_watchdog_recovery(
+            connection,
+            &task_id,
+            "run_one",
+            "event_one",
+            "wait",
+            true,
+            None,
+            instant(1),
+        )
+        .unwrap();
+        assert_eq!(blocked_wait.action, "stalled");
+        assert_eq!((blocked_wait.tries, blocked_wait.recovery_tries), (0, 0));
+        assert_eq!(blocked_wait.next_at, instant(2).to_rfc3339());
+
+        let unblocked_wait = record_watchdog_recovery(
+            connection,
+            &task_id,
+            "run_one",
+            "event_one",
+            "wait",
+            false,
+            None,
+            instant(2),
+        )
+        .unwrap();
+        assert_eq!(unblocked_wait.action, "stalled");
+        assert_eq!(
+            (unblocked_wait.tries, unblocked_wait.recovery_tries),
+            (0, 0)
+        );
+        assert_eq!(unblocked_wait.next_at, instant(7).to_rfc3339());
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The ledger check feeds Current admission, so a renamed column, a renamed or re-columned
+    /// index or a neutered budget trigger must all be refused, not just counted.
+    #[test]
+    fn recovery_ledger_schema_refuses_a_renamed_column_a_wrong_index_and_a_neutered_trigger() {
+        let mut database = crate::test_support::seeded_runtime_database_owned();
+        let connection = database.connection();
+        assert!(recovery_schema_matches(connection).unwrap());
+
+        for (case, breakage) in [
+            (
+                "a renamed stored backoff column",
+                "ALTER TABLE loom_task_recovery RENAME COLUMN next_at TO stale_next_at;",
+            ),
+            (
+                "a required column that is only renamed",
+                "ALTER TABLE loom_task_recovery RENAME COLUMN recovery_tries TO stale_tries;",
+            ),
+            (
+                "an index over the wrong column",
+                "DROP INDEX loom_task_recovery_epoch_idx;\
+                 CREATE INDEX loom_task_recovery_epoch_idx ON loom_task_recovery(task_id);",
+            ),
+            ("a missing index", "DROP INDEX loom_task_recovery_next_idx;"),
+            (
+                "a neutered budget trigger",
+                "DROP TRIGGER loom_task_recovery_budget_never_shrinks;\
+                 CREATE TRIGGER loom_task_recovery_budget_never_shrinks\
+                 BEFORE UPDATE ON loom_task_recovery BEGIN SELECT 1; END;",
+            ),
+        ] {
+            connection
+                .execute_batch("SAVEPOINT recovery_schema_probe")
+                .unwrap();
+            connection.execute_batch(breakage).unwrap();
+            assert!(
+                !recovery_schema_matches(connection).unwrap(),
+                "assertion a ledger with {case} is not admitted as Current"
+            );
+            // A renamed column must actually break the reader, not only the shape check.
+            if case == "a renamed stored backoff column" {
+                assert!(
+                    connection
+                        .prepare("SELECT next_at FROM loom_task_recovery")
+                        .is_err(),
+                    "assertion the renamed backoff is unreadable"
+                );
+            }
+            connection
+                .execute_batch(
+                    "ROLLBACK TO SAVEPOINT recovery_schema_probe;\
+                     RELEASE SAVEPOINT recovery_schema_probe;",
+                )
+                .unwrap();
+            assert!(
+                recovery_schema_matches(connection).unwrap(),
+                "assertion the restored ledger is admitted again after {case}"
+            );
+        }
     }
 }
