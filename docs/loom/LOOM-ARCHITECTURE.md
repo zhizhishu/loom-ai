@@ -24,7 +24,8 @@
 | 8 | **电脑和大脑分开** | B/C 可以只装 LOOM Node（文件/终端/浏览器/屏幕），不强制装任何 Agent；重活再选装本地 Runner。 |
 | 9 | **人格不扩权** | 换人格、换大脑都不改变 Bot 身份与授权；Pi Purge Strict 只在隔离实验用。 |
 | 10 | **开源直接用，可以整段照抄** | 参考快照许可已统一为 MIT。Mikka、PiBot 等上游代码可以整段照抄/移植/原样运行，保留版权与出处即可；LOOM 只写最薄适配层（规则见交接书 §2）。 |
-| 11 | **开发在 DE-BERO 沙箱** | 在 DE-BERO 独立容器里模拟用户环境开发与跑测试，不碰用户电脑上的服务、数据和全局配置；Windows 专属部分（桌面安装、Windows 电脑控制）仍在用户电脑隔离验收。 |
+| 11 | **开发与验收都在 DE-BERO** | 在 DE-BERO 独立容器里模拟用户环境开发、跑测试、做验收，不碰用户电脑上的服务、数据和全局配置。Windows 包由 GitHub 镜像仓库的 Actions 多构建一份（`windows-package.yml`），Bero 走通后再出 Windows 版。 |
+| 12 | **最终跑在云上** | 终态是云端：Linux Core + Web 登录 + 各设备 LOOM Node 连上来。DE-BERO 上的部署就是云端形态的第一版，所以 Core 不得依赖 Windows 本机路径或桌面进程。 |
 
 ## 2. 架构图
 
@@ -163,9 +164,29 @@ flowchart TB
 | P13 云端单用户 | Linux Core、Web 登录、跨端同一 Bot | PiBot Center 部署方式 |
 | P14 多用户 | 以后 | AgenTeam / MOVO |
 
-## 7. 待用户拍板
+## 7. 每个参考项目借什么
+
+原则：能直接导入、原样运行或整段照抄的就直接用（MIT，保留出处）；“借鉴”只用于和 LOOM 唯一 Core 冲突、无法整块搬的部分。
+
+| 参考 | 定位 | 直接用 | 借鉴（不整块搬） | 不要 |
+|---|---|---|---|---|
+| **Mikka** | 主体·协作 | 群聊路由、wake-after-commit 唤醒与恢复、Factory 派工/claim/reconcile/watchdog、Attention、成果审查与独立检查、电脑接管租约的算法，整段移植进 Rust Core | Bot/Agent/Run 术语与数据模型 | Postgres 第二套库；accept 时自动合并 PR；computer 缺省 ask→allow |
+| **PiBot** | 主体·落地 | 插件/能力管理（内容指纹与授权指纹）、turn-sync 预备/确认/回滚、Bot 看板协议、Bot 学习与 Hindsight 记忆插件、Shower 虚拟屏、Host 设备运行方式 | Center 的部署方式（云端 P13 照它）；跨设备 Room | 第二个权威 Harness 库；另起一个 Center 服务 |
+| **Pi** | 主助手内核 + 运行端 | 受管包、原生 JSONL RPC、Agent Skills、原生 MCP、Extension/Hooks，原样运行 | pi-mcp、pi-durable 只在 Pi 内部评估 | 自己写模拟 Pi 的桥接层 |
+| **Pi Purge** | 主助手人格 | `extensions/pi-purge.ts` 原样加载，Off/Append/Replace/Fallback/Strict | — | 改写成 LOOM 版“仿 Purge” |
+| **agent-purge** | 跨运行端人格 | Persona Markdown 解析、按运行端适配与恢复模块 | — | 它的 DSH 自动放行审批 Hook |
+| **DSH** | 运行端 | 官方 Host、Cordis、ACP、Profile/Bundle、原生 Hook、沙箱与审批，原样运行 | — | 本地自写 hook executor（回归原生） |
+| **ACCP** | 规则 | claim/lease/fencing 不变量和测试用例，照抄为 Core 的约束与测试 | Task DAG、context snapshot、交接/候选结果 | 再跑一个 ACCP 服务或第二调度器 |
+| **DeskFleet** | 设备零件 | 终端 PTY、文件、桌面通道里能直接接进 loom-node 的组件 | daemon/ACP Agent 分层、人类接管手感 | 整套 WebRTC 替换 loom-node |
+| **MindFS** | 设备零件 | 文件/终端/Relay 组件可直接接 | 设备工具与 Agent Runtime 区分 | 替换设备层 |
+| **UFO³ Galaxy** | 规划零件 | 设备画像（Registry/Manager）模块 | Constellation DAG 拆解与调度解耦 | 第二套调度 |
+| **AgentDock** | 电脑操作 | — | 本机电脑操作的工具形态与手感 | — |
+| **ROVAI** | 迁移素材 | 原有核心与页面、Team/Thread/Mission/Artifact 数据迁移 | 实用交互 | 改动已定的 loom-native UI |
+| **AgenTeam · MOVO** | 企业版 | 组织/岗位/配额/审计、MOVO 的 DSH 受管组合（企业版时直接用） | — | 个人版先做企业控制面 |
+
+## 8. 待用户拍板
 
 1. ~~Claude Code 在 Win11~~：已定，禁用（2026-11-18）。
 2. 记忆隔离：按 Workspace 隔离 + 账号级画像共享，是否就此定。
 3. 设备侧补缺顺序：先虚拟屏（PiBot Shower）还是先接管租约（Mikka computer）。
-4. 云端（P13）是否提前。
+4. ~~云端是否提前~~：终态就是云端（2026-11-18）；DE-BERO 部署即云端第一版，P13 的“多用户、对外登录”仍按顺序后做。

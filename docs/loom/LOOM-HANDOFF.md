@@ -11,7 +11,7 @@
 - “Pi 和 Pi Purge 是内置的，可以理解为主助手，也可以操控 B，四个端口。”
 - “之前老是说开源，不舍得用。”参考快照许可已统一为 MIT，**Mikka、PiBot 等上游代码可以整段照抄**，许可不确定不再是自己写的理由。
 - “Claude 依然禁用，Claude CLI 容易封号。”开发、测试、验收都不调用 Claude CLI。
-- “直接在 DE-BERO 沙箱那边模拟我环境实现。”
+- “直接在 DE-BERO 沙箱那边模拟我环境实现。”“以 DE-BERO 验收吧，Bero 走通了 Win 不难，GitHub 镜像多构建一个。”“最终我希望跑到云上。”
 
 ## 2. 复用硬规则（每个施工 Agent 的 READ FIRST）
 
@@ -22,9 +22,9 @@
 5. **复制代码的规矩**（沿用 PiBot `docs/reuse-first-development-plan.md` §9）：成熟库作依赖，不复制库源码；独立小模块才 vendor，放进明确的 `third-party/` 或 `adapted/` 目录，记录原路径、SHA、改动，更新 `THIRD_PARTY_NOTICES.md`；从原仓库/发布包取代码，不从网页文本粘贴。
 6. **数据只进一个 Core。** 移植 Mikka/PiBot 逻辑时，存储落到 Rust Core + SQLite；不另跑 Postgres、不另起 PiBot Center、不建第二套调度。
 7. **依赖版本跟随用户实际安装版本**（DSH `0.2.0-rc.2`、固定 Pi 版本），仓内不另锁旧版。注意系统 PATH 上的 `dsh --version` 仍报 `0.1.5-rc.2`，不要误判。
-8. **既有纪律不变**：只认原始回执；失败记录不改写；不碰 64851 / 64852、日常 userData 和正式数据；DE-BERO 根盘余量很小，不投大编译；不 `reset`、不清理用户 WIP；未经用户同意不推送远端。
+8. **既有纪律不变**：只认原始回执；失败记录不改写；不碰 64851 / 64852、日常 userData 和正式数据；DE-BERO 只用自己建的独立容器、不动已有容器；不 `reset`、不清理用户 WIP；未经用户同意不推送远端。
 9. **不调用 Claude CLI**：Claude Code 运行端禁用，开发与测试也不拿它当工兵或验收对象。
-10. **在 DE-BERO 沙箱开发**（见 §3.1）；用户电脑只做 Windows 专属的隔离验收。
+10. **在 DE-BERO 沙箱开发和验收**（见 §3.1）；Windows 包走 GitHub 镜像 Actions；终态上云，Core 不依赖 Windows 本机路径。
 11. 阶段结果只更新根 `TASK.md` / `LOG.md` / `LOOM-IMPLEMENTATION.md`，**不再新建计划书或交接书**；需要改计划就改本页三件套。
 
 ## 3. 当前状态（2026-11-18 晚，细节以 LOOM-IMPLEMENTATION 为准）
@@ -45,8 +45,9 @@
 
 - 主机 DE-BERO（Linux，4 核、19 GB 内存；2026-11-18 实测根盘 196 GB、可用 150 GB）。经 `komari-ssh` 执行，按 `berobox` 建**独立容器**，不动已有 23 个容器、不清理未知资源。
 - 容器里模拟用户环境：同分支代码、固定 Node/Rust、Pi 固定版本、DSH `0.2.0-rc.2`、Codex；**不装、不调用 Claude CLI**；模型走用户已授权的现有服务。
-- 在沙箱跑：Rust Core、Web、loom-node（Linux）、Node 测试、P0–P5 的单测与集成测试。
-- 留在用户电脑隔离验收：Windows 安装包、Electron 桌面、Windows 电脑控制、真跨设备（E5）。不碰 64851/64852、日常 userData。
+- 在沙箱开发**并验收**：Rust Core、Web、loom-node（Linux）、Node 测试、P0–P5 单测/集成/E2E；跨设备先用“Core 容器 + 另一个 Node 容器”验证。
+- Windows：Bero 走通后，由 GitHub 镜像仓库的 Actions（`windows-package.yml`、`loom-v2-e3-windows.yml`）多构建 Windows 包；用户电脑只做最后的安装冒烟，不碰 64851/64852、日常 userData。
+- 终态上云：DE-BERO 上的部署按云端形态做（Linux Core + Web 登录 + Node 连入）。
 - 代码同步：沙箱只拉本地已提交的版本；推送远端仍需用户同意。
 
 ## 4. 造轮子清单（按“主体 Mikka + PiBot”重新定性）
@@ -106,4 +107,4 @@ TASK-ID / Owner / 阶段(P0–P6) / 依赖
 
 ## 7. 等用户拍板
 
-见 [架构](LOOM-ARCHITECTURE.md) §7。施工者不要自定。
+见 [架构](LOOM-ARCHITECTURE.md) §8。施工者不要自定。
