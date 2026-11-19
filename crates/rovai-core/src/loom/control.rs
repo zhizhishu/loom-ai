@@ -60,6 +60,11 @@ const LOOM_STAGE_REVIEW_REPLAY_CONFLICT: &str = "LOOM_STAGE_REVIEW_REPLAY_CONFLI
 const LOOM_STAGE_MANIFEST_MISMATCH: &str = "LOOM_STAGE_MANIFEST_MISMATCH";
 const LOOM_STAGE_CANDIDATE_STALE: &str = "LOOM_STAGE_CANDIDATE_STALE";
 const LOOM_STAGE_REVIEWER_RUN_INVALID: &str = "LOOM_STAGE_REVIEWER_RUN_INVALID";
+/// The reviewing Run is not an independent observer: it shares the Agent session that produced a
+/// delivery of this Task, or it continues (or is continued by) a Run that delivered one.
+const LOOM_STAGE_REVIEWER_SESSION_SHARED: &str = "LOOM_STAGE_REVIEWER_SESSION_SHARED";
+/// The verdict does not come from the Run this Candidate's review was dispatched to.
+const LOOM_STAGE_REVIEW_SOURCE_UNBOUND: &str = "LOOM_STAGE_REVIEW_SOURCE_UNBOUND";
 const LOOM_STAGE_CRITERIA_INCOMPLETE: &str = "LOOM_STAGE_CRITERIA_INCOMPLETE";
 
 const MAX_DISPATCH_BUDGET: i64 = 1000;
@@ -795,9 +800,11 @@ pub fn stage_review_record(
     }
 
     // Identity and membership of the reviewing Run, resolved from the trusted Run the Host named.
-    let run: Option<(String, String)> = transaction
+    let run: Option<ReviewingRun> = transaction
         .query_row(
-            "SELECT COALESCE(run.camp_id, turn.camp_id), conversation.agent_id
+            "SELECT COALESCE(run.camp_id, turn.camp_id), conversation.agent_id,
+                    run.conversation_id, conversation.native_session_id,
+                    run.predecessor_agent_run_id
              FROM agent_run run
              JOIN conversation ON conversation.id = run.conversation_id
              LEFT JOIN camp_turn turn ON turn.id = run.camp_turn_id
@@ -805,10 +812,18 @@ pub fn stage_review_record(
                AND run.status='running'
                AND run.cancel_requested_at IS NULL",
             [&trusted_run_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok(ReviewingRun {
+                    camp_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    native_session_id: row.get(3)?,
+                    predecessor_run_id: row.get(4)?,
+                })
+            },
         )
         .optional()?;
-    let Some((run_camp_id, run_agent_id)) = run else {
+    let Some(run) = run else {
         return Err(LoomCommandError::rejection(
             LOOM_STAGE_REVIEWER_RUN_INVALID,
             format!(
@@ -821,7 +836,8 @@ pub fn stage_review_record(
         [&mission_id],
         |row| row.get(0),
     )?;
-    if run_agent_id != trusted_agent_id || run_camp_id != mission_camp_id {
+    let run_agent_id = run.agent_id;
+    if run_agent_id != trusted_agent_id || run.camp_id != mission_camp_id {
         return Err(LoomCommandError::rejection(
             LOOM_STAGE_REVIEWER_RUN_INVALID,
             format!("agent run {trusted_run_id} does not belong to agent {trusted_agent_id} of this Camp"),
@@ -833,6 +849,55 @@ pub fn stage_review_record(
             format!("agent {trusted_agent_id} is not an active member of this Camp"),
         ));
     }
+
+    // Only the Run a review was actually handed to may answer it. When the platform dispatched this
+    // Candidate's review, the Delivery's claimed Run is that observer; any other live Run of the
+    // assigned agent is not. A dispatch whose Delivery nobody has claimed yet proves no Run was
+    // asked at all, so it fails closed too.
+    match dispatched_review(
+        &transaction,
+        &plan_id,
+        &task_id,
+        &candidate_id,
+        policy_revision,
+    )? {
+        DispatchedReview::NotDispatched => {}
+        DispatchedReview::Run(dispatched_run_id) if dispatched_run_id == trusted_run_id => {}
+        DispatchedReview::Run(dispatched_run_id) => {
+            return Err(LoomCommandError::rejection(
+                LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
+                format!(
+                    "the review of candidate {candidate_id} was dispatched to agent run {dispatched_run_id}, not to {trusted_run_id}"
+                ),
+            ));
+        }
+        DispatchedReview::Unclaimed => {
+            return Err(LoomCommandError::rejection(
+                LOOM_STAGE_REVIEW_SOURCE_UNBOUND,
+                format!(
+                    "the review of candidate {candidate_id} was dispatched but no agent run has claimed its delivery"
+                ),
+            ));
+        }
+    }
+
+    // Independent observer: the reviewing Run has to stand outside the Agent session that produced
+    // this Task's deliveries. A verdict written from the producing session, or from a Run that
+    // continues (or is continued by) a producing Run, is the producer judging itself through a
+    // second agent identity — the upstream `factoryCheckIndependent` session/ancestry fence, with
+    // no question exemptions here because LOOM has no accepted-answer continuation.
+    ensure_reviewer_session_is_independent(
+        &transaction,
+        &plan_id,
+        &task_id,
+        &producer_run_id,
+        &RunSession {
+            run_id: trusted_run_id.clone(),
+            conversation_id: run.conversation_id,
+            native_session_id: run.native_session_id,
+            predecessor_run_id: run.predecessor_run_id,
+        },
+    )?;
 
     // Nobody reviews their own delivery: neither the producing Run nor the producing agent.
     if producer_run_id == trusted_run_id {
@@ -1450,6 +1515,178 @@ fn agent_of_run(connection: &Connection, agent_run_id: &str) -> Result<Option<St
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// The Run the platform asked to review one Candidate, if it dispatched the review at all.
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchedReview {
+    /// No review was dispatched for this Candidate under this authorization yet, so the trusted
+    /// Run the Host resolved is the only evidence of who was asked.
+    NotDispatched,
+    /// The review was dispatched and this Run claimed its Delivery: it, and only it, may answer.
+    Run(String),
+    /// The review was dispatched but no Run has claimed the Delivery: nobody was asked yet.
+    Unclaimed,
+}
+
+/// Which Run the platform handed this Candidate's review to.
+///
+/// The ledger is keyed by `(REVIEW, plan, task, candidate, authorization revision)`, so a Candidate
+/// carries at most one such dispatch per grant. The Delivery it names is claimed by exactly one Run.
+fn dispatched_review(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+    candidate_id: &str,
+    policy_revision: i64,
+) -> Result<DispatchedReview> {
+    let claimed: Option<Option<String>> = connection
+        .query_row(
+            "SELECT delivery.claimed_agent_run_id
+             FROM loom_control_dispatch dispatch
+             LEFT JOIN camp_message_delivery delivery ON delivery.id = dispatch.delivery_id
+             WHERE dispatch.plan_id=?1 AND dispatch.task_id=?2 AND dispatch.kind='REVIEW'
+               AND dispatch.candidate_id=?3 AND dispatch.policy_revision=?4",
+            params![plan_id, task_id, candidate_id, policy_revision],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match claimed {
+        None => DispatchedReview::NotDispatched,
+        Some(Some(run_id)) => DispatchedReview::Run(run_id),
+        Some(None) => DispatchedReview::Unclaimed,
+    })
+}
+
+/// The trusted Run asking to review, resolved from the Host's identity in this Camp.
+struct ReviewingRun {
+    camp_id: String,
+    agent_id: String,
+    conversation_id: String,
+    native_session_id: Option<String>,
+    predecessor_run_id: Option<String>,
+}
+
+/// The Agent session one Run executes in, plus the Run it continues.
+struct RunSession {
+    run_id: String,
+    conversation_id: String,
+    native_session_id: Option<String>,
+    predecessor_run_id: Option<String>,
+}
+
+impl RunSession {
+    fn read(connection: &Connection, run_id: &str) -> Result<Option<Self>> {
+        Ok(connection
+            .query_row(
+                "SELECT run.id, run.conversation_id, conversation.native_session_id,
+                        run.predecessor_agent_run_id
+                 FROM agent_run run
+                 JOIN conversation ON conversation.id = run.conversation_id
+                 WHERE run.id=?1",
+                [run_id],
+                |row| {
+                    Ok(Self {
+                        run_id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        native_session_id: row.get(2)?,
+                        predecessor_run_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+}
+
+/// True when two Runs observe the world through one Agent session: the same conversation, the same
+/// native session behind it, or a continuation edge in either direction.
+fn shares_agent_session(left: &RunSession, right: &RunSession) -> bool {
+    let same_native_session = match (
+        left.native_session_id.as_deref(),
+        right.native_session_id.as_deref(),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    };
+    left.conversation_id == right.conversation_id
+        || same_native_session
+        || left.predecessor_run_id.as_deref() == Some(right.run_id.as_str())
+        || right.predecessor_run_id.as_deref() == Some(left.run_id.as_str())
+}
+
+/// Refuse a reviewing Run that is not an independent observer of this Task's deliveries.
+///
+/// Every Run that claimed this Task or produced one of its Candidates is a production Run. The
+/// reviewer may share a session with none of them: not with the Run that produced the Candidate
+/// under review, and not with a Run that delivered an earlier version of the same Task. The
+/// reviewer may not itself be one of those Runs either — that is the same thread judging its own
+/// work through another identity. A producing Run that can no longer be resolved is judged by the
+/// caller before this fence, which fails closed on it.
+fn ensure_reviewer_session_is_independent(
+    connection: &Connection,
+    plan_id: &str,
+    task_id: &str,
+    producer_run_id: &str,
+    reviewer: &RunSession,
+) -> Result<()> {
+    let producer = RunSession::read(connection, producer_run_id)?;
+    if let Some(producer) = producer.as_ref()
+        && shares_agent_session(reviewer, producer)
+    {
+        return Err(shared_session_error(
+            "the Run that produced the Candidate under review",
+            &producer.run_id,
+        ));
+    }
+
+    let mut earlier: Vec<RunSession> = Vec::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT run.id, run.conversation_id, conversation.native_session_id,
+                    run.predecessor_agent_run_id
+             FROM agent_run run
+             JOIN conversation ON conversation.id = run.conversation_id
+             WHERE run.id IN (
+                 SELECT claim.agent_run_id FROM loom_claim claim
+                  WHERE claim.plan_id=?1 AND claim.task_id=?2
+                 UNION
+                 SELECT candidate.agent_run_id FROM loom_candidate candidate
+                  WHERE candidate.plan_id=?1 AND candidate.task_id=?2
+             )",
+        )?;
+        let rows = statement.query_map(params![plan_id, task_id], |row| {
+            Ok(RunSession {
+                run_id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                native_session_id: row.get(2)?,
+                predecessor_run_id: row.get(3)?,
+            })
+        })?;
+        for row in rows {
+            earlier.push(row?);
+        }
+    }
+    for delivery in &earlier {
+        if delivery.run_id == reviewer.run_id {
+            return Err(shared_session_error("this Task", &delivery.run_id));
+        }
+        if shares_agent_session(reviewer, delivery) {
+            return Err(shared_session_error(
+                "an earlier delivery of this Task",
+                &delivery.run_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn shared_session_error(role: &str, run_id: &str) -> anyhow::Error {
+    LoomCommandError::rejection(
+        LOOM_STAGE_REVIEWER_SESSION_SHARED,
+        format!(
+            "agent run {run_id} is not an independent observer: the reviewing Run shares its Agent session, which {role} also used"
+        ),
+    )
 }
 
 fn read_policy(connection: &Connection, plan_id: &str) -> Result<Option<LoomControlPolicy>> {
