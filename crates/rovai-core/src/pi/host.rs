@@ -45,6 +45,7 @@ use url::Url;
 use crate::{
     acp::CompletedAcpAction,
     builtin_tool_runtime::{BuiltinToolProcessConfig, BuiltinToolProcessConfigFactory},
+    loom::LiveClaim,
     runtime_fleet::{
         AgentRuntimeFleetManager, FleetAcquireRequest, FleetReleaseDisposition,
         RuntimeCompatibilityKey, RuntimeProcessHost,
@@ -210,6 +211,11 @@ struct PiManagedGuardState {
     workspace_real: String,
     expires_at_epoch_ms: i64,
     guard_log_path: String,
+    /// The LOOM claim the grant was issued under (empty for a Run bound to no LOOM Task). The
+    /// acknowledgement must echo it byte for byte, or this Host is not the one Core fenced.
+    claim_id: String,
+    fence_generation: i64,
+    lease_expires_at_epoch_ms: i64,
 }
 
 #[derive(Deserialize)]
@@ -1648,7 +1654,7 @@ impl PiHost {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(state) = self.guard_state.read().await.clone() {
-                if state.schema_version != 3
+                if state.schema_version != super::PI_MANAGED_GUARD_SCHEMA_VERSION
                     || state.extension_version != super::PI_HOST_EXTENSION_VERSION
                     || state.host_instance_id != self.host_instance_id
                     || state.host_binding_generation != binding.host_binding_generation
@@ -1662,6 +1668,9 @@ impl PiHost {
                     || state.workspace_real != grant.workspace_real
                     || state.expires_at_epoch_ms != grant.expires_at_epoch_ms
                     || state.guard_log_path != grant.log_path
+                    || state.claim_id != grant.claim_id
+                    || state.fence_generation != grant.fence_generation
+                    || state.lease_expires_at_epoch_ms != grant.lease_expires_at_epoch_ms
                 {
                     bail!("Pi managed guard state is not bound to this Run's file grant");
                 }
@@ -2077,6 +2086,25 @@ impl PiRuntime {
 type PiRuntimeCreationKey = (String, i64);
 type PiRuntimeCreationGate = Weak<Mutex<()>>;
 
+/// The warm-Host reuse key of one guarded Run.
+///
+/// The frozen compatibility digest alone says nothing about the write authorisation: two launches of
+/// the SAME Run under different claim fences hold different grants, so they must never reuse one warm
+/// Host (the older claim's grant is still materialized there). An unbound Run keys on `claim=none`,
+/// which keeps single-Run warm reuse working exactly as before.
+fn guarded_compatibility_digest(base: &str, mode: PiFileAccessMode, grant: &PiFileGrant) -> String {
+    let claim = grant.claim().map_or_else(
+        || "none".to_string(),
+        |(claim_id, fence_generation, _)| format!("{claim_id}:{fence_generation}"),
+    );
+    format!(
+        "{base}#file-access={};run={};epoch={};claim={claim}",
+        mode.as_str(),
+        grant.run_id,
+        grant.execution_epoch
+    )
+}
+
 pub struct PiRpcRuntimeAdapter {
     active: Mutex<HashMap<String, Arc<PiRuntime>>>,
     runtime_creation: StdMutex<HashMap<PiRuntimeCreationKey, PiRuntimeCreationGate>>,
@@ -2110,6 +2138,11 @@ pub struct PiAgentRunRuntimeRequest<'a> {
     pub bootstrap: &'a PreparedSessionBootstrap,
     pub builtin_tool_factory: &'a BuiltinToolProcessConfigFactory,
     pub mcp: Option<&'a PiMcpProjection>,
+    /// The live LOOM claim the calling Core already read for exactly this Run (see
+    /// `loom::live_claim_for_run`). `None` means the Run is bound to no LOOM Task, which is what keeps
+    /// ordinary chat grants unchanged. This module owns no database connection, so the claim is read
+    /// by its owner and only carried here.
+    pub live_claim: Option<&'a LiveClaim>,
 }
 
 impl PiRpcRuntimeAdapter {
@@ -2233,17 +2266,17 @@ impl PiRpcRuntimeAdapter {
             request.cwd,
             &guard_log_dir.join("guard.jsonl"),
             now_epoch_ms(),
+            request.live_claim,
         )?;
         // A guarded Run must never share a warm Host with another Run or with the native policy, so the
-        // reuse key carries the access mode plus the Run identity. Native Runs keep the digest verbatim,
-        // which leaves today's warm-reuse behaviour byte-identical.
+        // reuse key carries the access mode, the Run identity and the claim fence the grant was issued
+        // under. Native Runs keep the digest verbatim, which leaves today's warm-reuse behaviour
+        // byte-identical.
         let compatibility_digest = match spawn_file_grant.as_ref() {
-            Some(grant) => format!(
-                "{}#file-access={};run={};epoch={}",
+            Some(grant) => guarded_compatibility_digest(
                 request.runtime_compatibility_digest,
-                file_access_mode.as_str(),
-                grant.run_id,
-                grant.execution_epoch
+                file_access_mode,
+                grant,
             ),
             None => request.runtime_compatibility_digest.to_string(),
         };
@@ -4273,6 +4306,64 @@ done
                 assert!(!production_args.iter().any(|argument| argument == forbidden));
             }
         }
+    }
+
+    #[test]
+    fn guarded_host_reuse_key_carries_the_claim_fence_it_was_issued_under() {
+        let workspace = std::env::temp_dir()
+            .join(format!("rovai-pi-host-claim-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let now = now_epoch_ms();
+        let build = |claim: Option<&LiveClaim>| {
+            PiFileGrant::for_run(
+                PiFileAccessMode::WorkspaceWorkflow,
+                "run-1",
+                "bot-1",
+                3,
+                &workspace,
+                &workspace.join("guard.jsonl"),
+                now,
+                claim,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // An unbound Run keys exactly once, so its warm Host is still reused.
+        let unbound = build(None);
+        assert_eq!(
+            guarded_compatibility_digest("base", PiFileAccessMode::WorkspaceWorkflow, &unbound),
+            "base#file-access=workspace_workflow;run=run-1;epoch=3;claim=none"
+        );
+        // Two fences of the same Run hold different grants and must never share one warm Host.
+        let first = build(Some(&LiveClaim {
+            claim_id: "claim-1".to_string(),
+            agent_run_id: "run-1".to_string(),
+            fence_generation: 1,
+            lease_expires_at: chrono::DateTime::from_timestamp_millis(now + 90_000)
+                .unwrap()
+                .to_rfc3339(),
+        }));
+        let second = build(Some(&LiveClaim {
+            claim_id: "claim-2".to_string(),
+            agent_run_id: "run-1".to_string(),
+            fence_generation: 2,
+            lease_expires_at: chrono::DateTime::from_timestamp_millis(now + 90_000)
+                .unwrap()
+                .to_rfc3339(),
+        }));
+        let first_key =
+            guarded_compatibility_digest("base", PiFileAccessMode::WorkspaceWorkflow, &first);
+        let second_key =
+            guarded_compatibility_digest("base", PiFileAccessMode::WorkspaceWorkflow, &second);
+        assert_eq!(
+            first_key,
+            "base#file-access=workspace_workflow;run=run-1;epoch=3;claim=claim-1:1"
+        );
+        assert_ne!(
+            first_key, second_key,
+            "assertion two claim fences of one Run never share a warm Host"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
     }
 
     #[cfg(windows)]

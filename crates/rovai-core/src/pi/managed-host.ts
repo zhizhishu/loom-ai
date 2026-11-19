@@ -20,6 +20,12 @@ import {
 } from "./managed-workflow-tool.ts";
 
 const SCHEMA_VERSION = 3;
+// P0 step 2 / Core's plan decision E2: the guard acknowledgement (`rovai-managed-guard-state`)
+// carries the LOOM claim the grant was issued under, so THAT receipt moves to v4 while the binding
+// and session-state documents keep v3 (they did not change). Core's matching constant is
+// `PI_MANAGED_GUARD_SCHEMA_VERSION` in `pi.rs`; the two must move together or every guarded Run is
+// refused by `await_guard_ready`.
+const GRANT_SCHEMA_VERSION = 4;
 const EXTENSION_VERSION = "rovai-pi-host-v11";
 // Optional per-Run file-access policy. Absent => the unchanged legacy native policy (no guard).
 // Core writes the grant to a private file and points this env var at it; the same file is what the
@@ -49,6 +55,12 @@ const FILE_GRANT_KEYS = [
   "expiresAtEpochMs",
   "logPath",
 ];
+// The claim triple Core adds to every grant it issues (P0 step 2). A Run that holds no LOOM Task
+// presents the empty triple (`""`/`0`/`0`) — the keys are still present, so "missing" can never be
+// mistaken for "unbound". Carrying them is all this step does; refusing a write without a claim is
+// the shared guard's decision.
+const FILE_GRANT_CLAIM_KEYS = ["claimId", "fenceGeneration", "leaseExpiresAtEpochMs"];
+const FILE_GRANT_ALL_KEYS = [...FILE_GRANT_KEYS, ...FILE_GRANT_CLAIM_KEYS];
 
 /**
  * Read the Core-written grant. `null` means the legacy native policy: no guard, no restriction.
@@ -149,7 +161,7 @@ function loadBinding(): any {
 function validateFileAccess(binding: any): void {
   const grant = readRunGrant();
   if (grant === null) return;
-  if (!hasRequiredKeys(grant, FILE_GRANT_KEYS) || Object.keys(grant).length !== FILE_GRANT_KEYS.length) {
+  if (!hasRequiredKeys(grant, FILE_GRANT_ALL_KEYS) || Object.keys(grant).length !== FILE_GRANT_ALL_KEYS.length) {
     throw new Error("runGrant shape mismatch");
   }
   if (grant.schema !== FILE_GRANT_SCHEMA) throw new Error("runGrant schema mismatch");
@@ -170,6 +182,23 @@ function validateFileAccess(binding: any): void {
   if (!Number.isSafeInteger(grant.expiresAtEpochMs) || grant.expiresAtEpochMs <= Date.now()) {
     throw new Error("runGrant is expired");
   }
+  // The claim triple is coherent or it is not a Core-written grant: an empty claim id means "this Run
+  // holds no LOOM claim" and must then carry no fence and no lease; a present claim id must carry a
+  // positive fence and a positive lease. Whether that lease is still live is enforced where the write
+  // decision is made (the shared guard), not at extension load.
+  if (!Number.isSafeInteger(grant.fenceGeneration) || grant.fenceGeneration < 0) {
+    throw new Error("runGrant fenceGeneration is invalid");
+  }
+  if (!Number.isSafeInteger(grant.leaseExpiresAtEpochMs) || grant.leaseExpiresAtEpochMs < 0) {
+    throw new Error("runGrant claim lease is invalid");
+  }
+  if (nonEmpty(grant.claimId)) {
+    if (grant.fenceGeneration < 1 || grant.leaseExpiresAtEpochMs < 1) {
+      throw new Error("runGrant claim is incomplete");
+    }
+  } else if (grant.fenceGeneration !== 0 || grant.leaseExpiresAtEpochMs !== 0) {
+    throw new Error("runGrant claim is inconsistent");
+  }
 }
 
 /**
@@ -183,7 +212,7 @@ function publishGuardState(ctx: any, binding: any): void {
   ctx.ui.setStatus(
     "rovai-managed-guard-state",
     JSON.stringify({
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: GRANT_SCHEMA_VERSION,
       extensionVersion: EXTENSION_VERSION,
       hostInstanceId: binding.hostInstanceId,
       hostBindingGeneration: binding.hostBindingGeneration,
@@ -194,6 +223,9 @@ function publishGuardState(ctx: any, binding: any): void {
       workspaceReal: grant.workspaceReal,
       expiresAtEpochMs: grant.expiresAtEpochMs,
       guardLogPath: grant.logPath,
+      claimId: grant.claimId,
+      fenceGeneration: grant.fenceGeneration,
+      leaseExpiresAtEpochMs: grant.leaseExpiresAtEpochMs,
     }),
   );
 }

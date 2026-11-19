@@ -32,6 +32,15 @@ pub use host::{PiAgentRunRuntimeRequest, PiMcpProjection, PiRpcRuntimeAdapter, P
 
 pub(crate) const PI_PROTOCOL_VERSION: &str = "pi-jsonl-rpc-v1";
 pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v11";
+/// The schema version of the `rovai-managed-guard-state` acknowledgement (the grant receipt).
+///
+/// P0 step 2 / plan decision E2: the grant now carries the LOOM claim triple
+/// (`claimId`/`fenceGeneration`/`leaseExpiresAtEpochMs`), so the receipt moves from v3 to v4 and
+/// every older receipt is refused instead of being field-compared against a wider document. It is a
+/// SEPARATE constant from the binding/session-state `SCHEMA_VERSION` in `managed-host.ts` because
+/// those two documents did not change; the TypeScript side mirrors this with `GRANT_SCHEMA_VERSION`.
+/// Both ends must move together — drift here makes `await_guard_ready` refuse every guarded Run.
+pub(crate) const PI_MANAGED_GUARD_SCHEMA_VERSION: i64 = 4;
 // The managed Host extension validates the OPTIONAL per-Run file grant (`ROVAI_PI_FILE_GRANT_FILE`)
 // and publishes `rovai-managed-guard-state`. v10 widened the accepted grant to the two exact frozen
 // tool sets (`read` or `read`/`write`/`edit`); v11 adds the third, explicitly chosen
@@ -1140,6 +1149,32 @@ mod managed_workflow_source_tests {
             PI_FILE_GRANT_WORKFLOW_TOOLS,
             ["read", "write", "edit", PI_LOOM_TOOL_NAME]
         );
+    }
+
+    /// P0 step 2: the grant document carries the LOOM claim triple on both ends of one contract, and
+    /// the guard receipt's schema version is the same number in `managed-host.ts` and here. Node owns
+    /// the behavioural proof; this is the cargo-runnable drift guard that keeps the two ends together.
+    #[test]
+    fn managed_host_grant_carries_the_claim_and_one_receipt_schema_version() {
+        let source = include_str!("pi/managed-host.ts");
+        assert!(
+            source.contains(&format!(
+                "const GRANT_SCHEMA_VERSION = {PI_MANAGED_GUARD_SCHEMA_VERSION};"
+            )),
+            "the grant receipt schema version drifted from PI_MANAGED_GUARD_SCHEMA_VERSION"
+        );
+        for key in ["claimId", "fenceGeneration", "leaseExpiresAtEpochMs"] {
+            assert!(
+                source.contains(&format!("\"{key}\"")),
+                "managed-host.ts lost the {key} grant field"
+            );
+        }
+        // The empty (unbound) triple is a legal shape; an incoherent one is not.
+        assert!(source.contains("runGrant claim is incomplete"));
+        assert!(source.contains("runGrant claim is inconsistent"));
+        // The binding and session-state documents did NOT change shape, so they keep the older
+        // version: one shared bump would have invalidated evidence this step never widened.
+        assert!(source.contains("const SCHEMA_VERSION = 3;"));
     }
 }
 

@@ -17611,6 +17611,19 @@ impl Core {
         self.persist_runtime_compatibility_digest(execution, &runtime_compatibility_digest)
             .await?;
         let builtin_tool_factory = self.builtin_tool_process_config_factory()?;
+        // P0 step 2: the write authorisation Core is about to issue must carry the LOOM claim this Run
+        // actually holds right now. The claim is read here, under the database lock its owner already
+        // holds, and only carried into the grant; a Run bound to no LOOM Task reads as `None` and keeps
+        // the empty claim triple, so ordinary chat is unchanged. One read serves both the first spawn and
+        // the exact-resume replacement below, so they can never be built from two different fences.
+        let live_claim = {
+            let database = self.database.lock().await;
+            crate::loom::live_claim_for_run(
+                database.connection(),
+                &execution.agent_run_id,
+                chrono::Utc::now(),
+            )?
+        };
         launch_permit.check_cancelled()?;
         let runtime_result = self
             .pi
@@ -17630,6 +17643,7 @@ impl Core {
                 bootstrap: &session_bootstrap,
                 builtin_tool_factory: &builtin_tool_factory,
                 mcp: managed_mcp.as_ref(),
+                live_claim: live_claim.as_ref(),
             })
             .await;
         let runtime = match runtime_result {
@@ -17701,6 +17715,7 @@ impl Core {
                         bootstrap: &replacement_bootstrap,
                         builtin_tool_factory: &builtin_tool_factory,
                 mcp: managed_mcp.as_ref(),
+                        live_claim: live_claim.as_ref(),
                     })
                     .await
                     .with_context(|| {

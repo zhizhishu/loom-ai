@@ -226,6 +226,11 @@ function fixture(options = {}) {
     allowedTools: options.allowedTools ?? ['read', 'write', 'edit', LOOM_TOOL_NAME],
     expiresAtEpochMs: options.expiresAtEpochMs ?? Date.now() + 600_000,
     logPath: join(root, 'guard.jsonl'),
+    // P0 step 2: the same claim triple Core now writes into every grant. A workspace_workflow Run is
+    // bound to a LOOM Task, so the fixture carries a live claim instead of the empty unbound triple.
+    claimId: options.claimId ?? 'claim-workflow-1',
+    fenceGeneration: options.fenceGeneration ?? 1,
+    leaseExpiresAtEpochMs: options.leaseExpiresAtEpochMs ?? Date.now() + 600_000,
   }
   return { root, cliPath, grant, binding: { agentRunId: grant.runId, executionEpoch: grant.executionEpoch } }
 }

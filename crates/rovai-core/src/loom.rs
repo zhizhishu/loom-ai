@@ -1130,7 +1130,9 @@ fn lease_expired(lease_expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> 
 /// 同一 Run 可能因为接管而有多代 fence，只报最大的那一代；它已经过期时不回退到
 /// 更早的世代——过期就是没有活 claim。此函数不写库、不加锁，调用方自己持有连接与
 /// 时钟，避免在这里偷偷读第二个时钟。
-#[allow(dead_code)] // 只读口先落地，消费方（提交侧/远端接管）随后接上。
+///
+/// 消费方：`application::launch_pi_agent_run` 在发写授权（`pi::PiFileGrant`）前读它，
+/// 让 grant 携带的就是本 Run 当下真正持有的 claim/fence/租约。
 pub(crate) fn live_claim_for_run(
     connection: &rusqlite::Connection,
     agent_run_id: &str,
@@ -7271,6 +7273,79 @@ mod tests {
                 .is_none(),
             "assertion a released or expired lease is never reported as live"
         );
+    }
+
+    /// P0 步骤 2：写授权携带的就是这个 Run 当下真正持有的 claim。真库真租约，
+    /// 不构造假 claim：活 claim → 三字段齐全；过期 claim → 三字段为空。
+    #[test]
+    fn pi_file_grant_carries_only_a_live_claim() {
+        use crate::pi::{PiFileAccessMode, PiFileGrant, now_epoch_ms};
+
+        let mut database = fixture();
+        let mission_id = create_mission(&mut database, "LOOM pi grant claim");
+        let claim = held_task(
+            &mut database,
+            &mission_id,
+            "task_a",
+            "run_one",
+            "command_one",
+        );
+        let workspace = std::env::temp_dir()
+            .join(format!("rovai-loom-pi-grant-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let build = |claim: Option<&LiveClaim>| {
+            PiFileGrant::for_run(
+                PiFileAccessMode::WorkspaceWorkflow,
+                "run_one",
+                "bot_one",
+                1,
+                &workspace,
+                &workspace.join("guard.jsonl"),
+                now_epoch_ms(),
+                claim,
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        let live = live_claim_for_run(database.connection(), "run_one", chrono::Utc::now())
+            .unwrap()
+            .expect("an open, unexpired lease must read as live");
+        let grant = build(Some(&live));
+        assert_eq!(grant.claim_id, claim.claim_id.as_str());
+        assert_eq!(grant.fence_generation, 1);
+        assert_eq!(
+            grant.claim(),
+            Some((
+                claim.claim_id.as_str(),
+                1,
+                chrono::DateTime::parse_from_rfc3339(&claim.lease_expires_at)
+                    .unwrap()
+                    .timestamp_millis()
+            )),
+            "assertion the grant carries the exact claim, fence and lease the Run holds"
+        );
+
+        // 未绑定 LOOM 任务（普通聊天）的 Run 本来就没有 claim：同样为空，而且不是报错。
+        let unbound = build(None);
+        assert_eq!(unbound.claim_id, "");
+        assert_eq!(unbound.fence_generation, 0);
+        assert_eq!(unbound.lease_expires_at_epoch_ms, 0);
+
+        // 过期租约既不算活 claim，也不会被塞进写授权冒充活 fence。
+        expire_lease(&database, &claim.claim_id);
+        let expired =
+            live_claim_for_run(database.connection(), "run_one", chrono::Utc::now()).unwrap();
+        assert!(expired.is_none());
+        let grant = build(expired.as_ref());
+        assert_eq!(
+            grant.claim_id, "",
+            "assertion an expired lease is never carried into a write grant"
+        );
+        assert_eq!(grant.fence_generation, 0);
+        assert_eq!(grant.lease_expires_at_epoch_ms, 0);
+        assert!(grant.claim().is_none());
+        std::fs::remove_dir_all(&workspace).ok();
     }
 
     #[test]
