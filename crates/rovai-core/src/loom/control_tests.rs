@@ -18,9 +18,10 @@ use super::{
     LoomPlanImportTask, LoomReviewRecordInput, LoomReviewVerdict, LoomTaskReleaseInput,
     candidate_record, claim_acquire, plan_import, review_record, task_release,
 };
+use crate::agent_profile::AdapterKind;
 use crate::collaboration::ProjectBindingKind;
 use crate::command::{ActorRef, CommandEnvelope};
-use crate::db::Database;
+use crate::db::{Database, TestDatabaseOpenMode};
 use crate::mission::{CreateMissionCommand, MissionService};
 use crate::test_support::OwnedTestDatabase;
 use rusqlite::params;
@@ -329,7 +330,7 @@ fn acceptance_status(database: &OwnedTestDatabase, candidate_id: &str) -> String
         .unwrap()
 }
 
-fn count(database: &OwnedTestDatabase, sql: &str) -> i64 {
+fn count(database: &Database, sql: &str) -> i64 {
     database
         .connection()
         .query_row(sql, [], |row| row.get(0))
@@ -1519,6 +1520,151 @@ fn execute_event_key(plan_id: &str, task_id: &str) -> String {
     serde_json::to_string(&["EXECUTE", plan_id, task_id]).unwrap()
 }
 
+/// The durable dispatch facts this module recorded for one Task, in write order:
+/// `(event type, reason code)`. A recovery fact carries no reason.
+fn dispatch_events(database: &Database, task_id: &str) -> Vec<(String, Option<String>)> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT event_type, json_extract(payload_json, '$.reasonCode') FROM event_log
+             WHERE entity_type='loom_task' AND entity_id=?1
+               AND event_type IN ('loom.dispatch_failed','loom.dispatch_recovered')
+             ORDER BY id",
+        )
+        .unwrap();
+    statement
+        .query_map([task_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn failure_fact(reason: &str) -> (String, Option<String>) {
+    ("loom.dispatch_failed".to_string(), Some(reason.to_string()))
+}
+
+fn recovered_fact() -> (String, Option<String>) {
+    ("loom.dispatch_recovered".to_string(), None)
+}
+
+/// Point one member at a remote Node and give that Node the selected harness: a real
+/// `member_execution_target` row, a ready `mission_workspace` on that Node and a reported CLI.
+/// Returns the workspace id.
+fn select_remote_node(
+    database: &OwnedTestDatabase,
+    camp_id: &str,
+    member_id: &str,
+    node_id: &str,
+    adapter_kind: AdapterKind,
+    heartbeat: &str,
+) -> String {
+    let connection = database.connection();
+    let mission_id: String = connection
+        .query_row(
+            "SELECT id FROM mission WHERE camp_id=?1",
+            [camp_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let workspace_id = format!("workspace_{node_id}");
+    let root = format!("/fixture/{node_id}/worktree");
+    connection
+        .execute(
+            "INSERT INTO execution_node(node_id,display_name,role,os,arch,token_digest,paired_at,
+                                        revoked_at,last_heartbeat)
+             VALUES(?1,'Remote Node','remote',NULL,NULL,?2,?3,NULL,?3)",
+            params![node_id, "a".repeat(64), heartbeat],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO execution_node_cli(node_id,adapter_kind,path,version,path_present,
+                                            reported_at,installation_identity,
+                                            installation_generation)
+             VALUES(?1,?2,?3,'9.9.9',1,?4,?5,1)",
+            params![
+                node_id,
+                adapter_kind.as_str(),
+                format!("{root}/{}", adapter_kind.as_str()),
+                heartbeat,
+                format!("sha256:{}", "b".repeat(64))
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,
+                                           source_directory,repository_root,git_common_dir,
+                                           worktree_path,working_directory,base_branch,branch,
+                                           base_sha,preparation_token,preparation_kind,generation,
+                                           state,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?5,?6,?5,?5,'main','rovai/mission/remote','base',
+                    'loom-remote-preparation','create',1,'ready',?7,?7)",
+            params![
+                workspace_id,
+                mission_id,
+                camp_id,
+                node_id,
+                root,
+                format!("{root}/.git"),
+                heartbeat
+            ],
+        )
+        .unwrap();
+    let defaults = crate::agent_profile::member_runtime_defaults(adapter_kind);
+    let selection = serde_json::json!({
+        "nodeId": node_id,
+        "workspaceId": workspace_id,
+        "workspaceRoot": root,
+        "adapterKind": adapter_kind.as_str(),
+        "model": defaults.model,
+        "permissions": defaults.permissions,
+    });
+    connection
+        .execute(
+            "INSERT INTO member_execution_target(member_id,revision,node_id,selection_json,
+                                                 updated_at)
+             VALUES(?1,1,?2,?3,?4)",
+            params![member_id, node_id, selection.to_string(), heartbeat],
+        )
+        .unwrap();
+    workspace_id
+}
+
+/// The prepared Mission workspace the real scheduler hands to a claim, so a Mission lane is claimed
+/// exactly as production claims it instead of being deferred as unprepared. Captured immediately
+/// before each claim, because the fence is the workspace the claim will re-prove.
+fn claim_mission_lane(database: &mut OwnedTestDatabase, camp_id: &str, limit: i64) -> Vec<String> {
+    let project_path: String = database
+        .connection()
+        .query_row(
+            "SELECT project_path FROM camp WHERE id=?1",
+            [camp_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let workspace = crate::runtime::AgentRunWorkspace {
+        execution_root: project_path.clone(),
+        access: "write".into(),
+        isolation: "git_worktree".into(),
+    };
+    let fact = serde_json::json!({
+        "workingDirectory": project_path,
+        "branch": "rovai/mission/fixture",
+    });
+    let prepared =
+        crate::delivery_queue::capture_prepared_batch_workspace(database, camp_id, workspace, fact)
+            .unwrap();
+    let workspaces =
+        crate::delivery_queue::BatchWorkspaces::from([(camp_id.to_string(), Ok(prepared))]);
+    crate::delivery_queue::claim_waiting_delivery_batches_with_workspaces(
+        database,
+        limit,
+        &workspaces,
+    )
+    .unwrap()
+}
+
 /// Failure-vocabulary boundary, ported from Mikka
 /// `lib/factory/dispatch-recovery.ts:factoryDispatchFailureReason`: the reason names the first fact
 /// that makes the recipient unusable, in the order switch → presence → harness, and the same
@@ -1526,20 +1672,14 @@ fn execute_event_key(plan_id: &str, task_id: &str) -> String {
 #[test]
 fn dispatch_failure_reason_follows_the_disabled_offline_harness_order() {
     let mut database = fixture();
-    let (_mission_id, plan_id) =
-        dispatchable_plan(
-            &mut database,
-            "dispatch failure vocabulary",
-            "command_approve_vocabulary",
-            &[PRODUCER_AGENT, REVIEWER_AGENT],
-            &[],
-        );
-    let camp_id: String = database
-        .connection()
-        .query_row("SELECT camp_id FROM mission WHERE id=(SELECT mission_id FROM loom_plan WHERE plan_id=?1)", [&plan_id], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch failure vocabulary",
+        "command_approve_vocabulary",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
     let installation_id = installation_of(&database, PRODUCER_AGENT);
 
     // Every fact is broken at once, so only the *order* of the ladder can decide what is recorded.
@@ -1637,13 +1777,21 @@ fn dispatch_failure_reason_follows_the_disabled_offline_harness_order() {
         "assertion the_prerun_recheck_follows_the_same_ladder"
     );
 
-    // The last fact is repaired and nothing is left to explain, so the event is admitted and every
-    // recorded reason this module owns is cleared instead of being left behind.
+    // The last fact is repaired. The stored probe of that installation is stale at the same time:
+    // a probe result is not an admission fact, so it cannot keep a launchable Runtime out.
     database
         .connection()
         .execute(
             "UPDATE agent_profile SET selected_runtime_adapter_kind='codex-cli' WHERE id=?1",
             [PRODUCER_AGENT],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE adapter_capability_snapshot SET probe_status='light_failed'
+             WHERE installation_id=?1",
+            [&installation_id],
         )
         .unwrap();
     assert_eq!(
@@ -1663,20 +1811,79 @@ fn dispatch_failure_reason_follows_the_disabled_offline_harness_order() {
     );
 }
 
-/// Dedupe boundary: one recorded failure per reason, so repeated ticks cannot turn one unavailable
-/// recipient into a stream of events, and recovery resumes the *same* event identity instead of
-/// minting a second Delivery.
+/// Presence is launch intent, not a probe: Core's own admission starts a Runtime that is merely
+/// `light_ready`, `installed_unverified`, or has no capability snapshot yet, so dispatch must not be
+/// stricter than the execution path it feeds.
 #[test]
-fn a_dispatch_failure_is_recorded_once_and_recovery_resumes_the_same_event() {
-    let mut database = fixture();
-    let (_mission_id, plan_id) =
-        dispatchable_plan(
+fn dispatch_does_not_require_a_fresh_ready_probe() {
+    for probe in [
+        Some("light_ready"),
+        Some("light_failed"),
+        Some("installed_unverified"),
+        None,
+    ] {
+        let mut database = fixture();
+        let (_mission_id, plan_id) = dispatchable_plan(
             &mut database,
-            "dispatch failure dedupe",
-            "command_approve_dedupe",
+            "dispatch probe independence",
+            "command_approve_probe_independence",
             &[PRODUCER_AGENT, REVIEWER_AGENT],
             &[],
         );
+        let installation_id = installation_of(&database, PRODUCER_AGENT);
+        match probe {
+            Some(status) => {
+                database
+                    .connection()
+                    .execute(
+                        "UPDATE adapter_capability_snapshot SET probe_status=?1
+                         WHERE installation_id=?2",
+                        params![status, &installation_id],
+                    )
+                    .unwrap();
+            }
+            None => {
+                database
+                    .connection()
+                    .execute(
+                        "DELETE FROM adapter_capability_snapshot WHERE installation_id=?1",
+                        [&installation_id],
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            control::admit_due_dispatches(&mut database).unwrap(),
+            1,
+            "assertion a_{probe:?}_probe_does_not_block_a_launchable_installation"
+        );
+        assert_eq!(
+            task_blocked_reason(&database, &plan_id, "task_a"),
+            None,
+            "assertion no_failure_is_recorded_for_a_launchable_installation"
+        );
+        assert_eq!(
+            dispatch_events(&database, "task_a"),
+            vec![],
+            "assertion a_launchable_installation_writes_no_failure_fact"
+        );
+    }
+}
+
+/// Dedupe boundary: one recorded failure per reason, so repeated ticks cannot turn one unavailable
+/// recipient into a stream of events, and a verdict that changes and changes back is not recorded
+/// twice. Recovery resumes the *same* event identity instead of minting a second Delivery.
+#[test]
+fn a_dispatch_failure_is_recorded_once_and_recovery_resumes_the_same_event() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch failure dedupe",
+        "command_approve_dedupe",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
     let installation_id = installation_of(&database, PRODUCER_AGENT);
     database
         .connection()
@@ -1693,9 +1900,14 @@ fn a_dispatch_failure_is_recorded_once_and_recovery_resumes_the_same_event() {
         Some("loom.dispatch_recipient_offline"),
         "assertion the_first_unreachable_pass_records_the_presence_fact"
     );
+    let offline_fact = failure_fact("loom.dispatch_recipient_offline");
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![offline_fact.clone()],
+        "assertion the_first_unreachable_pass_writes_exactly_one_failure_fact"
+    );
 
-    // A repeated tick re-derives the same conclusion. It must not write a second copy of it: the
-    // reason is unchanged and the Task row is not touched at all.
+    // A repeated tick re-derives the same conclusion. It must not write a second copy of it.
     for _ in 0..3 {
         assert_eq!(
             control::admit_due_dispatches(&mut database).unwrap(),
@@ -1706,7 +1918,12 @@ fn a_dispatch_failure_is_recorded_once_and_recovery_resumes_the_same_event() {
     assert_eq!(
         task_row_revision(&database, &plan_id, "task_a"),
         recorded_revision,
-        "assertion a_repeated_tick_writes_no_second_failure_record"
+        "assertion a_repeated_tick_writes_no_second_current_state_reason"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![offline_fact.clone()],
+        "assertion a_repeated_tick_writes_no_second_failure_fact"
     );
     assert_eq!(
         count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
@@ -1719,8 +1936,47 @@ fn a_dispatch_failure_is_recorded_once_and_recovery_resumes_the_same_event() {
         "assertion an_unreachable_recipient_creates_no_delivery"
     );
 
-    // The runtime is back: the same Task is handed out under the identity it always had, so the
-    // Delivery that finally starts is the one the failed passes named — not a new copy of it.
+    // Switched off while the offline fact is already on record: the switch is a different fact and
+    // is recorded once, on top of — not instead of — the earlier one.
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_member SET status='left' WHERE camp_id=?1 AND agent_id=?2",
+            params![&camp_id, PRODUCER_AGENT],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_disabled"),
+        "assertion the_switch_replaces_only_the_current_state_mirror"
+    );
+    let disabled_fact = failure_fact("loom.dispatch_recipient_disabled");
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![offline_fact.clone(), disabled_fact.clone()],
+        "assertion one_fact_row_per_event_and_reason_instead_of_one_mutable_slot"
+    );
+
+    // The switch comes back but the runtime is still gone: the earlier offline judgement is not
+    // recorded a second time, because it is keyed by event and reason.
+    database
+        .connection()
+        .execute(
+            "UPDATE camp_member SET status='active' WHERE camp_id=?1 AND agent_id=?2",
+            params![&camp_id, PRODUCER_AGENT],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![offline_fact.clone(), disabled_fact.clone()],
+        "assertion an_offline_disabled_offline_round_trip_keeps_one_offline_fact"
+    );
+
+    // The runtime is back: exactly one recovery fact, and the same Task is handed out under the
+    // identity it always had, so the Delivery that finally starts is the one the failed passes
+    // named — not a new copy of it.
     database
         .connection()
         .execute(
@@ -1753,7 +2009,16 @@ fn a_dispatch_failure_is_recorded_once_and_recovery_resumes_the_same_event() {
     assert_eq!(
         task_blocked_reason(&database, &plan_id, "task_a"),
         None,
-        "assertion recovery_clears_the_recorded_failure"
+        "assertion recovery_clears_the_current_state_reason"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![
+            offline_fact.clone(),
+            disabled_fact.clone(),
+            recovered_fact()
+        ],
+        "assertion recovery_records_one_recovery_fact_after_the_failures"
     );
 
     for _ in 0..2 {
@@ -1764,27 +2029,63 @@ fn a_dispatch_failure_is_recorded_once_and_recovery_resumes_the_same_event() {
         );
     }
     assert_eq!(
-        (count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"), loom_deliveries(&database)),
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
         (1, 1),
         "assertion recovery_leaves_exactly_one_ledger_row_and_one_delivery"
     );
+    assert_eq!(
+        dispatch_events(&database, "task_a").len(),
+        3,
+        "assertion recovery_never_rewrites_or_deletes_the_failure_history"
+    );
+
+    // The facts are storage, not process state: a reopened database still sees them and still
+    // refuses to mint a second Delivery.
+    let directory = database.directory().to_path_buf();
+    database.close();
+    let mut reopened = Database::open(&directory).expect("the reopened database must be admitted");
+    assert_eq!(
+        dispatch_events(&reopened, "task_a"),
+        vec![offline_fact, disabled_fact, recovered_fact()],
+        "assertion the_dispatch_facts_survive_a_reopen"
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut reopened).unwrap(),
+        0,
+        "assertion a_reopened_database_never_redispatches_the_same_event"
+    );
+    assert_eq!(
+        (
+            count(&reopened, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            count(
+                &reopened,
+                "SELECT COUNT(*) FROM camp_message_delivery WHERE message_id IN
+                     (SELECT id FROM camp_message WHERE author_id='loom-control-scheduler')"
+            )
+        ),
+        (1, 1),
+        "assertion a_reopened_database_keeps_one_ledger_row_and_one_delivery"
+    );
 }
 
-/// Recovery boundary: a Delivery that is already reserved waits for an unreachable recipient instead
-/// of starting. The Delivery *is* the queued work — Core creates the Run from it at claim time — so
-/// "the same queued Run continues" means this exact row, and the exact handoff message behind it,
-/// survives the outage untouched: nothing is re-queued, nothing is rebuilt, and no second Delivery
-/// appears.
+/// Recovery boundary: the Delivery is the queued work — Core creates the Run from it at claim time —
+/// so "the same queued Run continues" means this exact row survives the outage and is the one the
+/// real claim materialises. A recipient that is unreachable cannot start it, and recovery starts the
+/// same Delivery instead of minting a second one.
 #[test]
-fn an_unreachable_recipient_holds_the_reserved_delivery_and_the_same_queued_work_continues() {
+fn an_unreachable_recipient_holds_the_reserved_delivery_and_the_same_queued_run_continues() {
     let mut database = fixture();
-    let (_mission_id, _plan_id) = dispatchable_plan(
+    let (mission_id, _plan_id) = dispatchable_plan(
         &mut database,
         "dispatch recovery keeps the queued run",
         "command_approve_recovery",
         &[PRODUCER_AGENT, REVIEWER_AGENT],
         &[],
     );
+    let camp_id = camp_of(&database, &mission_id);
     assert_eq!(
         control::admit_due_dispatches(&mut database).unwrap(),
         1,
@@ -1798,28 +2099,17 @@ fn an_unreachable_recipient_holds_the_reserved_delivery_and_the_same_queued_work
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    // The reserved Delivery is the queued work: a real handoff message, one waiting row and no Run
-    // yet, because Core materialises the Run when the queue claims it.
-    let (message_id, queue_sequence, delivery_status): (String, i64, String) = database
+    let (message_id, queue_sequence): (String, i64) = database
         .connection()
         .query_row(
-            "SELECT message_id, queue_sequence, status FROM camp_message_delivery WHERE id=?1",
+            "SELECT message_id, queue_sequence FROM camp_message_delivery WHERE id=?1",
             [&delivery_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(
-        delivery_status, "waiting",
-        "assertion a_reserved_delivery_waits_to_be_claimed"
-    );
-    assert_eq!(
-        count(&database, "SELECT COUNT(*) FROM agent_run"),
-        0,
-        "assertion a_waiting_delivery_has_no_run_of_its_own_yet"
-    );
 
-    // The recipient drops out after the reservation. The wrapper asks before every start, so the
-    // reserved Delivery waits and nothing about it is rebuilt.
+    // The recipient drops out after the reservation. The real claim asks the control plane before
+    // it starts anything, so this exact Delivery waits and no Run is created.
     let installation_id = installation_of(&database, PRODUCER_AGENT);
     database
         .connection()
@@ -1828,21 +2118,45 @@ fn an_unreachable_recipient_holds_the_reserved_delivery_and_the_same_queued_work
             [&installation_id],
         )
         .unwrap();
-    let now = chrono::Utc::now().to_rfc3339();
-    assert_eq!(
-        control::dispatch_block_reason(database.connection(), &dispatch_id, &now)
-            .unwrap()
-            .as_deref(),
-        Some("loom.dispatch_recipient_offline"),
-        "assertion a_reserved_delivery_waits_for_an_unreachable_recipient"
+    assert!(
+        claim_mission_lane(&mut database, &camp_id, 1).is_empty(),
+        "assertion an_unreachable_recipient_cannot_claim_the_reserved_delivery"
     );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM agent_run"),
+        0,
+        "assertion the_blocked_claim_starts_no_run"
+    );
+    let (waiting_status, unclaimed, same_message): (String, bool, bool) = database
+        .connection()
+        .query_row(
+            "SELECT status, claimed_agent_run_id IS NULL, message_id=?2
+             FROM camp_message_delivery WHERE id=?1",
+            params![&delivery_id, &message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (waiting_status.as_str(), unclaimed, same_message),
+        ("waiting", true, true),
+        "assertion the_queued_delivery_is_untouched_while_it_waits"
+    );
+
+    // A pass during the outage records the failure fact once and, the reservation already standing,
+    // admits no second dispatch.
     assert_eq!(
         control::admit_due_dispatches(&mut database).unwrap(),
         0,
         "assertion waiting_for_the_recipient_is_not_a_second_dispatch"
     );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_recipient_offline")],
+        "assertion the_reserved_work_records_its_presence_fact_once"
+    );
 
-    // The recipient comes back: the same Delivery, carrying the same queued Run, may start.
+    // The recipient comes back. The recovery pass records the recovery fact; the claim then
+    // materialises the Run from this very Delivery.
     database
         .connection()
         .execute(
@@ -1851,69 +2165,196 @@ fn an_unreachable_recipient_holds_the_reserved_delivery_and_the_same_queued_work
         )
         .unwrap();
     assert_eq!(
-        control::dispatch_block_reason(database.connection(), &dispatch_id, &now).unwrap(),
-        None,
-        "assertion the_reserved_delivery_may_start_once_the_recipient_is_reachable"
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion the_recovery_pass_resumes_the_reservation_instead_of_dispatching_again"
     );
-    let (status, still_the_delivery): (String, bool) = database
+    let claimed = claim_mission_lane(&mut database, &camp_id, 1);
+    assert_eq!(
+        claimed.len(),
+        1,
+        "assertion the_recovered_recipient_claims_the_same_queued_work"
+    );
+    let run_id = claimed[0].clone();
+    let (claimed_run, claimed_status, same_message, same_sequence, same_dispatch): (
+        Option<String>,
+        String,
+        bool,
+        bool,
+        bool,
+    ) = database
         .connection()
         .query_row(
-            "SELECT status, id=?2 FROM camp_message_delivery WHERE id=?1",
-            params![&delivery_id, &delivery_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT delivery.claimed_agent_run_id, delivery.status, delivery.message_id=?2,
+                    delivery.queue_sequence=?3,
+                    EXISTS(SELECT 1 FROM loom_control_dispatch WHERE dispatch_id=?4)
+             FROM camp_message_delivery AS delivery WHERE delivery.id=?1",
+            params![&delivery_id, &message_id, queue_sequence, &dispatch_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(
-        (status.as_str(), still_the_delivery),
-        ("waiting", true),
-        "assertion the_queued_delivery_is_untouched_while_it_waits"
+        (claimed_run.as_deref(), claimed_status.as_str()),
+        (Some(run_id.as_str()), "claimed"),
+        "assertion the_same_reserved_delivery_started_the_recovered_run"
     );
-    let (same_message, same_sequence, still_waiting, still_unclaimed): (String, i64, String, bool) =
-        database
-            .connection()
-            .query_row(
-                "SELECT message_id, queue_sequence, status, claimed_agent_run_id IS NULL
-                 FROM camp_message_delivery WHERE id=?1",
-                [&delivery_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
     assert_eq!(
-        (same_message.as_str(), same_sequence, still_waiting.as_str(), still_unclaimed),
-        (message_id.as_str(), queue_sequence, "waiting", true),
+        (same_message, same_sequence, same_dispatch),
+        (true, true, true),
         "assertion the_same_queued_work_continues_after_recovery"
     );
     assert_eq!(
-        count(&database, "SELECT COUNT(*) FROM agent_run"),
-        0,
-        "assertion recovery_never_queues_the_work_a_second_time"
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database),
+            count(&database, "SELECT COUNT(*) FROM agent_run")
+        ),
+        (1, 1, 1),
+        "assertion recovery_adds_no_second_ledger_row_no_second_delivery_and_no_second_run"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![
+            failure_fact("loom.dispatch_recipient_offline"),
+            recovered_fact()
+        ],
+        "assertion the_reserved_work_records_exactly_one_recovery_fact"
     );
     assert_eq!(
         control::admit_due_dispatches(&mut database).unwrap(),
         0,
-        "assertion recovery_reuses_the_reservation_instead_of_dispatching_again"
+        "assertion a_tick_after_the_recovery_never_dispatches_the_same_event_again"
+    );
+}
+
+/// Presence boundary, ported from the upstream device vocabulary: when a member explicitly selected
+/// a remote Node, that Node is the device — its heartbeat is presence and its catalog is the
+/// harness. The local installation of that Agent is not the device and must not be consulted.
+#[test]
+fn a_remote_recipient_is_judged_by_its_node_and_recovers_when_the_node_heartbeats() {
+    let mut database = fixture();
+    let (mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch remote device",
+        "command_approve_remote_device",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let camp_id = camp_of(&database, &mission_id);
+    let stale = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+    select_remote_node(
+        &database,
+        &camp_id,
+        PRODUCER_AGENT,
+        "node_remote",
+        AdapterKind::CodexCli,
+        &stale,
+    );
+    // The Agent's local installation is still present, enabled and launchable. A stale Node must
+    // still decide, because the Node is where the work would run.
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_stale_remote_node_is_not_dispatchable_even_with_a_local_runtime"
     );
     assert_eq!(
-        (count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"), loom_deliveries(&database)),
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_recipient_offline"),
+        "assertion a_stale_node_heartbeat_is_reported_as_presence"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![failure_fact("loom.dispatch_recipient_offline")],
+        "assertion the_stale_node_writes_one_presence_fact"
+    );
+
+    // A fresh heartbeat is presence; the Node reporting no usable installation of the selected
+    // harness is the harness step.
+    let fresh = chrono::Utc::now().to_rfc3339();
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node SET last_heartbeat=?1 WHERE node_id='node_remote'",
+            [&fresh],
+        )
+        .unwrap();
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=0
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(control::admit_due_dispatches(&mut database).unwrap(), 0);
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a").as_deref(),
+        Some("loom.dispatch_harness_unavailable"),
+        "assertion a_reachable_node_without_the_selected_harness_is_reported_as_the_harness"
+    );
+
+    // The Node reports the harness again: the same Task is dispatched, and the ladder's history is
+    // kept as three facts rather than one mutable slot.
+    database
+        .connection()
+        .execute(
+            "UPDATE execution_node_cli SET path_present=1
+             WHERE node_id='node_remote' AND adapter_kind='codex-cli'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        1,
+        "assertion a_recovered_remote_node_is_dispatched"
+    );
+    assert_eq!(
+        task_blocked_reason(&database, &plan_id, "task_a"),
+        None,
+        "assertion the_recovered_remote_node_carries_no_current_failure"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![
+            failure_fact("loom.dispatch_recipient_offline"),
+            failure_fact("loom.dispatch_harness_unavailable"),
+            recovered_fact()
+        ],
+        "assertion the_remote_ladder_records_each_fact_once_and_keeps_history"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
         (1, 1),
-        "assertion recovery_adds_no_second_ledger_row_and_no_second_delivery"
+        "assertion the_remote_recovery_mints_one_delivery"
     );
 }
 
 /// Concurrency boundary, ported from the upstream rule that a heartbeat which commits while the
 /// dispatch write waits for the lock must be observed: the availability of every recipient is read
-/// inside the writing transaction, so a pass that waited for the lock dispatches the recipients that
-/// came back in the meantime — one Delivery each, never a failure record for a stale reading.
+/// inside the writing transaction, so a pass never records a failure from facts it can no longer
+/// see — whichever side wins the lock, the repaired facts are the ones judged.
 #[test]
 fn recipients_that_come_back_while_the_pass_waits_for_the_lock_are_dispatched_once() {
     let mut database = fixture();
-    let (_mission_id, plan_id) = dispatchable_plan(
+    let (mission_id, plan_id) = dispatchable_plan(
         &mut database,
         "dispatch concurrent recovery",
         "command_approve_concurrent",
         &[PRODUCER_AGENT, REVIEWER_AGENT, SECOND_PRODUCER_AGENT],
         &[("task_second", SECOND_PRODUCER_AGENT)],
     );
+    let _ = &mission_id;
     let installation_id = installation_of(&database, PRODUCER_AGENT);
     database
         .connection()
@@ -1921,6 +2362,10 @@ fn recipients_that_come_back_while_the_pass_waits_for_the_lock_are_dispatched_on
             "UPDATE adapter_installation SET path_state='path_missing' WHERE id=?1",
             [&installation_id],
         )
+        .unwrap();
+    database
+        .connection()
+        .busy_timeout(std::time::Duration::from_secs(10))
         .unwrap();
     assert_eq!(
         control::admit_due_dispatches(&mut database).unwrap(),
@@ -1933,41 +2378,67 @@ fn recipients_that_come_back_while_the_pass_waits_for_the_lock_are_dispatched_on
             Some("loom.dispatch_recipient_offline"),
             "assertion every_waiting_recipient_records_the_same_availability_fact"
         );
+        assert_eq!(
+            dispatch_events(&database, task_id),
+            vec![failure_fact("loom.dispatch_recipient_offline")],
+            "assertion every_waiting_recipient_records_one_fact"
+        );
     }
 
-    // A second connection repairs the runtime and holds the write lock past the moment the pass
-    // asks for it. Only a read taken after the lock can see the recovery; a read taken before it
-    // would see the stale `path_missing` and write a failure that is already untrue.
-    let (locked, waiting) = std::sync::mpsc::channel();
-    let database_path = database.path().to_path_buf();
+    // A second connection repairs the runtime and holds the write lock. The pass is started while
+    // that lock is held, so a read taken before it would see the stale `path_missing`.
+    let directory = database.directory().to_path_buf();
     let repaired_installation = installation_id.clone();
+    let (locked, lock_held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {
-        let connection = rusqlite::Connection::open(&database_path).unwrap();
-        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
-        connection
+        let mut holder =
+            Database::open_verified_test_clone(&directory, TestDatabaseOpenMode::ProductionLike)
+                .unwrap();
+        holder
+            .connection()
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let transaction = holder
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
             .execute(
                 "UPDATE adapter_installation SET path_state='valid' WHERE id=?1",
                 [&repaired_installation],
             )
             .unwrap();
         locked.send(()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        connection.execute_batch("COMMIT").unwrap();
+        released.recv().unwrap();
+        transaction.commit().unwrap();
     });
-    waiting.recv().unwrap();
+    lock_held.recv().unwrap();
 
-    let admitted = control::admit_due_dispatches(&mut database).unwrap();
+    let admitted = std::thread::scope(|scope| {
+        let pass = scope.spawn(|| control::admit_due_dispatches(&mut database).unwrap());
+        release.send(()).unwrap();
+        pass.join().unwrap()
+    });
     holder.join().unwrap();
 
     assert_eq!(
         admitted, 2,
-        "assertion a_pass_that_waited_for_the_lock_dispatches_every_recipient_that_came_back"
+        "assertion a_pass_never_dispatches_from_a_stale_reading_of_the_device"
     );
     for task_id in ["task_a", "task_second"] {
         assert_eq!(
             task_blocked_reason(&database, &plan_id, task_id),
             None,
             "assertion the_recovered_recipient_carries_no_stale_failure_record"
+        );
+        assert_eq!(
+            dispatch_events(&database, task_id),
+            vec![
+                failure_fact("loom.dispatch_recipient_offline"),
+                recovered_fact()
+            ],
+            "assertion the_waited_pass_records_recovery_not_a_second_failure"
         );
         assert_eq!(
             control::admit_due_dispatches(&mut database).unwrap(),
@@ -1996,8 +2467,77 @@ fn recipients_that_come_back_while_the_pass_waits_for_the_lock_are_dispatched_on
         "assertion each_recovered_recipient_owns_exactly_one_event_identity"
     );
     assert_eq!(
-        (count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"), loom_deliveries(&database)),
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
         (2, 2),
         "assertion concurrent_recovery_creates_no_duplicate_delivery"
     );
+}
+
+/// Single-dispatch boundary, ported from upstream's concurrent `deviceOnline` race: two independent
+/// connections admitting the same queued work at the same instant must produce one Dispatch and one
+/// Delivery. The write transaction serialises them and the ledger's dedupe key is what the second
+/// pass sees, so neither one can mint a second copy.
+#[test]
+fn concurrent_passes_admit_the_same_queued_work_exactly_once() {
+    let mut database = fixture();
+    let (_mission_id, plan_id) = dispatchable_plan(
+        &mut database,
+        "dispatch concurrent passes",
+        "command_approve_two_passes",
+        &[PRODUCER_AGENT, REVIEWER_AGENT],
+        &[],
+    );
+    let directory = database.directory().to_path_buf();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let results: Vec<usize> = std::thread::scope(|scope| {
+        let mut passes = Vec::new();
+        for _ in 0..2 {
+            let directory = directory.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            passes.push(scope.spawn(move || {
+                let mut pass = Database::open_verified_test_clone(
+                    &directory,
+                    TestDatabaseOpenMode::ProductionLike,
+                )
+                .unwrap();
+                pass.connection()
+                    .busy_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                barrier.wait();
+                control::admit_due_dispatches(&mut pass).unwrap()
+            }));
+        }
+        barrier.wait();
+        passes
+            .into_iter()
+            .map(|pass| pass.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        results.iter().sum::<usize>(),
+        1,
+        "assertion two_concurrent_passes_admit_the_same_event_exactly_once: {results:?}"
+    );
+    assert_eq!(
+        (
+            count(&database, "SELECT COUNT(*) FROM loom_control_dispatch"),
+            loom_deliveries(&database)
+        ),
+        (1, 1),
+        "assertion concurrent_passes_leave_one_ledger_row_and_one_delivery"
+    );
+    assert_eq!(
+        dispatch_events(&database, "task_a"),
+        vec![],
+        "assertion a_successful_race_writes_no_failure_fact"
+    );
+    assert_eq!(
+        control::admit_due_dispatches(&mut database).unwrap(),
+        0,
+        "assertion a_tick_after_the_race_dispatches_nothing_again"
+    );
+    let _ = plan_id;
 }

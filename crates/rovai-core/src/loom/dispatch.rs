@@ -31,11 +31,19 @@
 //!   order — the switch, then presence, then the harness — ported from Mikka
 //!   `lib/factory/dispatch-recovery.ts:factoryDispatchFailureReason`. The facts are read inside the
 //!   same `IMMEDIATE` transaction as the decision, so a recipient that comes back while the pass
-//!   waits for the write lock is dispatched instead of being reported as absent. The reason is
-//!   deduped by value (a repeated tick writes nothing at all), and the moment the recipient is
-//!   reachable again the same Task is handed out under its own unchanged event identity: recovery
-//!   resumes the Delivery/queued Run the earlier pass could not start, and never mints a second
-//!   one.
+//!   waits for the write lock is dispatched instead of being reported as absent. Presence is the
+//!   device that will actually run the work: the local installation the Agent is bound to, or the
+//!   remote Node the member explicitly selected, judged by the same launch eligibility Core already
+//!   applies (`light_ready`, `installed_unverified` and a missing snapshot are startable; a stored
+//!   probe result is not a dispatch condition).
+//! * **A failure is a durable fact.** Each `(event identity, reason)` is recorded once as a
+//!   `loom.dispatch_failed` domain event — a repeated tick stores nothing, an
+//!   offline → disabled → offline round trip keeps one row per reason, and recovery never deletes
+//!   the history. Reaching the recipient again writes exactly one `loom.dispatch_recovered`, the
+//!   counterpart of upstream's `run_redispatched`, and the same Task is handed out under its own
+//!   unchanged event identity: recovery resumes the Delivery/queued Run the earlier pass could not
+//!   start, and never mints a second one. `loom_task.blocked_reason` is only the current-state
+//!   mirror of those facts.
 //!
 //! The cloud half of the upstream module (`FACTORY_CLOUD_DISPATCH_AVAILABLE`, `switchToCloud`) has
 //! no counterpart here: cloud (E2B) dispatch stays unavailable, so no pass of this module can start
@@ -46,6 +54,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use super::super::blocking_dependencies;
 use super::{LoomControlPolicy, active_member, read_policy};
+use crate::agent_profile::{RuntimeReadiness, RuntimeReadinessStatus};
 use crate::collaboration::{LoomDispatchAdmission, LoomDispatchAdmissionOutcome};
 use crate::db::Database;
 
@@ -71,6 +80,13 @@ const RECIPIENT_UNAVAILABLE_REASON: &str = "loom.dispatch_recipient_unavailable"
 const RECIPIENT_DISABLED_REASON: &str = "loom.dispatch_recipient_disabled";
 const RECIPIENT_OFFLINE_REASON: &str = "loom.dispatch_recipient_offline";
 const HARNESS_UNAVAILABLE_REASON: &str = "loom.dispatch_harness_unavailable";
+
+/// The durable event vocabulary of the same ladder, ported from Mikka's
+/// `run_dispatch_failed:<runId>:<reasonCode>` and `run_redispatched:<runId>`. The event identity of
+/// a dispatch plays the part of the Run id, because the queued Run itself is only materialised when
+/// its Delivery is claimed.
+const DISPATCH_FAILED_EVENT: &str = "loom.dispatch_failed";
+const DISPATCH_RECOVERED_EVENT: &str = "loom.dispatch_recovered";
 
 const EXECUTE: &str = "EXECUTE";
 const REVIEW: &str = "REVIEW";
@@ -251,6 +267,16 @@ fn admit_plan(
         return Ok(0);
     }
 
+    // The Camp every recorded fact belongs to. A missing Mission is not a reason to invent one:
+    // the events are stored without a Camp instead of failing the whole pass.
+    let camp_id: Option<String> = transaction
+        .query_row(
+            "SELECT camp_id FROM mission WHERE id=?1",
+            [mission_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
     let mut events = due_events(transaction, plan_id, mission_id, &policy, now)?;
     let mut admitted = 0usize;
     for event in events.drain(..) {
@@ -258,13 +284,31 @@ fn admit_plan(
             break;
         }
         // An event that is already in the ledger is not a new cost and must never be reported as
-        // one: this check runs before any budget decision.
-        let already_recorded: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM loom_control_dispatch WHERE dedupe_key=?1)",
-            [&event.dedupe_key],
-            |row| row.get(0),
-        )?;
-        if already_recorded {
+        // one: this check runs before any budget decision. It is still judged, because the queued
+        // work behind it can stop being reachable while it waits — a Delivery that is reserved but
+        // not yet claimed. That writes the same durable failure fact the unqueued path writes, and
+        // exactly one recovery fact when the recipient comes back; the reserved Delivery is the
+        // queued work, so recovering resumes it instead of admitting a second one.
+        let already_recorded: Option<String> = transaction
+            .query_row(
+                "SELECT dispatch_id FROM loom_control_dispatch WHERE dedupe_key=?1
+                 ORDER BY created_at DESC, dispatch_id DESC LIMIT 1",
+                [&event.dedupe_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(recorded_dispatch_id) = already_recorded {
+            match dispatch_block_reason(transaction, &recorded_dispatch_id, now)? {
+                Some(reason) if is_recipient_availability_reason(&reason) => {
+                    set_control_blocked_reason(transaction, plan_id, &event.task_id, &reason, now)?;
+                    record_dispatch_failure(transaction, camp_id.as_deref(), &event, &reason, now)?;
+                }
+                None => {
+                    record_dispatch_recovery(transaction, camp_id.as_deref(), &event, now)?;
+                    clear_control_blocked_reason(transaction, plan_id, &event.task_id, now)?;
+                }
+                Some(_) => {}
+            }
             continue;
         }
 
@@ -284,22 +328,29 @@ fn admit_plan(
             None,
         )? {
             match problem {
-                RECIPIENT_UNAVAILABLE_REASON | RECIPIENT_DISABLED_REASON
-                | RECIPIENT_OFFLINE_REASON | HARNESS_UNAVAILABLE_REASON
+                RECIPIENT_UNAVAILABLE_REASON
+                | RECIPIENT_DISABLED_REASON
+                | RECIPIENT_OFFLINE_REASON
+                | HARNESS_UNAVAILABLE_REASON
                 | "loom.dispatch_recipient_not_reviewer"
-                | "loom.dispatch_recipient_not_assignee" | "loom.dispatch_recipient_is_assignee"
-                | "loom.dispatch_recipient_is_producer" | "loom.dispatch_recipient_not_lead" => {
+                | "loom.dispatch_recipient_not_assignee"
+                | "loom.dispatch_recipient_is_assignee"
+                | "loom.dispatch_recipient_is_producer"
+                | "loom.dispatch_recipient_not_lead" => {
                     // The recorded reason is the specific code, not a generic "cannot reach".
-                    // Writing it is a compare-and-set on the value: an unchanged reason writes
-                    // nothing (so a repeated tick cannot produce a second event for the same
-                    // failure), and a changed one replaces it once.
-                    set_control_blocked_reason(
-                        transaction,
-                        plan_id,
-                        &event.task_id,
-                        problem,
-                        now,
-                    )?;
+                    // `blocked_reason` is only the current-state mirror of it; the fact itself is
+                    // the durable `(event identity, reason)` row written below, so no tick can
+                    // turn one unavailable recipient into a second copy of the same event.
+                    set_control_blocked_reason(transaction, plan_id, &event.task_id, problem, now)?;
+                    if is_recipient_availability_reason(problem) {
+                        record_dispatch_failure(
+                            transaction,
+                            camp_id.as_deref(),
+                            &event,
+                            problem,
+                            now,
+                        )?;
+                    }
                 }
                 PREVIOUS_OUTCOME_REASON => {
                     set_control_blocked_reason(
@@ -376,6 +427,7 @@ fn admit_plan(
                         params![now, plan_id, &event.task_id],
                     )?;
                 }
+                record_dispatch_recovery(transaction, camp_id.as_deref(), &event, now)?;
                 clear_control_blocked_reason(transaction, plan_id, &event.task_id, now)?;
                 admitted += 1;
             }
@@ -623,6 +675,8 @@ fn event_problem(
     // The recipient's own availability, in the upstream order disabled → offline → harness. It is
     // read from the transaction that is about to decide, never from an earlier reading: an
     // availability change that commits while this pass waits for the write lock is observed here.
+    // The device judged is the one execution will use: the selected remote Node when there is one,
+    // otherwise the local installation.
     if let Some(reason) = recipient_failure_reason(transaction, &camp_id, recipient)? {
         return Ok(Some(reason));
     }
@@ -1009,9 +1063,9 @@ fn latest_stage_review_id(
         .optional()?)
 }
 
-/// The persisted presence of one recipient: the switch (profile and Camp membership), the runtime
-/// it is bound to, and the harness that runtime actually offers. Read from the connection that is
-/// about to decide, so the facts are the ones the write lock ordered.
+/// The persisted presence of one recipient: the switch (profile and Camp membership) and the
+/// runtime the Agent is bound to locally. Read from the connection that is about to decide, so the
+/// facts are the ones the write lock ordered.
 struct RecipientPresence {
     profile_status: String,
     profile_removed: bool,
@@ -1020,10 +1074,8 @@ struct RecipientPresence {
     leave_requested: bool,
     /// The Adapter kind the Agent is configured to run, when one is configured at all.
     selected_adapter_kind: Option<String>,
-    /// `(enabled, adapter_kind, path_state)` of the installation bound to the Agent.
+    /// `(enabled, adapter_kind, path_state)` of the local installation bound to the Agent.
     installation: Option<(i64, String, String)>,
-    /// The probe the installation last reported, when it ever reported one.
-    probe_status: Option<String>,
 }
 
 /// Why this recipient cannot take a Delivery right now, or `None` when it can.
@@ -1032,6 +1084,15 @@ struct RecipientPresence {
 /// names the *first* fact that makes the recipient unusable instead of whichever fact was cheapest
 /// to read. Each step is asked only when the step above it passed, and an unreadable fact fails
 /// closed into the step it belongs to: nothing here answers "maybe".
+///
+/// Presence is the device that will actually run the work, never a probe: a local installation
+/// record carries launch intent (`enabled`, a resolvable `path_state`, the Adapter it offers), which
+/// is the same fact `agent_profile::runtime_readiness` reads, and Core's own admission starts a
+/// Runtime in `light_ready`, `installed_unverified` or without any snapshot. A stored `ready` probe
+/// would be a stricter condition here than the execution path itself, so it is not asked. When the
+/// member selected a remote Node, that Node — not the disabled local placeholder installation — is
+/// the device, and its heartbeat, catalog and harness are judged by
+/// `member_execution_availability::evaluate`.
 fn recipient_failure_reason(
     connection: &Connection,
     camp_id: &str,
@@ -1047,15 +1108,12 @@ fn recipient_failure_reason(
                     profile.selected_runtime_adapter_kind,
                     installation.enabled,
                     installation.adapter_kind,
-                    installation.path_state,
-                    snapshot.probe_status
+                    installation.path_state
              FROM agent_profile profile
              LEFT JOIN camp_member member
                     ON member.camp_id=?1 AND member.agent_id=profile.id
              LEFT JOIN adapter_installation installation
                     ON installation.id=profile.default_runtime_installation_id
-             LEFT JOIN adapter_capability_snapshot snapshot
-                    ON snapshot.installation_id=installation.id
              WHERE profile.id=?2",
             params![camp_id, agent_id],
             |row| {
@@ -1077,7 +1135,6 @@ fn recipient_failure_reason(
                     leave_requested: row.get(4)?,
                     selected_adapter_kind: row.get(5)?,
                     installation,
-                    probe_status: row.get(9)?,
                 })
             },
         )
@@ -1098,28 +1155,58 @@ fn recipient_failure_reason(
         return Ok(Some(RECIPIENT_DISABLED_REASON));
     }
 
-    // 2. offline — the member stands, but it is not present now, or the runtime bound to it cannot
-    //    be reached: no installation, a switched-off installation, or an executable that is gone.
+    // 2. offline — the member stands, but it is not present now, or the device it is bound to
+    //    cannot be reached.
     if presence.profile_status != "present" {
         return Ok(Some(RECIPIENT_OFFLINE_REASON));
     }
-    let Some((enabled, adapter_kind, path_state)) = presence.installation else {
-        return Ok(Some(RECIPIENT_OFFLINE_REASON));
-    };
-    if enabled != 1 || path_state != "valid" {
-        return Ok(Some(RECIPIENT_OFFLINE_REASON));
-    }
+    if remote_execution_selected(connection, agent_id)? {
+        // The explicit remote choice owns execution: the local installation is only a disabled
+        // placeholder for the Run's foreign key and says nothing about the Node that will run.
+        // `evaluate` is the owner of that eligibility (node role/revocation, prepared workspace,
+        // native catalog, fresh heartbeat), so the same facts decide here.
+        let availability = crate::member_execution_availability::evaluate(
+            connection,
+            agent_id,
+            // Only the local branch reads these, and it is not the branch being judged.
+            None,
+            &RuntimeReadiness {
+                status: RuntimeReadinessStatus::RuntimeNotConfigured,
+                blockers: Vec::new(),
+            },
+        )?;
+        if !availability.can_launch {
+            let code = availability
+                .readiness
+                .blockers
+                .first()
+                .map(|blocker| blocker.code.as_str())
+                .unwrap_or_default();
+            return Ok(Some(if remote_harness_is_missing(code) {
+                HARNESS_UNAVAILABLE_REASON
+            } else {
+                RECIPIENT_OFFLINE_REASON
+            }));
+        }
+    } else {
+        let Some((enabled, adapter_kind, path_state)) = presence.installation else {
+            return Ok(Some(RECIPIENT_OFFLINE_REASON));
+        };
+        if enabled != 1 || path_state != "valid" {
+            return Ok(Some(RECIPIENT_OFFLINE_REASON));
+        }
 
-    // 3. harness — reachable, but the harness the Agent must run is not the one installed there.
-    //    An Agent with no configured Adapter asks for no particular harness, exactly as an upstream
-    //    device with no harness requirement.
-    if let Some(selected) = presence
-        .selected_adapter_kind
-        .as_deref()
-        .filter(|kind| !kind.is_empty())
-    {
-        if selected != adapter_kind || presence.probe_status.as_deref() != Some("ready") {
-            return Ok(Some(HARNESS_UNAVAILABLE_REASON));
+        // 3. harness — reachable, but the harness the Agent must run is not the one installed there.
+        //    An Agent with no configured Adapter asks for no particular harness, exactly as an
+        //    upstream device with no harness requirement.
+        if let Some(selected) = presence
+            .selected_adapter_kind
+            .as_deref()
+            .filter(|kind| !kind.is_empty())
+        {
+            if selected != adapter_kind {
+                return Ok(Some(HARNESS_UNAVAILABLE_REASON));
+            }
         }
     }
 
@@ -1129,6 +1216,33 @@ fn recipient_failure_reason(
         return Ok(Some(RECIPIENT_UNAVAILABLE_REASON));
     }
     Ok(None)
+}
+
+/// True when the member's explicit execution choice points at another Node, so the local
+/// installation is not the device that will run the work.
+fn remote_execution_selected(connection: &Connection, agent_id: &str) -> Result<bool> {
+    if !crate::remote_execution::authority_table_available(connection, "member_execution_target")? {
+        return Ok(false);
+    }
+    Ok(
+        crate::remote_execution::load_member_target(connection, agent_id)?
+            .selection
+            .is_some(),
+    )
+}
+
+/// The catalog codes that mean "this Node has no usable installation of the selected harness"
+/// rather than "the Node is not reachable". The same split the upstream ladder makes between an
+/// absent device and an absent harness.
+fn remote_harness_is_missing(code: &str) -> bool {
+    matches!(
+        code,
+        "remote_catalog_program_unavailable"
+            | "remote_catalog_installation_unavailable"
+            | "remote_catalog_identity_malformed"
+            | "remote_catalog_generation_out_of_range"
+            | "remote_catalog_adapter_ambiguous"
+    )
 }
 
 fn agent_of_run(connection: &Connection, agent_run_id: &str) -> Result<Option<String>> {
@@ -1143,9 +1257,121 @@ fn agent_of_run(connection: &Connection, agent_run_id: &str) -> Result<Option<St
         .optional()?)
 }
 
+/// True for the reasons that mean "this recipient cannot take the work right now": the three
+/// upstream codes plus the module's fail-closed membership code. The identity rejections
+/// (`..._not_reviewer`, `..._not_assignee`, …) are not availability facts and never write one.
+fn is_recipient_availability_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        RECIPIENT_UNAVAILABLE_REASON
+            | RECIPIENT_DISABLED_REASON
+            | RECIPIENT_OFFLINE_REASON
+            | HARNESS_UNAVAILABLE_REASON
+    )
+}
+
+/// The stable identity of one recorded failure, keyed exactly like upstream's
+/// `run_dispatch_failed:<runId>:<reasonCode>`: one row per event and reason, whatever happens to
+/// `blocked_reason` in between. `event_log.event_id` is `UNIQUE`, so the insert is a
+/// compare-and-set at the storage layer.
+fn dispatch_failure_event_id(event_identity: &str, reason: &str) -> String {
+    format!("{DISPATCH_FAILED_EVENT}:{event_identity}:{reason}")
+}
+
+/// One dispatch fact in the domain event log. The facts are permanent: recovery never deletes
+/// them, so an offline → disabled → offline round trip stays three recorded judgements about the
+/// same event, not one mutable slot.
+fn record_dispatch_event(
+    transaction: &Transaction<'_>,
+    event_id: String,
+    event_type: &str,
+    camp_id: Option<&str>,
+    event: &DispatchEvent,
+    payload: serde_json::Value,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO event_log(event_id, event_type, payload_json, camp_id, entity_type, entity_id,
+                               actor_type, actor_id, created_at)
+         VALUES(?1, ?2, ?3, ?4, 'loom_task', ?5, 'system', 'loom.dispatch', ?6)
+         ON CONFLICT(event_id) DO NOTHING",
+        params![
+            event_id,
+            event_type,
+            serde_json::to_string(&payload)
+                .context("a LOOM dispatch fact must serialise as JSON")?,
+            camp_id,
+            event.task_id,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// Record that this event of this Task could not be handed out, and why. A repeated tick with the
+/// same verdict stores nothing; a different verdict is its own row.
+fn record_dispatch_failure(
+    transaction: &Transaction<'_>,
+    camp_id: Option<&str>,
+    event: &DispatchEvent,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    record_dispatch_event(
+        transaction,
+        dispatch_failure_event_id(&event.dedupe_key, reason),
+        DISPATCH_FAILED_EVENT,
+        camp_id,
+        event,
+        serde_json::json!({
+            "taskId": event.task_id,
+            "kind": event.kind,
+            "recipientAgentId": event.recipient_agent_id,
+            "reasonCode": reason,
+            "eventIdentity": event.dedupe_key,
+        }),
+        now,
+    )
+}
+
+/// Record that this event became reachable again — once, and only when an earlier pass recorded a
+/// failure for it. Upstream's `run_redispatched` is exactly this edge; the work itself is resumed
+/// through the same Delivery, so nothing here queues it twice.
+fn record_dispatch_recovery(
+    transaction: &Transaction<'_>,
+    camp_id: Option<&str>,
+    event: &DispatchEvent,
+    now: &str,
+) -> Result<()> {
+    let failure_prefix = format!("{DISPATCH_FAILED_EVENT}:{}:", event.dedupe_key);
+    let failed: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM event_log WHERE substr(event_id, 1, length(?1)) = ?1)",
+        [&failure_prefix],
+        |row| row.get(0),
+    )?;
+    if !failed {
+        return Ok(());
+    }
+    record_dispatch_event(
+        transaction,
+        format!("{DISPATCH_RECOVERED_EVENT}:{}", event.dedupe_key),
+        DISPATCH_RECOVERED_EVENT,
+        camp_id,
+        event,
+        serde_json::json!({
+            "taskId": event.task_id,
+            "kind": event.kind,
+            "recipientAgentId": event.recipient_agent_id,
+            "eventIdentity": event.dedupe_key,
+        }),
+        now,
+    )
+}
+
 /// Write one of this module's reasons. An existing reason written by somebody else — a User or
-/// another owner — is never overwritten, and an unchanged value writes nothing at all, which is
-/// what makes the recorded failure one event per `(task, code)` and not one per pass.
+/// another owner — is never overwritten, and an unchanged value writes nothing at all: this field
+/// is the current-state mirror, while the durable `(event identity, reason)` facts live in the
+/// domain event log.
 fn set_control_blocked_reason(
     transaction: &Transaction<'_>,
     plan_id: &str,
